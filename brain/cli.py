@@ -27,6 +27,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"companion-emergence {__version__}",
     )
+    # Subparsers reference not stored — subcommands are registered
+    # wholesale when this function is replaced in Task 4.
     parser.add_subparsers(dest="command", title="subcommands")
     return parser
 
@@ -35,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Returns shell exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if not getattr(args, "command", None):
+    if not args.command:
         parser.print_help()
         return 1
     return 0
