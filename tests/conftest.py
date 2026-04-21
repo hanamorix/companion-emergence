@@ -9,7 +9,11 @@ import pytest
 
 @pytest.fixture
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Remove companion-emergence-relevant env vars for isolation."""
+    """Remove companion-emergence-relevant env vars for isolation.
+
+    Used by tests for brain.paths and brain.config (Tasks 2+).
+    Each key here corresponds to an env var the framework reads at runtime.
+    """
     for key in [
         "NELLBRAIN_HOME",
         "NELL_IPC_JID",
