@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════
+# companion-emergence — .gitignore
+# WRITTEN BEFORE `git init`. Protects private persona state
+# from EVER entering git history. If you move a sensitive
+# path, update this file in the same commit.
+# ═══════════════════════════════════════════════════════════
+
+# ── Per-persona private data ──────────────────────────────
+# Memories are large and private. Runtime state is private.
+# Model weights are large (GGUF/bin/safetensors) and optional.
+# Art masters are Hana's IP (and any forker's art).
+persona/*/memories.json
+persona/*/memories.sqlite
+persona/*/memories.*.bak
+persona/*/data/
+persona/*/model/*.gguf
+persona/*/model/*.bin
+persona/*/model/*.safetensors
+persona/*/model/*.ckpt
+persona/*/art-masters/
+
+# Note: persona config files (personality.json, soul.json,
+# self_model.json, voice.json, persona.toml,
+# emotions/extensions.json) are deliberately NOT gitignored —
+# they're reference-implementation examples for forkers.
+
+# ── Runtime logs ──────────────────────────────────────────
+logs/
+*.log
+*.jsonl
+
+# ── Migration / backup snapshots ──────────────────────────
+*.bak
+*.bak.*
+*.pre-*
+backups/
+
+# ── Local config & secrets ────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.token
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ── NellFace (Tauri) ──────────────────────────────────────
+app/node_modules/
+app/src-tauri/target/
+app/dist/
+app/.vite/
+
+# ── ML artifacts (huge, reproducible from recipe) ────────
+models/
+training/datasets/
+training/checkpoints/
+training/versions/
+training/runs/
+training/wandb/
+training/*.gguf
+training/*.bin
+training/*.safetensors
+training/*.ckpt
+training/*.pt
+training/*.pth
+
+# ── Lock files (runtime-only) ─────────────────────────────
+*.json.lock
+
+# ── OS / editor cruft ─────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+.~*
