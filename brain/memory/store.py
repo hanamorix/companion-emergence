@@ -20,6 +20,17 @@ from pathlib import Path
 from typing import Any
 
 
+def _coerce_utc(ts: str) -> datetime:
+    """Parse ISO-8601 timestamp; coerce tz-naive values to UTC.
+
+    Shared by Memory.from_dict and MemoryStore._row_to_memory so both paths
+    from storage apply identical naive→UTC handling — no drift risk when a
+    third reader (e.g. migrator) is added.
+    """
+    dt = datetime.fromisoformat(ts)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 @dataclass
 class Memory:
     """A single memory — content, context, emotional weight, and metadata.
@@ -113,14 +124,10 @@ class Memory:
 
         Tz-naive timestamps are coerced to UTC (permissive for migrator input).
         """
-        created = datetime.fromisoformat(data["created_at"])
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        last_accessed = None
-        if data.get("last_accessed_at"):
-            last_accessed = datetime.fromisoformat(data["last_accessed_at"])
-            if last_accessed.tzinfo is None:
-                last_accessed = last_accessed.replace(tzinfo=UTC)
+        created = _coerce_utc(data["created_at"])
+        last_accessed = (
+            _coerce_utc(data["last_accessed_at"]) if data.get("last_accessed_at") else None
+        )
         return cls(
             id=data["id"],
             content=data["content"],
@@ -238,7 +245,8 @@ class MemoryStore:
         results: list[Memory] = []
         for row in rows:
             emotions = json.loads(row["emotions_json"])
-            if emotions.get(emotion_name, 0.0) >= min_intensity:
+            intensity = emotions.get(emotion_name, 0.0)
+            if isinstance(intensity, (int, float)) and intensity >= min_intensity:
                 results.append(_row_to_memory(row))
                 if limit is not None and len(results) >= limit:
                     break
@@ -279,6 +287,7 @@ class MemoryStore:
             else:
                 raise ValueError(f"Unknown update field: {key!r}")
 
+        # Empty `fields` kwargs — existence already verified above, nothing to write.
         if not column_map:
             return
         set_clause = ", ".join(f"{col} = ?" for col, _ in column_map.values())
@@ -304,9 +313,14 @@ class MemoryStore:
     def search_text(
         self, query: str, active_only: bool = True, limit: int | None = None
     ) -> list[Memory]:
-        """Case-insensitive substring search on content."""
-        sql = "SELECT * FROM memories WHERE content LIKE ? COLLATE NOCASE"
-        params: list[Any] = [f"%{query}%"]
+        """Case-insensitive substring search on content.
+
+        `%` and `_` in `query` are escaped so a caller passing `"%"` does
+        not match every row.
+        """
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        sql = "SELECT * FROM memories WHERE content LIKE ? ESCAPE '\\' COLLATE NOCASE"
+        params: list[Any] = [f"%{escaped}%"]
         if active_only:
             sql += " AND active = 1"
         sql += " ORDER BY created_at DESC"
@@ -333,14 +347,8 @@ class MemoryStore:
 
 def _row_to_memory(row: sqlite3.Row) -> Memory:
     """Materialise a sqlite row into a Memory dataclass."""
-    created = datetime.fromisoformat(row["created_at"])
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=UTC)
-    last_accessed = None
-    if row["last_accessed_at"]:
-        last_accessed = datetime.fromisoformat(row["last_accessed_at"])
-        if last_accessed.tzinfo is None:
-            last_accessed = last_accessed.replace(tzinfo=UTC)
+    created = _coerce_utc(row["created_at"])
+    last_accessed = _coerce_utc(row["last_accessed_at"]) if row["last_accessed_at"] else None
     return Memory(
         id=row["id"],
         content=row["content"],
