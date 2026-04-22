@@ -1,0 +1,35 @@
+# A starter persona: measured pace, literary voice, low arousal ceiling.
+# Forkers copy this directory to persona/<their-name>/ and edit fields marked FORKER.
+
+[persona]
+name = "starter-thoughtful"
+pronouns = "they/them"
+type = "starter"
+created = ""
+
+[model]
+# FORKER: set this to your Ollama model tag, or switch provider entirely.
+provider = "ollama"
+tag = ""
+fallback_provider = ""
+fallback_model = ""
+
+[rhythms]
+heartbeat_seconds = 90
+dream_hour = 3
+reflex_enabled = true
+growth_weekly_hour = "sunday 02:00"
+
+[privacy]
+# All integrations are opt-in. Enable deliberately; defaults protect by default.
+obsidian_integration = false
+ipc_integration = false
+filesystem_scan = false
+
+[bridge]
+bind = "127.0.0.1:8765"
+token_file = "data/bridge.token"
+
+[developmental]
+# Forced phase override. Leave empty to let the framework compute from data depth.
+phase_override = ""
