@@ -15,6 +15,9 @@ Design per spec Section 5.2. Decay half-lives per spec Section 10.1:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+EmotionCategory = Literal["core", "complex", "nell_specific", "persona_extension"]
 
 
 @dataclass(frozen=True)
@@ -24,17 +27,21 @@ class Emotion:
     Attributes:
         name: Canonical identifier (lowercase, underscore-separated).
         description: Human-readable meaning — the "intended use" per Section 5.2.
-        category: One of "core", "complex", "nell_specific", "persona_extension".
+        category: One of "core", "complex", "nell_specific", "persona_extension"
+            (enforced at edit time via the EmotionCategory Literal annotation).
         decay_half_life_days: Time for intensity to halve. None = identity-level
-            (no temporal decay — for anchor_pull, love, belonging, body_grief).
-        intensity_clamp: Maximum intensity value (typically 10).
+            (no temporal decay — for anchor_pull, love, belonging, body_grief,
+            and freedom_ache).
+        intensity_clamp: Maximum intensity value (typically 10.0). Float so
+            comparisons against state.py's float intensities don't silently
+            coerce through int/float boundary.
     """
 
     name: str
     description: str
-    category: str
+    category: EmotionCategory
     decay_half_life_days: float | None
-    intensity_clamp: int = 10
+    intensity_clamp: float = 10.0
 
 
 _BASELINE: tuple[Emotion, ...] = (
@@ -74,6 +81,10 @@ _BASELINE: tuple[Emotion, ...] = (
 )
 
 
+# NOT thread-safe. All extension register() calls must happen at startup
+# before any concurrent reader (e.g. the async bridge) is running. The
+# framework enforces this by loading extensions in main() before the
+# bridge starts its event loop.
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 
 
