@@ -117,3 +117,22 @@ def test_cosine_similarity_antiparallel_is_negative_one() -> None:
     a = np.array([1.0, 0.0])
     b = np.array([-1.0, 0.0])
     assert math.isclose(cosine_similarity(a, b), -1.0, rel_tol=1e-6)
+
+
+def test_cosine_similarity_zero_vector_returns_zero() -> None:
+    """Zero-norm input returns 0.0 without dividing by zero."""
+    zero = np.zeros(3)
+    v = np.array([1.0, 0.0, 0.0])
+    assert cosine_similarity(zero, v) == 0.0
+    assert cosine_similarity(v, zero) == 0.0
+    assert cosine_similarity(zero, zero) == 0.0
+
+
+def test_cache_roundtrip_vector_values_match(
+    cache: EmbeddingCache, provider: FakeEmbeddingProvider
+) -> None:
+    """Stored blob decodes back to the exact same float32 values across calls."""
+    expected = provider.embed("roundtrip").astype(np.float32)
+    cache.get_or_compute("roundtrip")  # store
+    actual = cache.get_or_compute("roundtrip")  # read from cache
+    np.testing.assert_array_equal(actual, expected)
