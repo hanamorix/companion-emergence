@@ -24,6 +24,19 @@ def test_joy_halves_over_3_days() -> None:
     assert math.isclose(state.emotions["joy"], 4.0, rel_tol=1e-6)
 
 
+def test_partial_decay_matches_exponential_formula() -> None:
+    """Decay at non-half-life boundaries matches the exact exponential formula.
+
+    Guards against a regression to linear (or other) decay: the two exactly-
+    at-half-life tests would pass linear too, so this test pins the curve shape.
+    """
+    state = EmotionalState()
+    state.set("grief", 7.0)
+    apply_decay(state, elapsed_seconds=10 * 24 * 3600)
+    expected = 7.0 * (0.5 ** (10.0 / 60.0))
+    assert math.isclose(state.emotions["grief"], expected, rel_tol=1e-9)
+
+
 def test_anchor_pull_does_not_decay() -> None:
     """Identity-level emotions (half_life=None) are untouched."""
     state = EmotionalState()
@@ -69,8 +82,15 @@ def test_decay_updates_dominant() -> None:
 
 
 def test_decay_ignores_unknown_emotion_in_state() -> None:
-    """If state has an emotion not in vocabulary (stale data), decay skips it gracefully."""
+    """If state has an emotion not in vocabulary (stale data), decay skips it gracefully.
+
+    As a side effect, _recompute_dominant sees the stale emotion as a valid
+    entry and it becomes dominant. That's intentional: the permissive-by-design
+    contract (see EmotionalState.from_dict) means downstream consumers treat
+    unknown names as opaque data, not as errors.
+    """
     state = EmotionalState()
     state.emotions["unknown_emotion"] = 5.0
     apply_decay(state, elapsed_seconds=10 * 24 * 3600)
     assert state.emotions["unknown_emotion"] == 5.0
+    assert state.dominant == "unknown_emotion"
