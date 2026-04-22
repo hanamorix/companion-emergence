@@ -53,7 +53,10 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         seed = int.from_bytes(h[:8], byteorder="big", signed=False)
         rng = np.random.default_rng(seed=seed)
         vec = rng.standard_normal(self._dim)
-        return vec / np.linalg.norm(vec)
+        norm = np.linalg.norm(vec)
+        if norm == 0.0:
+            raise ValueError(f"FakeEmbeddingProvider produced a zero-norm vector (dim={self._dim})")
+        return vec / norm
 
     def embedding_dim(self) -> int:
         return self._dim
