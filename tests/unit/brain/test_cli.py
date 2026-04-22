@@ -24,3 +24,40 @@ def test_no_args_prints_help_and_exits_nonzero(
     assert result == 1
     captured = capsys.readouterr()
     assert "usage:" in captured.out.lower()
+
+
+STUB_COMMANDS = [
+    "supervisor",
+    "dream",
+    "heartbeat",
+    "reflex",
+    "status",
+    "rest",
+    "soul",
+    "memory",
+    "works",
+    "migrate",
+]
+
+
+@pytest.mark.parametrize("name", STUB_COMMANDS)
+def test_stub_subcommand_runs_and_reports_not_implemented(
+    capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    """Every stub subcommand exits 0 and prints 'not implemented yet'."""
+    result = cli.main([name])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "not implemented" in captured.out.lower()
+    assert name in captured.out
+
+
+def test_stub_subcommand_help_works(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each stub subcommand supports --help without crashing."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["supervisor", "--help"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "supervisor" in captured.out.lower()
