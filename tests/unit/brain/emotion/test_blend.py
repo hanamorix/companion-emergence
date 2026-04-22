@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from brain.emotion.blend import BlendDetector
 from brain.emotion.state import EmotionalState
 
@@ -76,14 +78,10 @@ def test_naming_assigns_curated_name() -> None:
 
 
 def test_name_unknown_blend_raises() -> None:
-    """Naming a blend that hasn't been detected raises KeyError."""
+    """Naming a blend that hasn't been detected raises KeyError with a clear message."""
     detector = BlendDetector()
-    try:
+    with pytest.raises(KeyError, match="has not been detected"):
         detector.name_blend(("love", "grief"), "heartbreak")
-    except KeyError as e:
-        assert "not detected" in str(e).lower() or "love" in str(e).lower()
-    else:
-        raise AssertionError("Expected KeyError")
 
 
 def test_three_component_blend() -> None:

@@ -46,8 +46,11 @@ class BlendDetector:
 
     intensity_threshold: float = 5.0
     detection_threshold: int = 5
-    _observations: dict[tuple[str, ...], int] = field(default_factory=dict)
-    _names: dict[tuple[str, ...], str] = field(default_factory=dict)
+    # Private state populated by observe() / name_blend() / from_dict().
+    # init=False keeps the public constructor surface minimal — callers
+    # shouldn't be able to inject arbitrary counts via kwargs.
+    _observations: dict[tuple[str, ...], int] = field(default_factory=dict, init=False)
+    _names: dict[tuple[str, ...], str | None] = field(default_factory=dict, init=False)
 
     def observe(self, state: EmotionalState) -> None:
         """Record the high-intensity emotion combinations from the given state."""
@@ -61,8 +64,12 @@ class BlendDetector:
         if len(high) < 2:
             return
 
-        # Track every pair and every triple. We bound subset size at 3 so the
-        # combinatorics stay manageable even for rich states.
+        # Track every pair and every triple. Cap subset size at 3 — with
+        # typically ≤6 high-intensity emotions at once, C(6,3)=20 but
+        # C(6,4)=15, so 4-way tracking is affordable, but 3-way is where
+        # the meaningful emergent patterns ("building_love", "creative_feral")
+        # actually live. Higher orders are diluted. Bump if that assumption
+        # breaks as real data accrues.
         for size in (2, 3):
             if size > len(high):
                 break
@@ -112,10 +119,17 @@ class BlendDetector:
             intensity_threshold=float(data.get("intensity_threshold", 5.0)),
             detection_threshold=int(data.get("detection_threshold", 5)),
         )
+        # Sort component lists into canonical tuple order on the way in —
+        # observe() and name_blend() both operate on sorted keys, so any
+        # caller-supplied JSON with unsorted components would otherwise
+        # land at a non-matching key and cause spurious KeyErrors later.
         for entry in data.get("observations", []):
-            key = tuple(entry["components"])
+            key = tuple(sorted(entry["components"]))
             detector._observations[key] = int(entry["count"])
         for entry in data.get("names", []):
-            key = tuple(entry["components"])
-            detector._names[key] = entry["name"]
+            name = entry.get("name")
+            if name is None:
+                continue
+            key = tuple(sorted(entry["components"]))
+            detector._names[key] = name
         return detector
