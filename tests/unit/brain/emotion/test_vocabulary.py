@@ -29,7 +29,7 @@ def test_emotion_half_life_may_be_none() -> None:
     e = Emotion(
         name="anchor_pull",
         description="gravitational draw toward a specific person",
-        category="persona",
+        category="nell_specific",
         decay_half_life_days=None,
         intensity_clamp=10,
     )
