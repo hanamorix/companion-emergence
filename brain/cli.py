@@ -51,10 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
         prog="nell",
-        description=(
-            "companion-emergence — CLI for building emotionally aware "
-            "AI companions"
-        ),
+        description=("companion-emergence — CLI for building emotionally aware AI companions"),
     )
     parser.add_argument(
         "--version",

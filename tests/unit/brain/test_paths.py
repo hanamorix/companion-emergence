@@ -32,9 +32,7 @@ def test_get_home_falls_back_to_platformdirs(clean_env: None) -> None:
     assert result.is_absolute()
 
 
-def test_get_persona_dir_nests_under_home(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_get_persona_dir_nests_under_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """get_persona_dir('nell') returns <home>/personas/nell."""
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
     result = paths.get_persona_dir("nell")

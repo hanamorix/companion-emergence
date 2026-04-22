@@ -109,9 +109,7 @@ def _read_env_vars() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in _SUPPORTED_KEYS}
 
 
-def load_config(
-    persona_dir: Path, env_file: Path | None = None
-) -> Config:
+def load_config(persona_dir: Path, env_file: Path | None = None) -> Config:
     """Load and merge config from persona.toml + .env + env vars.
 
     Args:

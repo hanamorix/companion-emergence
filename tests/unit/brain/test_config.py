@@ -15,9 +15,7 @@ def _write_persona(persona_dir: Path, toml_body: str) -> None:
     (persona_dir / "persona.toml").write_text(toml_body)
 
 
-def test_persona_toml_provides_baseline(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_persona_toml_provides_baseline(tmp_path: Path, clean_env: None) -> None:
     """Values from persona.toml become the baseline config."""
     persona_dir = tmp_path / "nell"
     _write_persona(
@@ -41,9 +39,7 @@ tag = "my-model"
     assert result.source_trace["MODEL"] == "persona.toml"
 
 
-def test_env_var_overrides_persona_toml(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_env_var_overrides_persona_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Environment variables override persona.toml values."""
     persona_dir = tmp_path / "nell"
     _write_persona(
@@ -61,9 +57,7 @@ bind = "127.0.0.1:9000"
     assert result.source_trace["BRIDGE_BIND"] == "env"
 
 
-def test_env_file_overrides_persona_toml(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_env_file_overrides_persona_toml(tmp_path: Path, clean_env: None) -> None:
     """A .env file overrides persona.toml when no env var is set."""
     persona_dir = tmp_path / "nell"
     _write_persona(
@@ -79,9 +73,7 @@ def test_env_file_overrides_persona_toml(
     assert result.source_trace["PROVIDER"] == ".env"
 
 
-def test_env_var_beats_env_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_env_var_beats_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Env var takes precedence over .env file."""
     persona_dir = tmp_path / "nell"
     _write_persona(persona_dir, '[model]\nprovider = "from-toml"\n')
@@ -96,9 +88,7 @@ def test_env_var_beats_env_file(
     assert result.source_trace["PROVIDER"] == "env"
 
 
-def test_sensible_defaults_when_nothing_configured(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_sensible_defaults_when_nothing_configured(tmp_path: Path, clean_env: None) -> None:
     """When no config present, defaults apply AND are recorded in source_trace."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
@@ -114,9 +104,7 @@ def test_sensible_defaults_when_nothing_configured(
     assert result.source_trace["MODEL"] == "default"
 
 
-def test_ipc_jid_reads_from_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ipc_jid_reads_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """NELL_IPC_JID env var populates Config.ipc_jid."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
@@ -127,9 +115,7 @@ def test_ipc_jid_reads_from_env(
     assert result.source_trace["NELL_IPC_JID"] == "env"
 
 
-def test_ipc_jid_defaults_empty(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_ipc_jid_defaults_empty(tmp_path: Path, clean_env: None) -> None:
     """Unset NELL_IPC_JID leaves ipc_jid empty, not absent, with default source."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
@@ -139,17 +125,14 @@ def test_ipc_jid_defaults_empty(
     assert result.source_trace["NELL_IPC_JID"] == "default"
 
 
-def test_env_file_strips_inline_comments(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_env_file_strips_inline_comments(tmp_path: Path, clean_env: None) -> None:
     """`KEY=value # note` parses as value, not value-with-comment."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
 
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "PROVIDER=ollama  # local running on this box\n"
-        'MODEL="nell-stage13" # the good one\n'
+        'PROVIDER=ollama  # local running on this box\nMODEL="nell-stage13" # the good one\n'
     )
 
     result = config.load_config(persona_dir, env_file=env_file)
@@ -157,20 +140,14 @@ def test_env_file_strips_inline_comments(
     assert result.model == "nell-stage13"
 
 
-def test_env_file_ignores_comments_and_blank_lines(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_env_file_ignores_comments_and_blank_lines(tmp_path: Path, clean_env: None) -> None:
     """.env parser skips # comments and blank lines."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
 
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "# this is a comment\n"
-        "\n"
-        "PROVIDER=openai\n"
-        "# another comment\n"
-        'MODEL="claude-sonnet-4"\n'
+        '# this is a comment\n\nPROVIDER=openai\n# another comment\nMODEL="claude-sonnet-4"\n'
     )
 
     result = config.load_config(persona_dir, env_file=env_file)
@@ -178,9 +155,7 @@ def test_env_file_ignores_comments_and_blank_lines(
     assert result.model == "claude-sonnet-4"
 
 
-def test_persona_name_derived_from_dir(
-    tmp_path: Path, clean_env: None
-) -> None:
+def test_persona_name_derived_from_dir(tmp_path: Path, clean_env: None) -> None:
     """persona_name on the Config matches the persona_dir basename."""
     persona_dir = tmp_path / "sage"
     persona_dir.mkdir()
