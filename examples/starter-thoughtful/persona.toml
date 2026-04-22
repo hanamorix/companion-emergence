@@ -5,7 +5,18 @@
 name = "starter-thoughtful"
 pronouns = "they/them"
 type = "starter"
+# Leave empty; the framework populates this at first run.
+# JSON siblings (personality.json, self_model.json) use `null` for the same
+# "not yet set" semantics — TOML has no native null so we use empty string.
 created = ""
+
+# FORKER (optional): succession field documents who inherits authorship if
+# the primary author is unable to continue. Leave the block commented out
+# to defer the decision. See spec Section 15.5 for the rationale.
+# [succession]
+# primary_author = ""
+# successor = ""
+# successor_inherit_at = ""  # ISO 8601 timestamp or "on-primary-unavailable"
 
 [model]
 # FORKER: set this to your Ollama model tag, or switch provider entirely.
@@ -31,5 +42,9 @@ bind = "127.0.0.1:8765"
 token_file = "data/bridge.token"
 
 [developmental]
-# Forced phase override. Leave empty to let the framework compute from data depth.
+# FORKER: Leave empty. The framework computes phase from data depth over time
+# (nascent: <30 days → forming: 30-180 days → mature: 180+ days).
+# Set to "nascent"/"forming"/"mature" to force an override; the framework
+# will warn prominently and record the override permanently.
+# Reference: spec Section 15.8.
 phase_override = ""
