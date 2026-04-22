@@ -46,9 +46,16 @@ class HebbianMatrix:
         self._conn.close()
 
     def strengthen(self, a: str, b: str, delta: float = 0.1) -> None:
-        """Add `delta` to the weight of edge (a, b). Creates the edge if new."""
+        """Add `delta` to the weight of edge (a, b). Creates the edge if new.
+
+        `delta` must be positive — the module contract is that weights are
+        non-negative. Callers that want to weaken an edge use `decay_all`
+        or `garbage_collect`. Negative delta raises ValueError.
+        """
         if a == b:
             return  # self-edges not tracked
+        if delta <= 0.0:
+            raise ValueError(f"delta must be positive, got {delta!r}")
         lo, hi = _canonical(a, b)
         self._conn.execute(
             """
@@ -86,7 +93,14 @@ class HebbianMatrix:
         return [(other, float(weight)) for other, weight in rows]
 
     def decay_all(self, rate: float) -> None:
-        """Subtract `rate` from every weight, floored at 0."""
+        """Subtract `rate` from every weight, floored at 0.
+
+        `rate` must be non-negative. A negative rate would inflate every
+        weight in a single scheduled batch — silent corruption for
+        dream/heartbeat cycles. ValueError guards the sign.
+        """
+        if rate < 0.0:
+            raise ValueError(f"decay rate must be non-negative, got {rate!r}")
         self._conn.execute("UPDATE hebbian_edges SET weight = MAX(weight - ?, 0.0)", (rate,))
         self._conn.commit()
 
@@ -104,9 +118,11 @@ class HebbianMatrix:
     ) -> dict[str, float]:
         """BFS spreading activation from seed_ids, returning activation by id.
 
-        Seed nodes have activation 1.0. Each hop multiplies the source
-        activation by (edge_weight * decay_per_hop) to produce the
-        neighbour's activation. Multi-path arrivals take the max.
+        Seed nodes have activation 1.0 and are protected: propagation
+        cannot lower them. Each hop multiplies the source activation by
+        (edge_weight * decay_per_hop) to produce the neighbour's
+        activation. Multi-path arrivals take the max (not sum) — prevents
+        activation runaway on densely connected graphs.
 
         Returns a dict {memory_id: activation}.
         """
