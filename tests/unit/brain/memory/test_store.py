@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 
-from brain.memory.store import Memory
+import pytest
+
+from brain.memory.store import Memory, MemoryStore
 
 
 def test_memory_create_new_generates_uuid() -> None:
@@ -148,3 +151,197 @@ def test_memory_dataclass_preserves_explicit_id_for_migration() -> None:
         created_at=datetime.now(UTC),
     )
     assert m.id == "abc-123"
+
+
+@pytest.fixture
+def store() -> MemoryStore:
+    """In-memory MemoryStore, fresh per test."""
+    return MemoryStore(db_path=":memory:")
+
+
+def _mem(content: str = "x", **kw: object) -> Memory:
+    defaults = {"memory_type": "conversation", "domain": "us"}
+    defaults.update(kw)
+    return Memory.create_new(content=content, **defaults)  # type: ignore[arg-type]
+
+
+def test_store_init_creates_schema(store: MemoryStore) -> None:
+    """Fresh store has a memories table."""
+    cursor = store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+    )
+    assert cursor.fetchone() is not None
+
+
+def test_store_create_and_get_round_trips(store: MemoryStore) -> None:
+    """create() then get() returns the same Memory."""
+    original = _mem("first meeting", emotions={"love": 9.0})
+    store.create(original)
+
+    restored = store.get(original.id)
+    assert restored is not None
+    assert restored.id == original.id
+    assert restored.content == original.content
+    assert restored.emotions == original.emotions
+    assert restored.score == original.score
+
+
+def test_store_get_unknown_returns_none(store: MemoryStore) -> None:
+    """get() on a nonexistent id returns None."""
+    assert store.get("nonexistent-id") is None
+
+
+def test_store_create_returns_the_memory_id(store: MemoryStore) -> None:
+    """create() returns the id it stored."""
+    m = _mem("x")
+    returned = store.create(m)
+    assert returned == m.id
+
+
+def test_store_create_duplicate_id_raises(store: MemoryStore) -> None:
+    """Creating two memories with the same id raises."""
+    m = _mem("x")
+    store.create(m)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.create(m)
+
+
+def test_store_list_by_domain(store: MemoryStore) -> None:
+    """list_by_domain filters correctly."""
+    store.create(_mem("a", domain="us"))
+    store.create(_mem("b", domain="us"))
+    store.create(_mem("c", domain="work"))
+
+    us = store.list_by_domain("us")
+    work = store.list_by_domain("work")
+    assert len(us) == 2
+    assert len(work) == 1
+    assert all(m.domain == "us" for m in us)
+
+
+def test_store_list_by_type(store: MemoryStore) -> None:
+    """list_by_type filters by memory_type."""
+    store.create(_mem("a", memory_type="conversation"))
+    store.create(_mem("b", memory_type="meta"))
+    store.create(_mem("c", memory_type="conversation"))
+
+    convs = store.list_by_type("conversation")
+    assert len(convs) == 2
+    assert all(m.memory_type == "conversation" for m in convs)
+
+
+def test_store_list_by_emotion_filters_by_intensity(store: MemoryStore) -> None:
+    """list_by_emotion returns memories where that emotion >= min_intensity."""
+    store.create(_mem("a", emotions={"love": 9.0}))
+    store.create(_mem("b", emotions={"love": 3.0}))
+    store.create(_mem("c", emotions={"grief": 8.0}))
+
+    strong_love = store.list_by_emotion("love", min_intensity=5.0)
+    assert len(strong_love) == 1
+    assert strong_love[0].content == "a"
+
+
+def test_store_list_excludes_inactive_by_default(store: MemoryStore) -> None:
+    """list_by_domain excludes deactivated memories by default."""
+    m1 = _mem("active", domain="us")
+    m2 = _mem("inactive", domain="us")
+    store.create(m1)
+    store.create(m2)
+    store.deactivate(m2.id)
+
+    active = store.list_by_domain("us")
+    assert len(active) == 1
+    assert active[0].content == "active"
+
+
+def test_store_list_includes_inactive_when_requested(store: MemoryStore) -> None:
+    """Passing active_only=False includes deactivated memories."""
+    m1 = _mem("active", domain="us")
+    m2 = _mem("inactive", domain="us")
+    store.create(m1)
+    store.create(m2)
+    store.deactivate(m2.id)
+
+    all_ = store.list_by_domain("us", active_only=False)
+    assert len(all_) == 2
+
+
+def test_store_list_respects_limit(store: MemoryStore) -> None:
+    """limit caps the result count."""
+    for i in range(5):
+        store.create(_mem(f"m{i}", domain="us"))
+    assert len(store.list_by_domain("us", limit=3)) == 3
+
+
+def test_store_update_mutates_specified_fields(store: MemoryStore) -> None:
+    """update() mutates only the given fields."""
+    m = _mem("original")
+    store.create(m)
+    store.update(m.id, content="modified", importance=9.0)
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.content == "modified"
+    assert restored.importance == 9.0
+    assert restored.domain == m.domain  # unchanged
+
+
+def test_store_update_unknown_raises(store: MemoryStore) -> None:
+    """update() on a nonexistent id raises KeyError."""
+    with pytest.raises(KeyError):
+        store.update("nonexistent", content="x")
+
+
+def test_store_deactivate_flips_active_flag(store: MemoryStore) -> None:
+    """deactivate() sets active=False without deleting the row."""
+    m = _mem("x")
+    store.create(m)
+    store.deactivate(m.id)
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.active is False
+
+
+def test_store_deactivate_unknown_raises(store: MemoryStore) -> None:
+    """deactivate() on a nonexistent id raises KeyError."""
+    with pytest.raises(KeyError):
+        store.deactivate("nonexistent")
+
+
+def test_store_count_active_only_default(store: MemoryStore) -> None:
+    """count() excludes inactive by default."""
+    m1 = _mem("a")
+    m2 = _mem("b")
+    store.create(m1)
+    store.create(m2)
+    store.deactivate(m2.id)
+    assert store.count() == 1
+
+
+def test_store_count_including_inactive(store: MemoryStore) -> None:
+    """count(active_only=False) includes inactive memories."""
+    m1 = _mem("a")
+    m2 = _mem("b")
+    store.create(m1)
+    store.create(m2)
+    store.deactivate(m2.id)
+    assert store.count(active_only=False) == 2
+
+
+def test_store_search_text_returns_substring_matches(store: MemoryStore) -> None:
+    """search_text finds memories whose content contains the query."""
+    store.create(_mem("cold coffee, warm hana"))
+    store.create(_mem("the evening has a shape to it now"))
+    store.create(_mem("creative hunger strikes"))
+
+    results = store.search_text("evening")
+    assert len(results) == 1
+    assert "evening" in results[0].content
+
+
+def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
+    """Substring matching ignores case."""
+    store.create(_mem("The Moment"))
+    results = store.search_text("moment")
+    assert len(results) == 1
