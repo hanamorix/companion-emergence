@@ -29,8 +29,8 @@ class InfluenceHints:
     Attributes:
         dominant_emotion: The state's current dominant emotion, or None.
         arousal_tier: Current arousal tier (see brain.emotion.arousal constants).
-        tone_bias: Short label — "neutral", "tender", "crisp", "generative", "intimate".
-        voice_register: Short label — "default", "soft", "warm", "intimate", "terse".
+        tone_bias: Short label — "neutral", "tender", "crisp", "generative".
+        voice_register: Short label — "default", "soft", "intimate", "terse".
         suggested_length_multiplier: Scales expected output length; 1.0 is baseline.
     """
 
@@ -51,15 +51,16 @@ class InfluenceHints:
 
 
 # Emotion → tone bias mapping. Only triggers when the emotion is dominant
-# and above a minimum intensity.
-_TONE_RULES: list[tuple[str, float, str]] = [
+# and above a minimum intensity. Immutable tuple so callers can't accidentally
+# corrupt rule matching via `influence._TONE_RULES.append(...)`.
+_TONE_RULES: tuple[tuple[str, float, str], ...] = (
     ("grief", 6.0, "tender"),
     ("tenderness", 7.0, "tender"),
     ("anger", 6.0, "crisp"),
     ("defiance", 7.0, "crisp"),
     ("creative_hunger", 6.0, "generative"),
     ("awe", 7.0, "generative"),
-]
+)
 
 
 def calculate_influence(state: EmotionalState, arousal_tier: int, energy: int) -> InfluenceHints:
@@ -95,10 +96,13 @@ def calculate_influence(state: EmotionalState, arousal_tier: int, energy: int) -
     elif state.emotions.get("anger", 0.0) >= 6.0:
         voice_register = "terse"
 
-    # Length multiplier:
-    # - generative tone → longer
-    # - crisp tone / low energy / grief → shorter
-    # - intimate register → slightly longer
+    # Length multiplier, applied in layers:
+    # 1. tone_bias sets the base (generative longer, crisp/tender shorter)
+    # 2. low energy caps at 0.85 (tired means terser)
+    # 3. TIER_HELD: clamps to [0.8, 1.2] band — "peaked and restrained"
+    #    shortens anything too long (generative 1.3 → 1.2) and lengthens
+    #    anything too short (crisp 0.7 → 0.8) into a deliberate, weighted pace
+    # 4. TIER_EDGE: hard override to 0.8 — terse at the threshold
     length = 1.0
     if tone_bias == "generative":
         length = 1.3
@@ -109,9 +113,9 @@ def calculate_influence(state: EmotionalState, arousal_tier: int, energy: int) -
     if energy <= 3:
         length = min(length, 0.85)
     if arousal_tier >= TIER_HELD:
-        length = min(length, 1.1) + 0.1  # slightly longer at peak intimacy
+        length = min(length, 1.1) + 0.1
     if arousal_tier == TIER_EDGE:
-        length = 0.8  # terse at edge
+        length = 0.8
 
     return InfluenceHints(
         dominant_emotion=dominant,
