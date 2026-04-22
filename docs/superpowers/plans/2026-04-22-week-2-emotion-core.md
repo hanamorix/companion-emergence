@@ -263,7 +263,7 @@ cd /Users/hanamori/companion-emergence
 uv run pytest tests/unit/brain/emotion/test_vocabulary.py -v
 ```
 
-Expected: all 12 tests fail with `ModuleNotFoundError: No module named 'brain.emotion.vocabulary'` (or similar import error from __init__.py).
+Expected: all 13 tests fail with `ModuleNotFoundError: No module named 'brain.emotion.vocabulary'` (or similar import error from __init__.py).
 
 - [ ] **Step 5: Write `brain/emotion/vocabulary.py`**
 
@@ -389,7 +389,7 @@ cd /Users/hanamori/companion-emergence
 uv run pytest tests/unit/brain/emotion/test_vocabulary.py -v
 ```
 
-Expected: 12 passed.
+Expected: 13 passed.
 
 - [ ] **Step 7: Run full test suite to confirm no regression**
 
@@ -398,7 +398,7 @@ cd /Users/hanamori/companion-emergence
 uv run pytest -v
 ```
 
-Expected: 50 passed (38 from Week 1 + 12 new).
+Expected: 51 passed (38 from Week 1 + 13 new).
 
 - [ ] **Step 8: Run ruff**
 
@@ -422,7 +422,7 @@ with typed Emotion dataclass (name, description, category, half-life, clamp).
 Half-lives per spec Section 10.1: grief=60d, joy=3d, anchor_pull/love/belonging/
 body_grief/freedom_ache=None (identity-level); others seeded for later tuning.
 
-register()/_unregister() support per-persona extensions. 12 tests green.
+register()/_unregister() support per-persona extensions. 13 tests green.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -762,7 +762,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 61 passed (50 + 11). Ruff clean.
+Expected: 62 passed (51 + 11). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -965,7 +965,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 69 passed (61 + 8). Ruff clean.
+Expected: 70 passed (62 + 8). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -1208,7 +1208,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 78 passed (69 + 9). Ruff clean.
+Expected: 79 passed (70 + 9). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -1511,7 +1511,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 87 passed (78 + 9). Ruff clean.
+Expected: 88 passed (79 + 9). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -1794,7 +1794,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 96 passed (87 + 9). Ruff clean.
+Expected: 97 passed (88 + 9). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -2143,7 +2143,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Expected: 107 passed (96 + 11). Ruff clean.
+Expected: 108 passed (97 + 11). Ruff clean.
 
 - [ ] **Step 6: Commit**
 
@@ -2187,7 +2187,7 @@ cd /Users/hanamori/companion-emergence
 uv run pytest -v
 ```
 
-Expected: 107 tests pass (38 Week 1 + 12 vocab + 11 state + 8 decay + 9 arousal + 9 blend + 9 influence + 11 expression = 107).
+Expected: 108 tests pass (38 Week 1 + 13 vocab + 11 state + 8 decay + 9 arousal + 9 blend + 9 influence + 11 expression = 108).
 
 - [ ] **Step 3: Lint clean**
 
@@ -2262,10 +2262,10 @@ gh pr create --title "feat: Week 2 — brain/emotion package (7 modules)" --body
 - Ships the full `brain/emotion/` package per spec Section 5 (the emotional core — P1 organising principle)
 - 7 sub-modules: vocabulary, state, decay, arousal, blend, influence, expression
 - 26-baseline emotion taxonomy + persona extension registry
-- 69 new tests; total suite now 107 across macOS + Windows + Linux
+- 70 new tests; total suite now 108 across macOS + Windows + Linux
 
 ## Test plan
-- [x] pytest — 107 tests pass locally
+- [x] pytest — 108 tests pass locally
 - [x] ruff check + format — clean
 - [x] Manual smoke: all 7 sub-modules compose correctly in a single flow
 - [ ] CI matrix green across all 3 OSes (verifies after push)
@@ -2306,7 +2306,7 @@ git tag -a week-2-complete -m "Week 2 emotional core complete
 - influence: state → structured biasing hints (for provider abstraction Week 5)
 - expression: state → 24 facial + 8 arm/hand params (for NellFace Week 6)
 
-Total tests: 107 passing across macOS + Windows + Linux.
+Total tests: 108 passing across macOS + Windows + Linux.
 Week 3 opens with the memory substrate (SQLite-backed memories +
 Hebbian connections + embeddings) plus migrator beginnings."
 
@@ -2322,7 +2322,7 @@ Expected: tag pushed, Week 2 milestone recorded.
 Week 2 is green when ALL of the following are true:
 
 1. `uv sync --all-extras` succeeds on a fresh clone on macOS
-2. `uv run pytest -v` reports 107 passed
+2. `uv run pytest -v` reports 108 passed
 3. `uv run ruff check .` + `uv run ruff format --check .` both clean
 4. The integration smoke one-liner in Task 8 Step 5 runs without error and prints expected-shape output
 5. GitHub Actions CI shows `✓ success` on macos-latest AND windows-latest AND ubuntu-latest for the latest commit on main
