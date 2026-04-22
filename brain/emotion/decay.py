@@ -27,6 +27,9 @@ def apply_decay(state: EmotionalState, elapsed_seconds: float) -> None:
     see EmotionalState.from_dict's permissive contract).
     Emotions decayed below the noise floor are removed.
 
+    Non-positive `elapsed_seconds` (0 or negative) is a silent no-op. Callers
+    that want negative values to raise should validate upstream.
+
     Mutates state in place; recomputes dominant after.
     """
     if elapsed_seconds <= 0:
