@@ -11,9 +11,12 @@ this store.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -132,3 +135,223 @@ class Memory:
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
         )
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    emotions_json TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    importance REAL NOT NULL DEFAULT 0.0,
+    score REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL,
+    last_accessed_at TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    protected INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
+CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
+CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);
+CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+"""
+
+
+class MemoryStore:
+    """SQLite-backed store for Memory records.
+
+    Pass `":memory:"` as db_path for in-memory databases (used in tests).
+    Any filesystem path creates or opens a persistent database.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._conn = sqlite3.connect(str(db_path))
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    def close(self) -> None:
+        """Close the underlying connection. Safe to call multiple times."""
+        self._conn.close()
+
+    def create(self, memory: Memory) -> str:
+        """Insert a memory. Returns the id. Raises on duplicate id."""
+        self._conn.execute(
+            """
+            INSERT INTO memories (
+                id, content, memory_type, domain, emotions_json, tags_json,
+                importance, score, created_at, last_accessed_at, active, protected
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.id,
+                memory.content,
+                memory.memory_type,
+                memory.domain,
+                json.dumps(memory.emotions),
+                json.dumps(memory.tags),
+                memory.importance,
+                memory.score,
+                memory.created_at.isoformat(),
+                memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
+                1 if memory.active else 0,
+                1 if memory.protected else 0,
+            ),
+        )
+        self._conn.commit()
+        return memory.id
+
+    def get(self, memory_id: str) -> Memory | None:
+        """Return the Memory with the given id, or None."""
+        row = self._conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        return _row_to_memory(row) if row else None
+
+    def list_by_domain(
+        self, domain: str, active_only: bool = True, limit: int | None = None
+    ) -> list[Memory]:
+        """Return memories in the given domain, ordered by created_at desc."""
+        return self._list_filter("domain", domain, active_only, limit)
+
+    def list_by_type(
+        self, memory_type: str, active_only: bool = True, limit: int | None = None
+    ) -> list[Memory]:
+        """Return memories of the given type, ordered by created_at desc."""
+        return self._list_filter("memory_type", memory_type, active_only, limit)
+
+    def list_by_emotion(
+        self,
+        emotion_name: str,
+        min_intensity: float = 5.0,
+        active_only: bool = True,
+        limit: int | None = None,
+    ) -> list[Memory]:
+        """Return memories where `emotion_name` is present at >= min_intensity."""
+        sql = "SELECT * FROM memories WHERE 1=1"
+        if active_only:
+            sql += " AND active = 1"
+        sql += " ORDER BY created_at DESC"
+        rows = self._conn.execute(sql).fetchall()
+
+        results: list[Memory] = []
+        for row in rows:
+            emotions = json.loads(row["emotions_json"])
+            if emotions.get(emotion_name, 0.0) >= min_intensity:
+                results.append(_row_to_memory(row))
+                if limit is not None and len(results) >= limit:
+                    break
+        return results
+
+    def update(self, memory_id: str, **fields: Any) -> None:
+        """Update the given fields on an existing memory.
+
+        Accepts: content, memory_type, domain, emotions (dict), tags (list),
+        importance, score, last_accessed_at, active, protected.
+
+        Raises KeyError if memory_id does not exist.
+        """
+        if self.get(memory_id) is None:
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
+
+        column_map: dict[str, tuple[str, Any]] = {}
+        for key, value in fields.items():
+            if key == "emotions":
+                column_map["emotions_json"] = ("emotions_json", json.dumps(value))
+            elif key == "tags":
+                column_map["tags_json"] = ("tags_json", json.dumps(value))
+            elif key == "last_accessed_at":
+                column_map[key] = (
+                    key,
+                    value.isoformat() if value else None,
+                )
+            elif key in ("active", "protected"):
+                column_map[key] = (key, 1 if value else 0)
+            elif key in (
+                "content",
+                "memory_type",
+                "domain",
+                "importance",
+                "score",
+            ):
+                column_map[key] = (key, value)
+            else:
+                raise ValueError(f"Unknown update field: {key!r}")
+
+        if not column_map:
+            return
+        set_clause = ", ".join(f"{col} = ?" for col, _ in column_map.values())
+        values = [v for _, v in column_map.values()]
+        values.append(memory_id)
+        self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+        self._conn.commit()
+
+    def deactivate(self, memory_id: str) -> None:
+        """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
+        if self.get(memory_id) is None:
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
+        self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
+        self._conn.commit()
+
+    def count(self, active_only: bool = True) -> int:
+        """Return the total count of memories."""
+        sql = "SELECT COUNT(*) FROM memories"
+        if active_only:
+            sql += " WHERE active = 1"
+        return int(self._conn.execute(sql).fetchone()[0])
+
+    def search_text(
+        self, query: str, active_only: bool = True, limit: int | None = None
+    ) -> list[Memory]:
+        """Case-insensitive substring search on content."""
+        sql = "SELECT * FROM memories WHERE content LIKE ? COLLATE NOCASE"
+        params: list[Any] = [f"%{query}%"]
+        if active_only:
+            sql += " AND active = 1"
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def _list_filter(
+        self, column: str, value: str, active_only: bool, limit: int | None
+    ) -> list[Memory]:
+        sql = f"SELECT * FROM memories WHERE {column} = ?"
+        params: list[Any] = [value]
+        if active_only:
+            sql += " AND active = 1"
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+
+def _row_to_memory(row: sqlite3.Row) -> Memory:
+    """Materialise a sqlite row into a Memory dataclass."""
+    created = datetime.fromisoformat(row["created_at"])
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    last_accessed = None
+    if row["last_accessed_at"]:
+        last_accessed = datetime.fromisoformat(row["last_accessed_at"])
+        if last_accessed.tzinfo is None:
+            last_accessed = last_accessed.replace(tzinfo=UTC)
+    return Memory(
+        id=row["id"],
+        content=row["content"],
+        memory_type=row["memory_type"],
+        domain=row["domain"],
+        created_at=created,
+        emotions=json.loads(row["emotions_json"]),
+        tags=json.loads(row["tags_json"]),
+        importance=float(row["importance"]),
+        score=float(row["score"]),
+        last_accessed_at=last_accessed,
+        active=bool(row["active"]),
+        protected=bool(row["protected"]),
+    )
