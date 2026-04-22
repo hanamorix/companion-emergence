@@ -345,3 +345,40 @@ def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     store.create(_mem("The Moment"))
     results = store.search_text("moment")
     assert len(results) == 1
+
+
+def test_store_search_text_escapes_like_wildcards(store: MemoryStore) -> None:
+    """`%` and `_` in the query match literally, not as LIKE wildcards.
+
+    Without escaping, search_text("%") would wrap to "%%%" and match every
+    row — a footgun the moment Task 5 composes this with user-supplied
+    queries.
+    """
+    store.create(_mem("cold coffee"))
+    store.create(_mem("50% cream"))
+    store.create(_mem("under_score"))
+
+    assert len(store.search_text("%")) == 1  # only the one with literal %
+    assert len(store.search_text("_")) == 1  # only the one with literal _
+    assert store.search_text("%")[0].content == "50% cream"
+    assert store.search_text("_")[0].content == "under_score"
+
+
+def test_store_list_by_emotion_skips_non_numeric_values(store: MemoryStore) -> None:
+    """If a memory's emotions_json has a non-numeric value for the queried
+    emotion (e.g. from a malformed migration), skip it without raising.
+    """
+    m = _mem("corrupt", emotions={"love": 9.0})
+    store.create(m)
+    # Manually corrupt the stored JSON to simulate bad migrator output.
+    import json as _json
+
+    store._conn.execute(
+        "UPDATE memories SET emotions_json = ? WHERE id = ?",
+        (_json.dumps({"love": "high"}), m.id),
+    )
+    store._conn.commit()
+
+    # Must not raise TypeError from the >= comparison.
+    results = store.list_by_emotion("love", min_intensity=5.0)
+    assert results == []
