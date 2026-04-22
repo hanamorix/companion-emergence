@@ -204,9 +204,7 @@ Create `/Users/hanamori/companion-emergence/tests/conftest.py`:
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 
@@ -310,10 +308,11 @@ Expected: `All checks passed!` (or no output with exit code 0).
 
 ```bash
 cd /Users/hanamori/companion-emergence
-git add pyproject.toml brain/ tests/
+git add pyproject.toml uv.lock brain/ tests/
 git commit -m "feat(scaffold): pyproject.toml + brain package skeleton + basic CLI
 
 - pyproject.toml with hatchling build backend, uv-managed deps, nell entry point
+- uv.lock committed for reproducible installs
 - brain/__init__.py exposing __version__
 - brain/cli.py with --version and help-on-no-args
 - tests/conftest.py with clean_env fixture
