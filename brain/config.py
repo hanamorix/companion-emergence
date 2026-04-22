@@ -24,6 +24,16 @@ _SUPPORTED_KEYS: tuple[str, ...] = (
     "NELL_IPC_JID",
 )
 
+# Framework-level defaults, applied as the lowest-priority source so that
+# source_trace explicitly records "default" for unset keys (startup logging
+# can then distinguish "value came from default" from "value missing").
+_DEFAULTS: dict[str, str] = {
+    "BRIDGE_BIND": "127.0.0.1:8765",
+    "PROVIDER": "ollama",
+    "MODEL": "",
+    "NELL_IPC_JID": "",
+}
+
 
 @dataclass
 class Config:
@@ -34,6 +44,8 @@ class Config:
         bridge_bind: Host:port the bridge listens on.
         provider: LLM provider key (ollama, claude, openai, kimi).
         model: Model tag for the active provider.
+        ipc_jid: IPC target for outbox delivery (e.g. WhatsApp JID). Empty
+            disables outbox→IPC integration.
         source_trace: Maps each resolved key to the source that provided it.
     """
 
@@ -41,22 +53,34 @@ class Config:
     bridge_bind: str = "127.0.0.1:8765"
     provider: str = "ollama"
     model: str = ""
+    ipc_jid: str = ""
     source_trace: dict[str, str] = field(default_factory=dict)
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
-    """Parse a simple KEY=VALUE .env file. No shell expansion, no exports."""
+    """Parse a simple KEY=VALUE .env file.
+
+    Supports: comment lines starting with `#`, blank lines, surrounding
+    single/double quotes, inline comments after the value (`KEY=val # note`).
+    Does not support: shell expansion, `export` prefix, multi-line values.
+    Always read as UTF-8 regardless of platform default encoding.
+    """
     result: dict[str, str] = {}
     if not path.exists():
         return result
-    for raw_line in path.read_text().splitlines():
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
-        result[key.strip()] = value.strip().strip('"').strip("'")
+        value = value.strip()
+        # Strip inline comment (anything after a ` #` segment). The leading
+        # space is required so `#` inside a quoted URL or token survives.
+        if " #" in value:
+            value = value[: value.index(" #")].rstrip()
+        result[key.strip()] = value.strip('"').strip("'")
     return result
 
 
@@ -98,6 +122,7 @@ def load_config(
         Resolved Config with source_trace recording where each value came from.
     """
     sources: list[tuple[str, dict[str, str]]] = [
+        ("default", dict(_DEFAULTS)),
         ("persona.toml", _load_persona_toml(persona_dir)),
     ]
     if env_file is not None:
@@ -113,8 +138,9 @@ def load_config(
 
     return Config(
         persona_name=persona_dir.name,
-        bridge_bind=merged.get("BRIDGE_BIND", "127.0.0.1:8765"),
-        provider=merged.get("PROVIDER", "ollama"),
-        model=merged.get("MODEL", ""),
+        bridge_bind=merged["BRIDGE_BIND"],
+        provider=merged["PROVIDER"],
+        model=merged["MODEL"],
+        ipc_jid=merged["NELL_IPC_JID"],
         source_trace=trace,
     )
