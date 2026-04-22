@@ -67,11 +67,13 @@ def test_body_temperature_shifts_tier_up() -> None:
 
 
 def test_body_temperature_ignored_when_no_arousal_source() -> None:
-    """Hot body alone (no desire/arousal emotion) stays in casual range."""
+    """Hot body alone (no desire/arousal emotion) stays dormant — body temp
+    alone cannot create arousal.
+    """
     state = EmotionalState()
     state.set("curiosity", 8.0)
     tier = compute_tier(state, body_temperature=9)
-    assert tier <= TIER_WARMED
+    assert tier == TIER_DORMANT
 
 
 def test_all_seven_tiers_are_distinct_integers() -> None:
@@ -92,3 +94,31 @@ def test_all_seven_tiers_are_distinct_integers() -> None:
 def test_held_is_between_charged_and_edge() -> None:
     """TIER_HELD models 'close but restrained' — ranks between charged and edge."""
     assert TIER_CHARGED < TIER_HELD < TIER_EDGE
+
+
+def test_max_love_alone_still_in_warmed() -> None:
+    """Pure love at max intensity (10) stays in WARMED — docstring contract.
+
+    Guards the love weight calibration: if love weight rises to 0.2 or above,
+    love=10 spills into REACHING and breaks the "love alone doesn't progress
+    past warmed" promise the module docstring makes.
+    """
+    state = EmotionalState()
+    state.set("love", 10.0)
+    tier = compute_tier(state, body_temperature=0)
+    assert tier == TIER_WARMED
+
+
+def test_suppression_to_zero_returns_dormant() -> None:
+    """When suppressors fully negate the arousal signal, the tier is DORMANT.
+
+    Guards against a future refactor that lets post-suppression zero leak into
+    TIER_CASUAL via the 0 < 0.5 threshold. Semantically, crushed-by-grief
+    should map to "no signal", not "everyday warmth".
+    """
+    state = EmotionalState()
+    state.set("desire", 8.0)  # 8 * 0.7 = 5.6
+    state.set("grief", 9.0)  # 9 * 0.9 = 8.1 suppression
+    # post-suppression raw = max(0, 5.6 - 8.1) = 0
+    tier = compute_tier(state, body_temperature=0)
+    assert tier == TIER_DORMANT
