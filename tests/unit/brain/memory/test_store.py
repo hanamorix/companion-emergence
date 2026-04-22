@@ -97,10 +97,27 @@ def test_memory_to_dict_round_trips() -> None:
     assert restored.importance == original.importance
     assert restored.created_at == original.created_at
     assert restored.active == original.active
+    assert restored.last_accessed_at is None  # None survives the round-trip
+
+
+def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
+    """Set last_accessed_at + protected=True and confirm they round-trip."""
+    original = Memory.create_new(
+        content="important memory",
+        memory_type="conversation",
+        domain="us",
+        emotions={"love": 9.0},
+    )
+    original.last_accessed_at = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+    original.protected = True
+
+    restored = Memory.from_dict(original.to_dict())
+    assert restored.last_accessed_at == original.last_accessed_at
+    assert restored.protected is True
 
 
 def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
-    """Naive timestamps in JSON restore as UTC-aware."""
+    """Naive created_at AND last_accessed_at in JSON both restore as UTC-aware."""
     data = {
         "id": "00000000-0000-0000-0000-000000000001",
         "content": "legacy",
@@ -111,12 +128,14 @@ def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
         "importance": 0.0,
         "score": 0.0,
         "created_at": "2024-01-01T12:00:00",  # no tz
-        "last_accessed_at": None,
+        "last_accessed_at": "2024-01-02T08:00:00",  # no tz
         "active": True,
         "protected": False,
     }
     m = Memory.from_dict(data)
     assert m.created_at.tzinfo is not None
+    assert m.last_accessed_at is not None
+    assert m.last_accessed_at.tzinfo is not None
 
 
 def test_memory_dataclass_preserves_explicit_id_for_migration() -> None:

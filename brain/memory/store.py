@@ -31,7 +31,9 @@ class Memory:
         tags: free-form labels.
         importance: 0.0..10.0 (normalised). Auto-defaults to score/10 if
             not explicitly specified at create_new() time.
-        score: sum of emotion intensities — computed once at creation.
+        score: sum of emotion intensities — snapshot at construction.
+            Not updated if `emotions` is mutated in place after creation;
+            consumers that want a live sum should recompute themselves.
         created_at: tz-aware UTC datetime of creation.
         last_accessed_at: tz-aware UTC datetime of most recent read, or None.
         active: F22 deactivation flag. Inactive memories are excluded from
@@ -70,7 +72,7 @@ class Memory:
         """
         emotions = dict(emotions or {})
         tags = list(tags or [])
-        score = sum(emotions.values())
+        score = float(sum(emotions.values()))
         return cls(
             id=str(uuid.uuid4()),
             content=content,
