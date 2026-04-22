@@ -10,6 +10,6 @@ See spec Section 4.1 for the file-tree and Section 10.1 for the SQLite
 data-layer decision (replaces OG's JSON/numpy files).
 """
 
-from brain.memory.store import Memory
+from brain.memory.store import Memory, MemoryStore
 
-__all__ = ["Memory"]
+__all__ = ["Memory", "MemoryStore"]
