@@ -1,4 +1,4 @@
-"""Integration test: the shipped starter personas load cleanly."""
+"""Validation tests: shipped starter persona files exist and parse cleanly."""
 
 from __future__ import annotations
 
@@ -10,7 +10,22 @@ import pytest
 
 from brain import config
 
-_REPO_ROOT = Path(__file__).parent.parent.parent.parent
+
+def _find_repo_root() -> Path:
+    """Walk up from this file until we find pyproject.toml.
+
+    More robust than counting `.parent` calls — survives future
+    reorganisation of the tests/ directory tree (e.g. adding an
+    integration/ subdirectory between unit/ and brain/).
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "pyproject.toml").exists():
+            return parent
+    raise RuntimeError("Could not find repo root (no pyproject.toml found)")
+
+
+_REPO_ROOT = _find_repo_root()
 _STARTER_THOUGHTFUL = _REPO_ROOT / "examples" / "starter-thoughtful"
 
 
@@ -54,3 +69,6 @@ def test_starter_thoughtful_loads_via_brain_config(
     assert result.persona_name == "starter-thoughtful"
     assert result.bridge_bind == "127.0.0.1:8765"
     assert result.provider == "ollama"
+    # Confirm the TOML was actually read (guards against a silent fallback
+    # to defaults if the file fails to parse or the bridge section is empty).
+    assert result.source_trace["BRIDGE_BIND"] == "persona.toml"
