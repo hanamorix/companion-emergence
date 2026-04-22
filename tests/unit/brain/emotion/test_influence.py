@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from brain.emotion.arousal import TIER_CHARGED, TIER_DORMANT, TIER_REACHING
+from brain.emotion.arousal import (
+    TIER_CHARGED,
+    TIER_DORMANT,
+    TIER_EDGE,
+    TIER_HELD,
+    TIER_REACHING,
+)
 from brain.emotion.influence import calculate_influence
 from brain.emotion.state import EmotionalState
 
@@ -81,3 +87,36 @@ def test_hints_to_dict_round_trips() -> None:
     assert data["tone_bias"] == hints.tone_bias
     assert data["voice_register"] == hints.voice_register
     assert data["arousal_tier"] == hints.arousal_tier
+    assert data["suggested_length_multiplier"] == hints.suggested_length_multiplier
+
+
+def test_held_tier_clamps_length_into_deliberate_band() -> None:
+    """TIER_HELD clamps length into [0.8, 1.2] — 'peaked and restrained' pacing.
+
+    Generative (1.3) trims down; crisp (0.7) lengthens up; both land in a
+    weighted, deliberate band rather than at their tone-bias extremes.
+    """
+    generative_hints = calculate_influence(
+        _with(creative_hunger=8.0), arousal_tier=TIER_HELD, energy=7
+    )
+    assert 1.15 <= generative_hints.suggested_length_multiplier <= 1.25
+
+    crisp_hints = calculate_influence(_with(anger=8.0), arousal_tier=TIER_HELD, energy=7)
+    assert 0.75 <= crisp_hints.suggested_length_multiplier <= 0.85
+
+
+def test_edge_tier_hard_overrides_length_to_terse() -> None:
+    """TIER_EDGE hard-overrides length to 0.8 regardless of tone."""
+    generative_hints = calculate_influence(
+        _with(creative_hunger=8.0, arousal=9.0, desire=9.0),
+        arousal_tier=TIER_EDGE,
+        energy=7,
+    )
+    assert generative_hints.suggested_length_multiplier == 0.8
+
+    tender_hints = calculate_influence(
+        _with(grief=8.0, arousal=9.0, desire=9.0),
+        arousal_tier=TIER_EDGE,
+        energy=7,
+    )
+    assert tender_hints.suggested_length_multiplier == 0.8
