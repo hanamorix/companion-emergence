@@ -149,3 +149,60 @@ def test_combined_search_empty_inputs_returns_empty(search: MemorySearch) -> Non
     search.store.create(_mem("x"))
     results = search.combined_search(limit=5)
     assert results == []
+
+
+def test_combined_search_seed_id_surfaces_connected_memories(
+    search: MemorySearch,
+) -> None:
+    """combined_search with only seed_id returns spreading-activation neighbours."""
+    seed = _mem("seed memory")
+    near = _mem("near neighbour")
+    far = _mem("unrelated")
+    for m in (seed, near, far):
+        search.store.create(m)
+    search.hebbian.strengthen(seed.id, near.id, delta=0.8)
+
+    results = search.combined_search(seed_id=seed.id, limit=5)
+    returned_ids = [m.id for m, _ in results]
+    assert near.id in returned_ids
+    assert seed.id not in returned_ids  # seed always excluded
+    assert far.id not in returned_ids  # no edge to far
+
+
+def test_combined_search_seed_id_honours_domain_filter(search: MemorySearch) -> None:
+    """combined_search post-filters spreading results by domain (graph is
+    domain-agnostic, so the filter runs after activation).
+    """
+    seed = _mem("seed", domain="us")
+    us_neighbour = _mem("us neighbour", domain="us")
+    work_neighbour = _mem("work neighbour", domain="work")
+    for m in (seed, us_neighbour, work_neighbour):
+        search.store.create(m)
+    search.hebbian.strengthen(seed.id, us_neighbour.id, delta=0.7)
+    search.hebbian.strengthen(seed.id, work_neighbour.id, delta=0.7)
+
+    results = search.combined_search(seed_id=seed.id, domain="us", limit=5)
+    returned_ids = [m.id for m, _ in results]
+    assert us_neighbour.id in returned_ids
+    assert work_neighbour.id not in returned_ids
+
+
+def test_combined_search_blends_query_and_emotions(search: MemorySearch) -> None:
+    """When both query and emotions are given, scores from both sub-queries
+    accumulate on matching memories — a memory hitting both filters outranks
+    one hitting only one.
+    """
+    # m1 matches both the query content AND the emotion filter
+    m1 = _mem("strong love memory", emotions={"love": 9.0})
+    # m2 matches only the query content
+    m2 = _mem("strong love memory", emotions={"anger": 8.0})
+    # m3 matches only the emotion filter
+    m3 = _mem("unrelated", emotions={"love": 9.0})
+    for m in (m1, m2, m3):
+        search.store.create(m)
+
+    results = search.combined_search(query="strong love memory", emotions={"love": 9.0}, limit=5)
+    assert len(results) >= 1
+    # m1 accumulates both signals → top rank
+    top_id = results[0][0].id
+    assert top_id == m1.id
