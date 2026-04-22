@@ -1,0 +1,18 @@
+# Normalise line endings. Prevents CRLF vs LF edit-war churn between
+# Hana's macOS machine and her Windows test machine.
+* text=auto
+
+# Binary files stay binary.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.gguf binary
+*.bin binary
+*.safetensors binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.npy binary
