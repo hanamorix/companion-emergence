@@ -61,6 +61,23 @@ _ARM_HAND_PARAMS: tuple[str, ...] = (
     "reach_retract",
 )
 
+# Canonical hand-pose enum. compute_expression currently produces 4 of these
+# (resting, reaching, holding, open); the rest are defined for NellFace
+# animation authoring and future consumption (gesturing for explanatory
+# scenes, clasped for restraint, writing for creative states, guarded for
+# defensive states, fist for anger).
+_HAND_POSES: tuple[str, ...] = (
+    "resting",
+    "reaching",
+    "holding",
+    "gesturing",
+    "clasped",
+    "writing",
+    "guarded",
+    "open",
+    "fist",
+)
+
 
 @dataclass
 class ExpressionVector:
@@ -69,7 +86,7 @@ class ExpressionVector:
     Attributes:
         facial: {param_name: value in [0, 1]} for all 24 facial params.
         arm_hand: {param_name: value} for all 8 arm/hand params.
-            hand_pose is a string from a small enum; others are floats [0, 1].
+            hand_pose is a string from _HAND_POSES; others are floats [0, 1].
         arousal_tier: Pass-through of the current arousal tier.
     """
 
@@ -108,6 +125,12 @@ def compute_expression(state: EmotionalState, arousal_tier: int, energy: int) ->
 
     Returns:
         ExpressionVector with facial + arm_hand dicts populated.
+
+    Note on arm/hand coverage: Week 2 drives only the arousal-tier-gated
+    arm params (arm_tension, grip_strength, hand_pose, reach_forward).
+    The remaining four (arm_openness, wrist_angle, finger_spread,
+    reach_retract) stay at baseline 0.3 — NellFace Week 6 handles those
+    via pose-driven animation rather than emotion-driven ramping.
     """
     facial, arm_hand = _baseline()
 
@@ -118,6 +141,9 @@ def compute_expression(state: EmotionalState, arousal_tier: int, energy: int) ->
     facial["cheek_raise"] = _clamp(0.3 + 0.5 * joy)
 
     # Grief: lowers mouth, furrows brow, wets eyes.
+    # Grief's mouth coefficient (0.5) is intentionally heavier than joy's (0.4):
+    # mixed joy+grief states land below neutral, matching the human pattern
+    # where sadness tends to dominate the mouth expression even when smiling.
     grief = state.emotions.get("grief", 0.0) / 10.0
     facial["mouth_curve"] = _clamp(facial["mouth_curve"] - 0.5 * grief)
     facial["brow_furrow"] = _clamp(facial["brow_furrow"] + 0.4 * grief)
@@ -144,6 +170,10 @@ def compute_expression(state: EmotionalState, arousal_tier: int, energy: int) ->
     facial["blush_opacity"] = _clamp(0.2 + 0.3 * tenderness)
 
     # Desire / arousal: deepens blush, dilates pupils, opens lips, tenses body.
+    # arousal decays quickly (half-life ~0.5 days, physiological); desire
+    # decays over days (pull-toward). body_heat = max() so whichever is
+    # currently higher drives the expression — the transient arousal signal
+    # doesn't get washed out by slower-moving desire.
     desire = state.emotions.get("desire", 0.0) / 10.0
     arousal_emotion = state.emotions.get("arousal", 0.0) / 10.0
     body_heat = max(desire, arousal_emotion)

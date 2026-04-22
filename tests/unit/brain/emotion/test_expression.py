@@ -75,14 +75,17 @@ def test_expression_vector_has_8_arm_hand_params() -> None:
 
 
 def test_all_params_in_zero_to_one_range() -> None:
-    """All params stay in [0, 1] even at extreme emotional inputs."""
+    """All float params stay in [0, 1] even at extreme emotional inputs."""
     vec = compute_expression(
         _with(anger=10.0, fear=10.0, grief=10.0), arousal_tier=TIER_DORMANT, energy=2
     )
     for value in vec.facial.values():
         assert 0.0 <= value <= 1.0
-    for value in vec.arm_hand.values():
-        assert isinstance(value, (float, str))
+    for name, value in vec.arm_hand.items():
+        if isinstance(value, str):
+            # hand_pose is an enum string, not a float param
+            continue
+        assert 0.0 <= value <= 1.0, f"arm_hand[{name}] out of range: {value}"
 
 
 def test_to_dict_round_trips() -> None:
