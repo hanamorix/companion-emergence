@@ -128,3 +128,53 @@ def test_spreading_activation_aggregates_multi_path(matrix: HebbianMatrix) -> No
     act = matrix.spreading_activation(["a", "b"], depth=1, decay_per_hop=0.5)
     # x's activation: max(1.0*0.6*0.5, 1.0*0.8*0.5) = max(0.3, 0.4) = 0.4
     assert act["x"] == pytest.approx(0.4)
+
+
+def test_strengthen_self_edge_is_noop(matrix: HebbianMatrix) -> None:
+    """strengthen(x, x) is silently ignored — self-edges aren't tracked."""
+    matrix.strengthen("x", "x", delta=0.5)
+    assert matrix.weight("x", "x") == 0.0
+    assert matrix.neighbors("x") == []
+
+
+def test_strengthen_rejects_non_positive_delta(matrix: HebbianMatrix) -> None:
+    """Weights must stay non-negative by module contract; negative delta raises."""
+    with pytest.raises(ValueError, match="delta must be positive"):
+        matrix.strengthen("a", "b", delta=-0.1)
+    with pytest.raises(ValueError, match="delta must be positive"):
+        matrix.strengthen("a", "b", delta=0.0)
+
+
+def test_decay_all_rejects_negative_rate(matrix: HebbianMatrix) -> None:
+    """Negative rate would inflate every weight — a sign error in a scheduled
+    dream/heartbeat call would silently corrupt the graph. Guard forbids it.
+    """
+    matrix.strengthen("a", "b", delta=0.3)
+    with pytest.raises(ValueError, match="non-negative"):
+        matrix.decay_all(rate=-0.1)
+
+
+def test_decay_all_zero_rate_is_noop(matrix: HebbianMatrix) -> None:
+    """rate=0.0 leaves weights untouched."""
+    matrix.strengthen("a", "b", delta=0.3)
+    matrix.decay_all(rate=0.0)
+    assert matrix.weight("a", "b") == pytest.approx(0.3)
+
+
+def test_spreading_activation_depth_zero_returns_seeds_only(
+    matrix: HebbianMatrix,
+) -> None:
+    """depth=0 skips propagation entirely — only the seeds appear."""
+    matrix.strengthen("a", "b", delta=0.8)
+    act = matrix.spreading_activation(["a"], depth=0, decay_per_hop=0.5)
+    assert act == {"a": 1.0}
+
+
+def test_spreading_activation_zero_decay_blocks_propagation(
+    matrix: HebbianMatrix,
+) -> None:
+    """decay_per_hop=0 → propagated=0 → nothing beats the default 0.0 guard."""
+    matrix.strengthen("a", "b", delta=0.8)
+    act = matrix.spreading_activation(["a"], depth=2, decay_per_hop=0.0)
+    assert "b" not in act
+    assert act["a"] == pytest.approx(1.0)
