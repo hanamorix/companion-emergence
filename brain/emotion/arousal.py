@@ -13,6 +13,8 @@ Week 2 scope: forward direction only (state + body → tier). Reverse coupling
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from brain.emotion.state import EmotionalState
 
 # The 7 tiers, as named constants (module-level ints for fast comparison).
@@ -25,19 +27,26 @@ TIER_HELD: int = 5  # peaked and restrained — deliberate pause
 TIER_EDGE: int = 6  # at the threshold, no restraint
 
 # Emotions that feed into arousal calculation, with their contribution weights.
-_AROUSAL_EMOTIONS: dict[str, float] = {
-    "arousal": 1.0,
-    "desire": 0.7,
-    "tenderness": 0.2,
-    "love": 0.2,
-}
+# MappingProxyType (read-only dict view) prevents accidental runtime mutation
+# from callers. love=0.15 so at max intensity (10) raw=1.5, keeping pure love
+# inside WARMED per the module docstring's semantic contract.
+_AROUSAL_EMOTIONS: MappingProxyType[str, float] = MappingProxyType(
+    {
+        "arousal": 1.0,
+        "desire": 0.7,
+        "tenderness": 0.2,
+        "love": 0.15,
+    }
+)
 
 # Emotions that suppress arousal.
-_SUPPRESSORS: dict[str, float] = {
-    "grief": 0.9,
-    "shame": 0.7,
-    "fear": 0.5,
-}
+_SUPPRESSORS: MappingProxyType[str, float] = MappingProxyType(
+    {
+        "grief": 0.9,
+        "shame": 0.7,
+        "fear": 0.5,
+    }
+)
 
 
 def compute_tier(state: EmotionalState, body_temperature: int) -> int:
@@ -69,6 +78,12 @@ def compute_tier(state: EmotionalState, body_temperature: int) -> int:
         suppression += intensity * weight
     # Cap suppression so strong grief can't push below 0.
     raw = max(0.0, raw - suppression)
+
+    # If suppression fully negated the arousal signal, return DORMANT rather
+    # than leaking into CASUAL via the <0.5 threshold below — "desire
+    # crushed by grief" semantically matches DORMANT, not "everyday warmth".
+    if raw == 0.0:
+        return TIER_DORMANT
 
     # 4. Body temperature shift — each degree above neutral adds 0.3 to raw.
     raw += max(0, body_temperature) * 0.3
