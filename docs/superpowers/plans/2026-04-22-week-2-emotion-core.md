@@ -1127,13 +1127,15 @@ TIER_HELD: int = 5  # peaked and restrained — deliberate pause
 TIER_EDGE: int = 6  # at the threshold, no restraint
 
 # Emotions that feed into arousal calculation, with their contribution weights.
-# Weights calibrated so the test matrix (especially the desire=8 + tenderness=7
-# + body_temp=3 case) lands in the REACHING/CHARGED band rather than HELD.
+# Weights calibrated so the test matrix lands in the right tiers:
+# - desire=8 + tenderness=7 + body_temp=3 → REACHING/CHARGED (not HELD)
+# - love=10 (max intensity) → WARMED (not REACHING) — preserves docstring
+#   semantic "love alone doesn't progress past warmed"
 _AROUSAL_EMOTIONS: dict[str, float] = {
     "arousal": 1.0,
     "desire": 0.7,
     "tenderness": 0.2,
-    "love": 0.2,
+    "love": 0.15,
 }
 
 # Emotions that suppress arousal.
