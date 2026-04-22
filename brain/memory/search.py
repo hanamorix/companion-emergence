@@ -111,6 +111,14 @@ class MemorySearch:
         """Blend sub-queries with equal weight (1.0 each). Returns
         (memory, combined_score) ordered desc.
 
+        Emotion scores are divided by 100 as a rough scale heuristic so
+        they don't dwarf cosine similarity (0..1). Not principled —
+        tuning expected in v1.1.
+
+        Domain filter: applied pre-scoring for query/emotions via
+        _candidates(); applied post-scoring for seed_id since the
+        Hebbian graph is domain-agnostic.
+
         Returns [] if no filters are specified.
         """
         if not any((query, emotions, seed_id)):
@@ -134,6 +142,11 @@ class MemorySearch:
             for mem, act in self.spreading_search(
                 seed_id, depth=2, decay_per_hop=0.5, limit=limit * 2
             ):
+                # spreading_search has no domain parameter — the graph is
+                # domain-agnostic — so post-filter here to honour the
+                # domain contract documented at the module level.
+                if domain is not None and mem.domain != domain:
+                    continue
                 scores[mem.id] = scores.get(mem.id, 0.0) + act
                 ref_memory[mem.id] = mem
 
