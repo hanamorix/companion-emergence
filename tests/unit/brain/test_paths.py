@@ -16,7 +16,7 @@ def test_get_home_returns_a_path(clean_env: None) -> None:
 
 
 def test_get_home_respects_env_override(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """NELLBRAIN_HOME env var fully overrides the platformdirs default."""
     override = tmp_path / "custom_home"
@@ -52,13 +52,15 @@ def test_get_persona_dir_handles_multiple_personas(
     assert nell.parent == sage.parent
 
 
-def test_get_cache_dir_is_path(clean_env: None) -> None:
-    """get_cache_dir() returns a Path."""
+def test_get_cache_dir_is_absolute_path(clean_env: None) -> None:
+    """get_cache_dir() returns an absolute Path."""
     result = paths.get_cache_dir()
     assert isinstance(result, Path)
+    assert result.is_absolute()
 
 
-def test_get_log_dir_is_path(clean_env: None) -> None:
-    """get_log_dir() returns a Path."""
+def test_get_log_dir_is_absolute_path(clean_env: None) -> None:
+    """get_log_dir() returns an absolute Path."""
     result = paths.get_log_dir()
     assert isinstance(result, Path)
+    assert result.is_absolute()
