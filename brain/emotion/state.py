@@ -15,7 +15,7 @@ Design per spec Section 5.2 (state sub-module responsibility).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from brain.emotion.vocabulary import get as _get_emotion
@@ -44,8 +44,12 @@ class ResidueEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ResidueEntry:
+        """Restore from a dict. Tz-naive timestamps are coerced to UTC."""
+        ts = datetime.fromisoformat(data["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
         return cls(
-            timestamp=datetime.fromisoformat(data["timestamp"]),
+            timestamp=ts,
             source=data["source"],
             emotions=dict(data["emotions"]),
         )
@@ -66,6 +70,15 @@ class EmotionalState:
     residue: list[ResidueEntry] = field(default_factory=list)
     dominant: str | None = None
     residue_max: int = 16
+
+    def __post_init__(self) -> None:
+        """Ensure `dominant` is consistent with `emotions` on any construction.
+
+        Direct dataclass construction (e.g. from a snapshot in later modules)
+        can leave `dominant` stale. Recomputing here makes the invariant
+        self-healing regardless of how the state was built.
+        """
+        self._recompute_dominant()
 
     def set(self, name: str, intensity: float) -> None:
         """Set the intensity of an emotion. Zero removes it.
@@ -92,7 +105,11 @@ class EmotionalState:
         self._recompute_dominant()
 
     def add_residue(self, entry: ResidueEntry) -> None:
-        """Append a residue entry, evicting the oldest if at capacity."""
+        """Append a residue entry, evicting the oldest if at capacity.
+
+        No vocabulary validation on entry.emotions — residue is a historical
+        record and may contain retired emotion names from older sessions.
+        """
         self.residue.append(entry)
         if len(self.residue) > self.residue_max:
             # residue_max is small (16 by default); O(N) eviction is negligible.
@@ -100,7 +117,12 @@ class EmotionalState:
             del self.residue[:overflow]
 
     def copy(self) -> EmotionalState:
-        """Return a deep-copy of this state."""
+        """Return a deep-copy of this state.
+
+        MAINTENANCE: if new fields are added to EmotionalState, they must
+        be explicitly copied here. Intentionally manual (not copy.deepcopy)
+        to make the shallow/deep decision visible per field.
+        """
         return EmotionalState(
             emotions=dict(self.emotions),
             residue=[
@@ -116,7 +138,12 @@ class EmotionalState:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise to a plain-dict form suitable for JSON."""
+        """Serialise to a plain-dict form suitable for JSON.
+
+        `dominant` is included for human readability of the serialised form;
+        from_dict ignores it and recomputes from `emotions` so the restored
+        state is self-consistent even if the serialised dominant is stale.
+        """
         return {
             "emotions": dict(self.emotions),
             "dominant": self.dominant,
@@ -126,12 +153,22 @@ class EmotionalState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EmotionalState:
-        """Restore from a dict previously produced by to_dict."""
+        """Restore from a dict previously produced by to_dict.
+
+        Permissive: unknown emotion names in the serialised emotions dict
+        are preserved as-is (they may represent retired vocabulary entries
+        or in-flight schema migrations). Downstream consumers (decay,
+        expression, etc.) are responsible for handling unknown names
+        gracefully. Callers that need strict vocabulary enforcement should
+        construct via set() instead.
+        """
         state = cls(
             emotions=dict(data.get("emotions", {})),
             residue=[ResidueEntry.from_dict(r) for r in data.get("residue", [])],
             residue_max=int(data.get("residue_max", 16)),
         )
+        # __post_init__ already ran _recompute_dominant; calling again here
+        # is a no-op guard for the case where a future subclass overrides it.
         state._recompute_dominant()
         return state
 
