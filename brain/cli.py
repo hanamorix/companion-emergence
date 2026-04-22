@@ -30,7 +30,12 @@ _STUB_COMMANDS: tuple[str, ...] = (
 
 
 def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
-    """Factory: build a stub command handler that prints + returns 0."""
+    """Factory: build a stub command handler that prints + returns 0.
+
+    The returned handler accepts `args: argparse.Namespace` as required by
+    the `args.func(args)` dispatch protocol — stubs don't read it, but the
+    signature shape is load-bearing and should not be "cleaned up" to `_args`.
+    """
 
     def _handler(args: argparse.Namespace) -> int:
         print(
