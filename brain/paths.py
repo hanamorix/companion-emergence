@@ -15,6 +15,9 @@ from platformdirs import PlatformDirs
 _APP_NAME = "companion-emergence"
 _APP_AUTHOR = "hanamorix"
 
+# PlatformDirs properties are evaluated lazily (env vars read at
+# property-access time, not at construction), so module-level
+# instantiation is safe under monkeypatching in tests.
 _dirs = PlatformDirs(appname=_APP_NAME, appauthor=_APP_AUTHOR)
 
 
@@ -23,12 +26,16 @@ def get_home() -> Path:
 
     Resolution order:
     1. NELLBRAIN_HOME env var if set (supports ~ expansion)
-    2. platformdirs user_data_dir for the current OS
+    2. platformdirs user_data_path for the current OS
+
+    Both branches return a fully resolved canonical path so symlinks
+    collapse consistently (matters on Linux CI runners with symlinked
+    home dirs).
     """
     override = os.environ.get("NELLBRAIN_HOME")
     if override:
         return Path(override).expanduser().resolve()
-    return Path(_dirs.user_data_dir)
+    return _dirs.user_data_path.resolve()
 
 
 def get_persona_dir(name: str) -> Path:
@@ -38,9 +45,9 @@ def get_persona_dir(name: str) -> Path:
 
 def get_cache_dir() -> Path:
     """Return the cache directory (embeddings, computed matrices, etc)."""
-    return Path(_dirs.user_cache_dir)
+    return _dirs.user_cache_path.resolve()
 
 
 def get_log_dir() -> Path:
     """Return the log file directory."""
-    return Path(_dirs.user_log_dir)
+    return _dirs.user_log_path.resolve()
