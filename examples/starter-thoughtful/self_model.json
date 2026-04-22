@@ -1,0 +1,18 @@
+{
+  "generated_at": null,
+  "observation_window_days": 30,
+  "self_description": "",
+  "self_claims": [],
+  "behavioral_summary": {
+    "type_counts": {},
+    "top_emotions": [],
+    "top_topics": []
+  },
+  "soul_themes": [],
+  "creative_tendencies": [],
+  "network_summary": {
+    "formed_last_tick": 0,
+    "strengthened_last_tick": 0
+  },
+  "prior_model": null
+}
