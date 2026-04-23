@@ -112,6 +112,20 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
 
     metadata = {k: v for k, v in og.items() if k not in _FIRST_CLASS_OG_FIELDS}
 
+    # importance: only coerce real numbers. Strings like "high" would crash
+    # float(); lists/dicts too. Protects the never-raises contract.
+    importance_raw = og.get("importance")
+    if isinstance(importance_raw, (int, float)) and not isinstance(importance_raw, bool):
+        importance = float(importance_raw)
+    else:
+        importance = 0.0
+
+    # tags: only accept a real list. list("mytag") would explode a string
+    # into ['m','y','t','a','g']; list({"a":1}) would pull dict keys. Both
+    # are silent corruption, so we degrade-to-empty just like last_accessed.
+    tags_raw = og.get("tags")
+    tags = list(tags_raw) if isinstance(tags_raw, list) else []
+
     mem = Memory(
         id=og_id,
         content=content,
@@ -119,8 +133,8 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
         domain=str(og.get("domain") or "us"),
         created_at=created_at,
         emotions=emotions,
-        tags=list(og.get("tags") or []),
-        importance=float(og.get("importance") or 0.0),
+        tags=tags,
+        importance=importance,
         score=score,
         last_accessed_at=last_accessed_at,
         active=bool(og.get("active", True)),
