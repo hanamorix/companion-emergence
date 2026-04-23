@@ -14,6 +14,7 @@ from collections.abc import Callable
 from brain import __version__
 from brain.bridge.provider import get_provider
 from brain.engines.dream import DreamEngine
+from brain.engines.heartbeat import HeartbeatEngine
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
@@ -23,7 +24,6 @@ from brain.paths import get_persona_dir
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
-    "heartbeat",
     "reflex",
     "status",
     "rest",
@@ -97,6 +97,53 @@ def _dream_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _heartbeat_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell heartbeat` to the HeartbeatEngine."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir} — "
+            f"run `nell migrate --install-as {args.persona}` first."
+        )
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        try:
+            provider = get_provider(args.provider)
+            engine = HeartbeatEngine(
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                state_path=persona_dir / "heartbeat_state.json",
+                config_path=persona_dir / "heartbeat_config.json",
+                dream_log_path=persona_dir / "dreams.log.jsonl",
+                heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            )
+            result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
+        finally:
+            hebbian.close()
+    finally:
+        store.close()
+
+    if result.initialized:
+        print("Heartbeat initialized — work deferred until next tick.")
+    elif args.dry_run:
+        print("Heartbeat dry-run — no writes.")
+        print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
+        print(f"  would decay: {result.memories_decayed} memories")
+        print(f"  would prune: {result.edges_pruned} edges")
+        print(f"  dream: {'would fire' if result.dream_id else result.dream_gated_reason}")
+    else:
+        print(f"Heartbeat tick complete ({args.trigger}).")
+        print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
+        print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
+        if result.dream_id:
+            print(f"  dream fired: {result.dream_id}")
+        else:
+            print(f"  dream gated: {result.dream_gated_reason}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -144,6 +191,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=8, help="Max neighbours in prompt (default: 8)."
     )
     dream_sub.set_defaults(func=_dream_handler)
+
+    hb_sub = subparsers.add_parser(
+        "heartbeat",
+        help="Run one heartbeat orchestrator tick against a persona.",
+    )
+    hb_sub.add_argument("--persona", default="nell")
+    hb_sub.add_argument(
+        "--trigger",
+        choices=["open", "close", "manual"],
+        default="manual",
+    )
+    hb_sub.add_argument(
+        "--provider",
+        default="claude-cli",
+        help="LLM provider: claude-cli (default), fake, ollama.",
+    )
+    hb_sub.add_argument("--dry-run", action="store_true")
+    hb_sub.set_defaults(func=_heartbeat_handler)
 
     return parser
 
