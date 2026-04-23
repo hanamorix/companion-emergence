@@ -31,6 +31,20 @@ def _coerce_utc(ts: str) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
+def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
+    """Decode a metadata_json column value into a dict, defending against
+    manual DB edits or legacy writers that stored the string "null",
+    malformed JSON, or non-dict top-level values.
+    """
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 @dataclass
 class Memory:
     """A single memory — content, context, emotional weight, and metadata.
@@ -53,6 +67,10 @@ class Memory:
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
         protected: excluded from decay/consolidation.
+        metadata: free-form dict for fields not modelled as first-class
+            attributes — absorbs OG-only fields (source_date, supersedes,
+            etc.) during migration without proliferating the dataclass.
+            Forward-compatible: future engines read metadata[key] as needed.
     """
 
     id: str
@@ -67,6 +85,7 @@ class Memory:
     last_accessed_at: datetime | None = None
     active: bool = True
     protected: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create_new(
@@ -77,6 +96,7 @@ class Memory:
         emotions: dict[str, float] | None = None,
         tags: list[str] | None = None,
         importance: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Memory:
         """Factory: new memory with generated UUID, current UTC time,
         and auto-computed score + importance (if importance is None).
@@ -87,6 +107,7 @@ class Memory:
         emotions = dict(emotions or {})
         tags = list(tags or [])
         score = float(sum(emotions.values()))
+        metadata = dict(metadata or {})
         return cls(
             id=str(uuid.uuid4()),
             content=content,
@@ -97,6 +118,7 @@ class Memory:
             tags=tags,
             importance=importance if importance is not None else score / 10.0,
             score=score,
+            metadata=metadata,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,6 +138,7 @@ class Memory:
             else None,
             "active": self.active,
             "protected": self.protected,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -141,6 +164,7 @@ class Memory:
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
+            metadata=dict(data.get("metadata") or {}),
         )
 
 
@@ -157,7 +181,8 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at TEXT NOT NULL,
     last_accessed_at TEXT,
     active INTEGER NOT NULL DEFAULT 1,
-    protected INTEGER NOT NULL DEFAULT 0
+    protected INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
@@ -186,12 +211,19 @@ class MemoryStore:
 
     def create(self, memory: Memory) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id."""
+        try:
+            metadata_json = json.dumps(memory.metadata)
+        except TypeError as exc:
+            raise TypeError(
+                f"Memory.metadata for id={memory.id!r} contains non-JSON-serialisable values: {exc}"
+            ) from exc
         self._conn.execute(
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
-                importance, score, created_at, last_accessed_at, active, protected
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                importance, score, created_at, last_accessed_at, active, protected,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -206,6 +238,7 @@ class MemoryStore:
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
                 1 if memory.protected else 0,
+                metadata_json,
             ),
         )
         self._conn.commit()
@@ -269,6 +302,8 @@ class MemoryStore:
                 column_map["emotions_json"] = ("emotions_json", json.dumps(value))
             elif key == "tags":
                 column_map["tags_json"] = ("tags_json", json.dumps(value))
+            elif key == "metadata":
+                column_map["metadata_json"] = ("metadata_json", json.dumps(value))
             elif key == "last_accessed_at":
                 column_map[key] = (
                     key,
@@ -362,4 +397,5 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
         protected=bool(row["protected"]),
+        metadata=_safe_load_metadata(row["metadata_json"]),
     )
