@@ -27,10 +27,17 @@ _FIRST_CLASS_OG_FIELDS = frozenset(
 
 @dataclass(frozen=True)
 class SkippedMemory:
-    """Record of a skipped-during-migration OG memory."""
+    """Record of a skipped-during-migration OG memory.
+
+    Reason codes set by transform_memory:
+        missing_id, missing_content, non_numeric_emotion, unparseable_created_at.
+
+    Reason codes set externally by run_migrate (brain.migrator.cli):
+        duplicate_id.
+    """
 
     id: str
-    reason: str  # short code: missing_content, non_numeric_emotion, ...
+    reason: str
     field: str  # the specific field that failed, or "" if whole-record
     raw_snippet: str  # truncated human-readable excerpt of the original
 

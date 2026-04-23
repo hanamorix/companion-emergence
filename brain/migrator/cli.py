@@ -61,40 +61,45 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     started = time.monotonic()
 
     # ---- memories ----
+    # try/finally around store.close() so a mid-loop exception on disk-backed
+    # DBs doesn't leak a .db-wal file for the next run to recover from.
     og_memories = reader.read_memories()
     store = MemoryStore(db_path=work_dir / "memories.db")
     migrated_count = 0
     skipped: list[SkippedMemory] = []
     seen_ids: set[str] = set()
-
-    for og_mem in og_memories:
-        mem, sk = transform_memory(og_mem)
-        if sk is not None:
-            skipped.append(sk)
-            continue
-        assert mem is not None
-        if mem.id in seen_ids:
-            skipped.append(
-                SkippedMemory(
-                    id=mem.id,
-                    reason="duplicate_id",
-                    field="id",
-                    raw_snippet=mem.content[:120],
+    try:
+        for og_mem in og_memories:
+            mem, sk = transform_memory(og_mem)
+            if sk is not None:
+                skipped.append(sk)
+                continue
+            assert mem is not None
+            if mem.id in seen_ids:
+                skipped.append(
+                    SkippedMemory(
+                        id=mem.id,
+                        reason="duplicate_id",
+                        field="id",
+                        raw_snippet=mem.content[:120],
+                    )
                 )
-            )
-            continue
-        seen_ids.add(mem.id)
-        store.create(mem)
-        migrated_count += 1
-    store.close()
+                continue
+            seen_ids.add(mem.id)
+            store.create(mem)
+            migrated_count += 1
+    finally:
+        store.close()
 
     # ---- hebbian ----
     hebbian = HebbianMatrix(db_path=work_dir / "hebbian.db")
     edges_migrated = 0
-    for a, b, w in reader.iter_nonzero_upper_edges():
-        hebbian.strengthen(a, b, delta=float(w))
-        edges_migrated += 1
-    hebbian.close()
+    try:
+        for a, b, w in reader.iter_nonzero_upper_edges():
+            hebbian.strengthen(a, b, delta=float(w))
+            edges_migrated += 1
+    finally:
+        hebbian.close()
 
     elapsed = time.monotonic() - started
 
