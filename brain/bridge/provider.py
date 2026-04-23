@@ -73,8 +73,13 @@ class ClaudeCliProvider(LLMProvider):
                 f"ClaudeCliProvider failed (exit {result.returncode}): {result.stderr.strip()}"
             )
 
-        payload = json.loads(result.stdout)
-        return str(payload["result"])
+        try:
+            payload = json.loads(result.stdout)
+            return str(payload["result"])
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
+            ) from exc
 
     def name(self) -> str:
         return f"claude-cli:{self._model}"

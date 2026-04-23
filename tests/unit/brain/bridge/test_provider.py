@@ -77,6 +77,8 @@ def test_claude_cli_provider_builds_expected_command() -> None:
     assert "test prompt" in cmd
     assert "--output-format" in cmd
     assert "json" in cmd
+    assert "--model" in cmd
+    assert "sonnet" in cmd
 
 
 def test_claude_cli_provider_forwards_system_prompt() -> None:
@@ -130,3 +132,34 @@ def test_get_provider_unknown_name_raises() -> None:
     """Unknown provider name raises ValueError with a clear message."""
     with pytest.raises(ValueError, match="Unknown provider"):
         get_provider("nonsense")
+
+
+def test_claude_cli_provider_malformed_json_surfaces_runtime_error() -> None:
+    """Non-JSON stdout from the CLI surfaces as RuntimeError with context.
+
+    Guards the CLI contract drift case — if claude's output format changes
+    or a progress prefix appears, dream engine gets a meaningful error
+    instead of json.JSONDecodeError leaking up.
+    """
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "progress prefix not json"
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        with pytest.raises(RuntimeError, match="unexpected output format"):
+            p.generate("p")
+
+
+def test_claude_cli_provider_missing_result_key_surfaces_runtime_error() -> None:
+    """Valid JSON missing the 'result' key → RuntimeError, not raw KeyError."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps({"wrong": "shape"})
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        with pytest.raises(RuntimeError, match="unexpected output format"):
+            p.generate("p")
