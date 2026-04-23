@@ -132,7 +132,11 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
         print(f"  would decay: {result.memories_decayed} memories")
         print(f"  would prune: {result.edges_pruned} edges")
-        print(f"  dream: {'would fire' if result.dream_id else result.dream_gated_reason}")
+        # `or "gated"` defends against any future engine refactor that could
+        # leave dream_gated_reason=None — prevents literal "dream: None" output.
+        print(
+            f"  dream: {'would fire' if result.dream_id else (result.dream_gated_reason or 'gated')}"
+        )
     else:
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
@@ -140,7 +144,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         if result.dream_id:
             print(f"  dream fired: {result.dream_id}")
         else:
-            print(f"  dream gated: {result.dream_gated_reason}")
+            print(f"  dream gated: {result.dream_gated_reason or 'gated'}")
     return 0
 
 
