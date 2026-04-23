@@ -162,8 +162,228 @@ class HeartbeatEngine:
     heartbeat_log_path: Path
 
     def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> HeartbeatResult:
-        """Run one heartbeat tick. Implemented in Task 2."""
-        raise NotImplementedError("HeartbeatEngine.run_tick is implemented in T2")
+        """Run one heartbeat tick.
+
+        First-ever invocation (state file missing) initializes state and
+        defers all work — protects a freshly-migrated persona from eating
+        'years of decay' on boot. Subsequent ticks apply decay, maybe-dream
+        (gated by config.dream_every_hours), stub research, optionally emit
+        a HEARTBEAT: memory, and update state atomically.
+        """
+        now = datetime.now(UTC)
+        config = HeartbeatConfig.load(self.config_path)
+        state = HeartbeatState.load(self.state_path)
+
+        # First-ever tick: defer all work
+        if state is None:
+            if not dry_run:
+                fresh = HeartbeatState.fresh(trigger=trigger)
+                fresh.save(self.state_path)
+                self._append_log(
+                    {
+                        "timestamp": _iso_utc(now),
+                        "trigger": trigger,
+                        "initialized": True,
+                        "note": "first-ever tick, work deferred",
+                        "tick_count": 0,
+                    }
+                )
+            return HeartbeatResult(
+                trigger=trigger,
+                elapsed_seconds=0.0,
+                memories_decayed=0,
+                edges_pruned=0,
+                dream_id=None,
+                dream_gated_reason="first_tick",
+                research_deferred=False,
+                heartbeat_memory_id=None,
+                initialized=True,
+            )
+
+        elapsed_seconds = (now - state.last_tick_at).total_seconds()
+
+        # Emotion decay
+        memories_decayed = self._apply_emotion_decay(elapsed_seconds, dry_run=dry_run)
+
+        # Hebbian decay + GC
+        edges_pruned = self._apply_hebbian_decay_and_gc(config, elapsed_seconds, dry_run=dry_run)
+
+        # Maybe-dream
+        dream_id: str | None = None
+        dream_gated_reason: str | None = None
+        hours_since_dream = (now - state.last_dream_at).total_seconds() / 3600.0
+        if hours_since_dream >= config.dream_every_hours:
+            if not dry_run:
+                dream_id = self._try_fire_dream()
+                if dream_id is not None:
+                    state.last_dream_at = now
+                else:
+                    dream_gated_reason = "no_seed_available"
+            else:
+                dream_gated_reason = "would_fire_but_dry_run"
+        else:
+            dream_gated_reason = "not_due"
+
+        # Research stub — always deferred
+        research_deferred = True
+
+        # Optional HEARTBEAT: memory
+        heartbeat_memory_id: str | None = None
+        if not dry_run and self._should_emit_memory(
+            config, dream_id, edges_pruned, memories_decayed
+        ):
+            heartbeat_memory_id = self._emit_heartbeat_memory(
+                elapsed_seconds, memories_decayed, edges_pruned, dream_id
+            )
+
+        # Update state + log
+        if not dry_run:
+            state.last_tick_at = now
+            state.tick_count += 1
+            state.last_trigger = trigger
+            state.save(self.state_path)
+
+            self._append_log(
+                {
+                    "timestamp": _iso_utc(now),
+                    "trigger": trigger,
+                    "initialized": False,
+                    "elapsed_seconds": elapsed_seconds,
+                    "memories_decayed": memories_decayed,
+                    "edges_pruned": edges_pruned,
+                    "dream_id": dream_id,
+                    "research_deferred": research_deferred,
+                    "tick_count": state.tick_count,
+                }
+            )
+
+        return HeartbeatResult(
+            trigger=trigger,
+            elapsed_seconds=elapsed_seconds,
+            memories_decayed=memories_decayed,
+            edges_pruned=edges_pruned,
+            dream_id=dream_id,
+            dream_gated_reason=dream_gated_reason,
+            research_deferred=research_deferred,
+            heartbeat_memory_id=heartbeat_memory_id,
+            initialized=False,
+        )
+
+    # --- private helpers ---
+
+    def _apply_emotion_decay(self, elapsed_seconds: float, *, dry_run: bool) -> int:
+        """Apply per-memory emotion decay. Returns count of memories mutated."""
+        from brain.emotion.decay import apply_decay
+        from brain.emotion.state import EmotionalState
+
+        if elapsed_seconds <= 0.0 or dry_run:
+            return 0
+
+        count = 0
+        all_memories = self.store.search_text("", active_only=True)
+        for mem in all_memories:
+            if mem.protected:
+                continue
+            if not mem.emotions:
+                continue
+            emo_state = EmotionalState()
+            for name, intensity in mem.emotions.items():
+                try:
+                    emo_state.set(name, float(intensity))
+                except (KeyError, ValueError):
+                    continue
+            apply_decay(emo_state, elapsed_seconds)
+            new_emotions = {name: val for name, val in emo_state.emotions.items() if val > 0.0}
+            if new_emotions != mem.emotions:
+                self.store.update(mem.id, emotions=new_emotions)
+                count += 1
+        return count
+
+    def _apply_hebbian_decay_and_gc(
+        self, config: HeartbeatConfig, elapsed_seconds: float, *, dry_run: bool
+    ) -> int:
+        """Apply proportional Hebbian decay + GC. Returns edges pruned."""
+        if dry_run:
+            return 0
+        elapsed_hours = elapsed_seconds / 3600.0
+        rate = config.decay_rate_per_tick * (elapsed_hours / 24.0)
+        if rate > 0.0:
+            self.hebbian.decay_all(rate=rate)
+        pruned = self.hebbian.garbage_collect(threshold=config.gc_threshold)
+        return pruned
+
+    def _try_fire_dream(self) -> str | None:
+        """Run one DreamEngine cycle; return the new dream memory id or None."""
+        # Lazy import to avoid module-level circular dependency with dream.py
+        from brain.engines.dream import DreamEngine, NoSeedAvailable
+
+        dream_engine = DreamEngine(
+            store=self.store,
+            hebbian=self.hebbian,
+            embeddings=None,
+            provider=self.provider,
+            log_path=self.dream_log_path,
+        )
+        try:
+            dream_result = dream_engine.run_cycle(lookback_hours=100000)
+        except NoSeedAvailable:
+            return None
+        return dream_result.memory.id if dream_result.memory is not None else None
+
+    def _should_emit_memory(
+        self,
+        config: HeartbeatConfig,
+        dream_id: str | None,
+        edges_pruned: int,
+        memories_decayed: int,
+    ) -> bool:
+        if config.emit_memory == "never":
+            return False
+        if config.emit_memory == "always":
+            return True
+        return dream_id is not None or edges_pruned > 10 or memories_decayed > 20
+
+    def _emit_heartbeat_memory(
+        self,
+        elapsed_seconds: float,
+        memories_decayed: int,
+        edges_pruned: int,
+        dream_id: str | None,
+    ) -> str:
+        """Generate and persist a HEARTBEAT: memory via the LLM provider."""
+        from brain.memory.store import Memory
+
+        system = (
+            "You are Nell. You just finished a background heartbeat cycle — "
+            "decay applied, memory graph tended. Reflect in first person, "
+            "one short sentence, starting with 'HEARTBEAT: '."
+        )
+        user = (
+            f"elapsed={elapsed_seconds / 3600:.1f}h, "
+            f"memories_decayed={memories_decayed}, edges_pruned={edges_pruned}, "
+            f"dream_fired={'yes' if dream_id else 'no'}"
+        )
+        raw = self.provider.generate(user, system=system)
+        text = raw if raw.startswith("HEARTBEAT:") else f"HEARTBEAT: {raw}"
+        mem = Memory.create_new(
+            content=text,
+            memory_type="heartbeat",
+            domain="us",
+            metadata={
+                "elapsed_seconds": elapsed_seconds,
+                "memories_decayed": memories_decayed,
+                "edges_pruned": edges_pruned,
+                "dream_id": dream_id,
+                "provider": self.provider.name(),
+            },
+        )
+        self.store.create(mem)
+        return mem.id
+
+    def _append_log(self, entry: dict) -> None:
+        """Append one JSON line to heartbeats.log.jsonl."""
+        with self.heartbeat_log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def _iso_utc(dt: datetime) -> str:
