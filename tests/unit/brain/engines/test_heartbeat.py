@@ -411,3 +411,79 @@ def test_heartbeat_memory_skipped_when_never_mode(live_engine: HeartbeatEngine) 
 
     hb_memories = live_engine.store.list_by_type("heartbeat")
     assert len(hb_memories) == 0
+
+
+def test_dry_run_dream_eligible_returns_would_fire_reason(
+    live_engine: HeartbeatEngine,
+) -> None:
+    """dry_run=True when dream gate is open reports 'would_fire_but_dry_run'."""
+    _seed_conversation(live_engine.store, "seed", importance=9.0)
+    HeartbeatConfig(dream_every_hours=0.001).save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")  # init
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_dream_at = state.last_dream_at - timedelta(hours=1)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close", dry_run=True)
+    assert result.dream_gated_reason == "would_fire_but_dry_run"
+    assert result.dream_id is None
+
+
+def test_heartbeat_memory_metadata_links_to_dream_id(
+    live_engine: HeartbeatEngine,
+) -> None:
+    """The heartbeat memory's metadata.dream_id links back to the dream that
+    prompted it — the chain that consumers will traverse to find which
+    associative event triggered the meta-reflection.
+    """
+    _seed_conversation(live_engine.store, "seed", importance=9.0)
+    HeartbeatConfig(dream_every_hours=0.001, emit_memory="always").save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")  # init
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_dream_at = state.last_dream_at - timedelta(hours=1)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.dream_id is not None
+    assert result.heartbeat_memory_id is not None
+
+    hb_mem = live_engine.store.get(result.heartbeat_memory_id)
+    assert hb_mem is not None
+    assert hb_mem.metadata.get("dream_id") == result.dream_id
+
+
+def test_dream_gate_no_seed_reason_does_not_poison(live_engine: HeartbeatEngine) -> None:
+    """If the dream gate is open but NoSeedAvailable fires (no conversation
+    memories), dream_gated_reason='no_seed_available' and last_dream_at is
+    NOT advanced — so the next tick tries again instead of being silently
+    suppressed for 24h.
+    """
+    # NO conversation memory seeded; only a non-conversation memory that
+    # can't be selected as a dream seed.
+    other = Memory.create_new(
+        content="dream: an old dream",
+        memory_type="dream",
+        domain="us",
+        emotions={"love": 8.0},
+    )
+    live_engine.store.create(other)
+
+    HeartbeatConfig(dream_every_hours=0.001).save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")  # init
+    state_before = HeartbeatState.load(live_engine.state_path)
+    assert state_before is not None
+    state_before.last_dream_at = state_before.last_dream_at - timedelta(hours=1)
+    state_before.save(live_engine.state_path)
+    dream_at_before = state_before.last_dream_at
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.dream_id is None
+    assert result.dream_gated_reason == "no_seed_available"
+
+    # last_dream_at NOT advanced by failed dream attempt
+    state_after = HeartbeatState.load(live_engine.state_path)
+    assert state_after is not None
+    # last_tick_at advanced (every tick does), but last_dream_at stayed put
+    assert state_after.last_dream_at == dream_at_before
