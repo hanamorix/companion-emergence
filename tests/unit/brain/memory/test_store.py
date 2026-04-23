@@ -469,3 +469,40 @@ def test_store_list_by_emotion_skips_non_numeric_values(store: MemoryStore) -> N
     # Must not raise TypeError from the >= comparison.
     results = store.list_by_emotion("love", min_intensity=5.0)
     assert results == []
+
+
+def test_store_create_and_get_preserves_metadata(store: MemoryStore) -> None:
+    """MemoryStore.create and .get round-trip metadata dict."""
+    m = _mem("x", metadata={"source_date": "2024-01-01", "supersedes": "abc-123"})
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {"source_date": "2024-01-01", "supersedes": "abc-123"}
+
+
+def test_store_create_empty_metadata_survives(store: MemoryStore) -> None:
+    """Default empty metadata dict round-trips as {} (not None or missing)."""
+    m = _mem("x")
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_update_metadata_field(store: MemoryStore) -> None:
+    """update() can mutate the metadata field."""
+    m = _mem("x", metadata={"v": 1})
+    store.create(m)
+    store.update(m.id, metadata={"v": 2, "added": "yes"})
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {"v": 2, "added": "yes"}
+
+
+def test_store_update_rejects_unknown_field_still(store: MemoryStore) -> None:
+    """Update's unknown-field guard still works after the metadata addition."""
+    m = _mem("x")
+    store.create(m)
+    with pytest.raises(ValueError, match="Unknown update field"):
+        store.update(m.id, nonsense_field="oops")
