@@ -506,3 +506,87 @@ def test_store_update_rejects_unknown_field_still(store: MemoryStore) -> None:
     store.create(m)
     with pytest.raises(ValueError, match="Unknown update field"):
         store.update(m.id, nonsense_field="oops")
+
+
+def test_store_row_with_null_metadata_string_returns_empty_dict(store: MemoryStore) -> None:
+    """A row whose metadata_json column is the literal JSON null string
+    (not the SQL NULL) must NOT materialise Memory.metadata as None.
+
+    Belt-and-braces guard against manually-edited DBs or a future writer
+    that mistakenly calls json.dumps(None). Without the type check in
+    _safe_load_metadata, `json.loads('null')` → None would silently poison
+    every consumer doing memory.metadata.get(...).
+    """
+    m = _mem("x", metadata={"real": "data"})
+    store.create(m)
+    # Manually poison the row (simulates a bad external writer).
+    store._conn.execute("UPDATE memories SET metadata_json = 'null' WHERE id = ?", (m.id,))
+    store._conn.commit()
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}  # not None
+
+
+def test_store_row_with_malformed_metadata_returns_empty_dict(store: MemoryStore) -> None:
+    """Malformed JSON in metadata_json falls back to {} rather than raising."""
+    m = _mem("x")
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET metadata_json = ? WHERE id = ?", ("{not valid json", m.id)
+    )
+    store._conn.commit()
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_create_reports_memory_id_on_unjsonable_metadata(store: MemoryStore) -> None:
+    """Non-JSON-serialisable metadata surfaces TypeError with the memory id.
+
+    Useful for ETL: with 1,141 records going through create(), a bare
+    'Object of type datetime is not JSON serializable' is useless. The
+    wrapped error names the offending memory id.
+    """
+    m = _mem("x", metadata={"ts": datetime.now(UTC)})  # datetime not JSON-serialisable
+    with pytest.raises(TypeError, match=f"id={m.id!r}"):
+        store.create(m)
+
+
+def test_store_update_empty_metadata_is_explicit_overwrite(store: MemoryStore) -> None:
+    """update(metadata={}) is an explicit overwrite, consistent with update's
+    other fields. Callers who want to skip the field should omit the kwarg.
+    Pinning the semantic — accidental data loss is surfaced by the test.
+    """
+    m = _mem("x", metadata={"source_date": "2024-01-01", "supersedes": "abc"})
+    store.create(m)
+    store.update(m.id, metadata={})
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_create_and_get_preserves_nested_metadata(store: MemoryStore) -> None:
+    """Complex nested metadata (dict-of-dict, list, None values) round-trips."""
+    m = _mem(
+        "x",
+        metadata={
+            "nested": {"a": 1, "b": [2, 3]},
+            "list": ["x", "y", None],
+            "null_value": None,
+            "int_val": 42,
+            "float_val": 3.14,
+        },
+    )
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {
+        "nested": {"a": 1, "b": [2, 3]},
+        "list": ["x", "y", None],
+        "null_value": None,
+        "int_val": 42,
+        "float_val": 3.14,
+    }
