@@ -213,6 +213,33 @@ def test_memory_metadata_defensive_copy_on_create_new() -> None:
     assert m.metadata == {"source_date": "2024-01-01"}
 
 
+def test_memory_from_dict_metadata_null_defaults_empty() -> None:
+    """Explicit JSON null for 'metadata' restores as {}, not a crash.
+
+    OG JSON can legally contain "metadata": null; the migrator will feed
+    those dicts straight into from_dict. `dict(None)` would TypeError, so
+    from_dict uses `data.get("metadata") or {}` to absorb both the
+    absent-key and present-but-null cases.
+    """
+    data = {
+        "id": "null-md-001",
+        "content": "y",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": False,
+        "metadata": None,  # explicit null
+    }
+    restored = Memory.from_dict(data)
+    assert restored.metadata == {}
+
+
 @pytest.fixture
 def store() -> MemoryStore:
     """In-memory MemoryStore, fresh per test."""
