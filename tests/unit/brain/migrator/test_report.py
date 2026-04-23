@@ -120,3 +120,44 @@ def test_write_source_manifest_produces_valid_json(tmp_path: Path) -> None:
     assert data["files"][0]["size_bytes"] == 100
     assert data["files"][0]["sha256"] == "a" * 64
     assert "generated_at_utc" in data
+
+
+def test_format_report_renumbers_next_steps_when_inspect_cmds_absent() -> None:
+    """When only install_cmd is set, it renders as step 1 — not 'step 2 without 1'.
+
+    The --install-as flow omits inspect cmds (already installed). The report
+    must still read coherently rather than leaving a dangling step 2.
+    """
+    report = MigrationReport(
+        memories_migrated=1,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="uv run brain ...",
+    )
+    text = format_report(report)
+    assert "1. When satisfied, install as a persona:" in text
+    assert "2. When satisfied" not in text
+
+
+def test_format_report_empty_report_does_not_crash() -> None:
+    """Zero memories + zero edges + no manifest + no next steps produces
+    minimal coherent output without raising.
+    """
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+    )
+    text = format_report(report)
+    assert "Migration complete." in text
+    assert "0 migrated" in text
+    assert "Next steps" not in text  # section suppressed when empty
