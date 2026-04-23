@@ -58,13 +58,16 @@ def format_report(report: MigrationReport) -> str:
 
     if report.next_steps_inspect_cmds or report.next_steps_install_cmd:
         lines.append("Next steps:")
+        step = 1
         if report.next_steps_inspect_cmds:
-            lines.append("  1. Inspect the output:")
+            lines.append(f"  {step}. Inspect the output:")
             for cmd in report.next_steps_inspect_cmds:
                 lines.append(f"       {cmd}")
+            step += 1
         if report.next_steps_install_cmd:
-            lines.append("")
-            lines.append("  2. When satisfied, install as a persona:")
+            if step > 1:
+                lines.append("")
+            lines.append(f"  {step}. When satisfied, install as a persona:")
             lines.append(f"       {report.next_steps_install_cmd}")
 
     return "\n".join(lines) + "\n"
