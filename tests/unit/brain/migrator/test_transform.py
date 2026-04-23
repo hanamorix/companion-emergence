@@ -182,3 +182,46 @@ def test_skipped_memory_dataclass_shape() -> None:
     assert s.reason == "missing_content"
     assert s.field == "content"
     assert s.raw_snippet == "..."
+
+
+def test_transform_non_numeric_importance_degrades_to_zero() -> None:
+    """Non-numeric importance (e.g. 'high') must not crash float() — degrade to 0.0."""
+    mem, skipped = transform_memory(_og(importance="high"))
+    assert skipped is None
+    assert mem is not None
+    assert mem.importance == 0.0
+
+
+def test_transform_list_importance_degrades_to_zero() -> None:
+    """A list-valued importance field degrades to 0.0 rather than crashing."""
+    mem, skipped = transform_memory(_og(importance=[1, 2, 3]))
+    assert skipped is None
+    assert mem is not None
+    assert mem.importance == 0.0
+
+
+def test_transform_string_tags_degrades_to_empty_list() -> None:
+    """A string-valued tags field must NOT character-explode via list('mytag').
+
+    list('mytag') returns ['m','y','t','a','g'] — silent data corruption.
+    Tags is optional metadata, so degrade to [] rather than skip the memory.
+    """
+    mem, skipped = transform_memory(_og(tags="mytag"))
+    assert skipped is None
+    assert mem is not None
+    assert mem.tags == []
+
+
+def test_transform_dict_tags_degrades_to_empty_list() -> None:
+    """A dict-valued tags field degrades to [] rather than pulling dict keys."""
+    mem, skipped = transform_memory(_og(tags={"a": 1, "b": 2}))
+    assert skipped is None
+    assert mem is not None
+    assert mem.tags == []
+
+
+def test_transform_bool_emotion_score_falls_back_to_sum() -> None:
+    """bool emotion_score is rejected by the isinstance(v, bool) guard; falls back to sum."""
+    mem, _ = transform_memory(_og(emotions={"love": 5.0}, emotion_score=True))
+    assert mem is not None
+    assert mem.score == 5.0  # sum of emotions, not float(True)=1.0
