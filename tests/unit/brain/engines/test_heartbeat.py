@@ -166,3 +166,52 @@ def test_heartbeat_engine_construction(tmp_path: Path) -> None:
     assert engine.hebbian is hebbian
     store.close()
     hebbian.close()
+
+
+def test_heartbeat_config_load_invalid_json_returns_defaults(tmp_path: Path) -> None:
+    """Malformed JSON in config → defaults, no crash."""
+    path = tmp_path / "cfg.json"
+    path.write_text("not json at all {[}")
+    c = HeartbeatConfig.load(path)
+    assert c.dream_every_hours == 24.0
+
+
+def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path) -> None:
+    """Hand-edited config with wrong-type values (dream_every_hours={} etc.)
+    must NOT crash the CLI with TypeError. Graceful degrade to defaults.
+    """
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"dream_every_hours": {}}))
+    c = HeartbeatConfig.load(path)
+    assert c.dream_every_hours == 24.0
+
+
+def test_heartbeat_state_load_corrupt_returns_none(tmp_path: Path) -> None:
+    """A corrupt state file returns None (→ engine treats as first-ever tick
+    and reinitialises) rather than crashing with a traceback.
+    """
+    path = tmp_path / "state.json"
+    path.write_text("not json")
+    assert HeartbeatState.load(path) is None
+
+
+def test_heartbeat_state_load_missing_keys_returns_none(tmp_path: Path) -> None:
+    """State file missing required keys returns None — same graceful recovery."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"tick_count": 5}))
+    assert HeartbeatState.load(path) is None
+
+
+def test_heartbeat_state_save_rejects_naive_datetime(tmp_path: Path) -> None:
+    """Naive datetime in HeartbeatState.save raises — contract is tz-aware only."""
+    path = tmp_path / "state.json"
+    naive_dt = datetime(2026, 4, 23, 10, 0, 0)
+    s = HeartbeatState(
+        last_tick_at=naive_dt,
+        last_dream_at=naive_dt,
+        last_research_at=naive_dt,
+        tick_count=0,
+        last_trigger="init",
+    )
+    with pytest.raises(ValueError, match="tz-aware"):
+        s.save(path)
