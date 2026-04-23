@@ -167,7 +167,8 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at TEXT NOT NULL,
     last_accessed_at TEXT,
     active INTEGER NOT NULL DEFAULT 1,
-    protected INTEGER NOT NULL DEFAULT 0
+    protected INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
@@ -200,8 +201,9 @@ class MemoryStore:
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
-                importance, score, created_at, last_accessed_at, active, protected
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                importance, score, created_at, last_accessed_at, active, protected,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -216,6 +218,7 @@ class MemoryStore:
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
                 1 if memory.protected else 0,
+                json.dumps(memory.metadata),
             ),
         )
         self._conn.commit()
@@ -279,6 +282,8 @@ class MemoryStore:
                 column_map["emotions_json"] = ("emotions_json", json.dumps(value))
             elif key == "tags":
                 column_map["tags_json"] = ("tags_json", json.dumps(value))
+            elif key == "metadata":
+                column_map["metadata_json"] = ("metadata_json", json.dumps(value))
             elif key == "last_accessed_at":
                 column_map[key] = (
                     key,
@@ -372,4 +377,5 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
         protected=bool(row["protected"]),
+        metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
     )
