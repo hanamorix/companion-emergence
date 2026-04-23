@@ -12,6 +12,7 @@ import sys
 from collections.abc import Callable
 
 from brain import __version__
+from brain.migrator.cli import build_parser as _build_migrate_parser
 
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
@@ -25,7 +26,6 @@ _STUB_COMMANDS: tuple[str, ...] = (
     "soul",
     "memory",
     "works",
-    "migrate",
 )
 
 
@@ -66,6 +66,8 @@ def _build_parser() -> argparse.ArgumentParser:
             help=f"(stub) {name} — wired in a later week",
         )
         sub.set_defaults(func=_make_stub(name))
+
+    _build_migrate_parser(subparsers)
 
     return parser
 
