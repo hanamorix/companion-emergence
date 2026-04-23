@@ -154,6 +154,28 @@ def test_full_migration_source_manifest_records_all_files(og_mini: Path, tmp_pat
     for f in manifest["files"]:
         assert len(f["sha256"]) == 64
         assert f["size_bytes"] > 0
+        # Strong check: re-hash the source file and compare. If _record_manifest
+        # ever drifts from the bytes the reader consumed, this fails.
+        import hashlib
+
+        actual_sha = hashlib.sha256((og_mini / f["relative_path"]).read_bytes()).hexdigest()
+        assert f["sha256"] == actual_sha
+
+
+def test_full_migration_report_md_has_substantive_content(og_mini: Path, tmp_path: Path) -> None:
+    """migration-report.md file has meaningful content — guards against silent
+    regression of the user-facing artefact (e.g. a format_report refactor
+    leaving only a header line).
+    """
+    out = tmp_path / "migrated-mini"
+    args = MigrateArgs(input_dir=og_mini, output_dir=out, install_as=None, force=False)
+    run_migrate(args)
+
+    text = (out / "migration-report.md").read_text()
+    assert "Migration complete." in text
+    assert "4 migrated" in text  # memories
+    assert "3 migrated" in text  # edges
+    assert "missing_content" in text  # the one skipped memory's reason
 
 
 def test_full_migration_never_writes_to_og_dir(og_mini: Path, tmp_path: Path) -> None:
