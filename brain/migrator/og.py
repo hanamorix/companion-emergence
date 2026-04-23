@@ -80,6 +80,10 @@ class OGReader:
             raise ValueError(f"{ids_path} is not a JSON list")
 
         matrix = np.load(matrix_path)
+        # np.load doesn't expose its raw bytes, so the manifest entry does a
+        # second read_bytes() for the SHA — asymmetric with the JSON path
+        # which passes the already-read buffer. check_preflight + post-run
+        # re-stat close the TOCTOU window in practice.
         self._record_manifest(matrix_path)
 
         if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
