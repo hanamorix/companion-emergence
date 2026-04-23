@@ -48,12 +48,18 @@ class HeartbeatConfig:
         if emit not in _VALID_EMIT_MODES:
             emit = "conditional"
 
-        return cls(
-            dream_every_hours=float(data.get("dream_every_hours", 24.0)),
-            decay_rate_per_tick=float(data.get("decay_rate_per_tick", 0.01)),
-            gc_threshold=float(data.get("gc_threshold", 0.01)),
-            emit_memory=emit,  # type: ignore[arg-type]
-        )
+        try:
+            return cls(
+                dream_every_hours=float(data.get("dream_every_hours", 24.0)),
+                decay_rate_per_tick=float(data.get("decay_rate_per_tick", 0.01)),
+                gc_threshold=float(data.get("gc_threshold", 0.01)),
+                emit_memory=emit,  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            # Hand-edited config with wrong-type values (e.g. dream_every_hours={}
+            # or dream_every_hours=[1,2]) should degrade to defaults rather than
+            # crash the CLI with a traceback.
+            return cls()
 
     def save(self, path: Path) -> None:
         """Write config JSON to path (non-atomic — config is user-edited)."""
@@ -78,17 +84,26 @@ class HeartbeatState:
 
     @classmethod
     def load(cls, path: Path) -> HeartbeatState | None:
-        """Load state; return None if the file doesn't exist (→ first-ever tick)."""
+        """Load state; return None if the file is missing or corrupt.
+
+        Returning None triggers the first-ever-tick defer path in the engine,
+        which is the safest recovery from a hand-edited or truncated state
+        file (user-facing crashes from a malformed JSON are worse UX than
+        silently reinitialising).
+        """
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(
-            last_tick_at=_parse_iso_utc(data["last_tick_at"]),
-            last_dream_at=_parse_iso_utc(data["last_dream_at"]),
-            last_research_at=_parse_iso_utc(data["last_research_at"]),
-            tick_count=int(data["tick_count"]),
-            last_trigger=str(data["last_trigger"]),
-        )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return cls(
+                last_tick_at=_parse_iso_utc(data["last_tick_at"]),
+                last_dream_at=_parse_iso_utc(data["last_dream_at"]),
+                last_research_at=_parse_iso_utc(data["last_research_at"]),
+                tick_count=int(data["tick_count"]),
+                last_trigger=str(data["last_trigger"]),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
     @classmethod
     def fresh(cls, trigger: str) -> HeartbeatState:
@@ -152,7 +167,14 @@ class HeartbeatEngine:
 
 
 def _iso_utc(dt: datetime) -> str:
-    """ISO-8601 with Z suffix (matches Week 3.5 manifest format)."""
+    """ISO-8601 with Z suffix (matches Week 3.5 manifest format).
+
+    Requires a tz-aware UTC datetime — a naive datetime would silently
+    write a malformed stamp (no Z suffix, no offset) that doesn't parse
+    back cleanly.
+    """
+    if dt.tzinfo is None:
+        raise ValueError("_iso_utc requires a tz-aware datetime")
     return dt.isoformat().replace("+00:00", "Z")
 
 
