@@ -53,6 +53,10 @@ class Memory:
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
         protected: excluded from decay/consolidation.
+        metadata: free-form dict for fields not modelled as first-class
+            attributes — absorbs OG-only fields (source_date, supersedes,
+            etc.) during migration without proliferating the dataclass.
+            Forward-compatible: future engines read metadata[key] as needed.
     """
 
     id: str
@@ -67,6 +71,7 @@ class Memory:
     last_accessed_at: datetime | None = None
     active: bool = True
     protected: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create_new(
@@ -77,6 +82,7 @@ class Memory:
         emotions: dict[str, float] | None = None,
         tags: list[str] | None = None,
         importance: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Memory:
         """Factory: new memory with generated UUID, current UTC time,
         and auto-computed score + importance (if importance is None).
@@ -87,6 +93,7 @@ class Memory:
         emotions = dict(emotions or {})
         tags = list(tags or [])
         score = float(sum(emotions.values()))
+        metadata = dict(metadata or {})
         return cls(
             id=str(uuid.uuid4()),
             content=content,
@@ -97,6 +104,7 @@ class Memory:
             tags=tags,
             importance=importance if importance is not None else score / 10.0,
             score=score,
+            metadata=metadata,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,6 +124,7 @@ class Memory:
             else None,
             "active": self.active,
             "protected": self.protected,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -141,6 +150,7 @@ class Memory:
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
