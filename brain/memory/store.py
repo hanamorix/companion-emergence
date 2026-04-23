@@ -150,7 +150,7 @@ class Memory:
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
-            metadata=dict(data.get("metadata", {})),
+            metadata=dict(data.get("metadata") or {}),
         )
 
 
