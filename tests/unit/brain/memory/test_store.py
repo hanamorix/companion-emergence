@@ -153,6 +153,66 @@ def test_memory_dataclass_preserves_explicit_id_for_migration() -> None:
     assert m.id == "abc-123"
 
 
+def test_memory_metadata_defaults_to_empty_dict() -> None:
+    """metadata defaults to {} if not specified."""
+    m = Memory.create_new(content="x", memory_type="meta", domain="work")
+    assert m.metadata == {}
+
+
+def test_memory_create_new_accepts_metadata_kwarg() -> None:
+    """Memory.create_new accepts a metadata dict and preserves it verbatim."""
+    m = Memory.create_new(
+        content="x",
+        memory_type="meta",
+        domain="work",
+        metadata={"source_date": "2024-01-01", "supersedes": "abc-123"},
+    )
+    assert m.metadata == {"source_date": "2024-01-01", "supersedes": "abc-123"}
+
+
+def test_memory_metadata_round_trips_through_dict() -> None:
+    """metadata round-trips through to_dict / from_dict."""
+    original = Memory.create_new(
+        content="x",
+        memory_type="meta",
+        domain="work",
+        metadata={"emotional_tone": "tender", "access_count": 3, "tags_sig": None},
+    )
+    data = original.to_dict()
+    assert data["metadata"] == original.metadata
+    restored = Memory.from_dict(data)
+    assert restored.metadata == original.metadata
+
+
+def test_memory_from_dict_missing_metadata_defaults_empty() -> None:
+    """Legacy dicts without a 'metadata' key restore cleanly with metadata={}."""
+    data = {
+        "id": "legacy-001",
+        "content": "legacy",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": False,
+        # no 'metadata' key
+    }
+    restored = Memory.from_dict(data)
+    assert restored.metadata == {}
+
+
+def test_memory_metadata_defensive_copy_on_create_new() -> None:
+    """Mutating the caller's dict after create_new does not affect the memory."""
+    caller_dict = {"source_date": "2024-01-01"}
+    m = Memory.create_new(content="x", memory_type="meta", domain="work", metadata=caller_dict)
+    caller_dict["source_date"] = "mutated"
+    assert m.metadata == {"source_date": "2024-01-01"}
+
+
 @pytest.fixture
 def store() -> MemoryStore:
     """In-memory MemoryStore, fresh per test."""
