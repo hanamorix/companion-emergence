@@ -8,10 +8,34 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge.provider import FakeProvider
+from brain.bridge.provider import FakeProvider, LLMProvider
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+
+
+class _PrefixedFakeProvider(LLMProvider):
+    """Returns a response already starting with 'DREAM:' — exercises the
+    engine's no-double-prefix branch.
+    """
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        return "DREAM: already prefixed response"
+
+    def name(self) -> str:
+        return "fake-prefixed"
+
+
+class _UnprefixedFakeProvider(LLMProvider):
+    """Returns a response WITHOUT the DREAM prefix — exercises the engine's
+    auto-prefix branch explicitly.
+    """
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        return "just a raw thought with no prefix"
+
+    def name(self) -> str:
+        return "fake-unprefixed"
 
 
 @pytest.fixture
@@ -245,3 +269,70 @@ def test_run_cycle_respects_neighbour_limit(
 
     result = engine.run_cycle(dry_run=True, neighbour_limit=3)
     assert len(result.neighbours) <= 3
+
+
+def test_run_cycle_explicit_seed_not_found_raises(engine: DreamEngine) -> None:
+    """When --seed id doesn't exist in the store, NoSeedAvailable surfaces.
+
+    CLI users can pass stale ids; the error must be a clean engine-level
+    exception, not a downstream AttributeError.
+    """
+    with pytest.raises(NoSeedAvailable, match="not found"):
+        engine.run_cycle(seed_id="00000000-0000-0000-0000-000000000000")
+
+
+def test_run_cycle_auto_prefixes_when_llm_omits_dream_prefix(
+    store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path
+) -> None:
+    """If the LLM response doesn't start with 'DREAM:', the engine prepends it.
+
+    Explicitly exercises the auto-prefix branch that FakeProvider's always-
+    prefixed output skips over.
+    """
+    engine = DreamEngine(
+        store=store,
+        hebbian=hebbian,
+        embeddings=None,
+        provider=_UnprefixedFakeProvider(),
+        log_path=tmp_path / "dreams.log.jsonl",
+    )
+    seed = _mem("seed", importance=8.0)
+    store.create(seed)
+
+    result = engine.run_cycle()
+    assert result.memory is not None
+    assert result.memory.content == "DREAM: just a raw thought with no prefix"
+
+
+def test_run_cycle_does_not_double_prefix_when_llm_already_prefixed(
+    store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path
+) -> None:
+    """LLM response that already starts with 'DREAM:' is NOT double-prefixed."""
+    engine = DreamEngine(
+        store=store,
+        hebbian=hebbian,
+        embeddings=None,
+        provider=_PrefixedFakeProvider(),
+        log_path=tmp_path / "dreams.log.jsonl",
+    )
+    seed = _mem("seed", importance=8.0)
+    store.create(seed)
+
+    result = engine.run_cycle()
+    assert result.memory is not None
+    assert result.memory.content == "DREAM: already prefixed response"
+    assert not result.memory.content.startswith("DREAM: DREAM:")
+
+
+def test_run_cycle_no_neighbours_branch_surfaces_in_prompt(
+    engine: DreamEngine, store: MemoryStore
+) -> None:
+    """Seed with zero Hebbian edges uses the 'no neighbours' prompt branch
+    and reports strengthened_edges=0 (no edges to reinforce).
+    """
+    seed = _mem("lonely seed", importance=8.0)
+    store.create(seed)
+
+    result = engine.run_cycle(dry_run=True)
+    assert len(result.neighbours) == 0
+    assert "No other memories resonated" in result.prompt

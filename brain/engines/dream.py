@@ -151,6 +151,11 @@ class DreamEngine:
         neighbours: list[tuple[Memory, float]],
         dream_text: str,
     ) -> Memory:
+        # Sum per-emotion across seed + neighbours. Values are intentionally
+        # NOT clamped here — a vivid "love"-saturated dream may legitimately
+        # show love=80 across 8 activated memories. Downstream consumers that
+        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
+        # ingest, not here.
         aggregated_emotions: dict[str, float] = dict(seed.emotions)
         for mem, _ in neighbours:
             for k, v in mem.emotions.items():
