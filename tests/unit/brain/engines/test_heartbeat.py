@@ -8,12 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from brain.bridge.provider import FakeProvider
 from brain.engines.heartbeat import (
     HeartbeatConfig,
     HeartbeatEngine,
     HeartbeatResult,
     HeartbeatState,
 )
+from brain.memory.hebbian import HebbianMatrix
+from brain.memory.store import Memory, MemoryStore
 
 
 def test_heartbeat_config_defaults() -> None:
@@ -215,3 +218,196 @@ def test_heartbeat_state_save_rejects_naive_datetime(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="tz-aware"):
         s.save(path)
+
+
+@pytest.fixture
+def live_engine(tmp_path: Path) -> HeartbeatEngine:
+    """Engine with in-memory store/hebbian and tmp log/state paths."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    return HeartbeatEngine(
+        store=store,
+        hebbian=hebbian,
+        provider=FakeProvider(),
+        state_path=tmp_path / "hb_state.json",
+        config_path=tmp_path / "hb_config.json",
+        dream_log_path=tmp_path / "dreams.log.jsonl",
+        heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+    )
+
+
+def _seed_conversation(store: MemoryStore, content: str, importance: float = 5.0) -> Memory:
+    m = Memory.create_new(
+        content=content,
+        memory_type="conversation",
+        domain="us",
+        emotions={"love": 9.0, "tenderness": 5.0},
+    )
+    m.importance = importance
+    store.create(m)
+    return m
+
+
+def test_first_tick_initializes_and_defers_work(live_engine: HeartbeatEngine) -> None:
+    """First-ever tick returns initialized=True, writes state, does no work."""
+    _seed_conversation(live_engine.store, "seed")
+
+    result = live_engine.run_tick(trigger="open")
+    assert result.initialized is True
+    assert result.memories_decayed == 0
+    assert result.edges_pruned == 0
+    assert result.dream_id is None
+    assert result.dream_gated_reason == "first_tick"
+    assert live_engine.state_path.exists()
+
+    second = live_engine.run_tick(trigger="close")
+    assert second.initialized is False
+
+
+def test_second_tick_applies_decay(live_engine: HeartbeatEngine) -> None:
+    """Second tick after simulated elapsed time decays emotions."""
+    m = _seed_conversation(live_engine.store, "seed")
+    live_engine.run_tick(trigger="open")  # init
+
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_tick_at = state.last_tick_at - timedelta(hours=48)
+    state.last_dream_at = state.last_dream_at - timedelta(hours=48)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.initialized is False
+    assert result.elapsed_seconds >= 48 * 3600 - 10
+
+    reloaded = live_engine.store.get(m.id)
+    assert reloaded is not None
+    # love has decay_half_life_days=None (identity-level) so it never decays.
+    # tenderness has a 7-day half-life; after 48 h it should drop from 5.0.
+    assert reloaded.emotions.get("tenderness", 0.0) < 5.0
+
+
+def test_dream_gate_respects_config(live_engine: HeartbeatEngine) -> None:
+    """dream_every_hours config gates dream firing."""
+    _seed_conversation(live_engine.store, "seed", importance=9.0)
+    cfg = HeartbeatConfig(dream_every_hours=0.001)
+    cfg.save(live_engine.config_path)
+
+    live_engine.run_tick(trigger="open")  # init, no dream
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_dream_at = state.last_dream_at - timedelta(hours=1)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.dream_id is not None
+    assert result.dream_gated_reason is None
+
+
+def test_dream_gated_when_not_due(live_engine: HeartbeatEngine) -> None:
+    """Dream does not fire when last_dream_at + dream_every_hours > now."""
+    _seed_conversation(live_engine.store, "seed", importance=9.0)
+    live_engine.run_tick(trigger="open")  # init, no dream
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.dream_id is None
+    assert result.dream_gated_reason == "not_due"
+
+
+def test_protected_memories_skipped_by_decay(live_engine: HeartbeatEngine) -> None:
+    """protected=True memories don't get their emotions decayed."""
+    m = _seed_conversation(live_engine.store, "protected")
+    live_engine.store.update(m.id, protected=True)
+    live_engine.run_tick(trigger="open")
+
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_tick_at = state.last_tick_at - timedelta(hours=72)
+    state.save(live_engine.state_path)
+
+    live_engine.run_tick(trigger="close")
+
+    reloaded = live_engine.store.get(m.id)
+    assert reloaded is not None
+    assert reloaded.emotions.get("love", 0.0) == 9.0
+
+
+def test_hebbian_gc_prunes_weak_edges(live_engine: HeartbeatEngine) -> None:
+    """decay_all + gc removes weak edges."""
+    live_engine.hebbian.strengthen("a", "b", delta=0.005)
+    live_engine.hebbian.strengthen("c", "d", delta=0.5)
+    live_engine.run_tick(trigger="open")
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_tick_at = state.last_tick_at - timedelta(hours=48)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close")
+    assert result.edges_pruned >= 1
+    assert live_engine.hebbian.weight("a", "b") == 0.0
+    assert live_engine.hebbian.weight("c", "d") > 0.0
+
+
+def test_research_always_deferred(live_engine: HeartbeatEngine) -> None:
+    """research_deferred=True on every non-init tick (engine not built yet)."""
+    _seed_conversation(live_engine.store, "seed")
+    live_engine.run_tick(trigger="open")  # init
+    result = live_engine.run_tick(trigger="close")
+    assert result.research_deferred is True
+
+
+def test_dry_run_does_not_mutate_store_or_state(live_engine: HeartbeatEngine) -> None:
+    """--dry-run: no state file written, no memory decay, no dream."""
+    m = _seed_conversation(live_engine.store, "seed", importance=9.0)
+    live_engine.run_tick(trigger="manual", dry_run=True)
+
+    assert not live_engine.state_path.exists()
+    reloaded = live_engine.store.get(m.id)
+    assert reloaded is not None
+    assert reloaded.emotions.get("love", 0.0) == 9.0
+
+
+def test_heartbeats_log_has_init_entry(live_engine: HeartbeatEngine) -> None:
+    """First tick writes a JSONL entry marked initialized=true."""
+    live_engine.run_tick(trigger="open")
+    text = live_engine.heartbeat_log_path.read_text().strip()
+    line = json.loads(text.splitlines()[-1])
+    assert line["initialized"] is True
+    assert line["trigger"] == "open"
+
+
+def test_heartbeats_log_has_tick_entry(live_engine: HeartbeatEngine) -> None:
+    """Second tick writes a JSONL entry with elapsed/memories_decayed/etc."""
+    _seed_conversation(live_engine.store, "seed")
+    live_engine.run_tick(trigger="open")
+    live_engine.run_tick(trigger="close")
+
+    lines = live_engine.heartbeat_log_path.read_text().strip().splitlines()
+    assert len(lines) == 2
+    tick = json.loads(lines[-1])
+    assert tick["trigger"] == "close"
+    assert tick.get("initialized") is False
+    assert "elapsed_seconds" in tick
+    assert "tick_count" in tick
+
+
+def test_heartbeat_memory_emitted_when_always_mode(live_engine: HeartbeatEngine) -> None:
+    """emit_memory='always' → every non-init tick writes a heartbeat memory."""
+    _seed_conversation(live_engine.store, "seed")
+    HeartbeatConfig(dream_every_hours=999, emit_memory="always").save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")  # init, no memory
+    live_engine.run_tick(trigger="close")
+
+    hb_memories = live_engine.store.list_by_type("heartbeat")
+    assert len(hb_memories) == 1
+    assert hb_memories[0].content.startswith("HEARTBEAT:")
+
+
+def test_heartbeat_memory_skipped_when_never_mode(live_engine: HeartbeatEngine) -> None:
+    """emit_memory='never' → no heartbeat memory regardless of tick outcome."""
+    _seed_conversation(live_engine.store, "seed", importance=9.0)
+    HeartbeatConfig(dream_every_hours=0.001, emit_memory="never").save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")
+    live_engine.run_tick(trigger="close")
+
+    hb_memories = live_engine.store.list_by_type("heartbeat")
+    assert len(hb_memories) == 0
