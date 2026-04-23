@@ -12,13 +12,17 @@ import sys
 from collections.abc import Callable
 
 from brain import __version__
+from brain.bridge.provider import get_provider
+from brain.engines.dream import DreamEngine
+from brain.memory.hebbian import HebbianMatrix
+from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
+from brain.paths import get_persona_dir
 
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
-    "dream",
     "heartbeat",
     "reflex",
     "status",
@@ -47,6 +51,47 @@ def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
     return _handler
 
 
+def _dream_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell dream` to the DreamEngine."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir} — "
+            f"run `nell migrate --install-as {args.persona}` first."
+        )
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+    provider = get_provider(args.provider)
+    engine = DreamEngine(
+        store=store,
+        hebbian=hebbian,
+        embeddings=None,
+        provider=provider,
+        log_path=persona_dir / "dreams.log.jsonl",
+    )
+    try:
+        result = engine.run_cycle(
+            seed_id=args.seed,
+            lookback_hours=args.lookback,
+            depth=args.depth,
+            decay_per_hop=args.decay,
+            neighbour_limit=args.limit,
+            dry_run=args.dry_run,
+        )
+    finally:
+        store.close()
+        hebbian.close()
+
+    if args.dry_run:
+        print("Dry run — no writes.")
+        print(f"Seed: {result.seed.id}  ({result.seed.content[:80]})")
+        print(f"Neighbours: {len(result.neighbours)}")
+        print(f"Prompt preview:\n{result.prompt[:400]}")
+    else:
+        print(result.dream_text or "")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -68,6 +113,32 @@ def _build_parser() -> argparse.ArgumentParser:
         sub.set_defaults(func=_make_stub(name))
 
     _build_migrate_parser(subparsers)
+
+    dream_sub = subparsers.add_parser(
+        "dream",
+        help="Run one dream cycle against a persona's memory store.",
+    )
+    dream_sub.add_argument("--persona", default="nell", help="Persona name (default: nell).")
+    dream_sub.add_argument(
+        "--seed", default=None, help="Explicit seed memory id (default: auto-select)."
+    )
+    dream_sub.add_argument(
+        "--provider",
+        default="claude-cli",
+        help="LLM provider: claude-cli (default), fake, ollama.",
+    )
+    dream_sub.add_argument("--dry-run", action="store_true", help="Skip LLM call and store writes.")
+    dream_sub.add_argument(
+        "--lookback", type=int, default=24, help="Hours of history to consider (default: 24)."
+    )
+    dream_sub.add_argument(
+        "--depth", type=int, default=2, help="Spreading-activation depth (default: 2)."
+    )
+    dream_sub.add_argument("--decay", type=float, default=0.5, help="Per-hop decay (default: 0.5).")
+    dream_sub.add_argument(
+        "--limit", type=int, default=8, help="Max neighbours in prompt (default: 8)."
+    )
+    dream_sub.set_defaults(func=_dream_handler)
 
     return parser
 
