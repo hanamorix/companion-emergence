@@ -153,6 +153,93 @@ def test_memory_dataclass_preserves_explicit_id_for_migration() -> None:
     assert m.id == "abc-123"
 
 
+def test_memory_metadata_defaults_to_empty_dict() -> None:
+    """metadata defaults to {} if not specified."""
+    m = Memory.create_new(content="x", memory_type="meta", domain="work")
+    assert m.metadata == {}
+
+
+def test_memory_create_new_accepts_metadata_kwarg() -> None:
+    """Memory.create_new accepts a metadata dict and preserves it verbatim."""
+    m = Memory.create_new(
+        content="x",
+        memory_type="meta",
+        domain="work",
+        metadata={"source_date": "2024-01-01", "supersedes": "abc-123"},
+    )
+    assert m.metadata == {"source_date": "2024-01-01", "supersedes": "abc-123"}
+
+
+def test_memory_metadata_round_trips_through_dict() -> None:
+    """metadata round-trips through to_dict / from_dict."""
+    original = Memory.create_new(
+        content="x",
+        memory_type="meta",
+        domain="work",
+        metadata={"emotional_tone": "tender", "access_count": 3, "tags_sig": None},
+    )
+    data = original.to_dict()
+    assert data["metadata"] == original.metadata
+    restored = Memory.from_dict(data)
+    assert restored.metadata == original.metadata
+
+
+def test_memory_from_dict_missing_metadata_defaults_empty() -> None:
+    """Legacy dicts without a 'metadata' key restore cleanly with metadata={}."""
+    data = {
+        "id": "legacy-001",
+        "content": "legacy",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": False,
+        # no 'metadata' key
+    }
+    restored = Memory.from_dict(data)
+    assert restored.metadata == {}
+
+
+def test_memory_metadata_defensive_copy_on_create_new() -> None:
+    """Mutating the caller's dict after create_new does not affect the memory."""
+    caller_dict = {"source_date": "2024-01-01"}
+    m = Memory.create_new(content="x", memory_type="meta", domain="work", metadata=caller_dict)
+    caller_dict["source_date"] = "mutated"
+    assert m.metadata == {"source_date": "2024-01-01"}
+
+
+def test_memory_from_dict_metadata_null_defaults_empty() -> None:
+    """Explicit JSON null for 'metadata' restores as {}, not a crash.
+
+    OG JSON can legally contain "metadata": null; the migrator will feed
+    those dicts straight into from_dict. `dict(None)` would TypeError, so
+    from_dict uses `data.get("metadata") or {}` to absorb both the
+    absent-key and present-but-null cases.
+    """
+    data = {
+        "id": "null-md-001",
+        "content": "y",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": False,
+        "metadata": None,  # explicit null
+    }
+    restored = Memory.from_dict(data)
+    assert restored.metadata == {}
+
+
 @pytest.fixture
 def store() -> MemoryStore:
     """In-memory MemoryStore, fresh per test."""
@@ -382,3 +469,124 @@ def test_store_list_by_emotion_skips_non_numeric_values(store: MemoryStore) -> N
     # Must not raise TypeError from the >= comparison.
     results = store.list_by_emotion("love", min_intensity=5.0)
     assert results == []
+
+
+def test_store_create_and_get_preserves_metadata(store: MemoryStore) -> None:
+    """MemoryStore.create and .get round-trip metadata dict."""
+    m = _mem("x", metadata={"source_date": "2024-01-01", "supersedes": "abc-123"})
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {"source_date": "2024-01-01", "supersedes": "abc-123"}
+
+
+def test_store_create_empty_metadata_survives(store: MemoryStore) -> None:
+    """Default empty metadata dict round-trips as {} (not None or missing)."""
+    m = _mem("x")
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_update_metadata_field(store: MemoryStore) -> None:
+    """update() can mutate the metadata field."""
+    m = _mem("x", metadata={"v": 1})
+    store.create(m)
+    store.update(m.id, metadata={"v": 2, "added": "yes"})
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {"v": 2, "added": "yes"}
+
+
+def test_store_update_rejects_unknown_field_still(store: MemoryStore) -> None:
+    """Update's unknown-field guard still works after the metadata addition."""
+    m = _mem("x")
+    store.create(m)
+    with pytest.raises(ValueError, match="Unknown update field"):
+        store.update(m.id, nonsense_field="oops")
+
+
+def test_store_row_with_null_metadata_string_returns_empty_dict(store: MemoryStore) -> None:
+    """A row whose metadata_json column is the literal JSON null string
+    (not the SQL NULL) must NOT materialise Memory.metadata as None.
+
+    Belt-and-braces guard against manually-edited DBs or a future writer
+    that mistakenly calls json.dumps(None). Without the type check in
+    _safe_load_metadata, `json.loads('null')` → None would silently poison
+    every consumer doing memory.metadata.get(...).
+    """
+    m = _mem("x", metadata={"real": "data"})
+    store.create(m)
+    # Manually poison the row (simulates a bad external writer).
+    store._conn.execute("UPDATE memories SET metadata_json = 'null' WHERE id = ?", (m.id,))
+    store._conn.commit()
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}  # not None
+
+
+def test_store_row_with_malformed_metadata_returns_empty_dict(store: MemoryStore) -> None:
+    """Malformed JSON in metadata_json falls back to {} rather than raising."""
+    m = _mem("x")
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET metadata_json = ? WHERE id = ?", ("{not valid json", m.id)
+    )
+    store._conn.commit()
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_create_reports_memory_id_on_unjsonable_metadata(store: MemoryStore) -> None:
+    """Non-JSON-serialisable metadata surfaces TypeError with the memory id.
+
+    Useful for ETL: with 1,141 records going through create(), a bare
+    'Object of type datetime is not JSON serializable' is useless. The
+    wrapped error names the offending memory id.
+    """
+    m = _mem("x", metadata={"ts": datetime.now(UTC)})  # datetime not JSON-serialisable
+    with pytest.raises(TypeError, match=f"id={m.id!r}"):
+        store.create(m)
+
+
+def test_store_update_empty_metadata_is_explicit_overwrite(store: MemoryStore) -> None:
+    """update(metadata={}) is an explicit overwrite, consistent with update's
+    other fields. Callers who want to skip the field should omit the kwarg.
+    Pinning the semantic — accidental data loss is surfaced by the test.
+    """
+    m = _mem("x", metadata={"source_date": "2024-01-01", "supersedes": "abc"})
+    store.create(m)
+    store.update(m.id, metadata={})
+
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {}
+
+
+def test_store_create_and_get_preserves_nested_metadata(store: MemoryStore) -> None:
+    """Complex nested metadata (dict-of-dict, list, None values) round-trips."""
+    m = _mem(
+        "x",
+        metadata={
+            "nested": {"a": 1, "b": [2, 3]},
+            "list": ["x", "y", None],
+            "null_value": None,
+            "int_val": 42,
+            "float_val": 3.14,
+        },
+    )
+    store.create(m)
+    restored = store.get(m.id)
+    assert restored is not None
+    assert restored.metadata == {
+        "nested": {"a": 1, "b": [2, 3]},
+        "list": ["x", "y", None],
+        "null_value": None,
+        "int_val": 42,
+        "float_val": 3.14,
+    }
