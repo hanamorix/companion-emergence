@@ -59,28 +59,33 @@ def _dream_handler(args: argparse.Namespace) -> int:
             f"No persona directory at {persona_dir} — "
             f"run `nell migrate --install-as {args.persona}` first."
         )
+    # Nested try/finally so a HebbianMatrix open failure still closes the
+    # already-open MemoryStore connection. Inline contextmanager would be
+    # prettier but stores don't implement __enter__/__exit__ yet.
     store = MemoryStore(db_path=persona_dir / "memories.db")
-    hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
-    provider = get_provider(args.provider)
-    engine = DreamEngine(
-        store=store,
-        hebbian=hebbian,
-        embeddings=None,
-        provider=provider,
-        log_path=persona_dir / "dreams.log.jsonl",
-    )
     try:
-        result = engine.run_cycle(
-            seed_id=args.seed,
-            lookback_hours=args.lookback,
-            depth=args.depth,
-            decay_per_hop=args.decay,
-            neighbour_limit=args.limit,
-            dry_run=args.dry_run,
-        )
+        hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        try:
+            provider = get_provider(args.provider)
+            engine = DreamEngine(
+                store=store,
+                hebbian=hebbian,
+                embeddings=None,
+                provider=provider,
+                log_path=persona_dir / "dreams.log.jsonl",
+            )
+            result = engine.run_cycle(
+                seed_id=args.seed,
+                lookback_hours=args.lookback,
+                depth=args.depth,
+                decay_per_hop=args.decay,
+                neighbour_limit=args.limit,
+                dry_run=args.dry_run,
+            )
+        finally:
+            hebbian.close()
     finally:
         store.close()
-        hebbian.close()
 
     if args.dry_run:
         print("Dry run — no writes.")
