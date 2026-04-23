@@ -36,7 +36,6 @@ STUB_COMMANDS = [
     "soul",
     "memory",
     "works",
-    "migrate",
 ]
 
 
