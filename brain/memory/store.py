@@ -31,6 +31,20 @@ def _coerce_utc(ts: str) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
+def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
+    """Decode a metadata_json column value into a dict, defending against
+    manual DB edits or legacy writers that stored the string "null",
+    malformed JSON, or non-dict top-level values.
+    """
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 @dataclass
 class Memory:
     """A single memory — content, context, emotional weight, and metadata.
@@ -197,6 +211,12 @@ class MemoryStore:
 
     def create(self, memory: Memory) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id."""
+        try:
+            metadata_json = json.dumps(memory.metadata)
+        except TypeError as exc:
+            raise TypeError(
+                f"Memory.metadata for id={memory.id!r} contains non-JSON-serialisable values: {exc}"
+            ) from exc
         self._conn.execute(
             """
             INSERT INTO memories (
@@ -218,7 +238,7 @@ class MemoryStore:
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
                 1 if memory.protected else 0,
-                json.dumps(memory.metadata),
+                metadata_json,
             ),
         )
         self._conn.commit()
@@ -377,5 +397,5 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
         protected=bool(row["protected"]),
-        metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+        metadata=_safe_load_metadata(row["metadata_json"]),
     )
