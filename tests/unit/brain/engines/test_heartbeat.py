@@ -28,6 +28,7 @@ def _find_repo_root() -> Path:
 
 
 DEFAULT_REFLEX_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
+DEFAULT_INTERESTS_PATH = _find_repo_root() / "brain" / "engines" / "default_interests.json"
 
 
 def test_heartbeat_config_defaults() -> None:
@@ -685,6 +686,374 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
         assert any("reflex tick raised" in r.message for r in caplog.records)
         # Decay still ran
         assert result.memories_decayed >= 0
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_runs_research_when_enabled(tmp_path: Path) -> None:
+    """Heartbeat fires research when interest is eligible + trigger signal present."""
+    import json
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+    from brain.search.base import NoopWebSearcher
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "marine bio",
+                        "pull_score": 8.0,
+                        "scope": "either",
+                        "related_keywords": ["marine", "bio"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 1,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False,
+        research_enabled=True,
+        research_days_since_human_min=1.5,
+    ).save(config_path)
+
+    from datetime import UTC, datetime, timedelta
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        old_mem = Memory.create_new(
+            content="Hana and I talked long ago",
+            memory_type="conversation",
+            domain="us",
+            emotions={},
+        )
+        store.create(old_mem)
+        store._conn.execute(  # type: ignore[attr-defined]
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=3)).isoformat(), old_mem.id),
+        )
+        store._conn.commit()  # type: ignore[attr-defined]
+
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=tmp_path / "reflex_arcs.json",
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.research_fired == "marine bio"
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path) -> None:
+    """When both reflex and research eligible, reflex fires, research skipped."""
+    import json
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+    from brain.search.base import NoopWebSearcher
+
+    arcs_path = tmp_path / "reflex_arcs.json"
+    arcs_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "arcs": [
+                    {
+                        "name": "test_arc",
+                        "description": "d",
+                        "trigger": {"love": 5},
+                        "days_since_human_min": 0,
+                        "cooldown_hours": 1.0,
+                        "action": "a",
+                        "output_memory_type": "reflex_journal",
+                        "prompt_template": "Hi.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "marine bio",
+                        "pull_score": 8.0,
+                        "scope": "either",
+                        "related_keywords": ["marine"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 1,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=True,
+        research_enabled=True,
+        research_emotion_threshold=5.0,
+    ).save(config_path)
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=arcs_path,
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.reflex_fired == ("test_arc",)
+        assert result.research_fired is None
+        assert result.research_gated_reason == "reflex_won_tie"
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_interest_bump_hook(tmp_path: Path) -> None:
+    """Conversation memory with matching keyword bumps interest pull_score."""
+    import json
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines._interests import InterestSet
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+    from brain.search.base import NoopWebSearcher
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "lispector",
+                        "pull_score": 5.0,
+                        "scope": "either",
+                        "related_keywords": ["lispector", "clarice"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 3,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False,
+        research_enabled=False,
+        interest_bump_per_match=0.5,
+    ).save(config_path)
+
+    from datetime import UTC, datetime, timedelta
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        # Backdate state.last_tick_at to 1h ago so the memory seeded "now"
+        # qualifies as "conversation since last tick" for the ingestion hook.
+        prior_state = HeartbeatState.fresh("manual")
+        prior_state.last_tick_at = datetime.now(UTC) - timedelta(hours=1)
+        prior_state.save(tmp_path / "heartbeat_state.json")
+
+        store.create(
+            Memory.create_new(
+                content="Hana sent me a passage about clarice lispector today",
+                memory_type="conversation",
+                domain="us",
+                emotions={},
+            )
+        )
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=tmp_path / "reflex_arcs.json",
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.interests_bumped == 1
+        reloaded = InterestSet.load(interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert reloaded.interests[0].pull_score == 5.5
+        assert reloaded.interests[0].feed_count == 4
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
+    """Research LLM failure is isolated — tick completes."""
+    import json
+    import logging
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+    from brain.search.base import NoopWebSearcher
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "t",
+                        "pull_score": 8.0,
+                        "scope": "either",
+                        "related_keywords": ["t"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 1,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False, research_enabled=True, research_emotion_threshold=5.0
+    ).save(config_path)
+
+    class FailingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            raise RuntimeError("simulated LLM failure")
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FailingProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=tmp_path / "reflex_arcs.json",
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        with caplog.at_level(logging.WARNING, logger="brain.engines.heartbeat"):
+            result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.research_fired is None
+        assert result.research_gated_reason == "research_raised"
+        assert any("research tick raised" in r.message for r in caplog.records)
     finally:
         store.close()
         hm.close()
