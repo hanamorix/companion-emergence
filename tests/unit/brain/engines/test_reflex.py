@@ -20,7 +20,16 @@ from brain.engines.reflex import (
 )
 from brain.memory.store import Memory, MemoryStore
 
-DEFAULT_ARCS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_reflex_arcs.json"
+
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError(f"Could not find pyproject.toml above {here}")
+
+
+DEFAULT_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
 
 
 def _valid_arc_dict() -> dict:
