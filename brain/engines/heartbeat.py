@@ -548,9 +548,9 @@ class HeartbeatEngine:
                 interests_path=self.interests_path,
                 research_log_path=self.research_log_path,
                 default_interests_path=self.default_interests_path,
+                pull_threshold=6.0,
+                cooldown_hours=config.research_cooldown_hours_per_interest,
             )
-            engine.PULL_THRESHOLD = 6.0
-            engine.COOLDOWN_HOURS = config.research_cooldown_hours_per_interest
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
         except Exception as exc:
             logger.warning("research tick raised; isolating: %.200s", exc)
