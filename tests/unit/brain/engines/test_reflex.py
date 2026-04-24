@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.bridge.provider import FakeProvider
 from brain.engines.reflex import (
     ArcFire,
     ArcSkipped,
@@ -17,7 +18,7 @@ from brain.engines.reflex import (
     ReflexLog,
     ReflexResult,
 )
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore
 
 DEFAULT_ARCS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_reflex_arcs.json"
 
@@ -201,5 +202,288 @@ def test_reflex_engine_construction(tmp_path: Path):
             default_arcs_path=DEFAULT_ARCS_PATH,
         )
         assert engine.persona_name == "TestPersona"
+    finally:
+        store.close()
+
+
+# ---- run_tick ----
+
+
+def _build_engine(tmp_path: Path, store: MemoryStore) -> ReflexEngine:
+    return ReflexEngine(
+        store=store,
+        provider=FakeProvider(),
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
+        arcs_path=tmp_path / "arcs.json",
+        log_path=tmp_path / "log.json",
+        default_arcs_path=DEFAULT_ARCS_PATH,
+    )
+
+
+def _write_single_arc(
+    path: Path,
+    *,
+    trigger: dict,
+    cooldown_hours: float = 1.0,
+    days_since_human_min: float = 0.0,
+    name: str = "test_arc",
+) -> None:
+    arc = {
+        "name": name,
+        "description": "test",
+        "trigger": trigger,
+        "days_since_human_min": days_since_human_min,
+        "cooldown_hours": cooldown_hours,
+        "action": "generate_journal",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "You are {persona_name}. Write something.",
+    }
+    path.write_text(json.dumps({"version": 1, "arcs": [arc]}, indent=2), encoding="utf-8")
+
+
+def _seed_emotion_memory(store: MemoryStore, emotions: dict[str, float]) -> str:
+    mem = Memory.create_new(
+        content="seed",
+        memory_type="conversation",
+        domain="us",
+        emotions=emotions,
+    )
+    store.create(mem)
+    return mem.id
+
+
+def test_run_tick_returns_no_arcs_defined_when_empty(tmp_path: Path):
+    path = tmp_path / "arcs.json"
+    path.write_text(json.dumps({"version": 1, "arcs": []}), encoding="utf-8")
+
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = path
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.arcs_fired == ()
+        assert len(result.arcs_skipped) == 1
+        assert result.arcs_skipped[0].reason == "no_arcs_defined"
+    finally:
+        store.close()
+
+
+def test_run_tick_skips_when_trigger_not_met(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 8})
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 2.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+        assert result.arcs_fired == ()
+        assert any(s.reason == "trigger_not_met" for s in result.arcs_skipped)
+    finally:
+        store.close()
+
+
+def test_run_tick_fires_arc_when_trigger_met(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 5})
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 8.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+        assert len(result.arcs_fired) == 1
+        assert result.arcs_fired[0].arc_name == "test_arc"
+        # Memory was written
+        mem = store.get(result.arcs_fired[0].output_memory_id)
+        assert mem is not None
+        assert mem.memory_type == "reflex_journal"
+    finally:
+        store.close()
+
+
+def test_run_tick_dry_run_reports_would_fire(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 5})
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 8.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=True)
+        assert result.dry_run is True
+        assert result.would_fire == "test_arc"
+        assert result.arcs_fired == ()
+        # No memory written beyond the seed
+        assert store.count() == 1
+        # No log file written
+        assert not (tmp_path / "log.json").exists()
+    finally:
+        store.close()
+
+
+def test_run_tick_respects_cooldown(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 5}, cooldown_hours=24.0)
+
+    # Pre-populate log with a recent fire
+    log_path = tmp_path / "log.json"
+    recent = datetime.now(UTC) - timedelta(hours=1)
+    log = ReflexLog(
+        fires=(
+            ArcFire(
+                arc_name="test_arc",
+                fired_at=recent,
+                trigger_state={"love": 8.0},
+                output_memory_id="prev",
+            ),
+        )
+    )
+    log.save(log_path)
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 8.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+        assert result.arcs_fired == ()
+        assert any(s.reason == "cooldown_active" for s in result.arcs_skipped)
+    finally:
+        store.close()
+
+
+def test_run_tick_ranks_highest_threshold_excess(tmp_path: Path):
+    # Two eligible arcs; the one whose trigger is most exceeded wins.
+    arcs_path = tmp_path / "arcs.json"
+    payload = {
+        "version": 1,
+        "arcs": [
+            {
+                "name": "low_excess",
+                "description": "d",
+                "trigger": {"love": 5},
+                "days_since_human_min": 0,
+                "cooldown_hours": 1.0,
+                "action": "a",
+                "output_memory_type": "reflex_journal",
+                "prompt_template": "t",
+            },
+            {
+                "name": "high_excess",
+                "description": "d",
+                "trigger": {"defiance": 3},
+                "days_since_human_min": 0,
+                "cooldown_hours": 1.0,
+                "action": "a",
+                "output_memory_type": "reflex_journal",
+                "prompt_template": "t",
+            },
+        ],
+    }
+    arcs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 6.0, "defiance": 9.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+        # love excess = 6-5 = 1; defiance excess = 9-3 = 6 — defiance wins
+        assert len(result.arcs_fired) == 1
+        assert result.arcs_fired[0].arc_name == "high_excess"
+        assert any(
+            s.arc_name == "low_excess" and s.reason == "single_fire_cap"
+            for s in result.arcs_skipped
+        )
+    finally:
+        store.close()
+
+
+def test_run_tick_llm_failure_does_not_poison_cooldown(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 5})
+
+    class FailingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            raise RuntimeError("simulated LLM failure")
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 8.0})
+        engine = ReflexEngine(
+            store=store,
+            provider=FailingProvider(),
+            persona_name="Nell",
+            persona_system_prompt="",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=DEFAULT_ARCS_PATH,
+        )
+        with pytest.raises(RuntimeError):
+            engine.run_tick(dry_run=False)
+        # Log file NOT written — next tick can retry
+        assert not (tmp_path / "log.json").exists()
+    finally:
+        store.close()
+
+
+def test_run_tick_template_missing_key_substitutes_zero(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    arc = {
+        "name": "test_arc",
+        "description": "d",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "Unknown: {undefined_var} Love: {love}",
+    }
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": [arc]}), encoding="utf-8")
+
+    captured: list[str] = []
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "ok"
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_emotion_memory(store, {"love": 7.0})
+        engine = ReflexEngine(
+            store=store,
+            provider=CapturingProvider(),
+            persona_name="Nell",
+            persona_system_prompt="",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=DEFAULT_ARCS_PATH,
+        )
+        result = engine.run_tick(dry_run=False)
+        assert len(result.arcs_fired) == 1
+        assert captured[0] == "Unknown: 0 Love: 7.0"
+    finally:
+        store.close()
+
+
+def test_run_tick_days_since_human_gate(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    _write_single_arc(arcs_path, trigger={"love": 5}, days_since_human_min=5.0)
+
+    store = MemoryStore(":memory:")
+    try:
+        # Recent conversation memory — days_since_human ~0
+        _seed_emotion_memory(store, {"love": 8.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+        assert result.arcs_fired == ()
+        assert any(s.reason == "days_since_human_too_low" for s in result.arcs_skipped)
     finally:
         store.close()

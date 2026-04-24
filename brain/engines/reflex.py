@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
-from brain.memory.store import MemoryStore
+from brain.emotion.aggregate import aggregate_state
+from brain.memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +213,7 @@ class ReflexLog:
 
 @dataclass
 class ReflexEngine:
-    """Autonomous emotional-threshold creative expression engine.
-
-    run_tick() implementation ships in Task 2.
-    """
+    """Autonomous emotional-threshold creative expression engine."""
 
     store: MemoryStore
     provider: LLMProvider
@@ -225,7 +224,148 @@ class ReflexEngine:
     default_arcs_path: Path
 
     def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> ReflexResult:
-        raise NotImplementedError("run_tick body lands in Task 2")
+        """Evaluate arcs against current state, fire at most one per tick."""
+        now = datetime.now(UTC)
+
+        arc_set = ReflexArcSet.load(self.arcs_path, default_path=self.default_arcs_path)
+        log = ReflexLog.load(self.log_path)
+
+        if not arc_set.arcs:
+            return ReflexResult(
+                arcs_fired=(),
+                arcs_skipped=(ArcSkipped(arc_name="", reason="no_arcs_defined"),),
+                would_fire=None,
+                dry_run=dry_run,
+                evaluated_at=now,
+            )
+
+        all_mems = self.store.search_text("", active_only=True, limit=None)
+        state = aggregate_state(all_mems)
+        days_since_human = _compute_days_since_human(self.store, now)
+
+        eligible, skipped = self._evaluate(arc_set.arcs, state.emotions, days_since_human, log, now)
+
+        if not eligible:
+            return ReflexResult(
+                arcs_fired=(),
+                arcs_skipped=tuple(skipped),
+                would_fire=None,
+                dry_run=dry_run,
+                evaluated_at=now,
+            )
+
+        winner = self._rank(eligible, state.emotions, log, now)
+        losers = [a for a in eligible if a.name != winner.name]
+        skipped.extend(ArcSkipped(arc_name=a.name, reason="single_fire_cap") for a in losers)
+
+        if dry_run:
+            return ReflexResult(
+                arcs_fired=(),
+                arcs_skipped=tuple(skipped),
+                would_fire=winner.name,
+                dry_run=True,
+                evaluated_at=now,
+            )
+
+        fire = self._fire(winner, state.emotions, days_since_human, all_mems, now)
+        new_log = log.appended(fire)
+        new_log.save(self.log_path)
+
+        return ReflexResult(
+            arcs_fired=(fire,),
+            arcs_skipped=tuple(skipped),
+            would_fire=None,
+            dry_run=False,
+            evaluated_at=now,
+        )
+
+    def _evaluate(
+        self,
+        arcs: tuple[ReflexArc, ...],
+        emotions: Mapping[str, float],
+        days_since_human: float,
+        log: ReflexLog,
+        now: datetime,
+    ) -> tuple[list[ReflexArc], list[ArcSkipped]]:
+        eligible: list[ReflexArc] = []
+        skipped: list[ArcSkipped] = []
+
+        for arc in arcs:
+            if not _trigger_met(arc, emotions):
+                skipped.append(ArcSkipped(arc_name=arc.name, reason="trigger_not_met"))
+                continue
+            if days_since_human < arc.days_since_human_min:
+                skipped.append(ArcSkipped(arc_name=arc.name, reason="days_since_human_too_low"))
+                continue
+            last = log.last_fire_for_arc(arc.name)
+            if last is not None:
+                hours_since = (now - last).total_seconds() / 3600.0
+                if hours_since < arc.cooldown_hours:
+                    skipped.append(ArcSkipped(arc_name=arc.name, reason="cooldown_active"))
+                    continue
+            eligible.append(arc)
+
+        return eligible, skipped
+
+    def _rank(
+        self,
+        eligible: list[ReflexArc],
+        emotions: Mapping[str, float],
+        log: ReflexLog,
+        now: datetime,
+    ) -> ReflexArc:
+        """Highest aggregate threshold-excess wins; ties broken by longest-since-fire."""
+
+        def key(arc: ReflexArc) -> tuple[float, float]:
+            excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
+            last = log.last_fire_for_arc(arc.name)
+            seconds_since = (now - last).total_seconds() if last is not None else float("inf")
+            return (excess, seconds_since)
+
+        return max(eligible, key=key)
+
+    def _fire(
+        self,
+        arc: ReflexArc,
+        emotions: Mapping[str, float],
+        days_since_human: float,
+        all_mems: list,
+        now: datetime,
+    ) -> ArcFire:
+        """Render prompt → call LLM → write memory → return ArcFire."""
+        context: dict = defaultdict(lambda: "0")
+        context["persona_name"] = self.persona_name
+        context["days_since_human"] = f"{days_since_human:.1f}"
+        context["emotion_summary"] = _format_emotion_summary(emotions)
+        context["memory_summary"] = _format_memory_summary(all_mems)
+        for name, value in emotions.items():
+            context[name] = f"{value:.1f}"
+
+        prompt = arc.prompt_template.format_map(context)
+        raw = self.provider.generate(prompt, system=self.persona_system_prompt)
+
+        trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
+
+        mem = Memory.create_new(
+            content=raw,
+            memory_type=arc.output_memory_type,
+            domain="us",
+            emotions={},
+            metadata={
+                "arc_name": arc.name,
+                "trigger_state": trigger_state,
+                "fired_at": _iso_utc(now),
+                "provider": self.provider.name(),
+            },
+        )
+        self.store.create(mem)
+
+        return ArcFire(
+            arc_name=arc.name,
+            fired_at=now,
+            trigger_state=trigger_state,
+            output_memory_id=mem.id,
+        )
 
 
 # ---------- Helpers ----------
@@ -246,3 +386,31 @@ def _parse_iso_utc(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
+    for name, threshold in arc.trigger.items():
+        if emotions.get(name, 0.0) < threshold:
+            return False
+    return True
+
+
+def _compute_days_since_human(store: MemoryStore, now: datetime) -> float:
+    """Days since the most recent `conversation` memory. 999.0 if none exist."""
+    convos = store.list_by_type("conversation", active_only=True, limit=1)
+    if not convos:
+        return 999.0
+    latest = convos[0].created_at
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=UTC)
+    return (now - latest).total_seconds() / 86400.0
+
+
+def _format_emotion_summary(emotions: Mapping[str, float]) -> str:
+    top = sorted(emotions.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    return "\n".join(f"- {name}: {value:.1f}/10" for name, value in top)
+
+
+def _format_memory_summary(memories: list) -> str:
+    top = list(memories)[:3]
+    return "\n".join(f"- {m.content[:140]}" for m in top)
