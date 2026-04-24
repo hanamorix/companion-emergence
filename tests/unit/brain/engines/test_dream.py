@@ -56,6 +56,12 @@ def engine(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> DreamE
         embeddings=None,
         provider=FakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt=(
+            "You are Nell. You just woke from a dream about interconnected memories. "
+            "Reflect in first person, 2-3 sentences, starting with 'DREAM: '. "
+            "Be honest and specific, not abstract."
+        ),
     )
 
 
@@ -295,6 +301,8 @@ def test_run_cycle_auto_prefixes_when_llm_omits_dream_prefix(
         embeddings=None,
         provider=_UnprefixedFakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect in first person.",
     )
     seed = _mem("seed", importance=8.0)
     store.create(seed)
@@ -314,6 +322,8 @@ def test_run_cycle_does_not_double_prefix_when_llm_already_prefixed(
         embeddings=None,
         provider=_PrefixedFakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect in first person.",
     )
     seed = _mem("seed", importance=8.0)
     store.create(seed)
@@ -336,3 +346,78 @@ def test_run_cycle_no_neighbours_branch_surfaces_in_prompt(
     result = engine.run_cycle(dry_run=True)
     assert len(result.neighbours) == 0
     assert "No other memories resonated" in result.prompt
+
+
+def test_dream_system_prompt_uses_persona_name(tmp_path: Path) -> None:
+    """DreamEngine must render the persona name into its system prompt,
+    not hardcode 'Nell'. Multi-persona correctness fix.
+    """
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.dream import DreamEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    captured: dict[str, str | None] = {}
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            captured["system"] = system
+            return "DREAM: test"
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="seed",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 5.0},
+            )
+        )
+        engine = DreamEngine(
+            store=store,
+            hebbian=hm,
+            embeddings=None,
+            provider=CapturingProvider(),
+            persona_name="Iris",
+            persona_system_prompt="You are Iris. Reflect in first person, 2-3 sentences, starting with 'DREAM: '.",
+        )
+        try:
+            engine.run_cycle(lookback_hours=100000)
+        except Exception:
+            pass  # NoSeedAvailable may raise for incomplete setup; voice check still valid
+
+    finally:
+        store.close()
+        hm.close()
+
+    assert captured.get("system") is not None
+    assert "Iris" in captured["system"]
+    assert "Nell" not in captured["system"]
+
+
+def test_dream_engine_empty_persona_raises() -> None:
+    """DreamEngine must reject empty persona_name / persona_system_prompt
+    to force callers to be explicit."""
+    import pytest
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.dream import DreamEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        with pytest.raises(ValueError, match="persona_name"):
+            DreamEngine(
+                store=store,
+                hebbian=hm,
+                embeddings=None,
+                provider=FakeProvider(),
+                # persona_name omitted → should raise
+            )
+    finally:
+        store.close()
+        hm.close()

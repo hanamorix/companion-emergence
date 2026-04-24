@@ -44,7 +44,7 @@ def test_nell_heartbeat_first_tick_initializes(
     """First `nell heartbeat --trigger open` creates state + log; defers work."""
     from brain.cli import main
 
-    rc = main(["heartbeat", "--trigger", "open", "--provider", "fake"])
+    rc = main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"])
     assert rc == 0
     assert (nell_persona / "heartbeat_state.json").exists()
     assert (nell_persona / "heartbeats.log.jsonl").exists()
@@ -56,8 +56,8 @@ def test_nell_heartbeat_second_tick_does_work(nell_persona: Path) -> None:
     """Second invocation does real work and writes updated state."""
     from brain.cli import main
 
-    main(["heartbeat", "--trigger", "open", "--provider", "fake"])  # init
-    rc = main(["heartbeat", "--trigger", "close", "--provider", "fake"])
+    main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"])  # init
+    rc = main(["heartbeat", "--persona", "nell", "--trigger", "close", "--provider", "fake"])
     assert rc == 0
 
     state = json.loads((nell_persona / "heartbeat_state.json").read_text())
@@ -69,7 +69,9 @@ def test_nell_heartbeat_dry_run_no_writes(nell_persona: Path) -> None:
     """--dry-run doesn't create state file or log entry."""
     from brain.cli import main
 
-    rc = main(["heartbeat", "--trigger", "manual", "--provider", "fake", "--dry-run"])
+    rc = main(
+        ["heartbeat", "--persona", "nell", "--trigger", "manual", "--provider", "fake", "--dry-run"]
+    )
     assert rc == 0
     assert not (nell_persona / "heartbeat_state.json").exists()
     assert not (nell_persona / "heartbeats.log.jsonl").exists()
@@ -101,4 +103,4 @@ def test_nell_heartbeat_unknown_trigger_rejected(nell_persona: Path) -> None:
     from brain.cli import main
 
     with pytest.raises(SystemExit):
-        main(["heartbeat", "--trigger", "frobnicate", "--provider", "fake"])
+        main(["heartbeat", "--persona", "nell", "--trigger", "frobnicate", "--provider", "fake"])

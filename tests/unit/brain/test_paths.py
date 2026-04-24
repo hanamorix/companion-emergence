@@ -62,3 +62,31 @@ def test_get_log_dir_is_absolute_path(clean_env: None) -> None:
     result = paths.get_log_dir()
     assert isinstance(result, Path)
     assert result.is_absolute()
+
+
+def test_get_persona_dir_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("../etc/passwd")
+
+
+def test_get_persona_dir_rejects_forward_slash() -> None:
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("a/b")
+
+
+def test_get_persona_dir_rejects_dot_name() -> None:
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("..")
+
+
+def test_get_persona_dir_rejects_empty() -> None:
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("")
+
+
+def test_get_persona_dir_accepts_valid_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    result = paths.get_persona_dir("nell.sandbox")
+    assert result == tmp_path / "personas" / "nell.sandbox"

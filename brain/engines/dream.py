@@ -17,12 +17,6 @@ from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
-_SYSTEM_PROMPT = (
-    "You are Nell. You just woke from a dream about interconnected memories. "
-    "Reflect in first person, 2-3 sentences, starting with 'DREAM: '. "
-    "Be honest and specific, not abstract."
-)
-
 
 class NoSeedAvailable(Exception):  # noqa: N818
     """Raised when there are no conversation memories within the lookback window."""
@@ -50,6 +44,19 @@ class DreamEngine:
     embeddings: EmbeddingCache | None
     provider: LLMProvider
     log_path: Path | None = None
+    persona_name: str = ""
+    persona_system_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.persona_name:
+            raise ValueError(
+                "DreamEngine requires persona_name — construct explicitly, don't rely on a default."
+            )
+        if not self.persona_system_prompt:
+            raise ValueError(
+                "DreamEngine requires persona_system_prompt — construct "
+                "explicitly, don't rely on a default."
+            )
 
     def run_cycle(
         self,
@@ -143,7 +150,7 @@ class DreamEngine:
                 parts.append(f"  - {mem.content[:120]}")
         else:
             parts.append("No other memories resonated with this one yet.")
-        return _SYSTEM_PROMPT, "\n".join(parts)
+        return self.persona_system_prompt, "\n".join(parts)
 
     def _write_dream_memory(
         self,
