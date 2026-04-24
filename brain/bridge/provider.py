@@ -108,11 +108,19 @@ class OllamaProvider(LLMProvider):
 
 
 def get_provider(name: str) -> LLMProvider:
-    """Resolve a provider identifier to an instance. Raises ValueError on unknown."""
+    """Resolve a provider identifier to an instance.
+
+    Raises ValueError on unknown name. Raises NotImplementedError for
+    Phase 1 stubs (ollama) with a user-friendly message pointing to
+    the working alternatives.
+    """
     if name == "fake":
         return FakeProvider()
     if name == "claude-cli":
         return ClaudeCliProvider()
     if name == "ollama":
-        return OllamaProvider()
+        raise NotImplementedError(
+            "The 'ollama' provider is not yet implemented (Phase 1 stub). "
+            "Use 'claude-cli' (default, subscription-backed) or 'fake' (for tests)."
+        )
     raise ValueError(f"Unknown provider: {name!r}")

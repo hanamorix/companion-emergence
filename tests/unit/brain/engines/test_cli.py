@@ -45,7 +45,7 @@ def test_nell_dream_dry_run_with_fake_provider(
     """nell dream --dry-run --provider fake runs without writes + prints summary."""
     from brain.cli import main
 
-    rc = main(["dream", "--dry-run", "--provider", "fake"])
+    rc = main(["dream", "--persona", "nell", "--dry-run", "--provider", "fake"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "first meeting test seed" in out or "Dry run" in out
@@ -57,7 +57,7 @@ def test_nell_dream_real_cycle_with_fake_provider(
     """nell dream --provider fake writes a new dream memory."""
     from brain.cli import main
 
-    rc = main(["dream", "--provider", "fake"])
+    rc = main(["dream", "--persona", "nell", "--provider", "fake"])
     assert rc == 0
 
     store = MemoryStore(db_path=nell_persona / "memories.db")
@@ -67,11 +67,11 @@ def test_nell_dream_real_cycle_with_fake_provider(
 
 
 def test_nell_dream_ollama_surfaces_not_implemented(nell_persona: Path) -> None:
-    """--provider ollama fails cleanly with NotImplementedError."""
+    """--provider ollama fails cleanly with NotImplementedError at factory time."""
     from brain.cli import main
 
-    with pytest.raises(NotImplementedError):
-        main(["dream", "--provider", "ollama"])
+    with pytest.raises(NotImplementedError, match="not yet implemented"):
+        main(["dream", "--persona", "nell", "--provider", "ollama"])
 
 
 def test_nell_dream_unknown_provider_fails(nell_persona: Path) -> None:
@@ -79,7 +79,7 @@ def test_nell_dream_unknown_provider_fails(nell_persona: Path) -> None:
     from brain.cli import main
 
     with pytest.raises(ValueError, match="Unknown provider"):
-        main(["dream", "--provider", "nonsense"])
+        main(["dream", "--persona", "nell", "--provider", "nonsense"])
 
 
 def test_nell_dream_unknown_persona_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -125,7 +125,13 @@ def test_get_provider_resolves_known_names() -> None:
     """get_provider returns the right class for each known name."""
     assert isinstance(get_provider("fake"), FakeProvider)
     assert isinstance(get_provider("claude-cli"), ClaudeCliProvider)
-    assert isinstance(get_provider("ollama"), OllamaProvider)
+
+
+def test_get_provider_ollama_raises_user_friendly_error() -> None:
+    """ollama is a Phase 1 stub — factory should give user a clear
+    message instead of returning an instance that crashes on first use."""
+    with pytest.raises(NotImplementedError, match="not yet implemented"):
+        get_provider("ollama")
 
 
 def test_get_provider_unknown_name_raises() -> None:
