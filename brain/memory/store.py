@@ -192,6 +192,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 """
 
 
+_ALLOWED_FILTER_COLUMNS = frozenset({"domain", "memory_type"})
+
+
 class MemoryStore:
     """SQLite-backed store for Memory records.
 
@@ -368,6 +371,8 @@ class MemoryStore:
     def _list_filter(
         self, column: str, value: str, active_only: bool, limit: int | None
     ) -> list[Memory]:
+        if column not in _ALLOWED_FILTER_COLUMNS:
+            raise ValueError(f"Invalid filter column: {column!r}")
         sql = f"SELECT * FROM memories WHERE {column} = ?"
         params: list[Any] = [value]
         if active_only:

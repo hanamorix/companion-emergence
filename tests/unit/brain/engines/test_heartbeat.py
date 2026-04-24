@@ -176,6 +176,8 @@ def test_heartbeat_engine_construction(tmp_path: Path) -> None:
         config_path=tmp_path / "hb_config.json",
         dream_log_path=tmp_path / "dreams.log.jsonl",
         heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
     )
     assert engine.store is store
     assert engine.hebbian is hebbian
@@ -245,6 +247,8 @@ def live_engine(tmp_path: Path) -> HeartbeatEngine:
         config_path=tmp_path / "hb_config.json",
         dream_log_path=tmp_path / "dreams.log.jsonl",
         heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
     )
 
 
@@ -1057,3 +1061,111 @@ def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
     finally:
         store.close()
         hm.close()
+
+
+def test_heartbeat_memory_uses_persona_name(tmp_path: Path) -> None:
+    """_emit_heartbeat_memory must render persona name into system prompt,
+    not hardcode 'Nell'.
+    """
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    captured = {}
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            captured["system"] = system
+            return "HEARTBEAT: tended"
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False,
+        research_enabled=False,
+        emit_memory="always",
+    ).save(config_path)
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 5.0},
+            )
+        )
+        prior = HeartbeatState.fresh("manual")
+        prior.last_tick_at = datetime.now(UTC) - timedelta(hours=1)
+        prior.save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=CapturingProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            persona_name="Iris",
+            persona_system_prompt="You are Iris.",
+        )
+        engine.run_tick(trigger="manual", dry_run=False)
+
+        assert captured.get("system") is not None
+        assert "Iris" in captured["system"]
+        assert "Nell" not in captured["system"]
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_engine_empty_persona_raises() -> None:
+    """HeartbeatEngine must reject empty persona_name / persona_system_prompt
+    to force callers to be explicit rather than silently get defaults.
+    """
+    from pathlib import Path as _Path
+
+    import pytest
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        with pytest.raises(ValueError, match="persona_name"):
+            HeartbeatEngine(
+                store=store,
+                hebbian=hm,
+                provider=FakeProvider(),
+                state_path=_Path("/tmp/a"),
+                config_path=_Path("/tmp/b"),
+                dream_log_path=_Path("/tmp/c"),
+                heartbeat_log_path=_Path("/tmp/d"),
+                # persona_name omitted → should raise
+            )
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_config_save_is_atomic(tmp_path: Path) -> None:
+    """HeartbeatConfig.save must use .new + os.replace so a crash mid-write
+    leaves either the old valid file or the new valid file — never a
+    partial write. Corruption would silently revert to defaults on reload,
+    losing user-tuned values.
+    """
+    path = tmp_path / "cfg.json"
+    HeartbeatConfig(dream_every_hours=12.0, reflex_enabled=False).save(path)
+    assert path.exists()
+    # .new temp must not linger after save
+    assert not path.with_suffix(path.suffix + ".new").exists()
+    # Reloads cleanly with tuned values preserved
+    loaded = HeartbeatConfig.load(path)
+    assert loaded.dream_every_hours == 12.0
+    assert loaded.reflex_enabled is False
