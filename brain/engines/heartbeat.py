@@ -82,7 +82,11 @@ class HeartbeatConfig:
             return cls()
 
     def save(self, path: Path) -> None:
-        """Write config JSON to path (non-atomic — config is user-edited)."""
+        """Atomic save via .new + os.replace.
+
+        A crash mid-write leaves either the previous valid file or the new
+        valid file — never a partial write that corrupts the user's config.
+        """
         payload = {
             "dream_every_hours": self.dream_every_hours,
             "decay_rate_per_tick": self.decay_rate_per_tick,
@@ -96,7 +100,9 @@ class HeartbeatConfig:
             "research_cooldown_hours_per_interest": self.research_cooldown_hours_per_interest,
             "interest_bump_per_match": self.interest_bump_per_match,
         }
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp = path.with_suffix(path.suffix + ".new")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
 
 @dataclass

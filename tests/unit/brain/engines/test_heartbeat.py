@@ -1152,3 +1152,20 @@ def test_heartbeat_engine_empty_persona_raises() -> None:
     finally:
         store.close()
         hm.close()
+
+
+def test_heartbeat_config_save_is_atomic(tmp_path: Path) -> None:
+    """HeartbeatConfig.save must use .new + os.replace so a crash mid-write
+    leaves either the old valid file or the new valid file — never a
+    partial write. Corruption would silently revert to defaults on reload,
+    losing user-tuned values.
+    """
+    path = tmp_path / "cfg.json"
+    HeartbeatConfig(dream_every_hours=12.0, reflex_enabled=False).save(path)
+    assert path.exists()
+    # .new temp must not linger after save
+    assert not path.with_suffix(path.suffix + ".new").exists()
+    # Reloads cleanly with tuned values preserved
+    loaded = HeartbeatConfig.load(path)
+    assert loaded.dream_every_hours == 12.0
+    assert loaded.reflex_enabled is False

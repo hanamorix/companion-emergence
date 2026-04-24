@@ -124,10 +124,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         else:
             try:
                 og_arcs = extract_arcs_from_og(og_reflex_path)
-                reflex_arcs_target.write_text(
+                _reflex_tmp = reflex_arcs_target.with_suffix(reflex_arcs_target.suffix + ".new")
+                _reflex_tmp.write_text(
                     _json.dumps({"version": 1, "arcs": og_arcs}, indent=2) + "\n",
                     encoding="utf-8",
                 )
+                os.replace(_reflex_tmp, reflex_arcs_target)
                 reflex_arcs_migrated = len(og_arcs)
             except (ValueError, OSError) as exc:
                 reflex_arcs_skipped_reason = f"extract_error: {exc}"
@@ -152,10 +154,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             try:
                 soul_names = extract_soul_names_best_effort(args.input_dir)
                 og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
-                interests_target.write_text(
+                _interests_tmp = interests_target.with_suffix(interests_target.suffix + ".new")
+                _interests_tmp.write_text(
                     _json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
                     encoding="utf-8",
                 )
+                os.replace(_interests_tmp, interests_target)
                 interests_migrated = len(og_interests)
             except (ValueError, FileNotFoundError, OSError) as exc:
                 interests_skipped_reason = f"migrate_error: {exc}"
