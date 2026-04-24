@@ -134,7 +134,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         store.close()
 
     if result.initialized:
-        print("Heartbeat initialized — work deferred until next tick.")
+        if args.dry_run:
+            print("Heartbeat would initialize on first real tick — work deferred.")
+        else:
+            print("Heartbeat initialized — work deferred until next tick.")
     elif args.dry_run:
         print("Heartbeat dry-run — no writes.")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
