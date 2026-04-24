@@ -92,8 +92,8 @@ class ResearchEngine:
     research_log_path: Path
     default_interests_path: Path
 
-    PULL_THRESHOLD: float = 6.0
-    COOLDOWN_HOURS: float = 24.0
+    pull_threshold: float = 6.0
+    cooldown_hours: float = 24.0
 
     def run_tick(
         self,
@@ -108,6 +108,9 @@ class ResearchEngine:
         now = datetime.now(UTC)
 
         interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+        # Load existing log so new fires append cumulatively (rather than
+        # clobbering prior fire history on save). Cooldown logic is driven by
+        # Interest.last_researched_at, not this log — the log is audit-trail only.
         log = ResearchLog.load(self.research_log_path)
 
         if not interests.interests:
@@ -153,8 +156,8 @@ class ResearchEngine:
             winner = interests.find_by_topic(forced_interest_topic)
         else:
             eligible = interests.list_eligible(
-                pull_threshold=self.PULL_THRESHOLD,
-                cooldown_hours=self.COOLDOWN_HOURS,
+                pull_threshold=self.pull_threshold,
+                cooldown_hours=self.cooldown_hours,
                 now=now,
             )
             winner = eligible[0] if eligible else None
