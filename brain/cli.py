@@ -110,6 +110,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             f"run `nell migrate --install-as {args.persona}` first."
         )
     default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
+    searcher = get_searcher(getattr(args, "searcher", "ddgs"))
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
@@ -127,6 +128,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
                 reflex_arcs_path=persona_dir / "reflex_arcs.json",
                 reflex_log_path=persona_dir / "reflex_log.json",
                 reflex_default_arcs_path=default_arcs_path,
+                searcher=searcher,
+                interests_path=persona_dir / "interests.json",
+                research_log_path=persona_dir / "research_log.json",
+                default_interests_path=_default_interests_path(),
                 persona_name=args.persona,
                 persona_system_prompt=f"You are {args.persona}.",
             )
@@ -163,6 +168,12 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             print(f"  reflex fired: {', '.join(result.reflex_fired)}")
         elif result.reflex_skipped_count > 0:
             print(f"  reflex evaluated ({result.reflex_skipped_count} arc(s) skipped)")
+        if result.research_fired:
+            print(f"  research fired: {result.research_fired}")
+        elif result.research_gated_reason and result.research_gated_reason != "not_due":
+            print(f"  research gated: {result.research_gated_reason}")
+        if result.interests_bumped > 0:
+            print(f"  interests bumped: {result.interests_bumped}")
     return 0
 
 
@@ -397,6 +408,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default="claude-cli",
         help="LLM provider: claude-cli (default), fake, ollama.",
+    )
+    hb_sub.add_argument(
+        "--searcher",
+        default="ddgs",
+        choices=["ddgs", "noop", "claude-tool"],
+        help="Web searcher for research engine: ddgs (default), noop, claude-tool.",
     )
     hb_sub.add_argument("--dry-run", action="store_true")
     hb_sub.set_defaults(func=_heartbeat_handler)
