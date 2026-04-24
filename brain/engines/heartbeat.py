@@ -82,7 +82,11 @@ class HeartbeatConfig:
             return cls()
 
     def save(self, path: Path) -> None:
-        """Write config JSON to path (non-atomic — config is user-edited)."""
+        """Atomic save via .new + os.replace.
+
+        A crash mid-write leaves either the previous valid file or the new
+        valid file — never a partial write that corrupts the user's config.
+        """
         payload = {
             "dream_every_hours": self.dream_every_hours,
             "decay_rate_per_tick": self.decay_rate_per_tick,
@@ -96,7 +100,9 @@ class HeartbeatConfig:
             "research_cooldown_hours_per_interest": self.research_cooldown_hours_per_interest,
             "interest_bump_per_match": self.interest_bump_per_match,
         }
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp = path.with_suffix(path.suffix + ".new")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
 
 @dataclass
@@ -211,8 +217,20 @@ class HeartbeatEngine:
     default_interests_path: Path = field(
         default_factory=lambda: Path(__file__).parent / "default_interests.json"
     )
-    persona_name: str = "nell"
-    persona_system_prompt: str = "You are Nell."
+    persona_name: str = ""
+    persona_system_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.persona_name:
+            raise ValueError(
+                "HeartbeatEngine requires persona_name — construct explicitly, "
+                "don't rely on a default."
+            )
+        if not self.persona_system_prompt:
+            raise ValueError(
+                "HeartbeatEngine requires persona_system_prompt — construct "
+                "explicitly, don't rely on a default."
+            )
 
     def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> HeartbeatResult:
         """Run one heartbeat tick.
@@ -401,6 +419,13 @@ class HeartbeatEngine:
             embeddings=None,
             provider=self.provider,
             log_path=self.dream_log_path,
+            persona_name=self.persona_name,
+            persona_system_prompt=(
+                f"You are {self.persona_name}. You just woke from a dream "
+                "about interconnected memories. Reflect in first person, 2-3 "
+                "sentences, starting with 'DREAM: '. Be honest and specific, "
+                "not abstract."
+            ),
         )
         try:
             dream_result = dream_engine.run_cycle(lookback_hours=100000)
@@ -437,7 +462,7 @@ class HeartbeatEngine:
             # a misbehaving arc/provider must not abort decay, dream-gate, or
             # audit-log writes that follow. The exception is logged; the tick
             # continues with an empty reflex result.
-            logger.warning("reflex tick raised; isolating failure: %s", exc)
+            logger.warning("reflex tick raised; isolating: %.200s", exc)
             return ((), 0)
         fired = tuple(f.arc_name for f in result.arcs_fired)
         return (fired, len(result.arcs_skipped))
@@ -523,12 +548,12 @@ class HeartbeatEngine:
                 interests_path=self.interests_path,
                 research_log_path=self.research_log_path,
                 default_interests_path=self.default_interests_path,
+                pull_threshold=6.0,
+                cooldown_hours=config.research_cooldown_hours_per_interest,
             )
-            engine.PULL_THRESHOLD = 6.0
-            engine.COOLDOWN_HOURS = config.research_cooldown_hours_per_interest
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
         except Exception as exc:
-            logger.warning("research tick raised; isolating failure: %s", exc)
+            logger.warning("research tick raised; isolating: %.200s", exc)
             return (None, "research_raised")
 
         if result.fired is not None:
@@ -559,9 +584,9 @@ class HeartbeatEngine:
         from brain.memory.store import Memory
 
         system = (
-            "You are Nell. You just finished a background heartbeat cycle — "
-            "decay applied, memory graph tended. Reflect in first person, "
-            "one short sentence, starting with 'HEARTBEAT: '."
+            f"You are {self.persona_name}. You just finished a background "
+            "heartbeat cycle — decay applied, memory graph tended. Reflect in "
+            "first person, one short sentence, starting with 'HEARTBEAT: '."
         )
         user = (
             f"elapsed={elapsed_seconds / 3600:.1f}h, "
