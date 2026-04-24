@@ -9,8 +9,9 @@ the hosting application (or CI) calls this on app open/close.
 from __future__ import annotations
 
 import json
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -18,6 +19,9 @@ from typing import Literal
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.utils.time import iso_utc, parse_iso_utc
+
+logger = logging.getLogger(__name__)
 
 EmitMemoryMode = Literal["always", "conditional", "never"]
 _VALID_EMIT_MODES: tuple[str, ...] = ("always", "conditional", "never")
@@ -31,6 +35,8 @@ class HeartbeatConfig:
     decay_rate_per_tick: float = 0.01
     gc_threshold: float = 0.01
     emit_memory: EmitMemoryMode = "conditional"
+    reflex_enabled: bool = True
+    reflex_max_fires_per_tick: int = 1
 
     @classmethod
     def load(cls, path: Path) -> HeartbeatConfig:
@@ -54,6 +60,8 @@ class HeartbeatConfig:
                 decay_rate_per_tick=float(data.get("decay_rate_per_tick", 0.01)),
                 gc_threshold=float(data.get("gc_threshold", 0.01)),
                 emit_memory=emit,  # type: ignore[arg-type]
+                reflex_enabled=bool(data.get("reflex_enabled", True)),
+                reflex_max_fires_per_tick=int(data.get("reflex_max_fires_per_tick", 1)),
             )
         except (TypeError, ValueError):
             # Hand-edited config with wrong-type values (e.g. dream_every_hours={}
@@ -68,6 +76,8 @@ class HeartbeatConfig:
             "decay_rate_per_tick": self.decay_rate_per_tick,
             "gc_threshold": self.gc_threshold,
             "emit_memory": self.emit_memory,
+            "reflex_enabled": self.reflex_enabled,
+            "reflex_max_fires_per_tick": self.reflex_max_fires_per_tick,
         }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -96,9 +106,9 @@ class HeartbeatState:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             return cls(
-                last_tick_at=_parse_iso_utc(data["last_tick_at"]),
-                last_dream_at=_parse_iso_utc(data["last_dream_at"]),
-                last_research_at=_parse_iso_utc(data["last_research_at"]),
+                last_tick_at=parse_iso_utc(data["last_tick_at"]),
+                last_dream_at=parse_iso_utc(data["last_dream_at"]),
+                last_research_at=parse_iso_utc(data["last_research_at"]),
                 tick_count=int(data["tick_count"]),
                 last_trigger=str(data["last_trigger"]),
             )
@@ -120,9 +130,9 @@ class HeartbeatState:
     def save(self, path: Path) -> None:
         """Atomic save via write-to-.new + os.replace."""
         payload = {
-            "last_tick_at": _iso_utc(self.last_tick_at),
-            "last_dream_at": _iso_utc(self.last_dream_at),
-            "last_research_at": _iso_utc(self.last_research_at),
+            "last_tick_at": iso_utc(self.last_tick_at),
+            "last_dream_at": iso_utc(self.last_dream_at),
+            "last_research_at": iso_utc(self.last_research_at),
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
         }
@@ -144,13 +154,17 @@ class HeartbeatResult:
     research_deferred: bool
     heartbeat_memory_id: str | None
     initialized: bool
+    reflex_fired: tuple[str, ...] = ()
+    reflex_skipped_count: int = 0
 
 
 @dataclass
 class HeartbeatEngine:
-    """Composes decay + dream + research into one orchestrator tick.
+    """Composes decay + reflex + dream + research into one orchestrator tick.
 
-    run_tick() is implemented in Task 2; this task ships the scaffold only.
+    run_tick() is implemented below; reflex evaluation runs between
+    Hebbian-decay and dream-gate so reflex outputs can seed dreams in
+    the same tick.
     """
 
     store: MemoryStore
@@ -160,6 +174,17 @@ class HeartbeatEngine:
     config_path: Path
     dream_log_path: Path
     heartbeat_log_path: Path
+    # Reflex paths default to None so a HeartbeatEngine constructed without
+    # explicit persona-dir-qualified paths can't silently write to cwd. When
+    # either is None, _try_fire_reflex short-circuits with an empty result.
+    # Production (CLI) always passes all three paths anchored to persona_dir.
+    reflex_arcs_path: Path | None = None
+    reflex_log_path: Path | None = None
+    reflex_default_arcs_path: Path = field(
+        default_factory=lambda: Path(__file__).parent / "default_reflex_arcs.json"
+    )
+    persona_name: str = "nell"
+    persona_system_prompt: str = "You are Nell."
 
     def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> HeartbeatResult:
         """Run one heartbeat tick.
@@ -181,7 +206,7 @@ class HeartbeatEngine:
                 fresh.save(self.state_path)
                 self._append_log(
                     {
-                        "timestamp": _iso_utc(now),
+                        "timestamp": iso_utc(now),
                         "trigger": trigger,
                         "initialized": True,
                         "note": "first-ever tick, work deferred",
@@ -207,6 +232,9 @@ class HeartbeatEngine:
 
         # Hebbian decay + GC
         edges_pruned = self._apply_hebbian_decay_and_gc(config, elapsed_seconds, dry_run=dry_run)
+
+        # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
+        reflex_fired, reflex_skipped_count = self._try_fire_reflex(trigger, dry_run, config)
 
         # Maybe-dream
         dream_id: str | None = None
@@ -245,7 +273,7 @@ class HeartbeatEngine:
 
             self._append_log(
                 {
-                    "timestamp": _iso_utc(now),
+                    "timestamp": iso_utc(now),
                     "trigger": trigger,
                     "initialized": False,
                     "elapsed_seconds": elapsed_seconds,
@@ -253,6 +281,11 @@ class HeartbeatEngine:
                     "edges_pruned": edges_pruned,
                     "dream_id": dream_id,
                     "research_deferred": research_deferred,
+                    "reflex": {
+                        "enabled": config.reflex_enabled,
+                        "fired": list(reflex_fired),
+                        "skipped_count": reflex_skipped_count,
+                    },
                     "tick_count": state.tick_count,
                 }
             )
@@ -267,6 +300,8 @@ class HeartbeatEngine:
             research_deferred=research_deferred,
             heartbeat_memory_id=heartbeat_memory_id,
             initialized=False,
+            reflex_fired=reflex_fired,
+            reflex_skipped_count=reflex_skipped_count,
         )
 
     # --- private helpers ---
@@ -330,6 +365,40 @@ class HeartbeatEngine:
             return None
         return dream_result.memory.id if dream_result.memory is not None else None
 
+    def _try_fire_reflex(
+        self, trigger: str, dry_run: bool, config: HeartbeatConfig
+    ) -> tuple[tuple[str, ...], int]:
+        """Run one reflex tick. Returns (fired_arc_names, skipped_count)."""
+        if not config.reflex_enabled:
+            return ((), 0)
+        if self.reflex_arcs_path is None or self.reflex_log_path is None:
+            # Heartbeat was constructed without explicit reflex paths (common
+            # in unit tests that don't exercise reflex). Skip silently rather
+            # than writing arc/log files to cwd.
+            return ((), 0)
+        from brain.engines.reflex import ReflexEngine
+
+        engine = ReflexEngine(
+            store=self.store,
+            provider=self.provider,
+            persona_name=self.persona_name,
+            persona_system_prompt=self.persona_system_prompt,
+            arcs_path=self.reflex_arcs_path,
+            log_path=self.reflex_log_path,
+            default_arcs_path=self.reflex_default_arcs_path,
+        )
+        try:
+            result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        except Exception as exc:
+            # Fault-isolate reflex failures from the heartbeat tick per spec §7:
+            # a misbehaving arc/provider must not abort decay, dream-gate, or
+            # audit-log writes that follow. The exception is logged; the tick
+            # continues with an empty reflex result.
+            logger.warning("reflex tick raised; isolating failure: %s", exc)
+            return ((), 0)
+        fired = tuple(f.arc_name for f in result.arcs_fired)
+        return (fired, len(result.arcs_skipped))
+
     def _should_emit_memory(
         self,
         config: HeartbeatConfig,
@@ -384,25 +453,3 @@ class HeartbeatEngine:
         """Append one JSON line to heartbeats.log.jsonl."""
         with self.heartbeat_log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-
-
-def _iso_utc(dt: datetime) -> str:
-    """ISO-8601 with Z suffix (matches Week 3.5 manifest format).
-
-    Requires a tz-aware UTC datetime — a naive datetime would silently
-    write a malformed stamp (no Z suffix, no offset) that doesn't parse
-    back cleanly.
-    """
-    if dt.tzinfo is None:
-        raise ValueError("_iso_utc requires a tz-aware datetime")
-    return dt.isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso_utc(s: str) -> datetime:
-    """Parse ISO-8601 Z-suffix timestamp back to tz-aware datetime."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
