@@ -477,9 +477,28 @@ Out of scope for Week 4.6. Documented here so a future engineer reading this spe
 
 ## 15. Out-of-Session Follow-ups
 
+**Feature work:**
 - When Tauri app arrives (Week 6+): arc editor UI that writes `reflex_arcs.json`.
-- When Phase 2 arrives: reflex-emergence engine.
+- When Phase 2 arrives: reflex-emergence engine (autonomous arc crystallization).
 - Optional polish: a `nell reflex list` CLI to show active arcs + last-fired timestamps without triggering evaluation.
+
+**Tech debt (captured post-ship from review notes, 2026-04-24):**
+
+1. **Extract duplicated time helpers.** `_iso_utc` / `_parse_iso_utc` are triplicated across `brain/engines/dream.py`, `brain/engines/heartbeat.py`, `brain/engines/reflex.py`. Extract to `brain/utils/time.py` before the research engine lands (otherwise the fourth copy calcifies the pattern).
+
+2. **Tighten `HeartbeatEngine` reflex-path defaults.** `brain/engines/heartbeat.py:173-174` — `reflex_arcs_path` / `reflex_log_path` default to bare relative paths (`Path("reflex_arcs.json")`). CLI always passes explicit values, but future tests that construct `HeartbeatEngine` directly will silently target cwd. Either require the fields (`Path | None = None` + runtime check) or add a docstring note.
+
+3. **Fix test path fragility.** `tests/unit/brain/engines/test_heartbeat.py:499, 559` and `tests/unit/brain/engines/test_reflex.py` use `Path(__file__).parents[4]` to reach the repo root. Hardcoded depth — future directory moves fail silently. Add a `conftest.py` fixture that walks upward to find `pyproject.toml` as a `REPO_ROOT` sentinel.
+
+4. **Clarify dry-run + first-tick heartbeat message.** `brain/cli.py` `_heartbeat_handler` prints `"Heartbeat initialized — work deferred"` even in `--dry-run` mode, where nothing was actually initialized. Branch the message: dry-run + first-tick should say `"Would initialize on first real tick — work deferred."`
+
+5. **Test style consistency.** `tests/unit/brain/engines/test_heartbeat.py:492, 553` — new reflex integration tests missing `-> None` annotation (inconsistent with file). Also worth a one-line comment explaining the `HeartbeatState.fresh("manual").save(...)` setup pattern for future readers.
+
+6. **Expand `test_og_reflex.py` rename coverage.** Only 1/4 action renames and 1/3 output renames directly exercised. Add a parametrised test covering all 7 rename pairs.
+
+7. **Compact heartbeat CLI output.** As engines accumulate (research next), the success-path output keeps growing. After research lands, consider switching to a compact one-liner + optional `--verbose` that expands per-engine detail.
+
+Full list maintained in the memory file `project_companion_emergence_tech_debt.md`.
 
 ---
 
