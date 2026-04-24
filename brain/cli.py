@@ -60,8 +60,10 @@ def _dream_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
-            f"No persona directory at {persona_dir} — "
-            f"run `nell migrate --install-as {args.persona}` first."
+            f"No persona directory at {persona_dir}. "
+            "If you're porting existing OG NellBrain data, run `nell migrate "
+            f"--input /path/to/og/data --install-as {args.persona}`. "
+            f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
     # Nested try/finally so a HebbianMatrix open failure still closes the
     # already-open MemoryStore connection. Inline contextmanager would be
@@ -112,8 +114,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
-            f"No persona directory at {persona_dir} — "
-            f"run `nell migrate --install-as {args.persona}` first."
+            f"No persona directory at {persona_dir}. "
+            "If you're porting existing OG NellBrain data, run `nell migrate "
+            f"--input /path/to/og/data --install-as {args.persona}`. "
+            f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
     default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
     searcher = get_searcher(getattr(args, "searcher", "ddgs"))
@@ -188,8 +192,10 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
-            f"No persona directory at {persona_dir} — "
-            f"run `nell migrate --install-as {args.persona}` first."
+            f"No persona directory at {persona_dir}. "
+            "If you're porting existing OG NellBrain data, run `nell migrate "
+            f"--input /path/to/og/data --install-as {args.persona}`. "
+            f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
 
     default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
@@ -239,8 +245,10 @@ def _research_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
-            f"No persona directory at {persona_dir} — "
-            f"run `nell migrate --install-as {args.persona}` first."
+            f"No persona directory at {persona_dir}. "
+            "If you're porting existing OG NellBrain data, run `nell migrate "
+            f"--input /path/to/og/data --install-as {args.persona}`. "
+            f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
@@ -378,7 +386,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "dream",
         help="Run one dream cycle against a persona's memory store.",
     )
-    dream_sub.add_argument("--persona", default="nell", help="Persona name (default: nell).")
+    dream_sub.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     dream_sub.add_argument(
         "--seed", default=None, help="Explicit seed memory id (default: auto-select)."
     )
@@ -404,7 +420,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "heartbeat",
         help="Run one heartbeat orchestrator tick against a persona.",
     )
-    hb_sub.add_argument("--persona", default="nell")
+    hb_sub.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     hb_sub.add_argument(
         "--trigger",
         choices=["open", "close", "manual"],
@@ -428,7 +452,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "reflex",
         help="Run one reflex evaluation tick against a persona.",
     )
-    rf_sub.add_argument("--persona", default="nell")
+    rf_sub.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     rf_sub.add_argument(
         "--trigger",
         choices=["open", "close", "manual"],
@@ -447,7 +479,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "research",
         help="Run one research evaluation tick against a persona.",
     )
-    r_sub.add_argument("--persona", default="nell")
+    r_sub.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     r_sub.add_argument(
         "--trigger",
         choices=["manual", "emotion_high", "days_since_human", "open", "close"],
@@ -466,7 +506,15 @@ def _build_parser() -> argparse.ArgumentParser:
     i_actions = i_sub.add_subparsers(dest="action", required=True)
 
     i_list = i_actions.add_parser("list", help="List current interests.")
-    i_list.add_argument("--persona", default="nell")
+    i_list.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     i_list.set_defaults(func=_interest_list_handler)
 
     i_add = i_actions.add_parser("add", help="Add a new interest.")
@@ -474,13 +522,29 @@ def _build_parser() -> argparse.ArgumentParser:
     i_add.add_argument("--keywords", default="")
     i_add.add_argument("--scope", choices=["internal", "external", "either"], default="either")
     i_add.add_argument("--notes", default=None)
-    i_add.add_argument("--persona", default="nell")
+    i_add.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     i_add.set_defaults(func=_interest_add_handler)
 
     i_bump = i_actions.add_parser("bump", help="Nudge an interest's pull_score.")
     i_bump.add_argument("topic")
     i_bump.add_argument("--amount", type=float, default=1.0)
-    i_bump.add_argument("--persona", default="nell")
+    i_bump.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
+            "To start fresh: create personas/<name>/ manually."
+        ),
+    )
     i_bump.set_defaults(func=_interest_bump_handler)
 
     return parser
