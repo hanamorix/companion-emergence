@@ -169,3 +169,50 @@ def test_run_migrate_install_as_refuses_without_force(
     args = MigrateArgs(input_dir=og_dir, output_dir=None, install_as="nell", force=False)
     with pytest.raises(FileExistsError, match="persona"):
         run_migrate(args)
+
+
+def test_migrate_writes_reflex_arcs(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: migrator writes reflex_arcs.json from OG reflex_engine.py."""
+    import textwrap
+
+    # og_dir is tmp_path/og_data — reflex_engine.py lives one level up (NellBrain root).
+    # The migrator's second candidate path is args.input_dir.parent / "reflex_engine.py".
+    reflex_src = textwrap.dedent("""\
+        REFLEX_ARCS = {
+            "creative_pitch": {
+                "trigger": {"creative_hunger": 9},
+                "days_since_min": 0,
+                "action": "generate_story_pitch",
+                "output": "gifts",
+                "cooldown_hours": 48,
+                "description": "d",
+                "prompt_template": "t"
+            }
+        }
+    """)
+    (tmp_path / "reflex_engine.py").write_text(reflex_src, encoding="utf-8")
+
+    persona_root = tmp_path / "persona_root"
+    persona_root.mkdir()
+    monkeypatch.setenv("NELLBRAIN_HOME", str(persona_root))
+
+    args = MigrateArgs(
+        input_dir=og_dir,
+        output_dir=None,
+        install_as="testpersona",
+        force=False,
+    )
+    report = run_migrate(args)
+
+    from brain.paths import get_persona_dir
+
+    target = get_persona_dir("testpersona") / "reflex_arcs.json"
+    assert target.exists()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert len(data["arcs"]) == 1
+    assert data["arcs"][0]["name"] == "creative_pitch"
+    assert data["arcs"][0]["output_memory_type"] == "reflex_gift"
+    assert report.reflex_arcs_migrated == 1
+    assert report.reflex_arcs_skipped_reason is None
