@@ -77,6 +77,12 @@ def _dream_handler(args: argparse.Namespace) -> int:
                 embeddings=None,
                 provider=provider,
                 log_path=persona_dir / "dreams.log.jsonl",
+                persona_name=args.persona,
+                persona_system_prompt=(
+                    f"You are {args.persona}. You just woke from a dream about "
+                    "interconnected memories. Reflect in first person, 2-3 sentences, "
+                    "starting with 'DREAM: '. Be honest and specific, not abstract."
+                ),
             )
             result = engine.run_cycle(
                 seed_id=args.seed,
