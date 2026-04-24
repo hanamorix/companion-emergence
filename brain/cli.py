@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from brain import __version__
 from brain.bridge.provider import get_provider
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine
+from brain.engines.reflex import ReflexEngine
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
@@ -24,7 +26,6 @@ from brain.paths import get_persona_dir
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
-    "reflex",
     "status",
     "rest",
     "soul",
@@ -105,6 +106,8 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             f"No persona directory at {persona_dir} — "
             f"run `nell migrate --install-as {args.persona}` first."
         )
+    default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
+
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
@@ -118,6 +121,11 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
                 config_path=persona_dir / "heartbeat_config.json",
                 dream_log_path=persona_dir / "dreams.log.jsonl",
                 heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+                reflex_arcs_path=persona_dir / "reflex_arcs.json",
+                reflex_log_path=persona_dir / "reflex_log.json",
+                reflex_default_arcs_path=default_arcs_path,
+                persona_name=args.persona,
+                persona_system_prompt=f"You are {args.persona}.",
             )
             result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
         finally:
@@ -126,7 +134,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         store.close()
 
     if result.initialized:
-        print("Heartbeat initialized — work deferred until next tick.")
+        if args.dry_run:
+            print("Heartbeat would initialize on first real tick — work deferred.")
+        else:
+            print("Heartbeat initialized — work deferred until next tick.")
     elif args.dry_run:
         print("Heartbeat dry-run — no writes.")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
@@ -145,6 +156,57 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             print(f"  dream fired: {result.dream_id}")
         else:
             print(f"  dream gated: {result.dream_gated_reason or 'gated'}")
+        if result.reflex_fired:
+            print(f"  reflex fired: {', '.join(result.reflex_fired)}")
+        elif result.reflex_skipped_count > 0:
+            print(f"  reflex evaluated ({result.reflex_skipped_count} arc(s) skipped)")
+    return 0
+
+
+def _reflex_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell reflex` to the ReflexEngine."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir} — "
+            f"run `nell migrate --install-as {args.persona}` first."
+        )
+
+    default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
+
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        provider = get_provider(args.provider)
+        engine = ReflexEngine(
+            store=store,
+            provider=provider,
+            persona_name=args.persona,
+            persona_system_prompt=f"You are {args.persona}.",
+            arcs_path=persona_dir / "reflex_arcs.json",
+            log_path=persona_dir / "reflex_log.json",
+            default_arcs_path=default_arcs_path,
+        )
+        result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
+    finally:
+        store.close()
+
+    if result.dry_run:
+        if result.would_fire is not None:
+            print(f"Reflex dry-run — would fire: {result.would_fire}.")
+        else:
+            print("Reflex dry-run — no arc eligible.")
+    elif result.arcs_fired:
+        fired = result.arcs_fired[0]
+        print(f"Reflex fired: {fired.arc_name}")
+        print(f"  Memory id: {fired.output_memory_id}")
+    else:
+        print("Reflex evaluated — no arc fired.")
+
+    if result.arcs_skipped:
+        skip_strs = [f"{s.arc_name} ({s.reason})" for s in result.arcs_skipped if s.arc_name]
+        if skip_strs:
+            print(f"  Skipped: {', '.join(skip_strs)}")
+
     return 0
 
 
@@ -213,6 +275,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     hb_sub.add_argument("--dry-run", action="store_true")
     hb_sub.set_defaults(func=_heartbeat_handler)
+
+    rf_sub = subparsers.add_parser(
+        "reflex",
+        help="Run one reflex evaluation tick against a persona.",
+    )
+    rf_sub.add_argument("--persona", default="nell")
+    rf_sub.add_argument(
+        "--trigger",
+        choices=["open", "close", "manual"],
+        default="manual",
+    )
+    rf_sub.add_argument(
+        "--provider",
+        default="claude-cli",
+        help="LLM provider: claude-cli (default), fake, ollama.",
+    )
+    rf_sub.add_argument("--dry-run", action="store_true")
+    rf_sub.set_defaults(func=_reflex_handler)
 
     return parser
 
