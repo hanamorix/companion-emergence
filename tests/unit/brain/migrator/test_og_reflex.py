@@ -52,3 +52,62 @@ def test_extract_arcs_no_dict_raises(tmp_path: Path):
     path.write_text("# no arcs here\n", encoding="utf-8")
     with pytest.raises(ValueError):
         extract_arcs_from_og(path)
+
+
+@pytest.mark.parametrize(
+    "og_action,expected_action",
+    [
+        ("generate_story_pitch", "generate_pitch"),
+        ("write_journal", "generate_journal"),
+        ("write_gift", "generate_gift"),
+        ("write_memory", "generate_reflection"),
+        ("unknown_custom_action", "unknown_custom_action"),  # passthrough
+    ],
+)
+def test_action_renames(tmp_path: Path, og_action: str, expected_action: str):
+    src = textwrap.dedent(f'''\
+        REFLEX_ARCS = {{
+            "arc": {{
+                "trigger": {{"love": 5}},
+                "days_since_min": 0,
+                "action": "{og_action}",
+                "output": "journal",
+                "cooldown_hours": 1,
+                "description": "d",
+                "prompt_template": "t"
+            }}
+        }}
+    ''')
+    path = tmp_path / "reflex_engine.py"
+    path.write_text(src, encoding="utf-8")
+    arcs = extract_arcs_from_og(path)
+    assert arcs[0]["action"] == expected_action
+
+
+@pytest.mark.parametrize(
+    "og_output,expected_memory_type",
+    [
+        ("journal", "reflex_journal"),
+        ("gifts", "reflex_gift"),
+        ("memories", "reflex_memory"),
+        ("unknown_custom_output", "unknown_custom_output"),  # passthrough
+    ],
+)
+def test_output_renames(tmp_path: Path, og_output: str, expected_memory_type: str):
+    src = textwrap.dedent(f'''\
+        REFLEX_ARCS = {{
+            "arc": {{
+                "trigger": {{"love": 5}},
+                "days_since_min": 0,
+                "action": "write_journal",
+                "output": "{og_output}",
+                "cooldown_hours": 1,
+                "description": "d",
+                "prompt_template": "t"
+            }}
+        }}
+    ''')
+    path = tmp_path / "reflex_engine.py"
+    path.write_text(src, encoding="utf-8")
+    arcs = extract_arcs_from_og(path)
+    assert arcs[0]["output_memory_type"] == expected_memory_type
