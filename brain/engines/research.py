@@ -17,6 +17,8 @@ from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
+from brain.utils.emotion import format_emotion_summary
+from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -118,10 +120,10 @@ class ResearchEngine:
             )
 
         # Gate: need a trigger signal OR a forced interest.
-        days_since_human = (
+        days_since = (
             days_since_human_override
             if days_since_human_override is not None
-            else _compute_days_since_human(self.store, now)
+            else days_since_human(self.store, now)
         )
         emo_state = emotion_state_override
         if emo_state is None:
@@ -134,7 +136,7 @@ class ResearchEngine:
 
         gate_ok = (
             forced_interest_topic is not None
-            or days_since_human >= 1.5  # research_days_since_human_min default
+            or days_since >= 1.5  # research_days_since_human_min default
             or emo_peak >= 7.0  # research_emotion_threshold default
         )
         if not gate_ok:
@@ -292,8 +294,7 @@ class ResearchEngine:
     def _render_prompt(
         self, interest: Interest, memory_context: str, web_results: list, emo_state
     ) -> str:
-        top = sorted(emo_state.emotions.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        emo_summary = "\n".join(f"- {name}: {value:.1f}/10" for name, value in top) or "(neutral)"
+        emo_summary = format_emotion_summary(emo_state.emotions) or "(neutral)"
 
         if web_results:
             excerpts = "\n".join(
@@ -317,17 +318,6 @@ class ResearchEngine:
 
 
 # ---------- Module-level helpers ----------
-
-
-def _compute_days_since_human(store: MemoryStore, now: datetime) -> float:
-    """Days since most recent memory_type='conversation'. 999.0 if none."""
-    convos = store.list_by_type("conversation", active_only=True, limit=1)
-    if not convos:
-        return 999.0
-    latest = convos[0].created_at
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=UTC)
-    return (now - latest).total_seconds() / 86400.0
 
 
 def _create_research_memory(

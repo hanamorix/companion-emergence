@@ -19,6 +19,8 @@ from pathlib import Path
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
 from brain.memory.store import Memory, MemoryStore
+from brain.utils.emotion import format_emotion_summary
+from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -242,9 +244,9 @@ class ReflexEngine:
 
         all_mems = self.store.search_text("", active_only=True, limit=None)
         state = aggregate_state(all_mems)
-        days_since_human = _compute_days_since_human(self.store, now)
+        days_since = days_since_human(self.store, now)
 
-        eligible, skipped = self._evaluate(arc_set.arcs, state.emotions, days_since_human, log, now)
+        eligible, skipped = self._evaluate(arc_set.arcs, state.emotions, days_since, log, now)
 
         if not eligible:
             return ReflexResult(
@@ -268,7 +270,7 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        fire = self._fire(winner, state.emotions, days_since_human, all_mems, now)
+        fire = self._fire(winner, state.emotions, days_since, all_mems, now)
         new_log = log.appended(fire)
         new_log.save(self.log_path)
 
@@ -337,7 +339,7 @@ class ReflexEngine:
         context: dict = defaultdict(lambda: "0")
         context["persona_name"] = self.persona_name
         context["days_since_human"] = f"{days_since_human:.1f}"
-        context["emotion_summary"] = _format_emotion_summary(emotions)
+        context["emotion_summary"] = format_emotion_summary(emotions)
         context["memory_summary"] = _format_memory_summary(all_mems)
         for name, value in emotions.items():
             context[name] = f"{value:.1f}"
@@ -374,22 +376,6 @@ def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
         if emotions.get(name, 0.0) < threshold:
             return False
     return True
-
-
-def _compute_days_since_human(store: MemoryStore, now: datetime) -> float:
-    """Days since the most recent `conversation` memory. 999.0 if none exist."""
-    convos = store.list_by_type("conversation", active_only=True, limit=1)
-    if not convos:
-        return 999.0
-    latest = convos[0].created_at
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=UTC)
-    return (now - latest).total_seconds() / 86400.0
-
-
-def _format_emotion_summary(emotions: Mapping[str, float]) -> str:
-    top = sorted(emotions.items(), key=lambda kv: kv[1], reverse=True)[:5]
-    return "\n".join(f"- {name}: {value:.1f}/10" for name, value in top)
 
 
 def _format_memory_summary(memories: list) -> str:
