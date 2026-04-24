@@ -14,13 +14,16 @@ from pathlib import Path
 
 from brain import __version__
 from brain.bridge.provider import get_provider
+from brain.engines._interests import Interest, InterestSet
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
+from brain.engines.research import ResearchEngine
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
 from brain.paths import get_persona_dir
+from brain.search.factory import get_searcher
 
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
@@ -210,6 +213,128 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_interests_path() -> Path:
+    return Path(__file__).parent / "engines" / "default_interests.json"
+
+
+def _research_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell research` to the ResearchEngine."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir} — "
+            f"run `nell migrate --install-as {args.persona}` first."
+        )
+
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        provider = get_provider(args.provider)
+        searcher = get_searcher(args.searcher)
+        engine = ResearchEngine(
+            store=store,
+            provider=provider,
+            searcher=searcher,
+            persona_name=args.persona,
+            persona_system_prompt=f"You are {args.persona}.",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=_default_interests_path(),
+        )
+        result = engine.run_tick(
+            trigger=args.trigger,
+            dry_run=args.dry_run,
+            forced_interest_topic=args.interest,
+        )
+    finally:
+        store.close()
+
+    if result.dry_run:
+        if result.would_fire is not None:
+            print(f"Research dry-run — would fire: {result.would_fire}.")
+        else:
+            print(f"Research dry-run — {result.reason or 'no eligible interest'}.")
+    elif result.fired is not None:
+        print(f"Research fired: {result.fired.topic}")
+        print(f"  Memory id: {result.fired.output_memory_id}")
+        print(
+            f"  Web: {result.fired.web_result_count} results via "
+            f"{searcher.name() if result.fired.web_used else 'memory-only'}"
+        )
+    else:
+        print(f"Research evaluated — {result.reason or 'no fire'}.")
+    return 0
+
+
+def _interest_list_handler(args: argparse.Namespace) -> int:
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    interests = InterestSet.load(
+        persona_dir / "interests.json", default_path=_default_interests_path()
+    )
+    print(f"Interests for persona {args.persona!r} ({len(interests.interests)}):")
+    for i in interests.interests:
+        last = (
+            i.last_researched_at.isoformat().replace("+00:00", "Z")
+            if i.last_researched_at
+            else "never"
+        )
+        print(
+            f"  - {i.topic:<40} pull={i.pull_score:.1f}  scope={i.scope:<8}  last_researched={last}"
+        )
+        print(f"    keywords: {', '.join(i.related_keywords)}")
+    return 0
+
+
+def _interest_add_handler(args: argparse.Namespace) -> int:
+    import uuid
+    from datetime import UTC, datetime
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    interests_path = persona_dir / "interests.json"
+    interests = InterestSet.load(interests_path, default_path=_default_interests_path())
+    now = datetime.now(UTC)
+    new_interest = Interest(
+        id=str(uuid.uuid4()),
+        topic=args.topic,
+        pull_score=5.0,
+        scope=args.scope,
+        related_keywords=tuple(k.strip() for k in args.keywords.split(",") if k.strip()),
+        notes=args.notes or "",
+        first_seen=now,
+        last_fed=now,
+        last_researched_at=None,
+        feed_count=0,
+        source_types=("manual",),
+    )
+    interests.upsert(new_interest).save(interests_path)
+    print(f"Added interest: {new_interest.topic} (pull_score=5.0, scope={new_interest.scope})")
+    return 0
+
+
+def _interest_bump_handler(args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    interests_path = persona_dir / "interests.json"
+    interests = InterestSet.load(interests_path, default_path=_default_interests_path())
+    if interests.find_by_topic(args.topic) is None:
+        print(f"Interest not found: {args.topic!r}")
+        return 1
+    updated = interests.bump(args.topic, amount=args.amount, now=datetime.now(UTC))
+    updated.save(interests_path)
+    bumped = updated.find_by_topic(args.topic)
+    assert bumped is not None
+    print(
+        f"Bumped {args.topic!r}: pull_score={bumped.pull_score:.1f}, feed_count={bumped.feed_count}"
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -293,6 +418,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rf_sub.add_argument("--dry-run", action="store_true")
     rf_sub.set_defaults(func=_reflex_handler)
+
+    # nell research
+    r_sub = subparsers.add_parser(
+        "research",
+        help="Run one research evaluation tick against a persona.",
+    )
+    r_sub.add_argument("--persona", default="nell")
+    r_sub.add_argument(
+        "--trigger",
+        choices=["manual", "emotion_high", "days_since_human", "open", "close"],
+        default="manual",
+    )
+    r_sub.add_argument("--provider", default="claude-cli")
+    r_sub.add_argument("--searcher", default="ddgs", choices=["ddgs", "noop", "claude-tool"])
+    r_sub.add_argument(
+        "--interest", default=None, help="Force-research this topic, bypassing gates."
+    )
+    r_sub.add_argument("--dry-run", action="store_true")
+    r_sub.set_defaults(func=_research_handler)
+
+    # nell interest <list|add|bump>
+    i_sub = subparsers.add_parser("interest", help="Manage persona interests.")
+    i_actions = i_sub.add_subparsers(dest="action", required=True)
+
+    i_list = i_actions.add_parser("list", help="List current interests.")
+    i_list.add_argument("--persona", default="nell")
+    i_list.set_defaults(func=_interest_list_handler)
+
+    i_add = i_actions.add_parser("add", help="Add a new interest.")
+    i_add.add_argument("topic")
+    i_add.add_argument("--keywords", default="")
+    i_add.add_argument("--scope", choices=["internal", "external", "either"], default="either")
+    i_add.add_argument("--notes", default=None)
+    i_add.add_argument("--persona", default="nell")
+    i_add.set_defaults(func=_interest_add_handler)
+
+    i_bump = i_actions.add_parser("bump", help="Nudge an interest's pull_score.")
+    i_bump.add_argument("topic")
+    i_bump.add_argument("--amount", type=float, default=1.0)
+    i_bump.add_argument("--persona", default="nell")
+    i_bump.set_defaults(func=_interest_bump_handler)
 
     return parser
 
