@@ -19,6 +19,7 @@ from pathlib import Path
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
 from brain.memory.store import Memory, MemoryStore
+from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ class ArcFire:
     def to_dict(self) -> dict:
         return {
             "arc": self.arc_name,
-            "fired_at": _iso_utc(self.fired_at),
+            "fired_at": iso_utc(self.fired_at),
             "trigger_state": dict(self.trigger_state),
             "output_memory_id": self.output_memory_id,
         }
@@ -94,7 +95,7 @@ class ArcFire:
     def from_dict(cls, data: dict) -> ArcFire:
         return cls(
             arc_name=str(data["arc"]),
-            fired_at=_parse_iso_utc(data["fired_at"]),
+            fired_at=parse_iso_utc(data["fired_at"]),
             trigger_state={str(k): float(v) for k, v in data.get("trigger_state", {}).items()},
             output_memory_id=data.get("output_memory_id"),
         )
@@ -354,7 +355,7 @@ class ReflexEngine:
             metadata={
                 "arc_name": arc.name,
                 "trigger_state": trigger_state,
-                "fired_at": _iso_utc(now),
+                "fired_at": iso_utc(now),
                 "provider": self.provider.name(),
             },
         )
@@ -366,26 +367,6 @@ class ReflexEngine:
             trigger_state=trigger_state,
             output_memory_id=mem.id,
         )
-
-
-# ---------- Helpers ----------
-
-
-def _iso_utc(dt: datetime) -> str:
-    """ISO-8601 with Z suffix. Requires tz-aware datetime."""
-    if dt.tzinfo is None:
-        raise ValueError("_iso_utc requires a tz-aware datetime")
-    return dt.isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso_utc(s: str) -> datetime:
-    """Parse ISO-8601 Z-suffix timestamp back to tz-aware datetime."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
 
 
 def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
