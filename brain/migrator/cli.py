@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json as _json
 import os
 import shutil
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
+from brain.migrator.og_reflex import extract_arcs_from_og
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
@@ -101,6 +103,36 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     finally:
         hebbian.close()
 
+    # ---- reflex arcs ----
+    # --input points at OG's data/ dir, but reflex_engine.py sits one level
+    # up at NellBrain root. Try both locations so the migrator works whether
+    # the user points at NellBrain/ or NellBrain/data/.
+    _candidate_reflex_paths = [
+        args.input_dir / "reflex_engine.py",
+        args.input_dir.parent / "reflex_engine.py",
+    ]
+    og_reflex_path = next((p for p in _candidate_reflex_paths if p.exists()), None)
+
+    reflex_arcs_target = work_dir / "reflex_arcs.json"
+    reflex_arcs_migrated = 0
+    reflex_arcs_skipped_reason: str | None = None
+
+    if og_reflex_path is not None:
+        if reflex_arcs_target.exists() and not args.force:
+            reflex_arcs_skipped_reason = "existing_file_not_overwritten"
+        else:
+            try:
+                og_arcs = extract_arcs_from_og(og_reflex_path)
+                reflex_arcs_target.write_text(
+                    _json.dumps({"version": 1, "arcs": og_arcs}, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                reflex_arcs_migrated = len(og_arcs)
+            except (ValueError, OSError) as exc:
+                reflex_arcs_skipped_reason = f"extract_error: {exc}"
+    else:
+        reflex_arcs_skipped_reason = "og_reflex_engine_py_not_found"
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -119,6 +151,8 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         source_manifest=manifest,
         next_steps_inspect_cmds=inspect_cmds,
         next_steps_install_cmd=install_cmd,
+        reflex_arcs_migrated=reflex_arcs_migrated,
+        reflex_arcs_skipped_reason=reflex_arcs_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
