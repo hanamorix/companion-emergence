@@ -14,6 +14,7 @@ from pathlib import Path
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
+from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
 from brain.migrator.og_reflex import extract_arcs_from_og
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
@@ -133,6 +134,34 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     else:
         reflex_arcs_skipped_reason = "og_reflex_engine_py_not_found"
 
+    # ---- interests ----
+    _candidate_interests_paths = [
+        args.input_dir / "nell_interests.json",
+        args.input_dir / "data" / "nell_interests.json",
+        args.input_dir.parent / "nell_interests.json",
+    ]
+    og_interests_path = next((p for p in _candidate_interests_paths if p.exists()), None)
+    interests_target = work_dir / "interests.json"
+    interests_migrated = 0
+    interests_skipped_reason: str | None = None
+
+    if og_interests_path is not None:
+        if interests_target.exists() and not args.force:
+            interests_skipped_reason = "existing_file_not_overwritten"
+        else:
+            try:
+                soul_names = extract_soul_names_best_effort(args.input_dir)
+                og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
+                interests_target.write_text(
+                    _json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                interests_migrated = len(og_interests)
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                interests_skipped_reason = f"migrate_error: {exc}"
+    else:
+        interests_skipped_reason = "og_nell_interests_json_not_found"
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -153,6 +182,8 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         next_steps_install_cmd=install_cmd,
         reflex_arcs_migrated=reflex_arcs_migrated,
         reflex_arcs_skipped_reason=reflex_arcs_skipped_reason,
+        interests_migrated=interests_migrated,
+        interests_skipped_reason=interests_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
