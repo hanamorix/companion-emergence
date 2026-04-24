@@ -19,6 +19,7 @@ from typing import Literal
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +106,9 @@ class HeartbeatState:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             return cls(
-                last_tick_at=_parse_iso_utc(data["last_tick_at"]),
-                last_dream_at=_parse_iso_utc(data["last_dream_at"]),
-                last_research_at=_parse_iso_utc(data["last_research_at"]),
+                last_tick_at=parse_iso_utc(data["last_tick_at"]),
+                last_dream_at=parse_iso_utc(data["last_dream_at"]),
+                last_research_at=parse_iso_utc(data["last_research_at"]),
                 tick_count=int(data["tick_count"]),
                 last_trigger=str(data["last_trigger"]),
             )
@@ -129,9 +130,9 @@ class HeartbeatState:
     def save(self, path: Path) -> None:
         """Atomic save via write-to-.new + os.replace."""
         payload = {
-            "last_tick_at": _iso_utc(self.last_tick_at),
-            "last_dream_at": _iso_utc(self.last_dream_at),
-            "last_research_at": _iso_utc(self.last_research_at),
+            "last_tick_at": iso_utc(self.last_tick_at),
+            "last_dream_at": iso_utc(self.last_dream_at),
+            "last_research_at": iso_utc(self.last_research_at),
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
         }
@@ -201,7 +202,7 @@ class HeartbeatEngine:
                 fresh.save(self.state_path)
                 self._append_log(
                     {
-                        "timestamp": _iso_utc(now),
+                        "timestamp": iso_utc(now),
                         "trigger": trigger,
                         "initialized": True,
                         "note": "first-ever tick, work deferred",
@@ -268,7 +269,7 @@ class HeartbeatEngine:
 
             self._append_log(
                 {
-                    "timestamp": _iso_utc(now),
+                    "timestamp": iso_utc(now),
                     "trigger": trigger,
                     "initialized": False,
                     "elapsed_seconds": elapsed_seconds,
@@ -443,25 +444,3 @@ class HeartbeatEngine:
         """Append one JSON line to heartbeats.log.jsonl."""
         with self.heartbeat_log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-
-
-def _iso_utc(dt: datetime) -> str:
-    """ISO-8601 with Z suffix (matches Week 3.5 manifest format).
-
-    Requires a tz-aware UTC datetime — a naive datetime would silently
-    write a malformed stamp (no Z suffix, no offset) that doesn't parse
-    back cleanly.
-    """
-    if dt.tzinfo is None:
-        raise ValueError("_iso_utc requires a tz-aware datetime")
-    return dt.isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso_utc(s: str) -> datetime:
-    """Parse ISO-8601 Z-suffix timestamp back to tz-aware datetime."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
