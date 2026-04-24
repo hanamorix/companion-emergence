@@ -590,3 +590,13 @@ def test_store_create_and_get_preserves_nested_metadata(store: MemoryStore) -> N
         "int_val": 42,
         "float_val": 3.14,
     }
+
+
+def test_list_filter_rejects_unknown_column() -> None:
+    """_list_filter raises ValueError for column names not in the allowlist."""
+    store = MemoryStore(":memory:")
+    try:
+        with pytest.raises(ValueError, match="Invalid filter column"):
+            store._list_filter("created_at; DROP TABLE memories--", "x", True, None)
+    finally:
+        store.close()

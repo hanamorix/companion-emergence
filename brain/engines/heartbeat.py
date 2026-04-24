@@ -437,7 +437,7 @@ class HeartbeatEngine:
             # a misbehaving arc/provider must not abort decay, dream-gate, or
             # audit-log writes that follow. The exception is logged; the tick
             # continues with an empty reflex result.
-            logger.warning("reflex tick raised; isolating failure: %s", exc)
+            logger.warning("reflex tick raised; isolating: %.200s", exc)
             return ((), 0)
         fired = tuple(f.arc_name for f in result.arcs_fired)
         return (fired, len(result.arcs_skipped))
@@ -528,7 +528,7 @@ class HeartbeatEngine:
             engine.COOLDOWN_HOURS = config.research_cooldown_hours_per_interest
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
         except Exception as exc:
-            logger.warning("research tick raised; isolating failure: %s", exc)
+            logger.warning("research tick raised; isolating: %.200s", exc)
             return (None, "research_raised")
 
         if result.fired is not None:
