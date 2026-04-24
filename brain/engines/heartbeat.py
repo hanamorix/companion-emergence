@@ -9,6 +9,7 @@ the hosting application (or CI) calls this on app open/close.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,6 +19,8 @@ from typing import Literal
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 EmitMemoryMode = Literal["always", "conditional", "never"]
 _VALID_EMIT_MODES: tuple[str, ...] = ("always", "conditional", "never")
@@ -374,7 +377,15 @@ class HeartbeatEngine:
             log_path=self.reflex_log_path,
             default_arcs_path=self.reflex_default_arcs_path,
         )
-        result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        try:
+            result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        except Exception as exc:
+            # Fault-isolate reflex failures from the heartbeat tick per spec §7:
+            # a misbehaving arc/provider must not abort decay, dream-gate, or
+            # audit-log writes that follow. The exception is logged; the tick
+            # continues with an empty reflex result.
+            logger.warning("reflex tick raised; isolating failure: %s", exc)
+            return ((), 0)
         fired = tuple(f.arc_name for f in result.arcs_fired)
         return (fired, len(result.arcs_skipped))
 
