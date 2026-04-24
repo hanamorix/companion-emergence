@@ -19,6 +19,17 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
 
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError(f"Could not find pyproject.toml above {here}")
+
+
+DEFAULT_REFLEX_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
+
+
 def test_heartbeat_config_defaults() -> None:
     """HeartbeatConfig has sensible defaults per spec."""
     c = HeartbeatConfig()
@@ -487,3 +498,193 @@ def test_dream_gate_no_seed_reason_does_not_poison(live_engine: HeartbeatEngine)
     assert state_after is not None
     # last_tick_at advanced (every tick does), but last_dream_at stayed put
     assert state_after.last_dream_at == dream_at_before
+
+
+def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
+    """Heartbeat fires reflex arc when enabled and trigger met."""
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    # Write a single easy-to-trigger arc
+    arcs_path = tmp_path / "reflex_arcs.json"
+    arc = {
+        "name": "test_arc",
+        "description": "d",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "Hi {persona_name}.",
+    }
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": [arc]}), encoding="utf-8")
+
+    # Enable reflex in heartbeat config
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(reflex_enabled=True).save(config_path)
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=arcs_path,
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.reflex_fired == ("test_arc",)
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path) -> None:
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    arcs_path = tmp_path / "reflex_arcs.json"
+    arc = {
+        "name": "test_arc",
+        "description": "d",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "Hi.",
+    }
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": [arc]}), encoding="utf-8")
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(reflex_enabled=False).save(config_path)
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=arcs_path,
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.reflex_fired == ()
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
+    """Reflex LLM failure is isolated from the tick — decay/state still run."""
+    import logging
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    arcs_path = tmp_path / "reflex_arcs.json"
+    arc = {
+        "name": "test_arc",
+        "description": "d",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "Hi.",
+    }
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": [arc]}), encoding="utf-8")
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(reflex_enabled=True).save(config_path)
+
+    class FailingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            raise RuntimeError("simulated LLM failure")
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FailingProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=arcs_path,
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        with caplog.at_level(logging.WARNING, logger="brain.engines.heartbeat"):
+            result = engine.run_tick(trigger="manual", dry_run=False)
+        # Tick completed successfully despite reflex failure
+        assert result.reflex_fired == ()
+        # Warning was logged
+        assert any("reflex tick raised" in r.message for r in caplog.records)
+        # Decay still ran
+        assert result.memories_decayed >= 0
+    finally:
+        store.close()
+        hm.close()

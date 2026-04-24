@@ -24,6 +24,8 @@ class MigrationReport:
     source_manifest: list[FileManifest]
     next_steps_inspect_cmds: list[str]
     next_steps_install_cmd: str
+    reflex_arcs_migrated: int = 0
+    reflex_arcs_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -37,6 +39,14 @@ def format_report(report: MigrationReport) -> str:
     )
     lines.append(
         f"  Hebbian edges:  {report.edges_migrated:,} migrated, {report.edges_skipped:,} skipped"
+    )
+    lines.append(
+        f"  Reflex arcs:    {report.reflex_arcs_migrated:,} migrated"
+        + (
+            f" (skipped: {report.reflex_arcs_skipped_reason})"
+            if report.reflex_arcs_skipped_reason
+            else ""
+        )
     )
     lines.append(f"  Elapsed:        {report.elapsed_seconds:.1f}s")
     lines.append("")

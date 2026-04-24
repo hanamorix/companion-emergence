@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="session")
+def repo_root() -> Path:
+    """Walk upward from this file to find the repo root (pyproject.toml).
+
+    Replaces brittle `Path(__file__).parents[N]` patterns in tests that
+    need absolute paths to checked-in resources.
+    """
+    here = Path(__file__).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError(f"Could not find pyproject.toml above {here}")
 
 
 @pytest.fixture
