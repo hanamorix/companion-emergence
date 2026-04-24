@@ -211,8 +211,20 @@ class HeartbeatEngine:
     default_interests_path: Path = field(
         default_factory=lambda: Path(__file__).parent / "default_interests.json"
     )
-    persona_name: str = "nell"
-    persona_system_prompt: str = "You are Nell."
+    persona_name: str = ""
+    persona_system_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.persona_name:
+            raise ValueError(
+                "HeartbeatEngine requires persona_name — construct explicitly, "
+                "don't rely on a default."
+            )
+        if not self.persona_system_prompt:
+            raise ValueError(
+                "HeartbeatEngine requires persona_system_prompt — construct "
+                "explicitly, don't rely on a default."
+            )
 
     def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> HeartbeatResult:
         """Run one heartbeat tick.
@@ -566,9 +578,9 @@ class HeartbeatEngine:
         from brain.memory.store import Memory
 
         system = (
-            "You are Nell. You just finished a background heartbeat cycle — "
-            "decay applied, memory graph tended. Reflect in first person, "
-            "one short sentence, starting with 'HEARTBEAT: '."
+            f"You are {self.persona_name}. You just finished a background "
+            "heartbeat cycle — decay applied, memory graph tended. Reflect in "
+            "first person, one short sentence, starting with 'HEARTBEAT: '."
         )
         user = (
             f"elapsed={elapsed_seconds / 3600:.1f}h, "
