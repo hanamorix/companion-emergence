@@ -106,6 +106,8 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             f"No persona directory at {persona_dir} — "
             f"run `nell migrate --install-as {args.persona}` first."
         )
+    default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
+
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
@@ -119,6 +121,11 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
                 config_path=persona_dir / "heartbeat_config.json",
                 dream_log_path=persona_dir / "dreams.log.jsonl",
                 heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+                reflex_arcs_path=persona_dir / "reflex_arcs.json",
+                reflex_log_path=persona_dir / "reflex_log.json",
+                reflex_default_arcs_path=default_arcs_path,
+                persona_name=args.persona,
+                persona_system_prompt=f"You are {args.persona}.",
             )
             result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
         finally:
@@ -146,6 +153,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             print(f"  dream fired: {result.dream_id}")
         else:
             print(f"  dream gated: {result.dream_gated_reason or 'gated'}")
+        if result.reflex_fired:
+            print(f"  reflex fired: {', '.join(result.reflex_fired)}")
+        elif result.reflex_skipped_count > 0:
+            print(f"  reflex evaluated ({result.reflex_skipped_count} arc(s) skipped)")
     return 0
 
 
