@@ -174,8 +174,12 @@ class HeartbeatEngine:
     config_path: Path
     dream_log_path: Path
     heartbeat_log_path: Path
-    reflex_arcs_path: Path = field(default_factory=lambda: Path("reflex_arcs.json"))
-    reflex_log_path: Path = field(default_factory=lambda: Path("reflex_log.json"))
+    # Reflex paths default to None so a HeartbeatEngine constructed without
+    # explicit persona-dir-qualified paths can't silently write to cwd. When
+    # either is None, _try_fire_reflex short-circuits with an empty result.
+    # Production (CLI) always passes all three paths anchored to persona_dir.
+    reflex_arcs_path: Path | None = None
+    reflex_log_path: Path | None = None
     reflex_default_arcs_path: Path = field(
         default_factory=lambda: Path(__file__).parent / "default_reflex_arcs.json"
     )
@@ -366,6 +370,11 @@ class HeartbeatEngine:
     ) -> tuple[tuple[str, ...], int]:
         """Run one reflex tick. Returns (fired_arc_names, skipped_count)."""
         if not config.reflex_enabled:
+            return ((), 0)
+        if self.reflex_arcs_path is None or self.reflex_log_path is None:
+            # Heartbeat was constructed without explicit reflex paths (common
+            # in unit tests that don't exercise reflex). Skip silently rather
+            # than writing arc/log files to cwd.
             return ((), 0)
         from brain.engines.reflex import ReflexEngine
 
