@@ -19,6 +19,17 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
 
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError(f"Could not find pyproject.toml above {here}")
+
+
+DEFAULT_REFLEX_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
+
+
 def test_heartbeat_config_defaults() -> None:
     """HeartbeatConfig has sensible defaults per spec."""
     c = HeartbeatConfig()
@@ -489,14 +500,12 @@ def test_dream_gate_no_seed_reason_does_not_poison(live_engine: HeartbeatEngine)
     assert state_after.last_dream_at == dream_at_before
 
 
-def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path):
+def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
     """Heartbeat fires reflex arc when enabled and trigger met."""
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
-
-    default_arcs_path = Path(__file__).parents[4] / "brain" / "engines" / "default_reflex_arcs.json"
 
     # Write a single easy-to-trigger arc
     arcs_path = tmp_path / "reflex_arcs.json"
@@ -527,6 +536,8 @@ def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path):
                 emotions={"love": 8.0},
             )
         )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
         HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
 
         engine = HeartbeatEngine(
@@ -539,7 +550,7 @@ def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path):
             heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
             reflex_arcs_path=arcs_path,
             reflex_log_path=tmp_path / "reflex_log.json",
-            reflex_default_arcs_path=default_arcs_path,
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
             persona_name="Nell",
             persona_system_prompt="You are Nell.",
         )
@@ -550,13 +561,12 @@ def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path):
         hm.close()
 
 
-def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path):
+def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path) -> None:
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
 
-    default_arcs_path = Path(__file__).parents[4] / "brain" / "engines" / "default_reflex_arcs.json"
     arcs_path = tmp_path / "reflex_arcs.json"
     arc = {
         "name": "test_arc",
@@ -584,6 +594,8 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path):
                 emotions={"love": 8.0},
             )
         )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
         HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
 
         engine = HeartbeatEngine(
@@ -596,7 +608,7 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path):
             heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
             reflex_arcs_path=arcs_path,
             reflex_log_path=tmp_path / "reflex_log.json",
-            reflex_default_arcs_path=default_arcs_path,
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
             persona_name="Nell",
             persona_system_prompt="You are Nell.",
         )
@@ -607,7 +619,7 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path):
         hm.close()
 
 
-def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog):
+def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
     """Reflex LLM failure is isolated from the tick — decay/state still run."""
     import logging
 
@@ -616,7 +628,6 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog):
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
 
-    default_arcs_path = Path(__file__).parents[4] / "brain" / "engines" / "default_reflex_arcs.json"
     arcs_path = tmp_path / "reflex_arcs.json"
     arc = {
         "name": "test_arc",
@@ -648,6 +659,8 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog):
                 emotions={"love": 8.0},
             )
         )
+        # Pre-seed state so run_tick skips the first-tick-defer path and
+        # actually runs reflex + decay this iteration.
         HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
 
         engine = HeartbeatEngine(
@@ -660,7 +673,7 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog):
             heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
             reflex_arcs_path=arcs_path,
             reflex_log_path=tmp_path / "reflex_log.json",
-            reflex_default_arcs_path=default_arcs_path,
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
             persona_name="Nell",
             persona_system_prompt="You are Nell.",
         )
