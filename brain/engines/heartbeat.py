@@ -401,6 +401,13 @@ class HeartbeatEngine:
             embeddings=None,
             provider=self.provider,
             log_path=self.dream_log_path,
+            persona_name=self.persona_name,
+            persona_system_prompt=(
+                f"You are {self.persona_name}. You just woke from a dream "
+                "about interconnected memories. Reflect in first person, 2-3 "
+                "sentences, starting with 'DREAM: '. Be honest and specific, "
+                "not abstract."
+            ),
         )
         try:
             dream_result = dream_engine.run_cycle(lookback_hours=100000)
