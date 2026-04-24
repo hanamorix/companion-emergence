@@ -216,3 +216,52 @@ def test_migrate_writes_reflex_arcs(
     assert data["arcs"][0]["output_memory_type"] == "reflex_gift"
     assert report.reflex_arcs_migrated == 1
     assert report.reflex_arcs_skipped_reason is None
+
+
+def test_migrate_writes_interests(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: migrator writes interests.json from OG nell_interests.json."""
+    interests_data = {
+        "version": "1.0",
+        "interests": [
+            {
+                "id": "test-id",
+                "topic": "Lispector diagonal syntax",
+                "pull_score": 7.2,
+                "first_seen": "2026-03-29T16:42:33.435028+00:00",
+                "last_fed": "2026-03-31T11:37:13.729750+00:00",
+                "feed_count": 5,
+                "source_types": ["dream"],
+                "related_keywords": ["lispector", "syntax"],
+                "notes": "sideways through meaning",
+            }
+        ],
+    }
+    # og_dir is tmp_path/og_data — nell_interests.json candidate paths include
+    # args.input_dir / "nell_interests.json" which resolves to og_dir directly.
+    (og_dir / "nell_interests.json").write_text(json.dumps(interests_data), encoding="utf-8")
+
+    persona_root = tmp_path / "persona_root"
+    persona_root.mkdir()
+    monkeypatch.setenv("NELLBRAIN_HOME", str(persona_root))
+
+    args = MigrateArgs(
+        input_dir=og_dir,
+        output_dir=None,
+        install_as="testpersona",
+        force=False,
+    )
+    report = run_migrate(args)
+
+    from brain.paths import get_persona_dir
+
+    target = get_persona_dir("testpersona") / "interests.json"
+    assert target.exists()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert len(data["interests"]) == 1
+    assert data["interests"][0]["topic"] == "Lispector diagonal syntax"
+    assert data["interests"][0]["scope"] == "either"  # no soul match
+    assert data["interests"][0]["last_researched_at"] is None
+    assert report.interests_migrated == 1
+    assert report.interests_skipped_reason is None

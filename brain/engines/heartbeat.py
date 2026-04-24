@@ -19,6 +19,7 @@ from typing import Literal
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.search.base import NoopWebSearcher, WebSearcher
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -37,10 +38,14 @@ class HeartbeatConfig:
     emit_memory: EmitMemoryMode = "conditional"
     reflex_enabled: bool = True
     reflex_max_fires_per_tick: int = 1
+    research_enabled: bool = True
+    research_days_since_human_min: float = 1.5
+    research_emotion_threshold: float = 7.0
+    research_cooldown_hours_per_interest: float = 24.0
+    interest_bump_per_match: float = 0.1
 
     @classmethod
     def load(cls, path: Path) -> HeartbeatConfig:
-        """Load config from JSON; return defaults if file missing or invalid."""
         if not path.exists():
             return cls()
         try:
@@ -62,6 +67,13 @@ class HeartbeatConfig:
                 emit_memory=emit,  # type: ignore[arg-type]
                 reflex_enabled=bool(data.get("reflex_enabled", True)),
                 reflex_max_fires_per_tick=int(data.get("reflex_max_fires_per_tick", 1)),
+                research_enabled=bool(data.get("research_enabled", True)),
+                research_days_since_human_min=float(data.get("research_days_since_human_min", 1.5)),
+                research_emotion_threshold=float(data.get("research_emotion_threshold", 7.0)),
+                research_cooldown_hours_per_interest=float(
+                    data.get("research_cooldown_hours_per_interest", 24.0)
+                ),
+                interest_bump_per_match=float(data.get("interest_bump_per_match", 0.1)),
             )
         except (TypeError, ValueError):
             # Hand-edited config with wrong-type values (e.g. dream_every_hours={}
@@ -78,6 +90,11 @@ class HeartbeatConfig:
             "emit_memory": self.emit_memory,
             "reflex_enabled": self.reflex_enabled,
             "reflex_max_fires_per_tick": self.reflex_max_fires_per_tick,
+            "research_enabled": self.research_enabled,
+            "research_days_since_human_min": self.research_days_since_human_min,
+            "research_emotion_threshold": self.research_emotion_threshold,
+            "research_cooldown_hours_per_interest": self.research_cooldown_hours_per_interest,
+            "interest_bump_per_match": self.interest_bump_per_match,
         }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -156,6 +173,9 @@ class HeartbeatResult:
     initialized: bool
     reflex_fired: tuple[str, ...] = ()
     reflex_skipped_count: int = 0
+    research_fired: str | None = None
+    research_gated_reason: str | None = None
+    interests_bumped: int = 0
 
 
 @dataclass
@@ -182,6 +202,14 @@ class HeartbeatEngine:
     reflex_log_path: Path | None = None
     reflex_default_arcs_path: Path = field(
         default_factory=lambda: Path(__file__).parent / "default_reflex_arcs.json"
+    )
+    # Research paths default to None (same pattern as reflex) — if either is
+    # None, _try_fire_research short-circuits. CLI passes explicit paths.
+    searcher: WebSearcher = field(default_factory=NoopWebSearcher)
+    interests_path: Path | None = None
+    research_log_path: Path | None = None
+    default_interests_path: Path = field(
+        default_factory=lambda: Path(__file__).parent / "default_interests.json"
     )
     persona_name: str = "nell"
     persona_system_prompt: str = "You are Nell."
@@ -233,6 +261,9 @@ class HeartbeatEngine:
         # Hebbian decay + GC
         edges_pruned = self._apply_hebbian_decay_and_gc(config, elapsed_seconds, dry_run=dry_run)
 
+        # Interest ingestion hook (zero LLM — keyword match bumps existing interests)
+        interests_bumped = self._try_bump_interests(state, now, config, dry_run)
+
         # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
         reflex_fired, reflex_skipped_count = self._try_fire_reflex(trigger, dry_run, config)
 
@@ -252,8 +283,12 @@ class HeartbeatEngine:
         else:
             dream_gated_reason = "not_due"
 
-        # Research stub — always deferred
-        research_deferred = True
+        # Research evaluation (after dream gate so a research memory can't seed
+        # a dream in the same tick — each engine gets its own cycle).
+        research_fired, research_gated_reason = self._try_fire_research(
+            trigger, dry_run, config, reflex_fired
+        )
+        research_deferred = research_fired is None and research_gated_reason is None
 
         # Optional HEARTBEAT: memory
         heartbeat_memory_id: str | None = None
@@ -286,6 +321,11 @@ class HeartbeatEngine:
                         "fired": list(reflex_fired),
                         "skipped_count": reflex_skipped_count,
                     },
+                    "research": {
+                        "fired": research_fired,
+                        "gated_reason": research_gated_reason,
+                    },
+                    "interests_bumped": interests_bumped,
                     "tick_count": state.tick_count,
                 }
             )
@@ -302,6 +342,9 @@ class HeartbeatEngine:
             initialized=False,
             reflex_fired=reflex_fired,
             reflex_skipped_count=reflex_skipped_count,
+            research_fired=research_fired,
+            research_gated_reason=research_gated_reason,
+            interests_bumped=interests_bumped,
         )
 
     # --- private helpers ---
@@ -398,6 +441,99 @@ class HeartbeatEngine:
             return ((), 0)
         fired = tuple(f.arc_name for f in result.arcs_fired)
         return (fired, len(result.arcs_skipped))
+
+    def _try_bump_interests(
+        self,
+        state: HeartbeatState,
+        now: datetime,
+        config: HeartbeatConfig,
+        dry_run: bool,
+    ) -> int:
+        """Scan conversation memories since last tick, bump pull_scores on
+        keyword matches against existing interests. Zero LLM calls.
+        Returns count of interests touched.
+        """
+        if dry_run:
+            return 0
+        if self.interests_path is None:
+            return 0
+
+        from brain.engines._interests import InterestSet
+
+        interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+        if not interests.interests:
+            return 0
+
+        all_convos = self.store.list_by_type("conversation", active_only=True, limit=50)
+        recent = [m for m in all_convos if m.created_at >= state.last_tick_at]
+        if not recent:
+            return 0
+
+        touched: set[str] = set()
+        current = interests
+        for mem in recent:
+            content_lower = mem.content.lower()
+            for interest in current.interests:
+                if interest.topic in touched:
+                    continue
+                for kw in interest.related_keywords:
+                    if kw.lower() in content_lower:
+                        current = current.bump(
+                            interest.topic,
+                            amount=config.interest_bump_per_match,
+                            now=now,
+                        )
+                        touched.add(interest.topic)
+                        break
+
+        if touched:
+            current.save(self.interests_path)
+        return len(touched)
+
+    def _try_fire_research(
+        self,
+        trigger: str,
+        dry_run: bool,
+        config: HeartbeatConfig,
+        reflex_fired: tuple[str, ...],
+    ) -> tuple[str | None, str | None]:
+        """Run one research tick. Returns (fired_topic, gated_reason).
+
+        Reflex-wins-tie: if reflex fired this tick, research is skipped with
+        gated_reason='reflex_won_tie' — prevents two long outputs in one breath.
+        Fault-isolated: research exceptions return (None, 'research_raised'),
+        allowing the tick to continue (decay state save, audit log, etc).
+        """
+        if not config.research_enabled:
+            return (None, None)
+        if self.interests_path is None or self.research_log_path is None:
+            return (None, None)
+        if reflex_fired:
+            return (None, "reflex_won_tie")
+
+        from brain.engines.research import ResearchEngine
+
+        try:
+            engine = ResearchEngine(
+                store=self.store,
+                provider=self.provider,
+                searcher=self.searcher,
+                persona_name=self.persona_name,
+                persona_system_prompt=self.persona_system_prompt,
+                interests_path=self.interests_path,
+                research_log_path=self.research_log_path,
+                default_interests_path=self.default_interests_path,
+            )
+            engine.PULL_THRESHOLD = 6.0
+            engine.COOLDOWN_HOURS = config.research_cooldown_hours_per_interest
+            result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        except Exception as exc:
+            logger.warning("research tick raised; isolating failure: %s", exc)
+            return (None, "research_raised")
+
+        if result.fired is not None:
+            return (result.fired.topic, None)
+        return (None, result.reason)
 
     def _should_emit_memory(
         self,

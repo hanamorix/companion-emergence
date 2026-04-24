@@ -26,6 +26,8 @@ class MigrationReport:
     next_steps_install_cmd: str
     reflex_arcs_migrated: int = 0
     reflex_arcs_skipped_reason: str | None = None
+    interests_migrated: int = 0
+    interests_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -45,6 +47,14 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.reflex_arcs_skipped_reason})"
             if report.reflex_arcs_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Interests:      {report.interests_migrated:,} migrated"
+        + (
+            f" (skipped: {report.interests_skipped_reason})"
+            if report.interests_skipped_reason
             else ""
         )
     )
