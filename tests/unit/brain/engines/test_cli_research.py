@@ -118,3 +118,69 @@ def test_cli_research_interest_flag_removed(monkeypatch, tmp_path: Path):
                 "anything",
             ]
         )
+
+
+# ---- PR-B: provider/searcher resolution from persona_config.json ----
+
+
+def test_cli_research_reads_provider_from_persona_config(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """When --provider is omitted, persona_config.json drives the choice."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    persona_dir = _setup_persona(tmp_path / "personas")
+    (persona_dir / "interests.json").write_text(
+        '{"version": 1, "interests": []}', encoding="utf-8"
+    )
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "fake", "searcher": "noop"}\n', encoding="utf-8"
+    )
+    # No --provider / --searcher passed — must come from the file.
+    rc = main(["research", "--persona", "testpersona", "--dry-run"])
+    assert rc == 0
+
+
+def test_cli_research_provider_flag_overrides_persona_config(
+    monkeypatch, tmp_path: Path
+):
+    """CLI --provider overrides persona_config.json (developer override)."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    persona_dir = _setup_persona(tmp_path / "personas")
+    (persona_dir / "interests.json").write_text(
+        '{"version": 1, "interests": []}', encoding="utf-8"
+    )
+    # Persona file says use ollama (which would NotImplementedError).
+    # CLI override forces fake — proves CLI wins.
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "ollama", "searcher": "noop"}\n', encoding="utf-8"
+    )
+    rc = main(
+        [
+            "research",
+            "--persona",
+            "testpersona",
+            "--provider",
+            "fake",
+            "--searcher",
+            "noop",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+
+
+def test_cli_research_no_config_no_flag_uses_framework_default(
+    monkeypatch, tmp_path: Path
+):
+    """No persona_config.json + no flag → claude-cli default would fire.
+
+    We can't actually invoke claude-cli in tests, so we assert the resolve
+    helper picks 'claude-cli' when nothing else is provided. Direct unit
+    test — CLI integration is covered by the override + read-from-file
+    cases above.
+    """
+    from brain.persona_config import DEFAULT_PROVIDER, DEFAULT_SEARCHER, PersonaConfig
+
+    cfg = PersonaConfig.load(tmp_path / "missing.json")
+    assert cfg.provider == DEFAULT_PROVIDER == "claude-cli"
+    assert cfg.searcher == DEFAULT_SEARCHER == "ddgs"
