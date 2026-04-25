@@ -20,12 +20,16 @@ from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
+from brain.health.alarm import compute_pending_alarms
+from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
 from brain.paths import get_persona_dir
 from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
+from brain.utils.time import iso_utc
 
 
 def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
@@ -420,6 +424,160 @@ def _growth_log_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _health_show_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell health show` — pending alarms + recent self-treatments (read-only)."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from datetime import UTC, datetime, timedelta
+
+    audit_path = persona_dir / "heartbeats.log.jsonl"
+    cutoff = datetime.now(UTC) - timedelta(days=7)
+
+    # Collect recent anomaly records from the audit log.
+    recent_treatments: list[dict] = []
+    for entry in read_jsonl_skipping_corrupt(audit_path):
+        try:
+            from brain.utils.time import parse_iso_utc
+
+            ts = parse_iso_utc(entry["timestamp"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if ts < cutoff:
+            continue
+        for a in entry.get("anomalies") or []:
+            if isinstance(a, dict):
+                recent_treatments.append(a)
+
+    alarms = compute_pending_alarms(persona_dir)
+
+    print(f"Health for persona {args.persona!r}:\n")
+
+    print(f"  Pending alarms: {len(alarms)}")
+    for alarm in alarms:
+        date_str = alarm.first_seen_at.strftime("%Y-%m-%d")
+        print(
+            f"    {alarm.file}: {alarm.kind} {date_str} "
+            f"({alarm.occurrences_in_window} occurrences in window)"
+        )
+
+    print(f"  Recent self-treatments (last 7 days): {len(recent_treatments)}")
+    for t in recent_treatments:
+        try:
+            from brain.utils.time import parse_iso_utc
+
+            ts = parse_iso_utc(t["timestamp"])
+            ts_str = iso_utc(ts)
+        except (KeyError, ValueError, TypeError):
+            ts_str = "unknown"
+        f = t.get("file", "?")
+        action = t.get("action", "?")
+        cause = t.get("likely_cause", "unknown")
+        qpath = t.get("quarantine_path")
+        print(f"    {ts_str}  {f}  {action}  (cause: {cause})")
+        if qpath:
+            print(f"             forensic: {qpath}")
+
+    return 0
+
+
+def _health_check_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell health check` — run walk_persona, print per-file status."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    anomalies = walk_persona(persona_dir)
+
+    # Classify anomalies: unhealable vs self-treated.
+    unhealable = [a for a in anomalies if a.action == "alarmed_unrecoverable"]
+    healed = [a for a in anomalies if a.action != "alarmed_unrecoverable"]
+
+    # Gather all checked file names (from anomalies only — healthy files print OK below).
+    anomaly_files = {a.file for a in anomalies}
+
+    # Print per-file status for anomalies.
+    for a in healed:
+        print(f"⚠️  {a.file}: {a.action} ({a.kind})")
+    for a in unhealable:
+        print(f"❌  {a.file}: {a.kind} — unrecoverable")
+
+    # Healthy files: any JSON file in the walker's default set not in anomalies.
+    walker_files = [
+        "user_preferences.json",
+        "persona_config.json",
+        "heartbeat_config.json",
+        "heartbeat_state.json",
+        "interests.json",
+        "reflex_arcs.json",
+        "emotion_vocabulary.json",
+        "memories.db",
+        "hebbian.db",
+    ]
+    for fname in walker_files:
+        if fname not in anomaly_files and (persona_dir / fname).exists():
+            print(f"✅  {fname}: OK")
+
+    n_healed = len(healed)
+    n_unhealable = len(unhealable)
+    is_alarming = n_unhealable > 0
+    state = "alarming" if is_alarming else "healthy"
+    print(f"\n{n_healed} file(s) healed, {n_unhealable} unhealable. Brain is {state}.")
+
+    return 2 if is_alarming else 0
+
+
+def _health_acknowledge_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell health acknowledge` — append user_acknowledged entry to audit log."""
+    from datetime import UTC, datetime
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    # Validate: at most one of --file / --all may be set. Default to --all.
+    has_file = getattr(args, "ack_file", None) is not None
+    has_all = getattr(args, "ack_all", False)
+
+    if has_file and has_all:
+        print("Error: --file and --all are mutually exclusive.", file=sys.stderr)
+        return 1
+
+    if has_file:
+        files_to_ack = [args.ack_file]
+    else:
+        # Default: --all — acknowledge every pending alarm.
+        alarms = compute_pending_alarms(persona_dir)
+        files_to_ack = [alarm.file for alarm in alarms]
+
+    import json
+
+    entry = {
+        "timestamp": iso_utc(datetime.now(UTC)),
+        "user_acknowledged": files_to_ack,
+    }
+    audit_path = persona_dir / "heartbeats.log.jsonl"
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+    n = len(files_to_ack)
+    if n == 0:
+        print("No pending alarms to acknowledge.")
+    else:
+        desc = ", ".join(files_to_ack[:3])
+        if n > 3:
+            desc += f", ... ({n} total)"
+        print(f"Acknowledged {n} alarm(s): {desc}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -628,6 +786,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Filter by event type (e.g. 'emotion_added').",
     )
     g_log.set_defaults(func=_growth_log_handler)
+
+    # nell health show/check/acknowledge — read-only inspection + append-only audit.
+    # Per Task 13: no restore/add/delete/approve/reject actions are wired.
+    h_sub = subparsers.add_parser(
+        "health",
+        help="Inspect and acknowledge brain health alarms (read-only + audit-append).",
+    )
+    h_actions = h_sub.add_subparsers(dest="action", required=True)
+
+    h_show = h_actions.add_parser("show", help="Print pending alarms + recent self-treatments.")
+    h_show.add_argument("--persona", required=True, help="Persona name (required).")
+    h_show.set_defaults(func=_health_show_handler)
+
+    h_check = h_actions.add_parser(
+        "check", help="Run a full file integrity walk; exit 2 if unhealable alarms exist."
+    )
+    h_check.add_argument("--persona", required=True, help="Persona name (required).")
+    h_check.set_defaults(func=_health_check_handler)
+
+    h_ack = h_actions.add_parser(
+        "acknowledge",
+        help="Acknowledge pending alarms (appends to audit log; no destructive changes).",
+    )
+    h_ack.add_argument("--persona", required=True, help="Persona name (required).")
+    h_ack.add_argument(
+        "--file",
+        dest="ack_file",
+        default=None,
+        help="Acknowledge a specific file. Mutually exclusive with --all.",
+    )
+    h_ack.add_argument(
+        "--all",
+        dest="ack_all",
+        action="store_true",
+        default=False,
+        help="Acknowledge all pending alarms (default if neither --file nor --all is given).",
+    )
+    h_ack.set_defaults(func=_health_acknowledge_handler)
 
     return parser
 
