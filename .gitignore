@@ -86,3 +86,11 @@ training/*.pth
 *.swp
 *.swo
 .~*
+
+# ── Serena MCP cache (local tooling) ──────────────────────
+.serena/
+
+# ── Migration inspection output dirs ──────────────────────
+# `nell migrate --output <dir>` writes inspection artefacts
+# that are persona-private and shouldn't enter git.
+migrated-*/

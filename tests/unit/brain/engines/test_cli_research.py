@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -69,73 +68,53 @@ def test_cli_interest_list_empty(monkeypatch, tmp_path: Path, capsys):
     assert "testpersona" in out  # persona name appears in output
 
 
-def test_cli_interest_add_then_list(monkeypatch, tmp_path: Path, capsys):
+def test_cli_interest_add_subcommand_removed(monkeypatch, tmp_path: Path):
+    """`interest add` is no longer a user surface — brain develops interests."""
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
-    persona_dir = _setup_persona(tmp_path / "personas")
-    (persona_dir / "interests.json").write_text('{"version": 1, "interests": []}', encoding="utf-8")
-    rc = main(
-        [
-            "interest",
-            "add",
-            "deep sea creatures",
-            "--keywords",
-            "octopus,bioluminescence,ocean",
-            "--scope",
-            "either",
-            "--persona",
-            "testpersona",
-        ]
-    )
-    assert rc == 0
-
-    rc = main(["interest", "list", "--persona", "testpersona"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "deep sea creatures" in out
-
-    data = json.loads((persona_dir / "interests.json").read_text(encoding="utf-8"))
-    assert len(data["interests"]) == 1
-    assert data["interests"][0]["topic"] == "deep sea creatures"
-    assert data["interests"][0]["related_keywords"] == [
-        "octopus",
-        "bioluminescence",
-        "ocean",
-    ]
-    assert data["interests"][0]["scope"] == "either"
-    assert data["interests"][0]["pull_score"] == 5.0  # below default threshold
+    _setup_persona(tmp_path / "personas")
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "interest",
+                "add",
+                "deep sea creatures",
+                "--persona",
+                "testpersona",
+            ]
+        )
 
 
-def test_cli_interest_bump_increments_pull_score(monkeypatch, tmp_path: Path):
+def test_cli_interest_bump_subcommand_removed(monkeypatch, tmp_path: Path):
+    """`interest bump` is no longer a user surface — brain owns pull_scores."""
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
-    persona_dir = _setup_persona(tmp_path / "personas")
+    _setup_persona(tmp_path / "personas")
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "interest",
+                "bump",
+                "anything",
+                "--persona",
+                "testpersona",
+            ]
+        )
 
-    # Seed one interest
-    main(
-        [
-            "interest",
-            "add",
-            "seed topic",
-            "--keywords",
-            "s",
-            "--scope",
-            "either",
-            "--persona",
-            "testpersona",
-        ]
-    )
 
-    rc = main(
-        [
-            "interest",
-            "bump",
-            "seed topic",
-            "--amount",
-            "2.0",
-            "--persona",
-            "testpersona",
-        ]
-    )
-    assert rc == 0
-
-    data = json.loads((persona_dir / "interests.json").read_text(encoding="utf-8"))
-    assert data["interests"][0]["pull_score"] == 7.0  # 5.0 + 2.0
+def test_cli_research_interest_flag_removed(monkeypatch, tmp_path: Path):
+    """`nell research --interest` is gone — brain picks its own topic."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    _setup_persona(tmp_path / "personas")
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "research",
+                "--persona",
+                "testpersona",
+                "--provider",
+                "fake",
+                "--searcher",
+                "noop",
+                "--interest",
+                "anything",
+            ]
+        )
