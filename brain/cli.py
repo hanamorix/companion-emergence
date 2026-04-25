@@ -39,6 +39,7 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     searcher = getattr(args, "searcher", None) or config.searcher
     return provider, searcher
 
+
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
@@ -346,6 +347,55 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _growth_log_handler(args: argparse.Namespace) -> int:
+    """`nell growth log` — read-only inspection of the brain's growth biography.
+
+    Per Phase 2a §8: read-only. No add/approve/reject/force. The user
+    reads what the brain decided; if they want to override, they edit
+    `emotion_vocabulary.json` directly.
+    """
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from brain.growth.log import read_growth_log
+
+    log_path = persona_dir / "emotion_growth.log.jsonl"
+    events = read_growth_log(log_path, limit=args.limit)
+    if args.type:
+        events = [e for e in events if e.type == args.type]
+
+    print(f"Growth log for persona {args.persona!r} ({len(events)} events shown):")
+    if not events:
+        print("  (empty)")
+        return 0
+
+    for e in events:
+        ts = e.timestamp.isoformat().replace("+00:00", "Z")
+        print(f"\n  {ts}  {e.type:<20} {e.name}")
+        print(f'    "{e.description}"')
+        decay = (
+            "identity-level (no decay)"
+            if e.decay_half_life_days is None
+            else f"{e.decay_half_life_days:.1f} days"
+        )
+        print(f"    decay: {decay}  score: {e.score:.2f}")
+        print(f"    reason: {e.reason}")
+        if e.relational_context:
+            print(f"    relational: {e.relational_context}")
+        if e.evidence_memory_ids:
+            preview = ", ".join(e.evidence_memory_ids[:3])
+            extra = (
+                f", ... ({len(e.evidence_memory_ids)} total)"
+                if len(e.evidence_memory_ids) > 3
+                else ""
+            )
+            print(f"    evidence: {preview}{extra}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -527,6 +577,33 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     i_list.set_defaults(func=_interest_list_handler)
+
+    # nell growth log — read-only inspection of brain growth biography.
+    # Per Phase 2a §8: only `log` action ships; no add/approve/reject/force.
+    g_sub = subparsers.add_parser(
+        "growth",
+        help="Inspect the brain's autonomous growth biography (read-only).",
+    )
+    g_actions = g_sub.add_subparsers(dest="action", required=True)
+
+    g_log = g_actions.add_parser("log", help="Print the growth log.")
+    g_log.add_argument(
+        "--persona",
+        required=True,
+        help="Persona name (required).",
+    )
+    g_log.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Show only the most-recent N events.",
+    )
+    g_log.add_argument(
+        "--type",
+        default=None,
+        help="Filter by event type (e.g. 'emotion_added').",
+    )
+    g_log.set_defaults(func=_growth_log_handler)
 
     return parser
 
