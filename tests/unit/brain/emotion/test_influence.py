@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from brain.emotion.arousal import (
     TIER_CHARGED,
     TIER_DORMANT,
@@ -20,6 +22,17 @@ def _with(**intensities: float) -> EmotionalState:
     return state
 
 
+@pytest.fixture()
+def with_creative_hunger():
+    """Register creative_hunger (now a persona-extension emotion) for the test."""
+    from brain.emotion._canonical_personal_emotions import _CANONICAL
+    from brain.emotion.vocabulary import _unregister, register
+
+    register(_CANONICAL["creative_hunger"])
+    yield
+    _unregister("creative_hunger")
+
+
 def test_empty_state_returns_neutral_hints() -> None:
     """Empty state produces neutral hints (no tone bias, default voice)."""
     hints = calculate_influence(_with(), arousal_tier=TIER_DORMANT, energy=7)
@@ -36,7 +49,7 @@ def test_high_grief_biases_toward_soft_short() -> None:
     assert hints.suggested_length_multiplier < 1.0
 
 
-def test_high_creative_hunger_biases_toward_generative() -> None:
+def test_high_creative_hunger_biases_toward_generative(with_creative_hunger) -> None:
     """High creative hunger biases toward expansive / generative output."""
     hints = calculate_influence(_with(creative_hunger=8.0), arousal_tier=TIER_DORMANT, energy=8)
     assert hints.tone_bias == "generative"
@@ -90,7 +103,7 @@ def test_hints_to_dict_round_trips() -> None:
     assert data["suggested_length_multiplier"] == hints.suggested_length_multiplier
 
 
-def test_held_tier_clamps_length_into_deliberate_band() -> None:
+def test_held_tier_clamps_length_into_deliberate_band(with_creative_hunger) -> None:
     """TIER_HELD clamps length into [0.8, 1.2] — 'peaked and restrained' pacing.
 
     Generative (1.3) trims down; crisp (0.7) lengthens up; both land in a
@@ -105,7 +118,7 @@ def test_held_tier_clamps_length_into_deliberate_band() -> None:
     assert 0.75 <= crisp_hints.suggested_length_multiplier <= 0.85
 
 
-def test_edge_tier_hard_overrides_length_to_terse() -> None:
+def test_edge_tier_hard_overrides_length_to_terse(with_creative_hunger) -> None:
     """TIER_EDGE hard-overrides length to 0.8 regardless of tone."""
     generative_hints = calculate_influence(
         _with(creative_hunger=8.0, arousal=9.0, desire=9.0),

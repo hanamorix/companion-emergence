@@ -123,7 +123,7 @@ def test_run_tick_emotion_high_triggers(tmp_path: Path):
     try:
         engine = _build_engine(tmp_path, store)
         es = EmotionalState()
-        es.set("creative_hunger", 8.0)
+        es.set("curiosity", 8.0)
         result = engine.run_tick(
             trigger="emotion_high",
             dry_run=False,

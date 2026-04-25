@@ -57,13 +57,13 @@ def test_unrelated_pairs_tracked_independently() -> None:
     for _ in range(5):
         detector.observe(_with(tenderness=7.0, desire=6.0))
     for _ in range(5):
-        detector.observe(_with(creative_hunger=8.0, defiance=7.0))
+        detector.observe(_with(curiosity=8.0, defiance=7.0))
 
     detected = detector.detected()
     assert len(detected) == 2
     component_sets = {d.components for d in detected}
     assert ("desire", "tenderness") in component_sets
-    assert ("creative_hunger", "defiance") in component_sets
+    assert ("curiosity", "defiance") in component_sets
 
 
 def test_naming_assigns_curated_name() -> None:
@@ -88,7 +88,7 @@ def test_three_component_blend() -> None:
     """Three emotions co-occurring at high intensity form a three-component blend."""
     detector = BlendDetector()
     for _ in range(5):
-        detector.observe(_with(creative_hunger=8.0, defiance=7.0, joy=6.0))
+        detector.observe(_with(curiosity=8.0, defiance=7.0, joy=6.0))
     detected = detector.detected()
     assert len(detected) >= 1
     assert any(len(d.components) == 3 for d in detected)
