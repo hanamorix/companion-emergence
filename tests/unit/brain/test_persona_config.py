@@ -6,6 +6,40 @@ from pathlib import Path
 
 from brain.persona_config import DEFAULT_PROVIDER, DEFAULT_SEARCHER, PersonaConfig
 
+# ---- Task 9: attempt_heal wiring ----
+
+
+def test_persona_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
+    """Corrupt JSON → defaults returned + quarantine file present, original gone."""
+    path = tmp_path / "persona_config.json"
+    path.write_text("{this is not json", encoding="utf-8")
+
+    cfg, anomaly = PersonaConfig.load_with_anomaly(path)
+
+    assert cfg.provider == DEFAULT_PROVIDER
+    assert cfg.searcher == DEFAULT_SEARCHER
+    assert anomaly is not None
+    assert anomaly.kind == "json_parse_error"
+    # Original replaced by a quarantine file
+    assert not path.exists() or path.read_text().strip().startswith("{")  # reset default written
+    corrupt_files = list(tmp_path.glob("persona_config.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_persona_config_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
+    """A valid .bak1 + corrupt live file → .bak1 content returned."""
+    path = tmp_path / "persona_config.json"
+    bak1 = tmp_path / "persona_config.json.bak1"
+    bak1.write_text('{"provider": "ollama", "searcher": "noop"}\n', encoding="utf-8")
+    path.write_text("{corrupt", encoding="utf-8")
+
+    cfg, anomaly = PersonaConfig.load_with_anomaly(path)
+
+    assert cfg.provider == "ollama"
+    assert cfg.searcher == "noop"
+    assert anomaly is not None
+    assert "bak1" in anomaly.action
+
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
     """No persona_config.json → defaults."""

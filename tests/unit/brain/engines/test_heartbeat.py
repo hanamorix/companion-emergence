@@ -1518,3 +1518,76 @@ def test_heartbeat_growth_fault_isolated(tmp_path: Path) -> None:
     finally:
         store.close()
         hebbian.close()
+
+
+# ---- Task 9: attempt_heal wiring for HeartbeatConfig + HeartbeatState ----
+
+
+def test_heartbeat_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
+    """Corrupt heartbeat_config.json → defaults returned + quarantine file present."""
+    path = tmp_path / "heartbeat_config.json"
+    path.write_text("{corrupt json{{", encoding="utf-8")
+
+    cfg, anomaly = HeartbeatConfig._load_internal_with_anomaly(path)
+
+    assert cfg.dream_every_hours == 24.0
+    assert cfg.emit_memory == "conditional"
+    assert anomaly is not None
+    assert anomaly.kind == "json_parse_error"
+    corrupt_files = list(tmp_path.glob("heartbeat_config.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_heartbeat_config_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
+    """Valid .bak1 + corrupt live heartbeat_config.json → .bak1 content returned."""
+    path = tmp_path / "heartbeat_config.json"
+    bak1 = tmp_path / "heartbeat_config.json.bak1"
+    bak1.write_text(
+        json.dumps({"dream_every_hours": 6.0, "emit_memory": "always"}), encoding="utf-8"
+    )
+    path.write_text("{corrupt", encoding="utf-8")
+
+    cfg, anomaly = HeartbeatConfig._load_internal_with_anomaly(path)
+
+    assert cfg.dream_every_hours == 6.0
+    assert cfg.emit_memory == "always"
+    assert anomaly is not None
+    assert "bak1" in anomaly.action
+
+
+def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
+    """Corrupt heartbeat_state.json → None returned + quarantine file present."""
+    path = tmp_path / "heartbeat_state.json"
+    path.write_text("{corrupt json{{", encoding="utf-8")
+
+    state, anomaly = HeartbeatState.load_with_anomaly(path)
+
+    assert state is None
+    assert anomaly is not None
+    assert anomaly.kind == "json_parse_error"
+    corrupt_files = list(tmp_path.glob("heartbeat_state.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_heartbeat_state_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
+    """Valid .bak1 + corrupt live heartbeat_state.json → .bak1 content returned."""
+    path = tmp_path / "heartbeat_state.json"
+    bak1 = tmp_path / "heartbeat_state.json.bak1"
+    valid_state = {
+        "last_tick_at": "2026-04-25T10:00:00Z",
+        "last_dream_at": "2026-04-25T10:00:00Z",
+        "last_research_at": "2026-04-25T10:00:00Z",
+        "last_growth_at": "2026-04-25T10:00:00Z",
+        "tick_count": 3,
+        "last_trigger": "open",
+    }
+    bak1.write_text(json.dumps(valid_state), encoding="utf-8")
+    path.write_text("{corrupt", encoding="utf-8")
+
+    state, anomaly = HeartbeatState.load_with_anomaly(path)
+
+    assert state is not None
+    assert state.tick_count == 3
+    assert state.last_trigger == "open"
+    assert anomaly is not None
+    assert "bak1" in anomaly.action

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import shutil
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, get_args
+from typing import TYPE_CHECKING, Literal, get_args
+
+if TYPE_CHECKING:
+    from brain.health.anomaly import BrainAnomaly
 
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -86,14 +89,11 @@ class HeartbeatConfig:
         return cfg
 
     @classmethod
-    def _load_internal(cls, path: Path) -> HeartbeatConfig:
-        """Load heartbeat_config.json only — the developer-calibration layer."""
-        if not path.exists():
-            return cls()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return cls()
+    def _parse_internal_data(cls, data: object) -> HeartbeatConfig:
+        """Build instance from already-parsed JSON data (dict expected).
+
+        Applies per-field type-coercion; falls back to defaults on type errors.
+        """
         if not isinstance(data, dict):
             return cls()
 
@@ -125,12 +125,42 @@ class HeartbeatConfig:
             # crash the CLI with a traceback.
             return cls()
 
+    @classmethod
+    def _load_internal_with_anomaly(
+        cls, path: Path
+    ) -> tuple[HeartbeatConfig, BrainAnomaly | None]:
+        """Load heartbeat_config.json with self-healing from .bak rotation.
+
+        Returns (cfg, anomaly_or_None). The outer load() uses the anomaly-dropping
+        wrapper _load_internal to preserve existing call sites unchanged.
+        """
+        from brain.health.attempt_heal import attempt_heal
+
+        data, anomaly = attempt_heal(path, dict)
+        return cls._parse_internal_data(data), anomaly
+
+    @classmethod
+    def _load_internal(cls, path: Path) -> HeartbeatConfig:
+        """Load heartbeat_config.json only — the developer-calibration layer."""
+        cfg, anomaly = cls._load_internal_with_anomaly(path)
+        if anomaly is not None:
+            logger.warning(
+                "HeartbeatConfig anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
+            )
+        return cfg
+
     def save(self, path: Path) -> None:
-        """Atomic save via .new + os.replace.
+        """Atomic save via .bak rotation (save_with_backup).
 
         A crash mid-write leaves either the previous valid file or the new
         valid file — never a partial write that corrupts the user's config.
         """
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {
             "dream_every_hours": self.dream_every_hours,
             "decay_rate_per_tick": self.decay_rate_per_tick,
@@ -146,9 +176,24 @@ class HeartbeatConfig:
             "growth_enabled": self.growth_enabled,
             "growth_every_hours": self.growth_every_hours,
         }
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        if treatment.verify_after_write:
+            self._verify_after_write(path)
+
+    def _verify_after_write(self, path: Path) -> None:
+        """Re-read the written file; if corrupt, restore from .bak1."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("non-dict payload after write")
+        except (json.JSONDecodeError, ValueError, OSError):
+            logger.error(
+                "HeartbeatConfig verify_after_write failed for %s; restoring from .bak1", path
+            )
+            bak1 = path.with_name(path.name + ".bak1")
+            if bak1.exists():
+                shutil.copy2(bak1, path)
 
 
 @dataclass
@@ -163,6 +208,44 @@ class HeartbeatState:
     last_trigger: str
 
     @classmethod
+    def _parse_state_data(cls, data: object) -> HeartbeatState | None:
+        """Build instance from already-parsed JSON data; return None on bad shape."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                last_tick_at=parse_iso_utc(data["last_tick_at"]),
+                last_dream_at=parse_iso_utc(data["last_dream_at"]),
+                last_research_at=parse_iso_utc(data["last_research_at"]),
+                # Back-compat: last_growth_at absent → fall back to last_tick_at.
+                last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
+                tick_count=int(data["tick_count"]),
+                last_trigger=str(data["last_trigger"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def load_with_anomaly(
+        cls, path: Path
+    ) -> tuple[HeartbeatState | None, BrainAnomaly | None]:
+        """Load state with self-healing from .bak rotation if corrupt.
+
+        Returns (state_or_None, anomaly_or_None).
+          - Missing file → (None, None) — normal first-tick path.
+          - Corrupt file → quarantine + restore from .bak1/.bak2/.bak3 or reset.
+            If all baks are corrupt/missing, data=={} → parse returns None → engine
+            treats as first-ever tick and reinitialises (same safe recovery as before).
+        """
+        if not path.exists():
+            return None, None
+
+        from brain.health.attempt_heal import attempt_heal
+
+        data, anomaly = attempt_heal(path, dict)
+        return cls._parse_state_data(data), anomaly
+
+    @classmethod
     def load(cls, path: Path) -> HeartbeatState | None:
         """Load state; return None if the file is missing or corrupt.
 
@@ -171,20 +254,15 @@ class HeartbeatState:
         file (user-facing crashes from a malformed JSON are worse UX than
         silently reinitialising).
         """
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(
-                last_tick_at=parse_iso_utc(data["last_tick_at"]),
-                last_dream_at=parse_iso_utc(data["last_dream_at"]),
-                last_research_at=parse_iso_utc(data["last_research_at"]),
-                last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
-                tick_count=int(data["tick_count"]),
-                last_trigger=str(data["last_trigger"]),
+        state, anomaly = cls.load_with_anomaly(path)
+        if anomaly is not None:
+            logger.warning(
+                "HeartbeatState anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        return state
 
     @classmethod
     def fresh(cls, trigger: str) -> HeartbeatState:
@@ -200,7 +278,10 @@ class HeartbeatState:
         )
 
     def save(self, path: Path) -> None:
-        """Atomic save via write-to-.new + os.replace."""
+        """Atomic save via .bak rotation (save_with_backup)."""
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {
             "last_tick_at": iso_utc(self.last_tick_at),
             "last_dream_at": iso_utc(self.last_dream_at),
@@ -209,9 +290,24 @@ class HeartbeatState:
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
         }
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)  # atomic on POSIX + Windows
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        if treatment.verify_after_write:
+            self._verify_after_write(path)
+
+    def _verify_after_write(self, path: Path) -> None:
+        """Re-read the written file; if corrupt, restore from .bak1."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("non-dict payload after write")
+        except (json.JSONDecodeError, ValueError, OSError):
+            logger.error(
+                "HeartbeatState verify_after_write failed for %s; restoring from .bak1", path
+            )
+            bak1 = path.with_name(path.name + ".bak1")
+            if bak1.exists():
+                shutil.copy2(bak1, path)
 
 
 @dataclass(frozen=True)
