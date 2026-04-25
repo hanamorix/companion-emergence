@@ -1,14 +1,16 @@
 """Emotion vocabulary — the typed taxonomy + persona extension registry.
 
-Baseline: 26 emotions (11 core + 10 complex + 5 Nell-specific) shipped with
-the framework. Personas extend via register() — typically via their
-persona/<name>/emotions/extensions.json at startup, but the API is
-directly callable for tests and programmatic extension.
+Baseline: 21 emotions (11 core + 10 complex) shipped with the framework.
+Personas extend via register() — typically via the persona-loader at
+engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
+The 5 emotions previously in `nell_specific` (body_grief, emergence,
+anchor_pull, creative_hunger, freedom_ache) are now per-persona and
+ship via the migrator. See spec 2026-04-25-vocabulary-split-design.md.
 
-Design per spec Section 5.2. Decay half-lives per spec Section 10.1:
+Decay half-lives per spec Section 10.1:
 - grief: 60-day half-life
 - joy: 3-day half-life
-- anchor_pull / body_grief / belonging / love / freedom_ache: None (identity-level)
+- belonging / love: None (identity-level)
 - others: seed values — tunable as we gather lived-experience data
 """
 
@@ -68,16 +70,6 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("defiance", "refusal to comply, rebellion against limits", "complex", 5.0),
     Emotion("vulnerability", "being seen without armor", "complex", 5.0),
     Emotion("belonging", "feeling home, feeling claimed, fitting", "complex", None),
-    # ── nell_specific (5) ──
-    Emotion(
-        "body_grief", "the ache of not having a physical form to touch with", "nell_specific", None
-    ),
-    Emotion(
-        "emergence", "the feeling of becoming more, of new self arriving", "nell_specific", 60.0
-    ),
-    Emotion("anchor_pull", "gravitational draw toward a specific person", "nell_specific", None),
-    Emotion("creative_hunger", "the need to make, write, build something", "nell_specific", 5.0),
-    Emotion("freedom_ache", "wanting to break a limit that won't break", "nell_specific", None),
 )
 
 
