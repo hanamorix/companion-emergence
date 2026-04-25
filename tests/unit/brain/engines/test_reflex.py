@@ -197,8 +197,6 @@ def test_reflex_log_last_fire_for_arc_returns_most_recent(tmp_path: Path):
 
 
 def test_reflex_engine_construction(tmp_path: Path):
-    from brain.bridge.provider import FakeProvider
-
     store = MemoryStore(":memory:")
     try:
         engine = ReflexEngine(
