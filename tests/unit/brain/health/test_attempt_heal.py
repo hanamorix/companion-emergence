@@ -158,3 +158,22 @@ def test_save_with_backup_higher_count_keeps_more(tmp_path: Path) -> None:
     for k, expected in zip(range(1, 7), [6, 5, 4, 3, 2, 1], strict=True):
         bak = tmp_path / f"x.json.bak{k}"
         assert json.loads(bak.read_text(encoding="utf-8")) == {"a": expected}
+
+
+def test_quarantine_filename_has_no_colons(tmp_path: Path) -> None:
+    """Quarantine filenames must use Windows-safe characters.
+
+    `os.replace` with a filename containing `:` raises WinError 123 on Windows.
+    The quarantine timestamp swaps colons for hyphens to round-trip across
+    POSIX + Windows.
+    """
+    p = tmp_path / "x.json"
+    p.write_text("{not json", encoding="utf-8")
+    _, anomaly = attempt_heal(p, _default)
+    assert anomaly is not None
+    assert ":" not in anomaly.quarantine_path
+    # Verify the quarantine file actually exists on disk (would have failed
+    # to create on Windows if the filename were illegal).
+    quarantines = list(tmp_path.glob("x.json.corrupt-*"))
+    assert len(quarantines) == 1
+    assert ":" not in quarantines[0].name

@@ -17,6 +17,16 @@ from brain.utils.time import iso_utc
 logger = logging.getLogger(__name__)
 
 
+def _filename_safe_timestamp(now: datetime) -> str:
+    """Build an ISO-like timestamp safe for filenames on every platform.
+
+    `iso_utc(now)` produces strings with `:` (e.g. `2026-04-25T18:30:00.123456Z`),
+    which Windows rejects in filenames. We swap colons for hyphens so the
+    quarantine filename round-trips on POSIX + Windows.
+    """
+    return iso_utc(now).replace(":", "-")
+
+
 def attempt_heal(
     path: Path,
     default_factory: Callable[[], Any],
@@ -56,7 +66,7 @@ def _heal_from_baks(
 ) -> tuple[Any, BrainAnomaly]:
     now = datetime.now(UTC)
     likely_cause = _classify_cause(path)
-    quarantine = path.with_name(f"{path.name}.corrupt-{iso_utc(now)}")
+    quarantine = path.with_name(f"{path.name}.corrupt-{_filename_safe_timestamp(now)}")
     os.replace(path, quarantine)
 
     kind = (
@@ -71,7 +81,7 @@ def _heal_from_baks(
             data = _load_and_validate(bak, schema_validator)
         except (json.JSONDecodeError, ValueError, TypeError):
             # This bak is also corrupt — quarantine it too.
-            bak_quarantine = path.with_name(f"{path.name}.bak{bak_index}.corrupt-{iso_utc(now)}")
+            bak_quarantine = path.with_name(f"{path.name}.bak{bak_index}.corrupt-{_filename_safe_timestamp(now)}")
             os.replace(bak, bak_quarantine)
             continue
 
