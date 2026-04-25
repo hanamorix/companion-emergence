@@ -42,13 +42,15 @@ def get_persona_dir(name: str) -> Path:
     """Return the directory for a specific persona's private data.
 
     Raises ValueError if `name` could escape the personas/ root via path
-    traversal (contains '/', '\\', or equals '.' / '..').
+    traversal ('/' or '\\') or break str.format_map prompt rendering
+    (literal '{' or '}'), or equals '.' / '..'.
     """
     if not name:
         raise ValueError("Persona name cannot be empty.")
-    if "/" in name or "\\" in name or name in (".", ".."):
+    if "/" in name or "\\" in name or "{" in name or "}" in name or name in (".", ".."):
         raise ValueError(
-            f"Invalid persona name: {name!r} (must not contain '/' or '\\\\', or be '.' / '..')."
+            f"Invalid persona name: {name!r} "
+            "(must not contain '/', '\\\\', '{', '}', or be '.' / '..')."
         )
     return get_home() / "personas" / name
 
