@@ -250,7 +250,8 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
     vocab_path = persona_dir / "emotion_vocabulary.json"
     bak1 = persona_dir / "emotion_vocabulary.json.bak1"
     bak1.write_text(
-        json.dumps({"version": 1, "emotions": [{"name": "joy"}, {"name": "love"}]}), encoding="utf-8"
+        json.dumps({"version": 1, "emotions": [{"name": "joy"}, {"name": "love"}]}),
+        encoding="utf-8",
     )
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 

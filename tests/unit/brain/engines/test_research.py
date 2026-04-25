@@ -343,9 +343,7 @@ def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog)
     ResearchLog.load(path)
     corrupt_files = list(tmp_path.glob("research_log.json.corrupt-*"))
     assert len(corrupt_files) == 1
-    warn_msgs = [
-        r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()
-    ]
+    warn_msgs = [r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()]
     assert len(warn_msgs) == 1
 
 

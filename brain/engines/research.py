@@ -387,9 +387,7 @@ class ResearchLog:
                 anomaly.file,
             )
         fires_raw = data.get("fires", [])
-        return cls(
-            fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict))
-        )
+        return cls(fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict)))
 
     def save(self, path: Path) -> None:
         """Atomic save via .bak rotation (save_with_backup)."""

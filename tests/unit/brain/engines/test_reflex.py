@@ -140,9 +140,7 @@ def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Pat
     path = tmp_path / "reflex_arcs.json"
     bak1 = tmp_path / "reflex_arcs.json.bak1"
 
-    bak1.write_text(
-        json.dumps({"version": 1, "arcs": [_valid_arc_dict()]}), encoding="utf-8"
-    )
+    bak1.write_text(json.dumps({"version": 1, "arcs": [_valid_arc_dict()]}), encoding="utf-8")
     path.write_text("{corrupt{{", encoding="utf-8")
 
     result, anomaly = ReflexArcSet.load_with_anomaly(path, default_path=DEFAULT_ARCS_PATH)

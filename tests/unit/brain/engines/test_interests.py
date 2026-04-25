@@ -79,9 +79,7 @@ def test_interestset_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):
     bak1 = tmp_path / "interests.json.bak1"
 
     # .bak1 has a valid interest
-    bak1.write_text(
-        json.dumps({"version": 1, "interests": [_sample_dict()]}), encoding="utf-8"
-    )
+    bak1.write_text(json.dumps({"version": 1, "interests": [_sample_dict()]}), encoding="utf-8")
     path.write_text("{corrupt json{{", encoding="utf-8")
 
     result, anomaly = InterestSet.load_with_anomaly(path, default_path=DEFAULT_INTERESTS_PATH)

@@ -136,9 +136,7 @@ class HeartbeatConfig:
             return cls()
 
     @classmethod
-    def _load_internal_with_anomaly(
-        cls, path: Path
-    ) -> tuple[HeartbeatConfig, BrainAnomaly | None]:
+    def _load_internal_with_anomaly(cls, path: Path) -> tuple[HeartbeatConfig, BrainAnomaly | None]:
         """Load heartbeat_config.json with self-healing from .bak rotation.
 
         Returns (cfg, anomaly_or_None). The outer load() uses the anomaly-dropping
@@ -236,9 +234,7 @@ class HeartbeatState:
             return None
 
     @classmethod
-    def load_with_anomaly(
-        cls, path: Path
-    ) -> tuple[HeartbeatState | None, BrainAnomaly | None]:
+    def load_with_anomaly(cls, path: Path) -> tuple[HeartbeatState | None, BrainAnomaly | None]:
         """Load state with self-healing from .bak rotation if corrupt.
 
         Returns (state_or_None, anomaly_or_None).
@@ -418,7 +414,8 @@ class HeartbeatEngine:
         # are not double-counted.
         if len(tick_anomalies) >= 2:
             _walk_persona_dir = (
-                self.interests_path.parent if self.interests_path is not None
+                self.interests_path.parent
+                if self.interests_path is not None
                 else self.state_path.parent
             )
             seen: set[tuple[str, str]] = {(a.file, a.kind) for a in tick_anomalies}
