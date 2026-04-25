@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.emotion import vocabulary as _vocabulary
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
 from brain.migrator.og_reflex import extract_arcs_from_og
+from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
@@ -104,6 +106,31 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     finally:
         hebbian.close()
 
+    # ---- vocabulary ----
+    vocab_target = work_dir / "emotion_vocabulary.json"
+    vocabulary_emotions_migrated = 0
+    vocabulary_skipped_reason: str | None = None
+
+    if vocab_target.exists() and not args.force:
+        vocabulary_skipped_reason = "existing_file_not_overwritten"
+    else:
+        try:
+            framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
+            og_memories_for_vocab = reader.read_memories()
+            vocab_entries = extract_persona_vocabulary(
+                og_memories_for_vocab,
+                framework_baseline_names=framework_baseline_names,
+            )
+            _vocab_tmp = vocab_target.with_suffix(vocab_target.suffix + ".new")
+            _vocab_tmp.write_text(
+                _json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(_vocab_tmp, vocab_target)
+            vocabulary_emotions_migrated = len(vocab_entries)
+        except (ValueError, OSError) as exc:
+            vocabulary_skipped_reason = f"migrate_error: {exc}"
+
     # ---- reflex arcs ----
     # --input points at OG's data/ dir, but reflex_engine.py sits one level
     # up at NellBrain root. Try both locations so the migrator works whether
@@ -188,6 +215,8 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         reflex_arcs_skipped_reason=reflex_arcs_skipped_reason,
         interests_migrated=interests_migrated,
         interests_skipped_reason=interests_skipped_reason,
+        vocabulary_emotions_migrated=vocabulary_emotions_migrated,
+        vocabulary_skipped_reason=vocabulary_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
