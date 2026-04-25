@@ -70,6 +70,41 @@ def test_interestset_load_missing_falls_back_to_defaults(tmp_path: Path):
     assert loaded.interests == ()  # default is empty
 
 
+# ---- Health T10: attempt_heal wiring ----
+
+
+def test_interestset_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):
+    """Corrupt live file + valid .bak1 → restore .bak1, return its data, anomaly set."""
+    path = tmp_path / "interests.json"
+    bak1 = tmp_path / "interests.json.bak1"
+
+    # .bak1 has a valid interest
+    bak1.write_text(json.dumps({"version": 1, "interests": [_sample_dict()]}), encoding="utf-8")
+    path.write_text("{corrupt json{{", encoding="utf-8")
+
+    result, anomaly = InterestSet.load_with_anomaly(path, default_path=DEFAULT_INTERESTS_PATH)
+
+    assert anomaly is not None
+    assert "bak1" in anomaly.action
+    assert len(result.interests) == 1
+    assert result.interests[0].topic == "Test topic"
+    # original quarantined
+    corrupt_files = list(tmp_path.glob("interests.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_interestset_load_corrupt_no_bak_resets_to_default(tmp_path: Path):
+    """Corrupt live file + no .bak → reset to default (empty), anomaly with reset_to_default."""
+    path = tmp_path / "interests.json"
+    path.write_text("{corrupt json{{", encoding="utf-8")
+
+    result, anomaly = InterestSet.load_with_anomaly(path, default_path=DEFAULT_INTERESTS_PATH)
+
+    assert anomaly is not None
+    assert anomaly.action == "reset_to_default"
+    assert result.interests == ()
+
+
 def test_interestset_load_corrupt_falls_back(tmp_path: Path):
     bad = tmp_path / "interests.json"
     bad.write_text("not valid{", encoding="utf-8")

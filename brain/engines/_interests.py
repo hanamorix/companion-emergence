@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from brain.utils.time import iso_utc, parse_iso_utc
+
+if TYPE_CHECKING:
+    from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
 
@@ -105,36 +107,74 @@ class InterestSet:
     interests: tuple[Interest, ...] = field(default_factory=tuple)
 
     @classmethod
-    def load(cls, path: Path, *, default_path: Path) -> InterestSet:
-        source_path = path if path.exists() else default_path
-        if source_path != path:
-            logger.warning("interests file %s not found, using defaults", path)
+    def load_with_anomaly(
+        cls, path: Path, *, default_path: Path
+    ) -> tuple[InterestSet, BrainAnomaly | None]:
+        """Load with self-healing from .bak rotation if corrupt.
 
-        try:
-            data = json.loads(source_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("interests load failed (%s), falling back to defaults", exc)
-            data = json.loads(default_path.read_text(encoding="utf-8"))
+        Returns (instance, anomaly_or_None).
+          - Missing file → load from default_path, no anomaly.
+          - Corrupt file → quarantine, restore from .bak1/.bak2/.bak3 or write
+            default; parse the result with existing per-entry coercion.
+        """
+        from brain.health.attempt_heal import attempt_heal
 
-        if not isinstance(data, dict) or not isinstance(data.get("interests"), list):
-            logger.warning("interests schema invalid at %s, falling back to defaults", source_path)
-            data = json.loads(default_path.read_text(encoding="utf-8"))
+        def _default_factory() -> dict:
+            return json.loads(default_path.read_text(encoding="utf-8"))
+
+        def _schema_validator(data: object) -> None:
+            if not isinstance(data, dict) or not isinstance(data.get("interests"), list):
+                raise ValueError("interests schema invalid: missing 'interests' list")
+
+        if not path.exists():
+            data = _default_factory()
+            anomaly = None
+        else:
+            data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
 
         out: list[Interest] = []
-        for raw in data["interests"]:
+        for raw in data.get("interests", []):
             try:
                 out.append(Interest.from_dict(raw))
             except (KeyError, ValueError, TypeError) as exc:
                 logger.warning("interest %r failed to load: %s", raw.get("topic"), exc)
                 continue
-        return cls(interests=tuple(out))
+        return cls(interests=tuple(out)), anomaly
+
+    @classmethod
+    def load(cls, path: Path, *, default_path: Path) -> InterestSet:
+        """Load interests; on corrupt file, quarantine + heal, log WARNING."""
+        source_path = path if path.exists() else default_path
+        if source_path != path:
+            logger.warning("interests file %s not found, using defaults", path)
+            data = json.loads(default_path.read_text(encoding="utf-8"))
+            out: list[Interest] = []
+            for raw in data.get("interests", []):
+                try:
+                    out.append(Interest.from_dict(raw))
+                except (KeyError, ValueError, TypeError) as exc:
+                    logger.warning("interest %r failed to load: %s", raw.get("topic"), exc)
+                    continue
+            return cls(interests=tuple(out))
+
+        instance, anomaly = cls.load_with_anomaly(path, default_path=default_path)
+        if anomaly is not None:
+            logger.warning(
+                "InterestSet anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
+            )
+        return instance
 
     def save(self, path: Path) -> None:
-        """Atomic save via .new + os.replace."""
+        """Atomic save via .bak rotation (save_with_backup)."""
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {"version": 1, "interests": [i.to_dict() for i in self.interests]}
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
 
     def find_by_topic(self, topic: str) -> Interest | None:
         lower = topic.lower()

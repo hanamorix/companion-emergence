@@ -153,3 +153,105 @@ def test_nell_heartbeat_verbose_shows_all_gated_reasons(
     assert "dream gated:" in out
     # Verbose mode shows interests bumped: 0
     assert "interests bumped: 0" in out
+
+
+# ---- Task 12: compact CLI health output ----
+
+
+def test_compact_cli_clean_tick_no_health_output(
+    nell_persona: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No 🩹, no banner, no health output on clean tick."""
+    from brain.cli import main
+
+    main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"])  # init
+    main(["heartbeat", "--persona", "nell", "--trigger", "close", "--provider", "fake"])
+    out = capsys.readouterr().out
+
+    assert "🩹" not in out
+    assert "Brain alarm" not in out
+    assert "nell health" not in out
+    assert "self-treated" not in out
+
+
+def test_compact_cli_self_treated_emits_bandage_line(
+    nell_persona: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🩹 line appears when result.anomalies non-empty + no pending alarms."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    from brain.cli import main
+    from brain.engines.heartbeat import HeartbeatResult
+    from brain.health.anomaly import BrainAnomaly
+
+    anomaly = BrainAnomaly(
+        timestamp=datetime.now(UTC),
+        file="heartbeat_config.json",
+        kind="json_parse_error",
+        action="reset_to_default",
+        quarantine_path=None,
+        likely_cause="unknown",
+        detail="test",
+    )
+
+    def fake_run_tick(self, *, trigger="manual", dry_run=False):
+        return HeartbeatResult(
+            trigger=trigger,
+            elapsed_seconds=3600.0,
+            memories_decayed=0,
+            edges_pruned=0,
+            dream_id=None,
+            dream_gated_reason="not_due",
+            research_deferred=True,
+            heartbeat_memory_id=None,
+            initialized=False,
+            anomalies=(anomaly,),
+            pending_alarms_count=0,
+        )
+
+    with patch("brain.engines.heartbeat.HeartbeatEngine.run_tick", fake_run_tick):
+        rc = main(["heartbeat", "--persona", "nell", "--trigger", "close", "--provider", "fake"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "🩹" in out
+    assert "self-treated" in out
+    assert "Brain alarm" not in out
+
+
+def test_compact_cli_alarm_emits_banner_above_engine_status(
+    nell_persona: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Banner appears at top of output; persists until acknowledged."""
+    from unittest.mock import patch
+
+    from brain.cli import main
+    from brain.engines.heartbeat import HeartbeatResult
+
+    def fake_run_tick(self, *, trigger="manual", dry_run=False):
+        return HeartbeatResult(
+            trigger=trigger,
+            elapsed_seconds=3600.0,
+            memories_decayed=0,
+            edges_pruned=0,
+            dream_id=None,
+            dream_gated_reason="not_due",
+            research_deferred=True,
+            heartbeat_memory_id=None,
+            initialized=False,
+            anomalies=(),
+            pending_alarms_count=2,
+        )
+
+    with patch("brain.engines.heartbeat.HeartbeatEngine.run_tick", fake_run_tick):
+        rc = main(["heartbeat", "--persona", "nell", "--trigger", "close", "--provider", "fake"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "Brain alarm" in out
+    assert "nell health show" in out
+    # Banner must appear BEFORE the "Heartbeat tick complete" line
+    banner_pos = out.index("Brain alarm")
+    tick_pos = out.index("Heartbeat tick complete")
+    assert banner_pos < tick_pos

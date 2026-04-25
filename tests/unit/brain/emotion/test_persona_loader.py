@@ -7,7 +7,10 @@ import logging
 from pathlib import Path
 
 from brain.emotion import vocabulary
-from brain.emotion.persona_loader import load_persona_vocabulary
+from brain.emotion.persona_loader import (
+    load_persona_vocabulary,
+    load_persona_vocabulary_with_anomaly,
+)
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -128,6 +131,55 @@ def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
         assert any("test_bad_entry" in r.message for r in caplog.records)
     finally:
         _cleanup_emotion("test_good_entry")
+
+
+# ---- Health T10: attempt_heal wiring ----
+
+
+def test_load_persona_vocabulary_corrupt_quarantines_restores_from_bak(tmp_path: Path):
+    """Corrupt live vocab + valid .bak1 → restore .bak1, register its emotion, anomaly set."""
+    path = tmp_path / "emotion_vocabulary.json"
+    bak1 = tmp_path / "emotion_vocabulary.json.bak1"
+
+    good_vocab = {
+        "version": 1,
+        "emotions": [
+            {
+                "name": "test_heal_bak_a",
+                "description": "restored",
+                "category": "persona_extension",
+                "decay_half_life_days": 5.0,
+                "intensity_clamp": 10.0,
+            }
+        ],
+    }
+    bak1.write_text(json.dumps(good_vocab), encoding="utf-8")
+    path.write_text("{corrupt{{", encoding="utf-8")
+
+    try:
+        count, anomaly = load_persona_vocabulary_with_anomaly(path)
+        assert anomaly is not None
+        assert "bak1" in anomaly.action
+        assert count == 1
+        assert vocabulary.get("test_heal_bak_a") is not None
+        corrupt_files = list(tmp_path.glob("emotion_vocabulary.json.corrupt-*"))
+        assert len(corrupt_files) == 1
+    finally:
+        _cleanup_emotion("test_heal_bak_a")
+
+
+def test_load_persona_vocabulary_corrupt_no_bak_resets_to_default(tmp_path: Path):
+    """Corrupt vocab + no .bak → empty default written, count=0, anomaly with reset_to_default."""
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text("{corrupt{{", encoding="utf-8")
+
+    count, anomaly = load_persona_vocabulary_with_anomaly(path)
+
+    assert anomaly is not None
+    assert anomaly.action == "reset_to_default"
+    assert count == 0
+    # Default file written back to disk
+    assert path.exists()
 
 
 def test_load_with_store_warns_on_missing_emotion(tmp_path: Path, caplog):

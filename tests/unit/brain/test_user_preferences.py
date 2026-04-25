@@ -10,6 +10,36 @@ from brain.user_preferences import (
     read_raw_keys,
 )
 
+# ---- Task 9: attempt_heal wiring ----
+
+
+def test_user_preferences_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
+    """Corrupt JSON → defaults returned + quarantine file present."""
+    path = tmp_path / "user_preferences.json"
+    path.write_text("{not json at all", encoding="utf-8")
+
+    prefs, anomaly = UserPreferences.load_with_anomaly(path)
+
+    assert prefs.dream_every_hours == DEFAULT_DREAM_EVERY_HOURS
+    assert anomaly is not None
+    assert anomaly.kind == "json_parse_error"
+    corrupt_files = list(tmp_path.glob("user_preferences.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_user_preferences_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
+    """Valid .bak1 + corrupt live file → .bak1 content returned."""
+    path = tmp_path / "user_preferences.json"
+    bak1 = tmp_path / "user_preferences.json.bak1"
+    bak1.write_text('{"dream_every_hours": 8.0}\n', encoding="utf-8")
+    path.write_text("{corrupt", encoding="utf-8")
+
+    prefs, anomaly = UserPreferences.load_with_anomaly(path)
+
+    assert prefs.dream_every_hours == 8.0
+    assert anomaly is not None
+    assert "bak1" in anomaly.action
+
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
     prefs = UserPreferences.load(tmp_path / "nope.json")
