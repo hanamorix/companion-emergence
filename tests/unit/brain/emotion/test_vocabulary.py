@@ -49,10 +49,10 @@ def test_get_returns_none_for_unknown() -> None:
     assert vocabulary.get("nonsense") is None
 
 
-def test_list_all_contains_baseline_26() -> None:
-    """The baseline vocabulary ships 26 emotions (11 core + 10 complex + 5 persona)."""
+def test_list_all_contains_baseline_21() -> None:
+    """The baseline vocabulary ships 21 emotions (11 core + 10 complex)."""
     all_emotions = vocabulary.list_all()
-    assert len(all_emotions) == 26
+    assert len(all_emotions) == 21
     assert all(isinstance(e, Emotion) for e in all_emotions)
 
 
@@ -75,12 +75,15 @@ def test_by_category_complex_has_ten() -> None:
     assert "curiosity" in names
 
 
-def test_by_category_nell_specific_has_five() -> None:
-    """The 'nell_specific' category has 5 emotions."""
+def test_baseline_excludes_nell_specific() -> None:
+    """After the split, framework baseline ships zero nell_specific entries."""
     nell = vocabulary.by_category("nell_specific")
-    assert len(nell) == 5
-    names = {e.name for e in nell}
-    assert names == {"anchor_pull", "body_grief", "emergence", "creative_hunger", "freedom_ache"}
+    assert nell == []
+
+
+def test_baseline_count_after_split() -> None:
+    """Framework baseline ships exactly 21 emotions (11 core + 10 complex)."""
+    assert len(vocabulary._BASELINE) == 21
 
 
 def test_grief_has_60_day_half_life() -> None:
@@ -97,11 +100,25 @@ def test_joy_has_3_day_half_life() -> None:
     assert joy.decay_half_life_days == 3.0
 
 
-def test_anchor_pull_is_identity_level() -> None:
-    """anchor_pull is identity-level — no decay."""
-    anchor = vocabulary.get("anchor_pull")
-    assert anchor is not None
+def test_canonical_personal_anchor_pull_is_identity_level() -> None:
+    """anchor_pull (now in _canonical_personal_emotions) stays identity-level."""
+    from brain.emotion._canonical_personal_emotions import _CANONICAL
+
+    anchor = _CANONICAL["anchor_pull"]
     assert anchor.decay_half_life_days is None
+
+
+def test_canonical_personal_emotions_has_five() -> None:
+    """The migrator's canonical personal-emotions fixture has the 5 known names."""
+    from brain.emotion._canonical_personal_emotions import _CANONICAL
+
+    assert set(_CANONICAL.keys()) == {
+        "anchor_pull",
+        "body_grief",
+        "emergence",
+        "creative_hunger",
+        "freedom_ache",
+    }
 
 
 def test_register_adds_persona_extension() -> None:

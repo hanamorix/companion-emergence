@@ -28,6 +28,8 @@ class MigrationReport:
     reflex_arcs_skipped_reason: str | None = None
     interests_migrated: int = 0
     interests_skipped_reason: str | None = None
+    vocabulary_emotions_migrated: int = 0
+    vocabulary_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -47,6 +49,14 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.reflex_arcs_skipped_reason})"
             if report.reflex_arcs_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Vocabulary:     {report.vocabulary_emotions_migrated:,} emotions migrated"
+        + (
+            f" (skipped: {report.vocabulary_skipped_reason})"
+            if report.vocabulary_skipped_reason
             else ""
         )
     )
