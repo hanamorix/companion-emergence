@@ -9,15 +9,69 @@ Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain.emotion import vocabulary
 from brain.emotion.vocabulary import Emotion
 from brain.memory.store import MemoryStore
 
+if TYPE_CHECKING:
+    from brain.health.anomaly import BrainAnomaly
+
 logger = logging.getLogger(__name__)
+
+_DEFAULT_VOCAB: dict = {"version": 1, "emotions": []}
+
+
+def _default_vocab_factory() -> dict:
+    return {"version": 1, "emotions": []}
+
+
+def _vocab_schema_validator(data: object) -> None:
+    if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
+        raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
+
+
+def load_persona_vocabulary_with_anomaly(
+    path: Path,
+    *,
+    store: MemoryStore | None = None,
+) -> tuple[int, BrainAnomaly | None]:
+    """Load persona vocabulary with self-healing from .bak rotation if corrupt.
+
+    Returns (registered_count, anomaly_or_None).
+      - Missing file → 0, no anomaly.
+      - Corrupt file → quarantine, restore from .bak1/.bak2/.bak3 or reset to
+        empty default. Anomaly set.
+      - Healthy file → counts of newly registered emotions, no anomaly.
+    """
+    from brain.health.attempt_heal import attempt_heal
+
+    if not path.exists():
+        if store is not None:
+            _warn_on_referenced_but_unregistered(store)
+        return 0, None
+
+    data, anomaly = attempt_heal(
+        path, _default_vocab_factory, schema_validator=_vocab_schema_validator
+    )
+
+    if anomaly is not None:
+        logger.warning(
+            "emotion_vocabulary anomaly detected: %s action=%s file=%s",
+            anomaly.kind,
+            anomaly.action,
+            anomaly.file,
+        )
+
+    registered = _register_from_data(data)
+
+    if store is not None:
+        _warn_on_referenced_but_unregistered(store)
+
+    return registered, anomaly
 
 
 def load_persona_vocabulary(
@@ -32,7 +86,7 @@ def load_persona_vocabulary(
     this twice for the same persona returns 0 the second time.
 
     Missing `path` → returns 0 silently. Fresh personas don't need a file.
-    Corrupt JSON → returns 0, logs a warning.
+    Corrupt JSON → quarantine + heal from .bak, log a warning.
     Per-entry validation failure → that entry skipped + warning,
     other entries proceed.
 
@@ -40,26 +94,14 @@ def load_persona_vocabulary(
     for emotion names not in the registry and logs a one-time warning
     per missing name pointing the user at `nell migrate --force`.
     """
-    if not path.exists():
-        if store is not None:
-            _warn_on_referenced_but_unregistered(store)
-        return 0
+    count, _anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+    return count
 
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        logger.warning("emotion_vocabulary at %s could not be parsed: %.200s", path, exc)
-        return 0
 
-    if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
-        logger.warning(
-            "emotion_vocabulary at %s has invalid schema (missing 'emotions' list)",
-            path,
-        )
-        return 0
-
+def _register_from_data(data: dict) -> int:
+    """Register emotions from a parsed vocab dict; return count of newly registered."""
     registered = 0
-    for entry in data["emotions"]:
+    for entry in data.get("emotions", []):
         try:
             emotion = _entry_to_emotion(entry)
         except (KeyError, ValueError, TypeError) as exc:
@@ -75,10 +117,6 @@ def load_persona_vocabulary(
 
         vocabulary.register(emotion)
         registered += 1
-
-    if store is not None:
-        _warn_on_referenced_but_unregistered(store)
-
     return registered
 
 

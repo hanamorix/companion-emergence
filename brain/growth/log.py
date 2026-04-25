@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -62,29 +63,15 @@ def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
     """Read events oldest-first. `limit=N` returns the N most-recent events.
 
-    Corrupt lines (partial write, hand-edit) are skipped with a warning;
-    well-formed lines around them still parse.
+    Corrupt lines (partial write, hand-edit) are skipped with a warning via
+    `read_jsonl_skipping_corrupt`; well-formed lines around them still parse.
     """
-    if not path.exists():
-        return []
     events: list[GrowthLogEvent] = []
-    for line_index, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not raw.strip():
-            continue
+    for data in read_jsonl_skipping_corrupt(path):
         try:
-            data = json.loads(raw)
             events.append(_event_from_dict(data))
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            # Include line number + truncated content so a forensic grep can
-            # find and fix (or quarantine) the bad line. The exception alone
-            # doesn't tell you WHERE in the log the corruption is.
-            logger.warning(
-                "skipping malformed growth log line %d in %s: %.200s | content: %r",
-                line_index,
-                path,
-                exc,
-                raw[:200],
-            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("skipping growth log entry with schema error in %s: %s", path, exc)
             continue
     if limit is not None:
         events = events[-limit:]

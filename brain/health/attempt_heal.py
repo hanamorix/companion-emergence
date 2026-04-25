@@ -81,7 +81,9 @@ def _heal_from_baks(
             data = _load_and_validate(bak, schema_validator)
         except (json.JSONDecodeError, ValueError, TypeError):
             # This bak is also corrupt — quarantine it too.
-            bak_quarantine = path.with_name(f"{path.name}.bak{bak_index}.corrupt-{_filename_safe_timestamp(now)}")
+            bak_quarantine = path.with_name(
+                f"{path.name}.bak{bak_index}.corrupt-{_filename_safe_timestamp(now)}"
+            )
             os.replace(bak, bak_quarantine)
             continue
 
