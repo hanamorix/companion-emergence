@@ -48,8 +48,12 @@ class PersonaConfig:
 
         provider_raw = data.get("provider", DEFAULT_PROVIDER)
         searcher_raw = data.get("searcher", DEFAULT_SEARCHER)
-        provider = provider_raw if isinstance(provider_raw, str) and provider_raw else DEFAULT_PROVIDER
-        searcher = searcher_raw if isinstance(searcher_raw, str) and searcher_raw else DEFAULT_SEARCHER
+        provider = (
+            provider_raw if isinstance(provider_raw, str) and provider_raw else DEFAULT_PROVIDER
+        )
+        searcher = (
+            searcher_raw if isinstance(searcher_raw, str) and searcher_raw else DEFAULT_SEARCHER
+        )
         return cls(provider=provider, searcher=searcher)
 
     def save(self, path: Path) -> None:

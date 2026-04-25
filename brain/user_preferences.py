@@ -48,9 +48,7 @@ class UserPreferences:
             return cls()
         try:
             return cls(
-                dream_every_hours=float(
-                    data.get("dream_every_hours", DEFAULT_DREAM_EVERY_HOURS)
-                ),
+                dream_every_hours=float(data.get("dream_every_hours", DEFAULT_DREAM_EVERY_HOURS)),
             )
         except (TypeError, ValueError):
             return cls()
