@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -25,7 +25,9 @@ from brain.utils.time import iso_utc, parse_iso_utc
 logger = logging.getLogger(__name__)
 
 EmitMemoryMode = Literal["always", "conditional", "never"]
-_VALID_EMIT_MODES: tuple[str, ...] = ("always", "conditional", "never")
+# Single source of truth — derived from the Literal so a new mode added
+# above only needs to land in one place.
+_VALID_EMIT_MODES: tuple[str, ...] = get_args(EmitMemoryMode)
 
 
 @dataclass
