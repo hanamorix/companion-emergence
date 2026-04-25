@@ -100,11 +100,15 @@ class ResearchEngine:
         *,
         trigger: str = "manual",
         dry_run: bool = False,
-        forced_interest_topic: str | None = None,
         emotion_state_override=None,
         days_since_human_override: float | None = None,
     ) -> ResearchResult:
-        """Evaluate triggers, select an interest, fire (or report would_fire)."""
+        """Evaluate triggers, select an interest, fire (or report would_fire).
+
+        The brain owns topic selection — there is no force-research-this-topic
+        bypass. Per principle audit 2026-04-25: the user can't tell the brain
+        what to research; the brain decides from its own developed pull.
+        """
         now = datetime.now(UTC)
 
         interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
@@ -122,7 +126,7 @@ class ResearchEngine:
                 evaluated_at=now,
             )
 
-        # Gate: need a trigger signal OR a forced interest.
+        # Gate: need a trigger signal (days-since-human or emotion-peak).
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
@@ -138,8 +142,7 @@ class ResearchEngine:
         emo_peak = max(emo_state.emotions.values(), default=0.0)
 
         gate_ok = (
-            forced_interest_topic is not None
-            or days_since >= 1.5  # research_days_since_human_min default
+            days_since >= 1.5  # research_days_since_human_min default
             or emo_peak >= 7.0  # research_emotion_threshold default
         )
         if not gate_ok:
@@ -151,16 +154,13 @@ class ResearchEngine:
                 evaluated_at=now,
             )
 
-        # Select eligible interest
-        if forced_interest_topic is not None:
-            winner = interests.find_by_topic(forced_interest_topic)
-        else:
-            eligible = interests.list_eligible(
-                pull_threshold=self.pull_threshold,
-                cooldown_hours=self.cooldown_hours,
-                now=now,
-            )
-            winner = eligible[0] if eligible else None
+        # Select eligible interest — brain picks the highest-pull eligible one.
+        eligible = interests.list_eligible(
+            pull_threshold=self.pull_threshold,
+            cooldown_hours=self.cooldown_hours,
+            now=now,
+        )
+        winner = eligible[0] if eligible else None
 
         if winner is None:
             return ResearchResult(

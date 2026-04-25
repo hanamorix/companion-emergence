@@ -428,9 +428,12 @@ class HeartbeatEngine:
                 "sentences, starting with 'DREAM: '. Be honest and specific, "
                 "not abstract."
             ),
+            # lookback_hours=100000 ≈ "any conversation memory ever" — heartbeat
+            # picks dream seeds by importance, not recency.
+            lookback_hours=100000,
         )
         try:
-            dream_result = dream_engine.run_cycle(lookback_hours=100000)
+            dream_result = dream_engine.run_cycle()
         except NoSeedAvailable:
             return None
         return dream_result.memory.id if dream_result.memory is not None else None

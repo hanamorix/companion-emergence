@@ -15,7 +15,7 @@ from pathlib import Path
 from brain import __version__
 from brain.bridge.provider import get_provider
 from brain.emotion.persona_loader import load_persona_vocabulary
-from brain.engines._interests import Interest, InterestSet
+from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
@@ -57,7 +57,12 @@ def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
 
 
 def _dream_handler(args: argparse.Namespace) -> int:
-    """Dispatch `nell dream` to the DreamEngine."""
+    """Dispatch `nell dream` to the DreamEngine.
+
+    Developer-only entry point — production dreams fire from the heartbeat.
+    Mechanism knobs (seed, depth, decay, limit, lookback) are constructor-level
+    calibration, not CLI flags. Per principle audit 2026-04-25.
+    """
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
@@ -88,14 +93,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
                     "starting with 'DREAM: '. Be honest and specific, not abstract."
                 ),
             )
-            result = engine.run_cycle(
-                seed_id=args.seed,
-                lookback_hours=args.lookback,
-                depth=args.depth,
-                decay_per_hop=args.decay,
-                neighbour_limit=args.limit,
-                dry_run=args.dry_run,
-            )
+            result = engine.run_cycle(dry_run=args.dry_run)
         finally:
             hebbian.close()
     finally:
@@ -288,7 +286,6 @@ def _research_handler(args: argparse.Namespace) -> int:
         result = engine.run_tick(
             trigger=args.trigger,
             dry_run=args.dry_run,
-            forced_interest_topic=args.interest,
         )
     finally:
         store.close()
@@ -332,57 +329,6 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     return 0
 
 
-def _interest_add_handler(args: argparse.Namespace) -> int:
-    import uuid
-    from datetime import UTC, datetime
-
-    persona_dir = get_persona_dir(args.persona)
-    if not persona_dir.exists():
-        raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
-    interests_path = persona_dir / "interests.json"
-    interests = InterestSet.load(interests_path, default_path=_default_interests_path())
-    now = datetime.now(UTC)
-    new_interest = Interest(
-        id=str(uuid.uuid4()),
-        topic=args.topic,
-        pull_score=5.0,
-        scope=args.scope,
-        related_keywords=tuple(k.strip() for k in args.keywords.split(",") if k.strip()),
-        notes=args.notes or "",
-        first_seen=now,
-        last_fed=now,
-        last_researched_at=None,
-        feed_count=0,
-        source_types=("manual",),
-    )
-    interests.upsert(new_interest).save(interests_path)
-    print(f"Added interest: {new_interest.topic} (pull_score=5.0, scope={new_interest.scope})")
-    return 0
-
-
-def _interest_bump_handler(args: argparse.Namespace) -> int:
-    from datetime import UTC, datetime
-
-    persona_dir = get_persona_dir(args.persona)
-    if not persona_dir.exists():
-        raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
-    interests_path = persona_dir / "interests.json"
-    interests = InterestSet.load(interests_path, default_path=_default_interests_path())
-    if interests.find_by_topic(args.topic) is None:
-        print(f"Interest not found: {args.topic!r}")
-        return 1
-    updated = interests.bump(args.topic, amount=args.amount, now=datetime.now(UTC))
-    updated.save(interests_path)
-    bumped = updated.find_by_topic(args.topic)
-    assert bumped is not None
-    print(
-        f"Bumped {args.topic!r}: pull_score={bumped.pull_score:.1f}, feed_count={bumped.feed_count}"
-    )
-    return 0
-
-
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -407,7 +353,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     dream_sub = subparsers.add_parser(
         "dream",
-        help="Run one dream cycle against a persona's memory store.",
+        help=(
+            "(developer) Run one dream cycle against a persona's memory store. "
+            "Production dreams fire from the heartbeat — this is for debugging."
+        ),
     )
     dream_sub.add_argument(
         "--persona",
@@ -419,24 +368,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     dream_sub.add_argument(
-        "--seed", default=None, help="Explicit seed memory id (default: auto-select)."
-    )
-    dream_sub.add_argument(
         "--provider",
         default="claude-cli",
         help="LLM provider: claude-cli (default), fake, ollama.",
     )
     dream_sub.add_argument("--dry-run", action="store_true", help="Skip LLM call and store writes.")
-    dream_sub.add_argument(
-        "--lookback", type=int, default=24, help="Hours of history to consider (default: 24)."
-    )
-    dream_sub.add_argument(
-        "--depth", type=int, default=2, help="Spreading-activation depth (default: 2)."
-    )
-    dream_sub.add_argument("--decay", type=float, default=0.5, help="Per-hop decay (default: 0.5).")
-    dream_sub.add_argument(
-        "--limit", type=int, default=8, help="Max neighbours in prompt (default: 8)."
-    )
     dream_sub.set_defaults(func=_dream_handler)
 
     hb_sub = subparsers.add_parser(
@@ -524,14 +460,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     r_sub.add_argument("--provider", default="claude-cli")
     r_sub.add_argument("--searcher", default="ddgs", choices=["ddgs", "noop", "claude-tool"])
-    r_sub.add_argument(
-        "--interest", default=None, help="Force-research this topic, bypassing gates."
-    )
     r_sub.add_argument("--dry-run", action="store_true")
     r_sub.set_defaults(func=_research_handler)
 
-    # nell interest <list|add|bump>
-    i_sub = subparsers.add_parser("interest", help="Manage persona interests.")
+    # nell interest list — read-only inspection. The brain develops its own
+    # interests; the user does not add or bump them. Per principle audit
+    # 2026-04-25.
+    i_sub = subparsers.add_parser(
+        "interest",
+        help="Inspect persona interests (read-only).",
+    )
     i_actions = i_sub.add_subparsers(dest="action", required=True)
 
     i_list = i_actions.add_parser("list", help="List current interests.")
@@ -545,36 +483,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     i_list.set_defaults(func=_interest_list_handler)
-
-    i_add = i_actions.add_parser("add", help="Add a new interest.")
-    i_add.add_argument("topic")
-    i_add.add_argument("--keywords", default="")
-    i_add.add_argument("--scope", choices=["internal", "external", "either"], default="either")
-    i_add.add_argument("--notes", default=None)
-    i_add.add_argument(
-        "--persona",
-        required=True,
-        help=(
-            "Persona name (required). "
-            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
-            "To start fresh: create personas/<name>/ manually."
-        ),
-    )
-    i_add.set_defaults(func=_interest_add_handler)
-
-    i_bump = i_actions.add_parser("bump", help="Nudge an interest's pull_score.")
-    i_bump.add_argument("topic")
-    i_bump.add_argument("--amount", type=float, default=1.0)
-    i_bump.add_argument(
-        "--persona",
-        required=True,
-        help=(
-            "Persona name (required). "
-            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data --install-as <name>`. "
-            "To start fresh: create personas/<name>/ manually."
-        ),
-    )
-    i_bump.set_defaults(func=_interest_bump_handler)
 
     return parser
 
