@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from brain.growth.proposal import EmotionProposal
-from brain.growth.scheduler import GrowthTickResult, run_growth_tick
+from brain.growth.scheduler import GrowthTickResult, _read_current_vocabulary_names, run_growth_tick
 from brain.memory.store import MemoryStore
 
 
@@ -187,11 +187,10 @@ def test_run_growth_tick_corrupt_vocabulary_logs_warning(
 ) -> None:
     """A corrupt emotion_vocabulary.json is detected and surfaces a WARNING.
 
-    Prior to hardening, the JSONDecodeError was silently swallowed, so a
-    corrupt vocab file looked indistinguishable from "no emotions yet" to
-    the scheduler. The scheduler still proceeds (returns empty set + tick
-    continues) but the warning gives the user / forensic-grep a thread to
-    pull on rather than silent degradation.
+    Post-T10 the scheduler routes through attempt_heal, which quarantines the
+    corrupt file and resets to default. The scheduler still completes (returns
+    empty set) but the anomaly surfaces a WARNING so the user / forensic-grep
+    has a thread to pull on rather than silent degradation.
     """
     import logging
 
@@ -205,10 +204,13 @@ def test_run_growth_tick_corrupt_vocabulary_logs_warning(
     # Tick still completes (no proposals from stub anyway).
     assert result.emotions_added == 0
 
-    # Warning surfaces both the path and the corruption.
-    corrupt_warnings = [r for r in caplog.records if "corrupt JSON" in r.getMessage()]
-    assert len(corrupt_warnings) == 1
-    assert "emotion_vocabulary.json" in corrupt_warnings[0].getMessage()
+    # Warning surfaces the anomaly — message contains "anomaly" and the filename.
+    anomaly_warnings = [
+        r
+        for r in caplog.records
+        if "anomaly" in r.getMessage() and "emotion_vocabulary.json" in r.getMessage()
+    ]
+    assert len(anomaly_warnings) == 1
 
 
 def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
@@ -226,8 +228,58 @@ def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
     result = run_growth_tick(persona_dir, store, datetime.now(UTC))
     assert result.emotions_added == 0
 
-    schema_warnings = [r for r in caplog.records if "invalid schema" in r.getMessage()]
+    # Post-T10: schema mismatch goes through attempt_heal; warning message
+    # contains "anomaly" and identifies the file.
+    schema_warnings = [
+        r
+        for r in caplog.records
+        if "anomaly" in r.getMessage() and "emotion_vocabulary.json" in r.getMessage()
+    ]
     assert len(schema_warnings) == 1
+
+
+# ---- Health T10: attempt_heal wiring ----
+
+
+def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
+    persona_dir: Path, caplog
+) -> None:
+    """Corrupt vocab + valid .bak1 → names from .bak1 returned + quarantine created."""
+    import logging
+
+    vocab_path = persona_dir / "emotion_vocabulary.json"
+    bak1 = persona_dir / "emotion_vocabulary.json.bak1"
+    bak1.write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "joy"}, {"name": "love"}]}), encoding="utf-8"
+    )
+    vocab_path.write_text("{corrupt{{", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        names = _read_current_vocabulary_names(vocab_path)
+
+    # Names restored from .bak1
+    assert "joy" in names
+    assert "love" in names
+    # Original quarantined
+    corrupt_files = list(persona_dir.glob("emotion_vocabulary.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
+    persona_dir: Path, caplog
+) -> None:
+    """Corrupt vocab + no .bak → empty set returned + warning logged."""
+    import logging
+
+    vocab_path = persona_dir / "emotion_vocabulary.json"
+    vocab_path.write_text("{corrupt{{", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        names = _read_current_vocabulary_names(vocab_path)
+
+    assert names == set()
+    # Some warning surfaced (either from attempt_heal or existing path)
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 def test_run_growth_tick_missing_vocabulary_no_warning(

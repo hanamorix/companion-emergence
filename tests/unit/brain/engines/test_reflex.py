@@ -132,6 +132,58 @@ def test_reflex_arc_set_load_bad_arc_skipped_good_kept(tmp_path: Path):
     assert "broken" not in names
 
 
+# ---- Health T10: attempt_heal wiring ----
+
+
+def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):
+    """Corrupt live arcs file + valid .bak1 → restore .bak1, return its arcs, anomaly set."""
+    path = tmp_path / "reflex_arcs.json"
+    bak1 = tmp_path / "reflex_arcs.json.bak1"
+
+    bak1.write_text(
+        json.dumps({"version": 1, "arcs": [_valid_arc_dict()]}), encoding="utf-8"
+    )
+    path.write_text("{corrupt{{", encoding="utf-8")
+
+    result, anomaly = ReflexArcSet.load_with_anomaly(path, default_path=DEFAULT_ARCS_PATH)
+
+    assert anomaly is not None
+    assert "bak1" in anomaly.action
+    assert len(result.arcs) == 1
+    assert result.arcs[0].name == "test_arc"
+    corrupt_files = list(tmp_path.glob("reflex_arcs.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+
+
+def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
+    """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default."""
+    path = tmp_path / "reflex_arcs.json"
+    path.write_text("{corrupt{{", encoding="utf-8")
+
+    result, anomaly = ReflexArcSet.load_with_anomaly(path, default_path=DEFAULT_ARCS_PATH)
+
+    assert anomaly is not None
+    assert anomaly.action == "reset_to_default"
+    # default_path arcs loaded (4 OG arcs)
+    assert len(result.arcs) == 4
+
+
+def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
+    """save() via save_with_backup creates .bak1 on second write."""
+    path = tmp_path / "reflex_log.json"
+    fire = ArcFire(
+        arc_name="test_arc",
+        fired_at=datetime.now(UTC),
+        trigger_state={"love": 6.0},
+        output_memory_id="mem-1",
+    )
+    log = ReflexLog(fires=(fire,))
+    log.save(path)
+    log.save(path)  # second write should rotate the first into .bak1
+    bak1 = tmp_path / "reflex_log.json.bak1"
+    assert bak1.exists()
+
+
 # ---- ReflexLog ----
 
 
