@@ -79,6 +79,15 @@ def test_get_persona_dir_rejects_dot_name() -> None:
         paths.get_persona_dir("..")
 
 
+def test_get_persona_dir_rejects_brace_chars() -> None:
+    """Persona name with literal '{' or '}' would break str.format_map
+    prompt rendering used by reflex/research engines."""
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("evil{persona_name}")
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("evil}persona{")
+
+
 def test_get_persona_dir_rejects_empty() -> None:
     with pytest.raises(ValueError):
         paths.get_persona_dir("")

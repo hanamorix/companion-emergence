@@ -88,13 +88,23 @@ class ClaudeCliProvider(LLMProvider):
 class OllamaProvider(LLMProvider):
     """Placeholder for local Ollama integration.
 
-    Stub until Hana's local Ollama stack is back up. Fill in by:
+    Stub — fill in when Ollama integration lands. Fill in by:
     1. Replacing raise with an httpx POST to {host}/api/generate
     2. Parsing the streamed/non-streamed response
     3. Adding the httpx dep to pyproject
+
+    Default model: huihui_ai/qwen2.5-abliterated:7b — uncensored Qwen2.5
+    abliterated variant. Same base architecture as Nell's nell-dpo
+    fine-tune, light enough for most local hardware (~4.7GB), works
+    well with the brain's emotional + creative tone. Users can override
+    via `OllamaProvider(model="...")`.
     """
 
-    def __init__(self, model: str = "nell-dpo", host: str = "http://localhost:11434") -> None:
+    def __init__(
+        self,
+        model: str = "huihui_ai/qwen2.5-abliterated:7b",
+        host: str = "http://localhost:11434",
+    ) -> None:
         self._model = model
         self._host = host
 
