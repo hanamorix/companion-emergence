@@ -19,6 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+# `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
+# files in the wild may still contain entries with this category. New baseline
+# entries use only "core" or "complex"; new persona-loaded entries use only
+# "persona_extension". The Literal accepts `nell_specific` so loaders don't
+# reject older files outright.
 EmotionCategory = Literal["core", "complex", "nell_specific", "persona_extension"]
 
 
