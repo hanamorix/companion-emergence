@@ -39,10 +39,17 @@ def test_partial_decay_matches_exponential_formula() -> None:
 
 def test_anchor_pull_does_not_decay() -> None:
     """Identity-level emotions (half_life=None) are untouched."""
-    state = EmotionalState()
-    state.set("anchor_pull", 9.0)
-    apply_decay(state, elapsed_seconds=365 * 24 * 3600)
-    assert state.emotions["anchor_pull"] == 9.0
+    from brain.emotion._canonical_personal_emotions import _CANONICAL
+    from brain.emotion.vocabulary import _unregister, register
+
+    register(_CANONICAL["anchor_pull"])
+    try:
+        state = EmotionalState()
+        state.set("anchor_pull", 9.0)
+        apply_decay(state, elapsed_seconds=365 * 24 * 3600)
+        assert state.emotions["anchor_pull"] == 9.0
+    finally:
+        _unregister("anchor_pull")
 
 
 def test_love_does_not_decay() -> None:
