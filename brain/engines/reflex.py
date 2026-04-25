@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
@@ -22,6 +22,9 @@ from brain.memory.store import Memory, MemoryStore
 from brain.utils.emotion import format_emotion_summary
 from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
+
+if TYPE_CHECKING:
+    from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
 
@@ -132,69 +135,107 @@ class ReflexArcSet:
     arcs: tuple[ReflexArc, ...]
 
     @classmethod
-    def load(cls, path: Path, *, default_path: Path) -> ReflexArcSet:
-        """Load arcs from path, falling back to default_path on corrupt/missing.
+    def load_with_anomaly(
+        cls, path: Path, *, default_path: Path
+    ) -> tuple[ReflexArcSet, BrainAnomaly | None]:
+        """Load arcs with self-healing from .bak rotation if corrupt.
 
-        Per-arc validation failures skip that arc, log warning, keep others.
+        Returns (instance, anomaly_or_None).
+          - Missing file → load from default_path, no anomaly.
+          - Corrupt file → quarantine, restore from .bak1/.bak2/.bak3 or
+            reset to default_path content.
+          - Per-arc validation failures skip that arc, log warning, keep others.
         """
-        source_path = path if path.exists() else default_path
-        if source_path != path:
+        from brain.health.attempt_heal import attempt_heal
+
+        def _default_factory() -> dict:
+            return json.loads(default_path.read_text(encoding="utf-8"))
+
+        def _schema_validator(data: object) -> None:
+            if (
+                not isinstance(data, dict)
+                or "arcs" not in data
+                or not isinstance(data["arcs"], list)
+            ):
+                raise ValueError("reflex arcs schema invalid: missing 'arcs' list")
+
+        if not path.exists():
             logger.warning("reflex arcs file %s not found, using defaults", path)
-
-        try:
-            data = json.loads(source_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("reflex arcs load failed (%s), falling back to defaults", exc)
-            data = json.loads(default_path.read_text(encoding="utf-8"))
-
-        if not isinstance(data, dict) or "arcs" not in data or not isinstance(data["arcs"], list):
-            logger.warning(
-                "reflex arcs schema invalid at %s, falling back to defaults", source_path
-            )
-            data = json.loads(default_path.read_text(encoding="utf-8"))
+            data = _default_factory()
+            anomaly = None
+        else:
+            data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
 
         arcs: list[ReflexArc] = []
-        for raw in data["arcs"]:
+        for raw in data.get("arcs", []):
             try:
                 arcs.append(ReflexArc.from_dict(raw))
             except (KeyError, ValueError, TypeError) as exc:
                 logger.warning("reflex arc %r failed to load: %s", raw.get("name"), exc)
                 continue
-        return cls(arcs=tuple(arcs))
+        return cls(arcs=tuple(arcs)), anomaly
+
+    @classmethod
+    def load(cls, path: Path, *, default_path: Path) -> ReflexArcSet:
+        """Load arcs from path; on corrupt file, quarantine + heal, log WARNING."""
+        instance, anomaly = cls.load_with_anomaly(path, default_path=default_path)
+        if anomaly is not None:
+            logger.warning(
+                "ReflexArcSet anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
+            )
+        return instance
 
 
 @dataclass(frozen=True)
 class ReflexLog:
-    """Fire-history log for one persona."""
+    """Fire-history log for one persona.
+
+    Stored as a single JSON object ``{"version": 1, "fires": [...]}`` —
+    atomic-rewrite, not append-only JSONL.  Corruption recovery delegates
+    to ``attempt_heal`` + ``.bak`` rotation; ``save_with_backup`` keeps up
+    to three rolling backups for the adaptive-treatment layer.
+    """
 
     fires: tuple[ArcFire, ...] = field(default_factory=tuple)
 
     @classmethod
     def load(cls, path: Path) -> ReflexLog:
-        """Load the log; return empty on corrupt/missing."""
-        if not path.exists():
-            return cls()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return cls()
-            fires_raw = data.get("fires", [])
-            if not isinstance(fires_raw, list):
-                return cls()
-            fires = tuple(ArcFire.from_dict(f) for f in fires_raw if isinstance(f, dict))
-            return cls(fires=fires)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return cls()
+        """Load the log; heal from .bak rotation if corrupt, log WARNING."""
+        from brain.health.attempt_heal import attempt_heal
+
+        def _default_factory() -> dict:
+            return {"version": 1, "fires": []}
+
+        def _schema_validator(data: object) -> None:
+            if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
+                raise ValueError("reflex log schema invalid: missing 'fires' list")
+
+        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        if anomaly is not None:
+            logger.warning(
+                "ReflexLog anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
+            )
+        fires_raw = data.get("fires", [])
+        fires = tuple(ArcFire.from_dict(f) for f in fires_raw if isinstance(f, dict))
+        return cls(fires=fires)
 
     def save(self, path: Path) -> None:
-        """Atomic save via write-to-.new + os.replace."""
+        """Atomic save via .bak rotation (save_with_backup)."""
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {
             "version": 1,
             "fires": [f.to_dict() for f in self.fires],
         }
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
 
     def last_fire_for_arc(self, arc_name: str) -> datetime | None:
         """Return the most recent fired_at for the given arc, or None."""

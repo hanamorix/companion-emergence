@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import shutil
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
 
 from brain.bridge.provider import LLMProvider
+from brain.health.alarm import compute_pending_alarms
+from brain.health.anomaly import BrainAnomaly
+from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.search.base import NoopWebSearcher, WebSearcher
@@ -70,7 +73,17 @@ class HeartbeatConfig:
         `path` points at heartbeat_config.json. user_preferences.json is
         looked up next to it (`path.parent / "user_preferences.json"`).
         """
-        cfg = cls._load_internal(path)
+        cfg, _ = cls.load_with_anomaly(path)
+        return cfg
+
+    @classmethod
+    def load_with_anomaly(cls, path: Path) -> tuple[HeartbeatConfig, BrainAnomaly | None]:
+        """Load heartbeat_config.json (with self-healing), then merge user_preferences.
+
+        Returns (cfg, anomaly_or_None). The anomaly, if any, comes from the
+        internal-load stage; user_preferences merge never raises anomalies.
+        """
+        cfg, anomaly = cls._load_internal_with_anomaly(path)
 
         # Merge user_preferences.json — only override fields explicitly
         # present in the file, so a user_preferences.json that omits
@@ -83,17 +96,14 @@ class HeartbeatConfig:
         if "dream_every_hours" in explicit_keys:
             prefs = UserPreferences.load(user_prefs_path)
             cfg = replace(cfg, dream_every_hours=prefs.dream_every_hours)
-        return cfg
+        return cfg, anomaly
 
     @classmethod
-    def _load_internal(cls, path: Path) -> HeartbeatConfig:
-        """Load heartbeat_config.json only — the developer-calibration layer."""
-        if not path.exists():
-            return cls()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return cls()
+    def _parse_internal_data(cls, data: object) -> HeartbeatConfig:
+        """Build instance from already-parsed JSON data (dict expected).
+
+        Applies per-field type-coercion; falls back to defaults on type errors.
+        """
         if not isinstance(data, dict):
             return cls()
 
@@ -125,12 +135,40 @@ class HeartbeatConfig:
             # crash the CLI with a traceback.
             return cls()
 
+    @classmethod
+    def _load_internal_with_anomaly(cls, path: Path) -> tuple[HeartbeatConfig, BrainAnomaly | None]:
+        """Load heartbeat_config.json with self-healing from .bak rotation.
+
+        Returns (cfg, anomaly_or_None). The outer load() uses the anomaly-dropping
+        wrapper _load_internal to preserve existing call sites unchanged.
+        """
+        from brain.health.attempt_heal import attempt_heal
+
+        data, anomaly = attempt_heal(path, dict)
+        return cls._parse_internal_data(data), anomaly
+
+    @classmethod
+    def _load_internal(cls, path: Path) -> HeartbeatConfig:
+        """Load heartbeat_config.json only — the developer-calibration layer."""
+        cfg, anomaly = cls._load_internal_with_anomaly(path)
+        if anomaly is not None:
+            logger.warning(
+                "HeartbeatConfig anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
+            )
+        return cfg
+
     def save(self, path: Path) -> None:
-        """Atomic save via .new + os.replace.
+        """Atomic save via .bak rotation (save_with_backup).
 
         A crash mid-write leaves either the previous valid file or the new
         valid file — never a partial write that corrupts the user's config.
         """
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {
             "dream_every_hours": self.dream_every_hours,
             "decay_rate_per_tick": self.decay_rate_per_tick,
@@ -146,9 +184,24 @@ class HeartbeatConfig:
             "growth_enabled": self.growth_enabled,
             "growth_every_hours": self.growth_every_hours,
         }
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        if treatment.verify_after_write:
+            self._verify_after_write(path)
+
+    def _verify_after_write(self, path: Path) -> None:
+        """Re-read the written file; if corrupt, restore from .bak1."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("non-dict payload after write")
+        except (json.JSONDecodeError, ValueError, OSError):
+            logger.error(
+                "HeartbeatConfig verify_after_write failed for %s; restoring from .bak1", path
+            )
+            bak1 = path.with_name(path.name + ".bak1")
+            if bak1.exists():
+                shutil.copy2(bak1, path)
 
 
 @dataclass
@@ -163,6 +216,42 @@ class HeartbeatState:
     last_trigger: str
 
     @classmethod
+    def _parse_state_data(cls, data: object) -> HeartbeatState | None:
+        """Build instance from already-parsed JSON data; return None on bad shape."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                last_tick_at=parse_iso_utc(data["last_tick_at"]),
+                last_dream_at=parse_iso_utc(data["last_dream_at"]),
+                last_research_at=parse_iso_utc(data["last_research_at"]),
+                # Back-compat: last_growth_at absent → fall back to last_tick_at.
+                last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
+                tick_count=int(data["tick_count"]),
+                last_trigger=str(data["last_trigger"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def load_with_anomaly(cls, path: Path) -> tuple[HeartbeatState | None, BrainAnomaly | None]:
+        """Load state with self-healing from .bak rotation if corrupt.
+
+        Returns (state_or_None, anomaly_or_None).
+          - Missing file → (None, None) — normal first-tick path.
+          - Corrupt file → quarantine + restore from .bak1/.bak2/.bak3 or reset.
+            If all baks are corrupt/missing, data=={} → parse returns None → engine
+            treats as first-ever tick and reinitialises (same safe recovery as before).
+        """
+        if not path.exists():
+            return None, None
+
+        from brain.health.attempt_heal import attempt_heal
+
+        data, anomaly = attempt_heal(path, dict)
+        return cls._parse_state_data(data), anomaly
+
+    @classmethod
     def load(cls, path: Path) -> HeartbeatState | None:
         """Load state; return None if the file is missing or corrupt.
 
@@ -171,20 +260,15 @@ class HeartbeatState:
         file (user-facing crashes from a malformed JSON are worse UX than
         silently reinitialising).
         """
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(
-                last_tick_at=parse_iso_utc(data["last_tick_at"]),
-                last_dream_at=parse_iso_utc(data["last_dream_at"]),
-                last_research_at=parse_iso_utc(data["last_research_at"]),
-                last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
-                tick_count=int(data["tick_count"]),
-                last_trigger=str(data["last_trigger"]),
+        state, anomaly = cls.load_with_anomaly(path)
+        if anomaly is not None:
+            logger.warning(
+                "HeartbeatState anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        return state
 
     @classmethod
     def fresh(cls, trigger: str) -> HeartbeatState:
@@ -200,7 +284,10 @@ class HeartbeatState:
         )
 
     def save(self, path: Path) -> None:
-        """Atomic save via write-to-.new + os.replace."""
+        """Atomic save via .bak rotation (save_with_backup)."""
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {
             "last_tick_at": iso_utc(self.last_tick_at),
             "last_dream_at": iso_utc(self.last_dream_at),
@@ -209,9 +296,24 @@ class HeartbeatState:
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
         }
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)  # atomic on POSIX + Windows
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        if treatment.verify_after_write:
+            self._verify_after_write(path)
+
+    def _verify_after_write(self, path: Path) -> None:
+        """Re-read the written file; if corrupt, restore from .bak1."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("non-dict payload after write")
+        except (json.JSONDecodeError, ValueError, OSError):
+            logger.error(
+                "HeartbeatState verify_after_write failed for %s; restoring from .bak1", path
+            )
+            bak1 = path.with_name(path.name + ".bak1")
+            if bak1.exists():
+                shutil.copy2(bak1, path)
 
 
 @dataclass(frozen=True)
@@ -233,6 +335,8 @@ class HeartbeatResult:
     research_gated_reason: str | None = None
     interests_bumped: int = 0
     growth_emotions_added: int = 0
+    anomalies: tuple[BrainAnomaly, ...] = ()
+    pending_alarms_count: int = 0
 
 
 @dataclass
@@ -293,11 +397,43 @@ class HeartbeatEngine:
         a HEARTBEAT: memory, and update state atomically.
         """
         now = datetime.now(UTC)
-        config = HeartbeatConfig.load(self.config_path)
-        state = HeartbeatState.load(self.state_path)
+
+        # Collect per-tick anomalies from direct heartbeat-engine loads (config + state).
+        tick_anomalies: list[BrainAnomaly] = []
+
+        config, config_anomaly = HeartbeatConfig.load_with_anomaly(self.config_path)
+        if config_anomaly is not None:
+            tick_anomalies.append(config_anomaly)
+
+        state, state_anomaly = HeartbeatState.load_with_anomaly(self.state_path)
+        if state_anomaly is not None:
+            tick_anomalies.append(state_anomaly)
+
+        # Cross-file walk gate: >=2 anomalies triggers a full persona scan.
+        # Deduplicate by (file, kind) so files already caught in direct loads
+        # are not double-counted.
+        if len(tick_anomalies) >= 2:
+            _walk_persona_dir = (
+                self.interests_path.parent
+                if self.interests_path is not None
+                else self.state_path.parent
+            )
+            seen: set[tuple[str, str]] = {(a.file, a.kind) for a in tick_anomalies}
+            for walk_anomaly in walk_persona(_walk_persona_dir):
+                key = (walk_anomaly.file, walk_anomaly.kind)
+                if key not in seen:
+                    tick_anomalies.append(walk_anomaly)
+                    seen.add(key)
 
         # First-ever tick: defer all work
         if state is None:
+            # Compute pending alarms even on init tick (anomalies may exist from corrupt state)
+            if self.interests_path is not None:
+                persona_dir = self.interests_path.parent
+            else:
+                persona_dir = self.state_path.parent
+            pending_alarms_count = len(compute_pending_alarms(persona_dir))
+
             if not dry_run:
                 fresh = HeartbeatState.fresh(trigger=trigger)
                 fresh.save(self.state_path)
@@ -308,6 +444,8 @@ class HeartbeatEngine:
                         "initialized": True,
                         "note": "first-ever tick, work deferred",
                         "tick_count": 0,
+                        "anomalies": [a.to_dict() for a in tick_anomalies],
+                        "pending_alarms_count": pending_alarms_count,
                     }
                 )
             return HeartbeatResult(
@@ -320,6 +458,8 @@ class HeartbeatEngine:
                 research_deferred=False,
                 heartbeat_memory_id=None,
                 initialized=True,
+                anomalies=tuple(tick_anomalies),
+                pending_alarms_count=pending_alarms_count,
             )
 
         elapsed_seconds = (now - state.last_tick_at).total_seconds()
@@ -373,6 +513,13 @@ class HeartbeatEngine:
                 elapsed_seconds, memories_decayed, edges_pruned, dream_id
             )
 
+        # Compute pending alarms (always, before writing audit log).
+        if self.interests_path is not None:
+            persona_dir = self.interests_path.parent
+        else:
+            persona_dir = self.state_path.parent
+        pending_alarms_count = len(compute_pending_alarms(persona_dir))
+
         # Update state + log
         if not dry_run:
             state.last_tick_at = now
@@ -406,6 +553,8 @@ class HeartbeatEngine:
                         "emotions_added": growth_emotions_added,
                     },
                     "tick_count": state.tick_count,
+                    "anomalies": [a.to_dict() for a in tick_anomalies],
+                    "pending_alarms_count": pending_alarms_count,
                 }
             )
 
@@ -425,6 +574,8 @@ class HeartbeatEngine:
             research_gated_reason=research_gated_reason,
             interests_bumped=interests_bumped,
             growth_emotions_added=growth_emotions_added,
+            anomalies=tuple(tick_anomalies),
+            pending_alarms_count=pending_alarms_count,
         )
 
     # --- private helpers ---
