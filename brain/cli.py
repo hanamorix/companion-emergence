@@ -24,7 +24,20 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
 from brain.paths import get_persona_dir
+from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
+
+
+def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
+    """Resolve provider + searcher: CLI flag overrides persona file overrides default.
+
+    The brain owns provider/searcher; CLI flags are developer overrides only,
+    never written back. Per principle audit 2026-04-25 (PR-B).
+    """
+    config = PersonaConfig.load(persona_dir / "persona_config.json")
+    provider = getattr(args, "provider", None) or config.provider
+    searcher = getattr(args, "searcher", None) or config.searcher
+    return provider, searcher
 
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
@@ -74,12 +87,13 @@ def _dream_handler(args: argparse.Namespace) -> int:
     # Nested try/finally so a HebbianMatrix open failure still closes the
     # already-open MemoryStore connection. Inline contextmanager would be
     # prettier but stores don't implement __enter__/__exit__ yet.
+    provider_name, _ = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
-            provider = get_provider(args.provider)
+            provider = get_provider(provider_name)
             engine = DreamEngine(
                 store=store,
                 hebbian=hebbian,
@@ -120,14 +134,15 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
     default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
-    searcher = get_searcher(getattr(args, "searcher", "ddgs"))
+    provider_name, searcher_name = _resolve_routing(persona_dir, args)
+    searcher = get_searcher(searcher_name)
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
-            provider = get_provider(args.provider)
+            provider = get_provider(provider_name)
             engine = HeartbeatEngine(
                 store=store,
                 hebbian=hebbian,
@@ -215,11 +230,12 @@ def _reflex_handler(args: argparse.Namespace) -> int:
         )
 
     default_arcs_path = Path(__file__).parent / "engines" / "default_reflex_arcs.json"
+    provider_name, _ = _resolve_routing(persona_dir, args)
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        provider = get_provider(args.provider)
+        provider = get_provider(provider_name)
         engine = ReflexEngine(
             store=store,
             provider=provider,
@@ -268,11 +284,12 @@ def _research_handler(args: argparse.Namespace) -> int:
             f"Otherwise create {persona_dir} manually to start a fresh persona."
         )
 
+    provider_name, searcher_name = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        provider = get_provider(args.provider)
-        searcher = get_searcher(args.searcher)
+        provider = get_provider(provider_name)
+        searcher = get_searcher(searcher_name)
         engine = ResearchEngine(
             store=store,
             provider=provider,
@@ -369,8 +386,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dream_sub.add_argument(
         "--provider",
-        default="claude-cli",
-        help="LLM provider: claude-cli (default), fake, ollama.",
+        default=None,
+        help=(
+            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
     )
     dream_sub.add_argument("--dry-run", action="store_true", help="Skip LLM call and store writes.")
     dream_sub.set_defaults(func=_dream_handler)
@@ -395,14 +415,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     hb_sub.add_argument(
         "--provider",
-        default="claude-cli",
-        help="LLM provider: claude-cli (default), fake, ollama.",
+        default=None,
+        help=(
+            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
     )
     hb_sub.add_argument(
         "--searcher",
-        default="ddgs",
+        default=None,
         choices=["ddgs", "noop", "claude-tool"],
-        help="Web searcher for research engine: ddgs (default), noop, claude-tool.",
+        help=(
+            "(developer override) Web searcher for research engine — ddgs, noop, "
+            "claude-tool. Defaults to the value in {persona}/persona_config.json."
+        ),
     )
     hb_sub.add_argument("--dry-run", action="store_true")
     hb_sub.add_argument(
@@ -433,8 +459,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rf_sub.add_argument(
         "--provider",
-        default="claude-cli",
-        help="LLM provider: claude-cli (default), fake, ollama.",
+        default=None,
+        help=(
+            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
     )
     rf_sub.add_argument("--dry-run", action="store_true")
     rf_sub.set_defaults(func=_reflex_handler)
@@ -458,8 +487,23 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["manual", "emotion_high", "days_since_human", "open", "close"],
         default="manual",
     )
-    r_sub.add_argument("--provider", default="claude-cli")
-    r_sub.add_argument("--searcher", default="ddgs", choices=["ddgs", "noop", "claude-tool"])
+    r_sub.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
+    )
+    r_sub.add_argument(
+        "--searcher",
+        default=None,
+        choices=["ddgs", "noop", "claude-tool"],
+        help=(
+            "(developer override) Web searcher — ddgs, noop, claude-tool. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
+    )
     r_sub.add_argument("--dry-run", action="store_true")
     r_sub.set_defaults(func=_research_handler)
 
