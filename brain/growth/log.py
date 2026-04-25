@@ -68,14 +68,23 @@ def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEv
     if not path.exists():
         return []
     events: list[GrowthLogEvent] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for line_index, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not raw.strip():
             continue
         try:
             data = json.loads(raw)
             events.append(_event_from_dict(data))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("skipping malformed growth log line: %.200s", exc)
+            # Include line number + truncated content so a forensic grep can
+            # find and fix (or quarantine) the bad line. The exception alone
+            # doesn't tell you WHERE in the log the corruption is.
+            logger.warning(
+                "skipping malformed growth log line %d in %s: %.200s | content: %r",
+                line_index,
+                path,
+                exc,
+                raw[:200],
+            )
             continue
     if limit is not None:
         events = events[-limit:]

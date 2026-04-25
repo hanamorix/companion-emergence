@@ -111,6 +111,9 @@ def test_read_growth_log_with_limit_returns_most_recent(tmp_path: Path) -> None:
 
 def test_read_growth_log_skips_corrupt_lines(tmp_path: Path, caplog) -> None:
     """A partial-write or hand-edited bad line is skipped, others still parse."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
     log_path = tmp_path / "growth.log.jsonl"
     append_growth_event(log_path, _event(name="good"))
     # Append a corrupt line manually
@@ -120,6 +123,14 @@ def test_read_growth_log_skips_corrupt_lines(tmp_path: Path, caplog) -> None:
     events = read_growth_log(log_path)
     assert len(events) == 2
     assert {e.name for e in events} == {"good", "also_good"}
+
+    # Hardening: warning includes line number + content preview so a forensic
+    # grep of the logs can find and quarantine the bad line.
+    bad_warnings = [r for r in caplog.records if "malformed growth log line" in r.message]
+    assert len(bad_warnings) == 1
+    msg = bad_warnings[0].getMessage()
+    assert "line 2" in msg  # corrupt line is the 2nd line in the file
+    assert "{not valid json" in msg  # content preview present
 
 
 def test_read_growth_log_round_trips_all_fields(tmp_path: Path) -> None:
