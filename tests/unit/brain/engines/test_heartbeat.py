@@ -1423,6 +1423,16 @@ def test_heartbeat_growth_disabled_skips_growth_tick(tmp_path: Path) -> None:
 
         result = engine.run_tick(trigger="manual")
         assert result.growth_emotions_added == 0
+
+        # Hardening: audit log must record growth.enabled=False so a forensic
+        # reader can distinguish "disabled" from "not due" from "no persona dir".
+        audit_lines = (
+            (persona_dir / "heartbeats.log.jsonl").read_text(encoding="utf-8").splitlines()
+        )
+        last_audit = json.loads(audit_lines[-1])
+        assert last_audit["growth"]["enabled"] is False
+        assert last_audit["growth"]["ran"] is False
+        assert last_audit["growth"]["emotions_added"] == 0
     finally:
         store.close()
         hebbian.close()
