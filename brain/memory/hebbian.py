@@ -39,6 +39,19 @@ class HebbianMatrix:
 
     def __init__(self, db_path: str | Path) -> None:
         self._conn = sqlite3.connect(str(db_path))
+        try:
+            result = self._conn.execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            from brain.health.anomaly import BrainIntegrityError
+
+            raise BrainIntegrityError(str(db_path), str(exc)) from exc
+        if result != [("ok",)]:
+            detail = "; ".join(str(row[0]) for row in result)
+            self._conn.close()
+            from brain.health.anomaly import BrainIntegrityError
+
+            raise BrainIntegrityError(str(db_path), detail)
         self._conn.executescript(self._SCHEMA)
         self._conn.commit()
 
