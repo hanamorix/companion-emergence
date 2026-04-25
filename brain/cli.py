@@ -170,23 +170,38 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             f"  dream: {'would fire' if result.dream_id else (result.dream_gated_reason or 'gated')}"
         )
     else:
+        verbose = getattr(args, "verbose", False)
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
         print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
+
+        # Dream: show fires + interesting gates. Suppress "not_due" by default.
         if result.dream_id:
             print(f"  dream fired: {result.dream_id}")
-        else:
+        elif verbose or (result.dream_gated_reason and result.dream_gated_reason != "not_due"):
             print(f"  dream gated: {result.dream_gated_reason or 'gated'}")
+
+        # Reflex: show fires. Suppress "evaluated, nothing fired" unless --verbose.
         if result.reflex_fired:
             print(f"  reflex fired: {', '.join(result.reflex_fired)}")
-        elif result.reflex_skipped_count > 0:
+        elif verbose and result.reflex_skipped_count > 0:
             print(f"  reflex evaluated ({result.reflex_skipped_count} arc(s) skipped)")
+
+        # Research: show fires + interesting gates (no_eligible_interest,
+        # no_interests_defined, research_raised). Suppress not_due + reflex_won_tie
+        # by default.
         if result.research_fired:
             print(f"  research fired: {result.research_fired}")
-        elif result.research_gated_reason and result.research_gated_reason != "not_due":
+        elif result.research_gated_reason and (
+            verbose or result.research_gated_reason not in ("not_due", "reflex_won_tie")
+        ):
             print(f"  research gated: {result.research_gated_reason}")
+
+        # Interest bumps: show only if > 0 (already compact). Verbose adds zero.
         if result.interests_bumped > 0:
             print(f"  interests bumped: {result.interests_bumped}")
+        elif verbose:
+            print("  interests bumped: 0")
     return 0
 
 
@@ -454,6 +469,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Web searcher for research engine: ddgs (default), noop, claude-tool.",
     )
     hb_sub.add_argument("--dry-run", action="store_true")
+    hb_sub.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show all engine outcomes including gated reasons + zero-count engines. "
+        "Default output is compact — events shown, non-events hidden.",
+    )
     hb_sub.set_defaults(func=_heartbeat_handler)
 
     rf_sub = subparsers.add_parser(
