@@ -361,6 +361,11 @@ class HeartbeatEngine:
         )
         research_deferred = research_fired is None and research_gated_reason is None
 
+        # Growth tick — autonomous self-development (Phase 2a). Runs after
+        # all per-tick engines so it can observe the freshest state, before
+        # the audit log writes so the audit can summarize the growth outcome.
+        growth_emotions_added, growth_ran = self._try_run_growth(state, now, config, dry_run)
+
         # Optional HEARTBEAT: memory
         heartbeat_memory_id: str | None = None
         if not dry_run and self._should_emit_memory(
@@ -397,6 +402,11 @@ class HeartbeatEngine:
                         "gated_reason": research_gated_reason,
                     },
                     "interests_bumped": interests_bumped,
+                    "growth": {
+                        "enabled": config.growth_enabled,
+                        "ran": growth_ran,
+                        "emotions_added": growth_emotions_added,
+                    },
                     "tick_count": state.tick_count,
                 }
             )
@@ -416,6 +426,7 @@ class HeartbeatEngine:
             research_fired=research_fired,
             research_gated_reason=research_gated_reason,
             interests_bumped=interests_bumped,
+            growth_emotions_added=growth_emotions_added,
         )
 
     # --- private helpers ---
@@ -570,6 +581,43 @@ class HeartbeatEngine:
         if touched:
             current.save(self.interests_path)
         return len(touched)
+
+    def _try_run_growth(
+        self,
+        state: HeartbeatState,
+        now: datetime,
+        config: HeartbeatConfig,
+        dry_run: bool,
+    ) -> tuple[int, bool]:
+        """Run a growth tick if due. Returns (emotions_added, ran).
+
+        Fault-isolated: any exception logs a warning and returns (0, False).
+        Heartbeat tick continues normally — same pattern as reflex/research.
+        """
+        if not config.growth_enabled:
+            return (0, False)
+        if self.interests_path is None:
+            # Use interests_path as a proxy for "persona dir is wired" — Phase 2a
+            # doesn't add a separate persona_dir field.
+            return (0, False)
+
+        hours_since = (now - state.last_growth_at).total_seconds() / 3600.0
+        if hours_since < config.growth_every_hours:
+            return (0, False)
+
+        persona_dir = self.interests_path.parent
+        try:
+            from brain.growth.scheduler import run_growth_tick
+
+            result = run_growth_tick(persona_dir, self.store, now, dry_run=dry_run)
+        except Exception as exc:
+            logger.warning("growth tick raised; isolating: %.200s", exc)
+            return (0, False)
+
+        if not dry_run:
+            state.last_growth_at = now
+
+        return (result.emotions_added, True)
 
     def _try_fire_research(
         self,

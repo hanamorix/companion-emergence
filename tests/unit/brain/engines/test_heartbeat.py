@@ -1303,3 +1303,208 @@ def test_heartbeat_config_save_is_atomic(tmp_path: Path) -> None:
     loaded = HeartbeatConfig.load(path)
     assert loaded.dream_every_hours == 12.0
     assert loaded.reflex_enabled is False
+
+
+# ---- Phase 2a T6: _try_run_growth + heartbeat tick wiring ----
+
+
+def test_heartbeat_run_tick_calls_growth_after_research(tmp_path: Path) -> None:
+    """Growth tick fires when due; heartbeat reports the count."""
+    from unittest.mock import patch
+
+    from brain.engines.heartbeat import HeartbeatEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    # Seed a vocabulary so the scheduler has somewhere to write.
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": []}), encoding="utf-8"
+    )
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="test",
+            persona_system_prompt="You are test.",
+        )
+
+        # First tick — initializes state, defers all work.
+        engine.run_tick(trigger="open")
+
+        # Force last_growth_at older than 168h so growth is due.
+        from brain.engines.heartbeat import HeartbeatState
+
+        state = HeartbeatState.load(persona_dir / "heartbeat_state.json")
+        assert state is not None
+        old = datetime.now(UTC) - timedelta(hours=200)
+        state.last_growth_at = old
+        state.last_tick_at = old
+        state.save(persona_dir / "heartbeat_state.json")
+
+        # Inject a fake crystallizer that returns one proposal.
+        from brain.growth.proposal import EmotionProposal
+
+        proposal = EmotionProposal(
+            name="lingering",
+            description="x",
+            decay_half_life_days=None,
+            evidence_memory_ids=(),
+            score=0.5,
+            relational_context=None,
+        )
+        with patch(
+            "brain.growth.scheduler.crystallize_vocabulary",
+            return_value=[proposal],
+        ):
+            result = engine.run_tick(trigger="manual")
+
+        assert result.growth_emotions_added == 1
+
+        # Audit log entry has growth sub-object
+        log_lines = (persona_dir / "heartbeats.log.jsonl").read_text(encoding="utf-8").splitlines()
+        last_entry = json.loads(log_lines[-1])
+        assert "growth" in last_entry
+        assert last_entry["growth"]["enabled"] is True
+        assert last_entry["growth"]["ran"] is True
+        assert last_entry["growth"]["emotions_added"] == 1
+    finally:
+        store.close()
+        hebbian.close()
+
+
+def test_heartbeat_growth_disabled_skips_growth_tick(tmp_path: Path) -> None:
+    """growth_enabled=False short-circuits before scheduler runs."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    cfg_path = persona_dir / "heartbeat_config.json"
+    cfg_path.write_text(json.dumps({"growth_enabled": False}), encoding="utf-8")
+
+    from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=cfg_path,
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="test",
+            persona_system_prompt="You are test.",
+        )
+        engine.run_tick(trigger="open")  # init
+        # Push state back so growth would otherwise be due.
+        s = HeartbeatState.load(persona_dir / "heartbeat_state.json")
+        assert s is not None
+        s.last_growth_at = datetime.now(UTC) - timedelta(hours=200)
+        s.last_tick_at = datetime.now(UTC) - timedelta(hours=200)
+        s.save(persona_dir / "heartbeat_state.json")
+
+        result = engine.run_tick(trigger="manual")
+        assert result.growth_emotions_added == 0
+    finally:
+        store.close()
+        hebbian.close()
+
+
+def test_heartbeat_growth_not_due_returns_zero(tmp_path: Path) -> None:
+    """Within growth_every_hours window, growth tick returns zero."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    from brain.engines.heartbeat import HeartbeatEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="test",
+            persona_system_prompt="You are test.",
+        )
+        engine.run_tick(trigger="open")  # init
+        result = engine.run_tick(trigger="manual")  # not 168h later
+        assert result.growth_emotions_added == 0
+    finally:
+        store.close()
+        hebbian.close()
+
+
+def test_heartbeat_growth_fault_isolated(tmp_path: Path) -> None:
+    """If the growth tick raises, heartbeat continues — count is 0."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    from unittest.mock import patch
+
+    from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="test",
+            persona_system_prompt="You are test.",
+        )
+        engine.run_tick(trigger="open")
+        s = HeartbeatState.load(persona_dir / "heartbeat_state.json")
+        assert s is not None
+        s.last_growth_at = datetime.now(UTC) - timedelta(hours=200)
+        s.last_tick_at = datetime.now(UTC) - timedelta(hours=200)
+        s.save(persona_dir / "heartbeat_state.json")
+
+        with patch(
+            "brain.growth.scheduler.run_growth_tick",
+            side_effect=RuntimeError("simulated crash"),
+        ):
+            result = engine.run_tick(trigger="manual")
+        assert result.growth_emotions_added == 0
+        # Heartbeat tick still completed
+        assert not result.initialized
+    finally:
+        store.close()
+        hebbian.close()
