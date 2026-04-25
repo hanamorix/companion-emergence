@@ -37,7 +37,14 @@ class DreamResult:
 
 @dataclass
 class DreamEngine:
-    """Composes memory + emotion + LLM bridge into an associative cycle."""
+    """Composes memory + emotion + LLM bridge into an associative cycle.
+
+    Mechanism knobs (`lookback_hours`, `depth`, `decay_per_hop`,
+    `neighbour_limit`, `strengthen_delta`) are constructor-level calibration,
+    not per-call user choices. The brain's owner picks calibration once when
+    the engine is built; `run_cycle()` only takes `seed_id` (for heartbeat-
+    driven seed pickup) and `dry_run`. Per principle audit 2026-04-25.
+    """
 
     store: MemoryStore
     hebbian: HebbianMatrix
@@ -46,6 +53,11 @@ class DreamEngine:
     log_path: Path | None = None
     persona_name: str = ""
     persona_system_prompt: str = ""
+    lookback_hours: int = 24
+    depth: int = 2
+    decay_per_hop: float = 0.5
+    neighbour_limit: int = 8
+    strengthen_delta: float = 0.1
 
     def __post_init__(self) -> None:
         if not self.persona_name:
@@ -62,16 +74,14 @@ class DreamEngine:
         self,
         *,
         seed_id: str | None = None,
-        lookback_hours: int = 24,
-        depth: int = 2,
-        decay_per_hop: float = 0.5,
-        neighbour_limit: int = 8,
-        strengthen_delta: float = 0.1,
         dry_run: bool = False,
     ) -> DreamResult:
-        seed = self._select_seed(seed_id=seed_id, lookback_hours=lookback_hours)
+        seed = self._select_seed(seed_id=seed_id, lookback_hours=self.lookback_hours)
         neighbours = self._spread_activate(
-            seed, depth=depth, decay_per_hop=decay_per_hop, limit=neighbour_limit
+            seed,
+            depth=self.depth,
+            decay_per_hop=self.decay_per_hop,
+            limit=self.neighbour_limit,
         )
         system_prompt, user_prompt = self._build_prompt(seed, neighbours)
 
@@ -90,7 +100,7 @@ class DreamEngine:
         dream_text = raw_text if raw_text.startswith("DREAM:") else f"DREAM: {raw_text}"
 
         dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
-        edges = self._strengthen_edges(seed, neighbours, strengthen_delta)
+        edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
         self._log(seed, neighbours, dream_memory)
 
         return DreamResult(

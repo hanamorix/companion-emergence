@@ -75,7 +75,7 @@ def _mem(content: str, importance: float = 5.0, **kw: object) -> Memory:
 
 def test_run_cycle_raises_if_no_seed_candidates(engine: DreamEngine) -> None:
     with pytest.raises(NoSeedAvailable):
-        engine.run_cycle(lookback_hours=24)
+        engine.run_cycle()
 
 
 def test_run_cycle_picks_highest_importance_seed_in_window(
@@ -204,7 +204,7 @@ def test_run_cycle_respects_lookback_window(engine: DreamEngine, store: MemorySt
     recent = _mem("recent", importance=2.0)
     store.create(recent)
 
-    result = engine.run_cycle(lookback_hours=24)
+    result = engine.run_cycle()
     assert result.seed.id == recent.id
 
 
@@ -264,8 +264,20 @@ def test_run_cycle_system_prompt_mentions_nell_and_dream_prefix(
 
 
 def test_run_cycle_respects_neighbour_limit(
-    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix
+    store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path
 ) -> None:
+    """neighbour_limit is constructor-level calibration; build a fresh engine
+    with the override and assert it propagates into the cycle."""
+    capped_engine = DreamEngine(
+        store=store,
+        hebbian=hebbian,
+        embeddings=None,
+        provider=FakeProvider(),
+        log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect in first person.",
+        neighbour_limit=3,
+    )
     seed = _mem("seed", importance=8.0)
     store.create(seed)
     for i in range(10):
@@ -273,7 +285,7 @@ def test_run_cycle_respects_neighbour_limit(
         store.create(n)
         hebbian.strengthen(seed.id, n.id, delta=0.5)
 
-    result = engine.run_cycle(dry_run=True, neighbour_limit=3)
+    result = capped_engine.run_cycle(dry_run=True)
     assert len(result.neighbours) <= 3
 
 
@@ -382,9 +394,10 @@ def test_dream_system_prompt_uses_persona_name(tmp_path: Path) -> None:
             provider=CapturingProvider(),
             persona_name="Iris",
             persona_system_prompt="You are Iris. Reflect in first person, 2-3 sentences, starting with 'DREAM: '.",
+            lookback_hours=100000,
         )
         try:
-            engine.run_cycle(lookback_hours=100000)
+            engine.run_cycle()
         except Exception:
             pass  # NoSeedAvailable may raise for incomplete setup; voice check still valid
 

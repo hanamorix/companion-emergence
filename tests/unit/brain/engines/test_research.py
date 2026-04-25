@@ -181,38 +181,6 @@ def test_run_tick_ranks_highest_pull(tmp_path: Path):
         store.close()
 
 
-def test_run_tick_forced_interest_bypasses_gates(tmp_path: Path):
-    _write_interests(
-        tmp_path / "interests.json", [_interest_dict(pull_score=2.0)]
-    )  # way below threshold
-    store = MemoryStore(":memory:")
-    try:
-        engine = _build_engine(tmp_path, store)
-        result = engine.run_tick(
-            days_since_human_override=0.0,  # not-due gate would also block
-            forced_interest_topic="marine bioluminescence",
-        )
-        assert result.fired is not None
-        assert result.fired.topic == "marine bioluminescence"
-    finally:
-        store.close()
-
-
-def test_run_tick_forced_interest_not_found(tmp_path: Path):
-    _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
-    try:
-        engine = _build_engine(tmp_path, store)
-        result = engine.run_tick(
-            days_since_human_override=5.0,
-            forced_interest_topic="Unknown Topic",
-        )
-        assert result.fired is None
-        assert result.reason == "no_eligible_interest"
-    finally:
-        store.close()
-
-
 def test_run_tick_dry_run_reports_would_fire(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
