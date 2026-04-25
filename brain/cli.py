@@ -185,6 +185,15 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         )
     else:
         verbose = getattr(args, "verbose", False)
+
+        # Health banner — printed BEFORE engine status lines so it's visible
+        # at the top. Only shown when there are unacknowledged alarms.
+        if result.pending_alarms_count > 0:
+            print(
+                f"⚠️  Brain alarm — needs your attention. "
+                f"Run `nell health show --persona {args.persona}` for details."
+            )
+
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
         print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
@@ -216,6 +225,21 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             print(f"  interests bumped: {result.interests_bumped}")
         elif verbose:
             print("  interests bumped: 0")
+
+        # Self-treatment line — shown when anomalies were healed but no pending alarms.
+        # Appears after engine status, before the trailing newline.
+        if result.anomalies and result.pending_alarms_count == 0:
+            distinct_files = list(dict.fromkeys(a.file for a in result.anomalies))
+            count = len(distinct_files)
+            if count <= 2:
+                files_desc = ", ".join(distinct_files)
+            else:
+                files_desc = ", ".join(distinct_files[:2]) + ", ..."
+            print(
+                f"  \U0001fa79 brain self-treated {count} file"
+                f"{'s' if count != 1 else ''} ({files_desc})"
+                f" — see `nell health show` for details"
+            )
     return 0
 
 

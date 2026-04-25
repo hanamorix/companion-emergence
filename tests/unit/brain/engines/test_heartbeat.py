@@ -1591,3 +1591,156 @@ def test_heartbeat_state_load_corrupt_file_restores_from_bak(tmp_path: Path) -> 
     assert state.last_trigger == "open"
     assert anomaly is not None
     assert "bak1" in anomaly.action
+
+
+# ---- Task 12: anomaly aggregation in heartbeat tick ----
+
+
+def test_heartbeat_audit_log_anomalies_field_always_present(live_engine: HeartbeatEngine) -> None:
+    """Every audit entry has 'anomalies' key (empty list on clean tick)."""
+    _seed_conversation(live_engine.store, "seed")
+    live_engine.run_tick(trigger="open")  # init tick
+    live_engine.run_tick(trigger="close")  # real tick
+
+    lines = live_engine.heartbeat_log_path.read_text().strip().splitlines()
+    for line in lines:
+        entry = json.loads(line)
+        assert "anomalies" in entry, f"Missing 'anomalies' key in audit entry: {entry}"
+        assert isinstance(entry["anomalies"], list)
+    # Clean tick: anomalies should be empty
+    tick_entry = json.loads(lines[-1])
+    assert tick_entry["anomalies"] == []
+    assert "pending_alarms_count" in tick_entry
+    assert tick_entry["pending_alarms_count"] == 0
+
+
+def test_heartbeat_corrupt_state_file_self_heals_and_records(tmp_path: Path) -> None:
+    """Corrupting heartbeat_state.json triggers heal + anomaly entry in audit log + result."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=tmp_path / "heartbeat_config.json",
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        # Corrupt the state file — will trigger load_with_anomaly to return an anomaly
+        state_path = tmp_path / "heartbeat_state.json"
+        # Write a valid state first so the file exists
+        HeartbeatState.fresh("manual").save(state_path)
+        # Now corrupt it
+        state_path.write_text("{corrupt json{{{", encoding="utf-8")
+
+        result = engine.run_tick(trigger="manual")
+        # Corrupt state → engine treats as first-tick (initialized=True)
+        # and should record the anomaly
+        assert result.initialized is True
+        # The anomaly should be in the result
+        assert len(result.anomalies) >= 1
+        anomaly_kinds = [a.kind for a in result.anomalies]
+        assert "json_parse_error" in anomaly_kinds
+
+        # Audit log entry also has the anomaly
+        log_lines = engine.heartbeat_log_path.read_text().strip().splitlines()
+        entry = json.loads(log_lines[-1])
+        assert "anomalies" in entry
+        assert len(entry["anomalies"]) >= 1
+        assert entry["anomalies"][0]["kind"] == "json_parse_error"
+    finally:
+        store.close()
+        hebbian.close()
+
+
+def test_heartbeat_multi_anomaly_tick_triggers_walk(tmp_path: Path) -> None:
+    """>=2 anomalies trigger cross-file walk; merged into audit entry."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        # Corrupt BOTH config and state to generate 2 anomalies
+        (persona_dir / "heartbeat_config.json").write_text("{bad json{", encoding="utf-8")
+        (persona_dir / "heartbeat_state.json").write_text("{bad state{", encoding="utf-8")
+
+        from unittest.mock import patch
+
+        walk_calls = []
+
+        def fake_walk(d: Path) -> list:
+            walk_calls.append(d)
+            return []
+
+        with patch("brain.engines.heartbeat.walk_persona", side_effect=fake_walk):
+            result = engine.run_tick(trigger="manual")
+
+        # walk_persona must have been called because we had >=2 anomalies
+        assert len(walk_calls) >= 1
+        # Result should have >=2 anomalies
+        assert len(result.anomalies) >= 2
+    finally:
+        store.close()
+        hebbian.close()
+
+
+def test_heartbeat_alarm_increments_pending_alarms_count(tmp_path: Path) -> None:
+    """An identity-file reset_to_default → pending_alarms_count >= 1."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    from brain.health.anomaly import AlarmEntry
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+
+        # Patch compute_pending_alarms to return one alarm (simulates an
+        # identity-file reset_to_default becoming a pending alarm entry).
+        alarm = AlarmEntry(
+            file="emotion_vocabulary.json",
+            kind="json_parse_error",
+            first_seen_at=datetime.now(UTC),
+            occurrences_in_window=1,
+        )
+        with patch("brain.engines.heartbeat.compute_pending_alarms", return_value=[alarm]):
+            result = engine.run_tick(trigger="manual")
+
+        assert result.pending_alarms_count >= 1
+        # Audit log also has pending_alarms_count >= 1
+        log_lines = engine.heartbeat_log_path.read_text().strip().splitlines()
+        entry = json.loads(log_lines[-1])
+        assert entry["pending_alarms_count"] >= 1
+    finally:
+        store.close()
+        hebbian.close()
