@@ -53,6 +53,18 @@ class InfluenceHints:
 # Emotion → tone bias mapping. Only triggers when the emotion is dominant
 # and above a minimum intensity. Immutable tuple so callers can't accidentally
 # corrupt rule matching via `influence._TONE_RULES.append(...)`.
+#
+# Soft-coupling note (post vocabulary-split):
+#   `creative_hunger` is no longer in the framework baseline — it lives in
+#   per-persona emotion_vocabulary.json since the 2026-04-25 split. This rule
+#   only fires when the persona's *currently dominant* emotion is named
+#   `creative_hunger`, so personas that don't register that name simply never
+#   hit the rule (graceful no-op). Other personas can opt in to the same
+#   tone bias by registering an emotion with that exact name in their
+#   vocabulary file. Future work (Phase 2 emergence + Tauri GUI) may move
+#   tone bias to a per-emotion field in the persona's vocabulary so this
+#   table doesn't have to know persona-specific names at all — for now,
+#   the soft coupling is documented + intentional.
 _TONE_RULES: tuple[tuple[str, float, str], ...] = (
     ("grief", 6.0, "tender"),
     ("tenderness", 7.0, "tender"),

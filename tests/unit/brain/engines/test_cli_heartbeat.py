@@ -104,3 +104,52 @@ def test_nell_heartbeat_unknown_trigger_rejected(nell_persona: Path) -> None:
 
     with pytest.raises(SystemExit):
         main(["heartbeat", "--persona", "nell", "--trigger", "frobnicate", "--provider", "fake"])
+
+
+def test_nell_heartbeat_compact_output_suppresses_not_due(
+    nell_persona: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Default output suppresses 'dream gated: not_due' and similar non-events."""
+    from brain.cli import main
+
+    main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"])  # init
+    main(["heartbeat", "--persona", "nell", "--trigger", "close", "--provider", "fake"])
+    out = capsys.readouterr().out
+
+    # The active tick should NOT print "dream gated: not_due" by default
+    assert "dream gated: not_due" not in out
+    # And should NOT print "research gated: reflex_won_tie" or "research gated: not_due"
+    assert "research gated: not_due" not in out
+    assert "research gated: reflex_won_tie" not in out
+    # And should NOT print "interests bumped: 0"
+    assert "interests bumped: 0" not in out
+    # But the basic heartbeat lines should still be there
+    assert "Heartbeat tick complete" in out
+    assert "decayed:" in out
+
+
+def test_nell_heartbeat_verbose_shows_all_gated_reasons(
+    nell_persona: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--verbose flag re-enables non-event lines (dream gated: not_due, etc)."""
+    from brain.cli import main
+
+    main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"])  # init
+    main(
+        [
+            "heartbeat",
+            "--persona",
+            "nell",
+            "--trigger",
+            "close",
+            "--provider",
+            "fake",
+            "--verbose",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    # Verbose mode shows dream gated even for not_due
+    assert "dream gated:" in out
+    # Verbose mode shows interests bumped: 0
+    assert "interests bumped: 0" in out
