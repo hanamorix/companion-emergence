@@ -110,13 +110,34 @@ def run_growth_tick(
 
 
 def _read_current_vocabulary_names(vocab_path: Path) -> set[str]:
+    """Return the set of emotion names currently in the persona's vocabulary file.
+
+    Distinguishes three load outcomes:
+      - Missing file → return empty set silently (fresh persona; expected).
+      - Corrupt JSON or wrong schema → return empty set BUT log a WARNING
+        with the file path. A silent fallback would mask the corruption,
+        and the scheduler would then think "no emotions exist" and might
+        re-add framework baselines on the next growth tick.
+      - Well-formed → return the set of names.
+    """
     if not vocab_path.exists():
         return set()
     try:
         data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "growth scheduler: emotion_vocabulary at %s is corrupt JSON (%.200s); "
+            "treating as empty for this tick — fix or quarantine the file",
+            vocab_path,
+            exc,
+        )
         return set()
     if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
+        logger.warning(
+            "growth scheduler: emotion_vocabulary at %s has invalid schema "
+            "(missing 'emotions' list); treating as empty for this tick",
+            vocab_path,
+        )
         return set()
     return {e["name"] for e in data["emotions"] if isinstance(e, dict) and "name" in e}
 

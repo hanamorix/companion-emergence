@@ -177,3 +177,75 @@ def test_run_growth_tick_handles_multiple_proposals(persona_dir: Path, store: Me
     assert result.emotions_added == 3
     log_path = persona_dir / "emotion_growth.log.jsonl"
     assert len(log_path.read_text(encoding="utf-8").splitlines()) == 3
+
+
+# ---- Hardening: corrupt-vocab detection ----
+
+
+def test_run_growth_tick_corrupt_vocabulary_logs_warning(
+    persona_dir: Path, store: MemoryStore, caplog
+) -> None:
+    """A corrupt emotion_vocabulary.json is detected and surfaces a WARNING.
+
+    Prior to hardening, the JSONDecodeError was silently swallowed, so a
+    corrupt vocab file looked indistinguishable from "no emotions yet" to
+    the scheduler. The scheduler still proceeds (returns empty set + tick
+    continues) but the warning gives the user / forensic-grep a thread to
+    pull on rather than silent degradation.
+    """
+    import logging
+
+    caplog.set_level(logging.WARNING)
+
+    # Write corrupt JSON to the vocab path.
+    (persona_dir / "emotion_vocabulary.json").write_text("{not valid json", encoding="utf-8")
+
+    result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+
+    # Tick still completes (no proposals from stub anyway).
+    assert result.emotions_added == 0
+
+    # Warning surfaces both the path and the corruption.
+    corrupt_warnings = [r for r in caplog.records if "corrupt JSON" in r.getMessage()]
+    assert len(corrupt_warnings) == 1
+    assert "emotion_vocabulary.json" in corrupt_warnings[0].getMessage()
+
+
+def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
+    persona_dir: Path, store: MemoryStore, caplog
+) -> None:
+    """A vocab file with the wrong shape (missing 'emotions' list) surfaces a WARNING."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "wrong_field": []}), encoding="utf-8"
+    )
+
+    result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+
+    schema_warnings = [r for r in caplog.records if "invalid schema" in r.getMessage()]
+    assert len(schema_warnings) == 1
+
+
+def test_run_growth_tick_missing_vocabulary_no_warning(
+    persona_dir: Path, store: MemoryStore, caplog
+) -> None:
+    """A missing vocab file is the expected fresh-persona case — no warning."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+
+    # Don't seed the vocab file at all.
+    result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+
+    # Crucially: no warning. Missing != corrupt.
+    bad_warnings = [
+        r
+        for r in caplog.records
+        if "corrupt JSON" in r.getMessage() or "invalid schema" in r.getMessage()
+    ]
+    assert bad_warnings == []
