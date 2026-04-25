@@ -309,3 +309,64 @@ def test_run_tick_renders_prompt_with_context(tmp_path: Path):
 
     assert "marine bioluminescence" in captured["prompt"]
     assert "Nell" in (captured["system"] or "")
+
+
+# ---- ResearchLog unit tests ----
+
+
+def test_research_log_load_missing_returns_empty(tmp_path: Path) -> None:
+    from brain.engines.research import ResearchLog
+
+    log = ResearchLog.load(tmp_path / "nope.json")
+    assert log.fires == ()
+
+
+def test_research_log_load_corrupt_returns_empty(tmp_path: Path) -> None:
+    """Corrupt file is healed to empty via attempt_heal; fires == ()."""
+    from brain.engines.research import ResearchLog
+
+    path = tmp_path / "research_log.json"
+    path.write_text("{{{not json", encoding="utf-8")
+    log = ResearchLog.load(path)
+    assert log.fires == ()
+
+
+def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
+    """Corrupt primary is quarantined and a WARNING is emitted."""
+    import logging
+
+    from brain.engines.research import ResearchLog
+
+    caplog.set_level(logging.WARNING)
+    path = tmp_path / "research_log.json"
+    path.write_text("{{{not json", encoding="utf-8")
+    ResearchLog.load(path)
+    corrupt_files = list(tmp_path.glob("research_log.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+    warn_msgs = [
+        r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()
+    ]
+    assert len(warn_msgs) == 1
+
+
+def test_research_log_load_heals_from_bak(tmp_path: Path) -> None:
+    """When primary is corrupt, load restores the most recent valid .bak."""
+    from brain.engines.research import ResearchFire, ResearchLog
+
+    fire = ResearchFire(
+        interest_id="i1",
+        topic="marine bioluminescence",
+        fired_at=datetime.now(UTC),
+        trigger="days_since_human",
+        web_used=False,
+        web_result_count=0,
+        output_memory_id="mem-1",
+    )
+    good_payload = {"version": 1, "fires": [fire.to_dict()]}
+    path = tmp_path / "research_log.json"
+    bak1 = tmp_path / "research_log.json.bak1"
+    bak1.write_text(json.dumps(good_payload), encoding="utf-8")
+    path.write_text("{{{not json", encoding="utf-8")
+    log = ResearchLog.load(path)
+    assert len(log.fires) == 1
+    assert log.fires[0].topic == "marine bioluminescence"

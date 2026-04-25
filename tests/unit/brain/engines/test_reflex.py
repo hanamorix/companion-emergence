@@ -199,6 +199,43 @@ def test_reflex_log_load_corrupt_returns_empty(tmp_path: Path):
     assert log.fires == ()
 
 
+def test_reflex_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
+    """Corrupt file is quarantined and WARNING is emitted (attempt_heal path)."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    path = tmp_path / "log.json"
+    path.write_text("{{{not json", encoding="utf-8")
+    log = ReflexLog.load(path)
+    assert log.fires == ()
+    # Quarantine file should have been created
+    corrupt_files = list(tmp_path.glob("log.json.corrupt-*"))
+    assert len(corrupt_files) == 1
+    # Warning logged
+    warn_msgs = [r.getMessage() for r in caplog.records if "ReflexLog anomaly" in r.getMessage()]
+    assert len(warn_msgs) == 1
+
+
+def test_reflex_log_load_heals_from_bak(tmp_path: Path) -> None:
+    """When primary file is corrupt, load restores from .bak1."""
+    fire = ArcFire(
+        arc_name="restored_arc",
+        fired_at=datetime.now(UTC),
+        trigger_state={},
+        output_memory_id=None,
+    )
+    good_payload = {"version": 1, "fires": [fire.to_dict()]}
+    path = tmp_path / "log.json"
+    bak1 = tmp_path / "log.json.bak1"
+    import json
+
+    bak1.write_text(json.dumps(good_payload), encoding="utf-8")
+    path.write_text("{{{not json", encoding="utf-8")  # corrupt primary
+    log = ReflexLog.load(path)
+    assert len(log.fires) == 1
+    assert log.fires[0].arc_name == "restored_arc"
+
+
 def test_reflex_log_save_atomic(tmp_path: Path):
     path = tmp_path / "log.json"
     fire = ArcFire(

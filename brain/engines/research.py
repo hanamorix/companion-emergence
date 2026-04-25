@@ -6,9 +6,7 @@ This module ships the types + engine scaffold. run_tick body lands in Task 3.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -358,32 +356,49 @@ def _create_research_memory(
 
 @dataclass(frozen=True)
 class ResearchLog:
-    """Fire-history log for one persona."""
+    """Fire-history log for one persona.
+
+    Stored as a single JSON object ``{"version": 1, "fires": [...]}`` —
+    atomic-rewrite, not append-only JSONL.  Corruption recovery delegates
+    to ``attempt_heal`` + ``.bak`` rotation; ``save_with_backup`` keeps up
+    to three rolling backups for the adaptive-treatment layer.
+    """
 
     fires: tuple[ResearchFire, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> ResearchLog:
-        if not path.exists():
-            return cls()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return cls()
-            fires_raw = data.get("fires", [])
-            if not isinstance(fires_raw, list):
-                return cls()
-            return cls(
-                fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict))
+        """Load the log; heal from .bak rotation if corrupt, log WARNING."""
+        from brain.health.attempt_heal import attempt_heal
+
+        def _default_factory() -> dict:
+            return {"version": 1, "fires": []}
+
+        def _schema_validator(data: object) -> None:
+            if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
+                raise ValueError("research log schema invalid: missing 'fires' list")
+
+        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        if anomaly is not None:
+            logger.warning(
+                "ResearchLog anomaly detected: %s action=%s file=%s",
+                anomaly.kind,
+                anomaly.action,
+                anomaly.file,
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return cls()
+        fires_raw = data.get("fires", [])
+        return cls(
+            fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict))
+        )
 
     def save(self, path: Path) -> None:
+        """Atomic save via .bak rotation (save_with_backup)."""
+        from brain.health.adaptive import compute_treatment
+        from brain.health.attempt_heal import save_with_backup
+
         payload = {"version": 1, "fires": [f.to_dict() for f in self.fires]}
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        treatment = compute_treatment(path.parent, path.name)
+        save_with_backup(path, payload, backup_count=treatment.backup_count)
 
     def appended(self, fire: ResearchFire) -> ResearchLog:
         return ResearchLog(fires=self.fires + (fire,))
