@@ -28,13 +28,17 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
         # Seed memories that reference custom emotions not in baseline.
         store.create(
             Memory.create_new(
-                content="x", memory_type="conversation", domain="us",
+                content="x",
+                memory_type="conversation",
+                domain="us",
                 emotions={"body_grief": 8.0, "love": 9.0},
             )
         )
         store.create(
             Memory.create_new(
-                content="y", memory_type="conversation", domain="us",
+                content="y",
+                memory_type="conversation",
+                domain="us",
                 emotions={"creative_hunger": 7.0},
             )
         )
@@ -61,7 +65,10 @@ def test_baseline_names_in_memories_not_duplicated() -> None:
     try:
         store.create(
             Memory.create_new(
-                content="x", memory_type="conversation", domain="us", emotions={"love": 9.0},
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 9.0},
             )
         )
         result = reconstruct_vocabulary_from_memories(store)
@@ -78,7 +85,10 @@ def test_returned_shape_matches_persona_loader_expectation() -> None:
     try:
         store.create(
             Memory.create_new(
-                content="x", memory_type="conversation", domain="us", emotions={"x_emotion": 5.0},
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"x_emotion": 5.0},
             )
         )
         result = reconstruct_vocabulary_from_memories(store)

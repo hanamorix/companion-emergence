@@ -59,7 +59,9 @@ def _heal_from_baks(
     quarantine = path.with_name(f"{path.name}.corrupt-{iso_utc(now)}")
     os.replace(path, quarantine)
 
-    kind = "json_parse_error" if isinstance(original_exc, json.JSONDecodeError) else "schema_mismatch"
+    kind = (
+        "json_parse_error" if isinstance(original_exc, json.JSONDecodeError) else "schema_mismatch"
+    )
 
     for bak_index in (1, 2, 3):
         bak = path.with_name(f"{path.name}.bak{bak_index}")
@@ -75,27 +77,33 @@ def _heal_from_baks(
 
         # Found a valid bak — restore.
         os.replace(bak, path)
-        return data, BrainAnomaly(
-            timestamp=now,
-            file=path.name,
-            kind=kind,  # type: ignore[arg-type]
-            action=f"restored_from_bak{bak_index}",  # type: ignore[arg-type]
-            quarantine_path=quarantine.name,
-            likely_cause=likely_cause,
-            detail=str(original_exc)[:500],
+        return (
+            data,
+            BrainAnomaly(
+                timestamp=now,
+                file=path.name,
+                kind=kind,  # type: ignore[arg-type]
+                action=f"restored_from_bak{bak_index}",  # type: ignore[arg-type]
+                quarantine_path=quarantine.name,
+                likely_cause=likely_cause,
+                detail=str(original_exc)[:500],
+            ),
         )
 
     # All baks corrupt or missing — reset to default.
     default_data = default_factory()
     path.write_text(json.dumps(default_data, indent=2) + "\n", encoding="utf-8")
-    return default_data, BrainAnomaly(
-        timestamp=now,
-        file=path.name,
-        kind=kind,  # type: ignore[arg-type]
-        action="reset_to_default",
-        quarantine_path=quarantine.name,
-        likely_cause=likely_cause,
-        detail=str(original_exc)[:500],
+    return (
+        default_data,
+        BrainAnomaly(
+            timestamp=now,
+            file=path.name,
+            kind=kind,  # type: ignore[arg-type]
+            action="reset_to_default",
+            quarantine_path=quarantine.name,
+            likely_cause=likely_cause,
+            detail=str(original_exc)[:500],
+        ),
     )
 
 

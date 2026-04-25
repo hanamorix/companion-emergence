@@ -15,9 +15,7 @@ def test_missing_file_returns_empty(tmp_path: Path) -> None:
 
 def test_well_formed_lines_round_trip(tmp_path: Path) -> None:
     p = tmp_path / "log.jsonl"
-    p.write_text(
-        json.dumps({"a": 1}) + "\n" + json.dumps({"a": 2}) + "\n", encoding="utf-8"
-    )
+    p.write_text(json.dumps({"a": 1}) + "\n" + json.dumps({"a": 2}) + "\n", encoding="utf-8")
     out = read_jsonl_skipping_corrupt(p)
     assert out == [{"a": 1}, {"a": 2}]
 

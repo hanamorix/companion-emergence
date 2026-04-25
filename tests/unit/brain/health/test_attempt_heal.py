@@ -86,8 +86,12 @@ def test_attempt_heal_walks_to_bak2_when_bak1_corrupt(tmp_path: Path) -> None:
 
 def test_attempt_heal_schema_validator_failure_treated_as_corrupt(tmp_path: Path) -> None:
     p = tmp_path / "vocab.json"
-    p.write_text(json.dumps({"version": 1, "wrong_field": []}), encoding="utf-8")  # parses but invalid
-    data, anomaly = attempt_heal(p, lambda: {"version": 1, "emotions": []}, schema_validator=_vocab_validator)
+    p.write_text(
+        json.dumps({"version": 1, "wrong_field": []}), encoding="utf-8"
+    )  # parses but invalid
+    data, anomaly = attempt_heal(
+        p, lambda: {"version": 1, "emotions": []}, schema_validator=_vocab_validator
+    )
     assert anomaly is not None
     assert anomaly.kind == "schema_mismatch"
     assert anomaly.action == "reset_to_default"

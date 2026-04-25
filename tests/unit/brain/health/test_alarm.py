@@ -9,7 +9,9 @@ from pathlib import Path
 from brain.health.alarm import compute_pending_alarms
 
 
-def _audit_entry(file: str, when: datetime, action: str = "restored_from_bak1", kind: str = "json_parse_error") -> dict:
+def _audit_entry(
+    file: str, when: datetime, action: str = "restored_from_bak1", kind: str = "json_parse_error"
+) -> dict:
     return {
         "timestamp": when.isoformat().replace("+00:00", "Z"),
         "anomalies": [
@@ -37,14 +39,27 @@ def test_no_anomalies_no_alarms(tmp_path: Path) -> None:
 
 
 def test_reset_to_default_on_identity_file_alarms(tmp_path: Path) -> None:
-    _seed(tmp_path, [_audit_entry("emotion_vocabulary.json", datetime.now(UTC), action="reset_to_default")])
+    _seed(
+        tmp_path,
+        [_audit_entry("emotion_vocabulary.json", datetime.now(UTC), action="reset_to_default")],
+    )
     alarms = compute_pending_alarms(tmp_path)
     assert len(alarms) == 1
     assert alarms[0].file == "emotion_vocabulary.json"
 
 
 def test_sqlite_integrity_fail_alarms(tmp_path: Path) -> None:
-    _seed(tmp_path, [_audit_entry("memories.db", datetime.now(UTC), kind="sqlite_integrity_fail", action="alarmed_unrecoverable")])
+    _seed(
+        tmp_path,
+        [
+            _audit_entry(
+                "memories.db",
+                datetime.now(UTC),
+                kind="sqlite_integrity_fail",
+                action="alarmed_unrecoverable",
+            )
+        ],
+    )
     alarms = compute_pending_alarms(tmp_path)
     assert len(alarms) == 1
     assert alarms[0].kind == "sqlite_integrity_fail"

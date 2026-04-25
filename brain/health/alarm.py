@@ -9,12 +9,14 @@ from brain.health.anomaly import AlarmEntry
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 from brain.utils.time import parse_iso_utc
 
-_IDENTITY_FILES = frozenset({
-    "emotion_vocabulary.json",
-    "interests.json",
-    "reflex_arcs.json",
-    # future: "soul.json"
-})
+_IDENTITY_FILES = frozenset(
+    {
+        "emotion_vocabulary.json",
+        "interests.json",
+        "reflex_arcs.json",
+        # future: "soul.json"
+    }
+)
 
 WINDOW_DAYS = 7
 
