@@ -28,12 +28,12 @@ def test_aggregate_empty_returns_empty_state():
 
 def test_aggregate_max_pools_per_emotion():
     memories = [
-        _mem({"love": 6.0, "creative_hunger": 4.0}),
+        _mem({"love": 6.0, "curiosity": 4.0}),
         _mem({"love": 8.0, "defiance": 3.0}),
     ]
     result = aggregate_state(memories)
     assert result.emotions["love"] == 8.0
-    assert result.emotions["creative_hunger"] == 4.0
+    assert result.emotions["curiosity"] == 4.0
     assert result.emotions["defiance"] == 3.0
 
 

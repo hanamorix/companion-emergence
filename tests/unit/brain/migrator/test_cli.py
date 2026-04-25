@@ -218,6 +218,65 @@ def test_migrate_writes_reflex_arcs(
     assert report.reflex_arcs_skipped_reason is None
 
 
+def test_migrate_writes_emotion_vocabulary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: migrator writes emotion_vocabulary.json from OG memory
+    emotion references, with canonical entries for known nell_specific
+    and placeholders for any custom emotions."""
+    # Build a minimal OG source that references 1 nell_specific + 1 custom emotion.
+    og = tmp_path / "og_data"
+    og.mkdir()
+    memories = [
+        {
+            "id": "m1",
+            "content": "body grief test",
+            "memory_type": "conversation",
+            "domain": "us",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "emotions": {"body_grief": 5.0, "moonache": 3.0},
+            "emotion_score": 5.0,
+        },
+    ]
+    (og / "memories_v2.json").write_text(json.dumps(memories))
+    (og / "connection_matrix_ids.json").write_text(json.dumps(["m1"]))
+    import numpy as np
+
+    matrix = np.array([[0.0]], dtype=np.float32)
+    np.save(og / "connection_matrix.npy", matrix)
+    (og / "hebbian_state.json").write_text("{}")
+
+    persona_root = tmp_path / "persona_root"
+    persona_root.mkdir()
+    monkeypatch.setenv("NELLBRAIN_HOME", str(persona_root))
+
+    args = MigrateArgs(
+        input_dir=og,
+        output_dir=None,
+        install_as="testpersona",
+        force=False,
+    )
+    report = run_migrate(args)
+
+    from brain.paths import get_persona_dir
+
+    target = get_persona_dir("testpersona") / "emotion_vocabulary.json"
+    assert target.exists()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    names = {e["name"] for e in data["emotions"]}
+    assert "body_grief" in names
+    assert "moonache" in names
+    assert report.vocabulary_emotions_migrated == 2
+
+    # Canonical entry for body_grief
+    body_grief = next(e for e in data["emotions"] if e["name"] == "body_grief")
+    assert body_grief["decay_half_life_days"] is None
+    assert "physical form" in body_grief["description"]
+
+    # Placeholder for custom emotion
+    moonache = next(e for e in data["emotions"] if e["name"] == "moonache")
+    assert moonache["decay_half_life_days"] == 14.0
+    assert "migrated from OG" in moonache["description"]
+
+
 def test_migrate_writes_interests(
     og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
