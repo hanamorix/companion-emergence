@@ -84,6 +84,89 @@ def test_heartbeat_config_invalid_emit_memory_falls_back_to_default(tmp_path: Pa
     assert c.emit_memory == "conditional"
 
 
+# ---- Phase 2a T5: growth_enabled / growth_every_hours / last_growth_at ----
+
+
+def test_heartbeat_config_has_growth_defaults() -> None:
+    """HeartbeatConfig has growth_enabled=True + growth_every_hours=168.0 (weekly)."""
+    c = HeartbeatConfig()
+    assert c.growth_enabled is True
+    assert c.growth_every_hours == 168.0
+
+
+def test_heartbeat_config_round_trip_preserves_growth(tmp_path: Path) -> None:
+    """save() then load() preserves growth fields."""
+    original = HeartbeatConfig(growth_enabled=False, growth_every_hours=24.0)
+    path = tmp_path / "cfg.json"
+    original.save(path)
+    restored = HeartbeatConfig.load(path)
+    assert restored.growth_enabled is False
+    assert restored.growth_every_hours == 24.0
+
+
+def test_heartbeat_config_back_compat_missing_growth_fields(tmp_path: Path) -> None:
+    """Old config files without growth_* fields load with defaults."""
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"dream_every_hours": 12.0}), encoding="utf-8")
+    c = HeartbeatConfig.load(path)
+    assert c.growth_enabled is True
+    assert c.growth_every_hours == 168.0
+
+
+def test_heartbeat_state_includes_last_growth_at() -> None:
+    """HeartbeatState.fresh() initialises last_growth_at = now."""
+    s = HeartbeatState.fresh(trigger="open")
+    assert s.last_growth_at is not None
+    assert s.last_growth_at.tzinfo is not None  # tz-aware
+
+
+def test_heartbeat_state_round_trips_last_growth_at(tmp_path: Path) -> None:
+    s = HeartbeatState.fresh(trigger="open")
+    path = tmp_path / "state.json"
+    s.save(path)
+    restored = HeartbeatState.load(path)
+    assert restored is not None
+    assert restored.last_growth_at == s.last_growth_at
+
+
+def test_heartbeat_state_back_compat_missing_last_growth_at(tmp_path: Path) -> None:
+    """Old state files without last_growth_at load with last_growth_at=now (delays
+    first growth tick by growth_every_hours, which is the safe back-compat default)."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "last_tick_at": "2026-04-20T10:00:00Z",
+                "last_dream_at": "2026-04-20T10:00:00Z",
+                "last_research_at": "2026-04-20T10:00:00Z",
+                "tick_count": 5,
+                "last_trigger": "open",
+            }
+        ),
+        encoding="utf-8",
+    )
+    s = HeartbeatState.load(path)
+    assert s is not None
+    assert s.last_growth_at is not None  # backfilled to now-ish on load
+    assert s.last_growth_at.tzinfo is not None
+
+
+def test_heartbeat_result_default_growth_emotions_added_is_zero() -> None:
+    """HeartbeatResult.growth_emotions_added defaults to 0."""
+    r = HeartbeatResult(
+        trigger="manual",
+        elapsed_seconds=0.0,
+        memories_decayed=0,
+        edges_pruned=0,
+        dream_id=None,
+        dream_gated_reason=None,
+        research_deferred=False,
+        heartbeat_memory_id=None,
+        initialized=False,
+    )
+    assert r.growth_emotions_added == 0
+
+
 # ---- PR-C: user_preferences.json merges over heartbeat_config.json ----
 
 
@@ -155,6 +238,7 @@ def test_heartbeat_state_save_and_load_round_trips(tmp_path: Path) -> None:
         last_tick_at=when,
         last_dream_at=when - timedelta(hours=6),
         last_research_at=when,
+        last_growth_at=when,
         tick_count=5,
         last_trigger="open",
     )
@@ -276,6 +360,7 @@ def test_heartbeat_state_save_rejects_naive_datetime(tmp_path: Path) -> None:
         last_tick_at=naive_dt,
         last_dream_at=naive_dt,
         last_research_at=naive_dt,
+        last_growth_at=naive_dt,
         tick_count=0,
         last_trigger="init",
     )

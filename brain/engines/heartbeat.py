@@ -60,6 +60,8 @@ class HeartbeatConfig:
     research_emotion_threshold: float = 7.0
     research_cooldown_hours_per_interest: float = 24.0
     interest_bump_per_match: float = 0.1
+    growth_enabled: bool = True
+    growth_every_hours: float = 168.0  # weekly default
 
     @classmethod
     def load(cls, path: Path) -> HeartbeatConfig:
@@ -114,6 +116,8 @@ class HeartbeatConfig:
                     data.get("research_cooldown_hours_per_interest", 24.0)
                 ),
                 interest_bump_per_match=float(data.get("interest_bump_per_match", 0.1)),
+                growth_enabled=bool(data.get("growth_enabled", True)),
+                growth_every_hours=float(data.get("growth_every_hours", 168.0)),
             )
         except (TypeError, ValueError):
             # Hand-edited config with wrong-type values (e.g. dream_every_hours={}
@@ -139,6 +143,8 @@ class HeartbeatConfig:
             "research_emotion_threshold": self.research_emotion_threshold,
             "research_cooldown_hours_per_interest": self.research_cooldown_hours_per_interest,
             "interest_bump_per_match": self.interest_bump_per_match,
+            "growth_enabled": self.growth_enabled,
+            "growth_every_hours": self.growth_every_hours,
         }
         tmp = path.with_suffix(path.suffix + ".new")
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -152,6 +158,7 @@ class HeartbeatState:
     last_tick_at: datetime
     last_dream_at: datetime
     last_research_at: datetime
+    last_growth_at: datetime  # tz-aware UTC; defaults to now on first save
     tick_count: int
     last_trigger: str
 
@@ -172,6 +179,9 @@ class HeartbeatState:
                 last_tick_at=parse_iso_utc(data["last_tick_at"]),
                 last_dream_at=parse_iso_utc(data["last_dream_at"]),
                 last_research_at=parse_iso_utc(data["last_research_at"]),
+                last_growth_at=parse_iso_utc(
+                    data.get("last_growth_at") or data["last_tick_at"]
+                ),
                 tick_count=int(data["tick_count"]),
                 last_trigger=str(data["last_trigger"]),
             )
@@ -186,6 +196,7 @@ class HeartbeatState:
             last_tick_at=now,
             last_dream_at=now,
             last_research_at=now,
+            last_growth_at=now,
             tick_count=0,
             last_trigger=trigger,
         )
@@ -196,6 +207,7 @@ class HeartbeatState:
             "last_tick_at": iso_utc(self.last_tick_at),
             "last_dream_at": iso_utc(self.last_dream_at),
             "last_research_at": iso_utc(self.last_research_at),
+            "last_growth_at": iso_utc(self.last_growth_at),
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
         }
@@ -222,6 +234,7 @@ class HeartbeatResult:
     research_fired: str | None = None
     research_gated_reason: str | None = None
     interests_bumped: int = 0
+    growth_emotions_added: int = 0
 
 
 @dataclass
