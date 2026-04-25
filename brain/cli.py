@@ -14,6 +14,7 @@ from pathlib import Path
 
 from brain import __version__
 from brain.bridge.provider import get_provider
+from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import Interest, InterestSet
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine
@@ -70,6 +71,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
     # prettier but stores don't implement __enter__/__exit__ yet.
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(args.provider)
@@ -124,6 +126,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(args.provider)
@@ -202,6 +205,7 @@ def _reflex_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         provider = get_provider(args.provider)
         engine = ReflexEngine(
             store=store,
@@ -253,6 +257,7 @@ def _research_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         provider = get_provider(args.provider)
         searcher = get_searcher(args.searcher)
         engine = ResearchEngine(
@@ -294,6 +299,7 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
     interests = InterestSet.load(
         persona_dir / "interests.json", default_path=_default_interests_path()
     )
@@ -318,6 +324,7 @@ def _interest_add_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
     interests_path = persona_dir / "interests.json"
     interests = InterestSet.load(interests_path, default_path=_default_interests_path())
     now = datetime.now(UTC)
@@ -345,6 +352,7 @@ def _interest_bump_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
     interests_path = persona_dir / "interests.json"
     interests = InterestSet.load(interests_path, default_path=_default_interests_path())
     if interests.find_by_topic(args.topic) is None:
