@@ -84,6 +84,55 @@ def test_heartbeat_config_invalid_emit_memory_falls_back_to_default(tmp_path: Pa
     assert c.emit_memory == "conditional"
 
 
+# ---- PR-C: user_preferences.json merges over heartbeat_config.json ----
+
+
+def test_user_preferences_overrides_dream_every_hours(tmp_path: Path) -> None:
+    """When user_preferences.json sets dream_every_hours, it wins over heartbeat_config.json."""
+    cfg_path = tmp_path / "heartbeat_config.json"
+    cfg_path.write_text(json.dumps({"dream_every_hours": 24.0}))
+    (tmp_path / "user_preferences.json").write_text(json.dumps({"dream_every_hours": 6.0}))
+    c = HeartbeatConfig.load(cfg_path)
+    assert c.dream_every_hours == 6.0
+
+
+def test_user_preferences_missing_falls_back_to_heartbeat_config(tmp_path: Path) -> None:
+    """No user_preferences.json → heartbeat_config.json's value stands (back-compat)."""
+    cfg_path = tmp_path / "heartbeat_config.json"
+    cfg_path.write_text(json.dumps({"dream_every_hours": 8.0}))
+    c = HeartbeatConfig.load(cfg_path)
+    assert c.dream_every_hours == 8.0
+
+
+def test_user_preferences_present_but_omits_field(tmp_path: Path) -> None:
+    """user_preferences.json without dream_every_hours doesn't shadow heartbeat_config.json.
+
+    Critical for back-compat: a future user_preferences.json with new fields
+    must not silently reset dream_every_hours to the default.
+    """
+    cfg_path = tmp_path / "heartbeat_config.json"
+    cfg_path.write_text(json.dumps({"dream_every_hours": 8.0}))
+    (tmp_path / "user_preferences.json").write_text(json.dumps({"some_future_field": "x"}))
+    c = HeartbeatConfig.load(cfg_path)
+    assert c.dream_every_hours == 8.0
+
+
+def test_user_preferences_only_no_heartbeat_config(tmp_path: Path) -> None:
+    """user_preferences.json drives dream_every_hours when heartbeat_config.json is absent."""
+    (tmp_path / "user_preferences.json").write_text(json.dumps({"dream_every_hours": 12.0}))
+    c = HeartbeatConfig.load(tmp_path / "heartbeat_config.json")  # path doesn't exist
+    assert c.dream_every_hours == 12.0
+
+
+def test_user_preferences_corrupt_does_not_break_load(tmp_path: Path) -> None:
+    """Corrupt user_preferences.json doesn't crash HeartbeatConfig.load()."""
+    cfg_path = tmp_path / "heartbeat_config.json"
+    cfg_path.write_text(json.dumps({"dream_every_hours": 8.0}))
+    (tmp_path / "user_preferences.json").write_text("not json")
+    c = HeartbeatConfig.load(cfg_path)
+    assert c.dream_every_hours == 8.0  # falls back to heartbeat_config.json
+
+
 def test_heartbeat_state_load_missing_file_returns_none(tmp_path: Path) -> None:
     """HeartbeatState.load() returns None for first-ever tick detection."""
     assert HeartbeatState.load(tmp_path / "state.json") is None
