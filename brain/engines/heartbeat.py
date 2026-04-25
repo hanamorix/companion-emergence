@@ -179,9 +179,7 @@ class HeartbeatState:
                 last_tick_at=parse_iso_utc(data["last_tick_at"]),
                 last_dream_at=parse_iso_utc(data["last_dream_at"]),
                 last_research_at=parse_iso_utc(data["last_research_at"]),
-                last_growth_at=parse_iso_utc(
-                    data.get("last_growth_at") or data["last_tick_at"]
-                ),
+                last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
                 tick_count=int(data["tick_count"]),
                 last_trigger=str(data["last_trigger"]),
             )

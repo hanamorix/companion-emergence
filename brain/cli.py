@@ -39,6 +39,7 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     searcher = getattr(args, "searcher", None) or config.searcher
     return provider, searcher
 
+
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
@@ -356,8 +357,7 @@ def _growth_log_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
-            f"No persona directory at {persona_dir}. "
-            f"Persona {args.persona!r} does not exist."
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
         )
 
     from brain.growth.log import read_growth_log

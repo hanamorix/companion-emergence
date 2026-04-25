@@ -154,7 +154,4 @@ def _default_reason_for(proposal: EmotionProposal) -> str:
     one — the dataclass design here matches Phase 2b's likely shape but until
     the crystallizer produces one we describe by score + evidence count.
     """
-    return (
-        f"score={proposal.score:.2f}, "
-        f"evidence_count={len(proposal.evidence_memory_ids)}"
-    )
+    return f"score={proposal.score:.2f}, evidence_count={len(proposal.evidence_memory_ids)}"

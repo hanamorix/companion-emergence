@@ -56,9 +56,7 @@ def test_run_growth_tick_no_proposals_returns_zero(persona_dir: Path, store: Mem
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-def test_run_growth_tick_applies_proposal_atomically(
-    persona_dir: Path, store: MemoryStore
-) -> None:
+def test_run_growth_tick_applies_proposal_atomically(persona_dir: Path, store: MemoryStore) -> None:
     """When a crystallizer returns a proposal, vocabulary + log update together."""
     _seed_vocab(persona_dir)
     proposal = EmotionProposal(
@@ -141,9 +139,7 @@ def test_run_growth_tick_rejects_proposal_with_invalid_chars(
         assert result.proposals_rejected == 1
 
 
-def test_run_growth_tick_dry_run_does_not_write(
-    persona_dir: Path, store: MemoryStore
-) -> None:
+def test_run_growth_tick_dry_run_does_not_write(persona_dir: Path, store: MemoryStore) -> None:
     """dry_run=True calls crystallizer but writes neither vocabulary nor log."""
     _seed_vocab(persona_dir)
     proposal = EmotionProposal(
@@ -163,9 +159,7 @@ def test_run_growth_tick_dry_run_does_not_write(
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-def test_run_growth_tick_handles_multiple_proposals(
-    persona_dir: Path, store: MemoryStore
-) -> None:
+def test_run_growth_tick_handles_multiple_proposals(persona_dir: Path, store: MemoryStore) -> None:
     _seed_vocab(persona_dir)
     proposals = [
         EmotionProposal(
