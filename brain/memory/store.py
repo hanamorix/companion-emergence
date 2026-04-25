@@ -204,6 +204,21 @@ class MemoryStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self._conn = sqlite3.connect(str(db_path))
+        # Run integrity check BEFORE setting row_factory so result rows are
+        # plain tuples — the comparison [("ok",)] is unambiguous.
+        try:
+            result = self._conn.execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            from brain.health.anomaly import BrainIntegrityError
+
+            raise BrainIntegrityError(str(db_path), str(exc)) from exc
+        if result != [("ok",)]:
+            detail = "; ".join(str(row[0]) for row in result)
+            self._conn.close()
+            from brain.health.anomaly import BrainIntegrityError
+
+            raise BrainIntegrityError(str(db_path), detail)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
