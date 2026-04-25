@@ -249,7 +249,16 @@ def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
 
 
 def _verify_sources_unchanged(og_dir: Path, manifest: list[FileManifest]) -> None:
-    """Re-stat each source file; abort if any size differs from manifest."""
+    """Re-stat + re-hash each source file; abort if size or SHA-256 differs.
+
+    Size mismatch catches the obvious case (file truncated/grown). SHA-256
+    catches the harder case where same-byte-length content was mutated
+    during the migration window (e.g., a stale OG bridge writing fresh
+    JSON of identical length). The hash was computed by OGReader during
+    the initial manifest pass; we just compare it.
+    """
+    import hashlib
+
     for m in manifest:
         path = og_dir / m.relative_path
         st = path.stat()
@@ -257,6 +266,13 @@ def _verify_sources_unchanged(og_dir: Path, manifest: list[FileManifest]) -> Non
             raise RuntimeError(
                 f"Source file {path} changed size during migration "
                 f"(was {m.size_bytes}, now {st.st_size}). Aborting."
+            )
+        current_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if current_sha != m.sha256:
+            raise RuntimeError(
+                f"Source file {path} changed content during migration "
+                f"(SHA-256 mismatch: was {m.sha256[:12]}..., now "
+                f"{current_sha[:12]}...). Aborting."
             )
 
 
