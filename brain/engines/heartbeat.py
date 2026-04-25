@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
@@ -32,7 +32,22 @@ _VALID_EMIT_MODES: tuple[str, ...] = get_args(EmitMemoryMode)
 
 @dataclass
 class HeartbeatConfig:
-    """Per-persona heartbeat configuration. Loaded from heartbeat_config.json."""
+    """Per-persona heartbeat configuration.
+
+    Two-file resolution per principle audit 2026-04-25 (PR-C):
+
+    1. `heartbeat_config.json` — developer-only internal calibration. The
+       GUI never reads or writes this file. Holds decay/GC/threshold knobs
+       that calibrate the brain's physiology.
+    2. `user_preferences.json` — the GUI-surfaceable cadence file. When
+       a field is present here (currently only `dream_every_hours`), it
+       takes precedence over heartbeat_config.json. Missing or absent-key
+       → fall back to heartbeat_config.json's value (back-compat).
+
+    `dream_every_hours` is the one field that legitimately belongs to the
+    user. Everything else on this dataclass is internal — exposing it in
+    a GUI would let the user disable parts of the brain's autonomy.
+    """
 
     dream_every_hours: float = 24.0
     decay_rate_per_tick: float = 0.01
@@ -48,6 +63,29 @@ class HeartbeatConfig:
 
     @classmethod
     def load(cls, path: Path) -> HeartbeatConfig:
+        """Load heartbeat_config.json, then merge user_preferences.json if present.
+
+        `path` points at heartbeat_config.json. user_preferences.json is
+        looked up next to it (`path.parent / "user_preferences.json"`).
+        """
+        cfg = cls._load_internal(path)
+
+        # Merge user_preferences.json — only override fields explicitly
+        # present in the file, so a user_preferences.json that omits
+        # dream_every_hours doesn't shadow a custom value set in
+        # heartbeat_config.json (back-compat for pre-PR-C personas).
+        from brain.user_preferences import UserPreferences, read_raw_keys
+
+        user_prefs_path = path.parent / "user_preferences.json"
+        explicit_keys = read_raw_keys(user_prefs_path)
+        if "dream_every_hours" in explicit_keys:
+            prefs = UserPreferences.load(user_prefs_path)
+            cfg = replace(cfg, dream_every_hours=prefs.dream_every_hours)
+        return cfg
+
+    @classmethod
+    def _load_internal(cls, path: Path) -> HeartbeatConfig:
+        """Load heartbeat_config.json only — the developer-calibration layer."""
         if not path.exists():
             return cls()
         try:
