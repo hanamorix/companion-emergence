@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from brain.bridge.provider import LLMProvider
+from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
 from brain.health.anomaly import BrainAnomaly
 from brain.health.walker import walk_persona
@@ -473,8 +474,18 @@ class HeartbeatEngine:
         # Interest ingestion hook (zero LLM — keyword match bumps existing interests)
         interests_bumped = self._try_bump_interests(state, now, config, dry_run)
 
+        # Resolve persona_dir once — used for daemon_state writes later.
+        if self.interests_path is not None:
+            persona_dir = self.interests_path.parent
+        else:
+            persona_dir = self.state_path.parent
+
         # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
         reflex_fired, reflex_skipped_count = self._try_fire_reflex(trigger, dry_run, config)
+
+        # Write daemon_state for any reflex fires (fault-isolated).
+        if not dry_run and reflex_fired:
+            self._write_daemon_state_for_reflex(persona_dir, reflex_fired)
 
         # Maybe-dream
         dream_id: str | None = None
@@ -485,6 +496,8 @@ class HeartbeatEngine:
                 dream_id = self._try_fire_dream()
                 if dream_id is not None:
                     state.last_dream_at = now
+                    # Write daemon_state for the dream that just fired (fault-isolated).
+                    self._write_daemon_state_for_dream(persona_dir, dream_id)
                 else:
                     dream_gated_reason = "no_seed_available"
             else:
@@ -498,6 +511,10 @@ class HeartbeatEngine:
             trigger, dry_run, config, reflex_fired
         )
         research_deferred = research_fired is None and research_gated_reason is None
+
+        # Write daemon_state for research fire (fault-isolated).
+        if not dry_run and research_fired is not None:
+            self._write_daemon_state_for_research(persona_dir, research_fired)
 
         # Growth tick — autonomous self-development (Phase 2a). Runs after
         # all per-tick engines so it can observe the freshest state, before
@@ -520,11 +537,18 @@ class HeartbeatEngine:
             )
 
         # Compute pending alarms (always, before writing audit log).
-        if self.interests_path is not None:
-            persona_dir = self.interests_path.parent
-        else:
-            persona_dir = self.state_path.parent
         pending_alarms_count = len(compute_pending_alarms(persona_dir))
+
+        # Write the heartbeat's own daemon_state entry (always, last in tick,
+        # so it captures the full tick summary). Fault-isolated.
+        if not dry_run:
+            self._write_daemon_state_for_heartbeat(
+                persona_dir,
+                elapsed_seconds=elapsed_seconds,
+                memories_decayed=memories_decayed,
+                edges_pruned=edges_pruned,
+                dream_id=dream_id,
+            )
 
         # Update state + log
         if not dry_run:
@@ -880,6 +904,151 @@ class HeartbeatEngine:
         )
         self.store.create(mem)
         return mem.id
+
+    # --- daemon_state write helpers (all fault-isolated) ---
+
+    def _write_daemon_state_for_dream(self, persona_dir: Path, dream_id: str) -> None:
+        """Look up the just-fired dream memory and write a daemon_state fire entry.
+
+        Peak emotion + intensity come from the dream memory's emotions dict.
+        Falls back to 'curiosity'/'5' when the dict is missing or empty.
+        """
+        try:
+            mem = self.store.get(dream_id)
+            if mem is None:
+                return
+            dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+            theme = mem.content[:80]
+            update_daemon_state(
+                persona_dir,
+                daemon_type="dream",
+                dominant_emotion=dominant_emotion,
+                intensity=intensity,
+                theme=theme,
+                summary=mem.content,
+            )
+        except Exception as exc:
+            logger.warning("daemon_state write for dream failed; isolating: %.200s", exc)
+
+    def _write_daemon_state_for_reflex(
+        self, persona_dir: Path, fired_arcs: tuple[str, ...]
+    ) -> None:
+        """Write a daemon_state fire entry for the first fired reflex arc.
+
+        Looks up the most-recently-created reflex memory (by store.list_by_type,
+        limit=1, newest-first). Falls back to a compact synthetic summary if
+        no reflex memory is found.
+        """
+        try:
+            arc_name = fired_arcs[0] if fired_arcs else "reflex"
+            reflex_mems = self.store.list_by_type("reflex_journal", active_only=True, limit=1)
+            if reflex_mems:
+                mem = reflex_mems[0]
+                dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+                theme = arc_name
+                summary = mem.content
+            else:
+                # No memory found — write a minimal synthetic entry so the
+                # daemon_state still records that reflex fired this tick.
+                dominant_emotion = "curiosity"
+                intensity = 5
+                theme = arc_name
+                summary = "reflex fired"
+            update_daemon_state(
+                persona_dir,
+                daemon_type="reflex",
+                dominant_emotion=dominant_emotion,
+                intensity=intensity,
+                theme=theme,
+                summary=summary,
+                trigger=arc_name,
+            )
+        except Exception as exc:
+            logger.warning("daemon_state write for reflex failed; isolating: %.200s", exc)
+
+    def _write_daemon_state_for_research(self, persona_dir: Path, research_topic: str) -> None:
+        """Write a daemon_state fire entry for a research fire.
+
+        Looks up the most-recently-created research memory (limit=1). Falls back
+        to a synthetic entry keyed on the topic string if none is found.
+        """
+        try:
+            research_mems = self.store.list_by_type("research", active_only=True, limit=1)
+            if research_mems:
+                mem = research_mems[0]
+                dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+                theme = research_topic
+                summary = mem.content
+            else:
+                dominant_emotion = "curiosity"
+                intensity = 5
+                theme = research_topic
+                summary = f"research fired: {research_topic}"
+            update_daemon_state(
+                persona_dir,
+                daemon_type="research",
+                dominant_emotion=dominant_emotion,
+                intensity=intensity,
+                theme=theme,
+                summary=summary,
+            )
+        except Exception as exc:
+            logger.warning("daemon_state write for research failed; isolating: %.200s", exc)
+
+    def _write_daemon_state_for_heartbeat(
+        self,
+        persona_dir: Path,
+        *,
+        elapsed_seconds: float,
+        memories_decayed: int,
+        edges_pruned: int,
+        dream_id: str | None,
+    ) -> None:
+        """Write the heartbeat tick's own daemon_state entry.
+
+        dominant_emotion + intensity come from the aggregate emotional state
+        across all active conversation memories. Falls back to 'calm'/'3' when
+        no conversation memories exist.
+        """
+        try:
+            all_mems = self.store.search_text("", active_only=True)
+            combined_emotions: dict[str, float] = {}
+            for m in all_mems:
+                for name, val in m.emotions.items():
+                    combined_emotions[name] = combined_emotions.get(name, 0.0) + val
+            dominant_emotion, intensity = self._peak_emotion(combined_emotions, default=("calm", 3))
+            theme = "heartbeat tick"
+            summary = (
+                f"elapsed={elapsed_seconds / 3600:.1f}h, "
+                f"decays={memories_decayed}, edges_pruned={edges_pruned}, "
+                f"dream_fired={'yes' if dream_id else 'no'}"
+            )
+            update_daemon_state(
+                persona_dir,
+                daemon_type="heartbeat",
+                dominant_emotion=dominant_emotion,
+                intensity=intensity,
+                theme=theme,
+                summary=summary,
+            )
+        except Exception as exc:
+            logger.warning("daemon_state write for heartbeat failed; isolating: %.200s", exc)
+
+    @staticmethod
+    def _peak_emotion(
+        emotions: dict[str, float],
+        *,
+        default: tuple[str, int] = ("curiosity", 5),
+    ) -> tuple[str, int]:
+        """Return (dominant_emotion, intensity_0_to_10) from an emotions dict.
+
+        intensity is clamped to [0, 10] and rounded to the nearest integer.
+        Falls back to `default` when the dict is empty.
+        """
+        if not emotions:
+            return default
+        name, val = max(emotions.items(), key=lambda kv: kv[1])
+        return name, max(0, min(10, round(val)))
 
     def _append_log(self, entry: dict) -> None:
         """Append one JSON line to heartbeats.log.jsonl."""
