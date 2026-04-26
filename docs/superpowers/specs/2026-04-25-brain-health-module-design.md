@@ -347,7 +347,27 @@ The full health module ships when:
 
 ## 9. Open / Deferred
 
-- **Soul reconstruction.** When the soul module lands as a Phase 2a-extension, its `soul.json` healing strategy needs design. Soul crystallizations might be partially reconstructable from memories (F37 was self-claims-from-experience), but defer that until soul exists.
+### 9.1 Soul module health (concrete plan for when soul lands)
+
+When the Phase 2a-extension brings the soul module online, `soul.json` (or whatever its filename ends up being) joins the persona's identity-critical files. The heal strategy is already partially specified by the architecture; this section makes it concrete so the engineer building the soul module doesn't have to rediscover the plan.
+
+**File classification:** `soul.json` is an **atomic-rewrite identity file** — same tier as `emotion_vocabulary.json`, `interests.json`, `reflex_arcs.json`. Use `attempt_heal` + `save_with_backup`. Add it to:
+
+- `brain/health/walker.py:_DEFAULTS` with empty default `{"version": 1, "crystallizations": []}` (or whatever the schema settles on).
+- `brain/health/alarm.py:_IDENTITY_FILES` so `reset_to_default` on `soul.json` raises an alarm.
+
+**Reconstruction strategy:** F37 in OG NellBrain was *self-claims-from-experience* — the brain's soul names were derived from autobiographical patterns in memories. The same heuristic applies here: when all backups corrupt and reset would otherwise fire, scan `memories.db` for soul-claim patterns the brain has expressed and rebuild a partial `soul.json`. Implement as `brain/health/reconstruct.py:reconstruct_soul_from_memories(store) -> dict` mirroring `reconstruct_vocabulary_from_memories`. Wire it into the soul loader's heal flow the same way vocabulary does in `load_persona_vocabulary_with_anomaly` (Followup F1, 2026-04-26).
+
+**Schema validator:** mirror the vocabulary validator pattern — minimal type check (`isinstance(data, dict) and isinstance(data.get("crystallizations"), list)`) — so corrupt-but-parseable files trigger heal.
+
+**Acceptance:** when soul module lands, the soul module's PR must include:
+1. `soul.json` in `walker.py:_DEFAULTS` and `alarm.py:_IDENTITY_FILES`
+2. `reconstruct_soul_from_memories(store)` implementation + tests
+3. Soul loader's `*_with_anomaly` variant routes through `attempt_heal` and triggers reconstruction on `reset_to_default` when a store is provided
+4. Sandbox smoke: corrupt soul.json + run heartbeat tick → soul heals or reconstructs without user intervention
+
+### 9.2 Other deferred items
+
 - **Automatic .bak repair when a backup is detected corrupt mid-rotation.** v1 skips the corrupt backup and walks to the next; doesn't try to repair the backup itself. If real-world telemetry shows backups frequently corrupt mid-chain, revisit.
 - **GUI surface for "the brain self-healed."** Not a framework concern; future Tauri/NellFace work consumes the audit log directly.
 
