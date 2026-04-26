@@ -16,11 +16,15 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain.growth.crystallizers.vocabulary import crystallize_vocabulary
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import MemoryStore
+
+if TYPE_CHECKING:
+    from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ def run_growth_tick(
     now: datetime,
     *,
     dry_run: bool = False,
+    anomalies_collector: list[BrainAnomaly] | None = None,
 ) -> GrowthTickResult:
     """Run all crystallizers, apply their proposals atomically.
 
@@ -58,11 +63,19 @@ def run_growth_tick(
 
     `dry_run=True` calls the crystallizer but skips both writes; the
     returned `emotions_added` reflects "would-have-added" semantics.
+
+    `anomalies_collector` (optional): when the heartbeat tick passes its
+    per-tick anomaly list, any anomaly produced by reading the vocabulary
+    file (corruption, schema mismatch) gets appended so it surfaces in the
+    audit log + compact CLI alongside heartbeat-engine anomalies. Pass None
+    when calling `run_growth_tick` standalone (e.g., from tests).
     """
     vocab_path = persona_dir / "emotion_vocabulary.json"
     log_path = persona_dir / "emotion_growth.log.jsonl"
 
-    current_names = _read_current_vocabulary_names(vocab_path)
+    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path)
+    if vocab_anomaly is not None and anomalies_collector is not None:
+        anomalies_collector.append(vocab_anomaly)
 
     proposals = crystallize_vocabulary(store, current_vocabulary_names=current_names)
 
@@ -108,18 +121,21 @@ def run_growth_tick(
     )
 
 
-def _read_current_vocabulary_names(vocab_path: Path) -> set[str]:
-    """Return the set of emotion names currently in the persona's vocabulary file.
+def _read_current_vocabulary_names(
+    vocab_path: Path,
+) -> tuple[set[str], BrainAnomaly | None]:
+    """Return (set of emotion names, optional anomaly) for the vocabulary file.
 
     Distinguishes three load outcomes:
-      - Missing file → return empty set silently (fresh persona; expected).
+      - Missing file → (empty set, None) silently (fresh persona; expected).
       - Corrupt JSON or wrong schema → quarantine + heal from .bak or reset to
-        default; return names from the recovered data. Logs a WARNING so the
-        anomaly is visible.
-      - Well-formed → return the set of names.
+        default; returns (names_from_recovered_data, BrainAnomaly). The caller
+        (run_growth_tick) feeds the anomaly into its `anomalies_collector` so
+        it surfaces in the heartbeat audit log. Logs WARNING locally too.
+      - Well-formed → (set of names, None).
     """
     if not vocab_path.exists():
-        return set()
+        return set(), None
 
     from brain.health.attempt_heal import attempt_heal
 
@@ -142,7 +158,8 @@ def _read_current_vocabulary_names(vocab_path: Path) -> set[str]:
             anomaly.action,
         )
 
-    return {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}
+    names = {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}
+    return names, anomaly
 
 
 def _is_valid_name(name: str) -> bool:

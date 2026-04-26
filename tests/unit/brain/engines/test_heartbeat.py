@@ -1744,3 +1744,74 @@ def test_heartbeat_alarm_increments_pending_alarms_count(tmp_path: Path) -> None
     finally:
         store.close()
         hebbian.close()
+
+
+# ---- F3: growth-tick-internal anomalies surface in heartbeat audit log ----
+
+
+def test_heartbeat_growth_anomaly_surfaces_in_audit_log(tmp_path: Path) -> None:
+    """When growth tick reads a corrupt vocabulary file, the anomaly appears
+    in the heartbeat audit log + HeartbeatResult.anomalies — not just logged
+    as a warning inside growth.
+
+    Followup F3 from the brain-health module.
+    """
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    # Seed an empty interests file so growth has a persona dir to work with.
+    (persona_dir / "interests.json").write_text(
+        json.dumps({"version": 1, "interests": []}), encoding="utf-8"
+    )
+
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="test",
+            persona_system_prompt="You are test.",
+        )
+
+        # First tick initializes state — work deferred (first-tick semantics).
+        engine.run_tick(trigger="open")
+
+        # Force last_growth_at older than growth_every_hours so growth fires.
+        from brain.engines.heartbeat import HeartbeatState
+
+        s = HeartbeatState.load(persona_dir / "heartbeat_state.json")
+        assert s is not None
+        s.last_growth_at = datetime.now(UTC) - timedelta(hours=200)
+        s.last_tick_at = datetime.now(UTC) - timedelta(hours=200)
+        s.save(persona_dir / "heartbeat_state.json")
+
+        # Corrupt vocab file (no .bak → reset_to_default fires inside growth).
+        (persona_dir / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+
+        # Second tick runs growth. _read_current_vocabulary_names detects the
+        # corruption, heals it, and the anomaly is appended to tick_anomalies
+        # via the F3 wiring.
+        result = engine.run_tick(trigger="manual")
+
+        # The anomaly from inside growth surfaces in the result + audit log.
+        vocab_anomalies = [a for a in result.anomalies if a.file == "emotion_vocabulary.json"]
+        assert len(vocab_anomalies) >= 1
+        assert vocab_anomalies[0].action == "reset_to_default"
+
+        # Audit log also has it.
+        log_lines = (persona_dir / "heartbeats.log.jsonl").read_text().strip().splitlines()
+        last_entry = json.loads(log_lines[-1])
+        files_in_audit = {a["file"] for a in last_entry["anomalies"]}
+        assert "emotion_vocabulary.json" in files_in_audit
+    finally:
+        store.close()
+        hebbian.close()

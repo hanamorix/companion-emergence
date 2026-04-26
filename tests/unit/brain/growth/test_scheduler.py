@@ -256,11 +256,14 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(vocab_path)
 
     # Names restored from .bak1
     assert "joy" in names
     assert "love" in names
+    # Anomaly captures the heal action so caller can surface to audit log
+    assert anomaly is not None
+    assert anomaly.action == "restored_from_bak1"
     # Original quarantined
     corrupt_files = list(persona_dir.glob("emotion_vocabulary.json.corrupt-*"))
     assert len(corrupt_files) == 1
@@ -276,9 +279,11 @@ def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(vocab_path)
 
     assert names == set()
+    assert anomaly is not None
+    assert anomaly.action == "reset_to_default"
     # Some warning surfaced (either from attempt_heal or existing path)
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
@@ -302,3 +307,61 @@ def test_run_growth_tick_missing_vocabulary_no_warning(
         if "corrupt JSON" in r.getMessage() or "invalid schema" in r.getMessage()
     ]
     assert bad_warnings == []
+
+
+# ---- F3: anomaly collector forwarded through run_growth_tick ----
+
+
+def test_run_growth_tick_with_collector_appends_vocab_anomaly(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """When run_growth_tick is passed an anomalies_collector and the
+    vocabulary file is corrupt, the anomaly produced by the heal flow
+    appears in the collector — surfacing growth-tick-internal anomalies
+    to the heartbeat tick's audit log.
+
+    Followup F3 from the brain-health module.
+    """
+    from brain.health.anomaly import BrainAnomaly
+
+    # Corrupt the vocab file with no .bak so reset_to_default fires.
+    (persona_dir / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+
+    collector: list[BrainAnomaly] = []
+    result = run_growth_tick(
+        persona_dir,
+        store,
+        datetime.now(UTC),
+        anomalies_collector=collector,
+    )
+
+    # Tick still completes (Phase 2a stub returns no proposals)
+    assert result.emotions_added == 0
+
+    # Collector received the anomaly
+    assert len(collector) == 1
+    a = collector[0]
+    assert a.file == "emotion_vocabulary.json"
+    assert a.action == "reset_to_default"
+
+
+def test_run_growth_tick_no_collector_does_not_raise(persona_dir: Path, store: MemoryStore) -> None:
+    """Calling run_growth_tick without anomalies_collector still works —
+    the parameter is opt-in, not required."""
+    (persona_dir / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    # No collector passed; previously was the only way to call.
+    result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+
+
+def test_run_growth_tick_clean_vocabulary_collector_unchanged(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """When the vocabulary file is healthy, the collector receives nothing."""
+    from brain.health.anomaly import BrainAnomaly
+
+    _seed_vocab(persona_dir)  # writes a clean vocabulary file
+
+    collector: list[BrainAnomaly] = []
+    run_growth_tick(persona_dir, store, datetime.now(UTC), anomalies_collector=collector)
+    assert collector == []
