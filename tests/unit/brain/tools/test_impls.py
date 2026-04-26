@@ -419,16 +419,17 @@ def test_boot_emotional_state_nested(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_get_soul_returns_stub(tmp_path: Path) -> None:
-    """get_soul returns stub with empty crystallizations."""
+def test_get_soul_returns_real_shape(tmp_path: Path) -> None:
+    """get_soul returns real shape with loaded=True (SP-5 live)."""
     from brain.tools.impls.get_soul import get_soul
 
     ctx = _ctx(tmp_path)
     result = get_soul(**ctx)
 
-    assert result["loaded"] is False
-    assert result["crystallizations"] == []
-    assert "note" in result
+    assert result["loaded"] is True
+    assert "crystallizations" in result
+    assert isinstance(result["crystallizations"], list)
+    assert "count" in result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -436,8 +437,8 @@ def test_get_soul_returns_stub(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_crystallize_soul_returns_not_implemented_stub(tmp_path: Path) -> None:
-    """crystallize_soul returns the SP-5 deferred stub."""
+def test_crystallize_soul_creates_crystallization(tmp_path: Path) -> None:
+    """crystallize_soul creates a real crystallization (SP-5 live)."""
     from brain.tools.impls.crystallize_soul import crystallize_soul
 
     ctx = _ctx(tmp_path)
@@ -448,6 +449,23 @@ def test_crystallize_soul_returns_not_implemented_stub(tmp_path: Path) -> None:
         **ctx,
     )
 
+    assert result["created"] is True
+    assert "id" in result
+    assert result["love_type"] == "romantic"
+    assert result["resonance"] == 8  # default
+
+
+def test_crystallize_soul_invalid_love_type(tmp_path: Path) -> None:
+    """crystallize_soul returns created=False for invalid love_type."""
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    result = crystallize_soul(
+        moment="a moment",
+        love_type="not_real",
+        why_it_matters="whatever",
+        **ctx,
+    )
+
     assert result["created"] is False
-    assert "reason" in result
-    assert "SP-5" in result["reason"]
+    assert "unknown love_type" in result["reason"]
