@@ -50,7 +50,6 @@ _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
     "status",
     "rest",
-    "soul",
     "memory",
     "works",
 )
@@ -578,6 +577,182 @@ def _health_acknowledge_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _soul_list_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell soul list` — list active crystallizations."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from brain.soul.store import SoulStore
+
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        active = soul_store.list_active()
+    finally:
+        soul_store.close()
+
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        active = active[-limit:]
+
+    print(f"Soul crystallizations for persona {args.persona!r} ({len(active)} active):")
+    if not active:
+        print("  (none yet)")
+        return 0
+
+    for c in active:
+        ts = c.crystallized_at.isoformat().replace("+00:00", "Z")
+        moment_preview = c.moment[:80].replace("\n", " ")
+        print(f"\n  {c.id[:8]}…  [{c.love_type}]  resonance={c.resonance}  {ts}")
+        print(f"    {moment_preview}")
+    return 0
+
+
+def _soul_revoke_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell soul revoke` — revoke a crystallization."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        result = revoke_crystallization(soul_store, args.id, args.reason)
+    finally:
+        soul_store.close()
+
+    if result is None:
+        print(f"Crystallization {args.id!r} not found.", file=sys.stderr)
+        return 1
+
+    print(f"Revoked: {result.id}")
+    print(f"  moment: {result.moment[:80]}")
+    print(f"  reason: {result.revoked_reason}")
+    return 0
+
+
+def _soul_candidates_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell soul candidates` — list pending soul_candidates.jsonl entries."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    records = read_jsonl_skipping_corrupt(candidates_path)
+    pending = [r for r in records if r.get("status", "auto_pending") == "auto_pending"]
+
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        pending = pending[-limit:]
+
+    print(f"Pending soul candidates for persona {args.persona!r} ({len(pending)}):")
+    if not pending:
+        print("  (none)")
+        return 0
+
+    for c in pending:
+        text_preview = str(c.get("text", ""))[:80].replace("\n", " ")
+        queued = str(c.get("queued_at", "?"))[:19].replace("T", " ")
+        label = c.get("label", "?")
+        print(f"\n  {c.get('id', '?')[:8]}…  [{label}]  queued={queued}")
+        print(f"    {text_preview}")
+    return 0
+
+
+def _soul_audit_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell soul audit` — tail soul_audit.jsonl."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    from brain.soul.audit import read_audit_log
+
+    limit = getattr(args, "limit", 20)
+    entries = read_audit_log(persona_dir, limit=limit)
+
+    print(f"Soul audit log for persona {args.persona!r} (last {len(entries)} entries):")
+    if not entries:
+        print("  (empty)")
+        return 0
+
+    for e in entries:
+        ts = str(e.get("ts", "?"))[:19].replace("T", " ")
+        decision = e.get("decision", "?")
+        cid = str(e.get("candidate_id", "?"))[:8]
+        confidence = e.get("confidence", "?")
+        love_type = e.get("love_type", "?")
+        dry = " (dry-run)" if e.get("dry_run") else ""
+        print(
+            f"\n  {ts}  {decision:<8}  cid={cid}…  confidence={confidence}  type={love_type}{dry}"
+        )
+        reasoning = str(e.get("reasoning", ""))[:120]
+        if reasoning:
+            print(f"    {reasoning}")
+        if e.get("parse_error"):
+            print(f"    parse_error: {e['parse_error']}")
+        if e.get("forced_defer_reason"):
+            print(f"    forced_defer: {e['forced_defer_reason']}")
+    return 0
+
+
+def _soul_review_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell soul review` — run autonomous soul review pass."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
+        )
+
+    provider_name, _ = _resolve_routing(persona_dir, args)
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        provider = get_provider(provider_name)
+
+        from brain.soul.review import review_pending_candidates
+        from brain.soul.store import SoulStore
+
+        soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+        try:
+            report = review_pending_candidates(
+                persona_dir,
+                store=store,
+                soul_store=soul_store,
+                provider=provider,
+                max_decisions=getattr(args, "max", 5),
+                confidence_threshold=getattr(args, "confidence_threshold", 7),
+                dry_run=args.dry_run,
+            )
+        finally:
+            soul_store.close()
+    finally:
+        store.close()
+
+    if args.dry_run:
+        print("Soul review dry-run — no writes.")
+    print(
+        f"Soul review complete: {report.pending_at_start} pending, "
+        f"{report.examined} examined, {report.accepted} accepted, "
+        f"{report.rejected} rejected, {report.deferred} deferred, "
+        f"{report.parse_failures} parse failures."
+    )
+    if report.crystallization_ids:
+        print(f"  New crystallizations: {', '.join(report.crystallization_ids)}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -824,6 +999,70 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Acknowledge all pending alarms (default if neither --file nor --all is given).",
     )
     h_ack.set_defaults(func=_health_acknowledge_handler)
+
+    # nell soul — autonomous soul management (SP-5)
+    soul_sub = subparsers.add_parser(
+        "soul",
+        help="Manage the persona's permanent soul (crystallizations).",
+    )
+    soul_actions = soul_sub.add_subparsers(dest="action", required=True)
+
+    # nell soul list
+    sl_list = soul_actions.add_parser("list", help="List active crystallizations.")
+    sl_list.add_argument("--persona", required=True, help="Persona name (required).")
+    sl_list.add_argument("--limit", type=int, default=None, help="Show only the last N.")
+    sl_list.set_defaults(func=_soul_list_handler)
+
+    # nell soul revoke
+    sl_revoke = soul_actions.add_parser("revoke", help="Revoke a crystallization.")
+    sl_revoke.add_argument("--persona", required=True, help="Persona name (required).")
+    sl_revoke.add_argument("--id", required=True, help="Crystallization UUID to revoke.")
+    sl_revoke.add_argument("--reason", required=True, help="Reason for revocation.")
+    sl_revoke.set_defaults(func=_soul_revoke_handler)
+
+    # nell soul candidates
+    sl_cands = soul_actions.add_parser(
+        "candidates", help="List pending soul_candidates.jsonl entries."
+    )
+    sl_cands.add_argument("--persona", required=True, help="Persona name (required).")
+    sl_cands.add_argument("--limit", type=int, default=None, help="Show only the last N.")
+    sl_cands.set_defaults(func=_soul_candidates_handler)
+
+    # nell soul audit
+    sl_audit = soul_actions.add_parser("audit", help="Tail soul_audit.jsonl entries.")
+    sl_audit.add_argument("--persona", required=True, help="Persona name (required).")
+    sl_audit.add_argument(
+        "--limit", type=int, default=20, help="Show only the last N entries (default 20)."
+    )
+    sl_audit.set_defaults(func=_soul_audit_handler)
+
+    # nell soul review
+    sl_review = soul_actions.add_parser(
+        "review",
+        help="Run an autonomous soul review pass — brain decides on pending candidates.",
+    )
+    sl_review.add_argument("--persona", required=True, help="Persona name (required).")
+    sl_review.add_argument(
+        "--max", type=int, default=5, help="Maximum candidates to evaluate (default 5)."
+    )
+    sl_review.add_argument(
+        "--confidence-threshold",
+        type=int,
+        default=7,
+        dest="confidence_threshold",
+        help="Minimum confidence to accept/reject; below this → defer (default 7).",
+    )
+    sl_review.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Evaluate + audit log but skip all writes.",
+    )
+    sl_review.add_argument(
+        "--provider",
+        default=None,
+        help="(developer override) LLM provider — claude-cli, fake, ollama.",
+    )
+    sl_review.set_defaults(func=_soul_review_handler)
 
     return parser
 

@@ -30,7 +30,6 @@ STUB_COMMANDS = [
     "supervisor",
     "status",
     "rest",
-    "soul",
     "memory",
     "works",
 ]

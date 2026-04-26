@@ -1,4 +1,4 @@
-"""get_soul tool implementation — STUB until SP-5."""
+"""get_soul tool implementation — SP-5 real impl."""
 
 from __future__ import annotations
 
@@ -14,12 +14,23 @@ def get_soul(
     hebbian: HebbianMatrix,
     persona_dir: Path,
 ) -> dict:
-    """STUB: soul module not yet ported (lands in SP-5).
+    """Return the persona's active crystallizations.
 
-    Returns empty crystallizations list so boot() composition works.
+    Opens a SoulStore against the persona's crystallizations.db, reads
+    all active (non-revoked) crystallizations, and returns them as a list
+    of dicts. The store is closed in a finally block.
     """
+    from brain.soul.store import SoulStore
+
+    soul_db_path = persona_dir / "crystallizations.db"
+    soul_store = SoulStore(str(soul_db_path))
+    try:
+        active = soul_store.list_active()
+    finally:
+        soul_store.close()
+
     return {
-        "crystallizations": [],
-        "loaded": False,
-        "note": "Soul module pending (SP-5)",
+        "loaded": True,
+        "count": len(active),
+        "crystallizations": [c.to_dict() for c in active],
     }
