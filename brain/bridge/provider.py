@@ -165,10 +165,21 @@ class ClaudeCliProvider(LLMProvider):
       - The first "system" message → ``--system-prompt``.
       - Remaining messages are serialised as a "User: …\\nAssistant: …" script
         ending at the final user turn, passed via ``-p``.
-      - tool_calls are NOT surfaced — Claude CLI v1 does not return structured
-        tool-call objects to the caller.
 
-    For tool-calling chat, use OllamaProvider with a tool-capable model.
+    Tool-calling via --json-schema
+    ------------------------------
+    When ``tools`` is provided, the provider augments the system prompt with
+    instructions about available tools and passes a ``--json-schema`` flag
+    enforcing a discriminated-union response: either ``{"reply": "..."}`` or
+    ``{"tool_calls": [{"name": "...", "arguments": {...}}, ...]}``.
+
+    Claude's ``--output-format json`` with ``--json-schema`` returns the
+    structured output inside ``payload["structured_output"]``.  The provider
+    parses this and returns either a plain-text ChatResponse (reply path) or
+    a ChatResponse with tool_calls populated (tool-calling path).
+
+    When ``tools`` is None, the legacy text-flattening path applies — behaviour
+    is unchanged from before SP-3.
     """
 
     def __init__(
@@ -220,14 +231,19 @@ class ClaudeCliProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
-        """Flatten messages array into Claude CLI's text-only surface.
+        """Flatten messages into Claude CLI and optionally enforce tool-calling schema.
 
-        The Claude CLI does not expose a structured messages-array input
-        format in v1.  We translate:
-          - First system message → --system-prompt
-          - Remaining messages → "User: ...\\nAssistant: ..." conversation
-            script, ending at the last user turn, passed via -p.
-        tool_calls in the returned ChatResponse are always an empty tuple.
+        When ``tools`` is None:
+          - Flattens messages into "User: ...\\nAssistant: ..." script via -p.
+          - Returns ChatResponse(content=<text>, tool_calls=()).
+
+        When ``tools`` is provided:
+          - Augments the system prompt with tool instructions.
+          - Builds a discriminated-union ``--json-schema`` that forces Claude to
+            respond with either ``{"reply": "..."}`` or
+            ``{"tool_calls": [{"name": "...", "arguments": {...}}]}``.
+          - Parses ``structured_output`` from the JSON response and returns the
+            appropriate ChatResponse.
 
         Raises
         ------
@@ -236,7 +252,9 @@ class ClaudeCliProvider(LLMProvider):
         ProviderError("claude_cli_exit", ...)
             If the subprocess exits with a non-zero return code.
         ProviderError("claude_cli_parse", ...)
-            If the JSON output cannot be parsed or lacks "result".
+            If the JSON output cannot be parsed or lacks expected keys.
+        ProviderError("claude_schema", ...)
+            If the schema-constrained invocation returns an unexpected shape.
         """
         system_prompt: str | None = None
         conversation_messages: list[ChatMessage] = []
@@ -261,6 +279,14 @@ class ClaudeCliProvider(LLMProvider):
                 parts.append(f"{label}: {msg.content}")
             flat_prompt = "\n".join(parts)
 
+        if tools:
+            return self._chat_with_tools(
+                flat_prompt=flat_prompt,
+                system_prompt=system_prompt,
+                tools=tools,
+            )
+
+        # ── Legacy text path (no tools) ──────────────────────────────────────
         cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
         if system_prompt is not None:
             cmd.extend(["--system-prompt", system_prompt])
@@ -295,6 +321,174 @@ class ClaudeCliProvider(LLMProvider):
             ) from exc
 
         return ChatResponse(content=content, tool_calls=(), raw=None)
+
+    def _build_tool_call_schema(self, tools: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build a discriminated-union JSON schema for tool-calling responses.
+
+        Claude must respond with EITHER:
+          {"reply": "<text>"}          — final answer, no tool needed
+          {"tool_calls": [...]}        — one or more tool invocations
+
+        The ``name`` field in each tool_call is an enum of known tool names
+        so Claude cannot hallucinate an unknown tool.
+        """
+        tool_names = [t["name"] for t in tools if "name" in t]
+        return {
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {
+                        "reply": {"type": "string"},
+                    },
+                    "required": ["reply"],
+                    "additionalProperties": False,
+                },
+                {
+                    "properties": {
+                        "tool_calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "enum": tool_names,
+                                    },
+                                    "arguments": {"type": "object"},
+                                },
+                                "required": ["name", "arguments"],
+                            },
+                            "minItems": 1,
+                        }
+                    },
+                    "required": ["tool_calls"],
+                    "additionalProperties": False,
+                },
+            ],
+        }
+
+    def _build_tool_system_addendum(self, tools: list[dict[str, Any]]) -> str:
+        """Build the system-prompt addendum describing available tools."""
+        lines = ["You have access to these tools:"]
+        for tool in tools:
+            name = tool.get("name", "unknown")
+            desc = tool.get("description", "no description")
+            lines.append(f"  - {name}: {desc}")
+        lines.append(
+            "\nRespond with EITHER a final reply (use the 'reply' field) OR a "
+            "tool_calls array if you need to query state first. Do not mix both."
+        )
+        return "\n".join(lines)
+
+    def _chat_with_tools(
+        self,
+        flat_prompt: str,
+        system_prompt: str | None,
+        tools: list[dict[str, Any]],
+    ) -> ChatResponse:
+        """Inner path: invoke Claude CLI with --json-schema for tool-calling.
+
+        Returns a ChatResponse with either content (reply path) or tool_calls
+        populated (tool-call path).
+        """
+        import uuid as _uuid
+
+        schema = self._build_tool_call_schema(tools)
+        tool_addendum = self._build_tool_system_addendum(tools)
+
+        # Combine system prompt + tool instructions
+        if system_prompt:
+            full_system = f"{system_prompt}\n\n{tool_addendum}"
+        else:
+            full_system = tool_addendum
+
+        cmd = [
+            "claude",
+            "-p",
+            flat_prompt,
+            "--output-format",
+            "json",
+            "--model",
+            self._model,
+            "--json-schema",
+            json.dumps(schema),
+            "--system-prompt",
+            full_system,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderError(
+                "claude_cli_timeout",
+                f"subprocess timed out after {self._timeout}s (tools path)",
+            ) from exc
+
+        if result.returncode != 0:
+            raise ProviderError(
+                "claude_cli_exit",
+                f"exit {result.returncode}: {result.stderr.strip()} (tools path)",
+            )
+
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                "claude_cli_parse",
+                f"tools path: non-JSON output: {result.stdout[:200]!r}",
+            ) from exc
+
+        # Claude returns structured output under the "structured_output" key
+        # when --json-schema is active.
+        structured = payload.get("structured_output")
+        if structured is None:
+            raise ProviderError(
+                "claude_schema",
+                f"tools path: missing 'structured_output' in response: {result.stdout[:300]!r}",
+            )
+
+        # Reply path
+        if "reply" in structured:
+            return ChatResponse(
+                content=str(structured["reply"]),
+                tool_calls=(),
+                raw=payload,
+            )
+
+        # Tool-calls path
+        if "tool_calls" in structured:
+            parsed_tool_calls: list[ToolCall] = []
+            for tc in structured["tool_calls"]:
+                call_id = str(_uuid.uuid4())
+                try:
+                    parsed_tool_calls.append(
+                        ToolCall(
+                            id=call_id,
+                            name=str(tc["name"]),
+                            arguments=dict(tc.get("arguments") or {}),
+                        )
+                    )
+                except (KeyError, TypeError) as exc:
+                    raise ProviderError(
+                        "claude_schema",
+                        f"tools path: malformed tool_call entry {tc!r}: {exc}",
+                    ) from exc
+            return ChatResponse(
+                content="",
+                tool_calls=tuple(parsed_tool_calls),
+                raw=payload,
+            )
+
+        raise ProviderError(
+            "claude_schema",
+            f"tools path: structured_output has neither 'reply' nor 'tool_calls': {structured!r}",
+        )
 
 
 # ---------------------------------------------------------------------------
