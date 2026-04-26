@@ -14,7 +14,8 @@ _IDENTITY_FILES = frozenset(
         "emotion_vocabulary.json",
         "interests.json",
         "reflex_arcs.json",
-        # future: "soul.json"
+        # When the soul module lands, add "soul.json" here so its
+        # reset_to_default raises an alarm. See spec §9.1.
     }
 )
 

@@ -10,6 +10,10 @@ from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
 from brain.health.attempt_heal import attempt_heal
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
+#
+# When the soul module lands as a Phase 2a-extension, add `soul.json` here
+# with default `{"version": 1, "crystallizations": []}` (or whatever the
+# soul module's schema settles on). See spec §9.1 for the full plan.
 _DEFAULTS: dict[str, dict] = {
     "user_preferences.json": {"dream_every_hours": 24.0},
     "persona_config.json": {"provider": "claude-cli", "searcher": "ddgs"},

@@ -502,7 +502,13 @@ class HeartbeatEngine:
         # Growth tick — autonomous self-development (Phase 2a). Runs after
         # all per-tick engines so it can observe the freshest state, before
         # the audit log writes so the audit can summarize the growth outcome.
-        growth_emotions_added, growth_ran = self._try_run_growth(state, now, config, dry_run)
+        # Passing `tick_anomalies` as the collector lets growth-tick-internal
+        # anomalies (e.g., vocab corruption discovered while reading current
+        # vocabulary names) surface in the audit log alongside the engine's
+        # own load anomalies.
+        growth_emotions_added, growth_ran = self._try_run_growth(
+            state, now, config, dry_run, anomalies_collector=tick_anomalies
+        )
 
         # Optional HEARTBEAT: memory
         heartbeat_memory_id: str | None = None
@@ -737,11 +743,17 @@ class HeartbeatEngine:
         now: datetime,
         config: HeartbeatConfig,
         dry_run: bool,
+        anomalies_collector: list[BrainAnomaly] | None = None,
     ) -> tuple[int, bool]:
         """Run a growth tick if due. Returns (emotions_added, ran).
 
         Fault-isolated: any exception logs a warning and returns (0, False).
         Heartbeat tick continues normally — same pattern as reflex/research.
+
+        `anomalies_collector` is forwarded to `run_growth_tick` so any
+        anomaly produced inside growth (e.g., vocabulary file corruption
+        detected by `_read_current_vocabulary_names`) surfaces in the
+        heartbeat tick's audit log alongside engine-level anomalies.
         """
         if not config.growth_enabled:
             return (0, False)
@@ -758,7 +770,13 @@ class HeartbeatEngine:
         try:
             from brain.growth.scheduler import run_growth_tick
 
-            result = run_growth_tick(persona_dir, self.store, now, dry_run=dry_run)
+            result = run_growth_tick(
+                persona_dir,
+                self.store,
+                now,
+                dry_run=dry_run,
+                anomalies_collector=anomalies_collector,
+            )
         except Exception as exc:
             logger.warning("growth tick raised; isolating: %.200s", exc)
             return (0, False)
