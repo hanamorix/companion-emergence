@@ -63,11 +63,7 @@ def load_persona_vocabulary_with_anomaly(
     # a truthful empty default but it loses the persona-extension entries
     # the brain has been operating with. If we have memory access, the brain
     # can re-learn its own vocabulary from how it has been using emotions.
-    if (
-        anomaly is not None
-        and anomaly.action == "reset_to_default"
-        and store is not None
-    ):
+    if anomaly is not None and anomaly.action == "reset_to_default" and store is not None:
         from brain.health.attempt_heal import save_with_backup
         from brain.health.reconstruct import reconstruct_vocabulary_from_memories
 
