@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import FakeProvider, LLMProvider
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
@@ -25,6 +26,9 @@ class _PrefixedFakeProvider(LLMProvider):
     def name(self) -> str:
         return "fake-prefixed"
 
+    def chat(self, messages: list[ChatMessage], *, tools=None, options=None) -> ChatResponse:  # type: ignore[override]
+        return ChatResponse(content=self.generate(messages[-1].content), tool_calls=())
+
 
 class _UnprefixedFakeProvider(LLMProvider):
     """Returns a response WITHOUT the DREAM prefix — exercises the engine's
@@ -36,6 +40,9 @@ class _UnprefixedFakeProvider(LLMProvider):
 
     def name(self) -> str:
         return "fake-unprefixed"
+
+    def chat(self, messages: list[ChatMessage], *, tools=None, options=None) -> ChatResponse:  # type: ignore[override]
+        return ChatResponse(content=self.generate(messages[-1].content), tool_calls=())
 
 
 @pytest.fixture
