@@ -58,6 +58,41 @@ def load_persona_vocabulary_with_anomaly(
         path, _default_vocab_factory, schema_validator=_vocab_schema_validator
     )
 
+    # Reconstruct from memories when reset_to_default fires on vocabulary.
+    # The default factory writes empty `{"version":1,"emotions":[]}` — that's
+    # a truthful empty default but it loses the persona-extension entries
+    # the brain has been operating with. If we have memory access, the brain
+    # can re-learn its own vocabulary from how it has been using emotions.
+    if (
+        anomaly is not None
+        and anomaly.action == "reset_to_default"
+        and store is not None
+    ):
+        from brain.health.attempt_heal import save_with_backup
+        from brain.health.reconstruct import reconstruct_vocabulary_from_memories
+
+        recon_data = reconstruct_vocabulary_from_memories(store)
+        save_with_backup(path, recon_data)
+        data = recon_data
+        # Replace the anomaly with one whose action reflects the reconstruction.
+        # Same kind (json_parse_error / schema_mismatch — that's why we needed
+        # to reconstruct) and same forensic quarantine path; the heal path
+        # advanced beyond reset.
+        from brain.health.anomaly import BrainAnomaly
+
+        anomaly = BrainAnomaly(
+            timestamp=anomaly.timestamp,
+            file=anomaly.file,
+            kind=anomaly.kind,
+            action="reconstructed_from_memories",
+            quarantine_path=anomaly.quarantine_path,
+            likely_cause=anomaly.likely_cause,
+            detail=(
+                f"{anomaly.detail}; reconstructed "
+                f"{len(recon_data['emotions'])} entries from memories"
+            ),
+        )
+
     if anomaly is not None:
         logger.warning(
             "emotion_vocabulary anomaly detected: %s action=%s file=%s",
