@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1815,3 +1816,217 @@ def test_heartbeat_growth_anomaly_surfaces_in_audit_log(tmp_path: Path) -> None:
     finally:
         store.close()
         hebbian.close()
+
+
+# ---------------------------------------------------------------------------
+# SP-2 daemon_state integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_with_persona_dir(tmp_path: Path) -> tuple[HeartbeatEngine, Path]:
+    """Build a HeartbeatEngine wired to tmp_path as persona_dir.
+
+    Persona_dir is passed via interests_path.parent so the engine knows where
+    to write daemon_state.json.
+    """
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    engine = HeartbeatEngine(
+        store=store,
+        hebbian=hm,
+        provider=FakeProvider(),
+        state_path=tmp_path / "heartbeat_state.json",
+        config_path=tmp_path / "heartbeat_config.json",
+        dream_log_path=tmp_path / "dreams.log.jsonl",
+        heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+        interests_path=interests_path,
+        research_log_path=tmp_path / "research_log.json",
+        default_interests_path=DEFAULT_INTERESTS_PATH,
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
+    )
+    return engine, tmp_path
+
+
+def test_daemon_state_heartbeat_entry_written_after_tick(tmp_path: Path) -> None:
+    """After any non-init tick, daemon_state.json has a last_heartbeat entry."""
+    from brain.engines.daemon_state import load_daemon_state
+
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        store = engine.store
+        store.create(
+            Memory.create_new(
+                content="seed memory",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        engine.run_tick(trigger="open")  # init tick
+        engine.run_tick(trigger="close")  # real tick
+
+        state, anomaly = load_daemon_state(persona_dir)
+        assert anomaly is None
+        assert state.last_heartbeat is not None
+        assert state.last_heartbeat.theme == "heartbeat tick"
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+
+def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> None:
+    """When a dream fires, daemon_state.json has last_dream populated."""
+    from brain.engines.daemon_state import load_daemon_state
+
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        store = engine.store
+        store.create(
+            Memory.create_new(
+                content="a vivid conversation memory about the world",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 9.0, "emergence": 8.0},
+                importance=9.0,
+            )
+        )
+        HeartbeatConfig(dream_every_hours=0.001, emit_memory="never").save(engine.config_path)
+        engine.run_tick(trigger="open")  # init
+        state_obj = HeartbeatState.load(engine.state_path)
+        assert state_obj is not None
+        state_obj.last_dream_at = state_obj.last_dream_at - timedelta(hours=1)
+        state_obj.save(engine.state_path)
+
+        result = engine.run_tick(trigger="close")
+        if result.dream_id is None:
+            pytest.skip("dream didn't fire (no seed) — skip daemon_state dream check")
+
+        daemon_state, anomaly = load_daemon_state(persona_dir)
+        assert anomaly is None
+        assert daemon_state.last_dream is not None
+        assert daemon_state.last_dream.dominant_emotion != ""
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+
+def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path) -> None:
+    """When a reflex arc fires, daemon_state.json has last_reflex with trigger set."""
+    from brain.engines.daemon_state import load_daemon_state
+
+    arcs_path = tmp_path / "reflex_arcs.json"
+    arc = {
+        "name": "love_arc",
+        "description": "d",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "Hi {persona_name}.",
+    }
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": [arc]}), encoding="utf-8")
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
+    HeartbeatConfig(reflex_enabled=True).save(tmp_path / "heartbeat_config.json")
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="seed",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 8.0},
+            )
+        )
+        # Pre-seed state to skip init-defer path.
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=tmp_path / "heartbeat_config.json",
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=arcs_path,
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual")
+        assert result.reflex_fired == ("love_arc",)
+
+        daemon_state, anomaly = load_daemon_state(tmp_path)
+        assert anomaly is None
+        assert daemon_state.last_reflex is not None
+        assert daemon_state.last_reflex.trigger == "love_arc"
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_daemon_state_dry_run_does_not_write_file(tmp_path: Path) -> None:
+    """dry_run=True prevents daemon_state.json from being written."""
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        store = engine.store
+        store.create(
+            Memory.create_new(
+                content="seed",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 7.0},
+            )
+        )
+        engine.run_tick(trigger="manual", dry_run=True)
+        assert not (persona_dir / "daemon_state.json").exists()
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+
+def test_daemon_state_writer_error_is_fault_isolated(tmp_path: Path, caplog) -> None:
+    """A daemon_state write failure must not abort the heartbeat tick."""
+    import logging
+
+    import brain.engines.heartbeat as hb_module
+
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        store = engine.store
+        store.create(
+            Memory.create_new(
+                content="seed",
+                memory_type="conversation",
+                domain="us",
+                emotions={"love": 7.0},
+            )
+        )
+        engine.run_tick(trigger="open")  # init
+
+        # Patch update_daemon_state in the heartbeat module's namespace (where
+        # it was imported via `from brain.engines.daemon_state import …`) so the
+        # fault-isolation wrappers actually see the raised exception.
+        with patch.object(hb_module, "update_daemon_state", side_effect=RuntimeError("boom")):
+            with caplog.at_level(logging.WARNING, logger="brain.engines.heartbeat"):
+                result = engine.run_tick(trigger="close")
+
+        # Tick must have completed successfully
+        assert result.initialized is False
+        # Warning was emitted (at least one daemon_state write attempted)
+        assert any("daemon_state write" in r.message for r in caplog.records)
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
