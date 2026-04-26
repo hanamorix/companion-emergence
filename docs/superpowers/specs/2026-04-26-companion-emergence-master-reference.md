@@ -463,10 +463,18 @@ Ordered by dependency. Later sub-projects cannot ship cleanly without earlier on
 
 **Scope:** Create `brain/tools/` package. `schemas.py` ports 9 tool JSON schemas from OG's `nell_tools.py:SCHEMAS` — these are provider-agnostic and can be copied verbatim. `dispatch.py` maps tool name → implementation. `impls/` directory: one module per tool, each calling the new `brain/` APIs instead of `nell_brain.py`. Write-gate logic: `add_memory` requires `emotion_score ≥ 15 OR importance ≥ 7`; `add_journal` ungated. `boot` returns the composition of `get_emotional_state` + `get_personality` + `get_soul` (stub until SP-5) + `get_body_state` (stub). Each impl is pure Python — no LLM calls; all calls go through `MemoryStore`, `SoulStore`, etc.
 
+**Tool-calling on Claude CLI (subscription path).** Investigation 2026-04-26 confirmed two viable paths to give Claude tool-calling capability while staying on the subscription (never touching API tokens):
+
+1. **`--json-schema`** — Claude CLI accepts a JSON schema; the response carries a `structured_output` field matching that shape. Define the schema as a discriminated union of `{"reply": "...", "tool_calls": [...]}`. Chat engine parses `structured_output`, executes tools, sends results back as a follow-up user message. Works today; no extra infra. Slightly hand-rolled tool-call protocol.
+
+2. **`--mcp-config`** — register brain-tools as an MCP server; Claude Code natively invokes them via the MCP protocol. Most native integration; lets the user's other Claude Code sessions also access brain-tools if they want. More upfront work — requires building the MCP server alongside the Python tool impls.
+
+SP-3 brainstorm picks one (or implements both with `--mcp-config` as the production path and `--json-schema` as a fallback). Ollama tool-calling is unaffected — it goes through the native `chat(messages, tools=[...])` path on `OllamaProvider` already shipped in SP-1. Both paths preserve the subscription-only constraint per global feedback memory.
+
 **OG references:** `NellBrain/nell_tools.py` (all 9 tool impls + schemas + dispatch)
-**New framework files created:** `brain/tools/__init__.py`, `brain/tools/schemas.py`, `brain/tools/dispatch.py`, `brain/tools/impls/*.py`
-**Deliverable:** All 9 tool schemas valid; dispatch calling new brain APIs; tests for each tool with injected stores.
-**Rough test count:** 25–35 tests (one per tool, plus dispatch edge cases + write-gate validation).
+**New framework files created:** `brain/tools/__init__.py`, `brain/tools/schemas.py`, `brain/tools/dispatch.py`, `brain/tools/impls/*.py`, optionally `brain/tools/mcp_server.py` if MCP path is chosen
+**Deliverable:** All 9 tool schemas valid; dispatch calling new brain APIs; tests for each tool with injected stores; Claude tool-calling working via `--json-schema` or `--mcp-config`.
+**Rough test count:** 25–35 tests (one per tool, plus dispatch edge cases + write-gate validation + Claude tool-call protocol round-trip).
 
 ### SP-4: Conversation Ingest Pipeline
 
