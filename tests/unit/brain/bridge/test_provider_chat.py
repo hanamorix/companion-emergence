@@ -362,3 +362,128 @@ def test_get_provider_ollama_name_includes_model() -> None:
     """The returned OllamaProvider has the expected default model name."""
     provider = get_provider("ollama")
     assert provider.name().startswith("ollama:")
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCliProvider.chat — tool-calling via --json-schema (SP-3)
+# ---------------------------------------------------------------------------
+
+
+def _make_schema_claude_result(
+    structured_output: dict,
+    rc: int = 0,
+) -> MagicMock:
+    """Build a mock subprocess result for the --json-schema path."""
+    m = MagicMock()
+    m.returncode = rc
+    m.stdout = json.dumps({"structured_output": structured_output})
+    m.stderr = ""
+    return m
+
+
+_SAMPLE_TOOLS = [
+    {"name": "get_emotional_state", "description": "Get emotional state"},
+    {"name": "search_memories", "description": "Search memories"},
+]
+
+
+def test_claude_cli_chat_with_tools_includes_json_schema_flag() -> None:
+    """chat(tools=...) passes --json-schema flag in the subprocess command."""
+    mock_result = _make_schema_claude_result({"reply": "I feel fine"})
+
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat([ChatMessage(role="user", content="how do you feel?")], tools=_SAMPLE_TOOLS)
+
+    cmd = mock_run.call_args[0][0]
+    assert "--json-schema" in cmd
+
+
+def test_claude_cli_chat_with_tools_reply_path_returns_content() -> None:
+    """structured_output.reply path → ChatResponse with content, empty tool_calls."""
+    mock_result = _make_schema_claude_result({"reply": "I'm feeling well today."})
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        resp = p.chat([ChatMessage(role="user", content="how are you?")], tools=_SAMPLE_TOOLS)
+
+    assert isinstance(resp, ChatResponse)
+    assert resp.content == "I'm feeling well today."
+    assert resp.tool_calls == ()
+
+
+def test_claude_cli_chat_with_tools_tool_calls_path_returns_tool_calls() -> None:
+    """structured_output.tool_calls path → ChatResponse with tool_calls populated."""
+    mock_result = _make_schema_claude_result(
+        {
+            "tool_calls": [
+                {
+                    "name": "get_emotional_state",
+                    "arguments": {},
+                },
+                {
+                    "name": "search_memories",
+                    "arguments": {"query": "hana"},
+                },
+            ]
+        }
+    )
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        resp = p.chat(
+            [ChatMessage(role="user", content="what's in my brain?")], tools=_SAMPLE_TOOLS
+        )
+
+    assert isinstance(resp, ChatResponse)
+    assert resp.content == ""
+    assert len(resp.tool_calls) == 2
+    assert resp.tool_calls[0].name == "get_emotional_state"
+    assert resp.tool_calls[1].name == "search_memories"
+    assert resp.tool_calls[1].arguments == {"query": "hana"}
+
+
+def test_claude_cli_chat_with_tools_missing_structured_output_raises() -> None:
+    """Missing structured_output key in response → ProviderError("claude_schema")."""
+    bad = MagicMock()
+    bad.returncode = 0
+    bad.stdout = json.dumps({"result": "plain text but no structured_output"})
+    bad.stderr = ""
+
+    with patch("subprocess.run", return_value=bad):
+        p = ClaudeCliProvider()
+        with pytest.raises(ProviderError) as exc_info:
+            p.chat(
+                [ChatMessage(role="user", content="x")],
+                tools=_SAMPLE_TOOLS,
+            )
+
+    assert exc_info.value.stage == "claude_schema"
+
+
+def test_claude_cli_chat_with_tools_schema_includes_tool_names_as_enum() -> None:
+    """_build_tool_call_schema embeds tool names as an enum in the schema."""
+    p = ClaudeCliProvider()
+    schema = p._build_tool_call_schema(_SAMPLE_TOOLS)
+
+    # Find the enum in the oneOf → tool_calls → items → properties → name
+    tool_calls_branch = None
+    for branch in schema["oneOf"]:
+        if "tool_calls" in branch.get("properties", {}):
+            tool_calls_branch = branch
+            break
+
+    assert tool_calls_branch is not None
+    name_schema = tool_calls_branch["properties"]["tool_calls"]["items"]["properties"]["name"]
+    assert "get_emotional_state" in name_schema["enum"]
+    assert "search_memories" in name_schema["enum"]
+
+
+def test_claude_cli_chat_no_tools_does_not_use_json_schema() -> None:
+    """chat() without tools= uses the legacy path (no --json-schema flag)."""
+    with patch("subprocess.run", return_value=_make_claude_result("hello")) as mock_run:
+        p = ClaudeCliProvider()
+        p.chat([ChatMessage(role="user", content="hi")])
+
+    cmd = mock_run.call_args[0][0]
+    assert "--json-schema" not in cmd
