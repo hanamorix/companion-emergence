@@ -47,11 +47,24 @@ def test_fake_provider_output_has_dream_prefix() -> None:
     assert FakeProvider().generate("anything").startswith("DREAM:")
 
 
-def test_ollama_provider_raises_not_implemented() -> None:
-    """OllamaProvider.generate raises NotImplementedError with a clear message."""
-    p = OllamaProvider()
-    with pytest.raises(NotImplementedError, match="stub"):
-        p.generate("anything")
+def test_ollama_provider_generate_raises_provider_error_when_unreachable() -> None:
+    """OllamaProvider.generate raises ProviderError when Ollama is not running.
+
+    The stub NotImplementedError is gone — OllamaProvider is fully implemented.
+    On CI (no local Ollama) the request fails with a network error, surfaced as
+    ProviderError("ollama_request", ...).
+    """
+    from unittest.mock import patch
+
+    import httpx
+
+    from brain.bridge.provider import ProviderError
+
+    with patch("httpx.post", side_effect=httpx.RequestError("connection refused")):
+        p = OllamaProvider()
+        with pytest.raises(ProviderError) as exc_info:
+            p.generate("anything")
+    assert exc_info.value.stage == "ollama_request"
 
 
 def test_ollama_provider_name_includes_model() -> None:
@@ -127,11 +140,15 @@ def test_get_provider_resolves_known_names() -> None:
     assert isinstance(get_provider("claude-cli"), ClaudeCliProvider)
 
 
-def test_get_provider_ollama_raises_user_friendly_error() -> None:
-    """ollama is a Phase 1 stub — factory should give user a clear
-    message instead of returning an instance that crashes on first use."""
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
-        get_provider("ollama")
+def test_get_provider_ollama_returns_instance() -> None:
+    """get_provider("ollama") now returns a real OllamaProvider — no longer a stub.
+
+    SP-1 ships OllamaProvider with a full httpx-based implementation, so the
+    factory must hand back a usable instance.  The test that previously asserted
+    NotImplementedError is updated to assert the new behaviour.
+    """
+    provider = get_provider("ollama")
+    assert isinstance(provider, OllamaProvider)
 
 
 def test_get_provider_unknown_name_raises() -> None:

@@ -66,12 +66,28 @@ def test_nell_dream_real_cycle_with_fake_provider(
     assert len(dreams) == 1
 
 
-def test_nell_dream_ollama_surfaces_not_implemented(nell_persona: Path) -> None:
-    """--provider ollama fails cleanly with NotImplementedError at factory time."""
+def test_nell_dream_ollama_surfaces_provider_error_when_unreachable(
+    nell_persona: Path,
+) -> None:
+    """--provider ollama now attempts a real Ollama call.
+
+    SP-1 ships a working OllamaProvider, so the factory no longer raises
+    NotImplementedError.  On CI / dev machines without a local Ollama daemon,
+    the httpx request fails and surfaces as ProviderError("ollama_request").
+    We mock the network layer so the test is deterministic.
+    """
+    from unittest.mock import patch
+
+    import httpx
+
+    from brain.bridge.provider import ProviderError
     from brain.cli import main
 
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
-        main(["dream", "--persona", "nell", "--provider", "ollama"])
+    with patch("httpx.post", side_effect=httpx.RequestError("connection refused")):
+        with pytest.raises(ProviderError) as exc_info:
+            main(["dream", "--persona", "nell", "--provider", "ollama"])
+
+    assert exc_info.value.stage == "ollama_request"
 
 
 def test_nell_dream_unknown_provider_fails(nell_persona: Path) -> None:
