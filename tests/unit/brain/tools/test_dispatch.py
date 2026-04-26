@@ -97,16 +97,17 @@ def test_dispatch_boot_returns_composition(tmp_path: Path) -> None:
     assert "context_prose" in result
 
 
-def test_dispatch_get_soul_stub(tmp_path: Path) -> None:
-    """get_soul returns stub shape."""
+def test_dispatch_get_soul_returns_real_shape(tmp_path: Path) -> None:
+    """get_soul returns real shape (SP-5 live)."""
     ctx = _make_ctx(tmp_path)
     result = dispatch("get_soul", {}, **ctx)
-    assert result["loaded"] is False
+    assert result["loaded"] is True
     assert "crystallizations" in result
+    assert "count" in result
 
 
-def test_dispatch_crystallize_soul_stub(tmp_path: Path) -> None:
-    """crystallize_soul returns NotImplemented stub."""
+def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> None:
+    """crystallize_soul creates a real crystallization (SP-5 live)."""
     ctx = _make_ctx(tmp_path)
     result = dispatch(
         "crystallize_soul",
@@ -117,8 +118,9 @@ def test_dispatch_crystallize_soul_stub(tmp_path: Path) -> None:
         },
         **ctx,
     )
-    assert result["created"] is False
-    assert "SP-5" in result["reason"]
+    assert result["created"] is True
+    assert "id" in result
+    assert result["love_type"] == "romantic"
 
 
 # ---------------------------------------------------------------------------
