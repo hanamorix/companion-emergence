@@ -25,6 +25,10 @@ _DEFAULTS: dict[str, dict] = {
 }
 
 
+# Text identity files checked separately (voice.md — plain-text, not JSON).
+_TEXT_IDENTITY_FILES: tuple[str, ...] = ("voice.md",)
+
+
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
@@ -42,6 +46,18 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         _, anomaly = attempt_heal(path, default_factory=lambda d=default: d)
         if anomaly is not None:
             anomalies.append(anomaly)
+
+    # Plain-text identity file scan (voice.md).
+    for name in _TEXT_IDENTITY_FILES:
+        path = persona_dir / name
+        if not path.exists():
+            continue  # Missing voice.md is fine — created on first chat turn.
+        from brain.chat.voice import load_voice
+
+        _, anomaly = load_voice(persona_dir)
+        if anomaly is not None:
+            anomalies.append(anomaly)
+        break  # load_voice checks voice.md by name; only one text file for now
 
     # SQLite integrity — constructor runs PRAGMA integrity_check; catch failures.
     for db_name in ("memories.db", "hebbian.db"):

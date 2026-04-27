@@ -136,6 +136,86 @@ def _classify_cause(path: Path) -> str:
     return "unknown"
 
 
+def attempt_heal_text(
+    path: Path,
+    default_factory: Callable[[], str],
+) -> tuple[str, BrainAnomaly | None]:
+    """Like attempt_heal but for plain-text files (no JSON parsing).
+
+    Missing → (default_factory(), None) silently.
+    Empty → quarantine, walk .bak1/.bak2/.bak3, restore freshest valid backup.
+    All baks missing or empty → write default text + return anomaly.
+
+    What counts as "corrupt" for plain text: empty file (len == 0 after strip).
+    This is the practical failure mode after a disk hiccup on an identity file.
+    """
+    if not path.exists():
+        default_text = default_factory()
+        path.write_text(default_text, encoding="utf-8")
+        return default_text, None
+
+    content = path.read_text(encoding="utf-8")
+    if content.strip():
+        return content, None
+
+    # Empty file — treat as corrupt; start the heal cycle.
+    return _heal_text_from_baks(path, default_factory)
+
+
+def _heal_text_from_baks(
+    path: Path,
+    default_factory: Callable[[], str],
+) -> tuple[str, BrainAnomaly]:
+    now = datetime.now(UTC)
+    likely_cause = _classify_cause(path)
+    quarantine = path.with_name(f"{path.name}.corrupt-{_filename_safe_timestamp(now)}")
+    os.replace(path, quarantine)
+
+    for bak_index in (1, 2, 3):
+        bak = path.with_name(f"{path.name}.bak{bak_index}")
+        if not bak.exists():
+            continue
+        bak_content = bak.read_text(encoding="utf-8")
+        if not bak_content.strip():
+            # This bak is also empty — quarantine it too.
+            bak_quarantine = path.with_name(
+                f"{path.name}.bak{bak_index}.corrupt-{_filename_safe_timestamp(now)}"
+            )
+            os.replace(bak, bak_quarantine)
+            continue
+
+        # Found a valid bak — restore.
+        os.replace(bak, path)
+        return (
+            bak_content,
+            BrainAnomaly(
+                timestamp=now,
+                file=path.name,
+                kind="json_parse_error",  # closest kind; text "empty" maps here
+                action=f"restored_from_bak{bak_index}",  # type: ignore[arg-type]
+                quarantine_path=quarantine.name,
+                likely_cause=likely_cause,
+                detail="empty text file",
+            ),
+        )
+
+    # All baks corrupt or missing — reset to default.
+    default_text = default_factory()
+    path.write_text(default_text, encoding="utf-8")
+    return (
+        default_text,
+        BrainAnomaly(
+            timestamp=now,
+            file=path.name,
+            kind="json_parse_error",
+            action="reset_to_default",
+            quarantine_path=quarantine.name,
+            likely_cause=likely_cause,
+            detail="empty text file, all baks missing or empty",
+        ),
+    )
+
+
 def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
     """Atomic save with .bak rotation.
 
