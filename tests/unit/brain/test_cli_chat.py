@@ -69,6 +69,34 @@ def test_chat_one_shot_exits_zero() -> None:
     assert exit_code == 0
 
 
+def test_chat_one_shot_calls_close_session() -> None:
+    """One-shot mode must flush the conversation through the SP-4 ingest pipeline.
+
+    Without this, every one-shot reply leaves the buffer file orphaned and no
+    memories are ever committed (the bug the 2026-04-27 live-exercise stress
+    test surfaced — 0 ingest events across 20 prompts).
+    """
+    with patch("brain.ingest.pipeline.close_session") as mock_close:
+        exit_code = main(["chat", "--persona", "nell", "hello"])
+    assert exit_code == 0
+    assert mock_close.call_count == 1
+    # First positional arg is persona_dir; second is session_id (must be set)
+    call_args = mock_close.call_args
+    assert call_args.args[1]  # session_id non-empty
+
+
+def test_chat_one_shot_close_failure_warns_not_raises() -> None:
+    """If the ingest pipeline fails, the user still gets exit 0 + a warning.
+
+    Mirrors the REPL's best-effort flush pattern (cli.py:828-845): persistence
+    failures must never break the user-visible chat outcome.
+    """
+    with patch("brain.ingest.pipeline.close_session", side_effect=RuntimeError("boom")):
+        with pytest.warns(RuntimeWarning, match="ingest flush failed"):
+            exit_code = main(["chat", "--persona", "nell", "hello"])
+    assert exit_code == 0
+
+
 # ── Interactive REPL ──────────────────────────────────────────────────────────
 
 
