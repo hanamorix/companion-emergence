@@ -299,7 +299,7 @@ def _current_emotional_summary(store: MemoryStore) -> str:
 
         recent = store.search_text("", active_only=True, limit=50)
         state = aggregate_state(recent)
-        scores = dict(state.all())
+        scores = dict(state.emotions)
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"
