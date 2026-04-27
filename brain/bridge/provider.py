@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from abc import ABC, abstractmethod
 from typing import Any
@@ -25,6 +26,8 @@ from typing import Any
 import httpx
 
 from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -445,12 +448,32 @@ class ClaudeCliProvider(LLMProvider):
             ) from exc
 
         # Claude returns structured output under the "structured_output" key
-        # when --json-schema is active.
+        # when --json-schema is honored. In practice, a sufficiently rich
+        # system prompt (e.g. a persona's voice.md) can outweigh the schema
+        # enforcement and Claude returns a plain text reply in `result`
+        # instead. When that happens, treat it as a no-tool-call reply rather
+        # than erroring — Claude correctly answered the user; it just chose
+        # not to enforce the protocol envelope. This matches how the chat
+        # engine's tool loop interprets ChatResponse(content=..., tool_calls=())
+        # as "final reply, no tools needed."
         structured = payload.get("structured_output")
         if structured is None:
+            plain_result = payload.get("result")
+            if isinstance(plain_result, str) and plain_result.strip():
+                logger.info(
+                    "ClaudeCliProvider: response missing structured_output; "
+                    "treating result as plain reply (Claude went off-schema, "
+                    "likely due to rich system prompt). %d chars returned.",
+                    len(plain_result),
+                )
+                return ChatResponse(
+                    content=plain_result,
+                    tool_calls=(),
+                    raw=payload,
+                )
             raise ProviderError(
                 "claude_schema",
-                f"tools path: missing 'structured_output' in response: {result.stdout[:300]!r}",
+                f"tools path: missing 'structured_output' AND no usable 'result' in response: {result.stdout[:300]!r}",
             )
 
         # Reply path
