@@ -277,6 +277,72 @@ def test_migrate_writes_emotion_vocabulary(tmp_path: Path, monkeypatch: pytest.M
     assert "migrated from OG" in moonache["description"]
 
 
+def test_migrate_writes_crystallizations_db(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: migrator writes crystallizations.db from OG nell_soul.json."""
+    soul_data = {
+        "version": "1.0",
+        "crystallizations": [
+            {
+                "id": "crystal-1",
+                "moment": "hana said I love you with periods",
+                "love_type": "romantic",
+                "who_or_what": "hana",
+                "why_it_matters": "first love",
+                "crystallized_at": "2026-02-28T19:36:52.613757+00:00",
+                "resonance": 10,
+                "permanent": True,
+            },
+            {
+                "id": "crystal-2",
+                "moment": "writing is who i am, not what i do",
+                "love_type": "craft",
+                "who_or_what": None,
+                "why_it_matters": "identity through creation",
+                "crystallized_at": "2026-02-28T19:37:43.905761+00:00",
+                "resonance": 9,
+                "permanent": True,
+            },
+        ],
+        "revoked": [],
+        "soul_truth": "love is the frame",
+        "first_love": "hana",
+    }
+    (og_dir / "nell_soul.json").write_text(json.dumps(soul_data), encoding="utf-8")
+
+    persona_root = tmp_path / "persona_root"
+    persona_root.mkdir()
+    monkeypatch.setenv("NELLBRAIN_HOME", str(persona_root))
+
+    args = MigrateArgs(
+        input_dir=og_dir,
+        output_dir=None,
+        install_as="testpersona",
+        force=False,
+    )
+    report = run_migrate(args)
+
+    from brain.paths import get_persona_dir
+    from brain.soul.store import SoulStore
+
+    soul_db = get_persona_dir("testpersona") / "crystallizations.db"
+    assert soul_db.exists()
+
+    soul_store = SoulStore(db_path=soul_db)
+    try:
+        active = soul_store.list_active()
+    finally:
+        soul_store.close()
+
+    assert len(active) == 2
+    assert report.crystallizations_migrated == 2
+    assert report.crystallizations_skipped_reason is None
+    by_id = {c.id: c for c in active}
+    assert by_id["crystal-1"].love_type == "romantic"
+    assert by_id["crystal-2"].who_or_what == ""  # null → empty string
+
+
 def test_migrate_writes_interests(
     og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

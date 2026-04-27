@@ -30,6 +30,8 @@ class MigrationReport:
     interests_skipped_reason: str | None = None
     vocabulary_emotions_migrated: int = 0
     vocabulary_skipped_reason: str | None = None
+    crystallizations_migrated: int = 0
+    crystallizations_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -65,6 +67,14 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.interests_skipped_reason})"
             if report.interests_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Crystallizations: {report.crystallizations_migrated:,} migrated"
+        + (
+            f" (skipped: {report.crystallizations_skipped_reason})"
+            if report.crystallizations_skipped_reason
             else ""
         )
     )

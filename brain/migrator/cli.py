@@ -17,6 +17,7 @@ from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
 from brain.migrator.og_reflex import extract_arcs_from_og
+from brain.migrator.og_soul import extract_crystallizations_from_og
 from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
@@ -193,6 +194,29 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     else:
         interests_skipped_reason = "og_nell_interests_json_not_found"
 
+    # ---- soul crystallizations ----
+    # nell_soul.json lives in the OG data/ dir (same dir as memories_v2.json).
+    # Unlike reflex/interests we don't need a parent-dir fallback — the OG
+    # soul file has a single canonical location.
+    from brain.soul.store import SoulStore
+
+    soul_db_path = work_dir / "crystallizations.db"
+    crystallizations_migrated = 0
+    crystallizations_skipped_reason: str | None = None
+
+    if soul_db_path.exists() and not args.force:
+        crystallizations_skipped_reason = "existing_file_not_overwritten"
+    else:
+        soul_crystals, soul_skipped = extract_crystallizations_from_og(args.input_dir)
+        soul_store = SoulStore(db_path=soul_db_path)
+        try:
+            for crystal in soul_crystals:
+                soul_store.create(crystal)
+            crystallizations_migrated = len(soul_crystals)
+        finally:
+            soul_store.close()
+        # soul_skipped entries are logged by og_soul's module-level logger if desired
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -217,6 +241,8 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         interests_skipped_reason=interests_skipped_reason,
         vocabulary_emotions_migrated=vocabulary_emotions_migrated,
         vocabulary_skipped_reason=vocabulary_skipped_reason,
+        crystallizations_migrated=crystallizations_migrated,
+        crystallizations_skipped_reason=crystallizations_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
