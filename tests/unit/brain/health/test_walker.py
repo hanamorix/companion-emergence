@@ -90,3 +90,59 @@ def test_walk_missing_soul_db_no_anomaly(tmp_path: Path) -> None:
     # No crystallizations.db on disk
     anomalies = walk_persona(persona)
     assert all(a.file != "crystallizations.db" for a in anomalies)
+
+
+def test_walk_missing_voicecraft_no_anomaly(tmp_path: Path) -> None:
+    """voicecraft.md is optional — most personas don't have one. Missing
+    should NOT raise an anomaly (that would noise up `nell health check`
+    for every persona that doesn't author the voice-craft reference doc)."""
+    persona = _setup_persona(tmp_path)
+    # No voicecraft.md on disk — common case
+    anomalies = walk_persona(persona)
+    assert all(a.file != "voicecraft.md" for a in anomalies)
+
+
+def test_walk_clean_voicecraft_no_anomaly(tmp_path: Path) -> None:
+    """voicecraft.md present and well-formed → no anomaly."""
+    persona = _setup_persona(tmp_path)
+    (persona / "voicecraft.md").write_text(
+        "# Voice Craft\n\nReal content here.\n", encoding="utf-8"
+    )
+    anomalies = walk_persona(persona)
+    assert all(a.file != "voicecraft.md" for a in anomalies)
+
+
+def test_walk_corrupt_voicecraft_quarantines_and_heals(tmp_path: Path) -> None:
+    """voicecraft.md emptied (the practical disk-corruption mode for plain
+    text) → walker quarantines + heals from .bak1 if present.
+    """
+    persona = _setup_persona(tmp_path)
+    # Healthy backup
+    (persona / "voicecraft.md.bak1").write_text(
+        "# Voice Craft\n\nGood prior content.\n", encoding="utf-8"
+    )
+    # Live file emptied (the heal trigger for plain text per attempt_heal_text)
+    (persona / "voicecraft.md").write_text("", encoding="utf-8")
+
+    anomalies = walk_persona(persona)
+    voicecraft_anomalies = [a for a in anomalies if a.file == "voicecraft.md"]
+    assert len(voicecraft_anomalies) == 1
+    assert voicecraft_anomalies[0].action == "restored_from_bak1"
+    # Live file has been restored from .bak1
+    assert "Good prior content" in (persona / "voicecraft.md").read_text(encoding="utf-8")
+
+
+def test_walk_corrupt_voicecraft_no_bak_resets_to_empty(tmp_path: Path) -> None:
+    """voicecraft.md empty + no .bak → walker writes empty default + flags anomaly.
+
+    Empty default (rather than fabricated content) is intentional: voicecraft
+    is reference content the user wrote; we don't pretend to reconstruct it.
+    The anomaly tells the user it was lost; they restore from VCS.
+    """
+    persona = _setup_persona(tmp_path)
+    (persona / "voicecraft.md").write_text("", encoding="utf-8")  # corrupt, no bak
+
+    anomalies = walk_persona(persona)
+    voicecraft_anomalies = [a for a in anomalies if a.file == "voicecraft.md"]
+    assert len(voicecraft_anomalies) == 1
+    assert voicecraft_anomalies[0].action == "reset_to_default"

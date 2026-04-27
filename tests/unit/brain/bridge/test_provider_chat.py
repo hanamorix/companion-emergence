@@ -443,11 +443,54 @@ def test_claude_cli_chat_with_tools_tool_calls_path_returns_tool_calls() -> None
     assert resp.tool_calls[1].arguments == {"query": "hana"}
 
 
-def test_claude_cli_chat_with_tools_missing_structured_output_raises() -> None:
-    """Missing structured_output key in response → ProviderError("claude_schema")."""
+def test_claude_cli_chat_with_tools_missing_structured_output_falls_back_to_result(
+    caplog,
+) -> None:
+    """Missing structured_output but present `result` → graceful fallback.
+
+    Real-world failure observed 2026-04-27: a rich system prompt (Nell's
+    voice.md, ~17 KB) caused Claude to ignore the --json-schema envelope
+    and return a plain text reply via `result`. Earlier behavior raised
+    ProviderError, breaking chat. Fixed behavior: return ChatResponse with
+    content=result and empty tool_calls — Claude correctly answered, just
+    chose not to wrap in the schema.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    plain = MagicMock()
+    plain.returncode = 0
+    plain.stdout = json.dumps({"result": "honestly? full. like the room when she walks in."})
+    plain.stderr = ""
+
+    with patch("subprocess.run", return_value=plain):
+        p = ClaudeCliProvider()
+        response = p.chat(
+            [ChatMessage(role="user", content="how are you feeling?")],
+            tools=_SAMPLE_TOOLS,
+        )
+
+    assert isinstance(response, ChatResponse)
+    assert "honestly? full" in response.content
+    assert response.tool_calls == ()
+    # Fallback should log at INFO so we can observe how often Claude goes off-schema
+    assert any(
+        "off-schema" in r.getMessage() or "missing structured_output" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_claude_cli_chat_with_tools_no_structured_output_no_result_raises() -> None:
+    """Both structured_output AND result missing → ProviderError("claude_schema").
+
+    Genuine schema failure (e.g., transport corruption) still raises so the
+    chat engine surfaces the error rather than silently producing an empty
+    reply.
+    """
     bad = MagicMock()
     bad.returncode = 0
-    bad.stdout = json.dumps({"result": "plain text but no structured_output"})
+    bad.stdout = json.dumps({"type": "result", "subtype": "success"})
     bad.stderr = ""
 
     with patch("subprocess.run", return_value=bad):
@@ -459,6 +502,22 @@ def test_claude_cli_chat_with_tools_missing_structured_output_raises() -> None:
             )
 
     assert exc_info.value.stage == "claude_schema"
+
+
+def test_claude_cli_chat_with_tools_empty_result_string_raises() -> None:
+    """result is empty string → still a real schema failure; raise."""
+    bad = MagicMock()
+    bad.returncode = 0
+    bad.stdout = json.dumps({"result": ""})
+    bad.stderr = ""
+
+    with patch("subprocess.run", return_value=bad):
+        p = ClaudeCliProvider()
+        with pytest.raises(ProviderError):
+            p.chat(
+                [ChatMessage(role="user", content="x")],
+                tools=_SAMPLE_TOOLS,
+            )
 
 
 def test_claude_cli_chat_with_tools_schema_includes_tool_names_as_enum() -> None:
