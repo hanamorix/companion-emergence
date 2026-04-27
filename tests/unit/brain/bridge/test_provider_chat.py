@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -439,6 +440,7 @@ def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
     cfg = captured["config"]
     assert "brain-tools" in cfg["mcpServers"]
     server_cfg = cfg["mcpServers"]["brain-tools"]
+    assert server_cfg["command"] == sys.executable
     assert server_cfg["args"][0] == "-m"
     assert server_cfg["args"][1] == "brain.mcp_server"
     assert "--persona-dir" in server_cfg["args"]
@@ -557,6 +559,65 @@ def test_chat_with_tools_cleans_up_temp_file(persona_dir: Path) -> None:
 
     assert len(captured_path) == 1
     assert not Path(captured_path[0]).exists()
+
+
+def test_chat_with_tools_cleans_up_temp_file_on_subprocess_error(persona_dir: Path) -> None:
+    """Temp file must be unlinked even when subprocess.run raises TimeoutExpired."""
+    provider = ClaudeCliProvider()
+    captured_path: list[str] = []
+
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        captured_path.append(path)
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=300)
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+
+    assert ei.value.stage == "claude_cli_timeout"
+    assert len(captured_path) == 1
+    assert not Path(captured_path[0]).exists()
+
+
+def test_chat_with_tools_missing_mcp_sdk_raises_mcp_unavailable(persona_dir: Path) -> None:
+    """If the mcp SDK is not installed, raise ProviderError('mcp_unavailable')."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "mcp":
+            raise ImportError("No module named 'mcp'")
+        return real_import(name, *args, **kwargs)
+
+    provider = ClaudeCliProvider()
+    with patch("builtins.__import__", side_effect=_fake_import):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "mcp_unavailable"
+    assert "pip install" in ei.value.detail
+
+
+def test_chat_with_tools_temp_file_write_failure_raises_setup(persona_dir: Path) -> None:
+    """OSError on the temp file write must surface as ProviderError('claude_cli_setup')."""
+    provider = ClaudeCliProvider()
+    with patch("brain.bridge.provider.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "claude_cli_setup"
+    assert "disk full" in ei.value.detail
 
 
 def test_chat_without_tools_unchanged(persona_dir: Path) -> None:

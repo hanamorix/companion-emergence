@@ -33,7 +33,8 @@ def build_tools_list() -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
     Wraps schemas in the {"type": "function", "function": <schema>} shape
-    that Ollama and Claude (via --json-schema) both accept.
+    that Ollama accepts natively and the MCP server registers as tool
+    descriptions for the Claude path.
     """
     return [
         {"type": "function", "function": SCHEMAS[name]}
