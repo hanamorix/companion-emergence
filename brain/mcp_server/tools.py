@@ -15,13 +15,16 @@ from typing import Any
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
+from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
-from brain.mcp_server.audit import log_invocation
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
 from brain.tools.schemas import SCHEMAS
 
+# Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both
+# files truncate at the same boundary so the audit log preview length
+# stays consistent regardless of which truncation triggered first.
 _RESULT_SUMMARY_MAX_CHARS = 140
 
 
