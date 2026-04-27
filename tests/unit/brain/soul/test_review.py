@@ -342,3 +342,37 @@ def test_parse_decision_unknown_love_type_on_accept_defers() -> None:
     d = parse_decision(raw, "cid-2")
     assert d.decision == "defer"
     assert "love_type" in d.parse_error
+
+
+# ── _current_emotional_summary regression ─────────────────────────────────────
+
+
+def test_current_emotional_summary_uses_emotions_attr_not_all_method() -> None:
+    """Regression: EmotionalState exposes ``emotions: dict[str, float]`` directly,
+    not a ``.all()`` method. The helper used to call ``state.all()`` which
+    raised AttributeError every invocation against a real store, swallowing
+    silently to return "unknown". This test ensures real emotion data flows
+    through the helper as a non-"unknown" summary string.
+    """
+    from brain.memory.store import Memory
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(":memory:")
+    # "love" is a baseline emotion in brain.emotion.vocabulary — no persona
+    # loader needed for the regression check.
+    store.create(
+        Memory.create_new(
+            content="A genuinely meaningful moment.",
+            memory_type="experience",
+            domain="us",
+            emotions={"love": 9.0},
+            importance=8.0,
+        )
+    )
+
+    summary = _current_emotional_summary(store)
+    assert summary != "unknown", (
+        "helper still raising AttributeError — likely regressed back to state.all()"
+    )
+    # When emotions are present we expect a "name:value" formatted summary
+    assert ":" in summary, f"expected formatted summary, got {summary!r}"
