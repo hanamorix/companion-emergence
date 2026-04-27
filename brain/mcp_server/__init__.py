@@ -20,9 +20,9 @@ from pathlib import Path
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
+from brain.mcp_server.tools import register_tools
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
-from brain.mcp_server.tools import register_tools
 
 __all__ = ["run_server", "register_tools"]
 
