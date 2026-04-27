@@ -19,8 +19,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
+import sys
+import tempfile
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -169,17 +173,14 @@ class ClaudeCliProvider(LLMProvider):
       - Remaining messages are serialised as a "User: …\\nAssistant: …" script
         ending at the final user turn, passed via ``-p``.
 
-    Tool-calling via --json-schema
-    ------------------------------
-    When ``tools`` is provided, the provider augments the system prompt with
-    instructions about available tools and passes a ``--json-schema`` flag
-    enforcing a discriminated-union response: either ``{"reply": "..."}`` or
-    ``{"tool_calls": [{"name": "...", "arguments": {...}}, ...]}``.
-
-    Claude's ``--output-format json`` with ``--json-schema`` returns the
-    structured output inside ``payload["structured_output"]``.  The provider
-    parses this and returns either a plain-text ChatResponse (reply path) or
-    a ChatResponse with tool_calls populated (tool-calling path).
+    Tool-calling via --mcp-config
+    -----------------------------
+    When ``tools`` is provided, the provider writes a temp mcp.json pointing
+    at ``brain.mcp_server`` and passes ``--mcp-config <path>`` to the claude
+    CLI.  Tool calls happen inside the claude subprocess; the provider returns
+    the final assistant text directly — ``tool_calls`` on the ChatResponse is
+    always empty.  Requires ``options["persona_dir"]`` so the spawned server
+    knows which persona directory to load.
 
     When ``tools`` is None, the legacy text-flattening path applies — behaviour
     is unchanged from before SP-3.
@@ -234,42 +235,38 @@ class ClaudeCliProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
-        """Flatten messages into Claude CLI and optionally enforce tool-calling schema.
+        """Flatten messages into Claude CLI; route through MCP when tools given.
 
         When ``tools`` is None:
           - Flattens messages into "User: ...\\nAssistant: ..." script via -p.
           - Returns ChatResponse(content=<text>, tool_calls=()).
 
         When ``tools`` is provided:
-          - Augments the system prompt with tool instructions.
-          - Builds a discriminated-union ``--json-schema`` that forces Claude to
-            respond with either ``{"reply": "..."}`` or
-            ``{"tool_calls": [{"name": "...", "arguments": {...}}]}``.
-          - Parses ``structured_output`` from the JSON response and returns the
-            appropriate ChatResponse.
+          - Requires ``options["persona_dir"]`` to point the MCP server at the
+            active persona.
+          - Writes a temp mcp.json, calls claude with --mcp-config, returns
+            the final assistant text. Tool calls happen inside the claude
+            subprocess; tool_calls on the response is always empty.
 
         Raises
         ------
         ProviderError("claude_cli_timeout", ...)
-            If the subprocess exceeds the configured timeout.
         ProviderError("claude_cli_exit", ...)
-            If the subprocess exits with a non-zero return code.
         ProviderError("claude_cli_parse", ...)
-            If the JSON output cannot be parsed or lacks expected keys.
-        ProviderError("claude_schema", ...)
-            If the schema-constrained invocation returns an unexpected shape.
+        ProviderError("mcp_unavailable", ...)
+            When tools is non-None and options["persona_dir"] is missing,
+            or when the mcp SDK is not importable.
+        ProviderError("claude_cli_setup", ...)
+            When the temp config file write fails.
         """
         system_prompt: str | None = None
         conversation_messages: list[ChatMessage] = []
-
         for msg in messages:
             if msg.role == "system" and system_prompt is None:
                 system_prompt = msg.content
             else:
                 conversation_messages.append(msg)
 
-        # Build a flat conversation script for the -p flag.
-        # Format: "User: ...\nAssistant: ...\nUser: ..." ending on user turn.
         if not conversation_messages:
             flat_prompt = ""
         elif len(conversation_messages) == 1:
@@ -283,13 +280,19 @@ class ClaudeCliProvider(LLMProvider):
             flat_prompt = "\n".join(parts)
 
         if tools:
-            return self._chat_with_tools(
+            persona_dir_str = (options or {}).get("persona_dir")
+            if not persona_dir_str:
+                raise ProviderError(
+                    "mcp_unavailable",
+                    "tool-calling via MCP requires options['persona_dir']",
+                )
+            return self._chat_with_mcp_tools(
                 flat_prompt=flat_prompt,
                 system_prompt=system_prompt,
-                tools=tools,
+                persona_dir=Path(persona_dir_str),
             )
 
-        # ── Legacy text path (no tools) ──────────────────────────────────────
+        # ── Legacy text path (no tools) — unchanged from before SP-3 ──
         cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
         if system_prompt is not None:
             cmd.extend(["--system-prompt", system_prompt])
@@ -325,193 +328,99 @@ class ClaudeCliProvider(LLMProvider):
 
         return ChatResponse(content=content, tool_calls=(), raw=None)
 
-    def _build_tool_call_schema(self, tools: list[dict[str, Any]]) -> dict[str, Any]:
-        """Build a discriminated-union JSON schema for tool-calling responses.
-
-        Claude must respond with EITHER:
-          {"reply": "<text>"}          — final answer, no tool needed
-          {"tool_calls": [...]}        — one or more tool invocations
-
-        The ``name`` field in each tool_call is an enum of known tool names
-        so Claude cannot hallucinate an unknown tool.
-        """
-        tool_names = [t["name"] for t in tools if "name" in t]
-        return {
-            "type": "object",
-            "oneOf": [
-                {
-                    "properties": {
-                        "reply": {"type": "string"},
-                    },
-                    "required": ["reply"],
-                    "additionalProperties": False,
-                },
-                {
-                    "properties": {
-                        "tool_calls": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {
-                                        "type": "string",
-                                        "enum": tool_names,
-                                    },
-                                    "arguments": {"type": "object"},
-                                },
-                                "required": ["name", "arguments"],
-                            },
-                            "minItems": 1,
-                        }
-                    },
-                    "required": ["tool_calls"],
-                    "additionalProperties": False,
-                },
-            ],
-        }
-
-    def _build_tool_system_addendum(self, tools: list[dict[str, Any]]) -> str:
-        """Build the system-prompt addendum describing available tools."""
-        lines = ["You have access to these tools:"]
-        for tool in tools:
-            name = tool.get("name", "unknown")
-            desc = tool.get("description", "no description")
-            lines.append(f"  - {name}: {desc}")
-        lines.append(
-            "\nRespond with EITHER a final reply (use the 'reply' field) OR a "
-            "tool_calls array if you need to query state first. Do not mix both."
-        )
-        return "\n".join(lines)
-
-    def _chat_with_tools(
+    def _chat_with_mcp_tools(
         self,
         flat_prompt: str,
         system_prompt: str | None,
-        tools: list[dict[str, Any]],
+        persona_dir: Path,
     ) -> ChatResponse:
-        """Inner path: invoke Claude CLI with --json-schema for tool-calling.
+        """Tool-calling path: claude with --mcp-config pointing at brain.mcp_server.
 
-        Returns a ChatResponse with either content (reply path) or tool_calls
-        populated (tool-call path).
+        The mcp SDK is only imported here — keeps the legacy text path
+        usable on systems without the SDK installed.
         """
-        import uuid as _uuid
-
-        schema = self._build_tool_call_schema(tools)
-        tool_addendum = self._build_tool_system_addendum(tools)
-
-        # Combine system prompt + tool instructions
-        if system_prompt:
-            full_system = f"{system_prompt}\n\n{tool_addendum}"
-        else:
-            full_system = tool_addendum
-
-        cmd = [
-            "claude",
-            "-p",
-            flat_prompt,
-            "--output-format",
-            "json",
-            "--model",
-            self._model,
-            "--json-schema",
-            json.dumps(schema),
-            "--system-prompt",
-            full_system,
-        ]
-
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+            import mcp  # noqa: F401
+        except ImportError as exc:
             raise ProviderError(
-                "claude_cli_timeout",
-                f"subprocess timed out after {self._timeout}s (tools path)",
+                "mcp_unavailable",
+                "the 'mcp' SDK is required for the Claude tool-calling path. "
+                "pip install 'mcp>=1.0.0,<2.0.0'",
             ) from exc
 
-        if result.returncode != 0:
-            raise ProviderError(
-                "claude_cli_exit",
-                f"exit {result.returncode}: {result.stderr.strip()} (tools path)",
-            )
+        config = {
+            "mcpServers": {
+                "brain-tools": {
+                    "command": sys.executable,
+                    "args": [
+                        "-m",
+                        "brain.mcp_server",
+                        "--persona-dir",
+                        str(persona_dir),
+                    ],
+                    "env": {},
+                }
+            }
+        }
 
+        tmp_path: str | None = None
         try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise ProviderError(
-                "claude_cli_parse",
-                f"tools path: non-JSON output: {result.stdout[:200]!r}",
-            ) from exc
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".json",
+                    delete=False,
+                    encoding="utf-8",
+                ) as tmp:
+                    json.dump(config, tmp)
+                    tmp_path = tmp.name
+            except OSError as exc:
+                raise ProviderError(
+                    "claude_cli_setup",
+                    f"failed to write temp mcp.json: {exc}",
+                ) from exc
 
-        # Claude returns structured output under the "structured_output" key
-        # when --json-schema is honored. In practice, a sufficiently rich
-        # system prompt (e.g. a persona's voice.md) can outweigh the schema
-        # enforcement and Claude returns a plain text reply in `result`
-        # instead. When that happens, treat it as a no-tool-call reply rather
-        # than erroring — Claude correctly answered the user; it just chose
-        # not to enforce the protocol envelope. This matches how the chat
-        # engine's tool loop interprets ChatResponse(content=..., tool_calls=())
-        # as "final reply, no tools needed."
-        structured = payload.get("structured_output")
-        if structured is None:
-            plain_result = payload.get("result")
-            if isinstance(plain_result, str) and plain_result.strip():
-                logger.info(
-                    "ClaudeCliProvider: response missing structured_output; "
-                    "treating result as plain reply (Claude went off-schema, "
-                    "likely due to rich system prompt). %d chars returned.",
-                    len(plain_result),
+            cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
+            if system_prompt is not None:
+                cmd.extend(["--system-prompt", system_prompt])
+            cmd.extend(["--mcp-config", tmp_path])
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    check=False,
                 )
-                return ChatResponse(
-                    content=plain_result,
-                    tool_calls=(),
-                    raw=payload,
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError(
+                    "claude_cli_timeout",
+                    f"subprocess timed out after {self._timeout}s",
+                ) from exc
+
+            if result.returncode != 0:
+                raise ProviderError(
+                    "claude_cli_exit",
+                    f"exit {result.returncode}: {result.stderr.strip()}",
                 )
-            raise ProviderError(
-                "claude_schema",
-                f"tools path: missing 'structured_output' AND no usable 'result' in response: {result.stdout[:300]!r}",
-            )
 
-        # Reply path
-        if "reply" in structured:
-            return ChatResponse(
-                content=str(structured["reply"]),
-                tool_calls=(),
-                raw=payload,
-            )
+            try:
+                payload = json.loads(result.stdout)
+                content = str(payload["result"])
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ProviderError(
+                    "claude_cli_parse",
+                    f"unexpected output format: {result.stdout[:200]!r}",
+                ) from exc
 
-        # Tool-calls path
-        if "tool_calls" in structured:
-            parsed_tool_calls: list[ToolCall] = []
-            for tc in structured["tool_calls"]:
-                call_id = str(_uuid.uuid4())
+            return ChatResponse(content=content, tool_calls=(), raw=None)
+        finally:
+            if tmp_path is not None:
                 try:
-                    parsed_tool_calls.append(
-                        ToolCall(
-                            id=call_id,
-                            name=str(tc["name"]),
-                            arguments=dict(tc.get("arguments") or {}),
-                        )
-                    )
-                except (KeyError, TypeError) as exc:
-                    raise ProviderError(
-                        "claude_schema",
-                        f"tools path: malformed tool_call entry {tc!r}: {exc}",
-                    ) from exc
-            return ChatResponse(
-                content="",
-                tool_calls=tuple(parsed_tool_calls),
-                raw=payload,
-            )
-
-        raise ProviderError(
-            "claude_schema",
-            f"tools path: structured_output has neither 'reply' nor 'tool_calls': {structured!r}",
-        )
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------

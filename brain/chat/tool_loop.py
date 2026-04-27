@@ -81,7 +81,11 @@ def run_tool_loop(
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
 
     for _iteration in range(max_iterations):
-        last_response = provider.chat(messages, tools=tools)
+        last_response = provider.chat(
+            messages,
+            tools=tools,
+            options={"persona_dir": str(persona_dir)},
+        )
         if not last_response.tool_calls:
             return last_response, invocations
 
