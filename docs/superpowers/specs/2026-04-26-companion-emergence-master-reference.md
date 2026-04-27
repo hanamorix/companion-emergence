@@ -284,13 +284,13 @@ Tests: 7 test files under `tests/unit/brain/migrator/`.
 
 `LLMProvider` ABC with `generate(prompt: str, *, system: str | None = None) -> str` + `chat(messages, *, tools, options) -> ChatResponse` + `name() -> str` + `healthy() -> bool`. Four implementations:
 - `FakeProvider` — deterministic hash, tests
-- `ClaudeCliProvider` — subprocess against `claude -p ... --output-format json`; tool-calling via `--json-schema` discriminated-union schema (subscription, no API tokens)
+- `ClaudeCliProvider` — subprocess against `claude -p ... --output-format json`; tool-calling via stdio MCP server (`--mcp-config` + `--allowedTools`) registered as `brain/mcp_server/` (subscription, no API tokens)
 - `OllamaProvider` — full httpx port from OG; native tool-calling via Ollama's `/api/chat` `tools` field; default model `huihui_ai/qwen2.5-abliterated:7b`
 - `ProviderError(stage, detail)` exception with forensic stage context
 
 Factory: `get_provider(name: str) -> LLMProvider`. Companion types in `brain/bridge/chat.py`: `ChatMessage` (frozen, with optional `tool_call_id` + `tool_calls` tuple), `ToolCall` (id/name/arguments with robust `from_provider_dict`), `ChatResponse` (content + tool_calls + raw).
 
-**Status: ✅ Solid as of 2026-04-27** — SP-1 (PR #21) added the chat() interface; SP-3 (PR #23) layered Claude `--json-schema` tool-calling. Both Ollama (native) and Claude (subscription via JSON-schema) are first-class tool-capable providers.
+**Status: ✅ Solid as of 2026-04-27** — SP-1 (PR #21) added the chat() interface; SP-3 (PR #23) layered Claude tool-calling via `--json-schema` (interim); SP-3.1 (PR #31) replaced that with the production-path `--mcp-config` after the 2026-04-27 live-exercise stress test proved `--json-schema` fragile under rich voice.md. Both Ollama (native) and Claude (subscription via stdio MCP) are first-class tool-capable providers.
 
 Tests: 3 test files (`test_provider.py`, `test_chat.py`, `test_provider_chat.py`).
 
@@ -333,7 +333,7 @@ These were the design gaps that had to be closed before a first chat turn was po
 
 | Gap | Status | Closed by |
 |-----|--------|-----------|
-| 1. Provider interface mismatch | ✅ Closed | SP-1 (PR #21) added `chat()` + ChatResponse; SP-3 (PR #23) layered Claude `--json-schema` tool-calling |
+| 1. Provider interface mismatch | ✅ Closed | SP-1 (PR #21) added `chat()` + ChatResponse; SP-3 (PR #23) layered Claude `--json-schema` tool-calling; SP-3.1 (PR #31) replaced with stdio MCP server via `--mcp-config` (production path) |
 | 2. Daemon-state residue plumbing | ✅ Closed | SP-2 (PR #22) ships `brain/engines/daemon_state.py` + heartbeat tick writer |
 | 3. Conversation ingest pipeline | ✅ Closed | SP-4 (PR #24) ships `brain/ingest/` with full 8-stage pipeline |
 | 4. Soul model entirely absent | ✅ Closed | SP-5 (PR #25) ships `brain/soul/` with `Crystallization` + `SoulStore` (SQLite) + autonomous review |
@@ -428,7 +428,8 @@ The detailed gap analyses below are preserved as historical record — they docu
 | health/alarm.py | `brain/health/alarm.py` | 🆕 New | Computed from audit log — no recursive corruption risk |
 | health/anomaly.py | `brain/health/anomaly.py` | 🆕 New | BrainAnomaly + AlarmEntry types |
 | health/jsonl_reader.py | `brain/health/jsonl_reader.py` | 🆕 New | Shared append-only log reader |
-| bridge/provider.py | `brain/bridge/provider.py` | ✅ Solid | SP-1 added `chat(messages, tools)` (PR #21); SP-3 added Claude `--json-schema` tool-calling (PR #23) |
+| bridge/provider.py | `brain/bridge/provider.py` | ✅ Solid | SP-1 added `chat(messages, tools)` (PR #21); SP-3 added Claude `--json-schema` tool-calling (PR #23); SP-3.1 swapped to stdio MCP via `--mcp-config` + `--allowedTools` (PR #31) |
+| mcp_server/ | `brain/mcp_server/` | 🆕 New | SP-3.1 — stdio MCP server exposing 9 brain-tools; `register_tools` adapter, `audit.py` invocation log, `__main__.py` entry (PR #31) |
 | bridge/chat.py | `brain/bridge/chat.py` | 🆕 New | SP-1 — ChatMessage/ToolCall/ChatResponse + ProviderError |
 | search/base.py + ddgs + claude_tool | `brain/search/` | 🆕 New | Cleaner abstraction than OG's inline DuckDuckGo calls |
 | migrator/ | `brain/migrator/` | ✅ Solid | One-time tool; migration complete |
@@ -442,7 +443,7 @@ The detailed gap analyses below are preserved as historical record — they docu
 | tools/ | `brain/tools/` | 🆕 New | SP-3 — 9-tool schemas + dispatch + impls calling new framework APIs (PR #23) |
 | ingest/ | `brain/ingest/` | 🆕 New | SP-4 — 8-stage BUFFER→COMMIT→SOUL pipeline turning chats into structured memories (PR #24) |
 
-**Module audit summary (current as of 2026-04-27):** 22 ✅ Solid (was 22; 4 🔧 promoted to ✅ after SP work landed) / 0 🔧 Needs refactor (all 6 closed) / 0 ➕ Needs expansion (all 3 closed via SP-2) / 14 🆕 New (8 from health + 4 new packages from SP-1..SP-6 + daemon_state + voice/text-heal extension) / 0 ❌ Missing (all 3 closed by SP-3/SP-5/SP-6, plus daemon_state by SP-2 + ingest by SP-4)
+**Module audit summary (current as of 2026-04-27, post SP-3.1):** 22 ✅ Solid (was 22; 4 🔧 promoted to ✅ after SP work landed) / 0 🔧 Needs refactor (all 6 closed) / 0 ➕ Needs expansion (all 3 closed via SP-2) / 15 🆕 New (8 from health + 4 new packages from SP-1..SP-6 + daemon_state + voice/text-heal extension + mcp_server from SP-3.1) / 0 ❌ Missing (all 3 closed by SP-3/SP-5/SP-6, plus daemon_state by SP-2 + ingest by SP-4)
 
 ---
 
@@ -496,6 +497,14 @@ SP-3 brainstorm picks one (or implements both with `--mcp-config` as the product
 **New framework files created:** `brain/tools/__init__.py`, `brain/tools/schemas.py`, `brain/tools/dispatch.py`, `brain/tools/impls/*.py`, optionally `brain/tools/mcp_server.py` if MCP path is chosen
 **Deliverable:** All 9 tool schemas valid; dispatch calling new brain APIs; tests for each tool with injected stores; Claude tool-calling working via `--json-schema` or `--mcp-config`.
 **Rough test count:** 25–35 tests (one per tool, plus dispatch edge cases + write-gate validation + Claude tool-call protocol round-trip).
+
+#### SP-3.1: Post-ship swap to `--mcp-config` (2026-04-27)
+
+**Status:** ✅ Shipped — PR #31, commit `9f91f9e`, 2026-04-27
+**Driver:** 2026-04-27 live-exercise stress test surfaced 0 tool invocations across 20 prompts — rich `voice.md` outweighed `--json-schema` enforcement, and PR #28's off-schema fallback (added to keep chat working under rich voice.md) silently swallowed the tool surface.
+**Outcome:** New `brain/mcp_server/` package: `__main__.py` argparse entry (`python -m brain.mcp_server --persona-dir <path>`), `__init__.py` lifecycle (open stores → register tools → stdio loop → close stores), `tools.py` schema-to-MCP adapter routing through existing `brain.tools.dispatch.dispatch()`, `audit.py` writing one JSONL line per invocation to `<persona>/tool_invocations.log.jsonl`. `ClaudeCliProvider._chat_with_mcp_tools()` writes a temp mcp.json, invokes `claude -p ... --mcp-config <tmp> --allowedTools mcp__brain-tools__<each>`, parses `payload["result"]`. Removed: `_build_tool_call_schema`, `_build_tool_system_addendum`, `_chat_with_tools`, off-schema fallback, all `--json-schema` machinery. `tool_loop` runs single-pass for Claude (Ollama unchanged). `DEFAULT_VOICE_TEMPLATE` now ships a "Brain-tools" section with the three load-bearing rules (proactive search before answering, no describing tool returns without calling, name failures honestly) so every fresh persona starts wired correctly. 23 net new tests.
+**Verification:** Live sandbox-clone test against the migrated `nell.sandbox`. Casual prompt produced 3 real `search_memories` calls (escalating queries when each came back empty) with audit log entries; reply correctly named "all empty" instead of confabulating. Directive prompt produced verbatim memory cite with UUID. Spec §12 success criteria fully met.
+**Out of scope (explicit):** Removing `tool_loop` (still needed for Ollama); supervisor / `close_stale_sessions` wiring (SP-7); per-persona voice.md restructure (Hana's lane — `nell.sandbox` got a parallel edit so she can use the framework end-to-end today).
 
 ### SP-4: Conversation Ingest Pipeline
 
