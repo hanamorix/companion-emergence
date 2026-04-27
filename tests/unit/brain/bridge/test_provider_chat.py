@@ -479,6 +479,39 @@ def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
     assert "--json-schema" not in cmd
 
 
+def test_chat_with_tools_passes_allowed_tools_for_each_brain_tool(persona_dir: Path) -> None:
+    """The cmd must include --allowedTools with every brain-tool enumerated.
+
+    Claude CLI's `-p` (non-interactive) mode blocks MCP tool calls unless
+    each is explicitly pre-approved. Without this flag, the MCP server starts
+    and tools are advertised but Claude refuses to call them — the same
+    mechanism gap the live-exercise stress test surfaced.
+    """
+    from brain.tools import NELL_TOOL_NAMES
+
+    provider = ClaudeCliProvider()
+    captured: dict = {}
+
+    def _capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_proc(json.dumps({"result": "ok"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    cmd = captured["cmd"]
+    assert "--allowedTools" in cmd
+    # Every NELL_TOOL_NAME must appear under the mcp__brain-tools__ namespace.
+    for name in NELL_TOOL_NAMES:
+        assert f"mcp__brain-tools__{name}" in cmd, (
+            f"missing --allowedTools entry for {name}"
+        )
+
+
 def test_chat_with_tools_parses_payload_result(persona_dir: Path) -> None:
     provider = ClaudeCliProvider()
 
