@@ -74,7 +74,7 @@ def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stor
     assert json.loads(text) == {"ok": True}
     # Audit log was written
     log_path = persona_dir / "tool_invocations.log.jsonl"
-    rec = json.loads(log_path.read_text())
+    rec = json.loads(log_path.read_text(encoding="utf-8"))
     assert rec["name"] == "search_memories"
     assert rec["arguments"] == {"query": "x"}
     assert rec["error"] is None
@@ -100,7 +100,7 @@ def test_register_tools_dispatches_and_logs_error(persona_dir: Path, fake_stores
 
     text = result.root.content[0].text
     assert json.loads(text) == {"error": "boom"}
-    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text())
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert rec["name"] == "search_memories"
     assert rec["error"] == "boom"
 
@@ -142,7 +142,7 @@ def test_register_tools_summary_truncated(persona_dir: Path, fake_stores) -> Non
         call_handler = _get_call_handler(server)
         asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
 
-    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text())
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert len(rec["result_summary"]) <= 141  # 140 + "…"
 
 

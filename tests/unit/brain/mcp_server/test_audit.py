@@ -31,7 +31,7 @@ def test_log_invocation_writes_jsonl_line(tmp_path: Path) -> None:
 def test_log_invocation_truncates_long_summary(tmp_path: Path) -> None:
     long = "x" * 500
     log_invocation(tmp_path, name="x", arguments={}, result_summary=long)
-    rec = json.loads((tmp_path / "tool_invocations.log.jsonl").read_text())
+    rec = json.loads((tmp_path / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     # 140 chars + ellipsis (1 char "…")
     assert rec["result_summary"].endswith("…")
     assert len(rec["result_summary"]) == 141
@@ -45,14 +45,14 @@ def test_log_invocation_records_error(tmp_path: Path) -> None:
         result_summary="error: boom",
         error="boom",
     )
-    rec = json.loads((tmp_path / "tool_invocations.log.jsonl").read_text())
+    rec = json.loads((tmp_path / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert rec["error"] == "boom"
 
 
 def test_log_invocation_appends_two_lines(tmp_path: Path) -> None:
     log_invocation(tmp_path, name="a", arguments={}, result_summary="r1")
     log_invocation(tmp_path, name="b", arguments={}, result_summary="r2")
-    lines = (tmp_path / "tool_invocations.log.jsonl").read_text().splitlines()
+    lines = (tmp_path / "tool_invocations.log.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
     assert json.loads(lines[0])["name"] == "a"
     assert json.loads(lines[1])["name"] == "b"
