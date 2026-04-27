@@ -25,8 +25,17 @@ _DEFAULTS: dict[str, dict] = {
 }
 
 
-# Text identity files checked separately (voice.md — plain-text, not JSON).
-_TEXT_IDENTITY_FILES: tuple[str, ...] = ("voice.md",)
+# Text identity files checked separately (plain-text, not JSON).
+# Two semantics:
+#   _AUTO_CREATE_TEXT_FILES — auto-generated from default template if missing.
+#     Currently only voice.md (chat engine relies on it being present after
+#     first call). Walker delegates to load_voice() which owns the template.
+#   _OPTIONAL_TEXT_FILES — optional reference docs. Skip silently if missing,
+#     heal-from-bak if corrupt (empty), no auto-create. Used for files like
+#     voicecraft.md that exist only when the persona's author chose to write
+#     them.
+_AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
+_OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 
 
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
@@ -47,8 +56,9 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         if anomaly is not None:
             anomalies.append(anomaly)
 
-    # Plain-text identity file scan (voice.md).
-    for name in _TEXT_IDENTITY_FILES:
+    # Auto-creating text identity scan (voice.md). load_voice() owns the
+    # default template and the attempt_heal_text invocation.
+    for name in _AUTO_CREATE_TEXT_FILES:
         path = persona_dir / name
         if not path.exists():
             continue  # Missing voice.md is fine — created on first chat turn.
@@ -57,7 +67,22 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         _, anomaly = load_voice(persona_dir)
         if anomaly is not None:
             anomalies.append(anomaly)
-        break  # load_voice checks voice.md by name; only one text file for now
+        break  # load_voice checks voice.md by name; only one auto-create file
+
+    # Optional text reference scan (voicecraft.md, future doc files).
+    # Skip silently if missing. Heal from .bak if empty/corrupt; no auto-create.
+    from brain.health.attempt_heal import attempt_heal_text
+
+    for name in _OPTIONAL_TEXT_FILES:
+        path = persona_dir / name
+        if not path.exists():
+            continue  # Optional file; absence is not an anomaly.
+        # Pass an empty-string default — when all baks are corrupt, the heal
+        # rewrites an empty file rather than fabricating content. The anomaly
+        # signals the loss; the user can restore the original from VCS.
+        _, anomaly = attempt_heal_text(path, default_factory=lambda: "")
+        if anomaly is not None:
+            anomalies.append(anomaly)
 
     # SQLite integrity — constructor runs PRAGMA integrity_check; catch failures.
     # When SP-5 (soul) added crystallizations.db, walker needs to scan it too —
