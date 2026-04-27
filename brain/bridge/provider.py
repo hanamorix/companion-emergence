@@ -380,10 +380,20 @@ class ClaudeCliProvider(LLMProvider):
                     f"failed to write temp mcp.json: {exc}",
                 ) from exc
 
+            # Build the list of allowed MCP tool names for --allowedTools.
+            # Claude CLI blocks MCP tool calls in non-interactive (-p) mode
+            # unless each tool is explicitly pre-approved.  The MCP server
+            # name in mcp.json is "brain-tools", so Claude registers tools as
+            # "mcp__brain-tools__<name>".  We allow all nine brain-tools here
+            # so the LLM can call them without a permission prompt.
+            from brain.tools import NELL_TOOL_NAMES  # local import — avoids circular
+
+            allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
             cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
             if system_prompt is not None:
                 cmd.extend(["--system-prompt", system_prompt])
             cmd.extend(["--mcp-config", tmp_path])
+            cmd.extend(["--allowedTools", *allowed_mcp])
 
             try:
                 result = subprocess.run(
