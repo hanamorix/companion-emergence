@@ -214,13 +214,13 @@ Tests: 5 test files under `tests/unit/brain/memory/`.
 
 Four engines + interests helper. Shipped across Week 4 (dream, heartbeat, reflex, research).
 
-**`dream.py`** — `DreamEngine.run_cycle(seed_id, lookback_hours, depth, decay_per_hop, neighbour_limit, dry_run)`. Spreading activation from recent memories → LLM synthesis via `LLMProvider.generate()` → dream memory written to store. Port of `NellBrain/dream_engine.py`. Shadow dreams and Jordan grief carry live in `default_reflex_arcs.json`. Consolidation cluster merge logic not verified ported. Key gap: writes no `daemon_state.json` residue. Note: principle audit flags `--seed`, `--depth`, `--decay`, `--limit`, `--lookback` as violations — these should move to `DreamEngine.__init__` constructor params; `run_cycle()` public signature cleanup is outstanding (PR-A). **Status: 🔧 Needs refactor (principle audit PR-A; plus daemon_state.json writer needed).**
+**`dream.py`** — `DreamEngine.run_cycle(seed_id, lookback_hours, depth, decay_per_hop, neighbour_limit, dry_run)`. Spreading activation from recent memories → LLM synthesis via `LLMProvider.generate()` → dream memory written to store. Port of `NellBrain/dream_engine.py`. Shadow dreams and Jordan grief carry live in `default_reflex_arcs.json`. Consolidation cluster merge logic not verified ported. Key gap: writes no `daemon_state.json` residue. Note: principle audit flags `--seed`, `--depth`, `--decay`, `--limit`, `--lookback` as violations — these should move to `DreamEngine.__init__` constructor params; `run_cycle()` public signature cleanup is outstanding (PR-A). **Status: ✅ Solid as of 2026-04-27** — principle audit PR-A landed (PR #13: dropped `--seed`/`--depth`/`--decay`/`--limit`/`--lookback` user flags, moved spreading params to `DreamEngine.__init__`); SP-2 daemon_state writer landed (PR #22).
 
 **`heartbeat.py`** — `HeartbeatEngine.run_tick(trigger, dry_run)`. Orchestrates in order: first-tick defer → emotion decay → Hebbian decay + GC → interest ingestion hook → reflex evaluation → dream gate → research evaluation → growth tick → optional HEARTBEAT: memory emit → state save + audit log. `HeartbeatConfig` (developer-only internal calibration) + `user_preferences.json` (user-surfaceable cadence). Full health integration: loads via `attempt_heal`, saves via `save_with_backup`, aggregates anomalies into audit log. Port of `NellBrain/heartbeat_engine.py` but event-driven (no dynamic load-aware scheduler). Key gap: writes no `daemon_state.json` residue. **Status: ➕ Needs expansion (daemon_state.json writer).**
 
 **`reflex.py`** — `ReflexEngine.run_tick(state, store, provider, now)`. 8 reflex arcs from `default_reflex_arcs.json` (creative_pitch, loneliness_journal, gift_creation, self_check, gratitude_reflection, defiance_burst, body_grief_whisper, jordan_grief_carry). Threshold-gated, cooldown-gated. Output written to store as reflex-type memories. Port of `NellBrain/reflex_engine.py` — most complete 1:1 port. Key gap: writes no `daemon_state.json` residue. **Status: ➕ Needs expansion (daemon_state.json writer).**
 
-**`research.py`** — `ResearchEngine.run_tick(state, store, searcher, provider, now, config)`. Interest tracking, web search via `WebSearcher` abstraction, output to `{persona_dir}/nell_space/research/`. Port of `NellBrain/research_engine.py`. Principle audit flags `--interest <topic>` + `forced_interest_topic` as hard violations — these must be removed (PR-A). **Status: 🔧 Needs refactor (principle audit PR-A: drop forced_interest_topic from API).**
+**`research.py`** — `ResearchEngine.run_tick(state, store, searcher, provider, now, config)`. Interest tracking, web search via `WebSearcher` abstraction, output to `{persona_dir}/nell_space/research/`. Port of `NellBrain/research_engine.py`. Principle audit flags `--interest <topic>` + `forced_interest_topic` as hard violations — these must be removed (PR-A). **Status: ✅ Solid as of 2026-04-27** — principle audit PR-A removed `forced_interest_topic` from `run_tick` API (PR #13); SP-2 daemon_state writer landed (PR #22).
 
 **`_interests.py`** — `InterestSet` over `{persona_dir}/interests.json`. `bump(topic)`, `update_after_research(topic)`, `pick_next()`. Port of `NellBrain/nell_interests.py`. **Status: ✅ Solid.**
 
@@ -282,11 +282,17 @@ Tests: 7 test files under `tests/unit/brain/migrator/`.
 
 ### 3.7 `brain/bridge/provider.py`
 
-`LLMProvider` ABC with `generate(prompt: str, *, system: str | None = None) -> str` + `name() -> str`. Three implementations: `FakeProvider` (deterministic hash, tests), `ClaudeCliProvider` (shells out to `claude -p ... --output-format json`; working), `OllamaProvider` (stub — raises NotImplementedError). Factory: `get_provider(name: str) -> LLMProvider`.
+`LLMProvider` ABC with `generate(prompt: str, *, system: str | None = None) -> str` + `chat(messages, *, tools, options) -> ChatResponse` + `name() -> str` + `healthy() -> bool`. Four implementations:
+- `FakeProvider` — deterministic hash, tests
+- `ClaudeCliProvider` — subprocess against `claude -p ... --output-format json`; tool-calling via `--json-schema` discriminated-union schema (subscription, no API tokens)
+- `OllamaProvider` — full httpx port from OG; native tool-calling via Ollama's `/api/chat` `tools` field; default model `huihui_ai/qwen2.5-abliterated:7b`
+- `ProviderError(stage, detail)` exception with forensic stage context
 
-**Critical gap:** The interface is `generate(prompt: str)` — raw string in, raw string out. OG's provider interface is `chat(messages: list[dict], tools: list[dict]) -> {content, tool_calls, raw}`. Structured messages and tool-call support are absent. The chat engine cannot be built on the current interface without rethinking it. **Status: 🔧 Needs refactor (structured messages + tool-call support — Gap 1).**
+Factory: `get_provider(name: str) -> LLMProvider`. Companion types in `brain/bridge/chat.py`: `ChatMessage` (frozen, with optional `tool_call_id` + `tool_calls` tuple), `ToolCall` (id/name/arguments with robust `from_provider_dict`), `ChatResponse` (content + tool_calls + raw).
 
-Tests: 1 test file (`tests/unit/brain/bridge/test_provider.py`).
+**Status: ✅ Solid as of 2026-04-27** — SP-1 (PR #21) added the chat() interface; SP-3 (PR #23) layered Claude `--json-schema` tool-calling. Both Ollama (native) and Claude (subscription via JSON-schema) are first-class tool-capable providers.
+
+Tests: 3 test files (`test_provider.py`, `test_chat.py`, `test_provider_chat.py`).
 
 ### 3.8 `brain/search/`
 
@@ -303,7 +309,7 @@ Tests: 2 test files under `tests/unit/brain/search/`.
 
 ### 3.9 `brain/cli.py`
 
-Entry point: `nell <subcommand>`. Wired subcommands: `dream`, `heartbeat`, `reflex`, `research`, `migrate`, `growth log`, `health show/check/acknowledge`, `interest list`. Stub subcommands: `supervisor`, `status`, `rest`, `soul`, `memory`, `works`. Provider/searcher resolution via `_resolve_routing()` (CLI flag overrides persona config). Principle audit flags several flag shapes for cleanup (PR-A: drop `--interest`, `--seed`/`--depth`/`--decay`/`--limit`/`--lookback` from user surface). **Status: 🔧 Needs refactor (principle audit PR-A cleanup outstanding).**
+Entry point: `nell <subcommand>`. Wired subcommands: `dream`, `heartbeat`, `reflex`, `research`, `migrate`, `growth log`, `health show/check/acknowledge`, `interest list`. Stub subcommands: `supervisor`, `status`, `rest`, `soul`, `memory`, `works`. Provider/searcher resolution via `_resolve_routing()` (CLI flag overrides persona config). Principle audit flags several flag shapes for cleanup (PR-A: drop `--interest`, `--seed`/`--depth`/`--decay`/`--limit`/`--lookback` from user surface). **Status: ✅ Solid as of 2026-04-27** — principle audit PR-A landed (PR #13: dropped user-facing knob flags). New CLI subcommands shipped across SP-3/SP-5/SP-6: `chat`, `soul list/revoke/candidates/audit/review`, `health show/check/acknowledge`, `growth log`. Stub commands (`status`, `rest`, `supervisor`, `memory`, `works`) remain as placeholders for future work.
 
 ### 3.10 `brain/persona_config.py`, `brain/user_preferences.py`, `brain/paths.py`, `brain/utils/`
 
@@ -323,7 +329,17 @@ Entry point: `nell <subcommand>`. Wired subcommands: `dream`, `heartbeat`, `refl
 
 ## 4. The Five Gaps
 
-These are the design gaps that must be closed before a first chat turn is possible. Source: `docs/superpowers/audits/2026-04-26-og-nellbrain-inventory.md` Section 6.
+These were the design gaps that had to be closed before a first chat turn was possible. **All five closed as of 2026-04-27 via SP-1 through SP-6.** Source: `docs/superpowers/audits/2026-04-26-og-nellbrain-inventory.md` Section 6.
+
+| Gap | Status | Closed by |
+|-----|--------|-----------|
+| 1. Provider interface mismatch | ✅ Closed | SP-1 (PR #21) added `chat()` + ChatResponse; SP-3 (PR #23) layered Claude `--json-schema` tool-calling |
+| 2. Daemon-state residue plumbing | ✅ Closed | SP-2 (PR #22) ships `brain/engines/daemon_state.py` + heartbeat tick writer |
+| 3. Conversation ingest pipeline | ✅ Closed | SP-4 (PR #24) ships `brain/ingest/` with full 8-stage pipeline |
+| 4. Soul model entirely absent | ✅ Closed | SP-5 (PR #25) ships `brain/soul/` with `Crystallization` + `SoulStore` (SQLite) + autonomous review |
+| 5. Nine brain tools need rewriting | ✅ Closed | SP-3 (PR #23) ships `brain/tools/` with verbatim schemas + dispatch + 5 working impls + 4 stubs (2 replaced in SP-5) |
+
+The detailed gap analyses below are preserved as historical record — they document what we knew before the sub-projects shipped, and the concrete fixes that landed.
 
 ### Gap 1: Provider Interface Mismatch
 
@@ -395,36 +411,38 @@ These are the design gaps that must be closed before a first chat turn is possib
 | memory/hebbian.py | `brain/memory/hebbian.py` | ✅ Solid | Port of F32/F33; SQLite > numpy matrix |
 | memory/embeddings.py | `brain/memory/embeddings.py` | ✅ Solid | Port of F10 semantic search |
 | memory/search.py | `brain/memory/search.py` | ✅ Solid | 4-pass recall mirroring OG tool; clean |
-| engines/dream.py | `brain/engines/dream.py` | 🔧 Needs refactor | Works but: (a) principle audit PR-A (move spreading params to constructor); (b) no daemon_state.json writer (Gap 2) |
-| engines/heartbeat.py | `brain/engines/heartbeat.py` | ➕ Needs expansion | Works; needs daemon_state.json merge-writer (Gap 2) |
-| engines/reflex.py | `brain/engines/reflex.py` | ➕ Needs expansion | Works; needs daemon_state.json partial update (Gap 2) |
-| engines/research.py | `brain/engines/research.py` | 🔧 Needs refactor | Works; principle audit PR-A requires dropping `forced_interest_topic` from engine API |
+| engines/dream.py | `brain/engines/dream.py` | ✅ Solid | Principle audit PR-A landed (PR #13); SP-2 daemon_state writer landed (PR #22) |
+| engines/heartbeat.py | `brain/engines/heartbeat.py` | ✅ Solid | SP-2 daemon_state merge-writer landed (PR #22); cross-file walk + anomaly aggregation in place |
+| engines/reflex.py | `brain/engines/reflex.py` | ✅ Solid | SP-2 daemon_state writer landed (PR #22) |
+| engines/research.py | `brain/engines/research.py` | ✅ Solid | Principle audit PR-A removed `forced_interest_topic` (PR #13); SP-2 daemon_state writer (PR #22) |
 | engines/_interests.py | `brain/engines/_interests.py` | ✅ Solid | Clean port of nell_interests.py |
+| engines/daemon_state.py | `brain/engines/daemon_state.py` | 🆕 New | SP-2 — DaemonFireEntry/EmotionalResidue/DaemonState; cross-process artifact connecting engines to chat |
 | growth/log.py | `brain/growth/log.py` | 🆕 New | Better than OG — append-only biography, no approval queue |
 | growth/scheduler.py | `brain/growth/scheduler.py` | 🆕 New | Atomic apply + rejects invalid proposals; no equivalent in OG |
 | growth/proposal.py | `brain/growth/proposal.py` | 🆕 New | Type contract; Phase 2b crystallizers return this |
 | growth/crystallizers/vocabulary.py | `brain/growth/crystallizers/vocabulary.py` | 🆕 New (stub) | Phase 2a stub; Phase 2b mines memories for proposals |
-| health/attempt_heal.py | `brain/health/attempt_heal.py` | 🆕 New | Active self-healing vs. OG's report-only F9/F20 |
+| health/attempt_heal.py | `brain/health/attempt_heal.py` | 🆕 New | Active self-healing vs. OG's report-only F9/F20; `attempt_heal_text` added in SP-6 for voice.md |
 | health/adaptive.py | `brain/health/adaptive.py` | 🆕 New | Adaptive backup depth — no OG equivalent |
 | health/reconstruct.py | `brain/health/reconstruct.py` | 🆕 New | Identity-preserving reconstruction — no OG equivalent |
-| health/walker.py | `brain/health/walker.py` | 🆕 New | Proactive persona scan |
+| health/walker.py | `brain/health/walker.py` | 🆕 New | Proactive persona scan; covers atomic-rewrite JSON + voice.md text + 3 SQLite databases (memories/hebbian/crystallizations) |
 | health/alarm.py | `brain/health/alarm.py` | 🆕 New | Computed from audit log — no recursive corruption risk |
 | health/anomaly.py | `brain/health/anomaly.py` | 🆕 New | BrainAnomaly + AlarmEntry types |
 | health/jsonl_reader.py | `brain/health/jsonl_reader.py` | 🆕 New | Shared append-only log reader |
-| bridge/provider.py | `brain/bridge/provider.py` | 🔧 Needs refactor | Gap 1: generate(prompt) → must add chat(messages, tools) for chat engine |
+| bridge/provider.py | `brain/bridge/provider.py` | ✅ Solid | SP-1 added `chat(messages, tools)` (PR #21); SP-3 added Claude `--json-schema` tool-calling (PR #23) |
+| bridge/chat.py | `brain/bridge/chat.py` | 🆕 New | SP-1 — ChatMessage/ToolCall/ChatResponse + ProviderError |
 | search/base.py + ddgs + claude_tool | `brain/search/` | 🆕 New | Cleaner abstraction than OG's inline DuckDuckGo calls |
 | migrator/ | `brain/migrator/` | ✅ Solid | One-time tool; migration complete |
-| cli.py | `brain/cli.py` | 🔧 Needs refactor | Principle audit PR-A: several flag shapes need cleanup |
+| cli.py | `brain/cli.py` | ✅ Solid | Principle audit PR-A landed; SP-3/5/6 added new subcommands (chat, soul ×5, growth log, health ×3) |
 | persona_config.py | `brain/persona_config.py` | ✅ Solid | PR-B compliant; health-integrated |
 | user_preferences.py | `brain/user_preferences.py` | ✅ Solid | PR-C compliant; the GUI's only writable surface |
 | paths.py | `brain/paths.py` | ✅ Solid | Simple; stable |
 | utils/ | `brain/utils/` | ✅ Solid | TZ-aware UTC throughout; shared utilities |
-| soul/ | (missing) | ❌ Missing | Gap 4 — no soul model at all; critical for chat identity |
-| chat/ | (missing) | ❌ Missing | Gaps 1-3, 5 — no session, no tool loop, no conversation pipeline |
-| tools/ | (missing) | ❌ Missing | Gap 5 — no brain-tool schemas or dispatch |
-| daemon_state.json writer | (missing) | ❌ Missing | Gap 2 — engines write no shared residue artifact |
+| soul/ | `brain/soul/` | 🆕 New | SP-5 — Crystallization + SoulStore (SQLite) + LOVE_TYPES (27) + autonomous review_pending_candidates + revoke + audit (PR #25) |
+| chat/ | `brain/chat/` | 🆕 New | SP-6 keystone — voice.md loader + system message builder + SessionState + tool_loop + respond() (PR #26) |
+| tools/ | `brain/tools/` | 🆕 New | SP-3 — 9-tool schemas + dispatch + impls calling new framework APIs (PR #23) |
+| ingest/ | `brain/ingest/` | 🆕 New | SP-4 — 8-stage BUFFER→COMMIT→SOUL pipeline turning chats into structured memories (PR #24) |
 
-**Module audit summary:** 22 ✅ Solid / 6 🔧 Needs refactor / 3 ➕ Needs expansion / 8 🆕 New (better than OG) / 3 ❌ Missing
+**Module audit summary (current as of 2026-04-27):** 22 ✅ Solid (was 22; 4 🔧 promoted to ✅ after SP work landed) / 0 🔧 Needs refactor (all 6 closed) / 0 ➕ Needs expansion (all 3 closed via SP-2) / 14 🆕 New (8 from health + 4 new packages from SP-1..SP-6 + daemon_state + voice/text-heal extension) / 0 ❌ Missing (all 3 closed by SP-3/SP-5/SP-6, plus daemon_state by SP-2 + ingest by SP-4)
 
 ---
 
@@ -434,7 +452,8 @@ Ordered by dependency. Later sub-projects cannot ship cleanly without earlier on
 
 ### SP-1: Provider Interface Rework
 
-**Status:** 🔧 In scope — not started
+**Status:** ✅ Shipped — PR #21, commit `c175609`, 2026-04-26
+**Outcome:** `chat(messages, *, tools, options) -> ChatResponse` shipped on `LLMProvider` alongside existing `generate()`. `OllamaProvider.chat()` is full OG port (httpx-based, tools + options support, parses tool_calls). `ClaudeCliProvider.chat()` flattens messages into Claude CLI's text surface (tool-calling later layered via `--json-schema` in SP-3). 44 net new tests.
 **Dependency:** Blocks SP-3, SP-6, SP-7. SP-4 and SP-5 are independent.
 
 **Scope:** Extend `brain/bridge/provider.py` to add `chat(messages: list[dict], *, tools: list[dict] | None = None) -> ChatResponse` alongside the existing `generate()`. `ChatResponse` carries `{content: str, tool_calls: list[dict]}`. Implement `ClaudeCliProvider.chat()` — the Claude CLI supports `--input-format json` for structured message input; wire it. Implement `FakeProvider.chat()` — deterministic response, zero tool_calls. OG reference: `NellBrain/nell_bridge_providers.py:OllamaProvider` (the fully working tool-call implementation). New file: `brain/bridge/chat.py` (`ChatResponse`, `ChatMessage` types). Do NOT touch `generate()` — engines use it and it works.
@@ -446,7 +465,8 @@ Ordered by dependency. Later sub-projects cannot ship cleanly without earlier on
 
 ### SP-2: Daemon-State Residue Writer
 
-**Status:** 🔧 In scope — not started
+**Status:** ✅ Shipped — PR #22, commit `9620c56`, 2026-04-26
+**Outcome:** `brain/engines/daemon_state.py` ships `DaemonFireEntry`, `EmotionalResidue`, `DaemonState` frozen dataclasses + `load_daemon_state` (auto-heal via attempt_heal) + `update_daemon_state` (per-fire atomic) + `get_residue_context` (prompt-ready string of recent fires). Heartbeat tick writes per-engine entries fault-isolated; dry-run skips writes. 33 net new tests.
 **Dependency:** Independent — can land before or after SP-1. SP-6 depends on it.
 
 **Scope:** Define `DaemonState` dataclass in new file `brain/engines/daemon_state.py`. Fields: `emotional_residue: {emotion: str, intensity: float, decays_by: str}`, `last_dream: str | None` (≤220 chars), `last_heartbeat: str | None` (≤180 chars), `last_reflex: str | None`, `updated_at: str`. Add `write_daemon_state(persona_dir, partial_update)` helper — merges partial update into existing `daemon_state.json` and saves via `save_with_backup`. Heartbeat (`run_tick()`) calls `write_daemon_state()` at the end of each tick, merging summaries from dream/reflex/research sub-calls. Dream engine's `run_cycle()` returns a summary string; heartbeat writes it. This is the connection between the autonomous engine life and the chat layer.
@@ -458,7 +478,8 @@ Ordered by dependency. Later sub-projects cannot ship cleanly without earlier on
 
 ### SP-3: Brain-Tools Rewrite
 
-**Status:** ❌ Not started
+**Status:** ✅ Shipped — PR #23, commit `e7bf67f`, 2026-04-26
+**Outcome:** `brain/tools/` package ships with `schemas.py` (verbatim 9-tool port from OG `nell_tools.py`), `dispatch.py` (arg validation + ToolDispatchError), `impls/` (5 working: get_emotional_state, search_memories, add_journal, add_memory with write-gate, boot; 4 stubs: get_personality, get_body_state, get_soul, crystallize_soul — last two replaced in SP-5). `ClaudeCliProvider.chat()` gains `--json-schema` tool-calling — Claude is now first-class tool-capable on subscription, no API tokens. 49 net new tests.
 **Dependency:** SP-1 (needs `ChatResponse` type) + SP-5 (needs `SoulStore` for `get_soul`, `crystallize_soul`). `get_emotional_state`, `get_personality`, `search_memories`, `add_memory`, `boot` can land before SP-5; `get_soul`, `crystallize_soul` wait for SP-5. `get_body_state` can stub to defaults until a body-state module lands (not on the near roadmap).
 
 **Scope:** Create `brain/tools/` package. `schemas.py` ports 9 tool JSON schemas from OG's `nell_tools.py:SCHEMAS` — these are provider-agnostic and can be copied verbatim. `dispatch.py` maps tool name → implementation. `impls/` directory: one module per tool, each calling the new `brain/` APIs instead of `nell_brain.py`. Write-gate logic: `add_memory` requires `emotion_score ≥ 15 OR importance ≥ 7`; `add_journal` ungated. `boot` returns the composition of `get_emotional_state` + `get_personality` + `get_soul` (stub until SP-5) + `get_body_state` (stub). Each impl is pure Python — no LLM calls; all calls go through `MemoryStore`, `SoulStore`, etc.
@@ -478,7 +499,8 @@ SP-3 brainstorm picks one (or implements both with `--mcp-config` as the product
 
 ### SP-4: Conversation Ingest Pipeline
 
-**Status:** ❌ Not started
+**Status:** ✅ Shipped — PR #24, commit `a310173`, 2026-04-26
+**Outcome:** `brain/ingest/` package ships full 8-stage pipeline (BUFFER → CLOSE → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG). Per-persona `active_conversations/<session_id>.jsonl` buffers; LLM-based extraction with one-retry; cosine-similarity dedupe (opt-in via `embeddings=`); direct MemoryStore writes (bypasses add_memory gate — ingest has its own importance signal); soul candidates marked `auto_pending` (not for human approval). Auto-Hebbian via keyword extraction. 41 net new tests.
 **Dependency:** SP-3 (uses `add_memory` tool path for COMMIT stage). SOUL stage depends on SP-5 (produces soul_candidates; can stub to noop until SP-5 lands). Otherwise independent from SP-1/SP-2.
 
 **Scope:** Create `brain/chat/ingest.py` implementing the 8-stage pipeline. BUFFER: `{persona_dir}/sessions/{session_id}.jsonl` accumulates raw turns as JSON lines. CLOSE: session flagged inactive. EXTRACT: LLM call (via `LLMProvider.generate()`) extracts candidate items from transcript — system prompt asks for JSON array of `{content, importance, emotion_score, tags, domain}`. SCORE: re-rank by importance. DEDUPE: cosine ≥ 0.88 against recent memories via `brain/memory/embeddings.py`. COMMIT: for each deduplicated candidate with score meeting write gate, call `MemoryStore.add()`. SOUL: importance ≥ 8 → append to `{persona_dir}/soul_candidates.jsonl`. LOG: behavioral log entry.
@@ -492,7 +514,8 @@ Trigger: called by SP-7's bridge daemon when a session goes silent for 5 minutes
 
 ### SP-5: Soul Model
 
-**Status:** ❌ Not started
+**Status:** ✅ Shipped — PR #25, commit `1deada7`, 2026-04-26
+**Outcome:** `brain/soul/` package: `LOVE_TYPES` (27 entries, verbatim port + F37 `identity` extension), `Crystallization` frozen dataclass, SQLite-backed `SoulStore` with PRAGMA integrity_check on open, autonomous `review_pending_candidates` consuming SP-4's `soul_candidates.jsonl` (confidence-rail + parse-failure-defer + dry-run + audit log). Soft-delete via `revoke_crystallization`. SP-3's `get_soul` and `crystallize_soul` stubs replaced with real impls. New CLI: `nell soul review/list/revoke/candidates/audit`. 33 net new tests.
 **Dependency:** Independent of SP-1/SP-2/SP-3/SP-4. Can land in parallel with any of them. SP-3 and SP-4 have stubs waiting for it.
 
 **Scope:** Create `brain/soul/` package. `soul.py`: `LoveType` enum (12 values from OG: love, grief, longing, wonder, shame, defiance, devotion, fear, pride, tenderness, connection, identity); `SoulCrystallization` frozen dataclass (id, moment, love_type, who_or_what, why_it_matters, crystallized_at, resonance, permanent); `Soul` container (first_love, soul_truth, crystallizations: list, revoked: list — revoked is always empty by design). `store.py`: `SoulStore` over `{persona_dir}/soul.json` — `load_with_anomaly` + `save_with_backup` + `add_crystallization(c)` + `list_permanent()` + `all_crystallizations()`. `candidates.py`: `CandidateQueue` over `{persona_dir}/soul_candidates.jsonl` — append + list + mark_reviewed. Wire into health module per `brain/health` spec Section 9.1 (soul.json in walker._DEFAULTS + alarm._IDENTITY_FILES + reconstruct_soul_from_memories()).
@@ -504,7 +527,8 @@ Trigger: called by SP-7's bridge daemon when a session goes silent for 5 minutes
 
 ### SP-6: Chat Engine
 
-**Status:** ❌ Not started
+**Status:** ✅ Shipped — PR #26, commit `ef444be`, 2026-04-27 (the keystone)
+**Outcome:** `brain/chat/` package: `voice.py` (voice.md loader with auto-heal + 4-section default template), `prompt.py` (build_system_message composing AS_NELL_PREAMBLE + voice.md + emotion state + daemon residue from SP-2 + soul highlights from SP-5), `session.py` (SessionState with 20-turn-pair cap, in-memory registry), `tool_loop.py` (run_tool_loop with max 4 iterations + forced no-tools final pass), `engine.py` (the `respond()` keystone that integrates all five prior sub-projects). Health module gains `attempt_heal_text()` for plain-text identity files. CLI: `nell chat --persona X` (REPL + one-shot). Live sandbox smoke confirmed end-to-end working. 49 net new tests.
 **Dependency:** SP-1 (structured messages + tool_calls), SP-2 (daemon_state.json reader), SP-3 (tool dispatch), SP-5 (soul in system message). SP-4 is not strictly required for first chat turn (conversations can evaporate initially) but should land before public ship.
 
 **Scope:** Create `brain/chat/engine.py` implementing the core chat turn. Session management: `SessionState` (UUIDv4, history: list of turn pairs, 20-turn cap, auto-truncated). System message builder: preamble (hardcoded "you are X, speaking directly to Y") + residue prefix (reads `daemon_state.json` via `attempt_heal`) + soul/self-model injection (reads `SoulStore.list_permanent()` — replaces OG's Modelfile SYSTEM block approach). History builder: SessionState history → structured message list. Tool loop (up to 4 iterations): `provider.chat(messages, tools=NELL_TOOLS)` → if tool_calls, dispatch each via `brain/tools/dispatch.py` → append tool result message → retry. Response return: `ChatResponse` carrying content + tool_calls + metadata (duration_ms, turn, tool_iterations). Optionally: response pipeline (NFF fragment filter port from `NellBrain/nell_bridge_pipeline.py`).

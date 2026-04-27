@@ -60,7 +60,9 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         break  # load_voice checks voice.md by name; only one text file for now
 
     # SQLite integrity — constructor runs PRAGMA integrity_check; catch failures.
-    for db_name in ("memories.db", "hebbian.db"):
+    # When SP-5 (soul) added crystallizations.db, walker needs to scan it too —
+    # otherwise corrupt soul data goes undetected by `nell health check`.
+    for db_name in ("memories.db", "hebbian.db", "crystallizations.db"):
         db_path = persona_dir / db_name
         if not db_path.exists():
             continue
@@ -69,10 +71,14 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
                 from brain.memory.store import MemoryStore
 
                 MemoryStore(db_path=db_path).close()
-            else:
+            elif db_name == "hebbian.db":
                 from brain.memory.hebbian import HebbianMatrix
 
                 HebbianMatrix(db_path=db_path).close()
+            else:  # crystallizations.db
+                from brain.soul.store import SoulStore
+
+                SoulStore(db_path=db_path).close()
         except BrainIntegrityError as exc:
             anomalies.append(
                 BrainAnomaly(
