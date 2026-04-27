@@ -186,9 +186,20 @@ Scans `memories.db` for distinct emotion names referenced in any memory's `emoti
 
 Computed on-demand from the audit log; no separate state file (one source of truth, no recursive corruption risk). Returns `list[AlarmEntry]` representing the union of:
 
-- Files with ≥3 anomalies in the last 7 days (after adaptive treatment was already in effect).
+- **Files with ≥6 anomalies in the last 7 days** (recurring corruption surviving Layer 2 adaptation — see threshold note below).
 - Files where reconstruction failed and reset-to-default fired on an identity-critical file.
 - SQLite integrity check failures.
+
+**Threshold note — two distinct counts, not to be conflated:**
+
+The brain-health module uses **two different anomaly-count thresholds** that can read like the same number if you're skimming. They are intentionally distinct:
+
+| Threshold | Code location | Trigger | Rule |
+|-----------|---------------|---------|------|
+| **Bump threshold** | `brain/health/adaptive.py:BUMP_THRESHOLD = 3` | Adaptive treatment activates | ≥3 anomalies in 7d → backup_count goes 3 → 6 + verify-after-write enabled |
+| **Alarm threshold** | `brain/health/alarm.py` (≥6 check in `compute_pending_alarms`) | Persistent CLI banner | ≥6 anomalies in 7d → alarm fires (the file kept corrupting *even after adaptation*) |
+
+Layer 2 (adaptive) catches recurring corruption early and reacts; Layer 3 (alarm) only fires when adaptation itself isn't enough. A file that hits 3 anomalies and then stops corrupting (because the elevated backup-depth + verify-after-write does its job) never reaches the alarm — that's the success case. A file that keeps corrupting past 6 in the same window is the genuine alarm case: something deeper is wrong (disk hardware, framework bug) and the user needs to know.
 
 The persistent CLI banner reads `pending_alarms` and prints until `nell health acknowledge` writes a `user_acknowledged` entry that suppresses the alarm in the next computation.
 
