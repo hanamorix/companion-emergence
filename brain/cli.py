@@ -753,6 +753,109 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _chat_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell chat` to the chat engine.
+
+    One-shot mode (message provided): `nell chat --persona X "message"`
+    Interactive REPL mode: `nell chat --persona X`
+
+    The REPL keeps a single SessionState across turns.  On exit (EOF / 'exit' /
+    'quit') it flushes the conversation through the ingest pipeline best-effort
+    and prints a summary.
+    """
+    from brain.chat.engine import respond
+    from brain.chat.session import create_session
+    from brain.ingest.pipeline import close_session
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(
+            f"No persona directory at {persona_dir}. "
+            "If you're porting existing OG NellBrain data, run `nell migrate "
+            f"--input /path/to/og/data --install-as {args.persona}`. "
+            f"Otherwise create {persona_dir} manually to start a fresh persona."
+        )
+
+    provider_name, _ = _resolve_routing(persona_dir, args)
+
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        from brain.emotion.persona_loader import load_persona_vocabulary
+
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        try:
+            provider = get_provider(provider_name)
+
+            # One-shot mode
+            message = getattr(args, "message", None)
+            if message:
+                result = respond(
+                    persona_dir,
+                    message,
+                    store=store,
+                    hebbian=hebbian,
+                    provider=provider,
+                )
+                print(result.content)
+                return 0
+
+            # Interactive REPL mode
+            session = create_session(args.persona)
+            total_tool_calls = 0
+            try:
+                while True:
+                    try:
+                        user_input = input("> ")
+                    except EOFError:
+                        break
+                    user_input = user_input.strip()
+                    if user_input.lower() in ("exit", "quit"):
+                        break
+                    if not user_input:
+                        continue
+                    result = respond(
+                        persona_dir,
+                        user_input,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                        session=session,
+                    )
+                    print(result.content)
+                    print()
+                    total_tool_calls += len(result.tool_invocations)
+            finally:
+                # Flush conversation through ingest pipeline (best-effort)
+                try:
+                    close_session(
+                        persona_dir,
+                        session.session_id,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(
+                        f"Session ingest flush failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=1,
+                    )
+                # Summary
+                print(
+                    f"\nSession ended. {session.turns} turn(s), "
+                    f"{total_tool_calls} tool call(s) used."
+                )
+        finally:
+            hebbian.close()
+    finally:
+        store.close()
+
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -1035,6 +1138,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=20, help="Show only the last N entries (default 20)."
     )
     sl_audit.set_defaults(func=_soul_audit_handler)
+
+    # nell chat — keystone chat engine (SP-6)
+    chat_sub = subparsers.add_parser(
+        "chat",
+        help="Chat with a persona. One-shot or interactive REPL.",
+    )
+    chat_sub.add_argument(
+        "--persona",
+        required=True,
+        help=(
+            "Persona name (required). "
+            "To port existing OG NellBrain data: `nell migrate --input /path/to/og/data "
+            "--install-as <name>`. To start fresh: create personas/<name>/ manually."
+        ),
+    )
+    chat_sub.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "Defaults to the value in {persona}/persona_config.json."
+        ),
+    )
+    chat_sub.add_argument(
+        "message",
+        nargs="?",
+        default=None,
+        help="Single message for one-shot mode. Omit for interactive REPL.",
+    )
+    chat_sub.set_defaults(func=_chat_handler)
 
     # nell soul review
     sl_review = soul_actions.add_parser(
