@@ -798,6 +798,26 @@ def _chat_handler(args: argparse.Namespace) -> int:
                     provider=provider,
                 )
                 print(result.content)
+                # Flush conversation through ingest pipeline (best-effort).
+                # Mirrors the REPL's finally block — without this, every
+                # one-shot reply orphans its buffer file and no memories
+                # ever commit (live-exercise 2026-04-27 surfaced the bug).
+                try:
+                    close_session(
+                        persona_dir,
+                        result.session_id,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(
+                        f"Session ingest flush failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=1,
+                    )
                 return 0
 
             # Interactive REPL mode
