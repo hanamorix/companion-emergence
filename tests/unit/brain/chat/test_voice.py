@@ -10,13 +10,45 @@ from brain.health.attempt_heal import attempt_heal_text
 # ── DEFAULT_VOICE_TEMPLATE shape ──────────────────────────────────────────────
 
 
-def test_default_voice_template_has_four_sections() -> None:
-    """The template must contain all 4 required section headers."""
+def test_default_voice_template_has_five_sections() -> None:
+    """The template must contain all 5 required section headers."""
     template = DEFAULT_VOICE_TEMPLATE
     assert "## 1. Who you are" in template
-    assert "## 2. What's in your head" in template
-    assert "## 3. How emotion shapes your voice" in template
-    assert "## 4. Your boundaries with the user" in template
+    assert "## 2. What's already in your head" in template
+    assert "## 3. Brain-tools — what you can fetch" in template
+    assert "## 4. How emotion shapes your voice" in template
+    assert "## 5. Your boundaries with the user" in template
+
+
+def test_default_voice_template_lists_all_brain_tools() -> None:
+    """Every brain-tool must be named in the template's tools section.
+
+    Without this, a fresh persona starts with no explicit tool-use guidance
+    and reproduces the 2026-04-27 confabulation failure (Nell's casual prompt
+    role-played a tool failure instead of calling search_memories).
+    """
+    from brain.tools import NELL_TOOL_NAMES
+
+    template = DEFAULT_VOICE_TEMPLATE
+    for name in NELL_TOOL_NAMES:
+        assert f"`{name}`" in template, (
+            f"missing brain-tool {name!r} in default voice template"
+        )
+
+
+def test_default_voice_template_states_load_bearing_rules() -> None:
+    """The three load-bearing tool-use rules must be present.
+
+    These are what make the persona actually call tools rather than narrating
+    around them. Persona authors can rephrase but should not delete them.
+    """
+    template = DEFAULT_VOICE_TEMPLATE
+    # 1. Proactive-use rule
+    assert "before you commit to an answer" in template
+    # 2. Anti-confabulation rule
+    assert "confabulating" in template
+    # 3. Anti-fake-failure rule
+    assert "narrating a refusal that never happened" in template
 
 
 # ── load_voice — healthy paths ────────────────────────────────────────────────

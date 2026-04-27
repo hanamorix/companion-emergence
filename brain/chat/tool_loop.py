@@ -20,6 +20,7 @@ from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
 from brain.tools.schemas import SCHEMAS
 
@@ -27,30 +28,17 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 4
 
-# The canonical tool list used in every chat turn.
-# Ported from OG NELL_TOOLS (nell_bridge.py:172-185).
-_NELL_TOOL_NAMES = (
-    "get_emotional_state",
-    "get_soul",
-    "get_personality",
-    "get_body_state",
-    "boot",
-    "search_memories",
-    "add_journal",
-    "add_memory",
-    "crystallize_soul",
-)
-
 
 def build_tools_list() -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
     Wraps schemas in the {"type": "function", "function": <schema>} shape
-    that Ollama and Claude (via --json-schema) both accept.
+    that Ollama accepts natively and the MCP server registers as tool
+    descriptions for the Claude path.
     """
     return [
         {"type": "function", "function": SCHEMAS[name]}
-        for name in _NELL_TOOL_NAMES
+        for name in NELL_TOOL_NAMES
         if name in SCHEMAS
     ]
 
@@ -94,7 +82,11 @@ def run_tool_loop(
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
 
     for _iteration in range(max_iterations):
-        last_response = provider.chat(messages, tools=tools)
+        last_response = provider.chat(
+            messages,
+            tools=tools,
+            options={"persona_dir": str(persona_dir)},
+        )
         if not last_response.tool_calls:
             return last_response, invocations
 

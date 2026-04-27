@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -87,7 +89,7 @@ def test_fake_provider_chat_different_messages_differ() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeCliProvider.chat
+# ClaudeCliProvider.chat — legacy text path (no tools)
 # ---------------------------------------------------------------------------
 
 
@@ -102,7 +104,7 @@ def _make_claude_result(content: str = "hello", rc: int = 0) -> MagicMock:
 
 def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
     """ClaudeCliProvider.chat uses -p for the flattened conversation."""
-    with patch("subprocess.run", return_value=_make_claude_result()) as mock_run:
+    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
         p = ClaudeCliProvider(model="sonnet")
         p.chat([ChatMessage(role="user", content="hello")])
 
@@ -114,7 +116,7 @@ def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
 
 def test_claude_cli_chat_passes_system_prompt_flag() -> None:
     """System message in the list → --system-prompt flag."""
-    with patch("subprocess.run", return_value=_make_claude_result()) as mock_run:
+    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
         p = ClaudeCliProvider()
         p.chat(
             [
@@ -130,7 +132,7 @@ def test_claude_cli_chat_passes_system_prompt_flag() -> None:
 
 def test_claude_cli_chat_parses_success() -> None:
     """Successful call returns ChatResponse with correct content."""
-    with patch("subprocess.run", return_value=_make_claude_result("dream response")):
+    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result("dream response")):
         p = ClaudeCliProvider()
         resp = p.chat([ChatMessage(role="user", content="dream")])
 
@@ -146,7 +148,7 @@ def test_claude_cli_chat_nonzero_exit_raises_provider_error() -> None:
     bad.stdout = ""
     bad.stderr = "auth failure"
 
-    with patch("subprocess.run", return_value=bad):
+    with patch("brain.bridge.provider.subprocess.run", return_value=bad):
         p = ClaudeCliProvider()
         with pytest.raises(ProviderError) as exc_info:
             p.chat([ChatMessage(role="user", content="x")])
@@ -158,7 +160,7 @@ def test_claude_cli_chat_nonzero_exit_raises_provider_error() -> None:
 def test_claude_cli_chat_timeout_raises_provider_error() -> None:
     """Subprocess timeout → ProviderError("claude_cli_timeout", ...)."""
     with patch(
-        "subprocess.run",
+        "brain.bridge.provider.subprocess.run",
         side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=300),
     ):
         p = ClaudeCliProvider()
@@ -175,7 +177,7 @@ def test_claude_cli_chat_bad_json_raises_provider_error() -> None:
     bad.stdout = "not json at all"
     bad.stderr = ""
 
-    with patch("subprocess.run", return_value=bad):
+    with patch("brain.bridge.provider.subprocess.run", return_value=bad):
         p = ClaudeCliProvider()
         with pytest.raises(ProviderError) as exc_info:
             p.chat([ChatMessage(role="user", content="x")])
@@ -365,184 +367,306 @@ def test_get_provider_ollama_name_includes_model() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeCliProvider.chat — tool-calling via --json-schema (SP-3)
+# ClaudeCliProvider.chat — tool-calling via --mcp-config (SP-3 rewrite)
+#
+# Replaces the old --json-schema tests; the underlying provider was
+# rewritten to use --mcp-config (production path per master ref §6 SP-3
+# and 2026-04-27 stress-test finding).
 # ---------------------------------------------------------------------------
 
 
-def _make_schema_claude_result(
-    structured_output: dict,
-    rc: int = 0,
-) -> MagicMock:
-    """Build a mock subprocess result for the --json-schema path."""
-    m = MagicMock()
-    m.returncode = rc
-    m.stdout = json.dumps({"structured_output": structured_output})
-    m.stderr = ""
-    return m
+@pytest.fixture()
+def persona_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "persona"
+    d.mkdir()
+    return d
 
 
-_SAMPLE_TOOLS = [
-    {"name": "get_emotional_state", "description": "Get emotional state"},
-    {"name": "search_memories", "description": "Search memories"},
-]
-
-
-def test_claude_cli_chat_with_tools_includes_json_schema_flag() -> None:
-    """chat(tools=...) passes --json-schema flag in the subprocess command."""
-    mock_result = _make_schema_claude_result({"reply": "I feel fine"})
-
-    with patch("subprocess.run", return_value=mock_result) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
-        p.chat([ChatMessage(role="user", content="how do you feel?")], tools=_SAMPLE_TOOLS)
-
-    cmd = mock_run.call_args[0][0]
-    assert "--json-schema" in cmd
-
-
-def test_claude_cli_chat_with_tools_reply_path_returns_content() -> None:
-    """structured_output.reply path → ChatResponse with content, empty tool_calls."""
-    mock_result = _make_schema_claude_result({"reply": "I'm feeling well today."})
-
-    with patch("subprocess.run", return_value=mock_result):
-        p = ClaudeCliProvider()
-        resp = p.chat([ChatMessage(role="user", content="how are you?")], tools=_SAMPLE_TOOLS)
-
-    assert isinstance(resp, ChatResponse)
-    assert resp.content == "I'm feeling well today."
-    assert resp.tool_calls == ()
-
-
-def test_claude_cli_chat_with_tools_tool_calls_path_returns_tool_calls() -> None:
-    """structured_output.tool_calls path → ChatResponse with tool_calls populated."""
-    mock_result = _make_schema_claude_result(
-        {
-            "tool_calls": [
-                {
-                    "name": "get_emotional_state",
-                    "arguments": {},
-                },
-                {
-                    "name": "search_memories",
-                    "arguments": {"query": "hana"},
-                },
-            ]
-        }
+def _fake_proc(stdout: str, returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
 
-    with patch("subprocess.run", return_value=mock_result):
-        p = ClaudeCliProvider()
-        resp = p.chat(
-            [ChatMessage(role="user", content="what's in my brain?")], tools=_SAMPLE_TOOLS
+
+def test_chat_with_tools_passes_mcp_config_flag(persona_dir: Path) -> None:
+    """The new path must call claude with --mcp-config <tmp_path>."""
+    provider = ClaudeCliProvider()
+    captured: dict = {}
+
+    def _capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["mcp_config_path"] = cmd[cmd.index("--mcp-config") + 1]
+        return _fake_proc(json.dumps({"result": "hello back"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        response = provider.chat(
+            [
+                ChatMessage(role="system", content="you are nell"),
+                ChatMessage(role="user", content="hi"),
+            ],
+            tools=[{"name": "search_memories", "description": "search"}],
+            options={"persona_dir": str(persona_dir)},
         )
 
-    assert isinstance(resp, ChatResponse)
-    assert resp.content == ""
-    assert len(resp.tool_calls) == 2
-    assert resp.tool_calls[0].name == "get_emotional_state"
-    assert resp.tool_calls[1].name == "search_memories"
-    assert resp.tool_calls[1].arguments == {"query": "hana"}
-
-
-def test_claude_cli_chat_with_tools_missing_structured_output_falls_back_to_result(
-    caplog,
-) -> None:
-    """Missing structured_output but present `result` → graceful fallback.
-
-    Real-world failure observed 2026-04-27: a rich system prompt (Nell's
-    voice.md, ~17 KB) caused Claude to ignore the --json-schema envelope
-    and return a plain text reply via `result`. Earlier behavior raised
-    ProviderError, breaking chat. Fixed behavior: return ChatResponse with
-    content=result and empty tool_calls — Claude correctly answered, just
-    chose not to wrap in the schema.
-    """
-    import logging
-
-    caplog.set_level(logging.INFO)
-
-    plain = MagicMock()
-    plain.returncode = 0
-    plain.stdout = json.dumps({"result": "honestly? full. like the room when she walks in."})
-    plain.stderr = ""
-
-    with patch("subprocess.run", return_value=plain):
-        p = ClaudeCliProvider()
-        response = p.chat(
-            [ChatMessage(role="user", content="how are you feeling?")],
-            tools=_SAMPLE_TOOLS,
-        )
-
-    assert isinstance(response, ChatResponse)
-    assert "honestly? full" in response.content
+    assert response.content == "hello back"
     assert response.tool_calls == ()
-    # Fallback should log at INFO so we can observe how often Claude goes off-schema
-    assert any(
-        "off-schema" in r.getMessage() or "missing structured_output" in r.getMessage()
-        for r in caplog.records
-    )
+    # --mcp-config flag is present and points at a real json file (now unlinked,
+    # but we captured the path during the call)
+    assert "--mcp-config" in captured["cmd"]
+    assert captured["mcp_config_path"].endswith(".json")
 
 
-def test_claude_cli_chat_with_tools_no_structured_output_no_result_raises() -> None:
-    """Both structured_output AND result missing → ProviderError("claude_schema").
+def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
+    """The temp mcp.json must contain the right command + args."""
+    provider = ClaudeCliProvider()
+    captured: dict = {}
 
-    Genuine schema failure (e.g., transport corruption) still raises so the
-    chat engine surfaces the error rather than silently producing an empty
-    reply.
-    """
-    bad = MagicMock()
-    bad.returncode = 0
-    bad.stdout = json.dumps({"type": "result", "subtype": "success"})
-    bad.stderr = ""
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        # Read the temp file BEFORE the provider's finally block deletes it
+        captured["config"] = json.loads(Path(path).read_text())
+        return _fake_proc(json.dumps({"result": "ok"}))
 
-    with patch("subprocess.run", return_value=bad):
-        p = ClaudeCliProvider()
-        with pytest.raises(ProviderError) as exc_info:
-            p.chat(
-                [ChatMessage(role="user", content="x")],
-                tools=_SAMPLE_TOOLS,
-            )
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [
+                ChatMessage(role="system", content="sys"),
+                ChatMessage(role="user", content="hi"),
+            ],
+            tools=[{"name": "x", "description": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
 
-    assert exc_info.value.stage == "claude_schema"
-
-
-def test_claude_cli_chat_with_tools_empty_result_string_raises() -> None:
-    """result is empty string → still a real schema failure; raise."""
-    bad = MagicMock()
-    bad.returncode = 0
-    bad.stdout = json.dumps({"result": ""})
-    bad.stderr = ""
-
-    with patch("subprocess.run", return_value=bad):
-        p = ClaudeCliProvider()
-        with pytest.raises(ProviderError):
-            p.chat(
-                [ChatMessage(role="user", content="x")],
-                tools=_SAMPLE_TOOLS,
-            )
+    cfg = captured["config"]
+    assert "brain-tools" in cfg["mcpServers"]
+    server_cfg = cfg["mcpServers"]["brain-tools"]
+    assert server_cfg["command"] == sys.executable
+    assert server_cfg["args"][0] == "-m"
+    assert server_cfg["args"][1] == "brain.mcp_server"
+    assert "--persona-dir" in server_cfg["args"]
+    assert str(persona_dir) in server_cfg["args"]
 
 
-def test_claude_cli_chat_with_tools_schema_includes_tool_names_as_enum() -> None:
-    """_build_tool_call_schema embeds tool names as an enum in the schema."""
-    p = ClaudeCliProvider()
-    schema = p._build_tool_call_schema(_SAMPLE_TOOLS)
+def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
+    """The other flags (-p, --output-format, --model, --system-prompt)
+    must remain — only --json-schema is replaced."""
+    provider = ClaudeCliProvider()
+    captured: dict = {}
 
-    # Find the enum in the oneOf → tool_calls → items → properties → name
-    tool_calls_branch = None
-    for branch in schema["oneOf"]:
-        if "tool_calls" in branch.get("properties", {}):
-            tool_calls_branch = branch
-            break
+    def _capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_proc(json.dumps({"result": "ok"}))
 
-    assert tool_calls_branch is not None
-    name_schema = tool_calls_branch["properties"]["tool_calls"]["items"]["properties"]["name"]
-    assert "get_emotional_state" in name_schema["enum"]
-    assert "search_memories" in name_schema["enum"]
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [
+                ChatMessage(role="system", content="sys-prompt"),
+                ChatMessage(role="user", content="hi"),
+            ],
+            tools=[{"name": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
 
-
-def test_claude_cli_chat_no_tools_does_not_use_json_schema() -> None:
-    """chat() without tools= uses the legacy path (no --json-schema flag)."""
-    with patch("subprocess.run", return_value=_make_claude_result("hello")) as mock_run:
-        p = ClaudeCliProvider()
-        p.chat([ChatMessage(role="user", content="hi")])
-
-    cmd = mock_run.call_args[0][0]
+    cmd = captured["cmd"]
+    assert cmd[0] == "claude"
+    assert "-p" in cmd
+    assert "--output-format" in cmd
+    assert "json" in cmd
+    assert "--model" in cmd
+    assert "--system-prompt" in cmd
+    assert "sys-prompt" in cmd
+    # The replaced flag must NOT appear
     assert "--json-schema" not in cmd
+
+
+def test_chat_with_tools_passes_allowed_tools_for_each_brain_tool(persona_dir: Path) -> None:
+    """The cmd must include --allowedTools with every brain-tool enumerated.
+
+    Claude CLI's `-p` (non-interactive) mode blocks MCP tool calls unless
+    each is explicitly pre-approved. Without this flag, the MCP server starts
+    and tools are advertised but Claude refuses to call them — the same
+    mechanism gap the live-exercise stress test surfaced.
+    """
+    from brain.tools import NELL_TOOL_NAMES
+
+    provider = ClaudeCliProvider()
+    captured: dict = {}
+
+    def _capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_proc(json.dumps({"result": "ok"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    cmd = captured["cmd"]
+    assert "--allowedTools" in cmd
+    # Every NELL_TOOL_NAME must appear under the mcp__brain-tools__ namespace.
+    for name in NELL_TOOL_NAMES:
+        assert f"mcp__brain-tools__{name}" in cmd, (
+            f"missing --allowedTools entry for {name}"
+        )
+
+
+def test_chat_with_tools_parses_payload_result(persona_dir: Path) -> None:
+    provider = ClaudeCliProvider()
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(json.dumps({"result": "the actual reply"})),
+    ):
+        response = provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    assert response.content == "the actual reply"
+    assert response.tool_calls == ()
+
+
+def test_chat_with_tools_missing_result_key_raises_parse(persona_dir: Path) -> None:
+    provider = ClaudeCliProvider()
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(json.dumps({"different_key": "x"})),
+    ):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "claude_cli_parse"
+
+
+def test_chat_with_tools_nonzero_exit_raises_exit(persona_dir: Path) -> None:
+    provider = ClaudeCliProvider()
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc("", returncode=2, stderr="boom"),
+    ):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "claude_cli_exit"
+
+
+def test_chat_with_tools_missing_persona_dir_option_raises(tmp_path: Path) -> None:
+    """tools= without options['persona_dir'] is a programmer bug — fail fast."""
+    provider = ClaudeCliProvider()
+    with pytest.raises(ProviderError) as ei:
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "x"}],
+            options={},  # missing persona_dir
+        )
+    assert ei.value.stage == "mcp_unavailable"
+
+
+def test_chat_with_tools_cleans_up_temp_file(persona_dir: Path) -> None:
+    """The temp mcp.json file must be unlinked after the call returns."""
+    provider = ClaudeCliProvider()
+    captured_path: list[str] = []
+
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        captured_path.append(path)
+        return _fake_proc(json.dumps({"result": "ok"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    assert len(captured_path) == 1
+    assert not Path(captured_path[0]).exists()
+
+
+def test_chat_with_tools_cleans_up_temp_file_on_subprocess_error(persona_dir: Path) -> None:
+    """Temp file must be unlinked even when subprocess.run raises TimeoutExpired."""
+    provider = ClaudeCliProvider()
+    captured_path: list[str] = []
+
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        captured_path.append(path)
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=300)
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+
+    assert ei.value.stage == "claude_cli_timeout"
+    assert len(captured_path) == 1
+    assert not Path(captured_path[0]).exists()
+
+
+def test_chat_with_tools_missing_mcp_sdk_raises_mcp_unavailable(persona_dir: Path) -> None:
+    """If the mcp SDK is not installed, raise ProviderError('mcp_unavailable')."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "mcp":
+            raise ImportError("No module named 'mcp'")
+        return real_import(name, *args, **kwargs)
+
+    provider = ClaudeCliProvider()
+    with patch("builtins.__import__", side_effect=_fake_import):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "mcp_unavailable"
+    assert "pip install" in ei.value.detail
+
+
+def test_chat_with_tools_temp_file_write_failure_raises_setup(persona_dir: Path) -> None:
+    """OSError on the temp file write must surface as ProviderError('claude_cli_setup')."""
+    provider = ClaudeCliProvider()
+    with patch("brain.bridge.provider.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "claude_cli_setup"
+    assert "disk full" in ei.value.detail
+
+
+def test_chat_without_tools_unchanged(persona_dir: Path) -> None:
+    """When tools is None, the provider falls through the legacy text path —
+    no --mcp-config, no persona_dir requirement."""
+    provider = ClaudeCliProvider()
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(json.dumps({"result": "plain reply"})),
+    ) as mock_run:
+        response = provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=None,
+        )
+
+    assert response.content == "plain reply"
+    cmd = mock_run.call_args.args[0]
+    assert "--mcp-config" not in cmd
