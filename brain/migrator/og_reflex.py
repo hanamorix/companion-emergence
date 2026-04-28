@@ -1,4 +1,4 @@
-"""Extract OG reflex arc dicts from reflex_engine.py via AST.
+"""Extract OG reflex arc dicts from reflex_engine.py via AST, and migrate them.
 
 We parse the file's AST rather than importing it — the OG module's
 imports depend on nell_brain.py and other top-level modules that are
@@ -8,6 +8,9 @@ not available in the new framework's environment.
 from __future__ import annotations
 
 import ast
+import json
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -83,3 +86,78 @@ def _transform_og_arc(name: str, og: dict[str, Any]) -> dict[str, Any] | None:
         "output_memory_type": _OUTPUT_RENAMES.get(og["output"], og["output"]),
         "prompt_template": str(og["prompt_template"]),
     }
+
+
+def _default_arcs_path() -> Path:
+    """Return the bundled default_reflex_arcs.json shipped with the engines module."""
+    return Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
+
+
+def migrate_reflex_arcs(
+    persona_dir: Path,
+    *,
+    og_reflex_engine_path: Path | None = None,
+    force: bool = True,
+) -> list[dict[str, Any]]:
+    """Write (or update) reflex_arcs.json in `persona_dir` with provenance stamps.
+
+    Behaviour
+    ---------
+    - If `og_reflex_engine_path` is provided, extract arcs from OG source via AST.
+    - Otherwise, load the bundled ``default_reflex_arcs.json``.
+    - Stamp every arc with ``created_by="og_migration"`` and a ``created_at``
+      timestamp (ISO 8601 UTC).
+    - **Idempotent**: if ``reflex_arcs.json`` already exists, re-read it and
+      preserve the original ``created_at`` / ``created_by`` for any arc whose
+      name is already present.  Only newly introduced arc names get a fresh
+      ``created_at`` of *now*.
+    - Writes atomically via a ``.new`` temp file + ``os.replace``.
+
+    Returns the list of arc dicts written.
+    """
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    arcs_path = persona_dir / "reflex_arcs.json"
+
+    # 1. Build the source arc list (OG extraction or default bundled arcs).
+    if og_reflex_engine_path is not None:
+        source_arcs: list[dict[str, Any]] = extract_arcs_from_og(og_reflex_engine_path)
+    else:
+        default_data = json.loads(_default_arcs_path().read_text(encoding="utf-8"))
+        source_arcs = list(default_data.get("arcs", []))
+
+    # 2. Load existing arcs (for idempotency — preserve created_at/created_by).
+    existing_by_name: dict[str, dict[str, Any]] = {}
+    if arcs_path.exists():
+        try:
+            existing_data = json.loads(arcs_path.read_text(encoding="utf-8"))
+            for a in existing_data.get("arcs", []):
+                if isinstance(a, dict) and "name" in a:
+                    existing_by_name[a["name"]] = a
+        except (json.JSONDecodeError, OSError):
+            pass  # corrupt existing file — treat as empty, re-stamp everything
+
+    # 3. Stamp each arc with provenance.
+    now_iso = datetime.now(UTC).isoformat()
+    arcs_to_write: list[dict[str, Any]] = []
+    for arc in source_arcs:
+        arc_dict = dict(arc)  # copy — don't mutate source
+        existing = existing_by_name.get(arc_dict.get("name", ""))
+        if existing is not None and "created_at" in existing:
+            # Already stamped on a previous migration run — preserve the original.
+            arc_dict["created_by"] = existing.get("created_by", "og_migration")
+            arc_dict["created_at"] = existing["created_at"]
+        else:
+            # First time seeing this arc — stamp now.
+            arc_dict.setdefault("created_by", "og_migration")
+            arc_dict.setdefault("created_at", now_iso)
+        arcs_to_write.append(arc_dict)
+
+    # 4. Atomic write.
+    tmp_path = arcs_path.with_suffix(arcs_path.suffix + ".new")
+    tmp_path.write_text(
+        json.dumps({"version": 1, "arcs": arcs_to_write}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, arcs_path)
+
+    return arcs_to_write

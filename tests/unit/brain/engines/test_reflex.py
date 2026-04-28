@@ -581,3 +581,73 @@ def test_run_tick_days_since_human_gate(tmp_path: Path):
         assert any(s.reason == "days_since_human_too_low" for s in result.arcs_skipped)
     finally:
         store.close()
+
+
+# ---- ReflexArc provenance (Phase 2) ----
+
+
+def test_reflex_arc_has_created_by_field():
+    arc = ReflexArc(
+        name="creative_pitch",
+        description="creative hunger overwhelmed",
+        trigger={"creative_hunger": 8.0},
+        days_since_human_min=0.0,
+        cooldown_hours=48.0,
+        action="generate_pitch",
+        output_memory_type="reflex_pitch",
+        prompt_template="...",
+        created_by="brain_emergence",
+        created_at=datetime(2026, 4, 28, tzinfo=UTC),
+    )
+    assert arc.created_by == "brain_emergence"
+    assert arc.created_at == datetime(2026, 4, 28, tzinfo=UTC)
+
+
+def test_reflex_arc_from_dict_backward_compat_no_created_by():
+    """Loading an arc from old persona file (pre-Phase-2): missing created_by
+    defaults to 'og_migration', missing created_at defaults to epoch sentinel."""
+    arc = ReflexArc.from_dict({
+        "name": "x",
+        "description": "y",
+        "trigger": {"e": 5.0},
+        "days_since_human_min": 0.0,
+        "cooldown_hours": 12.0,
+        "action": "z",
+        "output_memory_type": "reflex_x",
+        "prompt_template": "t",
+    })
+    assert arc.created_by == "og_migration"
+    assert arc.created_at == datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def test_reflex_arc_from_dict_with_created_by():
+    arc = ReflexArc.from_dict({
+        "name": "x",
+        "description": "y",
+        "trigger": {"e": 5.0},
+        "days_since_human_min": 0.0,
+        "cooldown_hours": 12.0,
+        "action": "z",
+        "output_memory_type": "reflex_x",
+        "prompt_template": "t",
+        "created_by": "brain_emergence",
+        "created_at": "2026-04-28T10:00:00+00:00",
+    })
+    assert arc.created_by == "brain_emergence"
+    assert arc.created_at == datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+
+
+def test_reflex_arc_from_dict_rejects_invalid_created_by():
+    with pytest.raises(ValueError, match="created_by"):
+        ReflexArc.from_dict({
+            "name": "x",
+            "description": "y",
+            "trigger": {"e": 5.0},
+            "days_since_human_min": 0.0,
+            "cooldown_hours": 12.0,
+            "action": "z",
+            "output_memory_type": "reflex_x",
+            "prompt_template": "t",
+            "created_by": "alien_source",  # not in allowed enum
+            "created_at": "2026-04-28T10:00:00+00:00",
+        })

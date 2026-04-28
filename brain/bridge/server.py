@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from brain.bridge import events
@@ -67,7 +67,7 @@ def _word_chunks(text: str) -> list[str]:
     return re.findall(r"\S+|\s+", text)
 
 
-async def _idle_watcher(state: "BridgeAppState", idle_shutdown_seconds: float) -> None:
+async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> None:
     """Background task that triggers graceful shutdown after idle threshold.
 
     Production-only path. Tests should NOT start this watcher (default
@@ -99,18 +99,162 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
     return True
 
 
-def _respond_blocking(s: "BridgeAppState", sess: Any, message: str) -> Any:
-    """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread."""
+def _respond_blocking(
+    persona_dir: Path, sess: Any, message: str, provider: LLMProvider,
+) -> Any:
+    """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
+
+    Opens fresh per-call MemoryStore + HebbianMatrix INSIDE the worker thread,
+    so SQLite connections never cross thread boundaries. Closing on exit means
+    no leaked fds. Provider is passed in (stateless / thread-safe).
+    """
+    from contextlib import ExitStack
+
     from brain.chat.engine import respond
 
-    return respond(
-        s.persona_dir,
-        message,
-        store=s.store,
-        hebbian=s.hebbian,
-        provider=s.provider,
-        session=sess,
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        return respond(
+            persona_dir,
+            message,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            session=sess,
+        )
+
+
+def _close_session_blocking(
+    persona_dir: Path, session_id: str, provider: LLMProvider,
+) -> Any:
+    """Wrap brain.ingest.pipeline.close_session — blocks; called via asyncio.to_thread.
+
+    Same per-call store pattern as _respond_blocking; close_session needs
+    embeddings too for dedupe.
+    """
+    from contextlib import ExitStack
+
+    from brain.ingest.pipeline import close_session
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+        return close_session(
+            persona_dir,
+            session_id,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            embeddings=embeddings,
+        )
+
+
+async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 30.0) -> None:
+    """Wait for all per-session in_flight locks to release, up to `timeout` seconds.
+
+    Spec §7 step 2: graceful shutdown waits up to 30s for active chat turns
+    to finish before proceeding to the close-and-stop steps. We poll every
+    100ms — locks are asyncio.Lock so this stays on the loop.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if not any(lock.locked() for lock in state.in_flight_locks.values()):
+            return
+        await asyncio.sleep(0.1)
+    held = sum(1 for lock in state.in_flight_locks.values() if lock.locked())
+    if held:
+        logger.warning("shutdown drain: %d in-flight chat(s) did not release in %.0fs",
+                       held, timeout)
+
+
+def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
+    """Fire HeartbeatEngine.run_tick(trigger='close') in-process.
+
+    Per SP-7 spec §7 step 5 + Reflex Phase 2's anchor for weekly growth.
+    Best-effort: any exception is logged by the caller; we don't block
+    shutdown on heartbeat issues.
+
+    Per H-A: opens its own per-call stores inside the worker thread.
+    Constructor pattern mirrors brain/cli.py:_heartbeat_handler.
+    """
+    from contextlib import ExitStack
+
+    from brain.engines.heartbeat import HeartbeatEngine
+    from brain.persona_config import PersonaConfig
+    from brain.search.factory import get_searcher
+
+    config = PersonaConfig.load(persona_dir / "persona_config.json")
+    searcher = get_searcher(config.searcher)
+    default_arcs_path = (
+        Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
     )
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            reflex_arcs_path=persona_dir / "reflex_arcs.json",
+            reflex_log_path=persona_dir / "reflex_log.json",
+            reflex_default_arcs_path=default_arcs_path,
+            searcher=searcher,
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=Path(__file__).parent.parent
+            / "engines" / "default_interests.json",
+            persona_name=persona_dir.name,
+            persona_system_prompt=f"You are {persona_dir.name}.",
+        )
+        engine.run_tick(trigger="close", dry_run=False)
+
+
+def _drain_sessions_blocking(
+    persona_dir: Path, provider: LLMProvider, silence_minutes: float = 0,
+) -> Any:
+    """Wrap brain.ingest.pipeline.close_stale_sessions — used by shutdown.
+
+    Same per-call store pattern. Silence_minutes=0 (default) closes EVERY
+    live session, which is what graceful shutdown wants.
+    """
+    from contextlib import ExitStack
+
+    from brain.ingest.pipeline import close_stale_sessions
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+        return close_stale_sessions(
+            persona_dir,
+            silence_minutes=silence_minutes,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            embeddings=embeddings,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,18 +288,29 @@ class CloseReq(BaseModel):
 
 @dataclass
 class BridgeAppState:
+    """Bridge runtime state held on app.state.bridge.
+
+    Note: SQLite-backed stores (MemoryStore, HebbianMatrix, EmbeddingCache)
+    are NOT held here. Each worker thread / handler that needs them opens
+    its own per-call instances against `persona_dir`. The `provider` is
+    safe to share — it's stateless (Claude CLI invokes a subprocess per
+    call; no long-lived resource).
+
+    `auth_token` (H-C): None disables auth (test/dev). When set, all HTTP
+    routes require Authorization: Bearer <token>; WS endpoints require
+    ?token=<token> query param + Origin allowlist.
+    """
+
     persona_dir: Path
     persona: str
     client_origin: str
     started_at: datetime
-    store: MemoryStore
-    hebbian: HebbianMatrix
-    embeddings: EmbeddingCache
     provider: LLMProvider
     event_bus: EventBus
     in_flight_locks: dict[str, asyncio.Lock]
     last_chat_at: datetime | None = None
-    supervisor_thread: Any | None = None  # Task 6 fills this
+    supervisor_thread: Any | None = None
+    auth_token: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -169,34 +324,29 @@ def build_app(
     tick_interval_s: float = 60.0,
     silence_minutes: float = 5.0,
     idle_shutdown_seconds: float | None = None,
+    auth_token: str | None = None,
+    allowed_origins: tuple[str, ...] = ("tauri://localhost", "null"),
 ) -> FastAPI:
-    """Build a FastAPI app for the given persona. Public for tests + daemon."""
+    """Build a FastAPI app for the given persona. Public for tests + daemon.
+
+    auth_token: when set, HTTP routes require Authorization: Bearer <token>
+    and WS endpoints require ?token=<token>. None (default) disables auth
+    — used by tests and offline dev. Production runner.py always passes a
+    fresh ephemeral token.
+
+    allowed_origins: WebSocket Origin header allowlist (extra defense
+    against browser-based attacks if someone proxies localhost). "null"
+    matches CLI/non-browser clients; "tauri://localhost" matches SP-8.
+    """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Construct singletons. Each opened DB handle is registered on an
-        # ExitStack so a partial-init failure (e.g. HebbianMatrix raises
-        # after MemoryStore opened) cleanly rolls back the handles already
-        # acquired. Without this, a startup failure would leak fds.
-        from contextlib import ExitStack
-
-        cleanup = ExitStack()
-        try:
-            store = MemoryStore(persona_dir / "memories.db")
-            cleanup.callback(store.close)
-            hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-            cleanup.callback(hebbian.close)
-            config = PersonaConfig.load(persona_dir / "persona_config.json")
-            provider = get_provider(config.provider)
-
-            embeddings = EmbeddingCache(
-                persona_dir / "embeddings.db",
-                FakeEmbeddingProvider(dim=256),
-            )
-            cleanup.callback(embeddings.close)
-        except Exception:
-            cleanup.close()
-            raise
+        # Per HA hardening: NO persistent SQLite stores held on app.state.
+        # Each worker thread / handler opens its own per-call stores against
+        # persona_dir. The lifespan only constructs the provider (stateless),
+        # the EventBus, the supervisor thread, and the idle watcher.
+        config = PersonaConfig.load(persona_dir / "persona_config.json")
+        provider = get_provider(config.provider)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())
@@ -207,12 +357,10 @@ def build_app(
             persona=persona_dir.name,
             client_origin=client_origin,
             started_at=datetime.now(UTC),
-            store=store,
-            hebbian=hebbian,
-            embeddings=embeddings,
             provider=provider,
             event_bus=bus,
             in_flight_locks={},
+            auth_token=auth_token,
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
 
@@ -225,10 +373,7 @@ def build_app(
             kwargs={
                 "stop_event": stop_event,
                 "persona_dir": persona_dir,
-                "store": store,
-                "hebbian": hebbian,
                 "provider": provider,
-                "embeddings": embeddings,
                 "event_bus": bus,
                 "tick_interval_s": tick_interval_s,
                 "silence_minutes": silence_minutes,
@@ -238,9 +383,6 @@ def build_app(
         )
         sup_thread.start()
         app.state.bridge.supervisor_thread = sup_thread
-        # stop_event stays a lifespan-local; the teardown finally references
-        # it directly. No need to attach it to BridgeAppState — nothing else
-        # reads it from there.
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -252,7 +394,16 @@ def build_app(
         try:
             yield
         finally:
-            # Cancel idle watcher first so it doesn't fire SIGTERM during teardown
+            # Shutdown sequence per spec §7:
+            #   1. Cancel idle watcher (so it can't fire SIGTERM during teardown)
+            #   2. Drain in-flight chats (best-effort wait, 30s cap)
+            #   3. Close all live sessions via ingest pipeline (silence_minutes=0)
+            #   4. Stop supervisor thread (180s join cap)
+            #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
+            #   6. Publish shutdown event
+            #   7. Clear publisher
+
+            # 1. Cancel idle watcher
             if idle_task is not None:
                 idle_task.cancel()
                 try:
@@ -261,38 +412,93 @@ def build_app(
                     pass
                 except Exception:
                     logger.exception("idle watcher raised during teardown")
-            # Stop supervisor thread
+
+            # 2. Drain in-flight chats — wait up to 30s for active locks to release
+            await _wait_for_in_flight_drain(app.state.bridge, timeout=30.0)
+
+            # 3. Close all live sessions (silence_minutes=0) via per-call stores.
+            #    This is the data-saving step — every conversation that was open
+            #    becomes memory before the lights go out.
+            try:
+                reports = await asyncio.to_thread(
+                    _drain_sessions_blocking, persona_dir, provider, 0,
+                )
+            except Exception:
+                logger.exception("shutdown drain failed")
+                reports = []
+
+            # 4. Stop supervisor thread
             stop_event.set()
             sup_thread.join(timeout=180.0)
             if sup_thread.is_alive():
                 logger.warning("supervisor thread did not stop within 180s")
-            # Drain all live sessions (silence_minutes=0) — late import so
-            # monkeypatched close_stale_sessions in tests is honored.
-            try:
-                from brain.ingest.pipeline import close_stale_sessions
 
-                reports = close_stale_sessions(
-                    persona_dir,
-                    silence_minutes=0,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=provider,
-                    embeddings=embeddings,
-                )
+            # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
+            #    In-process import + run_tick(trigger="close"). Best-effort:
+            #    failure is logged but doesn't block shutdown.
+            try:
+                await asyncio.to_thread(_run_heartbeat_close, persona_dir, provider)
+            except Exception:
+                logger.exception("heartbeat close-trigger failed during shutdown")
+
+            # 6. Publish shutdown event
+            try:
                 bus.publish(
                     {"type": "shutdown", "clean": True, "drained": len(reports), "at": _now()}
                 )
             except Exception:
-                logger.exception("shutdown drain failed")
+                logger.exception("shutdown event publish failed")
+
+            # 7. Clear publisher
             events.set_publisher(None)
-            # ExitStack closes the three DB handles (registered LIFO):
-            # embeddings → hebbian → store
-            cleanup.close()
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
 
-    @app.get("/health")
+    # ── H-C: auth + Origin check helpers ──────────────────────────────────
+    # HTTP: require `Authorization: Bearer <token>` when auth_token is set.
+    # WS: require `?token=<token>` query param + Origin in allowlist.
+    # Both no-op when auth_token is None (test/dev mode).
+
+    import secrets as _secrets
+
+    from fastapi import Header
+
+    def _consteq(a: str, b: str) -> bool:
+        """Constant-time string compare. secrets.compare_digest handles
+        tokens of different lengths safely."""
+        return _secrets.compare_digest(a.encode(), b.encode())
+
+    # auth_token captured by closure; tests pass None to disable.
+    async def require_http_auth(
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        if auth_token is None:
+            return  # auth disabled (tests / offline dev)
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        token = authorization[len("Bearer "):]
+        if not _consteq(token, auth_token):
+            raise HTTPException(status_code=401, detail="invalid token")
+
+    def _check_ws_auth(ws: WebSocket) -> tuple[bool, str]:
+        """Return (ok, reason). Caller closes the WS with reason on False."""
+        # Origin check first — cheap, defends against browsers.
+        origin = ws.headers.get("origin") or "null"
+        if origin not in allowed_origins:
+            logger.warning("WS rejected: origin=%r not in allowlist", origin)
+            return False, "origin not allowed"
+        # Token check second (closure-captured auth_token).
+        if auth_token is None:
+            return True, ""  # auth disabled
+        token = ws.query_params.get("token", "")
+        if not token:
+            return False, "missing token"
+        if not _consteq(token, auth_token):
+            return False, "invalid token"
+        return True, ""
+
+    @app.get("/health", dependencies=[Depends(require_http_auth)])
     def health() -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         uptime = (datetime.now(UTC) - s.started_at).total_seconds()
@@ -326,7 +532,7 @@ def build_app(
             "anomalies": len(anomalies),
         }
 
-    @app.post("/session/new", response_model=NewSessionResp)
+    @app.post("/session/new", response_model=NewSessionResp, dependencies=[Depends(require_http_auth)])
     def session_new(req: NewSessionReq) -> NewSessionResp:
         s: BridgeAppState = app.state.bridge
         sess = create_session(s.persona)
@@ -336,7 +542,7 @@ def build_app(
             created_at=sess.created_at.isoformat(),
         )
 
-    @app.get("/state/{session_id}")
+    @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         sess = get_session(session_id)
@@ -356,7 +562,7 @@ def build_app(
         }
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
-    @app.post("/chat")
+    @app.post("/chat", dependencies=[Depends(require_http_auth)])
     async def chat(req: ChatReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         sess = get_session(req.session_id)
@@ -369,7 +575,9 @@ def build_app(
             t0 = datetime.now(UTC)
             events.publish("chat_started", session_id=req.session_id, client=s.client_origin)
             try:
-                result = await asyncio.to_thread(_respond_blocking, s, sess, req.message)
+                result = await asyncio.to_thread(
+                    _respond_blocking, s.persona_dir, sess, req.message, s.provider,
+                )
             except Exception as exc:
                 logger.exception("chat failed session=%s", req.session_id)
                 raise HTTPException(status_code=502, detail=f"provider error: {exc}") from exc
@@ -392,6 +600,11 @@ def build_app(
     # ── WS /stream/{session_id} — simulated streaming ──────────────────────
     @app.websocket("/stream/{session_id}")
     async def stream(ws: WebSocket, session_id: str) -> None:
+        # H-C: validate token + Origin BEFORE accepting the upgrade.
+        ok, reason = _check_ws_auth(ws)
+        if not ok:
+            await ws.close(code=4001, reason=reason)
+            return
         await ws.accept()
         s: BridgeAppState = app.state.bridge
         sess = get_session(session_id)
@@ -423,7 +636,9 @@ def build_app(
             events.publish("chat_started", session_id=session_id, client=s.client_origin)
 
             try:
-                result = await asyncio.to_thread(_respond_blocking, s, sess, message)
+                result = await asyncio.to_thread(
+                    _respond_blocking, s.persona_dir, sess, message, s.provider,
+                )
             except Exception as exc:
                 logger.exception("stream failed session=%s", session_id)
                 await ws.send_json(
@@ -478,6 +693,11 @@ def build_app(
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")
     async def events_ws(ws: WebSocket) -> None:
+        # H-C: validate token + Origin BEFORE accepting the upgrade.
+        ok, reason = _check_ws_auth(ws)
+        if not ok:
+            await ws.close(code=4001, reason=reason)
+            return
         await ws.accept()
         s: BridgeAppState = app.state.bridge
         q = s.event_bus.subscribe()
@@ -494,20 +714,44 @@ def build_app(
             s.event_bus.unsubscribe(q)
 
     # ── POST /sessions/close — explicit ingest trigger ─────────────────────
-    @app.post("/sessions/close")
+    @app.post("/sessions/close", dependencies=[Depends(require_http_auth)])
     async def sessions_close(req: CloseReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        from brain.ingest.pipeline import close_session
+        from brain.chat.session import get_session, remove_session
 
-        report = await asyncio.to_thread(
-            close_session,
-            s.persona_dir,
-            req.session_id,
-            store=s.store,
-            hebbian=s.hebbian,
-            provider=s.provider,
-            embeddings=s.embeddings,
-        )
+        # H2/D2: differentiate cases.
+        # Unknown session id (never registered, or already removed) → 404.
+        # Known session → run ingest, remove from registry, drop in_flight lock.
+        sess = get_session(req.session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        # H-A: per-call stores inside the worker thread, not shared singletons.
+        # Wrap the pipeline call so internal exceptions don't crash the handler —
+        # surface them as 502 with a counted-error report. Spec §11 says the
+        # ingest pipeline should catch + count internally, but the current
+        # implementation lets some commit exceptions propagate; the handler
+        # converts those to a uniform error shape so the caller never sees
+        # a silent success and never sees a stack trace.
+        try:
+            report = await asyncio.to_thread(
+                _close_session_blocking, s.persona_dir, req.session_id, s.provider,
+            )
+        except Exception as exc:
+            logger.exception("close_session failed session=%s", req.session_id)
+            # Still clean up the registry — the buffer is whatever the pipeline
+            # left it as; future supervisor ticks may retry per spec §11.
+            remove_session(req.session_id)
+            s.in_flight_locks.pop(req.session_id, None)
+            raise HTTPException(
+                status_code=502,
+                detail=f"ingest pipeline error: {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # H2: clean up registry + lock so sessions_active stays accurate.
+        remove_session(req.session_id)
+        s.in_flight_locks.pop(req.session_id, None)
+
         events.publish(
             "session_closed",
             session_id=req.session_id,
@@ -518,6 +762,7 @@ def build_app(
         )
         return {
             "session_id": req.session_id,
+            "closed": True,
             "committed": report.committed,
             "deduped": report.deduped,
             "soul_candidates": report.soul_candidates,

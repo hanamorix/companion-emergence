@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,19 @@ class GrowthTickResult:
     emotions_added: int
     proposals_seen: int
     proposals_rejected: int
+
+
+def _should_run_growth_tick(
+    *, last_tick: datetime | None, now: datetime, throttle_days: float,
+) -> bool:
+    """True iff enough time has elapsed since the last growth tick.
+
+    `last_tick=None` means never-run; always returns True.
+    Boundary `now - last_tick == throttle_days` returns True (inclusive).
+    """
+    if last_tick is None:
+        return True
+    return (now - last_tick) >= timedelta(days=throttle_days)
 
 
 def run_growth_tick(

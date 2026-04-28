@@ -22,13 +22,36 @@ from brain.bridge import state_file
 from brain.bridge.server import build_app
 
 
-def _allocate_port() -> int:
-    """Bind ephemeral, read assigned port, close. Race window is tiny."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+def _allocate_port(max_attempts: int = 3) -> int:
+    """Bind ephemeral, read assigned port, close. Retry with backoff if the
+    bind→close→rebind race loses the port.
+
+    Per SP-7 spec §11: 3× retry with backoff. Uvicorn re-binds the port
+    we discovered, so there's a race window between our close and uvicorn's
+    bind. Almost never fires in practice (sub-millisecond window) but
+    cheap to defend against.
+
+    Backoff schedule: 10ms, 100ms, 1s — total worst-case ~1.1s before
+    giving up.
+    """
+    import time
+
+    last_exc: OSError | None = None
+    for attempt in range(max_attempts):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            return port
+        except OSError as exc:
+            last_exc = exc
+            backoff_s = (10 ** attempt) / 1000.0  # 0.01, 0.1, 1.0
+            time.sleep(backoff_s)
+    raise RuntimeError(
+        f"_allocate_port: failed to bind a free port after {max_attempts} attempts; "
+        f"last error: {last_exc}",
+    )
 
 
 def _write_clean_shutdown(persona_dir: Path) -> None:
@@ -46,6 +69,8 @@ def _write_clean_shutdown(persona_dir: Path) -> None:
 
 
 def main() -> int:
+    import secrets
+
     p = argparse.ArgumentParser()
     p.add_argument("--persona-dir", required=True, type=Path)
     p.add_argument("--client-origin", default="cli")
@@ -54,6 +79,11 @@ def main() -> int:
 
     persona_dir = args.persona_dir
     port = _allocate_port()
+    # H-C: ephemeral bearer token persisted in bridge.json. 32 bytes from
+    # secrets.token_urlsafe — cryptographically random, safe in URLs (WS
+    # query string), readable by anyone who can read the persona dir
+    # (which is the same trust boundary as the SQLite stores).
+    auth_token = secrets.token_urlsafe(32)
 
     initial_state = state_file.BridgeState(
         persona=persona_dir.name,
@@ -63,6 +93,7 @@ def main() -> int:
         stopped_at=None,
         shutdown_clean=False,
         client_origin=args.client_origin,
+        auth_token=auth_token,
     )
     state_file.write(persona_dir, initial_state)
 
@@ -88,6 +119,7 @@ def main() -> int:
         persona_dir=persona_dir,
         client_origin=args.client_origin,
         idle_shutdown_seconds=args.idle_shutdown_seconds,
+        auth_token=auth_token,
     )
     try:
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

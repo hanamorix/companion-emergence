@@ -1,12 +1,13 @@
-"""EmotionProposal — what a vocabulary crystallizer returns.
+"""Growth proposals — what crystallizers return.
 
-A proposal is the brain's *decision* to add an emotion. The scheduler
-applies it atomically — there's no candidate queue, no human approval
-gate. Per principle audit 2026-04-25: the brain has agency.
+Proposals are the brain's *decisions*. The scheduler applies them
+atomically — there's no candidate queue, no human approval gate.
+Per principle audit 2026-04-25: the brain has agency.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -36,3 +37,33 @@ class EmotionProposal:
     evidence_memory_ids: tuple[str, ...]
     score: float
     relational_context: str | None
+
+
+@dataclass(frozen=True)
+class ReflexArcProposal:
+    """One arc the reflex crystallizer has decided to add."""
+
+    name: str
+    description: str
+    trigger: Mapping[str, float]
+    cooldown_hours: float
+    output_memory_type: str
+    prompt_template: str
+    reasoning: str
+    days_since_human_min: float = 0.0
+
+
+@dataclass(frozen=True)
+class ReflexPruneProposal:
+    """One brain-emergence arc the brain has decided to prune."""
+
+    name: str
+    reasoning: str
+
+
+@dataclass(frozen=True)
+class ReflexCrystallizationResult:
+    """Outcome of one crystallizer pass — both emergences and prunings."""
+
+    emergences: list[ReflexArcProposal]
+    prunings: list[ReflexPruneProposal]

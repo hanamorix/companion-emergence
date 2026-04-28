@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_CREATED_BY = ("og_migration", "brain_emergence", "user_authored")
 
 
 # ---------- Types ----------
@@ -44,6 +46,8 @@ class ReflexArc:
     action: str
     output_memory_type: str
     prompt_template: str
+    created_by: Literal["og_migration", "brain_emergence", "user_authored"] = "og_migration"
+    created_at: datetime = field(default_factory=lambda: datetime(1970, 1, 1, tzinfo=UTC))
 
     @classmethod
     def from_dict(cls, data: dict) -> ReflexArc:
@@ -67,6 +71,19 @@ class ReflexArc:
             raise ValueError(f"ReflexArc {data.get('name')!r}: trigger must be non-empty dict")
         trigger = {str(k): float(v) for k, v in trigger_raw.items()}
 
+        created_by = data.get("created_by", "og_migration")
+        if created_by not in _ALLOWED_CREATED_BY:
+            raise ValueError(
+                f"ReflexArc {data.get('name')!r}: created_by must be one of "
+                f"{_ALLOWED_CREATED_BY}, got {created_by!r}"
+            )
+
+        created_at_raw = data.get("created_at")
+        if created_at_raw is None:
+            created_at = datetime(1970, 1, 1, tzinfo=UTC)
+        else:
+            created_at = parse_iso_utc(str(created_at_raw))
+
         return cls(
             name=str(data["name"]),
             description=str(data["description"]),
@@ -76,7 +93,24 @@ class ReflexArc:
             action=str(data["action"]),
             output_memory_type=str(data["output_memory_type"]),
             prompt_template=str(data["prompt_template"]),
+            created_by=created_by,
+            created_at=created_at,
         )
+
+    def to_dict(self) -> dict:
+        """Serialize for writing back to reflex_arcs.json."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "trigger": dict(self.trigger),
+            "days_since_human_min": self.days_since_human_min,
+            "cooldown_hours": self.cooldown_hours,
+            "action": self.action,
+            "output_memory_type": self.output_memory_type,
+            "prompt_template": self.prompt_template,
+            "created_by": self.created_by,
+            "created_at": iso_utc(self.created_at),
+        }
 
 
 @dataclass(frozen=True)
