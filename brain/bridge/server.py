@@ -238,7 +238,9 @@ def build_app(
         )
         sup_thread.start()
         app.state.bridge.supervisor_thread = sup_thread
-        app.state.bridge._supervisor_stop = stop_event
+        # stop_event stays a lifespan-local; the teardown finally references
+        # it directly. No need to attach it to BridgeAppState — nothing else
+        # reads it from there.
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -322,7 +324,6 @@ def build_app(
             "supervisor_thread": sup_status,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
-            "shutdown_clean_last": True,  # Task 7 will surface previous-state info
         }
 
     @app.post("/session/new", response_model=NewSessionResp)
@@ -432,9 +433,11 @@ def build_app(
                 return
 
             # Tool events fire BEFORE reply chunks — they happened first in the loop.
+            # tool_invocations shape per brain/chat/tool_loop.py:79 —
+            # {name, arguments, result_summary, error?}. Pinned to canonical keys.
             for inv in result.tool_invocations:
-                tool_name = inv.get("name") or inv.get("tool_name") or "?"
-                summary = inv.get("result_summary") or inv.get("summary") or ""
+                tool_name = inv.get("name", "?")
+                summary = inv.get("result_summary", "")
                 await ws.send_json(
                     {"type": "tool_call", "tool": tool_name, "session_id": session_id, "at": _now()}
                 )
