@@ -67,6 +67,13 @@ class EventBus:
 
     Per-subscriber queue is bounded at QUEUE_MAX; overflow drops the OLDEST
     event so live clients keep receiving fresh data instead of stale.
+
+    Threading note: subscribe()/unsubscribe() mutate `self._subscribers`
+    while publish() iterates a `list(...)` snapshot of it. CPython's GIL
+    makes `list.append`/`list.remove` atomic at the bytecode level, so this
+    is safe under standard CPython. On free-threaded Python 3.13t (no GIL)
+    this would need a `threading.Lock` around _subscribers mutation; not
+    required today.
     """
 
     QUEUE_MAX = 64

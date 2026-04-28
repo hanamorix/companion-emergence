@@ -75,6 +75,10 @@ def main() -> int:
     # after startup), we want to mark clean shutdown and exit gracefully.
     # After uvicorn.run() is called, uvicorn owns SIGTERM; our atexit fires on exit.
     def _sigterm_handler(signum: int, frame: object) -> None:
+        # Only fires in the tiny window between this signal.signal() call
+        # and uvicorn.run() registering its own SIGTERM handler — once
+        # uvicorn is up, this handler is replaced. atexit + the finally
+        # block cover the post-uvicorn paths.
         _write_clean_shutdown(persona_dir)
         sys.exit(0)
 
