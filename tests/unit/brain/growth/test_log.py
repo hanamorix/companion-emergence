@@ -155,3 +155,103 @@ def test_read_growth_log_round_trips_all_fields(tmp_path: Path) -> None:
     assert restored.evidence_memory_ids == ("a", "b", "c")
     assert restored.score == 0.5
     assert restored.relational_context == "ctx"
+
+
+# ---------------------------------------------------------------------------
+# Arc lifecycle event helpers (Phase 2 reflex emergence)
+# ---------------------------------------------------------------------------
+
+from brain.growth.log import (  # noqa: E402
+    arc_added_event,
+    arc_proposal_dropped_event,
+    arc_pruned_by_brain_event,
+    arc_rejected_user_removed_event,
+    arc_removed_by_user_event,
+)
+
+
+def _now():
+    return datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def test_arc_added_event_helper():
+    event = arc_added_event(
+        timestamp=_now(),
+        name="manuscript_obsession",
+        description="creative drive narrowed to one project",
+        reasoning="Over the past month I've fired creative_pitch four times",
+        created_by="brain_emergence",
+    )
+    assert event.type == "arc_added"
+    assert event.name == "manuscript_obsession"
+    assert event.description == "creative drive narrowed to one project"
+    assert event.reason == "Over the past month I've fired creative_pitch four times"
+    assert event.decay_half_life_days is None
+    assert event.evidence_memory_ids == ()
+    assert event.score == 0.0
+    assert event.relational_context == "brain_emergence"  # encodes created_by
+
+
+def test_arc_pruned_by_brain_event_helper():
+    event = arc_pruned_by_brain_event(
+        timestamp=_now(),
+        name="loneliness_journal",
+        description="loneliness hit threshold — wrote a journal entry",
+        reasoning="I'm not in that place anymore",
+    )
+    assert event.type == "arc_pruned_by_brain"
+    assert event.name == "loneliness_journal"
+    assert event.reason == "I'm not in that place anymore"
+
+
+def test_arc_removed_by_user_event_helper():
+    event = arc_removed_by_user_event(
+        timestamp=_now(),
+        name="loneliness_journal",
+        description="loneliness hit threshold — wrote a journal entry",
+    )
+    assert event.type == "arc_removed_by_user"
+    assert event.name == "loneliness_journal"
+    assert event.reason == "user edited reflex_arcs.json"
+
+
+def test_arc_rejected_user_removed_event_helper():
+    event = arc_rejected_user_removed_event(
+        timestamp=_now(),
+        name="loneliness_journal",
+        reasoning="brain re-proposed; honoring user removal",
+    )
+    assert event.type == "arc_rejected_user_removed"
+
+
+def test_arc_proposal_dropped_event_helper():
+    event = arc_proposal_dropped_event(
+        timestamp=_now(),
+        name="bad_arc",
+        reasoning="trigger overlap with existing arc creative_pitch",
+    )
+    assert event.type == "arc_proposal_dropped"
+
+
+def test_arc_events_round_trip_through_jsonl(tmp_path: Path):
+    """Write each arc event type to a real growth log file and read back."""
+    log_path = tmp_path / "emotion_growth.log.jsonl"
+    events = [
+        arc_added_event(
+            timestamp=_now(), name="x", description="d",
+            reasoning="r", created_by="brain_emergence",
+        ),
+        arc_pruned_by_brain_event(timestamp=_now(), name="y", description="d", reasoning="r"),
+        arc_removed_by_user_event(timestamp=_now(), name="z", description="d"),
+        arc_rejected_user_removed_event(timestamp=_now(), name="w", reasoning="r"),
+        arc_proposal_dropped_event(timestamp=_now(), name="v", reasoning="r"),
+    ]
+    for e in events:
+        append_growth_event(log_path, e)
+
+    read_back = read_growth_log(log_path)
+    assert len(read_back) == 5
+    assert [e.type for e in read_back] == [
+        "arc_added", "arc_pruned_by_brain", "arc_removed_by_user",
+        "arc_rejected_user_removed", "arc_proposal_dropped",
+    ]

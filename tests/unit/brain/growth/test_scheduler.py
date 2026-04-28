@@ -10,7 +10,12 @@ from unittest.mock import patch
 import pytest
 
 from brain.growth.proposal import EmotionProposal
-from brain.growth.scheduler import GrowthTickResult, _read_current_vocabulary_names, run_growth_tick
+from brain.growth.scheduler import (
+    GrowthTickResult,
+    _read_current_vocabulary_names,
+    _should_run_growth_tick,
+    run_growth_tick,
+)
 from brain.memory.store import MemoryStore
 
 
@@ -365,3 +370,40 @@ def test_run_growth_tick_clean_vocabulary_collector_unchanged(
     collector: list[BrainAnomaly] = []
     run_growth_tick(persona_dir, store, datetime.now(UTC), anomalies_collector=collector)
     assert collector == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — _should_run_growth_tick throttle predicate tests
+# ---------------------------------------------------------------------------
+
+
+def test_throttle_runs_when_never_ticked() -> None:
+    """last_tick=None → always run (first ever growth tick)."""
+    assert _should_run_growth_tick(
+        last_tick=None,
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        throttle_days=7.0,
+    ) is True
+
+
+def test_throttle_runs_when_window_elapsed() -> None:
+    """8 days since last tick with a 7-day throttle → should run."""
+    last = datetime(2026, 4, 20, tzinfo=UTC)
+    now = datetime(2026, 4, 28, tzinfo=UTC)  # 8 days later
+    assert _should_run_growth_tick(last_tick=last, now=now, throttle_days=7.0) is True
+
+
+def test_throttle_skips_when_window_active() -> None:
+    """3 days since last tick with a 7-day throttle → skip."""
+    last = datetime(2026, 4, 25, tzinfo=UTC)
+    now = datetime(2026, 4, 28, tzinfo=UTC)  # 3 days later
+    assert _should_run_growth_tick(last_tick=last, now=now, throttle_days=7.0) is False
+
+
+def test_throttle_boundary_at_exactly_threshold() -> None:
+    """Exactly throttle_days elapsed → inclusive, returns True."""
+    from datetime import timedelta
+
+    last = datetime(2026, 4, 21, tzinfo=UTC)
+    now = last + timedelta(days=7)  # exactly 7 days
+    assert _should_run_growth_tick(last_tick=last, now=now, throttle_days=7.0) is True

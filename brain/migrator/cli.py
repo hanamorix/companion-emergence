@@ -16,7 +16,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
-from brain.migrator.og_reflex import extract_arcs_from_og
+from brain.migrator.og_reflex import migrate_reflex_arcs
 from brain.migrator.og_soul import extract_crystallizations_from_og
 from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
@@ -151,13 +151,11 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             reflex_arcs_skipped_reason = "existing_file_not_overwritten"
         else:
             try:
-                og_arcs = extract_arcs_from_og(og_reflex_path)
-                _reflex_tmp = reflex_arcs_target.with_suffix(reflex_arcs_target.suffix + ".new")
-                _reflex_tmp.write_text(
-                    _json.dumps({"version": 1, "arcs": og_arcs}, indent=2) + "\n",
-                    encoding="utf-8",
+                og_arcs = migrate_reflex_arcs(
+                    persona_dir=work_dir,
+                    og_reflex_engine_path=og_reflex_path,
+                    force=args.force,
                 )
-                os.replace(_reflex_tmp, reflex_arcs_target)
                 reflex_arcs_migrated = len(og_arcs)
             except (ValueError, OSError) as exc:
                 reflex_arcs_skipped_reason = f"extract_error: {exc}"

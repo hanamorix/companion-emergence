@@ -18,6 +18,7 @@ from brain.engines.daemon_state import (
     EmotionalResidue,
     get_residue_context,
     load_daemon_state,
+    save_daemon_state,
     update_daemon_state,
 )
 
@@ -394,3 +395,44 @@ def test_get_residue_context_formats_hours_ago_and_truncated_summary() -> None:
     quoted_end = context_line.rindex('"')
     extracted_summary = context_line[quoted_start:quoted_end]
     assert len(extracted_summary) <= 200
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — last_growth_tick_at field tests
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_state_has_last_growth_tick_at_field() -> None:
+    """DaemonState default-constructed has last_growth_tick_at=None."""
+    s = DaemonState()
+    assert hasattr(s, "last_growth_tick_at")
+    assert s.last_growth_tick_at is None
+
+
+def test_daemon_state_round_trip_with_last_growth_tick_at(tmp_path: Path) -> None:
+    """last_growth_tick_at survives a save/load round-trip without loss."""
+    from datetime import UTC, datetime
+
+    persona_dir = tmp_path
+    ts = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    state = DaemonState(last_growth_tick_at=ts)
+    save_daemon_state(persona_dir, state)
+    state2, _anom = load_daemon_state(persona_dir)
+    assert state2.last_growth_tick_at == ts
+
+
+def test_daemon_state_legacy_file_without_last_growth_tick_at(tmp_path: Path) -> None:
+    """Legacy daemon_state.json without last_growth_tick_at loads with None (no exception).
+
+    The legacy dict uses only the fields that existed before this field was
+    added — all of which are optional in the dataclass (default None). An
+    empty dict is therefore the minimal valid legacy shape, and loading it
+    must not raise; the new field defaults to None.
+    """
+    import json
+
+    # Minimal legacy dict: no keys at all (all DaemonState fields are optional).
+    legacy: dict = {}
+    (tmp_path / "daemon_state.json").write_text(json.dumps(legacy))
+    state, _anom = load_daemon_state(tmp_path)
+    assert state.last_growth_tick_at is None

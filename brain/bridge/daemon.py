@@ -170,13 +170,27 @@ def cmd_start(args) -> int:
             s = state_file.read(persona_dir)
             if s is not None and s.pid == pid and s.port:
                 try:
-                    r = httpx.get(f"http://127.0.0.1:{s.port}/health", timeout=1.0)
+                    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+                    r = httpx.get(
+                        f"http://127.0.0.1:{s.port}/health",
+                        headers=headers,
+                        timeout=1.0,
+                    )
                     if r.status_code == 200:
                         print(f"bridge started on port {s.port} (pid {pid})")
                         return 0
                 except httpx.HTTPError:
                     continue
-        print(f"bridge spawned (pid {pid}) but /health did not respond in 5s", file=sys.stderr)
+        # H-D: readiness failed — kill the orphan child and tell the user where to look.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already dead
+        print(
+            f"bridge spawned (pid {pid}) but /health did not respond in 5s — "
+            f"killed orphan child. Inspect log at {log_path}",
+            file=sys.stderr,
+        )
         return 1
     finally:
         release_lock(persona_dir, fd)
@@ -216,7 +230,10 @@ def cmd_status(args) -> int:
         return 0
     if state_file.is_running(persona_dir):
         try:
-            r = httpx.get(f"http://127.0.0.1:{s.port}/health", timeout=1.0)
+            headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+            r = httpx.get(
+                f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=1.0,
+            )
             health = r.json()
             print(f"bridge: running pid={s.pid} port={s.port}")
             print(f"  uptime_s: {health['uptime_s']}")
@@ -244,7 +261,8 @@ def cmd_tail(args) -> int:
     if s is None or not state_file.is_running(persona_dir):
         print("bridge not running", file=sys.stderr)
         return 1
-    url = f"ws://127.0.0.1:{s.port}/events"
+    token_qs = f"?token={s.auth_token}" if s.auth_token else ""
+    url = f"ws://127.0.0.1:{s.port}/events{token_qs}"
     try:
         with connect(url) as ws:
             while True:

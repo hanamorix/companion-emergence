@@ -144,6 +144,7 @@ class DaemonState:
     last_reflex: DaemonFireEntry | None = None
     last_research: DaemonFireEntry | None = None
     emotional_residue: EmotionalResidue | None = None
+    last_growth_tick_at: datetime | None = None
 
     def to_dict(self) -> dict:
         """Serialise to dict — only non-None keys are included."""
@@ -158,6 +159,8 @@ class DaemonState:
             d["last_research"] = self.last_research.to_dict()
         if self.emotional_residue is not None:
             d["emotional_residue"] = self.emotional_residue.to_dict()
+        if self.last_growth_tick_at is not None:
+            d["last_growth_tick_at"] = iso_utc(self.last_growth_tick_at)
         return d
 
     @classmethod
@@ -180,12 +183,22 @@ class DaemonState:
             except (KeyError, TypeError, ValueError):
                 return None
 
+        def _parse_growth_tick_at() -> datetime | None:
+            raw = d.get("last_growth_tick_at")
+            if not raw:
+                return None
+            try:
+                return parse_iso_utc(str(raw))
+            except (TypeError, ValueError):
+                return None
+
         return cls(
             last_dream=_parse_fire("last_dream"),
             last_heartbeat=_parse_fire("last_heartbeat"),
             last_reflex=_parse_fire("last_reflex"),
             last_research=_parse_fire("last_research"),
             emotional_residue=_parse_residue(),
+            last_growth_tick_at=_parse_growth_tick_at(),
         )
 
 
@@ -194,6 +207,12 @@ class DaemonState:
 # ---------------------------------------------------------------------------
 
 _STATE_FILENAME = "daemon_state.json"
+
+
+def save_daemon_state(persona_dir: Path, state: DaemonState) -> None:
+    """Atomic-write a DaemonState to daemon_state.json via save_with_backup."""
+    path = persona_dir / _STATE_FILENAME
+    save_with_backup(path, state.to_dict())
 
 
 def load_daemon_state(

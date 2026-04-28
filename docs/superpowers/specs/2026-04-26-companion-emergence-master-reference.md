@@ -549,15 +549,18 @@ Trigger: called by SP-7's bridge daemon when a session goes silent for 5 minutes
 
 ### SP-7: Bridge Daemon
 
-**Status:** ❌ Not started
-**Dependency:** SP-6. SP-4 ideally lands before or alongside.
+**Status:** ✅ Shipped 2026-04-28 (squash-commit `8f3ae58` on main).
+**Hardening pass:** 2026-04-28 — SQLite per-call stores (release-blocker bug fixed), session lifecycle cleanup, shutdown sequence aligned to spec, ephemeral auth token, port retry, daemon polish. See branch `reflex-phase-2`.
 
-**Scope:** Build the HTTP/WebSocket server wrapping SP-6's chat engine. Key design questions (unresolved — see Section 8): transport (IPC socket vs. gRPC vs. HTTP), port/address, event broadcast mechanism. OG used FastAPI on localhost:8765 with HTTP `/chat` + WS `/stream/{id}` + WS `/events`. companion-emergence may use the same or a different transport depending on Tauri shell requirements. The bridge daemon also folds the supervisor (SP-4 ingest trigger: `close_stale_sessions()`) and the F16 event broadcast (dream/reflex/active_tick events for the UI). Decisions on transport and event model should be made in a spec session before code.
+**Spec:** `docs/superpowers/specs/2026-04-28-sp-7-bridge-daemon-design.md`
 
-**OG references:** `NellBrain/nell_bridge.py` (full), `NellBrain/nell_bridge_session.py`, `NellBrain/nell_supervisor.py`
-**New framework files created:** `brain/bridge/daemon.py`, `brain/bridge/server.py` (or equivalent)
-**Deliverable:** Running daemon accepting chat requests and persisting sessions.
-**Rough test count:** 15–25 integration tests (session create/continue, tool round-trip, graceful shutdown).
+**Scope shipped:** Per-persona FastAPI daemon on `127.0.0.1` (dynamic port). Seven endpoints: `POST /session/new`, `GET /state/{sid}`, `POST /chat`, `WS /stream/{sid}` (simulated streaming), `WS /events` (server-push broadcast of 14 event types), `POST /sessions/close`, `GET /health`. Folded supervisor as non-daemon thread, dirty-shutdown recovery via `bridge.json::shutdown_clean`, simulated streaming (Claude CLI doesn't expose token streaming — see §10 of SP-7 spec).
+
+**Open question §8 Q1 resolved:** transport = HTTP + WebSocket on localhost (see SP-7 spec §3 for the rejected alternatives gRPC and Unix socket).
+
+**Files:** `brain/bridge/server.py`, `brain/bridge/state_file.py`, `brain/bridge/supervisor.py`, `brain/bridge/daemon.py`, `brain/bridge/runner.py`, `brain/bridge/events.py`, `brain/bridge/provider.py` (existed pre-SP-7).
+**OG references:** `NellBrain/nell_bridge.py`, `NellBrain/nell_bridge_session.py`, `NellBrain/nell_supervisor.py`
+**Tests shipped:** ~50 (29 unit + integration on bridge module + 11 auth + 2 threading-safety integration).
 
 ### SP-8: Tauri Integration
 

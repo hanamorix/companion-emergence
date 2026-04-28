@@ -108,3 +108,101 @@ def _event_from_dict(data: dict) -> GrowthLogEvent:
             None if data["relational_context"] is None else str(data["relational_context"])
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Arc lifecycle event constructors (Phase 2 reflex emergence)
+# ---------------------------------------------------------------------------
+
+
+def arc_added_event(
+    *,
+    timestamp: datetime,
+    name: str,
+    description: str,
+    reasoning: str,
+    created_by: str,  # "brain_emergence" | "user_authored" | "og_migration"
+) -> GrowthLogEvent:
+    """Constructor for arc_added events. Stashes created_by in relational_context
+    so the brain can read provenance back from its own growth log."""
+    return GrowthLogEvent(
+        timestamp=timestamp,
+        type="arc_added",
+        name=name,
+        description=description,
+        decay_half_life_days=None,
+        reason=reasoning,
+        evidence_memory_ids=(),
+        score=0.0,
+        relational_context=created_by,
+    )
+
+
+def arc_pruned_by_brain_event(
+    *, timestamp: datetime, name: str, description: str, reasoning: str,
+) -> GrowthLogEvent:
+    """Constructor for arc_pruned_by_brain events."""
+    return GrowthLogEvent(
+        timestamp=timestamp,
+        type="arc_pruned_by_brain",
+        name=name,
+        description=description,
+        decay_half_life_days=None,
+        reason=reasoning,
+        evidence_memory_ids=(),
+        score=0.0,
+        relational_context=None,
+    )
+
+
+def arc_removed_by_user_event(
+    *, timestamp: datetime, name: str, description: str,
+) -> GrowthLogEvent:
+    """Constructor for arc_removed_by_user events. Reason is hardcoded
+    because user file-edit removals don't carry explicit reasoning."""
+    return GrowthLogEvent(
+        timestamp=timestamp,
+        type="arc_removed_by_user",
+        name=name,
+        description=description,
+        decay_half_life_days=None,
+        reason="user edited reflex_arcs.json",
+        evidence_memory_ids=(),
+        score=0.0,
+        relational_context=None,
+    )
+
+
+def arc_rejected_user_removed_event(
+    *, timestamp: datetime, name: str, reasoning: str,
+) -> GrowthLogEvent:
+    """Constructor for arc_rejected_user_removed events — fired when the
+    brain proposes an arc whose name is in the 15-day graveyard window."""
+    return GrowthLogEvent(
+        timestamp=timestamp,
+        type="arc_rejected_user_removed",
+        name=name,
+        description="",
+        decay_half_life_days=None,
+        reason=reasoning,
+        evidence_memory_ids=(),
+        score=0.0,
+        relational_context=None,
+    )
+
+
+def arc_proposal_dropped_event(
+    *, timestamp: datetime, name: str, reasoning: str,
+) -> GrowthLogEvent:
+    """Constructor for arc_proposal_dropped events — generic gate-rejection."""
+    return GrowthLogEvent(
+        timestamp=timestamp,
+        type="arc_proposal_dropped",
+        name=name,
+        description="",
+        decay_half_life_days=None,
+        reason=reasoning,
+        evidence_memory_ids=(),
+        score=0.0,
+        relational_context=None,
+    )

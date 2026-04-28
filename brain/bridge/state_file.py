@@ -39,6 +39,11 @@ class BridgeState:
     stopped_at: str | None
     shutdown_clean: bool
     client_origin: str  # "cli" | "tauri" | "tests"
+    # H-C auth: ephemeral bearer token generated at start, persisted in
+    # bridge.json so local clients (CLI / Tauri) can read it. Must NOT be
+    # committed to git or logged. None for legacy state files (auth disabled
+    # for backward compat — runner.py always generates one in real use).
+    auth_token: str | None = None
 
 
 def _state_path(persona_dir: Path) -> Path:
@@ -61,6 +66,7 @@ def _default_factory() -> dict:
         "stopped_at": None,
         "shutdown_clean": True,
         "client_origin": "cli",
+        "auth_token": None,
     }
 
 
