@@ -753,8 +753,8 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     return 0
 
 
-def _chat_handler(args: argparse.Namespace) -> int:
-    """Dispatch `nell chat` to the chat engine.
+def _chat_direct_mode(args: argparse.Namespace) -> int:
+    """Dispatch `nell chat` to the chat engine (in-process, no bridge).
 
     One-shot mode (message provided): `nell chat --persona X "message"`
     Interactive REPL mode: `nell chat --persona X`
@@ -874,6 +874,79 @@ def _chat_handler(args: argparse.Namespace) -> int:
         store.close()
 
     return 0
+
+
+def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
+    """Chat with a persona via the bridge daemon's WebSocket streaming API."""
+    import json
+    import sys as _sys
+
+    import httpx
+    from websockets.sync.client import connect
+
+    from brain.bridge import state_file
+
+    s = state_file.read(persona_dir)
+    base = f"http://127.0.0.1:{s.port}"
+    sid_arg = getattr(args, "session", None)
+    if sid_arg:
+        sid = sid_arg
+    else:
+        sid = httpx.post(f"{base}/session/new", json={"client": "cli"}).json()["session_id"]
+
+    print(f"chat session {sid} (Ctrl-D to exit)")
+    while True:
+        try:
+            line = input("you: ").strip()
+        except EOFError:
+            break
+        if not line:
+            continue
+        with connect(f"ws://127.0.0.1:{s.port}/stream/{sid}") as ws:
+            ws.send(json.dumps({"message": line}))
+            print("nell: ", end="", flush=True)
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get("type") == "reply_chunk":
+                    print(msg["text"], end="", flush=True)
+                elif msg.get("type") == "done":
+                    print()
+                    break
+                elif msg.get("type") == "error":
+                    print(
+                        f"\n[error: {msg.get('detail', msg.get('code'))}]",
+                        file=_sys.stderr,
+                    )
+                    return 1
+    httpx.post(f"{base}/sessions/close", json={"session_id": sid})
+    return 0
+
+
+def _chat_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell chat` — auto-spawns bridge unless --no-bridge is set."""
+    from brain.bridge import daemon, state_file
+    from brain.paths import get_persona_dir
+
+    persona_dir = get_persona_dir(args.persona)
+    if args.no_bridge:
+        return _chat_direct_mode(args)
+
+    if not state_file.is_running(persona_dir):
+        if args.bridge_only:
+            print("bridge not running (--bridge-only set)", file=sys.stderr)
+            return 1
+
+        # Auto-spawn
+        class _StartArgs:
+            persona = args.persona
+            idle_shutdown = 30
+            client_origin = "cli"
+
+        rc = daemon.cmd_start(_StartArgs())
+        if rc != 0:
+            return rc
+
+    return _chat_via_bridge(args, persona_dir)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1058,6 +1131,41 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     i_list.set_defaults(func=_interest_list_handler)
 
+    # nell bridge — SP-7 daemon control
+    from brain.bridge.daemon import cmd_start, cmd_status, cmd_stop, cmd_tail
+
+    b_sub = subparsers.add_parser(
+        "bridge",
+        help="Manage the per-persona bridge daemon (SP-7).",
+    )
+    b_actions = b_sub.add_subparsers(dest="action", required=True)
+
+    b_start = b_actions.add_parser("start", help="Start the bridge daemon.")
+    b_start.add_argument("--persona", required=True)
+    b_start.add_argument(
+        "--idle-shutdown",
+        type=float,
+        default=30,
+        help="Idle-shutdown threshold in minutes (0 = never).",
+    )
+    b_start.add_argument(
+        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
+    )
+    b_start.set_defaults(func=cmd_start)
+
+    b_stop = b_actions.add_parser("stop", help="Stop the bridge daemon.")
+    b_stop.add_argument("--persona", required=True)
+    b_stop.add_argument("--timeout", type=float, default=180.0)
+    b_stop.set_defaults(func=cmd_stop)
+
+    b_status = b_actions.add_parser("status", help="Show bridge daemon status.")
+    b_status.add_argument("--persona", required=True)
+    b_status.set_defaults(func=cmd_status)
+
+    b_tail = b_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
+    b_tail.add_argument("--persona", required=True)
+    b_tail.set_defaults(func=cmd_tail)
+
     # nell growth log — read-only inspection of brain growth biography.
     # Per Phase 2a §8: only `log` action ships; no add/approve/reject/force.
     g_sub = subparsers.add_parser(
@@ -1186,6 +1294,18 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="Single message for one-shot mode. Omit for interactive REPL.",
+    )
+    chat_sub.add_argument(
+        "--no-bridge",
+        action="store_true",
+        default=False,
+        help="Bypass the bridge daemon and call engine.respond() in-process.",
+    )
+    chat_sub.add_argument(
+        "--bridge-only",
+        action="store_true",
+        default=False,
+        help="Error out if bridge isn't running; do not auto-spawn.",
     )
     chat_sub.set_defaults(func=_chat_handler)
 
