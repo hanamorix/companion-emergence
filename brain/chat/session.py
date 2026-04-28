@@ -101,8 +101,24 @@ def get_session(session_id: str) -> SessionState | None:
 
 
 def all_sessions() -> list[SessionState]:
-    """Return all registered sessions (live + stale)."""
+    """Return all registered sessions.
+
+    H-B hardening (2026-04-28): with `remove_session` now wired into
+    `/sessions/close`, this returns only LIVE sessions — closed ones are
+    pulled from the registry. Long-lived bridges no longer accumulate stale.
+    """
     return list(_SESSIONS.values())
+
+
+def remove_session(session_id: str) -> bool:
+    """Remove a session from the registry. Returns True if it was present.
+
+    Called by `/sessions/close` after the ingest pipeline succeeds, so
+    `sessions_active` count stays accurate and in_flight_locks can be
+    cleaned up by the caller. Idempotent — calling on an unknown id is
+    a silent False return, not an error.
+    """
+    return _SESSIONS.pop(session_id, None) is not None
 
 
 def reset_registry() -> None:

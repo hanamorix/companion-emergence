@@ -888,11 +888,20 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
 
     s = state_file.read(persona_dir)
     base = f"http://127.0.0.1:{s.port}"
+    # H-C: read the bridge's ephemeral auth token from bridge.json and
+    # send it on every HTTP/WS request. None when running against a
+    # legacy/dev bridge with auth disabled.
+    auth_token = s.auth_token
+    http_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    ws_token_qs = f"?token={auth_token}" if auth_token else ""
+
     sid_arg = getattr(args, "session", None)
     if sid_arg:
         sid = sid_arg
     else:
-        sid = httpx.post(f"{base}/session/new", json={"client": "cli"}).json()["session_id"]
+        sid = httpx.post(
+            f"{base}/session/new", json={"client": "cli"}, headers=http_headers,
+        ).json()["session_id"]
 
     print(f"chat session {sid} (Ctrl-D to exit)")
     while True:
@@ -902,7 +911,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
             break
         if not line:
             continue
-        with connect(f"ws://127.0.0.1:{s.port}/stream/{sid}") as ws:
+        with connect(f"ws://127.0.0.1:{s.port}/stream/{sid}{ws_token_qs}") as ws:
             ws.send(json.dumps({"message": line}))
             print("nell: ", end="", flush=True)
             while True:
@@ -918,7 +927,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
                         file=_sys.stderr,
                     )
                     return 1
-    httpx.post(f"{base}/sessions/close", json={"session_id": sid})
+    httpx.post(f"{base}/sessions/close", json={"session_id": sid}, headers=http_headers)
     return 0
 
 
