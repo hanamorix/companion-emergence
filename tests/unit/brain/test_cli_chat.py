@@ -58,14 +58,14 @@ def _reset_sessions():
 
 def test_chat_one_shot_prints_response(capsys: pytest.CaptureFixture) -> None:
     """nell chat --persona nell 'hello' prints a response and exits 0."""
-    exit_code = main(["chat", "--persona", "nell", "hello"])
+    exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "FAKE_CHAT" in captured.out
 
 
 def test_chat_one_shot_exits_zero() -> None:
-    exit_code = main(["chat", "--persona", "nell", "hello"])
+    exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     assert exit_code == 0
 
 
@@ -77,7 +77,7 @@ def test_chat_one_shot_calls_close_session() -> None:
     test surfaced — 0 ingest events across 20 prompts).
     """
     with patch("brain.ingest.pipeline.close_session") as mock_close:
-        exit_code = main(["chat", "--persona", "nell", "hello"])
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     assert exit_code == 0
     assert mock_close.call_count == 1
     # First positional arg is persona_dir; second is session_id (must be set)
@@ -93,7 +93,7 @@ def test_chat_one_shot_close_failure_warns_not_raises() -> None:
     """
     with patch("brain.ingest.pipeline.close_session", side_effect=RuntimeError("boom")):
         with pytest.warns(RuntimeWarning, match="ingest flush failed"):
-            exit_code = main(["chat", "--persona", "nell", "hello"])
+            exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     assert exit_code == 0
 
 
@@ -103,7 +103,7 @@ def test_chat_one_shot_close_failure_warns_not_raises() -> None:
 def test_chat_repl_handles_exit_command(capsys: pytest.CaptureFixture) -> None:
     """Typing 'exit' closes the REPL cleanly."""
     with patch("builtins.input", side_effect=["exit"]):
-        exit_code = main(["chat", "--persona", "nell"])
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge"])
     assert exit_code == 0
     captured = capsys.readouterr()
     # Summary line printed
@@ -113,7 +113,7 @@ def test_chat_repl_handles_exit_command(capsys: pytest.CaptureFixture) -> None:
 def test_chat_repl_handles_eof(capsys: pytest.CaptureFixture) -> None:
     """EOF (Ctrl+D) closes the REPL cleanly."""
     with patch("builtins.input", side_effect=EOFError()):
-        exit_code = main(["chat", "--persona", "nell"])
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge"])
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "Session ended" in captured.out
@@ -122,7 +122,7 @@ def test_chat_repl_handles_eof(capsys: pytest.CaptureFixture) -> None:
 def test_chat_repl_produces_response_for_one_turn(capsys: pytest.CaptureFixture) -> None:
     """One turn produces a FAKE_CHAT response before exit."""
     with patch("builtins.input", side_effect=["hello there", "exit"]):
-        exit_code = main(["chat", "--persona", "nell"])
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge"])
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "FAKE_CHAT" in captured.out
@@ -144,4 +144,4 @@ def test_chat_missing_persona_dir_raises_file_not_found(tmp_path: Path, monkeypa
     empty_home.mkdir()
     monkeypatch.setattr(paths, "get_home", lambda: empty_home)
     with pytest.raises(FileNotFoundError):
-        main(["chat", "--persona", "ghost"])
+        main(["chat", "--persona", "ghost", "--no-bridge"])
