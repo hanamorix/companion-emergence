@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -75,11 +74,11 @@ def run_folded(
             )
         except Exception:
             logger.exception("supervisor tick raised")
-        # Sleep in 0.1s slices so stop_event is responsive.
-        slept = 0.0
-        while slept < tick_interval_s and not stop_event.is_set():
-            time.sleep(0.1)
-            slept += 0.1
+        # Wait for the next tick or for stop_event, whichever comes first.
+        # stop_event.wait() returns True as soon as the event is set, so
+        # SIGTERM/teardown unblocks us immediately rather than waiting out
+        # the rest of the interval.
+        stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
 
 
