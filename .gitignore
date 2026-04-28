@@ -94,3 +94,6 @@ training/*.pth
 # `nell migrate --output <dir>` writes inspection artefacts
 # that are persona-private and shouldn't enter git.
 migrated-*/
+
+# Local worktrees for parallel development
+.worktrees/
