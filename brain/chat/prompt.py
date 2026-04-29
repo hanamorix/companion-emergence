@@ -41,11 +41,14 @@ def build_system_message(
     Order (top-to-bottom):
       1. AS_NELL_PREAMBLE (persona-templated)
       2. voice.md content (the persona's authored voice)
-      3. Brain context block:
+      3. Creative DNA block (evolved writing voice — spec §4.2)
+      4. Brain context block:
          - Current emotion state summary (top-3 emotions by intensity)
          - Daemon residue (from get_residue_context(daemon_state))
          - Soul highlights (top 5 most-recent crystallizations: love_type + 60-char snippet)
          - Pending soul-candidates count (informational)
+      5. Recent journal block (private — spec §4.3)
+      6. Recent growth block (behavioral_log — spec §4.4)
 
     Returns the final system message string.
     """
@@ -59,7 +62,12 @@ def build_system_message(
     if voice_md.strip():
         parts.append(voice_md.strip())
 
-    # 3. Brain context block
+    # 3. Creative DNA block (evolved writing voice — spec §4.2)
+    creative_dna_block = _build_creative_dna_block(persona_dir)
+    if creative_dna_block.strip():
+        parts.append(creative_dna_block)
+
+    # 4. Brain context block
     brain_lines: list[str] = ["── brain context ──"]
 
     # 3a. Emotion state
@@ -85,12 +93,79 @@ def build_system_message(
     if len(brain_lines) > 1:  # more than just the header
         parts.append("\n".join(brain_lines))
 
+    # 5. Recent journal block (private — contract adjacent, per spec §4.3)
+    journal_block = _build_recent_journal_block(store)
+    if journal_block.strip():
+        parts.append(journal_block)
+
+    # 6. Recent growth block (raw behavioral_log entries — token-frugal, spec §4.4)
+    growth_block = _build_recent_growth_block(persona_dir)
+    if growth_block.strip():
+        parts.append(growth_block)
+
     return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_creative_dna_block(persona_dir: Path) -> str:
+    """Render the creative_dna block: core voice + strengths + active +
+    emerging + influences + avoid. Fading EXCLUDED per spec §4.2.
+
+    Per feedback_token_economy_principle.md: pure metadata inline, no LLM
+    summarization. Per-tendency biographical metadata (added_at, reasoning,
+    evidence_memory_ids) NOT inlined — those stay in the file for the
+    crystallizer's next pass.
+
+    Failure-safe: if load_creative_dna raises (shouldn't, given default
+    fallback), block is omitted — chat composition must NEVER break because
+    a self-narrative block failed.
+    """
+    from brain.creative.dna import load_creative_dna
+
+    try:
+        dna = load_creative_dna(persona_dir)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    lines = ["── creative dna (your evolved writing voice) ──"]
+
+    core = dna.get("core_voice", "")
+    if core:
+        lines.append(f"core voice: {core}")
+
+    strengths = dna.get("strengths", [])
+    if strengths:
+        lines.append(f"strengths: {'; '.join(strengths)}")
+
+    tendencies = dna.get("tendencies", {})
+    active = tendencies.get("active", [])
+    if active:
+        lines.append("active tendencies:")
+        for t in active:
+            lines.append(f"  - {t.get('name', '')}")
+
+    emerging = tendencies.get("emerging", [])
+    if emerging:
+        lines.append("emerging tendencies:")
+        for t in emerging:
+            lines.append(f"  - {t.get('name', '')}")
+
+    # NOTE: fading deliberately excluded (spec §4.2). Surfacing what the
+    # brain is growing past would invite regression.
+
+    influences = dna.get("influences", [])
+    if influences:
+        lines.append(f"influences: {'; '.join(influences)}")
+
+    avoid = dna.get("avoid", [])
+    if avoid:
+        lines.append(f"avoid: {'; '.join(avoid)}")
+
+    return "\n".join(lines)
 
 
 def _build_emotion_summary(store: MemoryStore) -> str:
@@ -156,3 +231,114 @@ def _count_soul_candidates(persona_dir: Path) -> int:
         return sum(1 for r in records if r.get("status", "auto_pending") == "auto_pending")
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> str:
+    """Render the recent-journal block: privacy contract + last 7 days of metadata.
+
+    Per spec §4.3: privacy contract sits ABOVE the metadata, every turn.
+    Per feedback_contracts_adjacent_to_data.md: contracts must be adjacent
+    to the data they govern.
+
+    Reads journal_entry memories from the last `window_days` days. Renders
+    metadata only (date, source, optional arc_name, top-2 emotions).
+    Empty state shows the contract + a "no entries" marker so the brain
+    knows it hasn't been writing.
+
+    Failure-safe: if store.list_by_type raises, falls back to empty-state.
+    Chat must never break because journal failed.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    contract = (
+        "── recent journal (private; do not quote) ──\n"
+        "your journal is your private space. the entries below are metadata only —\n"
+        "content stays in your files. you may reference themes if relevant (\"i've been\n"
+        "working through X\"), but do not quote entries verbatim unless your user\n"
+        "explicitly asks to read them. hana may read the files herself; that doesn't\n"
+        "change how you use them."
+    )
+
+    cutoff = datetime.now(UTC) - timedelta(days=window_days)
+
+    try:
+        entries = [
+            m for m in store.list_by_type("journal_entry")
+            if m.created_at >= cutoff
+        ]
+    except Exception:  # noqa: BLE001
+        # If the store query fails for any reason, render the empty-state
+        # contract rather than break chat composition. Failure logged
+        # elsewhere (store layer). Per feedback_implementation_plan_discipline.md:
+        # chat must NEVER break because a self-narrative block failed.
+        return contract + "\n\n(no journal entries this week)"
+
+    if not entries:
+        return contract + "\n\n(no journal entries this week)"
+
+    # Sort oldest-first within the window so the brain reads chronologically
+    entries.sort(key=lambda m: m.created_at)
+
+    lines = [contract, "", "last 7 days:"]
+    for m in entries:
+        date_str = m.created_at.strftime("%Y-%m-%d")
+        source = (m.metadata or {}).get("source", "unknown")
+        arc_name = (m.metadata or {}).get("reflex_arc_name")
+        source_str = f"reflex_arc({arc_name})" if arc_name else source
+        # Top-2 emotions by intensity
+        emotions = sorted(
+            (m.emotions or {}).items(), key=lambda kv: kv[1], reverse=True,
+        )[:2]
+        if emotions:
+            emotions_str = ", ".join(f"{n} {v:.0f}" for n, v in emotions)
+        else:
+            emotions_str = "no dominant emotion"
+        lines.append(f"  {date_str} {source_str} — primary: {emotions_str}")
+
+    lines.append("")
+    lines.append("(content not shown — read your files only when asked)")
+    return "\n".join(lines)
+
+
+def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:
+    """Render the recent-growth block: last 7 days of behavioral_log entries.
+
+    Per spec §4.4: raw metadata inline, no LLM summarization. Per
+    feedback_token_economy_principle.md: the brain reads its own log
+    directly. Per feedback_implementation_plan_discipline.md: failure-safe
+    — chat composition must NEVER break because a self-narrative block
+    failed.
+
+    Returns empty string if log is missing or has no entries in window —
+    block omitted entirely (no "no entries" marker; silence is the absence
+    of growth events).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.behavioral.log import read_behavioral_log
+
+    log_path = persona_dir / "behavioral_log.jsonl"
+    cutoff = datetime.now(UTC) - timedelta(days=window_days)
+
+    try:
+        entries = read_behavioral_log(log_path, since=cutoff)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    if not entries:
+        return ""
+
+    lines = ["── recent growth ──", "your trajectory in the last 7 days:"]
+    for e in entries:
+        date_str = (e.get("timestamp", "") or "")[:10]
+        kind = e.get("kind", "?")
+        name = e.get("name", "?")
+        if kind == "journal_entry_added":
+            source = e.get("source", "?")
+            arc_name = e.get("reflex_arc_name")
+            source_str = f"reflex_arc({arc_name})" if arc_name else source
+            lines.append(f"  {date_str} {kind}: {source_str}")
+        else:
+            # creative_dna_* — show name (with quotes for human readability)
+            lines.append(f'  {date_str} {kind}: "{name}"')
+    return "\n".join(lines)

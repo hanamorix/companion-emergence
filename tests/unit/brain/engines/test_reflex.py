@@ -651,3 +651,156 @@ def test_reflex_arc_from_dict_rejects_invalid_created_by():
             "created_by": "alien_source",  # not in allowed enum
             "created_at": "2026-04-28T10:00:00+00:00",
         })
+
+
+# ---- behavioral_log emission from _fire ----
+
+
+def test_reflex_fire_emits_behavioral_log_for_journal_arcs(tmp_path: Path):
+    """When a reflex arc with output_memory_type='journal_entry' fires, a
+    journal_entry_added entry must appear in <persona>/behavioral_log.jsonl
+    with source='reflex_arc' and reflex_arc_name set.
+
+    Arcs with non-journal output types (reflex_pitch, reflex_gift) do NOT
+    write to behavioral_log — those are creative outputs, not journal entries.
+    """
+    from datetime import UTC, datetime
+
+    from brain.behavioral.log import read_behavioral_log
+    from brain.bridge.chat import ChatResponse
+    from brain.bridge.provider import LLMProvider
+    from brain.engines.reflex import ReflexArc, ReflexEngine
+    from brain.memory.store import MemoryStore
+
+    class _FakeProvider(LLMProvider):
+        def name(self): return "fake"
+        def generate(self, prompt, *, system=None): return "a brief journal-like reply"
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="a brief journal-like reply", tool_calls=[])
+
+    arc = ReflexArc(
+        name="self_check",
+        description="vulnerability check",
+        trigger={"vulnerability": 8.0},
+        days_since_human_min=0.0,
+        cooldown_hours=12.0,
+        action="generate_journal",
+        output_memory_type="journal_entry",
+        prompt_template="vulnerability is {vulnerability}, write briefly.",
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = ReflexEngine(
+            store=store,
+            provider=_FakeProvider(),
+            persona_name="testpersona",
+            persona_system_prompt="You are testpersona.",
+            arcs_path=tmp_path / "reflex_arcs.json",
+            log_path=tmp_path / "reflex_log.json",
+            default_arcs_path=tmp_path / "default_arcs.json",
+        )
+        emotion_state = {"vulnerability": 9.0}
+        fire = engine._fire(arc, emotion_state, 0.0, [], datetime.now(UTC), dry_run=False)
+        assert fire.output_memory_id is not None
+
+        entries = read_behavioral_log(tmp_path / "behavioral_log.jsonl")
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["kind"] == "journal_entry_added"
+        assert e["name"] == fire.output_memory_id
+        assert e["source"] == "reflex_arc"
+        assert e["reflex_arc_name"] == "self_check"
+    finally:
+        store.close()
+
+
+def test_reflex_fire_does_not_log_for_non_journal_arcs(tmp_path: Path):
+    """Arcs with output_memory_type other than 'journal_entry' do NOT
+    write a behavioral_log entry."""
+    from datetime import UTC, datetime
+
+    from brain.behavioral.log import read_behavioral_log
+    from brain.bridge.chat import ChatResponse
+    from brain.bridge.provider import LLMProvider
+    from brain.engines.reflex import ReflexArc, ReflexEngine
+    from brain.memory.store import MemoryStore
+
+    class _FakeProvider(LLMProvider):
+        def name(self): return "fake"
+        def generate(self, prompt, *, system=None): return "story pitch text"
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="story pitch text", tool_calls=[])
+
+    arc = ReflexArc(
+        name="creative_pitch",
+        description="creative hunger",
+        trigger={"creative_hunger": 8.0},
+        days_since_human_min=0.0,
+        cooldown_hours=48.0,
+        action="generate_pitch",
+        output_memory_type="reflex_pitch",  # NOT journal_entry
+        prompt_template="creative hunger {creative_hunger}",
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = ReflexEngine(
+            store=store, provider=_FakeProvider(),
+            persona_name="testpersona",
+            persona_system_prompt="You are testpersona.",
+            arcs_path=tmp_path / "reflex_arcs.json",
+            log_path=tmp_path / "reflex_log.json",
+            default_arcs_path=tmp_path / "default_arcs.json",
+        )
+        engine._fire(arc, {"creative_hunger": 9.0}, 0.0, [], datetime.now(UTC), dry_run=False)
+
+        # behavioral_log file should not exist (no entries written)
+        log_file = tmp_path / "behavioral_log.jsonl"
+        assert not log_file.exists() or read_behavioral_log(log_file) == []
+    finally:
+        store.close()
+
+
+def test_reflex_dry_run_does_not_emit_behavioral_log(tmp_path: Path):
+    """dry_run=True must not write to behavioral_log even for journal arcs."""
+    from datetime import UTC, datetime
+
+    from brain.behavioral.log import read_behavioral_log
+    from brain.bridge.chat import ChatResponse
+    from brain.bridge.provider import LLMProvider
+    from brain.engines.reflex import ReflexArc, ReflexEngine
+    from brain.memory.store import MemoryStore
+
+    class _FakeProvider(LLMProvider):
+        def name(self): return "fake"
+        def generate(self, prompt, *, system=None): return "x"
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="x", tool_calls=[])
+
+    arc = ReflexArc(
+        name="self_check",
+        description="d",
+        trigger={"vulnerability": 8.0},
+        days_since_human_min=0.0,
+        cooldown_hours=12.0,
+        action="generate_journal",
+        output_memory_type="journal_entry",
+        prompt_template="t",
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = ReflexEngine(
+            store=store, provider=_FakeProvider(),
+            persona_name="t",
+            persona_system_prompt="You are t.",
+            arcs_path=tmp_path / "reflex_arcs.json",
+            log_path=tmp_path / "reflex_log.json",
+            default_arcs_path=tmp_path / "default_arcs.json",
+        )
+        engine._fire(arc, {"vulnerability": 9.0}, 0.0, [], datetime.now(UTC), dry_run=True)
+        log_file = tmp_path / "behavioral_log.jsonl"
+        assert not log_file.exists() or read_behavioral_log(log_file) == []
+    finally:
+        store.close()

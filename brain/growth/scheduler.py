@@ -127,6 +127,25 @@ def run_growth_tick(
             ),
         )
 
+    # Creative DNA crystallization (spec §5)
+    if not dry_run:
+        try:
+            from brain.bridge.provider import get_provider
+            from brain.growth.crystallizers.creative_dna import crystallize_creative_dna
+            from brain.persona_config import PersonaConfig
+
+            cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+            provider = get_provider(cfg.provider)
+            crystallize_creative_dna(
+                store=store,
+                persona_dir=persona_dir,
+                provider=provider,
+                persona_name=persona_dir.name,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("creative_dna crystallizer skipped: %s", exc)
+
     return GrowthTickResult(
         emotions_added=emotions_added,
         proposals_seen=len(proposals),
