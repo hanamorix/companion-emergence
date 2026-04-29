@@ -73,7 +73,7 @@ def test_dispatch_add_journal_returns_dict(tmp_path: Path) -> None:
     result = dispatch("add_journal", {"content": "test entry"}, **ctx)
     assert isinstance(result, dict)
     assert "created_id" in result
-    assert result["memory_type"] == "journal"
+    assert result["memory_type"] == "journal_entry"
 
 
 def test_dispatch_get_emotional_state_returns_dict(tmp_path: Path) -> None:

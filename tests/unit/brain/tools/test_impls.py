@@ -231,11 +231,11 @@ def test_add_journal_creates_journal_memory(tmp_path: Path) -> None:
     result = add_journal("today was quiet", store=store, hebbian=hebbian, persona_dir=tmp_path)
 
     assert "created_id" in result
-    assert result["memory_type"] == "journal"
+    assert result["memory_type"] == "journal_entry"
     # Verify it's actually in the store
     m = store.get(result["created_id"])
     assert m is not None
-    assert m.memory_type == "journal"
+    assert m.memory_type == "journal_entry"
     assert m.content == "today was quiet"
 
 

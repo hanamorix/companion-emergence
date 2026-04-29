@@ -409,6 +409,8 @@ class ReflexEngine:
         days_since_human: float,
         all_mems: list,
         now: datetime,
+        *,
+        dry_run: bool = False,
     ) -> ArcFire:
         """Render prompt → call LLM → write memory → return ArcFire."""
         context: dict = defaultdict(lambda: "0")
@@ -437,6 +439,27 @@ class ReflexEngine:
             },
         )
         self.store.create(mem)
+
+        # Spec §3.4: when reflex fires a journal-shaped arc, emit
+        # journal_entry_added to behavioral_log so the brain sees the trajectory.
+        # Best-effort: log failure does NOT prevent the reflex fire (memory
+        # write is the load-bearing operation).
+        if arc.output_memory_type == "journal_entry" and not dry_run:
+            from brain.behavioral.log import append_behavioral_event
+
+            persona_dir = self.log_path.parent
+            try:
+                append_behavioral_event(
+                    persona_dir / "behavioral_log.jsonl",
+                    kind="journal_entry_added",
+                    name=mem.id,
+                    timestamp=now,
+                    source="reflex_arc",
+                    reflex_arc_name=arc.name,
+                    emotional_state=dict(emotions),
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning("reflex fire: behavioral_log append failed: %s", exc)
 
         return ArcFire(
             arc_name=arc.name,
