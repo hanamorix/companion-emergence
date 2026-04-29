@@ -927,7 +927,27 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
                         file=_sys.stderr,
                     )
                     return 1
-    httpx.post(f"{base}/sessions/close", json={"session_id": sid}, headers=http_headers)
+    # /sessions/close runs the full ingest pipeline (extract via Claude CLI,
+    # commit memories, dedupe, soul candidates). On long sessions this can
+    # take 30s+. Default httpx timeout (5s) reliably trips. 120s leaves
+    # plenty of headroom; if the server is slower than that, the bridge
+    # has bigger problems than this client missing.
+    try:
+        httpx.post(
+            f"{base}/sessions/close",
+            json={"session_id": sid},
+            headers=http_headers,
+            timeout=120.0,
+        )
+    except (httpx.TimeoutException, httpx.HTTPError) as exc:
+        # Bridge keeps running; ingest may still complete server-side. We
+        # don't surface as an error to the user since the chat itself
+        # succeeded — but flag it so they know.
+        print(
+            f"\n[note: session close call timed out ({exc.__class__.__name__}); "
+            f"ingest may complete in the background]",
+            file=_sys.stderr,
+        )
     return 0
 
 
