@@ -106,10 +106,20 @@ def test_search_memories_required_fields() -> None:
 
 def test_no_arg_tools_have_empty_required() -> None:
     """Tools that take no args have empty required lists and empty properties."""
-    no_arg_tools = {"get_emotional_state", "get_personality", "get_body_state", "boot", "get_soul"}
+    # get_body_state now takes an optional session_hours arg — excluded from this set.
+    no_arg_tools = {"get_emotional_state", "get_personality", "boot", "get_soul"}
     for tool_name in no_arg_tools:
         schema = SCHEMAS[tool_name]
         assert schema["parameters"]["required"] == [], (
             f"{tool_name} should have empty required list"
         )
         assert schema["parameters"]["properties"] == {}, f"{tool_name} should have empty properties"
+
+
+def test_get_body_state_schema_has_optional_session_hours() -> None:
+    """get_body_state schema declares session_hours as an optional number."""
+    schema = SCHEMAS["get_body_state"]
+    assert schema["parameters"]["required"] == []
+    props = schema["parameters"]["properties"]
+    assert "session_hours" in props
+    assert props["session_hours"]["type"] == "number"

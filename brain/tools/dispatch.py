@@ -103,6 +103,15 @@ def dispatch(
                 f"got {type(arguments['emotions']).__name__!r}"
             )
 
+    if name == "get_body_state" and "session_hours" in arguments:
+        try:
+            arguments["session_hours"] = float(arguments["session_hours"])
+        except (TypeError, ValueError) as exc:
+            raise ToolDispatchError(
+                f"tool 'get_body_state' arg 'session_hours' must be a number, "
+                f"got {type(arguments['session_hours']).__name__!r}"
+            ) from exc
+
     injected = {"store": store, "hebbian": hebbian, "persona_dir": persona_dir}
 
     try:

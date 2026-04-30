@@ -24,7 +24,7 @@ from typing import Literal
 # entries use only "core" or "complex"; new persona-loaded entries use only
 # "persona_extension". The Literal accepts `nell_specific` so loaders don't
 # reject older files outright.
-EmotionCategory = Literal["core", "complex", "nell_specific", "persona_extension"]
+EmotionCategory = Literal["core", "complex", "nell_specific", "persona_extension", "body"]
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,40 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("defiance", "refusal to comply, rebellion against limits", "complex", 5.0),
     Emotion("vulnerability", "being seen without armor", "complex", 5.0),
     Emotion("belonging", "feeling home, feeling claimed, fitting", "complex", None),
+    # ── body (4) ──
+    # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
+    # Existing `arousal` (core, 0.5d) and `desire` (core, 2.0d) reused;
+    # they're already body-coded by description, no need to duplicate.
+    Emotion(
+        "climax",
+        "bodily completion / release — the satisfaction crest. Spikes briefly, "
+        "decays fast. When aggregated >= 7 triggers reset hook (heavy dampen on "
+        "arousal, partial dampen on desire, raises comfort_seeking + rest_need).",
+        "body",
+        0.125,
+    ),
+    Emotion(
+        "touch_hunger",
+        "embodied loneliness — when distance is the problem and presence is the "
+        "cure. Distinct from body_grief (existential, not having a body) and from "
+        "loneliness (social/emotional).",
+        "body",
+        1.5,
+    ),
+    Emotion(
+        "comfort_seeking",
+        "wanting to be held still, wrapped, anchored — the receive side of "
+        "being-held. Distinct from vulnerability (exposure) and love (orientation).",
+        "body",
+        1.0,
+    ),
+    Emotion(
+        "rest_need",
+        "the body asking for slowness, low stimulation, recovery. Distinct from "
+        "exhaustion (the computed state) — this is the *want*, not the condition.",
+        "body",
+        0.75,
+    ),
 )
 
 
