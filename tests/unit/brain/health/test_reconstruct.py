@@ -11,13 +11,14 @@ def test_empty_store_returns_baseline_only() -> None:
     try:
         result = reconstruct_vocabulary_from_memories(store)
         names = {e["name"] for e in result["emotions"]}
-        # 21 framework baseline emotions
+        # 25 framework baseline emotions (11 core + 10 complex + 4 body)
         assert "love" in names
         assert "joy" in names
         assert "belonging" in names
+        assert "climax" in names  # body
         # No persona extensions
         for e in result["emotions"]:
-            assert e["category"] == "core" or e["category"] == "complex"
+            assert e["category"] in {"core", "complex", "body"}
     finally:
         store.close()
 

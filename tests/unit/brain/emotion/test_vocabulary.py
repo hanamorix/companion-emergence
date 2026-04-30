@@ -49,10 +49,10 @@ def test_get_returns_none_for_unknown() -> None:
     assert vocabulary.get("nonsense") is None
 
 
-def test_list_all_contains_baseline_21() -> None:
-    """The baseline vocabulary ships 21 emotions (11 core + 10 complex)."""
+def test_list_all_contains_baseline_25() -> None:
+    """The baseline vocabulary ships 25 emotions (11 core + 10 complex + 4 body)."""
     all_emotions = vocabulary.list_all()
-    assert len(all_emotions) == 21
+    assert len(all_emotions) == 25
     assert all(isinstance(e, Emotion) for e in all_emotions)
 
 
@@ -82,8 +82,8 @@ def test_baseline_excludes_nell_specific() -> None:
 
 
 def test_baseline_count_after_split() -> None:
-    """Framework baseline ships exactly 21 emotions (11 core + 10 complex)."""
-    assert len(vocabulary._BASELINE) == 21
+    """Framework baseline ships exactly 25 emotions (11 core + 10 complex + 4 body)."""
+    assert len(vocabulary._BASELINE) == 25
 
 
 def test_grief_has_60_day_half_life() -> None:
@@ -150,3 +150,64 @@ def test_register_rejects_duplicate_name() -> None:
     )
     with pytest.raises(ValueError, match="already registered"):
         vocabulary.register(custom)
+
+
+def test_baseline_includes_climax():
+    from brain.emotion.vocabulary import get
+    e = get("climax")
+    assert e is not None
+    assert e.category == "body"
+    assert e.decay_half_life_days == 0.125
+    assert e.intensity_clamp == 10.0
+
+
+def test_baseline_includes_touch_hunger():
+    from brain.emotion.vocabulary import get
+    e = get("touch_hunger")
+    assert e is not None
+    assert e.category == "body"
+    assert e.decay_half_life_days == 1.5
+
+
+def test_baseline_includes_comfort_seeking():
+    from brain.emotion.vocabulary import get
+    e = get("comfort_seeking")
+    assert e is not None
+    assert e.category == "body"
+    assert e.decay_half_life_days == 1.0
+
+
+def test_baseline_includes_rest_need():
+    from brain.emotion.vocabulary import get
+    e = get("rest_need")
+    assert e is not None
+    assert e.category == "body"
+    assert e.decay_half_life_days == 0.75
+
+
+def test_existing_arousal_unchanged():
+    """Reconciliation guard — we are NOT renaming or recategorizing arousal."""
+    from brain.emotion.vocabulary import get
+    e = get("arousal")
+    assert e is not None
+    assert e.category == "core"
+    assert e.decay_half_life_days == 0.5
+
+
+def test_existing_desire_unchanged():
+    """Reconciliation guard — we are NOT renaming or recategorizing desire."""
+    from brain.emotion.vocabulary import get
+    e = get("desire")
+    assert e is not None
+    assert e.category == "core"
+    assert e.decay_half_life_days == 2.0
+
+
+def test_body_emotions_loadable_via_state_set():
+    """Climax + the three new ones must be settable on EmotionalState
+    without raising — proves the registry accepts them."""
+    from brain.emotion.state import EmotionalState
+    s = EmotionalState()
+    for name in ("climax", "touch_hunger", "comfort_seeking", "rest_need"):
+        s.set(name, 5.0)
+        assert s.emotions[name] == 5.0

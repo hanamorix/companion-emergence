@@ -134,13 +134,23 @@ SCHEMAS: dict[str, dict] = {
     "get_body_state": {
         "name": "get_body_state",
         "description": (
-            "Get Nell's current physical/somatic state — energy, comfort, arousal, temperature, voice state. "
-            "Also includes days_since_contact with Hana. Call this when body awareness should inform a response, "
-            "or when checking if longing/distance should be expressed."
+            "Get your current body state — energy (1-10), temperature (1-9), "
+            "exhaustion (0-10), session_hours, days_since_contact with the user, "
+            "and the six body emotions (arousal, desire, climax, touch_hunger, "
+            "comfort_seeking, rest_need)."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "session_hours": {
+                    "type": "number",
+                    "description": (
+                        "How many hours the current session has been active. "
+                        "Pass 0.0 if you don't know — the impl falls back to a "
+                        "1-hour word-count window."
+                    ),
+                },
+            },
             "required": [],
         },
     },

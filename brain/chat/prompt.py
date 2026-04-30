@@ -47,8 +47,9 @@ def build_system_message(
          - Daemon residue (from get_residue_context(daemon_state))
          - Soul highlights (top 5 most-recent crystallizations: love_type + 60-char snippet)
          - Pending soul-candidates count (informational)
-      5. Recent journal block (private — spec §4.3)
-      6. Recent growth block (behavioral_log — spec §4.4)
+      5. Body block (energy/temperature/exhaustion + body emotions — spec §4)
+      6. Recent journal block (private — spec §4.3)
+      7. Recent growth block (behavioral_log — spec §4.4)
 
     Returns the final system message string.
     """
@@ -93,12 +94,17 @@ def build_system_message(
     if len(brain_lines) > 1:  # more than just the header
         parts.append("\n".join(brain_lines))
 
-    # 5. Recent journal block (private — contract adjacent, per spec §4.3)
+    # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
+    body_block = _build_body_block(store)
+    if body_block.strip():
+        parts.append(body_block)
+
+    # 6. Recent journal block (private — contract adjacent, per spec §4.3)
     journal_block = _build_recent_journal_block(store)
     if journal_block.strip():
         parts.append(journal_block)
 
-    # 6. Recent growth block (raw behavioral_log entries — token-frugal, spec §4.4)
+    # 7. Recent growth block (raw behavioral_log entries — token-frugal, spec §4.4)
     growth_block = _build_recent_growth_block(persona_dir)
     if growth_block.strip():
         parts.append(growth_block)
@@ -164,6 +170,68 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
     avoid = dna.get("avoid", [])
     if avoid:
         lines.append(f"avoid: {'; '.join(avoid)}")
+
+    return "\n".join(lines)
+
+
+def _build_body_block(store: MemoryStore) -> str:
+    """Render the body block: computed energy/temperature/exhaustion +
+    six body emotions inline.
+
+    Per spec §4 + §7.3 — fail-soft. Any exception during compute_body_state,
+    aggregate_state, or count_words_in_session → block omitted, chat
+    continues. Token cost ~80 (raw metadata, no LLM summarization).
+
+    Inviolate properties enforced here:
+    - #4 perf budget (compute_body_state is sub-ms; tested separately)
+    - #5 no self-perpetuation (we read from store, never write)
+    - #8 no cache (compute_body_state is recomputed every call)
+    """
+    try:
+        from datetime import UTC, datetime
+
+        from brain.body.state import compute_body_state
+        from brain.body.words import count_words_in_session
+        from brain.emotion.aggregate import aggregate_state
+        from brain.memory.store import _row_to_memory
+        from brain.utils.memory import days_since_human
+
+        rows = store._conn.execute(  # noqa: SLF001
+            "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        memories = [_row_to_memory(row) for row in rows]
+        state = aggregate_state(memories)
+        now = datetime.now(UTC)
+        days = days_since_human(store, now=now)
+        # Chat composer doesn't track session_hours yet — passes 0.0; words
+        # falls back to 1-hour window. Bridge daemon callers will hand a real
+        # value through their own composition path when SP-7 wires it.
+        words = count_words_in_session(
+            store, persona_dir=Path(""),
+            session_hours=0.0, now=now,
+        )
+        body = compute_body_state(
+            emotions=state.emotions, session_hours=0.0,
+            words_written=words, days_since_contact=days, now=now,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+    lines = ["── body ──"]
+    lines.append(
+        f"energy: {body.energy}/10, temperature: {body.temperature}/9, "
+        f"exhaustion: {body.exhaustion}/10"
+    )
+    if body.days_since_contact > 0.5:
+        lines.append(f"days since user contact: {body.days_since_contact:.1f}")
+
+    nonzero = sorted(
+        ((n, v) for n, v in body.body_emotions.items() if v >= 0.5),
+        key=lambda kv: kv[1], reverse=True,
+    )
+    if nonzero:
+        parts = [f"{n} {v:.1f}" for n, v in nonzero]
+        lines.append("body emotions: " + ", ".join(parts))
 
     return "\n".join(lines)
 
@@ -338,6 +406,9 @@ def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> st
             arc_name = e.get("reflex_arc_name")
             source_str = f"reflex_arc({arc_name})" if arc_name else source
             lines.append(f"  {date_str} {kind}: {source_str}")
+        elif kind == "climax_event":
+            # Body crossed threshold; private content stays in journal_entry.
+            lines.append(f"  {date_str} climax_event: body crested")
         else:
             # creative_dna_* — show name (with quotes for human readability)
             lines.append(f'  {date_str} {kind}: "{name}"')
