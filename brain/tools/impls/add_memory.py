@@ -67,6 +67,17 @@ def add_memory(
     )
     store.create(memory)
 
+    # Body event hook: when an LLM-tagged memory commits with climax >= 7,
+    # auto-write a private journal_entry referencing this originating memory.
+    # Fail-soft inside record_climax_event — never affects the add_memory
+    # return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
+    if memory.emotions.get("climax", 0.0) >= 7.0:
+        from brain.body.events import record_climax_event
+
+        record_climax_event(
+            originating_memory=memory, store=store, persona_dir=persona_dir,
+        )
+
     # Auto-Hebbian: find the 3 most text-related existing memories and
     # strengthen edges. We search on individual keywords from the content
     # (not the full phrase) so partial-match memories surface correctly.

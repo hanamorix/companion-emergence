@@ -227,6 +227,33 @@ def test_recent_growth_block_renders_behavioral_log_entries(
     assert "journal_entry_added" in msg
 
 
+def test_recent_growth_block_renders_climax_event(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+):
+    """A climax_event entry shows up in the growth block as 'body crested'.
+    Content stays in the journal_entry memory; behavioral_log is metadata-only."""
+    from brain.behavioral.log import append_behavioral_event
+
+    log_path = persona_dir / "behavioral_log.jsonl"
+    append_behavioral_event(
+        log_path, kind="climax_event",
+        name="mem_climax_journal_xyz",
+        timestamp=datetime.now(UTC) - timedelta(days=1),
+        source="climax_event",
+        reflex_arc_name=None,
+        emotional_state={"climax": 8.0, "arousal": 8.0},
+    )
+
+    msg = build_system_message(
+        persona_dir, voice_md="", daemon_state=daemon_state,
+        soul_store=soul_store, store=store,
+    )
+
+    assert "── recent growth ──" in msg
+    assert "climax_event: body crested" in msg
+
+
+
 def test_recent_growth_block_omitted_when_log_empty(
     persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
 ):

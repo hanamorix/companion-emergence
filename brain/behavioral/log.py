@@ -32,6 +32,10 @@ _VALID_KINDS = frozenset({
     "creative_dna_active_demoted",
     "creative_dna_fading_dropped",
     "journal_entry_added",
+    # body lifecycle — emitted by brain/body/events.py when an add_memory
+    # commit lands with climax >= 7. Same wire shape as journal_entry_added
+    # (uses source/reflex_arc_name/emotional_state slots).
+    "climax_event",
 })
 
 
@@ -60,7 +64,7 @@ def append_behavioral_event(
     if kind not in _VALID_KINDS:
         raise ValueError(f"behavioral_log: unknown kind {kind!r}")
 
-    if kind == "journal_entry_added":
+    if kind in {"journal_entry_added", "climax_event"}:
         entry: dict[str, Any] = {
             "timestamp": iso_utc(timestamp),
             "kind": kind,
