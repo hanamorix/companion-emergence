@@ -341,6 +341,34 @@ def test_add_memory_auto_links_related(tmp_path: Path) -> None:
     assert len(result["auto_linked_to"]) >= 1
 
 
+def test_add_memory_surfaces_auto_link_failure(tmp_path: Path) -> None:
+    """A graph-linking failure keeps the memory but returns a visible warning."""
+    from brain.tools.impls.add_memory import add_memory
+
+    class BrokenHebbian:
+        def strengthen(self, *_args: object, **_kwargs: object) -> None:
+            raise OSError("hebbian disk full")
+
+    store = _make_store()
+    _seed_memory(store, content="writing together late at night")
+
+    result = add_memory(
+        content="another late night of writing together",
+        memory_type="event",
+        domain="creative_writing",
+        emotions={"love": 10, "joy": 6},
+        store=store,
+        hebbian=BrokenHebbian(),
+        persona_dir=tmp_path,
+    )
+
+    assert result["created"] is True
+    assert result["auto_linked_to"] == []
+    assert "auto_link_error" in result
+    assert "hebbian disk full" in result["auto_link_error"]
+    assert store.count() == 2
+
+
 def test_add_memory_calc_importance_auto_low(tmp_path: Path) -> None:
     """Auto-calculated importance from low score falls in 1-10 range."""
     from brain.tools.impls._common import _calc_importance_from_emotions

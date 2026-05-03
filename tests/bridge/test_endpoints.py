@@ -91,8 +91,17 @@ def test_health_sessions_active_increments_after_new(persona_dir: Path):
 
 def test_chat_404_unknown_session(persona_dir: Path):
     with _make_client(persona_dir) as c:
-        r = c.post("/chat", json={"session_id": "no-such-sid", "message": "hi"})
+        r = c.post(
+            "/chat",
+            json={"session_id": "00000000-0000-0000-0000-000000000000", "message": "hi"},
+        )
         assert r.status_code == 404
+
+
+def test_chat_rejects_invalid_session_id_shape(persona_dir: Path):
+    with _make_client(persona_dir) as c:
+        r = c.post("/chat", json={"session_id": "no-such-sid", "message": "hi"})
+        assert r.status_code == 422
 
 
 def test_chat_round_trip_with_fake_provider(persona_dir: Path, monkeypatch):
@@ -106,10 +115,26 @@ def test_chat_round_trip_with_fake_provider(persona_dir: Path, monkeypatch):
         assert body["reply"] == "hello, hana"
         assert body["turn"] == 1
         assert "duration_ms" in body
+        assert body["metadata"]["persistence_ok"] is True
 
         s = c.get(f"/state/{sid}").json()
         assert s["turns"] == 1
         assert s["history_len"] == 2  # user + assistant
+
+
+def test_chat_rejects_empty_and_oversized_messages(persona_dir: Path, monkeypatch):
+    """HTTP chat should reject messages outside the supported size contract."""
+    _patch_fake_provider(monkeypatch, reply="hello")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        assert c.post("/chat", json={"session_id": sid, "message": ""}).status_code == 422
+        assert c.post("/chat", json={"session_id": sid, "message": "x" * 20001}).status_code == 422
+
+
+def test_session_new_rejects_unknown_client_label(persona_dir: Path):
+    with _make_client(persona_dir) as c:
+        r = c.post("/session/new", json={"client": "surprise-browser"})
+        assert r.status_code == 422
 
 
 def test_sessions_close_returns_ingest_report(persona_dir: Path, monkeypatch):
@@ -124,6 +149,7 @@ def test_sessions_close_returns_ingest_report(persona_dir: Path, monkeypatch):
         assert body["session_id"] == sid
         assert "committed" in body
         assert "deduped" in body
+        assert "soul_queue_errors" in body
         assert "errors" in body
 
 
@@ -146,5 +172,32 @@ def test_stream_round_trip(persona_dir: Path, monkeypatch):
     assert types[0] == "started"
     assert types[-1] == "done"
     assert "reply_chunk" in types
+    assert frames[-1]["metadata"]["persistence_ok"] is True
     chunked = "".join(f["text"] for f in frames if f.get("type") == "reply_chunk")
     assert chunked == "hello world from nell"
+
+
+def test_stream_accepts_bearer_websocket_subprotocol(persona_dir: Path, monkeypatch):
+    """WS auth should not require putting the bearer token in the URL query string."""
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="hello")
+    app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token="secret-token")
+    with TestClient(app) as c:
+        sid = c.post(
+            "/session/new",
+            json={"client": "tests"},
+            headers={"Authorization": "Bearer secret-token"},
+        ).json()["session_id"]
+        with c.websocket_connect(
+            f"/stream/{sid}", subprotocols=["bearer", "secret-token"]
+        ) as ws:
+            assert ws.accepted_subprotocol == "bearer"
+            ws.send_json({"message": "hi"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame.get("type") == "done":
+                    break
+
+    assert frames[-1]["type"] == "done"

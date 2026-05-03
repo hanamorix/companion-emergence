@@ -22,6 +22,29 @@ def test_round_trip_preserves_all_fields(persona_dir: Path):
     assert read_back == state
 
 
+def test_write_protects_bridge_state_and_backup_files(persona_dir: Path):
+    state = state_file.BridgeState(
+        persona="test-persona",
+        pid=os.getpid(),
+        port=51234,
+        started_at="2026-04-28T10:15:00Z",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
+        auth_token="secret-token",
+    )
+    state_file.write(persona_dir, state)
+    state_file.write(persona_dir, state)
+
+    if os.name == "posix":
+        assert oct(persona_dir.stat().st_mode & 0o777) == "0o700"
+        assert oct((persona_dir / "bridge.json").stat().st_mode & 0o777) == "0o600"
+        assert oct((persona_dir / "bridge.json.bak1").stat().st_mode & 0o777) == "0o600"
+    else:
+        assert (persona_dir / "bridge.json").exists()
+        assert (persona_dir / "bridge.json.bak1").exists()
+
+
 def test_read_returns_none_when_missing(persona_dir: Path):
     assert state_file.read(persona_dir) is None
 

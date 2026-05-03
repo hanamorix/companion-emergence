@@ -25,12 +25,17 @@ if TYPE_CHECKING:
 
 DEFAULT_PROVIDER = "claude-cli"
 DEFAULT_SEARCHER = "ddgs"
+DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
 
 logger = logging.getLogger(__name__)
 
 
 def _default_persona_config_dict() -> dict:
-    return {"provider": DEFAULT_PROVIDER, "searcher": DEFAULT_SEARCHER}
+    return {
+        "provider": DEFAULT_PROVIDER,
+        "searcher": DEFAULT_SEARCHER,
+        "mcp_audit_log_level": DEFAULT_MCP_AUDIT_LOG_LEVEL,
+    }
 
 
 @dataclass
@@ -45,6 +50,7 @@ class PersonaConfig:
 
     provider: str = DEFAULT_PROVIDER
     searcher: str = DEFAULT_SEARCHER
+    mcp_audit_log_level: str = DEFAULT_MCP_AUDIT_LOG_LEVEL
 
     @classmethod
     def _parse_data(cls, data: object) -> PersonaConfig:
@@ -53,13 +59,17 @@ class PersonaConfig:
             return cls()
         provider_raw = data.get("provider", DEFAULT_PROVIDER)
         searcher_raw = data.get("searcher", DEFAULT_SEARCHER)
+        audit_raw = data.get("mcp_audit_log_level", DEFAULT_MCP_AUDIT_LOG_LEVEL)
         provider = (
             provider_raw if isinstance(provider_raw, str) and provider_raw else DEFAULT_PROVIDER
         )
         searcher = (
             searcher_raw if isinstance(searcher_raw, str) and searcher_raw else DEFAULT_SEARCHER
         )
-        return cls(provider=provider, searcher=searcher)
+        audit_level = audit_raw.strip().lower() if isinstance(audit_raw, str) else ""
+        if audit_level not in {"off", "metadata", "redacted", "full"}:
+            audit_level = DEFAULT_MCP_AUDIT_LOG_LEVEL
+        return cls(provider=provider, searcher=searcher, mcp_audit_log_level=audit_level)
 
     @classmethod
     def load_with_anomaly(cls, path: Path) -> tuple[PersonaConfig, BrainAnomaly | None]:
@@ -90,7 +100,11 @@ class PersonaConfig:
         from brain.health.adaptive import compute_treatment
         from brain.health.attempt_heal import save_with_backup
 
-        payload = {"provider": self.provider, "searcher": self.searcher}
+        payload = {
+            "provider": self.provider,
+            "searcher": self.searcher,
+            "mcp_audit_log_level": self.mcp_audit_log_level,
+        }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
         if treatment.verify_after_write:

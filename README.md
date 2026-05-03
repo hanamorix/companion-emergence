@@ -10,6 +10,8 @@ The framework's design lives in [`docs/source-spec/`](docs/source-spec/). Read t
 
 ## Status
 
-Week 0 — design approved 2026-04-21. Rebuild starting.
+Active local-first prototype. The bridge, chat/session flow, memory ingest, soul review, health checks, and test/lint gates are implemented enough for private development and local smoke testing.
+
+Known incomplete surfaces remain intentional and visible: some CLI commands are wired as future-work stubs and exit non-zero. See [`docs/release-checklist.md`](docs/release-checklist.md) before any public/tagged release.
 
 Reference implementation: Nell (migrates from the NellBrain OG project). Other personas arrive as forkers build them.
