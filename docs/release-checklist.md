@@ -24,7 +24,8 @@ This project is private/local-first during development. Before sharing a public 
 ## Packaging/versioning
 
 - Set the intended version in `pyproject.toml`.
-- Add or update `CHANGELOG.md` once the project is public-facing.
+- Add or update `CHANGELOG.md` before tagging or sharing a build.
+- Review `docs/roadmap.md` and confirm known stubs/incomplete surfaces are documented.
 - Build the wheel/sdist only after tests and lint pass.
 - Do not add release automation until the CLI/API surface is stable enough to version.
 
