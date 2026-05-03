@@ -118,10 +118,37 @@ def read(persona_dir: Path) -> BridgeState | None:
     return BridgeState(**data)
 
 
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Windows-safe PID liveness check that avoids os.kill(pid, 0)."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    process_query_limited_information = 0x1000
+    still_active = 259
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # ERROR_ACCESS_DENIED means the process exists but is not queryable by
+        # this user/session. Treat it as alive, matching PermissionError on
+        # POSIX. Other errors mean no live process was opened.
+        return kernel32.GetLastError() == 5
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def pid_is_alive(pid: int) -> bool:
     """Return True if the given pid is a live process owned by this user."""
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -131,9 +158,6 @@ def pid_is_alive(pid: int) -> bool:
         # Pid exists but is owned by someone else — treat as alive.
         return True
     except OSError as exc:
-        # Windows raises plain OSError/WinError for invalid PID values instead
-        # of ProcessLookupError. Treat those as dead rather than letting dirty
-        # shutdown recovery crash before it can drain orphan buffers.
         logger.debug("pid liveness check failed pid=%s err=%s", pid, exc)
         return False
 
