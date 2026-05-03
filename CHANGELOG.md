@@ -1,0 +1,48 @@
+# Changelog
+
+All notable changes to companion-emergence will be tracked here.
+
+The project is still private/local-first during development. Entries below describe private release readiness, not a public stable API promise.
+
+## 0.0.1 - Unreleased
+
+### Added
+
+- Local-first persona data layout under the platform-aware `NELLBRAIN_HOME` root.
+- `nell` CLI entry point with migration, chat, bridge, health, soul, growth, dream, heartbeat, reflex, research, interest, and status surfaces.
+- `nell status` for checking a persona directory, provider/searcher config, memory database count, and bridge process state without contacting live providers.
+- Bridge HTTP/WebSocket server with local bearer-token authentication, session lifecycle endpoints, health checks, audit-safe event streaming, and dirty-shutdown recovery hooks.
+- Chat/session flow with memory retrieval, body/emotion state context, persistence metadata, and local ingestion on session close.
+- SQLite memory store, Hebbian associations, embedding cache, and health/self-healing support for local data files.
+- Soul candidate queue, review workflow, audit logging, duplicate-safe acceptance, and revocation support.
+- Growth scheduler and crystallizers for identity, preferences, relationships, style, and vocabulary.
+- MCP server tools with configurable audit logging modes: `off`, `metadata`, `redacted`, and `full`.
+- Release checklist for private smoke testing and future public/tagged releases.
+
+### Changed
+
+- Stub CLI commands intentionally exit non-zero until implemented, so incomplete surfaces are visible instead of silently pretending to work.
+- Provider-backed growth paths are guarded so local tests and dry runs do not accidentally hang on live provider calls.
+- Memory hot paths can avoid expensive integrity checks while health checks retain deeper verification.
+- Empty memory text searches are rejected; callers that want broad listing must use explicit listing APIs.
+
+### Security and privacy
+
+- WebSocket authentication uses bearer subprotocol headers instead of URL query-string tokens.
+- Bridge state files are protected with owner-only permissions where the platform supports POSIX permission bits.
+- MCP tool audit logging redacts sensitive arguments by default.
+- Status output does not print bridge bearer tokens.
+
+### Fixed
+
+- Chat persistence failures are surfaced in response metadata instead of disappearing silently.
+- Soul queue write failures increment explicit ingest error counts.
+- Soul review acceptance is retry/duplicate safe.
+- Windows CI no longer uses POSIX-only PID liveness probes.
+- Tests no longer assume POSIX chmod behavior on Windows or distinct timestamps from immediate back-to-back calls.
+
+### Known incomplete surfaces
+
+- `nell supervisor`, `nell rest`, `nell memory`, and `nell works` remain intentional future-work stubs.
+- Public release automation is deferred until the CLI/API surface is stable enough to version.
+- Public contributor documentation is not yet written because the project remains private during development.
