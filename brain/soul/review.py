@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -297,7 +298,7 @@ def _current_emotional_summary(store: MemoryStore) -> str:
     try:
         from brain.emotion.aggregate import aggregate_state
 
-        recent = store.search_text("", active_only=True, limit=50)
+        recent = store.list_active(limit=50)
         state = aggregate_state(recent)
         scores = dict(state.emotions)
     except Exception as exc:
@@ -326,8 +327,24 @@ def _apply_accept(
 
     from brain.soul.crystallization import Crystallization
 
+    source_id = str(candidate.get("memory_id") or candidate.get("id") or "").strip()
+    if source_id:
+        safe_source_id = re.sub(r"[^A-Za-z0-9_.:-]+", "-", source_id)[:120]
+        crystallization_id = f"candidate-{safe_source_id}"
+    else:
+        crystallization_id = str(uuid.uuid4())
+
+    if soul_store.get(crystallization_id) is not None:
+        _mark_candidate(
+            candidate,
+            "accepted",
+            crystallization_id=crystallization_id,
+            accepted_at=datetime.now(UTC).isoformat(),
+        )
+        return crystallization_id
+
     c = Crystallization(
-        id=str(uuid.uuid4()),
+        id=crystallization_id,
         moment=candidate.get("text", ""),
         love_type=decision.love_type,
         why_it_matters=decision.why_it_matters,
@@ -341,10 +358,10 @@ def _apply_accept(
     _mark_candidate(
         candidate,
         "accepted",
-        crystallization_id=c.id,
+        crystallization_id=crystallization_id,
         accepted_at=datetime.now(UTC).isoformat(),
     )
-    return c.id
+    return crystallization_id
 
 
 def _apply_reject(candidate: dict, decision: Decision, dry_run: bool) -> None:

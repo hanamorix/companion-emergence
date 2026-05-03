@@ -317,7 +317,7 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        all_mems = self.store.search_text("", active_only=True, limit=None)
+        all_mems = self.store.list_active(limit=None)
         state = aggregate_state(all_mems)
         days_since = days_since_human(self.store, now)
 

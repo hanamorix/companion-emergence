@@ -29,10 +29,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from brain.bridge import events
 from brain.bridge.events import EventBus
@@ -113,7 +113,7 @@ def _respond_blocking(
     from brain.chat.engine import respond
 
     with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
@@ -140,7 +140,7 @@ def _close_session_blocking(
     from brain.ingest.pipeline import close_session
 
     with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
@@ -199,7 +199,7 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     )
 
     with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
@@ -239,7 +239,7 @@ def _drain_sessions_blocking(
     from brain.ingest.pipeline import close_stale_sessions
 
     with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
@@ -263,7 +263,7 @@ def _drain_sessions_blocking(
 
 
 class NewSessionReq(BaseModel):
-    client: str = "cli"  # "cli" | "tauri" | "tests"
+    client: Literal["cli", "tauri", "tests"] = "cli"
 
 
 class NewSessionResp(BaseModel):
@@ -273,12 +273,12 @@ class NewSessionResp(BaseModel):
 
 
 class ChatReq(BaseModel):
-    session_id: str
-    message: str
+    session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    message: str = Field(..., min_length=1, max_length=20_000)
 
 
 class CloseReq(BaseModel):
-    session_id: str
+    session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +297,8 @@ class BridgeAppState:
     call; no long-lived resource).
 
     `auth_token` (H-C): None disables auth (test/dev). When set, all HTTP
-    routes require Authorization: Bearer <token>; WS endpoints require
-    ?token=<token> query param + Origin allowlist.
+    routes require Authorization: Bearer <token>; WS endpoints prefer
+    Sec-WebSocket-Protocol: bearer, <token>, plus Origin allowlist.
     """
 
     persona_dir: Path
@@ -330,9 +330,9 @@ def build_app(
     """Build a FastAPI app for the given persona. Public for tests + daemon.
 
     auth_token: when set, HTTP routes require Authorization: Bearer <token>
-    and WS endpoints require ?token=<token>. None (default) disables auth
-    — used by tests and offline dev. Production runner.py always passes a
-    fresh ephemeral token.
+    and WS endpoints require Sec-WebSocket-Protocol: bearer, <token>.
+    None (default) disables auth — used by tests and offline dev. Production
+    runner.py always passes a fresh ephemeral token.
 
     allowed_origins: WebSocket Origin header allowlist (extra defense
     against browser-based attacks if someone proxies localhost). "null"
@@ -457,7 +457,7 @@ def build_app(
 
     # ── H-C: auth + Origin check helpers ──────────────────────────────────
     # HTTP: require `Authorization: Bearer <token>` when auth_token is set.
-    # WS: require `?token=<token>` query param + Origin in allowlist.
+    # WS: require `Sec-WebSocket-Protocol: bearer, <token>` + Origin allowlist.
     # Both no-op when auth_token is None (test/dev mode).
 
     import secrets as _secrets
@@ -481,6 +481,25 @@ def build_app(
         if not _consteq(token, auth_token):
             raise HTTPException(status_code=401, detail="invalid token")
 
+    def _ws_subprotocol_parts(ws: WebSocket) -> list[str]:
+        raw = ws.headers.get("sec-websocket-protocol", "")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    def _ws_subprotocol_token(ws: WebSocket) -> str:
+        """Extract a browser-friendly WS bearer token from subprotocols.
+
+        Supported form: Sec-WebSocket-Protocol: bearer, <token>.
+        """
+        parts = _ws_subprotocol_parts(ws)
+        for i, part in enumerate(parts[:-1]):
+            if part.lower() == "bearer":
+                return parts[i + 1]
+        return ""
+
+    def _ws_accept_subprotocol(ws: WebSocket) -> str | None:
+        parts = _ws_subprotocol_parts(ws)
+        return "bearer" if any(part.lower() == "bearer" for part in parts) else None
+
     def _check_ws_auth(ws: WebSocket) -> tuple[bool, str]:
         """Return (ok, reason). Caller closes the WS with reason on False."""
         # Origin check first — cheap, defends against browsers.
@@ -491,7 +510,7 @@ def build_app(
         # Token check second (closure-captured auth_token).
         if auth_token is None:
             return True, ""  # auth disabled
-        token = ws.query_params.get("token", "")
+        token = _ws_subprotocol_token(ws)
         if not token:
             return False, "missing token"
         if not _consteq(token, auth_token):
@@ -595,6 +614,7 @@ def build_app(
                 "turn": result.turn,
                 "tool_invocations": result.tool_invocations,
                 "duration_ms": duration_ms,
+                "metadata": result.metadata,
             }
 
     # ── WS /stream/{session_id} — simulated streaming ──────────────────────
@@ -605,7 +625,7 @@ def build_app(
         if not ok:
             await ws.close(code=4001, reason=reason)
             return
-        await ws.accept()
+        await ws.accept(subprotocol=_ws_accept_subprotocol(ws))
         s: BridgeAppState = app.state.bridge
         sess = get_session(session_id)
         if sess is None:
@@ -623,8 +643,12 @@ def build_app(
         except (WebSocketDisconnect, ValueError):
             return
         message = req.get("message", "")
-        if not message:
+        if not isinstance(message, str) or not message:
             await ws.send_json({"type": "error", "code": "empty_message", "done": True})
+            await ws.close()
+            return
+        if len(message) > 20_000:
+            await ws.send_json({"type": "error", "code": "message_too_large", "done": True})
             await ws.close()
             return
 
@@ -680,6 +704,7 @@ def build_app(
                     "session_id": session_id,
                     "turn": result.turn,
                     "duration_ms": duration_ms,
+                    "metadata": result.metadata,
                     "at": _now(),
                 }
             )
@@ -698,7 +723,7 @@ def build_app(
         if not ok:
             await ws.close(code=4001, reason=reason)
             return
-        await ws.accept()
+        await ws.accept(subprotocol=_ws_accept_subprotocol(ws))
         s: BridgeAppState = app.state.bridge
         q = s.event_bus.subscribe()
         await ws.send_json(
@@ -758,6 +783,7 @@ def build_app(
             committed=report.committed,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
+            soul_queue_errors=report.soul_queue_errors,
             errors=report.errors,
         )
         return {
@@ -766,6 +792,7 @@ def build_app(
             "committed": report.committed,
             "deduped": report.deduped,
             "soul_candidates": report.soul_candidates,
+            "soul_queue_errors": report.soul_queue_errors,
             "errors": report.errors,
         }
 

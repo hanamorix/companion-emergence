@@ -170,8 +170,8 @@ def respond(
     )
     content = response.content or ""
 
-    # 8. Persist turn (best-effort)
-    _persist_turn(
+    # 8. Persist turn (best-effort, but surfaced in metadata)
+    persistence_ok, persistence_error = _persist_turn(
         persona_dir=persona_dir,
         session_id=session.session_id,
         user_text=user_input,
@@ -187,7 +187,11 @@ def respond(
         turn=session.turns,
         tool_invocations=invocations,
         duration_ms=duration_ms,
-        metadata={"provider": provider.name()},
+        metadata={
+            "provider": provider.name(),
+            "persistence_ok": persistence_ok,
+            "persistence_error": persistence_error,
+        },
     )
 
 
@@ -196,7 +200,7 @@ def _persist_turn(
     session_id: str,
     user_text: str,
     assistant_text: str,
-) -> None:
+) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
     Mirrors OG _persist_turn (nell_bridge.py:200-230): failures here must
@@ -209,9 +213,11 @@ def _persist_turn(
             persona_dir,
             {"session_id": session_id, "speaker": "assistant", "text": assistant_text},
         )
+        return True, None
     except (OSError, ValueError) as exc:
         logger.warning(
             "conversation buffer write failed session=%s err=%s",
             session_id,
             exc,
         )
+        return False, str(exc)

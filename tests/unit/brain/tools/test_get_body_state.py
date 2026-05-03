@@ -11,6 +11,7 @@ import pytest
 
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.tools.impls import get_body_state as body_tool
 from brain.tools.impls.get_body_state import get_body_state
 
 
@@ -64,8 +65,21 @@ def test_session_hours_passed_through(store, hebbian, tmp_path):
     assert out["session_hours"] == 2.5
 
 
-def test_recomputes_each_call(store, hebbian, tmp_path):
+def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):
     """Inviolate property #8 from spec §7.1 — no cache."""
+    calls = 0
+    original = body_tool.compute_body_state
+
+    def counting_compute_body_state(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(body_tool, "compute_body_state", counting_compute_body_state)
+
     out1 = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
     out2 = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
-    assert out1["computed_at"] != out2["computed_at"]
+
+    assert calls == 2
+    assert "computed_at" in out1
+    assert "computed_at" in out2

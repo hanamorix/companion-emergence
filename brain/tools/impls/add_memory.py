@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _write_gate_check
+
+logger = logging.getLogger(__name__)
 
 
 def add_memory(
@@ -83,6 +86,7 @@ def add_memory(
     # (not the full phrase) so partial-match memories surface correctly.
     # Exclude the new memory itself.
     related_ids: list[str] = []
+    auto_link_error: str | None = None
     try:
         # Extract up to 3 significant keywords from the content (skip short words)
         words = [w.strip(".,!?;:\"'") for w in content.lower().split()]
@@ -103,13 +107,18 @@ def add_memory(
                 hebbian.strengthen(memory.id, rel.id, delta=0.5)
                 related_ids.append(rel.id)
                 seen_ids.add(rel.id)
-    except Exception:
-        # Hebbian strengthening is best-effort — don't fail the write.
-        pass
+    except Exception as exc:
+        # Hebbian strengthening is best-effort — don't fail the write, but do
+        # surface the partial failure so callers and logs are not misled.
+        auto_link_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("add_memory auto-link failed memory_id=%s err=%s", memory.id, auto_link_error)
 
-    return {
+    result = {
         "created": True,
         "id": memory.id,
         "importance": effective_importance,
         "auto_linked_to": related_ids,
     }
+    if auto_link_error is not None:
+        result["auto_link_error"] = auto_link_error
+    return result

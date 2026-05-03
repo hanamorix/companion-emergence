@@ -180,7 +180,7 @@ def _warn_on_referenced_but_unregistered(store: MemoryStore) -> None:
     without re-migration yet.
     """
     seen_missing: set[str] = set()
-    for mem in store.search_text("", active_only=True, limit=None):
+    for mem in store.list_active(limit=None):
         for name in mem.emotions:
             if name in seen_missing:
                 continue

@@ -227,6 +227,30 @@ def test_close_session_memory_and_soul_candidate_both_written(
     assert candidates[0]["memory_id"] == mem_id
 
 
+def test_close_session_counts_soul_queue_failure_without_claiming_success(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed memory is not reported as queued if the soul queue append fails."""
+    ingest_turn(tmp_path, {"session_id": "sess_soul_fail", "speaker": "Hana", "text": "this matters"})
+    provider = _CannedProvider(
+        [{"text": "The important truth was remembered", "label": "observation", "importance": 10}]
+    )
+    monkeypatch.setattr("brain.ingest.pipeline.queue_soul_candidate", lambda *a, **k: False)
+
+    report = close_session(
+        tmp_path,
+        "sess_soul_fail",
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
+    )
+
+    assert report.committed == 1
+    assert report.soul_candidates == 0
+    assert report.soul_queue_errors == 1
+    assert list_soul_candidates(tmp_path) == []
+
+
 # ---------------------------------------------------------------------------
 # close_stale_sessions tests
 # ---------------------------------------------------------------------------
