@@ -119,24 +119,28 @@ def close_session(
 
         # SOUL
         if item.importance >= crystallize_threshold:
-            queue_soul_candidate(
+            queued = queue_soul_candidate(
                 persona_dir,
                 memory_id=mem_id,
                 item=item,
                 session_id=session_id,
             )
-            report.soul_candidates += 1
+            if queued:
+                report.soul_candidates += 1
+            else:
+                report.soul_queue_errors += 1
 
     # ── LOG ──────────────────────────────────────────────────────────────────
     logger.info(
         "conversation_ingested session=%s turns=%d extracted=%d committed=%d "
-        "deduped=%d soul_candidates=%d errors=%d",
+        "deduped=%d soul_candidates=%d soul_queue_errors=%d errors=%d",
         session_id,
         len(turns),
         report.extracted,
         report.committed,
         report.deduped,
         report.soul_candidates,
+        report.soul_queue_errors,
         report.errors,
     )
 

@@ -51,7 +51,7 @@ def store() -> MemoryStore:
 
 
 def test_run_growth_tick_no_proposals_returns_zero(persona_dir: Path, store: MemoryStore) -> None:
-    """Phase 2a's real crystallizer returns [] — scheduler returns count=0."""
+    """Real crystallizer returns no proposals when the store has no repeated pattern."""
     _seed_vocab(persona_dir)
     result = run_growth_tick(persona_dir, store, datetime.now(UTC))
     assert isinstance(result, GrowthTickResult)
@@ -340,7 +340,7 @@ def test_run_growth_tick_with_collector_appends_vocab_anomaly(
         anomalies_collector=collector,
     )
 
-    # Tick still completes (Phase 2a stub returns no proposals)
+    # Tick still completes (vocabulary crystallizer has no repeated pattern to propose).
     assert result.emotions_added == 0
 
     # Collector received the anomaly

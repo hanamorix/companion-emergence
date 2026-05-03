@@ -427,6 +427,27 @@ def test_store_search_text_returns_substring_matches(store: MemoryStore) -> None
     assert "evening" in results[0].content
 
 
+def test_store_search_text_rejects_empty_query(store: MemoryStore) -> None:
+    """Callers must choose list_active() explicitly instead of LIKE '%%'."""
+    store.create(_mem("cold coffee, warm hana"))
+
+    with pytest.raises(ValueError, match="use list_active"):
+        store.search_text("")
+
+
+def test_store_list_active_is_explicit_list_all_path(store: MemoryStore) -> None:
+    """list_active returns active memories without relying on empty search."""
+    active = _mem("active")
+    inactive = _mem("inactive")
+    store.create(active)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+
+    results = store.list_active()
+
+    assert [m.id for m in results] == [active.id]
+
+
 def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     """Substring matching ignores case."""
     store.create(_mem("The Moment"))

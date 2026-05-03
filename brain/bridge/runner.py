@@ -80,9 +80,8 @@ def main() -> int:
     persona_dir = args.persona_dir
     port = _allocate_port()
     # H-C: ephemeral bearer token persisted in bridge.json. 32 bytes from
-    # secrets.token_urlsafe — cryptographically random, safe in URLs (WS
-    # query string), readable by anyone who can read the persona dir
-    # (which is the same trust boundary as the SQLite stores).
+    # secrets.token_urlsafe — cryptographically random and subprotocol-safe.
+    # bridge.json/state backups are chmod-hardened by state_file.write().
     auth_token = secrets.token_urlsafe(32)
 
     initial_state = state_file.BridgeState(
