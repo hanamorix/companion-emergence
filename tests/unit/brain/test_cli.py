@@ -39,9 +39,9 @@ STUB_COMMANDS = [
 def test_stub_subcommand_runs_and_reports_not_implemented(
     capsys: pytest.CaptureFixture[str], name: str
 ) -> None:
-    """Every stub subcommand exits 0 and prints 'not implemented yet'."""
+    """Every stub subcommand exits non-zero and prints 'not implemented yet'."""
     result = cli.main([name])
-    assert result == 0
+    assert result == 2
     captured = capsys.readouterr()
     assert "not implemented" in captured.out.lower()
     assert name in captured.out

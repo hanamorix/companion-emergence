@@ -202,23 +202,25 @@ class MemoryStore:
     Any filesystem path creates or opens a persistent database.
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._conn = sqlite3.connect(str(db_path))
         # Run integrity check BEFORE setting row_factory so result rows are
-        # plain tuples — the comparison [("ok",)] is unambiguous.
-        try:
-            result = self._conn.execute("PRAGMA integrity_check").fetchall()
-        except sqlite3.DatabaseError as exc:
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
+        # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
+        # paths may pass integrity_check=False and leave deep checks to health.
+        if integrity_check:
+            try:
+                result = self._conn.execute("PRAGMA integrity_check").fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._conn.close()
+                from brain.health.anomaly import BrainIntegrityError
 
-            raise BrainIntegrityError(str(db_path), str(exc)) from exc
-        if result != [("ok",)]:
-            detail = "; ".join(str(row[0]) for row in result)
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
+                raise BrainIntegrityError(str(db_path), str(exc)) from exc
+            if result != [("ok",)]:
+                detail = "; ".join(str(row[0]) for row in result)
+                self._conn.close()
+                from brain.health.anomaly import BrainIntegrityError
 
-            raise BrainIntegrityError(str(db_path), detail)
+                raise BrainIntegrityError(str(db_path), detail)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -369,14 +371,27 @@ class MemoryStore:
         """Case-insensitive substring search on content.
 
         `%` and `_` in `query` are escaped so a caller passing `"%"` does
-        not match every row.
+        not match every row. Empty queries are rejected; use list_active()
+        when the caller intentionally wants a bounded/all-memory scan.
         """
+        if query == "":
+            raise ValueError("empty query passed to search_text; use list_active() instead")
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         sql = "SELECT * FROM memories WHERE content LIKE ? ESCAPE '\\' COLLATE NOCASE"
         params: list[Any] = [f"%{escaped}%"]
         if active_only:
             sql += " AND active = 1"
         sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def list_active(self, limit: int | None = None) -> list[Memory]:
+        """Return active memories ordered by created_at desc."""
+        sql = "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC"
+        params: list[Any] = []
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

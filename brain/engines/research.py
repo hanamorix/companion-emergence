@@ -134,7 +134,7 @@ class ResearchEngine:
         if emo_state is None:
             from brain.emotion.aggregate import aggregate_state
 
-            all_mems = self.store.search_text("", active_only=True, limit=None)
+            all_mems = self.store.list_active(limit=None)
             emo_state = aggregate_state(all_mems)
 
         emo_peak = max(emo_state.emotions.values(), default=0.0)
