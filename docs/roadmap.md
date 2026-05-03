@@ -11,6 +11,7 @@ The framework is a private prototype with enough implemented surface for local s
 - bridge daemon and HTTP/WebSocket API
 - chat/session lifecycle
 - memory ingest and retrieval
+- safe memory inspection through `nell memory list/search/show`
 - body/emotion context
 - soul candidate review
 - growth scheduler/crystallizers
@@ -38,7 +39,6 @@ Current intentional stubs:
 
 - `nell supervisor`
 - `nell rest`
-- `nell memory`
 - `nell works`
 
 Rules for stubs:
@@ -50,10 +50,9 @@ Rules for stubs:
 
 Suggested order:
 
-1. `nell memory` — inspect/list/search local memories safely.
-2. `nell supervisor` — expose bridge/supervisor lifecycle in one operator-facing place.
-3. `nell rest` — clarify whether this is sleep/rest cadence, bridge rest, or old-plan residue before implementing.
-4. `nell works` — define the user story before building; the name is currently ambiguous.
+1. `nell supervisor` — expose bridge/supervisor lifecycle in one operator-facing place.
+2. `nell rest` — clarify whether this is sleep/rest cadence, bridge rest, or old-plan residue before implementing.
+3. `nell works` — define the user story before building; the name is currently ambiguous.
 
 ### 3. Firm up packaging before public release automation
 
@@ -94,3 +93,4 @@ These block a public/tagged release, but do not block private local development:
 - Resolved audit reliability issues around chat persistence, soul queue reporting, soul review idempotency, bridge API validation, memory search/listing, pytest markers, MCP audit privacy, add-memory error visibility, and vocabulary crystallization.
 - Hardened cross-platform CI assumptions for Windows PID probing, POSIX-only permission assertions, and timestamp precision flakes.
 - Added `nell status` as the first non-stub operational status surface.
+- Added `nell memory list/search/show` for safe local inspection of a persona's memory store.

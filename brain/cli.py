@@ -8,6 +8,7 @@ surface is stable while subsequent weeks fill in functionality.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -25,7 +26,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
 from brain.paths import get_home, get_persona_dir
 from brain.persona_config import PersonaConfig
@@ -50,7 +51,6 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
 _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
     "rest",
-    "memory",
     "works",
 )
 
@@ -130,6 +130,126 @@ def _print_bridge_status(state: state_file.BridgeState | None) -> None:
 
     print("bridge: stopped")
     print(f"stopped_at: {state.stopped_at or 'unknown'}")
+
+
+def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
+    """Open a persona memory store for read-only CLI inspection."""
+    persona_dir = get_persona_dir(persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return None, 1
+
+    memory_path = persona_dir / "memories.db"
+    if not memory_path.exists():
+        print(f"No memory store at {memory_path}.", file=sys.stderr)
+        return None, 1
+
+    return MemoryStore(memory_path, integrity_check=False), 0
+
+
+def _memory_preview(content: str, *, limit: int = 72) -> str:
+    """Return a compact single-line memory preview."""
+    single_line = " ".join(content.split())
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[: limit - 1].rstrip() + "…"
+
+
+def _positive_int(value: str) -> int:
+    """Parse a positive integer CLI argument."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _print_memory_rows(title: str, memories: list[Memory]) -> None:
+    """Print compact memory rows for list/search output."""
+    print(title)
+    if not memories:
+        print("(none)")
+        return
+
+    for memory in memories:
+        print(
+            f"{memory.id[:8]}  {memory.created_at.date().isoformat()}  "
+            f"{memory.memory_type}/{memory.domain}  "
+            f"importance={memory.importance:.2f}  {_memory_preview(memory.content)}"
+        )
+
+
+def _format_mapping(mapping: dict[str, object]) -> str:
+    """Format small dicts deterministically for CLI output."""
+    if not mapping:
+        return "(none)"
+    return ", ".join(f"{key}={float(value):.2f}" for key, value in sorted(mapping.items()))
+
+
+def _memory_list_handler(args: argparse.Namespace) -> int:
+    """List recent active memories for a persona."""
+    store, rc = _open_memory_store_for_cli(args.persona)
+    if store is None:
+        return rc
+    try:
+        memories = store.list_active(limit=args.limit)
+    finally:
+        store.close()
+
+    _print_memory_rows(f"active memories for {args.persona}", memories)
+    return 0
+
+
+def _memory_search_handler(args: argparse.Namespace) -> int:
+    """Search active memories by non-empty text query."""
+    query = args.query.strip()
+    if not query:
+        print("query must not be empty", file=sys.stderr)
+        return 2
+
+    store, rc = _open_memory_store_for_cli(args.persona)
+    if store is None:
+        return rc
+    try:
+        memories = store.search_text(query, limit=args.limit)
+    finally:
+        store.close()
+
+    _print_memory_rows(f"memory search for {args.persona}: {query}", memories)
+    return 0
+
+
+def _memory_show_handler(args: argparse.Namespace) -> int:
+    """Show one full memory record by id."""
+    store, rc = _open_memory_store_for_cli(args.persona)
+    if store is None:
+        return rc
+    try:
+        memory = store.get(args.memory_id)
+    finally:
+        store.close()
+
+    if memory is None:
+        print(f"unknown memory id: {args.memory_id}", file=sys.stderr)
+        return 1
+
+    print(f"id: {memory.id}")
+    print(f"type: {memory.memory_type}")
+    print(f"domain: {memory.domain}")
+    print(f"created_at: {memory.created_at.isoformat()}")
+    print(f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}")
+    print(f"importance: {memory.importance:.2f}")
+    print(f"score: {memory.score:.2f}")
+    print(f"active: {'yes' if memory.active else 'no'}")
+    print(f"protected: {'yes' if memory.protected else 'no'}")
+    print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
+    print(f"emotions: {_format_mapping(memory.emotions)}")
+    print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
+    print("content:")
+    print(memory.content)
+    return 0
 
 
 def _dream_handler(args: argparse.Namespace) -> int:
@@ -1067,6 +1187,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Persona name to inspect. Defaults to nell.",
     )
     status_sub.set_defaults(func=_status_handler)
+
+    memory_sub = subparsers.add_parser(
+        "memory",
+        help="Inspect local persona memories safely.",
+    )
+    memory_actions = memory_sub.add_subparsers(dest="action", required=True)
+
+    memory_list = memory_actions.add_parser("list", help="List recent active memories.")
+    memory_list.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_list.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=20,
+        help="Maximum active memories to show (default 20).",
+    )
+    memory_list.set_defaults(func=_memory_list_handler)
+
+    memory_search = memory_actions.add_parser("search", help="Search active memories by text.")
+    memory_search.add_argument("query", help="Non-empty text to search for.")
+    memory_search.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_search.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=20,
+        help="Maximum matching memories to show (default 20).",
+    )
+    memory_search.set_defaults(func=_memory_search_handler)
+
+    memory_show = memory_actions.add_parser("show", help="Show one full memory by id.")
+    memory_show.add_argument("memory_id", help="Memory UUID to inspect.")
+    memory_show.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_show.set_defaults(func=_memory_show_handler)
 
     _build_migrate_parser(subparsers)
 
