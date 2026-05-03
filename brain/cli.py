@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from brain import __version__
+from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
@@ -26,7 +27,7 @@ from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
-from brain.paths import get_persona_dir
+from brain.paths import get_home, get_persona_dir
 from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
 from brain.utils.time import iso_utc
@@ -48,7 +49,6 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
 # filled in across Weeks 2-8 as respective modules come online.
 _STUB_COMMANDS: tuple[str, ...] = (
     "supervisor",
-    "status",
     "rest",
     "memory",
     "works",
@@ -71,6 +71,65 @@ def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
         return 2
 
     return _handler
+
+
+def _status_handler(args: argparse.Namespace) -> int:
+    """Print local persona/bridge status without making provider calls or writes."""
+    persona_dir = get_persona_dir(args.persona)
+    persona_exists = persona_dir.exists()
+
+    print(f"companion-emergence {__version__}")
+    print(f"home: {get_home()}")
+    print(f"persona: {args.persona}")
+    print(f"persona_dir: {persona_dir}")
+    print(f"persona_exists: {'yes' if persona_exists else 'no'}")
+
+    state = state_file.read(persona_dir)
+    if not persona_exists:
+        _print_bridge_status(state)
+        return 1
+
+    config = PersonaConfig.load(persona_dir / "persona_config.json")
+    print(f"provider: {config.provider}")
+    print(f"searcher: {config.searcher}")
+    print(f"mcp_audit_log_level: {config.mcp_audit_log_level}")
+
+    memory_path = persona_dir / "memories.db"
+    if memory_path.exists():
+        store = MemoryStore(memory_path, integrity_check=False)
+        try:
+            print(f"memories_active: {store.count(active_only=True)}")
+        finally:
+            store.close()
+    else:
+        print("memories_active: missing")
+
+    _print_bridge_status(state)
+    return 0
+
+
+def _print_bridge_status(state: state_file.BridgeState | None) -> None:
+    """Print bridge status while never exposing bearer tokens."""
+    if state is None or state.pid is None:
+        print("bridge: not running")
+        return
+
+    if state_file.pid_is_alive(state.pid):
+        print("bridge: running")
+        print(f"pid: {state.pid}")
+        print(f"port: {state.port or 'unknown'}")
+        print(f"started_at: {state.started_at}")
+        print(f"client_origin: {state.client_origin}")
+        return
+
+    if not state.shutdown_clean:
+        print("bridge: crashed-dirty")
+        print(f"pid: {state.pid}")
+        print("recovery: needed on next bridge start")
+        return
+
+    print("bridge: stopped")
+    print(f"stopped_at: {state.stopped_at or 'unknown'}")
 
 
 def _dream_handler(args: argparse.Namespace) -> int:
@@ -997,6 +1056,17 @@ def _build_parser() -> argparse.ArgumentParser:
             help=f"(stub) {name} — wired in a later week",
         )
         sub.set_defaults(func=_make_stub(name))
+
+    status_sub = subparsers.add_parser(
+        "status",
+        help="Show local persona, memory, and bridge status without contacting providers.",
+    )
+    status_sub.add_argument(
+        "--persona",
+        default="nell",
+        help="Persona name to inspect. Defaults to nell.",
+    )
+    status_sub.set_defaults(func=_status_handler)
 
     _build_migrate_parser(subparsers)
 
