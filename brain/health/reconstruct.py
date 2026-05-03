@@ -19,7 +19,7 @@ def reconstruct_vocabulary_from_memories(store: MemoryStore) -> dict:
     """Build emotion_vocabulary.json content: baseline + extensions found in memories."""
     baseline_names: set[str] = {e.name for e in _vocabulary._BASELINE}
     seen_names: set[str] = set()
-    for mem in store.search_text("", active_only=True, limit=None):
+    for mem in store.list_active(limit=None):
         for name in mem.emotions:
             seen_names.add(name)
 

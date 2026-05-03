@@ -80,6 +80,22 @@ def write(persona_dir: Path, state: BridgeState) -> None:
         logger.warning("compute_treatment failed; defaulting to backup_count=3")
         backup_count = 3
     save_with_backup(path, asdict(state), backup_count=backup_count)
+    _protect_state_files(path, backup_count)
+
+
+def _protect_state_files(path: Path, backup_count: int) -> None:
+    """Keep bridge state/token files owner-only after atomic rotation."""
+    try:
+        path.parent.chmod(0o700)
+    except OSError as exc:
+        logger.warning("failed to chmod bridge state dir %s: %s", path.parent, exc)
+    for candidate in [path, *(path.with_name(f"{path.name}.bak{i}") for i in range(1, backup_count + 1))]:
+        if not candidate.exists():
+            continue
+        try:
+            candidate.chmod(0o600)
+        except OSError as exc:
+            logger.warning("failed to chmod bridge state file %s: %s", candidate, exc)
 
 
 def read(persona_dir: Path) -> BridgeState | None:
@@ -102,10 +118,37 @@ def read(persona_dir: Path) -> BridgeState | None:
     return BridgeState(**data)
 
 
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Windows-safe PID liveness check that avoids os.kill(pid, 0)."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    process_query_limited_information = 0x1000
+    still_active = 259
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # ERROR_ACCESS_DENIED means the process exists but is not queryable by
+        # this user/session. Treat it as alive, matching PermissionError on
+        # POSIX. Other errors mean no live process was opened.
+        return kernel32.GetLastError() == 5
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def pid_is_alive(pid: int) -> bool:
     """Return True if the given pid is a live process owned by this user."""
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -114,6 +157,9 @@ def pid_is_alive(pid: int) -> bool:
     except PermissionError:
         # Pid exists but is owned by someone else — treat as alive.
         return True
+    except OSError as exc:
+        logger.debug("pid liveness check failed pid=%s err=%s", pid, exc)
+        return False
 
 
 def recovery_needed(persona_dir: Path) -> bool:

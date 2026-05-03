@@ -183,8 +183,10 @@ def test_respond_catches_and_logs_ingest_persistence_error(
             provider=provider,
             voice_md_override="# Nell",
         )
-    # Response still delivered
+    # Response still delivered, but persistence failure is visible to callers.
     assert result.content.startswith("FAKE_CHAT")
+    assert result.metadata["persistence_ok"] is False
+    assert result.metadata["persistence_error"] == "disk full"
     # Warning logged
     assert any(
         "buffer" in r.message.lower() or "failed" in r.message.lower() for r in caplog.records

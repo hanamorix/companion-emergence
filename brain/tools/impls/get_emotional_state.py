@@ -30,13 +30,7 @@ def get_emotional_state(
         all       — {emotion: score, ...}
         summary   — human-readable multi-line string
     """
-    active_memories = store.search_text("", active_only=True)
-    # search_text("") matches all rows; use list_all fallback if store has
-    # a list_all method, otherwise rely on the empty-query LIKE match.
-    # The LIKE '%''%' with empty escaped query returns all rows.
-    if not active_memories:
-        # Also try listing by count — if store is truly empty that's fine.
-        pass
+    active_memories = store.list_active()
 
     emotional_state = aggregate_state(active_memories)
 

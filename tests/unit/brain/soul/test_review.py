@@ -6,6 +6,7 @@ import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from brain.bridge.provider import LLMProvider
 from brain.memory.store import MemoryStore
@@ -173,6 +174,35 @@ def test_review_accept_creates_crystallization(tmp_path: Path) -> None:
     updated = _json.loads(lines[0])
     assert updated["status"] == "accepted"
     assert "crystallization_id" in updated
+
+    store.close()
+    soul_store.close()
+
+
+def test_review_accept_is_idempotent_if_candidate_save_failed(tmp_path: Path) -> None:
+    """Retrying after candidate-status save failure must not duplicate crystallizations."""
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    provider = _AcceptProvider()
+
+    candidate = _make_candidate("This exact memory should crystallize once.")
+    candidate["memory_id"] = "mem-once"
+    _write_candidates(tmp_path, [candidate])
+
+    with patch("brain.soul.review._save_soul_candidates", side_effect=OSError("disk hiccup")):
+        try:
+            review_pending_candidates(tmp_path, store=store, soul_store=soul_store, provider=provider)
+        except OSError:
+            pass
+
+    assert soul_store.count() == 1
+
+    report = review_pending_candidates(tmp_path, store=store, soul_store=soul_store, provider=provider)
+
+    assert report.accepted == 1
+    assert soul_store.count() == 1
+    active = soul_store.list_active()
+    assert active[0].id == "candidate-mem-once"
 
     store.close()
     soul_store.close()

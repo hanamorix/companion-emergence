@@ -164,4 +164,4 @@ class MemorySearch:
         # All active memories (unbounded; caller's limit governs output).
         # Note: for large stores this is O(N); later optimisation via
         # ANN index is scoped for v1.1.
-        return self.store.search_text("", active_only=True)
+        return self.store.list_active()
