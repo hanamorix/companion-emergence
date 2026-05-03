@@ -9,8 +9,9 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 ### Added
 
 - Local-first persona data layout under the platform-aware `NELLBRAIN_HOME` root.
-- `nell` CLI entry point with migration, chat, bridge, health, soul, growth, dream, heartbeat, reflex, research, interest, and status surfaces.
+- `nell` CLI entry point with migration, chat, bridge, health, soul, growth, dream, heartbeat, reflex, research, interest, status, and memory inspection surfaces.
 - `nell status` for checking a persona directory, provider/searcher config, memory database count, and bridge process state without contacting live providers.
+- `nell memory list/search/show` for safe local memory inspection without contacting live providers.
 - Bridge HTTP/WebSocket server with local bearer-token authentication, session lifecycle endpoints, health checks, audit-safe event streaming, and dirty-shutdown recovery hooks.
 - Chat/session flow with memory retrieval, body/emotion state context, persistence metadata, and local ingestion on session close.
 - SQLite memory store, Hebbian associations, embedding cache, and health/self-healing support for local data files.
@@ -43,6 +44,6 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ### Known incomplete surfaces
 
-- `nell supervisor`, `nell rest`, `nell memory`, and `nell works` remain intentional future-work stubs.
+- `nell supervisor`, `nell rest`, and `nell works` remain intentional future-work stubs.
 - Public release automation is deferred until the CLI/API surface is stable enough to version.
 - Public contributor documentation is in progress.
