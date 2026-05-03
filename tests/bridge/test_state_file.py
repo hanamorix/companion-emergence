@@ -36,9 +36,13 @@ def test_write_protects_bridge_state_and_backup_files(persona_dir: Path):
     state_file.write(persona_dir, state)
     state_file.write(persona_dir, state)
 
-    assert oct(persona_dir.stat().st_mode & 0o777) == "0o700"
-    assert oct((persona_dir / "bridge.json").stat().st_mode & 0o777) == "0o600"
-    assert oct((persona_dir / "bridge.json.bak1").stat().st_mode & 0o777) == "0o600"
+    if os.name == "posix":
+        assert oct(persona_dir.stat().st_mode & 0o777) == "0o700"
+        assert oct((persona_dir / "bridge.json").stat().st_mode & 0o777) == "0o600"
+        assert oct((persona_dir / "bridge.json.bak1").stat().st_mode & 0o777) == "0o600"
+    else:
+        assert (persona_dir / "bridge.json").exists()
+        assert (persona_dir / "bridge.json.bak1").exists()
 
 
 def test_read_returns_none_when_missing(persona_dir: Path):

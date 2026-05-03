@@ -130,6 +130,12 @@ def pid_is_alive(pid: int) -> bool:
     except PermissionError:
         # Pid exists but is owned by someone else — treat as alive.
         return True
+    except OSError as exc:
+        # Windows raises plain OSError/WinError for invalid PID values instead
+        # of ProcessLookupError. Treat those as dead rather than letting dirty
+        # shutdown recovery crash before it can drain orphan buffers.
+        logger.debug("pid liveness check failed pid=%s err=%s", pid, exc)
+        return False
 
 
 def recovery_needed(persona_dir: Path) -> bool:
