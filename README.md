@@ -16,4 +16,6 @@ Known incomplete surfaces remain intentional and visible: some CLI commands are 
 
 Operational quick check: `nell status --persona nell` reports local persona/config/memory/bridge state without contacting live providers.
 
+Memory inspection is local-only and explicit: use `nell memory list --persona nell`, `nell memory search "query" --persona nell`, and `nell memory show <memory_id> --persona nell`.
+
 Reference implementation: Nell (migrates from the NellBrain OG project). Other personas arrive as forkers build them.
