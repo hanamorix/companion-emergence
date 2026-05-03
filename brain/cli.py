@@ -56,7 +56,7 @@ _STUB_COMMANDS: tuple[str, ...] = (
 
 
 def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
-    """Factory: build a stub command handler that prints + returns 0.
+    """Factory: build a stub command handler that prints + returns 2.
 
     The returned handler accepts `args: argparse.Namespace` as required by
     the `args.func(args)` dispatch protocol — stubs don't read it, but the
@@ -68,7 +68,7 @@ def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
             f"nell {name} — not implemented yet. "
             "This subcommand is wired in a future week per the implementation plan."
         )
-        return 0
+        return 2
 
     return _handler
 

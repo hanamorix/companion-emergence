@@ -39,6 +39,10 @@ packages = ["brain"]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["."]
+markers = [
+    "unit: unit tests",
+    "integration: integration tests",
+]
 
 [tool.ruff]
 line-length = 100

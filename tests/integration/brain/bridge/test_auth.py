@@ -148,23 +148,37 @@ def test_ws_rejects_no_token(persona_dir_for_auth: Path, monkeypatch):
         assert exc_info.value.code == 4001
 
 
-def test_ws_rejects_wrong_token(persona_dir_for_auth: Path, monkeypatch):
+def test_ws_rejects_wrong_subprotocol_token(persona_dir_for_auth: Path, monkeypatch):
     from starlette.websockets import WebSocketDisconnect
 
     _patch_provider(monkeypatch, _FakeProvider())
     app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
     with TestClient(app) as c:
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/events?token=wrong-token"):
+            with c.websocket_connect("/events", subprotocols=["bearer", "wrong-token"]):
                 pass
         assert exc_info.value.code == 4001
 
 
-def test_ws_accepts_correct_token(persona_dir_for_auth: Path, monkeypatch):
+def test_ws_rejects_query_string_token(persona_dir_for_auth: Path, monkeypatch):
+    """Bearer tokens should not be accepted from URL query strings."""
+    from starlette.websockets import WebSocketDisconnect
+
     _patch_provider(monkeypatch, _FakeProvider())
     app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
     with TestClient(app) as c:
-        with c.websocket_connect("/events?token=secret-token") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with c.websocket_connect("/events?token=secret-token"):
+                pass
+        assert exc_info.value.code == 4001
+
+
+def test_ws_accepts_correct_subprotocol_token(persona_dir_for_auth: Path, monkeypatch):
+    _patch_provider(monkeypatch, _FakeProvider())
+    app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
+    with TestClient(app) as c:
+        with c.websocket_connect("/events", subprotocols=["bearer", "secret-token"]) as ws:
+            assert ws.accepted_subprotocol == "bearer"
             f = ws.receive_json()
             assert f["type"] == "connected"
 
@@ -181,6 +195,6 @@ def test_ws_rejects_disallowed_origin(persona_dir_for_auth: Path, monkeypatch):
     )
     with TestClient(app) as c:
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/events?token=secret-token"):
+            with c.websocket_connect("/events", subprotocols=["bearer", "secret-token"]):
                 pass
         assert exc_info.value.code == 4001

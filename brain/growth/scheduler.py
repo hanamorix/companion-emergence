@@ -18,7 +18,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from brain.growth.crystallizers.vocabulary import crystallize_vocabulary
+from brain.growth.crystallizers.vocabulary import (
+    VOCABULARY_CRYSTALLIZER_STATUS,
+    crystallize_vocabulary,
+)
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import MemoryStore
@@ -41,6 +44,7 @@ class GrowthTickResult:
     emotions_added: int
     proposals_seen: int
     proposals_rejected: int
+    vocabulary_crystallizer_status: str = "implemented"
 
 
 def _should_run_growth_tick(
@@ -128,7 +132,7 @@ def run_growth_tick(
         )
 
     # Creative DNA crystallization (spec §5)
-    if not dry_run:
+    if not dry_run and (persona_dir / "persona_config.json").exists():
         try:
             from brain.bridge.provider import get_provider
             from brain.growth.crystallizers.creative_dna import crystallize_creative_dna
@@ -150,6 +154,7 @@ def run_growth_tick(
         emotions_added=emotions_added,
         proposals_seen=len(proposals),
         proposals_rejected=proposals_rejected,
+        vocabulary_crystallizer_status=VOCABULARY_CRYSTALLIZER_STATUS,
     )
 
 

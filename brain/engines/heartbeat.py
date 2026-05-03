@@ -619,7 +619,7 @@ class HeartbeatEngine:
             return 0
 
         count = 0
-        all_memories = self.store.search_text("", active_only=True)
+        all_memories = self.store.list_active()
         for mem in all_memories:
             if mem.protected:
                 continue
@@ -1011,7 +1011,7 @@ class HeartbeatEngine:
         no conversation memories exist.
         """
         try:
-            all_mems = self.store.search_text("", active_only=True)
+            all_mems = self.store.list_active()
             combined_emotions: dict[str, float] = {}
             for m in all_mems:
                 for name, val in m.emotions.items():

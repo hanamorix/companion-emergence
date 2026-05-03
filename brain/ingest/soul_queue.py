@@ -36,7 +36,7 @@ def queue_soul_candidate(
     memory_id: str,
     item: ExtractedItem,
     session_id: str,
-) -> None:
+) -> bool:
     """Append a soul candidate record to <persona_dir>/soul_candidates.jsonl.
 
     The record shape matches the OG nell_conversation_ingest.py schema with
@@ -66,8 +66,10 @@ def queue_soul_candidate(
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
     except OSError as exc:
         logger.warning("queue_soul_candidate: failed to write to %s: %s", path, exc)
+        return False
 
 
 def list_soul_candidates(persona_dir: Path) -> list[dict]:
