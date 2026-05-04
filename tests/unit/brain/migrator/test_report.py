@@ -161,3 +161,44 @@ def test_format_report_empty_report_does_not_crash() -> None:
     assert "Migration complete." in text
     assert "0 migrated" in text
     assert "Next steps" not in text  # section suppressed when empty
+
+
+def test_format_report_shows_creative_dna_and_journal_lines() -> None:
+    """Migrated creative_dna + retagged journal memories render in the report."""
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+        creative_dna_migrated=True,
+        journal_memories_retagged=14,
+    )
+    text = format_report(report)
+    assert "Creative DNA:" in text
+    assert "migrated" in text
+    assert "Journal:" in text
+    assert "14 memories retagged" in text
+
+
+def test_format_report_shows_creative_dna_skipped_reason_when_og_missing() -> None:
+    """When OG lacks nell_creative_dna.json, the report renders the skipped reason."""
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+        creative_dna_migrated=False,
+        creative_dna_skipped_reason="og file not present",
+    )
+    text = format_report(report)
+    assert "Creative DNA:" in text
+    assert "not migrated" in text
+    assert "skipped: og file not present" in text
