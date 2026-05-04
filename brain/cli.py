@@ -1148,6 +1148,10 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
 
 def _chat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` — auto-spawns bridge unless --no-bridge is set."""
+    # Note: this auto-spawn imports brain.bridge.daemon directly. It does
+    # NOT shell out to `nell bridge`/`nell supervisor`, so the deprecated
+    # bridge alias (removed in v0.1) does not affect this path. See
+    # `_deprecated_bridge` above and docs/roadmap.md §3.
     from brain.bridge import daemon, state_file
     from brain.paths import get_persona_dir
 
