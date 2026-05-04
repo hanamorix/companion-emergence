@@ -202,3 +202,23 @@ def test_format_report_shows_creative_dna_skipped_reason_when_og_missing() -> No
     assert "Creative DNA:" in text
     assert "not migrated" in text
     assert "skipped: og file not present" in text
+
+
+def test_format_report_shows_legacy_line() -> None:
+    """Migrated + missing legacy file counts render in the report."""
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+        legacy_files_preserved=14,
+        legacy_files_missing=2,
+    )
+    text = format_report(report)
+    assert "Legacy files:" in text
+    assert "14 preserved" in text
+    assert "2 missing" in text
