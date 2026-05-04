@@ -16,6 +16,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
+from brain.migrator.og_journal_dna import migrate_creative_dna, migrate_journal_memories
 from brain.migrator.og_reflex import migrate_reflex_arcs
 from brain.migrator.og_soul import extract_crystallizations_from_og
 from brain.migrator.og_vocabulary import extract_persona_vocabulary
@@ -215,6 +216,33 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             soul_store.close()
         # soul_skipped entries are logged by og_soul's module-level logger if desired
 
+    # ---- creative_dna ----
+    creative_dna_migrated = False
+    creative_dna_skipped_reason: str | None = None
+    try:
+        creative_dna_migrated = migrate_creative_dna(
+            persona_dir=work_dir,
+            og_root=args.input_dir.parent,
+        )
+        if not creative_dna_migrated:
+            creative_dna_skipped_reason = "og file not present"
+    except Exception as exc:  # noqa: BLE001
+        creative_dna_skipped_reason = f"migrate_error: {exc}"
+
+    # ---- journal memories (reflex_journal -> journal_entry retag) ----
+    journal_memories_retagged = 0
+    journal_memories_skipped_reason: str | None = None
+    journal_store = MemoryStore(db_path=work_dir / "memories.db")
+    try:
+        journal_memories_retagged = migrate_journal_memories(
+            persona_dir=work_dir,
+            store=journal_store,
+        )
+    except Exception as exc:  # noqa: BLE001
+        journal_memories_skipped_reason = f"migrate_error: {exc}"
+    finally:
+        journal_store.close()
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -241,6 +269,10 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         vocabulary_skipped_reason=vocabulary_skipped_reason,
         crystallizations_migrated=crystallizations_migrated,
         crystallizations_skipped_reason=crystallizations_skipped_reason,
+        creative_dna_migrated=creative_dna_migrated,
+        creative_dna_skipped_reason=creative_dna_skipped_reason,
+        journal_memories_retagged=journal_memories_retagged,
+        journal_memories_skipped_reason=journal_memories_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
