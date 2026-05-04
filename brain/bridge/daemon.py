@@ -1,10 +1,12 @@
 """SP-7 bridge daemon orchestration — process spawn, stop, status, recovery.
 
 Public surface used by CLI handlers in brain.cli:
-  cmd_start(args) -> int
-  cmd_stop(args)  -> int
-  cmd_status(args) -> int
-  cmd_tail(args)  -> int
+  cmd_start(args)    -> int
+  cmd_stop(args)     -> int
+  cmd_restart(args)  -> int
+  cmd_status(args)   -> int
+  cmd_tail(args)     -> int
+  cmd_tail_log(args) -> int
 
 Internal:
   run_recovery_if_needed(persona_dir) — drain orphan buffers if previous bridge

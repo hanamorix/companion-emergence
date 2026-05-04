@@ -234,6 +234,9 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     log_path = log_dir / "bridge-nell.log"
     log_path.write_text("seed\n")
 
+    stop_event = threading.Event()
+    monkeypatch.setattr(daemon, "_follow_should_stop", stop_event)
+
     # writer thread appends two lines after a short delay, then signals interrupt
     def writer():
         time.sleep(0.15)
@@ -242,10 +245,8 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
             f.write("new2\n")
             f.flush()
         time.sleep(0.15)
-        # raise KeyboardInterrupt in main via _follow_should_stop hook
-        daemon._follow_should_stop.set()  # type: ignore[attr-defined]
+        stop_event.set()
 
-    daemon._follow_should_stop = threading.Event()  # type: ignore[attr-defined]
     t = threading.Thread(target=writer, daemon=True)
     t.start()
 
