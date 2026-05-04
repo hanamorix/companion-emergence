@@ -19,6 +19,7 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 - Growth scheduler and crystallizers for identity, preferences, relationships, style, and vocabulary.
 - MCP server tools with configurable audit logging modes: `off`, `metadata`, `redacted`, and `full`.
 - Release checklist for private smoke testing and future public/tagged releases.
+- `nell supervisor` lifecycle command — canonical operator surface for the per-persona bridge daemon. Actions: `start`, `stop`, `status`, `restart`, `tail-events`, `tail-log`. Wraps the existing bridge daemon implementation; same args, same exit codes, plus sequential `restart` (stop-then-start, gated on stop success) and cross-platform `tail-log`.
 
 ### Changed
 
@@ -42,8 +43,12 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 - Windows CI no longer uses POSIX-only PID liveness probes.
 - Tests no longer assume POSIX chmod behavior on Windows or distinct timestamps from immediate back-to-back calls.
 
+### Deprecated
+
+- `nell bridge` — use `nell supervisor` instead. The alias still works and forwards to the new command, but prints a deprecation warning to stderr. Will be removed in v0.1.
+
 ### Known incomplete surfaces
 
-- `nell supervisor`, `nell rest`, and `nell works` remain intentional future-work stubs.
+- `nell rest` and `nell works` remain intentional future-work stubs.
 - Public release automation is deferred until the CLI/API surface is stable enough to version.
 - Public contributor documentation is in progress.

@@ -37,7 +37,6 @@ The framework is a private prototype with enough implemented surface for local s
 
 Current intentional stubs:
 
-- `nell supervisor`
 - `nell rest`
 - `nell works`
 
@@ -50,7 +49,7 @@ Rules for stubs:
 
 Suggested order:
 
-1. `nell supervisor` — expose bridge/supervisor lifecycle in one operator-facing place.
+1. ~~`nell supervisor` — expose bridge/supervisor lifecycle in one operator-facing place.~~ *(shipped 2026-05-04 — see `docs/superpowers/specs/2026-05-04-nell-supervisor-design.md`)*
 2. `nell rest` — clarify whether this is sleep/rest cadence, bridge rest, or old-plan residue before implementing.
 3. `nell works` — define the user story before building; the name is currently ambiguous.
 
@@ -87,9 +86,11 @@ These block a public/tagged release, but do not block private local development:
 - Public contributor/onboarding docs are missing.
 - Public API/CLI compatibility policy is not defined.
 - Signing/distribution story is not applicable yet because this is not a desktop app package; if that changes, write a separate release plan.
+- Remove the deprecated `nell bridge` alias. Removing it does not affect `nell chat` auto-spawn — chat uses `brain.bridge.daemon` internals directly (inside `_chat_handler`), not the CLI surface.
 
 ## Done recently
 
+- Implemented `nell supervisor` as the canonical bridge lifecycle command (start/stop/status/restart/tail-events/tail-log), with `nell bridge` kept as a deprecating alias until v0.1.
 - Resolved audit reliability issues around chat persistence, soul queue reporting, soul review idempotency, bridge API validation, memory search/listing, pytest markers, MCP audit privacy, add-memory error visibility, and vocabulary crystallization.
 - Hardened cross-platform CI assumptions for Windows PID probing, POSIX-only permission assertions, and timestamp precision flakes.
 - Added `nell status` as the first non-stub operational status surface.
