@@ -275,16 +275,17 @@ def cmd_tail(args) -> int:
 def cmd_restart(args) -> int:
     """Stop the bridge, then start it again. Two-phase, gated on stop success.
 
-    Stop is allowed to return 0 (stopped cleanly) or 1 (no bridge was running) —
-    both proceed to start. Any other non-zero stop code (lock held, timeout)
-    bails before start so we don't spawn a second bridge while the first is wedged.
-    Restart's exit code is whatever cmd_start returned (0/1/2) when stop succeeded,
-    or stop's exit code when stop failed.
+    `cmd_stop` collapses "no bridge was running" and "clean SIGTERM stop"
+    into exit code 0; it returns 1 only when the bridge ignored SIGTERM
+    and timed out (wedged). Restart proceeds to start ONLY when stop
+    returned 0 — never over a wedged bridge. Restart's exit code is
+    whatever `cmd_start` returned (0/1/2) on the success path, or stop's
+    exit code on the bail path.
     """
-    print("stopping bridge…")
+    print("stopping bridge...")
     stop_rc = cmd_stop(args)
-    if stop_rc not in (0, 1):
+    if stop_rc != 0:
         print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
         return stop_rc
-    print("starting bridge…")
+    print("starting bridge...")
     return cmd_start(args)
