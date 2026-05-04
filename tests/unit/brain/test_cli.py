@@ -33,7 +33,6 @@ def test_no_args_prints_help_and_exits_nonzero(
 
 
 STUB_COMMANDS = [
-    "supervisor",
     "rest",
     "works",
 ]
@@ -56,10 +55,10 @@ def test_stub_subcommand_help_works(
 ) -> None:
     """Each stub subcommand supports --help without crashing."""
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["supervisor", "--help"])
+        cli.main([STUB_COMMANDS[0], "--help"])
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
-    assert "supervisor" in captured.out.lower()
+    assert STUB_COMMANDS[0] in captured.out.lower()
 
 
 def _make_persona(tmp_path: Path, name: str = "nell") -> Path:
