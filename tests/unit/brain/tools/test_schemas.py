@@ -14,11 +14,15 @@ _EXPECTED_TOOLS = {
     "boot",
     "get_soul",
     "crystallize_soul",
+    "save_work",
+    "list_works",
+    "search_works",
+    "read_work",
 }
 
 
 def test_schemas_has_all_nine_tools() -> None:
-    """SCHEMAS contains exactly 9 tool entries."""
+    """SCHEMAS contains all 13 tool entries (9 brain + 4 works)."""
     assert set(SCHEMAS.keys()) == _EXPECTED_TOOLS
 
 
