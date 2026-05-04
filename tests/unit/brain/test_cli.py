@@ -130,3 +130,61 @@ def test_status_reports_persona_config_memory_and_bridge_state(
     assert "pid: 12345" in captured.out
     assert "port: 8765" in captured.out
     assert "secret-token" not in captured.out
+
+
+# ---------- nell bridge deprecation alias (removed in v0.1) ----------
+
+
+@pytest.fixture
+def stub_daemon(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
+    """Replace daemon handlers with stubs that record calls; return the call log."""
+    from brain.bridge import daemon
+
+    calls: dict[str, list] = {"start": [], "stop": [], "status": [], "tail": []}
+
+    monkeypatch.setattr(daemon, "cmd_start", lambda a: (calls["start"].append(a), 0)[1])
+    monkeypatch.setattr(daemon, "cmd_stop", lambda a: (calls["stop"].append(a), 0)[1])
+    monkeypatch.setattr(daemon, "cmd_status", lambda a: (calls["status"].append(a), 0)[1])
+    monkeypatch.setattr(daemon, "cmd_tail", lambda a: (calls["tail"].append(a), 0)[1])
+    return calls
+
+
+@pytest.mark.parametrize(
+    "action,handler_key",
+    [("start", "start"), ("stop", "stop"), ("status", "status"), ("tail-events", "tail")],
+)
+def test_bridge_alias_still_dispatches_to_real_handler(
+    action: str, handler_key: str, stub_daemon: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`nell bridge X` keeps working exactly like before — the real daemon handler runs."""
+    rc = cli.main(["bridge", action, "--persona", "nell"])
+    assert rc == 0
+    assert len(stub_daemon[handler_key]) == 1
+
+
+def test_bridge_alias_prints_deprecation_warning_to_stderr(
+    stub_daemon: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli.main(["bridge", "status", "--persona", "nell"])
+    captured = capsys.readouterr()
+    assert "deprecated" in captured.err.lower()
+    assert "nell supervisor" in captured.err
+    assert "v0.1" in captured.err
+
+
+def test_bridge_alias_does_not_print_warning_to_stdout(
+    stub_daemon: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Warning must NOT pollute stdout — scripts piping output through jq/grep depend on this."""
+    cli.main(["bridge", "status", "--persona", "nell"])
+    captured = capsys.readouterr()
+    assert "deprecated" not in captured.out.lower()
+
+
+def test_bridge_alias_preserves_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the real handler returns 2, the alias must also return 2 (not coerce)."""
+    from brain.bridge import daemon
+
+    monkeypatch.setattr(daemon, "cmd_start", lambda a: 2)
+    rc = cli.main(["bridge", "start", "--persona", "nell"])
+    assert rc == 2

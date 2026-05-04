@@ -55,6 +55,22 @@ _STUB_COMMANDS: tuple[str, ...] = (
 )
 
 
+# Deprecation alias for `nell bridge` — to be removed in v0.1.
+# Note: `nell chat` auto-spawn (see _chat_handler ≈ line 1134) imports
+# brain.bridge.daemon directly and does NOT use this CLI surface, so
+# removing the alias does not break chat. See docs/roadmap.md §3.
+def _deprecated_bridge(real_handler):
+    def wrapped(args):
+        print(
+            "warning: 'nell bridge' is deprecated; use 'nell supervisor' instead. "
+            "This alias will be removed in v0.1.",
+            file=sys.stderr,
+        )
+        return real_handler(args)
+    wrapped.__name__ = f"deprecated_{real_handler.__name__}"
+    return wrapped
+
+
 def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
     """Factory: build a stub command handler that prints + returns 2.
 
@@ -1382,7 +1398,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     i_list.set_defaults(func=_interest_list_handler)
 
-    # nell supervisor — canonical bridge lifecycle (replaces nell bridge in v0.1).
+    # Daemon handlers — shared by `supervisor` (canonical) and `bridge` (deprecated alias).
     from brain.bridge.daemon import (
         cmd_restart,
         cmd_start,
@@ -1392,6 +1408,7 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd_tail_log,
     )
 
+    # nell supervisor — canonical bridge lifecycle (replaces nell bridge in v0.1).
     s_sub = subparsers.add_parser(
         "supervisor",
         help="Manage the per-persona bridge daemon — canonical lifecycle command.",
@@ -1471,7 +1488,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # nell bridge — SP-7 daemon control (kept for back-compat; supervisor is canonical)
     b_sub = subparsers.add_parser(
         "bridge",
-        help="Manage the per-persona bridge daemon (SP-7).",
+        help="Manage the bridge daemon (deprecated — use 'nell supervisor').",
     )
     b_actions = b_sub.add_subparsers(dest="action", required=True)
 
@@ -1486,20 +1503,23 @@ def _build_parser() -> argparse.ArgumentParser:
     b_start.add_argument(
         "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
     )
-    b_start.set_defaults(func=cmd_start)
+    b_start.set_defaults(func=_deprecated_bridge(cmd_start))
 
     b_stop = b_actions.add_parser("stop", help="Stop the bridge daemon.")
     b_stop.add_argument("--persona", required=True)
     b_stop.add_argument("--timeout", type=float, default=180.0)
-    b_stop.set_defaults(func=cmd_stop)
+    b_stop.set_defaults(func=_deprecated_bridge(cmd_stop))
 
     b_status = b_actions.add_parser("status", help="Show bridge daemon status.")
     b_status.add_argument("--persona", required=True)
-    b_status.set_defaults(func=cmd_status)
+    b_status.set_defaults(func=_deprecated_bridge(cmd_status))
 
-    b_tail = b_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
+    b_tail = b_actions.add_parser(
+        "tail-events",
+        help="Tail /events as JSON lines. (deprecated — use `nell supervisor tail-events`)",
+    )
     b_tail.add_argument("--persona", required=True)
-    b_tail.set_defaults(func=cmd_tail)
+    b_tail.set_defaults(func=_deprecated_bridge(cmd_tail))
 
     # nell growth log — read-only inspection of brain growth biography.
     # Per Phase 2a §8: only `log` action ships; no add/approve/reject/force.
