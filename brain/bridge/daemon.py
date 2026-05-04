@@ -270,3 +270,21 @@ def cmd_tail(args) -> int:
                 print(msg)
     except KeyboardInterrupt:
         return 0
+
+
+def cmd_restart(args) -> int:
+    """Stop the bridge, then start it again. Two-phase, gated on stop success.
+
+    Stop is allowed to return 0 (stopped cleanly) or 1 (no bridge was running) —
+    both proceed to start. Any other non-zero stop code (lock held, timeout)
+    bails before start so we don't spawn a second bridge while the first is wedged.
+    Restart's exit code is whatever cmd_start returned (0/1/2) when stop succeeded,
+    or stop's exit code when stop failed.
+    """
+    print("stopping bridge…")
+    stop_rc = cmd_stop(args)
+    if stop_rc not in (0, 1):
+        print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
+        return stop_rc
+    print("starting bridge…")
+    return cmd_start(args)
