@@ -46,15 +46,11 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     return provider, searcher
 
 
-# Subcommands the framework plans to ship. Each is a stub in Week 1.
-# `nell supervisor` was unstubbed on 2026-05-04 (see
-# docs/superpowers/specs/2026-05-04-nell-supervisor-design.md).
-# `nell rest` was removed on 2026-05-04 (see
-# docs/superpowers/specs/2026-05-04-nell-rest-physiology-design.md);
-# rest is a body-state physiology concern, not a CLI command.
-_STUB_COMMANDS: tuple[str, ...] = (
-    "works",
-)
+# All Week-1 framework stubs have been resolved:
+# - `nell supervisor` shipped 2026-05-04 (see docs/superpowers/specs/2026-05-04-nell-supervisor-design.md)
+# - `nell rest` removed 2026-05-04 (rest is body-state physiology, not a command — see docs/superpowers/specs/2026-05-04-nell-rest-physiology-design.md)
+# - `nell works` shipped 2026-05-04 (see docs/superpowers/specs/2026-05-04-nell-works-design.md)
+_STUB_COMMANDS: tuple[str, ...] = ()
 
 
 # Deprecation alias for `nell bridge` — to be removed in v0.1.
@@ -267,6 +263,64 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
     print("content:")
     print(memory.content)
+    return 0
+
+
+def _works_list_handler(args: argparse.Namespace) -> int:
+    """List recent brain-authored creative artifacts."""
+    from brain.paths import get_persona_dir
+    from brain.tools.impls.list_works import list_works
+
+    persona_dir = get_persona_dir(args.persona)
+    works_list = list_works(type=args.type, limit=args.limit, persona_dir=persona_dir)
+    if not works_list:
+        print("(no works)")
+        return 0
+    for w in works_list:
+        summary = f" — {w['summary']}" if w["summary"] else ""
+        print(f"{w['id']} | {w['type']:<8} | {w['created_at']} | {w['title']}{summary}")
+    return 0
+
+
+def _works_search_handler(args: argparse.Namespace) -> int:
+    """Search brain-authored creative artifacts by title/summary/content."""
+    from brain.paths import get_persona_dir
+    from brain.tools.impls.search_works import search_works
+
+    persona_dir = get_persona_dir(args.persona)
+    matches = search_works(
+        query=args.query, type=args.type, limit=args.limit, persona_dir=persona_dir
+    )
+    if not matches:
+        print("(no matches)")
+        return 0
+    for w in matches:
+        summary = f" — {w['summary']}" if w["summary"] else ""
+        print(f"{w['id']} | {w['type']:<8} | {w['created_at']} | {w['title']}{summary}")
+    return 0
+
+
+def _works_read_handler(args: argparse.Namespace) -> int:
+    """Print one work's frontmatter header followed by its full content."""
+    from brain.paths import get_persona_dir
+    from brain.tools.impls.read_work import read_work
+
+    persona_dir = get_persona_dir(args.persona)
+    result = read_work(id=args.id, persona_dir=persona_dir)
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+        return 1
+    print("---")
+    print(f"id: {result['id']}")
+    print(f"title: {result['title']}")
+    print(f"type: {result['type']}")
+    print(f"created_at: {result['created_at']}")
+    if result.get("summary"):
+        print(f"summary: {result['summary']}")
+    print(f"word_count: {result['word_count']}")
+    print("---")
+    print()
+    print(result["content"])
     return 0
 
 
@@ -1490,6 +1544,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Follow the log: emit new lines as written. Ctrl-c to exit.",
     )
     s_tail_log.set_defaults(func=cmd_tail_log)
+
+    # nell works — read-only inspection of brain-authored creative artifacts.
+    # Saving is brain-territory via the save_work MCP tool, not a CLI command.
+    w_sub = subparsers.add_parser(
+        "works",
+        help="Inspect brain-authored creative artifacts (read-only).",
+    )
+    w_actions = w_sub.add_subparsers(dest="action", required=True)
+
+    w_list = w_actions.add_parser("list", help="List recent works.")
+    w_list.add_argument("--persona", required=True)
+    w_list.add_argument(
+        "--type",
+        default=None,
+        help="Filter by type (story/code/planning/idea/role_play/letter/other).",
+    )
+    w_list.add_argument("--limit", type=int, default=20)
+    w_list.set_defaults(func=_works_list_handler)
+
+    w_search = w_actions.add_parser("search", help="Search works by title/summary/content.")
+    w_search.add_argument("--persona", required=True)
+    w_search.add_argument("--query", required=True)
+    w_search.add_argument("--type", default=None)
+    w_search.add_argument("--limit", type=int, default=20)
+    w_search.set_defaults(func=_works_search_handler)
+
+    w_read = w_actions.add_parser("read", help="Read one work's full content.")
+    w_read.add_argument("--persona", required=True)
+    w_read.add_argument("--id", required=True)
+    w_read.set_defaults(func=_works_read_handler)
 
     # nell bridge — SP-7 daemon control (kept for back-compat; supervisor is canonical)
     b_sub = subparsers.add_parser(
