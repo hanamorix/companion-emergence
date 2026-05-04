@@ -46,11 +46,13 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     return provider, searcher
 
 
-# Subcommands the framework plans to ship. Each is a stub in Week 1;
-# `nell supervisor` was unstubbed on 2026-05-04
-# (see docs/superpowers/specs/2026-05-04-nell-supervisor-design.md).
+# Subcommands the framework plans to ship. Each is a stub in Week 1.
+# `nell supervisor` was unstubbed on 2026-05-04 (see
+# docs/superpowers/specs/2026-05-04-nell-supervisor-design.md).
+# `nell rest` was removed on 2026-05-04 (see
+# docs/superpowers/specs/2026-05-04-nell-rest-physiology-design.md);
+# rest is a body-state physiology concern, not a CLI command.
 _STUB_COMMANDS: tuple[str, ...] = (
-    "rest",
     "works",
 )
 
