@@ -504,3 +504,35 @@ def test_run_migrate_retags_reflex_journal_memories(tmp_path: Path) -> None:
         assert conv_mems[0].id == "m1"
     finally:
         store.close()
+
+
+def test_run_migrate_preserves_legacy_files(tmp_path: Path) -> None:
+    """End-to-end: OG with biographical files → output/legacy/<file> exists; report counts match."""
+    og_data = tmp_path / "og" / "data"
+    og_data.mkdir(parents=True)
+    # Minimum valid OG seed files the existing migrators consume
+    (og_data / "memories_v2.json").write_text("[]")
+    (og_data / "connection_matrix_ids.json").write_text(json.dumps([]))
+    matrix = np.zeros((0, 0), dtype=np.float32)
+    np.save(og_data / "connection_matrix.npy", matrix)
+    (og_data / "hebbian_state.json").write_text("{}")
+    # Two legacy-list files for preservation
+    (og_data / "nell_journal.json").write_text(
+        '{"entries": [{"timestamp": "2026-01-01", "entry": "test", "private": true}]}'
+    )
+    (og_data / "nell_gifts.json").write_text('{"gifts": []}')
+
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    # Two preserved (journal, gifts); the other 14 in LEGACY_FILES → missing.
+    assert report.legacy_files_preserved == 2
+    assert report.legacy_files_missing == 14
+    assert report.legacy_skipped_reason is None
+    assert (output / "legacy" / "nell_journal.json").exists()
+    assert (output / "legacy" / "nell_gifts.json").exists()
+    # Verify byte fidelity of the journal copy
+    journal_text = (output / "legacy" / "nell_journal.json").read_text()
+    assert "test" in journal_text
+    assert "2026-01-01" in journal_text

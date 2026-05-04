@@ -17,6 +17,7 @@ from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
 from brain.migrator.og_journal_dna import migrate_creative_dna, migrate_journal_memories
+from brain.migrator.og_legacy import migrate_legacy_files
 from brain.migrator.og_reflex import migrate_reflex_arcs
 from brain.migrator.og_soul import extract_crystallizations_from_og
 from brain.migrator.og_vocabulary import extract_persona_vocabulary
@@ -243,6 +244,20 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     finally:
         journal_store.close()
 
+    # ---- legacy preservation ----
+    legacy_files_preserved = 0
+    legacy_files_missing = 0
+    legacy_skipped_reason: str | None = None
+    try:
+        preserved, missing = migrate_legacy_files(
+            og_data_dir=args.input_dir,
+            persona_dir=work_dir,
+        )
+        legacy_files_preserved = len(preserved)
+        legacy_files_missing = len(missing)
+    except OSError as exc:
+        legacy_skipped_reason = f"copy_error: {exc}"
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -273,6 +288,9 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         creative_dna_skipped_reason=creative_dna_skipped_reason,
         journal_memories_retagged=journal_memories_retagged,
         journal_memories_skipped_reason=journal_memories_skipped_reason,
+        legacy_files_preserved=legacy_files_preserved,
+        legacy_files_missing=legacy_files_missing,
+        legacy_skipped_reason=legacy_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
