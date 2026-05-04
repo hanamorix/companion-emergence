@@ -47,15 +47,19 @@ def test_cmd_restart_calls_stop_then_start_when_running(
     assert "starting bridge" in out
 
 
-def test_cmd_restart_proceeds_when_nothing_was_running(
+def test_cmd_restart_bails_when_stop_timed_out_on_wedged_bridge(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Stop returns 1 with no-bridge-running semantics — restart should still try start."""
+    """Stop returns 1 (SIGTERM timeout / wedged bridge) — restart must NOT call start.
+
+    cmd_stop returns 0 for clean-stop AND no-bridge-running, so the only way
+    to see stop=1 is a wedge. Spawning a second bridge over a wedged first
+    one is the exact footgun the supervisor exists to prevent.
+    """
     calls: list[str] = []
 
     def fake_stop(args):
         calls.append("stop")
-        print("no bridge running")
         return 1
 
     def fake_start(args):
@@ -66,11 +70,14 @@ def test_cmd_restart_proceeds_when_nothing_was_running(
     monkeypatch.setattr(daemon, "cmd_start", fake_start)
 
     rc = daemon.cmd_restart(_args("nell"))
-    assert rc == 0
-    assert calls == ["stop", "start"]
+    assert rc == 1
+    assert calls == ["stop"]
+    err = capsys.readouterr().err
+    assert "restart aborted" in err
+    assert "stop failed" in err
 
 
-def test_cmd_restart_bails_when_stop_fails_with_lock_held(
+def test_cmd_restart_bails_when_stop_returns_unexpected_high_code(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Stop returns 2 (lock held) — restart must NOT call start; returns stop's code."""
