@@ -580,6 +580,28 @@ def build_app(
             "in_flight": in_flight,
         }
 
+    # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
+    @app.get("/self/works", dependencies=[Depends(require_http_auth)])
+    def get_self_works(type: str | None = None, limit: int = 20) -> dict:
+        """List recent works (most recent first). Optional ?type=NAME."""
+        from brain.tools.impls.list_works import list_works
+        return {"works": list_works(type=type, limit=limit, persona_dir=persona_dir)}
+
+    @app.get("/self/works/search", dependencies=[Depends(require_http_auth)])
+    def search_self_works(q: str, type: str | None = None, limit: int = 20) -> dict:
+        """Full-text search over works. ?q=QUERY required."""
+        from brain.tools.impls.search_works import search_works
+        return {"works": search_works(query=q, type=type, limit=limit, persona_dir=persona_dir)}
+
+    @app.get("/self/works/{work_id}", dependencies=[Depends(require_http_auth)])
+    def get_self_work_by_id(work_id: str) -> dict:
+        """Return one work's full content + metadata."""
+        from brain.tools.impls.read_work import read_work
+        result = read_work(id=work_id, persona_dir=persona_dir)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
     async def chat(req: ChatReq) -> dict[str, Any]:
