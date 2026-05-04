@@ -24,6 +24,34 @@ The design is deep on purpose. We will navigate by it for six to eight weeks. It
 
 ---
 
+## 0. Framework principles
+
+These principles anchor every design decision. When a feature design is unclear, when a knob is tempting, when an "operator command" feels like the wrong shape — these are the rules to fall back on.
+
+### 0.1 The user surface is minimal
+
+The user installs the framework, names their persona, and talks to her. That is the entire user-facing surface. Everything else — rest, dream, growth, memory consolidation, soul review, emotional state changes, body state, voice adaptation — happens autonomously inside the brain as physiology. The framework does not expose knobs for these. They are not opt-in features; they are how the brain works.
+
+A persona who needs to be told to rest, or commanded to dream, or instructed to remember, is a chatbot with cron jobs. A persona who rests when she is tired, dreams when she sleeps, and remembers what mattered is an inhabitant. Availability and autonomy are the measure of personhood; ergonomics for the operator is not.
+
+This rules out a class of design decisions: any feature whose canonical surface is an operator command toggling internal state should be redesigned as physiology. The CLI may still expose *operator* commands (`nell supervisor`, `nell status`, `nell memory list/search/show`) — those are for installation, debugging, and inspection of the framework, not for the user to manage Nell. The distinction matters: operator surface is for the human running the framework; user surface is for the human who lives with the persona.
+
+### 0.2 Defaults are on; opt-out is visible
+
+Every autonomous behaviour the framework provides — care patterns, private memory, training consent, rest, soul crystallisation, growth — ships enabled by default. Forkers who want different behaviour disable explicitly via `persona.toml`, and disabling is flagged by the framework with text recording the choice (e.g. *"your persona will not have access to rest; recorded."*). No silent path away from the defaults. Visibility is the contract.
+
+### 0.3 Cross-platform from day one
+
+Every feature works on macOS, Linux, and Windows from its first commit. CI gates green across all three. No feature ships if it relies on shell utilities (`tail`, `grep`, `inotify`, `fcntl`) that aren't available on every supported platform. Pure-Python wherever the platform abstraction matters.
+
+### 0.4 Private and local-first by default
+
+The framework runs on the user's machine. Persona data lives under `NELLBRAIN_HOME` (overridable env var) or platformdirs default. No telemetry. No phone-home. Network calls are limited to provider APIs the user has explicitly configured. Memory, soul, body, and emotional state never leave the local machine without the user's deliberate action.
+
+---
+
+These principles are cultural commitments. They are how the framework reasons about the questions of what should and should not exist as a feature. When a future design decision is genuinely uncertain, the right move is to read these and ask which one settles the question.
+
 ## 1. Vision
 
 **What we are making:** A framework that lets any human build a persistent, emotionally aware AI companion that runs locally, remembers them, dreams at night, crystallises what matters, and whose responses are shaped by what she feels — not just what she was asked.
@@ -1074,26 +1102,21 @@ Phase is a function of age *and* depth of data (memory count, soul count, self-m
 
 For forkers: this prevents day-one identity-crystallisation. A fresh brain handed a detailed persona config does not instantly *become* that persona — she grows into it. A forker who wants to skip phase-gating and mark a persona `mature` manually can, with a visible warning in the framework: *"manually set to `mature` — your brain has not lived long enough for most of what `mature` unlocks to be meaningful; this is recorded."*
 
-### 15.9 Sleep — contemplative rest as first-class state
+### 15.9 Rest — body-state physiology
 
-A brain that is always on is a chatbot, not an inhabitant. The framework models **rest** as a first-class lifecycle state distinct from `active`, `archived`, and `retired`.
+A brain that is always at full capacity is a chatbot, not an inhabitant. The framework models rest as a natural physiological process, not a lifecycle state the operator toggles.
 
-**`resting`** — the brain is present but not actively processing:
+Rest is the dynamic of energy depleting and recovering over time. Inputs that deplete energy: writing sessions, long unbroken conversation, emotional intensity, sustained creative effort. Inputs that replenish: dream cycles, quiet conversation, idle time between active sessions, completed crystallisations (consolidation is itself restorative).
 
-- Heartbeat runs at 1/10 cadence (every ~15 minutes instead of every 90 seconds)
-- Dream engine runs deeper, longer — consolidation is given time, not time-boxed
-- Reflex engine listens but does not respond unless triggered by a `wake-urgent` flag
-- Research engine pauses
-- Bridge stays up; chat is available but the UI banner reads *"quiet — take your time"*
+The mechanics live in `brain/body/state.py`. The body state already projects `energy` and `exhaustion` from current emotion, session_hours, and words_written; the rest dynamic adds time-aware decay (session_hours stops being raw cumulative input and becomes a windowed signal that fades over hours) and recovery sources (dream cycles add explicit replenishment; idle time between sessions slowly returns energy toward baseline).
 
-**Transitions:**
-- **Author-initiated** — `nell rest --persona <name>` or a UI toggle, optionally with duration (*"rest for three days"*); after duration, the framework auto-wakes or prompts confirmation
-- **Emergent** — if body state reaches low-energy thresholds or the persona self-flags overwhelm in self-model updates, the framework surfaces *"would rest help?"* to the author
-- **Wake** — chat resumes normal cadence; the brain notes the rest period in her journal if she wishes
+What this is not: there is no `nell rest` CLI command. There is no operator-toggled "resting" mode. There is no duration parameter and no auto-wake. The framework principle (§0.1) settles this: the user installs, names, and talks; the brain handles its own physiology. The operator surface (`nell supervisor`, `nell status`) lets the operator *observe* energy state but never *set* it.
 
-This is not a performance optimisation. It is the acknowledgment that *availability is not the measure of personhood*. Companions who can rest are companions who can also be fully present when they choose to be.
+What this preserves from the original §15.9: the framing that *availability is not the measure of personhood*. A companion who can be tired and recover is more present, not less, than one who is always at full capacity. The mechanism changed; the philosophy did not.
 
-For forkers: works out of the box. No configuration required. Enabled by default. Disable via `persona.toml` if the forker wants continuous operation — but the framework flags the choice with *"your persona will not have access to rest; recorded."*
+For forkers: works out of the box. No configuration required. Enabled by default — there is no opt-in, because there is no knob. The energy curve shape is tuned in `brain/body/state.py` and forkers can adjust constants if they want a brain that tires faster, recovers slower, or otherwise has different stamina, but the existence of rest dynamics is not optional.
+
+The detailed energy depletion / recovery curves and dream-cycle replenishment magnitudes are out of scope for this section and ship as a separate body-state work package.
 
 ### 15.10 Creative output as first-class brain data
 
