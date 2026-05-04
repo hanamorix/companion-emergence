@@ -56,10 +56,26 @@ def get_persona_dir(name: str) -> Path:
 
 
 def get_cache_dir() -> Path:
-    """Return the cache directory (embeddings, computed matrices, etc)."""
+    """Return the cache directory (embeddings, computed matrices, etc).
+
+    Resolution order matches get_home():
+    1. NELLBRAIN_HOME / "cache" if NELLBRAIN_HOME is set (supports ~ expansion)
+    2. platformdirs user_cache_path for the current OS
+    """
+    override = os.environ.get("NELLBRAIN_HOME")
+    if override:
+        return (Path(override).expanduser() / "cache").resolve()
     return _dirs.user_cache_path.resolve()
 
 
 def get_log_dir() -> Path:
-    """Return the log file directory."""
+    """Return the log file directory (per-persona bridge logs etc).
+
+    Resolution order matches get_home():
+    1. NELLBRAIN_HOME / "logs" if NELLBRAIN_HOME is set (supports ~ expansion)
+    2. platformdirs user_log_path for the current OS
+    """
+    override = os.environ.get("NELLBRAIN_HOME")
+    if override:
+        return (Path(override).expanduser() / "logs").resolve()
     return _dirs.user_log_path.resolve()

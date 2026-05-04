@@ -64,6 +64,44 @@ def test_get_log_dir_is_absolute_path(clean_env: None) -> None:
     assert result.is_absolute()
 
 
+def test_get_log_dir_respects_env_override(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NELLBRAIN_HOME redirects get_log_dir to <HOME>/logs."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    result = paths.get_log_dir()
+    assert result == (tmp_path / "logs").resolve()
+
+
+def test_get_log_dir_falls_back_to_platformdirs(clean_env: None) -> None:
+    """Without NELLBRAIN_HOME, get_log_dir() returns the platformdirs path.
+
+    Asserts the resolved path contains the project app name — platformdirs
+    always nests under the appname on every supported OS.
+    """
+    result = paths.get_log_dir()
+    assert isinstance(result, Path)
+    assert result.is_absolute()
+    assert "companion-emergence" in str(result).lower()
+
+
+def test_get_cache_dir_respects_env_override(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NELLBRAIN_HOME redirects get_cache_dir to <HOME>/cache."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    result = paths.get_cache_dir()
+    assert result == (tmp_path / "cache").resolve()
+
+
+def test_get_cache_dir_falls_back_to_platformdirs(clean_env: None) -> None:
+    """Without NELLBRAIN_HOME, get_cache_dir() returns the platformdirs path."""
+    result = paths.get_cache_dir()
+    assert isinstance(result, Path)
+    assert result.is_absolute()
+    assert "companion-emergence" in str(result).lower()
+
+
 def test_get_persona_dir_rejects_path_traversal() -> None:
     with pytest.raises(ValueError):
         paths.get_persona_dir("../etc/passwd")
