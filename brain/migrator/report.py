@@ -36,6 +36,9 @@ class MigrationReport:
     creative_dna_skipped_reason: str | None = None
     journal_memories_retagged: int = 0
     journal_memories_skipped_reason: str | None = None
+    legacy_files_preserved: int = 0
+    legacy_files_missing: int = 0
+    legacy_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -96,6 +99,15 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.journal_memories_skipped_reason})"
             if report.journal_memories_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Legacy files:   {report.legacy_files_preserved:,} preserved, "
+        f"{report.legacy_files_missing:,} missing"
+        + (
+            f" (skipped: {report.legacy_skipped_reason})"
+            if report.legacy_skipped_reason
             else ""
         )
     )
