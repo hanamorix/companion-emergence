@@ -48,8 +48,12 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 - `nell bridge` — use `nell supervisor` instead. The alias still works and forwards to the new command, but prints a deprecation warning to stderr. Will be removed in v0.1.
 
+### Removed
+
+- `nell rest` stub command. Rest is a body-state physiology concern (energy depletes from writing and long sessions, recovers from dreams and idle time), not a user-facing CLI command. The mechanics live in `brain/body/state.py`; see source spec §15.9 (rewritten) and §0 (framework principles, new).
+
 ### Known incomplete surfaces
 
-- `nell rest` and `nell works` remain intentional future-work stubs.
+- `nell works` remains an intentional future-work stub.
 - Public release automation is deferred until the CLI/API surface is stable enough to version.
 - Public contributor documentation is in progress.
