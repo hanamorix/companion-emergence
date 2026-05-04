@@ -33,7 +33,6 @@ def test_no_args_prints_help_and_exits_nonzero(
 
 
 STUB_COMMANDS = [
-    "rest",
     "works",
 ]
 
