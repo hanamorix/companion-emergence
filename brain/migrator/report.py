@@ -32,6 +32,10 @@ class MigrationReport:
     vocabulary_skipped_reason: str | None = None
     crystallizations_migrated: int = 0
     crystallizations_skipped_reason: str | None = None
+    creative_dna_migrated: bool = False
+    creative_dna_skipped_reason: str | None = None
+    journal_memories_retagged: int = 0
+    journal_memories_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -75,6 +79,23 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.crystallizations_skipped_reason})"
             if report.crystallizations_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        "  Creative DNA:   "
+        + ("migrated" if report.creative_dna_migrated else "not migrated")
+        + (
+            f" (skipped: {report.creative_dna_skipped_reason})"
+            if report.creative_dna_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Journal:        {report.journal_memories_retagged:,} memories retagged"
+        + (
+            f" (skipped: {report.journal_memories_skipped_reason})"
+            if report.journal_memories_skipped_reason
             else ""
         )
     )
