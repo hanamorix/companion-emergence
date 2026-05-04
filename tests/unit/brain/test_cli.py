@@ -32,34 +32,6 @@ def test_no_args_prints_help_and_exits_nonzero(
     assert "usage:" in captured.out.lower()
 
 
-STUB_COMMANDS = [
-    "works",
-]
-
-
-@pytest.mark.parametrize("name", STUB_COMMANDS)
-def test_stub_subcommand_runs_and_reports_not_implemented(
-    capsys: pytest.CaptureFixture[str], name: str
-) -> None:
-    """Every stub subcommand exits non-zero and prints 'not implemented yet'."""
-    result = cli.main([name])
-    assert result == 2
-    captured = capsys.readouterr()
-    assert "not implemented" in captured.out.lower()
-    assert name in captured.out
-
-
-def test_stub_subcommand_help_works(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Each stub subcommand supports --help without crashing."""
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main([STUB_COMMANDS[0], "--help"])
-    assert exc_info.value.code == 0
-    captured = capsys.readouterr()
-    assert STUB_COMMANDS[0] in captured.out.lower()
-
-
 def _make_persona(tmp_path: Path, name: str = "nell") -> Path:
     home = tmp_path / "home"
     persona_dir = home / "personas" / name
