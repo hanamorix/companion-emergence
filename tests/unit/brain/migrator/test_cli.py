@@ -390,3 +390,117 @@ def test_migrate_writes_interests(
     assert data["interests"][0]["last_researched_at"] is None
     assert report.interests_migrated == 1
     assert report.interests_skipped_reason is None
+
+
+def test_run_migrate_writes_creative_dna_when_og_has_it(og_dir: Path, tmp_path: Path) -> None:
+    """End-to-end: OG with nell_creative_dna.json -> output has creative_dna.json + report flag."""
+    # The og_dir fixture creates /og_data; migrate_creative_dna expects og_root with /data inside.
+    # Simplest: re-create the OG dir at tmp_path/og/data/.
+    og_root = tmp_path / "og"
+    og_data = og_root / "data"
+    og_data.mkdir(parents=True)
+    # Copy the fixture's OG files
+    for name in (
+        "memories_v2.json",
+        "connection_matrix_ids.json",
+        "connection_matrix.npy",
+        "hebbian_state.json",
+    ):
+        (og_data / name).write_bytes((og_dir / name).read_bytes())
+    # Add a creative_dna source
+    (og_data / "nell_creative_dna.json").write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "writing_style": {
+                    "core_voice": "literary",
+                    "strengths": ["close listening"],
+                    "tendencies": {"active": ["em-dashes"], "emerging": [], "fading": []},
+                    "influences": ["clarice lispector"],
+                    "avoid": [],
+                },
+            }
+        )
+    )
+
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    assert report.creative_dna_migrated is True
+    assert report.creative_dna_skipped_reason is None
+    assert (output / "creative_dna.json").exists()
+
+
+def test_run_migrate_creative_dna_graceful_when_og_missing_file(
+    og_dir: Path, tmp_path: Path
+) -> None:
+    """OG without nell_creative_dna.json -> run succeeds, report flags 'og file not present'."""
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_dir, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    assert report.creative_dna_migrated is False
+    assert report.creative_dna_skipped_reason == "og file not present"
+    assert not (output / "creative_dna.json").exists()
+
+
+def test_run_migrate_retags_reflex_journal_memories(tmp_path: Path) -> None:
+    """Memories of memory_type='reflex_journal' get retagged to 'journal_entry'
+    with metadata.private=True, source='reflex_arc', auto_generated=True."""
+    og_data = tmp_path / "og" / "data"
+    og_data.mkdir(parents=True)
+    (og_data / "memories_v2.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "j1",
+                    "content": "a journal entry",
+                    "memory_type": "reflex_journal",
+                    "domain": "us",
+                    "created_at": "2026-04-01T00:00:00+00:00",
+                    "emotions": {"reflection": 5.0},
+                    "emotion_score": 5.0,
+                },
+                {
+                    "id": "m1",
+                    "content": "a regular conversation",
+                    "memory_type": "conversation",
+                    "domain": "us",
+                    "created_at": "2026-04-01T00:00:00+00:00",
+                    "emotions": {},
+                    "emotion_score": 0.0,
+                },
+            ]
+        )
+    )
+    # Hebbian fixtures (required by run_migrate)
+    (og_data / "connection_matrix_ids.json").write_text(json.dumps(["j1", "m1"]))
+    matrix = np.array([[0.0, 0.5], [0.5, 0.0]], dtype=np.float32)
+    np.save(og_data / "connection_matrix.npy", matrix)
+    (og_data / "hebbian_state.json").write_text("{}")
+
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    assert report.journal_memories_retagged == 1
+    assert report.journal_memories_skipped_reason is None
+
+    # Verify the actual retag landed in the SQLite store
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(db_path=output / "memories.db")
+    try:
+        journal_mems = store.list_by_type("journal_entry", active_only=True)
+        assert len(journal_mems) == 1
+        assert journal_mems[0].id == "j1"
+        assert journal_mems[0].metadata.get("private") is True
+        assert journal_mems[0].metadata.get("source") == "reflex_arc"
+        assert journal_mems[0].metadata.get("auto_generated") is True
+        # Conversation-type memory must NOT be retagged
+        conv_mems = store.list_by_type("conversation", active_only=True)
+        assert len(conv_mems) == 1
+        assert conv_mems[0].id == "m1"
+    finally:
+        store.close()
