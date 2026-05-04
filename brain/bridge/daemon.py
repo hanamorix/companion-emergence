@@ -294,8 +294,10 @@ def cmd_restart(args) -> int:
     return cmd_start(args)
 
 
-# Hook used by tests + ctrl-c handler in follow mode. Tests can set this
-# Event to exit follow mode cleanly without raising KeyboardInterrupt.
+# Test seam: setting this Event from a test allows the follow-mode loop
+# to exit cleanly without raising KeyboardInterrupt. Production exit
+# from follow mode is handled by the KeyboardInterrupt catch in
+# cmd_tail_log itself.
 _follow_should_stop: threading.Event | None = None
 
 
