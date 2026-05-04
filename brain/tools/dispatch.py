@@ -20,7 +20,11 @@ from brain.tools.impls.get_body_state import get_body_state
 from brain.tools.impls.get_emotional_state import get_emotional_state
 from brain.tools.impls.get_personality import get_personality
 from brain.tools.impls.get_soul import get_soul
+from brain.tools.impls.list_works import list_works
+from brain.tools.impls.read_work import read_work
+from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_memories import search_memories
+from brain.tools.impls.search_works import search_works
 from brain.tools.schemas import SCHEMAS
 
 
@@ -47,7 +51,14 @@ _DISPATCH: dict[str, Any] = {
     "boot": boot,
     "get_soul": get_soul,
     "crystallize_soul": crystallize_soul,
+    "save_work": save_work,
+    "list_works": list_works,
+    "search_works": search_works,
+    "read_work": read_work,
 }
+
+
+_WORKS_TOOLS = frozenset({"save_work", "list_works", "search_works", "read_work"})
 
 
 def dispatch(
@@ -111,6 +122,12 @@ def dispatch(
                 f"tool 'get_body_state' arg 'session_hours' must be a number, "
                 f"got {type(arguments['session_hours']).__name__!r}"
             ) from exc
+
+    if name in _WORKS_TOOLS:
+        try:
+            return fn(**arguments, persona_dir=persona_dir)
+        except TypeError as exc:
+            raise ToolDispatchError(f"bad arguments to tool {name!r}: {exc}") from exc
 
     injected = {"store": store, "hebbian": hebbian, "persona_dir": persona_dir}
 
