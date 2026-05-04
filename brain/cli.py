@@ -47,9 +47,9 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
 
 
 # Subcommands the framework plans to ship. Each is a stub in Week 1;
-# filled in across Weeks 2-8 as respective modules come online.
+# `nell supervisor` was unstubbed on 2026-05-04
+# (see docs/superpowers/specs/2026-05-04-nell-supervisor-design.md).
 _STUB_COMMANDS: tuple[str, ...] = (
-    "supervisor",
     "rest",
     "works",
 )
@@ -1382,9 +1382,93 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     i_list.set_defaults(func=_interest_list_handler)
 
-    # nell bridge — SP-7 daemon control
-    from brain.bridge.daemon import cmd_start, cmd_status, cmd_stop, cmd_tail
+    # nell supervisor — canonical bridge lifecycle (replaces nell bridge in v0.1).
+    from brain.bridge.daemon import (
+        cmd_restart,
+        cmd_start,
+        cmd_status,
+        cmd_stop,
+        cmd_tail,
+        cmd_tail_log,
+    )
 
+    s_sub = subparsers.add_parser(
+        "supervisor",
+        help="Manage the per-persona bridge daemon — canonical lifecycle command.",
+    )
+    s_actions = s_sub.add_subparsers(dest="action", required=True)
+
+    def _add_persona_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--persona", required=True)
+
+    def _nonneg_int(v: str) -> int:
+        iv = int(v)
+        if iv < 0:
+            raise argparse.ArgumentTypeError("must be a non-negative integer")
+        return iv
+
+    s_start = s_actions.add_parser("start", help="Start the bridge daemon.")
+    _add_persona_arg(s_start)
+    s_start.add_argument(
+        "--idle-shutdown",
+        type=float,
+        default=30,
+        help="Idle-shutdown threshold in minutes (0 = never).",
+    )
+    s_start.add_argument(
+        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
+    )
+    s_start.set_defaults(func=cmd_start)
+
+    s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
+    _add_persona_arg(s_stop)
+    s_stop.add_argument("--timeout", type=float, default=180.0)
+    s_stop.set_defaults(func=cmd_stop)
+
+    s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
+    _add_persona_arg(s_status)
+    s_status.set_defaults(func=cmd_status)
+
+    s_restart = s_actions.add_parser(
+        "restart", help="Stop and start — gated on stop success.",
+    )
+    _add_persona_arg(s_restart)
+    s_restart.add_argument("--idle-shutdown", type=float, default=30)
+    s_restart.add_argument(
+        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
+    )
+    s_restart.add_argument("--timeout", type=float, default=180.0)
+    s_restart.set_defaults(func=cmd_restart)
+
+    s_tail_events = s_actions.add_parser(
+        "tail-events", help="Tail /events as JSON lines."
+    )
+    _add_persona_arg(s_tail_events)
+    s_tail_events.set_defaults(func=cmd_tail)
+
+    s_tail_log = s_actions.add_parser(
+        "tail-log", help="Tail the bridge log file (cross-platform).",
+    )
+    _add_persona_arg(s_tail_log)
+    s_tail_log.add_argument(
+        "-n",
+        "--lines",
+        dest="lines",
+        type=_nonneg_int,
+        default=50,
+        help="Print the last N lines (default 50; 0 = none, useful with -f).",
+    )
+    s_tail_log.add_argument(
+        "-f",
+        "--follow",
+        dest="follow",
+        action="store_true",
+        default=False,
+        help="Follow the log: emit new lines as written. Ctrl-c to exit.",
+    )
+    s_tail_log.set_defaults(func=cmd_tail_log)
+
+    # nell bridge — SP-7 daemon control (kept for back-compat; supervisor is canonical)
     b_sub = subparsers.add_parser(
         "bridge",
         help="Manage the per-persona bridge daemon (SP-7).",
