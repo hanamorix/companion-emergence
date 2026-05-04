@@ -118,3 +118,141 @@ def test_cmd_restart_propagates_start_already_running_code(
     monkeypatch.setattr(daemon, "cmd_stop", lambda a: 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda a: 2)
     assert daemon.cmd_restart(_args("nell")) == 2
+
+
+# ---------- cmd_tail_log ----------
+
+
+def _make_persona(tmp_path: Path, name: str = "nell") -> Path:
+    home = tmp_path / "home"
+    persona_dir = home / "personas" / name
+    persona_dir.mkdir(parents=True)
+    return persona_dir
+
+
+def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str = "nell") -> Path:
+    """Wire NELLBRAIN_HOME so get_persona_dir + get_log_dir resolve under tmp_path.
+
+    NELLBRAIN_HOME is read by get_home() (and thus get_persona_dir). get_log_dir()
+    uses platformdirs and ignores NELLBRAIN_HOME, so we monkeypatch it directly
+    so the supervisor's bridge log resolves under tmp_path/home/logs.
+    """
+    from brain import paths
+
+    home = tmp_path / "home"
+    log_dir = home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_persona(tmp_path, persona)
+    monkeypatch.setenv("NELLBRAIN_HOME", str(home))
+    monkeypatch.setattr(paths, "get_log_dir", lambda: log_dir)
+    return log_dir
+
+
+def _tail_args(persona: str, **kw) -> argparse.Namespace:
+    ns = argparse.Namespace(persona=persona, lines=50, follow=False)
+    for k, v in kw.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def test_cmd_tail_log_prints_last_n_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "bridge-nell.log"
+    log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
+
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=3))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "line 98" in out
+    assert "line 99" in out
+    assert "line 100" in out
+    assert "line 97" not in out
+
+
+def test_cmd_tail_log_default_50_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "bridge-nell.log"
+    log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
+
+    rc = daemon.cmd_tail_log(_tail_args("nell"))  # lines=50 default
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "line 51" in out
+    assert "line 50" not in out
+
+
+def test_cmd_tail_log_n_zero_prints_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "bridge-nell.log"
+    log_path.write_text("alpha\nbeta\n")
+
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=0))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_cmd_tail_log_missing_file_returns_1_with_helpful_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_paths(monkeypatch, tmp_path)  # log dir exists; log file does not
+
+    rc = daemon.cmd_tail_log(_tail_args("nell"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "bridge log not found" in err
+    assert "supervisor ever started" in err
+
+
+def test_cmd_tail_log_persona_not_found_returns_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("NELLBRAIN_HOME", str(home))
+
+    rc = daemon.cmd_tail_log(_tail_args("ghost"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "persona directory not found" in err
+
+
+def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Follow mode polls the log; KeyboardInterrupt exits cleanly with code 0."""
+    import threading
+    import time
+
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "bridge-nell.log"
+    log_path.write_text("seed\n")
+
+    # writer thread appends two lines after a short delay, then signals interrupt
+    def writer():
+        time.sleep(0.15)
+        with log_path.open("a") as f:
+            f.write("new1\n")
+            f.write("new2\n")
+            f.flush()
+        time.sleep(0.15)
+        # raise KeyboardInterrupt in main via _follow_should_stop hook
+        daemon._follow_should_stop.set()  # type: ignore[attr-defined]
+
+    daemon._follow_should_stop = threading.Event()  # type: ignore[attr-defined]
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=1, follow=True))
+    t.join(timeout=2.0)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "seed" in out
+    assert "new1" in out
+    assert "new2" in out
