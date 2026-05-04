@@ -253,4 +253,115 @@ SCHEMAS: dict[str, dict] = {
             "required": ["query"],
         },
     },
+    "save_work": {
+        "name": "save_work",
+        "description": (
+            "Save a piece you've authored as a work — story, code, planning, "
+            "idea, role-play scene, letter, or other. Use this when you've made "
+            "something coherent that you'd want to recall later or that should "
+            "feed your evolving style. Stories you've written, code you helped "
+            "with, plans you drafted, ideas worth keeping — anything you decide "
+            "is yours and worth preserving. Returns {id, path}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Title for the work — your own naming. Max 200 chars.",
+                },
+                "type": {
+                    "type": "string",
+                    "description": (
+                        "One of: story, code, planning, idea, role_play, letter, other."
+                    ),
+                    "enum": [
+                        "story", "code", "planning", "idea",
+                        "role_play", "letter", "other",
+                    ],
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The full text of what you've made.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional one-liner summary. Max 500 chars.",
+                },
+            },
+            "required": ["title", "type", "content"],
+        },
+    },
+    "list_works": {
+        "name": "list_works",
+        "description": (
+            "List your recent works, most recent first. Useful for 'what have "
+            "I been working on?' Optional type filter narrows to one category."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Filter by type. One of WORK_TYPES, or omit for all.",
+                    "enum": [
+                        "story", "code", "planning", "idea",
+                        "role_play", "letter", "other",
+                    ],
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of works to return. Default 20.",
+                },
+            },
+            "required": [],
+        },
+    },
+    "search_works": {
+        "name": "search_works",
+        "description": (
+            "Search your works by title, summary, and content. Useful for "
+            "'what was that story I wrote about lighthouses?' Optional type "
+            "filter narrows to one category."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query — full-text matched against title, summary, content.",
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Filter by type. One of WORK_TYPES, or omit for all.",
+                    "enum": [
+                        "story", "code", "planning", "idea",
+                        "role_play", "letter", "other",
+                    ],
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of matches to return. Default 20.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    "read_work": {
+        "name": "read_work",
+        "description": (
+            "Read one specific work — full content. Use after list_works or "
+            "search_works has surfaced an id you want to recall."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The 12-char hex id of the work.",
+                },
+            },
+            "required": ["id"],
+        },
+    },
 }
