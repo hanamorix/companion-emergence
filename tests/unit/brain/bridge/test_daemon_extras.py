@@ -131,20 +131,16 @@ def _make_persona(tmp_path: Path, name: str = "nell") -> Path:
 
 
 def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str = "nell") -> Path:
-    """Wire NELLBRAIN_HOME so get_persona_dir + get_log_dir resolve under tmp_path.
+    """Wire NELLBRAIN_HOME so get_persona_dir AND get_log_dir resolve under tmp_path/home.
 
-    NELLBRAIN_HOME is read by get_home() (and thus get_persona_dir). get_log_dir()
-    uses platformdirs and ignores NELLBRAIN_HOME, so we monkeypatch it directly
-    so the supervisor's bridge log resolves under tmp_path/home/logs.
+    get_log_dir() honors NELLBRAIN_HOME (returning <HOME>/logs) since the
+    paths.py override fix; setting the env var is sufficient.
     """
-    from brain import paths
-
     home = tmp_path / "home"
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     _make_persona(tmp_path, persona)
     monkeypatch.setenv("NELLBRAIN_HOME", str(home))
-    monkeypatch.setattr(paths, "get_log_dir", lambda: log_dir)
     return log_dir
 
 
