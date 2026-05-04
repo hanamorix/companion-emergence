@@ -56,7 +56,7 @@ _STUB_COMMANDS: tuple[str, ...] = (
 
 
 # Deprecation alias for `nell bridge` — to be removed in v0.1.
-# Note: `nell chat` auto-spawn (see _chat_handler ≈ line 1134) imports
+# Note: `nell chat` auto-spawn (see `_chat_handler`) imports
 # brain.bridge.daemon directly and does NOT use this CLI surface, so
 # removing the alias does not break chat. See docs/roadmap.md §3.
 def _deprecated_bridge(real_handler):
