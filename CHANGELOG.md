@@ -27,6 +27,7 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 - Provider-backed growth paths are guarded so local tests and dry runs do not accidentally hang on live provider calls.
 - Memory hot paths can avoid expensive integrity checks while health checks retain deeper verification.
 - Empty memory text searches are rejected; callers that want broad listing must use explicit listing APIs.
+- `NELLBRAIN_HOME` now also redirects `get_log_dir()` and `get_cache_dir()` (to `$NELLBRAIN_HOME/logs/` and `$NELLBRAIN_HOME/cache/` respectively). Previously only persona data honored the override; bridge logs and cache state went to the platformdirs default. The new layout makes a sandboxed `NELLBRAIN_HOME` actually sandboxed. Users with `NELLBRAIN_HOME` set will see bridge logs move from the platformdirs location to `$NELLBRAIN_HOME/logs/` on next bridge start.
 
 ### Security and privacy
 
