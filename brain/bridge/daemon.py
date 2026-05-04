@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -289,3 +290,58 @@ def cmd_restart(args) -> int:
         return stop_rc
     print("starting bridge...")
     return cmd_start(args)
+
+
+# Hook used by tests + ctrl-c handler in follow mode. Tests can set this
+# Event to exit follow mode cleanly without raising KeyboardInterrupt.
+_follow_should_stop: threading.Event | None = None
+
+
+def cmd_tail_log(args) -> int:
+    """Print the last N lines of the bridge log; -f to follow.
+
+    Cross-platform: pure Python loop, no shell `tail` (Windows CI lacks it).
+    Follow mode polls every 200ms. KeyboardInterrupt is treated as a clean
+    exit (returns 0). Tests can interrupt the loop by setting the module-level
+    `_follow_should_stop` Event before the call.
+    """
+    from brain.paths import get_log_dir, get_persona_dir
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
+
+    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    if not log_path.exists():
+        print(
+            f"bridge log not found at {log_path} — has the supervisor ever started?",
+            file=sys.stderr,
+        )
+        return 1
+
+    n = max(0, int(args.lines))
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+            tail = lines[-n:] if n > 0 else []
+            for line in tail:
+                print(line, end="")
+            if not getattr(args, "follow", False):
+                return 0
+            # Follow mode: seek to end, poll for new content
+            f.seek(0, 2)  # SEEK_END
+            stop = _follow_should_stop or threading.Event()
+            try:
+                while not stop.is_set():
+                    chunk = f.read()
+                    if chunk:
+                        print(chunk, end="")
+                    else:
+                        time.sleep(0.2)
+            except KeyboardInterrupt:
+                return 0
+            return 0
+    except OSError as e:
+        print(f"error reading {log_path}: {e}", file=sys.stderr)
+        return 1
