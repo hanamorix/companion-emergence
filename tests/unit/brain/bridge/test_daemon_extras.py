@@ -226,7 +226,15 @@ def test_cmd_tail_log_persona_not_found_returns_1(
 def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Follow mode polls the log; KeyboardInterrupt exits cleanly with code 0."""
+    """Follow mode polls the log; KeyboardInterrupt exits cleanly with code 0.
+
+    Timing: the writer thread sleeps 150ms, appends two lines, sleeps another
+    150ms, then sets the stop_event. The daemon polls every 200ms. If this
+    test ever flakes on a heavily loaded Windows CI runner where the test
+    thread is starved between the writer flush and stop_event.set(), widen
+    the writer's first sleep (200-300ms) rather than lengthening t.join's
+    timeout — the issue would be the chunk-read race, not the join.
+    """
     import threading
     import time
 

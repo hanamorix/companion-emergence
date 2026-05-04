@@ -162,21 +162,24 @@ def test_bridge_alias_still_dispatches_to_real_handler(
     assert len(stub_daemon[handler_key]) == 1
 
 
+@pytest.mark.parametrize("action", ["start", "stop", "status", "tail-events"])
 def test_bridge_alias_prints_deprecation_warning_to_stderr(
-    stub_daemon: dict, capsys: pytest.CaptureFixture[str]
+    action: str, stub_daemon: dict, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli.main(["bridge", "status", "--persona", "nell"])
+    """All four bridge actions must print the deprecation warning, not just status."""
+    cli.main(["bridge", action, "--persona", "nell"])
     captured = capsys.readouterr()
     assert "deprecated" in captured.err.lower()
     assert "nell supervisor" in captured.err
     assert "v0.1" in captured.err
 
 
+@pytest.mark.parametrize("action", ["start", "stop", "status", "tail-events"])
 def test_bridge_alias_does_not_print_warning_to_stdout(
-    stub_daemon: dict, capsys: pytest.CaptureFixture[str]
+    action: str, stub_daemon: dict, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Warning must NOT pollute stdout — scripts piping output through jq/grep depend on this."""
-    cli.main(["bridge", "status", "--persona", "nell"])
+    cli.main(["bridge", action, "--persona", "nell"])
     captured = capsys.readouterr()
     assert "deprecated" not in captured.out.lower()
 
