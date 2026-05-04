@@ -20,6 +20,7 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 - MCP server tools with configurable audit logging modes: `off`, `metadata`, `redacted`, and `full`.
 - Release checklist for private smoke testing and future public/tagged releases.
 - `nell supervisor` lifecycle command — canonical operator surface for the per-persona bridge daemon. Actions: `start`, `stop`, `status`, `restart`, `tail-events`, `tail-log`. Wraps the existing bridge daemon implementation; same args, same exit codes, plus sequential `restart` (stop-then-start, gated on stop success) and cross-platform `tail-log`.
+- `nell works` — brain-authored creative artifact portfolio. Nell decides via the `save_work` MCP tool when something she's written (story, code, planning doc, idea, role-play scene, letter) is worth preserving. Stored at `persona/<name>/data/works/<id>.md` with a SQLite + FTS5 index. Operators browse via `nell works list/search/read --persona X`; the brain herself recalls via the MCP tools (`list_works`, `search_works`, `read_work`) and via the bridge `GET /self/works[*]` endpoints (per source spec §15.2). Type taxonomy: story, code, planning, idea, role_play, letter, other.
 
 ### Changed
 
