@@ -26,6 +26,10 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "add_journal",
     "add_memory",
     "crystallize_soul",
+    "save_work",
+    "list_works",
+    "search_works",
+    "read_work",
 )
 
 __all__ = [

@@ -37,7 +37,7 @@ The framework is a private prototype with enough implemented surface for local s
 
 Current intentional stubs:
 
-- `nell works`
+(none — all roadmap §2 stubs are resolved)
 
 Rules for stubs:
 
@@ -50,7 +50,7 @@ Suggested order:
 
 1. ~~`nell supervisor` — expose bridge/supervisor lifecycle in one operator-facing place.~~ *(shipped 2026-05-04 — see `docs/superpowers/specs/2026-05-04-nell-supervisor-design.md`)*
 2. ~~`nell rest` — clarify whether this is sleep/rest cadence, bridge rest, or old-plan residue before implementing.~~ *(removed 2026-05-04 — rest is body-state physiology per source spec §15.9 rewrite, not a command. See `docs/superpowers/specs/2026-05-04-nell-rest-physiology-design.md`.)*
-3. `nell works` — define the user story before building; the name is currently ambiguous.
+3. ~~`nell works` — define the user story before building; the name is currently ambiguous.~~ *(shipped 2026-05-04 — see `docs/superpowers/specs/2026-05-04-nell-works-design.md`)*
 
 ### 3. Firm up packaging before public release automation
 
@@ -89,6 +89,7 @@ These block a public/tagged release, but do not block private local development:
 
 ## Done recently
 
+- Implemented `nell works` — brain-authored artifact portfolio with brain-decided saving via the `save_work` MCP tool. Operator CLI (`nell works list/search/read`) + bridge endpoints (`GET /self/works[*]`) for inspection and self-knowledge.
 - Removed the `nell rest` stub. Rest reframed as body-state physiology (§15.9 rewrite); the source spec also gained a new §0 capturing framework principles (user surface = install + name + talk; brain handles physiology naturally; defaults on; cross-platform; local-first).
 - Implemented `nell supervisor` as the canonical bridge lifecycle command (start/stop/status/restart/tail-events/tail-log), with `nell bridge` kept as a deprecating alias until v0.1.
 - Resolved audit reliability issues around chat persistence, soul queue reporting, soul review idempotency, bridge API validation, memory search/listing, pytest markers, MCP audit privacy, add-memory error visibility, and vocabulary crystallization.

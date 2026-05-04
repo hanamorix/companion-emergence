@@ -7,7 +7,7 @@ def test_nell_tool_names_exported() -> None:
     from brain.tools import NELL_TOOL_NAMES
 
     assert isinstance(NELL_TOOL_NAMES, tuple)
-    assert len(NELL_TOOL_NAMES) == 9
+    assert len(NELL_TOOL_NAMES) == 13
     # Spot-check the 9 known tools from spec §1
     assert "search_memories" in NELL_TOOL_NAMES
     assert "get_emotional_state" in NELL_TOOL_NAMES
@@ -18,6 +18,11 @@ def test_nell_tool_names_exported() -> None:
     assert "add_journal" in NELL_TOOL_NAMES
     assert "add_memory" in NELL_TOOL_NAMES
     assert "crystallize_soul" in NELL_TOOL_NAMES
+    # 4 works tools added in Task 3
+    assert "save_work" in NELL_TOOL_NAMES
+    assert "list_works" in NELL_TOOL_NAMES
+    assert "search_works" in NELL_TOOL_NAMES
+    assert "read_work" in NELL_TOOL_NAMES
 
 
 def test_tool_loop_imports_from_brain_tools() -> None:

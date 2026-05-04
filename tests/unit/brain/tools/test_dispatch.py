@@ -129,7 +129,7 @@ def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> No
 
 
 def test_all_nine_tools_dispatch_without_crash(tmp_path: Path) -> None:
-    """All 9 registered tool names dispatch without raising."""
+    """All registered tool names dispatch without raising."""
     ctx = _make_ctx(tmp_path)
 
     # Map of tool → minimal valid arguments
@@ -152,9 +152,19 @@ def test_all_nine_tools_dispatch_without_crash(tmp_path: Path) -> None:
             "love_type": "craft",
             "why_it_matters": "it mattered",
         },
+        "save_work": {
+            "title": "smoke",
+            "type": "idea",
+            "content": "smoke-test content",
+        },
+        "list_works": {},
+        "search_works": {"query": "smoke"},
+        "read_work": {"id": "zzzzzzzzzzzz"},
     }
 
     for tool_name in _DISPATCH:
         args = minimal_args.get(tool_name, {})
         result = dispatch(tool_name, args, **ctx)
-        assert isinstance(result, dict), f"{tool_name} did not return a dict"
+        assert isinstance(result, dict) or isinstance(result, list), (
+            f"{tool_name} did not return a dict or list"
+        )
