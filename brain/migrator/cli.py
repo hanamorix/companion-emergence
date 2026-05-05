@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json as _json
+import json
 import os
 import shutil
 import time
@@ -130,12 +130,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             )
             _vocab_tmp = vocab_target.with_suffix(vocab_target.suffix + ".new")
             _vocab_tmp.write_text(
-                _json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
+                json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
                 encoding="utf-8",
             )
             os.replace(_vocab_tmp, vocab_target)
             vocabulary_emotions_migrated = len(vocab_entries)
-        except (ValueError, OSError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             vocabulary_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex arcs ----
@@ -163,7 +163,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
                     force=args.force,
                 )
                 reflex_arcs_migrated = len(og_arcs)
-            except (ValueError, OSError) as exc:
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
                 reflex_arcs_skipped_reason = f"extract_error: {exc}"
     else:
         reflex_arcs_skipped_reason = "og_reflex_engine_py_not_found"
@@ -188,12 +188,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
                 og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
                 _interests_tmp = interests_target.with_suffix(interests_target.suffix + ".new")
                 _interests_tmp.write_text(
-                    _json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
+                    json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
                     encoding="utf-8",
                 )
                 os.replace(_interests_tmp, interests_target)
                 interests_migrated = len(og_interests)
-            except (ValueError, FileNotFoundError, OSError) as exc:
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
                 interests_skipped_reason = f"migrate_error: {exc}"
     else:
         interests_skipped_reason = "og_nell_interests_json_not_found"
@@ -231,7 +231,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         if not creative_dna_migrated:
             creative_dna_skipped_reason = "og file not present"
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         creative_dna_skipped_reason = f"migrate_error: {exc}"
 
     # ---- journal memories (reflex_journal -> journal_entry retag) ----
@@ -243,7 +243,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             persona_dir=work_dir,
             store=journal_store,
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         journal_memories_skipped_reason = f"migrate_error: {exc}"
     finally:
         journal_store.close()
@@ -259,7 +259,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         legacy_files_preserved = len(preserved)
         legacy_files_missing = len(missing)
-    except OSError as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         legacy_skipped_reason = f"copy_error: {exc}"
 
     # ---- soul_candidates schema migration ----
@@ -273,7 +273,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         soul_candidates_migrated = sc_migrated
         soul_candidates_skipped_missing_memory_id = sc_skipped
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         soul_candidates_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex_log schema migration ----
@@ -284,7 +284,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             og_data_dir=args.input_dir,
             persona_dir=work_dir,
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         reflex_log_skipped_reason = f"migrate_error: {exc}"
 
     elapsed = time.monotonic() - started
