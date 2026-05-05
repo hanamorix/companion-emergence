@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,8 +58,14 @@ def append_audit_entry(
     }
 
     try:
+        # fsync after append: the audit trail IS the safety rail. A torn
+        # final line means the brain made a decision and lost the audit
+        # entry that explained it — exactly the failure mode this log
+        # exists to prevent.
         with open(audit_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except OSError as exc:
         logger.warning("soul audit log write failed for %s: %s", audit_path, exc)
 

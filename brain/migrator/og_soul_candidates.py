@@ -27,6 +27,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from brain.health.attempt_heal import save_with_backup_text
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_IMPORTANCE = 8
@@ -77,9 +79,11 @@ def migrate_soul_candidates(
 
     if migrated_records:
         dest = persona_dir / "soul_candidates.jsonl"
-        with dest.open("w", encoding="utf-8") as f:
-            for record in migrated_records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        text = "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in migrated_records
+        )
+        save_with_backup_text(dest, text)
 
     return (len(migrated_records), skipped_missing_memory_id)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -64,8 +65,14 @@ def queue_soul_candidate(
     }
     path = _soul_candidates_path(persona_dir)
     try:
+        # fsync after append so a SIGKILL between write() and the next OS
+        # buffer flush can't leave a torn line that the next append would
+        # silently concatenate to. soul_candidates is the upstream of the
+        # autonomous-soul safety rail — durability matters here.
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         return True
     except OSError as exc:
         logger.warning("queue_soul_candidate: failed to write to %s: %s", path, exc)

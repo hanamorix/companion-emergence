@@ -261,3 +261,96 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     assert "seed" in out
     assert "new1" in out
     assert "new2" in out
+
+
+# ---------- cmd_tail (I-1 follow-up audit: subprotocol auth, no ?token=) ----------
+
+
+def test_cmd_tail_uses_subprotocol_auth_not_url_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cmd_tail must authenticate via Sec-WebSocket-Protocol (subprotocols
+    arg), NOT via ?token=<...> URL query string.
+
+    Pre-fix (I-1 in 2026-05-05 follow-up audit): cmd_tail built
+    'ws://...?token=<token>'. The server only reads the bearer token from
+    Sec-WebSocket-Protocol so tail was silently broken under auth, AND
+    the token leaked into URL space (process listing, proxy logs).
+    """
+    from contextlib import contextmanager
+    from brain.bridge import state_file
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(
+        "brain.paths.get_persona_dir", lambda name: persona_dir
+    )
+
+    s = state_file.BridgeState(
+        persona="nell", pid=12345, port=50000,
+        started_at="2026-05-05T00:00:00+00:00",
+        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        auth_token="secret-token-aaa",
+    )
+    state_file.write(persona_dir, s)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def fake_connect(url, *, subprotocols=None, **kw):
+        captured["url"] = url
+        captured["subprotocols"] = subprotocols
+        # Raise KeyboardInterrupt immediately to bail out of the recv loop
+        class _WS:
+            def recv(self): raise KeyboardInterrupt()
+        yield _WS()
+
+    monkeypatch.setattr(
+        "websockets.sync.client.connect", fake_connect
+    )
+
+    rc = daemon.cmd_tail(_args("nell"))
+    assert rc == 0
+    assert captured["url"] == "ws://127.0.0.1:50000/events"
+    assert "?token=" not in captured["url"]
+    assert "secret-token-aaa" not in captured["url"]
+    # Auth via subprotocols ["bearer", "<token>"]
+    assert captured["subprotocols"] == ["bearer", "secret-token-aaa"]
+
+
+def test_cmd_tail_no_subprotocols_when_token_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If auth_token is None (auth-disabled config), pass subprotocols=None."""
+    from contextlib import contextmanager
+    from brain.bridge import state_file
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(
+        "brain.paths.get_persona_dir", lambda name: persona_dir
+    )
+
+    s = state_file.BridgeState(
+        persona="nell", pid=12345, port=50000,
+        started_at="2026-05-05T00:00:00+00:00",
+        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        auth_token=None,
+    )
+    state_file.write(persona_dir, s)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def fake_connect(url, *, subprotocols=None, **kw):
+        captured["subprotocols"] = subprotocols
+        class _WS:
+            def recv(self): raise KeyboardInterrupt()
+        yield _WS()
+
+    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
+    rc = daemon.cmd_tail(_args("nell"))
+    assert rc == 0
+    assert captured["subprotocols"] is None

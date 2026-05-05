@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import logging
 import os
 import signal
 import socket
@@ -20,6 +21,8 @@ import uvicorn
 
 from brain.bridge import state_file
 from brain.bridge.server import build_app
+
+logger = logging.getLogger(__name__)
 
 
 def _allocate_port(max_attempts: int = 3) -> int:
@@ -65,7 +68,9 @@ def _write_clean_shutdown(persona_dir: Path) -> None:
             cur.shutdown_clean = True
             state_file.write(persona_dir, cur)
     except Exception:
-        pass  # best-effort only; don't re-raise at exit time
+        # best-effort only; don't re-raise at exit time, but leave a
+        # forensic breadcrumb so silent dirty-shutdowns are debuggable.
+        logger.warning("clean-shutdown write failed", exc_info=True)
 
 
 def main() -> int:
