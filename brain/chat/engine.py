@@ -214,10 +214,13 @@ def _persist_turn(
             {"session_id": session_id, "speaker": "assistant", "text": assistant_text},
         )
         return True, None
-    except (OSError, ValueError) as exc:
-        logger.warning(
-            "conversation buffer write failed session=%s err=%s",
+    except Exception as exc:  # noqa: BLE001
+        # The contract here is explicit (per OG nell_bridge.py:200-230):
+        # persistence errors must NEVER break the chat response. The chat
+        # surface is more important than surfacing a buffer-layer bug to
+        # the user. We log with full traceback so the bug isn't lost.
+        logger.exception(
+            "conversation buffer write failed session=%s",
             session_id,
-            exc,
         )
         return False, str(exc)

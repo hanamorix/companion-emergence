@@ -59,7 +59,15 @@ def migrate_creative_dna(*, persona_dir: Path, og_root: Path) -> bool:
 
 
 def _migrate_tendencies(og_tendencies: Any, mtime: str, reasoning: str) -> dict[str, list]:
-    """Coerce both OG schema variants to {active, emerging, fading}."""
+    """Coerce both OG schema variants to {active, emerging, fading}.
+
+    Defensive against malformed OG payloads: int / str / None / anything
+    other than list-or-dict returns the empty shape rather than crashing
+    the migration mid-run with AttributeError. The migrator's outer
+    try/except (OSError, JSONDecodeError, ValueError) does NOT catch
+    AttributeError, so a single corrupted file would have killed an
+    otherwise-healthy migration.
+    """
     if isinstance(og_tendencies, list):
         return {
             "active": [
@@ -74,6 +82,8 @@ def _migrate_tendencies(og_tendencies: Any, mtime: str, reasoning: str) -> dict[
             "emerging": [],
             "fading": [],
         }
+    if not isinstance(og_tendencies, dict):
+        return {"active": [], "emerging": [], "fading": []}
     return {
         "active": [
             {
