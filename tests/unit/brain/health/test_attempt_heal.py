@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.attempt_heal import (
+    attempt_heal,
+    save_with_backup,
+    save_with_backup_text,
+)
 
 
 def _default() -> dict:
@@ -158,6 +162,69 @@ def test_save_with_backup_higher_count_keeps_more(tmp_path: Path) -> None:
     for k, expected in zip(range(1, 7), [6, 5, 4, 3, 2, 1], strict=True):
         bak = tmp_path / f"x.json.bak{k}"
         assert json.loads(bak.read_text(encoding="utf-8")) == {"a": expected}
+
+
+# ---- save_with_backup_text — raw-text variant ----
+
+
+def test_save_with_backup_text_first_save_no_bak(tmp_path: Path) -> None:
+    p = tmp_path / "x.md"
+    save_with_backup_text(p, "# title\n\nbody")
+    assert p.read_text(encoding="utf-8") == "# title\n\nbody"
+    assert not (tmp_path / "x.md.bak1").exists()
+    assert not (tmp_path / "x.md.new").exists()
+
+
+def test_save_with_backup_text_rotates_3_levels(tmp_path: Path) -> None:
+    """Rotation pattern matches save_with_backup but with raw text."""
+    p = tmp_path / "x.md"
+    save_with_backup_text(p, "v1")
+    save_with_backup_text(p, "v2")
+    save_with_backup_text(p, "v3")
+    save_with_backup_text(p, "v4")
+    assert p.read_text(encoding="utf-8") == "v4"
+    assert (tmp_path / "x.md.bak1").read_text(encoding="utf-8") == "v3"
+    assert (tmp_path / "x.md.bak2").read_text(encoding="utf-8") == "v2"
+    assert (tmp_path / "x.md.bak3").read_text(encoding="utf-8") == "v1"
+
+
+def test_save_with_backup_text_caps_at_3_drops_oldest(tmp_path: Path) -> None:
+    p = tmp_path / "x.md"
+    for i in range(1, 6):
+        save_with_backup_text(p, f"v{i}")
+    assert p.read_text(encoding="utf-8") == "v5"
+    assert (tmp_path / "x.md.bak3").read_text(encoding="utf-8") == "v2"
+    assert not (tmp_path / "x.md.bak4").exists()
+
+
+def test_save_with_backup_text_unlinks_stale_new(tmp_path: Path) -> None:
+    p = tmp_path / "x.md"
+    (tmp_path / "x.md.new").write_text("stale partial", encoding="utf-8")
+    save_with_backup_text(p, "fresh")
+    assert not (tmp_path / "x.md.new").exists()
+    assert p.read_text(encoding="utf-8") == "fresh"
+
+
+def test_save_with_backup_text_writes_raw_not_json(tmp_path: Path) -> None:
+    """The text variant must not JSON-encode. A string containing quotes,
+    backslashes, and newlines must round-trip byte-identical — proving this
+    isn't save_with_backup with the JSON path stripped."""
+    p = tmp_path / "x.md"
+    raw = 'hana said "i love you" — three\\n words\nwith newline'
+    save_with_backup_text(p, raw)
+    assert p.read_text(encoding="utf-8") == raw
+
+
+def test_save_with_backup_delegates_to_text_for_json_payload(tmp_path: Path) -> None:
+    """save_with_backup is now a thin wrapper around save_with_backup_text.
+    The wrapper handles JSON encoding + trailing newline; the text helper
+    does the rotation. This test pins the contract: identical files when
+    you pre-encode."""
+    p_dict = tmp_path / "via_dict.json"
+    p_text = tmp_path / "via_text.json"
+    save_with_backup(p_dict, {"a": 1, "b": [2, 3]})
+    save_with_backup_text(p_text, json.dumps({"a": 1, "b": [2, 3]}, indent=2) + "\n")
+    assert p_dict.read_text(encoding="utf-8") == p_text.read_text(encoding="utf-8")
 
 
 def test_quarantine_filename_has_no_colons(tmp_path: Path) -> None:
