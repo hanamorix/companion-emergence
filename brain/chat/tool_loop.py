@@ -87,6 +87,11 @@ def run_tool_loop(
             tools=tools,
             options={"persona_dir": str(persona_dir)},
         )
+        # Provider-dispatched invocations (claude-cli MCP path): tools
+        # already ran inside the subprocess. Surface them for telemetry
+        # without re-dispatching.
+        if last_response.dispatched_invocations:
+            invocations.extend(last_response.dispatched_invocations)
         if not last_response.tool_calls:
             return last_response, invocations
 
