@@ -696,3 +696,105 @@ def test_run_migrate_force_clobber_succeeds_when_marker_present(
     # Should not raise
     report = run_migrate(args)
     assert report.memories_migrated > 0
+
+
+# ---- I-5: concurrency lock ----
+
+
+def _migrate_lock_for(path: Path) -> Path:
+    """Mirror the helper in brain.migrator.cli._migrate_lock_path."""
+    return path.parent / f".{path.name}.migrate.lock"
+
+
+def test_run_migrate_releases_lock_on_success(og_dir: Path, tmp_path: Path) -> None:
+    """A successful run leaves no migrate lockfile behind."""
+    out = tmp_path / "migrated"
+    args = MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False)
+    run_migrate(args)
+    assert not _migrate_lock_for(out).exists()
+
+
+def test_run_migrate_lock_lives_outside_target_dir(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock must live as a sibling of the target — not inside — so the
+    install_as flow's rmtree on <name>.new doesn't blow away the lock
+    mid-migration."""
+    from brain.migrator import cli as migrator_cli
+
+    captured: list[Path] = []
+    real_acquire = migrator_cli._acquire_migrate_lock
+
+    def spy(lock_path: Path) -> int:
+        captured.append(lock_path)
+        return real_acquire(lock_path)
+
+    monkeypatch.setattr(migrator_cli, "_acquire_migrate_lock", spy)
+
+    out = tmp_path / "migrated"
+    args = MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False)
+    run_migrate(args)
+
+    assert len(captured) == 1
+    lock_path = captured[0]
+    # Lock is sibling of target, not child
+    assert lock_path.parent == out.parent
+    assert lock_path.name == ".migrated.migrate.lock"
+
+
+def test_run_migrate_refuses_when_lock_held_by_live_pid(
+    og_dir: Path, tmp_path: Path
+) -> None:
+    """Pre-create lockfile with a live PID (our own). run_migrate must raise
+    a clear error and leave the lockfile untouched (it's not ours to remove)."""
+    import os
+    from datetime import UTC, datetime
+
+    out = tmp_path / "migrated"
+    lock_path = _migrate_lock_for(out)
+    lock_path.write_text(f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n")
+
+    args = MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False)
+    with pytest.raises(RuntimeError, match="another migrate is in progress"):
+        run_migrate(args)
+    # The original lockfile is preserved — we did not own it
+    assert lock_path.exists()
+    assert str(os.getpid()) in lock_path.read_text()
+
+
+def test_run_migrate_takes_over_stale_lock(og_dir: Path, tmp_path: Path) -> None:
+    """Stale lockfile (PID belongs to a dead process) is taken over silently."""
+    from datetime import UTC, datetime
+
+    out = tmp_path / "migrated"
+    lock_path = _migrate_lock_for(out)
+    # PID 999999999 is well above the typical max (32768/4194304), reliably dead
+    lock_path.write_text(f"999999999\n{datetime.now(UTC).isoformat()}\n")
+
+    args = MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False)
+    run_migrate(args)  # must not raise
+    # Lock is released after the run completes
+    assert not lock_path.exists()
+    # And the migration actually wrote outputs
+    assert (out / "memories.db").exists()
+
+
+def test_run_migrate_releases_lock_on_failure(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a migrator step raises, the lockfile is still cleaned up via
+    try/finally — otherwise a crash leaves the next run permanently locked."""
+    from brain.migrator import cli as migrator_cli
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated migrator crash")
+
+    # _verify_sources_unchanged runs late but always; redirect to crash
+    monkeypatch.setattr(migrator_cli, "_verify_sources_unchanged", boom)
+
+    out = tmp_path / "migrated"
+    args = MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False)
+    with pytest.raises(RuntimeError, match="simulated migrator crash"):
+        run_migrate(args)
+    # Lock released even though run_migrate raised
+    assert not _migrate_lock_for(out).exists()
