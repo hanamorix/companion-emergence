@@ -38,6 +38,22 @@ from brain.memory.store import MemoryStore
 logger = logging.getLogger(__name__)
 
 
+def _load_user_name(persona_dir: Path) -> str | None:
+    """Look up PersonaConfig.user_name; None if missing or unset.
+
+    Best-effort — never raises. PersonaConfig is the home for the
+    user's name; we read it here once per session close. If the
+    config file is corrupt or the field is missing, the extractor
+    falls back to the legacy "user:" / "assistant:" prompt path.
+    """
+    try:
+        from brain.persona_config import PersonaConfig
+
+        return PersonaConfig.load(persona_dir / "persona_config.json").user_name
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def close_session(
     persona_dir: Path,
     session_id: str,
@@ -87,11 +103,25 @@ def close_session(
         return report
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
-    transcript = format_transcript(turns, max_tokens=int(cfg.get("max_transcript_tokens", 6000)))
+    # Bug A (audit-3): pass speaker names so the LLM extractor can
+    # disambiguate the current user from historical figures the assistant
+    # may reference. user_name comes from PersonaConfig.user_name (None
+    # when unset → legacy unnamed prompt). assistant_name is the persona
+    # name (always known — it's the persona dir's basename).
+    user_name = _load_user_name(persona_dir)
+    assistant_name = persona_dir.name
+    transcript = format_transcript(
+        turns,
+        max_tokens=int(cfg.get("max_transcript_tokens", 6000)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+    )
     items = extract_items(
         transcript,
         provider=provider,
         max_retries=int(cfg.get("extraction_max_retries", 1)),
+        user_name=user_name,
+        assistant_name=assistant_name,
     )
     report.extracted = len(items)
 

@@ -20,7 +20,7 @@ from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_PROMPT = """You are extracting durable memories from a conversation transcript.
+EXTRACTION_PROMPT_LEGACY = """You are extracting durable memories from a conversation transcript.
 Return ONLY a JSON array. Each item: {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10}}.
 Skip pleasantries. Keep items concrete. No prose, no commentary.
 
@@ -29,15 +29,63 @@ TRANSCRIPT:
 
 JSON:"""
 
+EXTRACTION_PROMPT_NAMED = """You are extracting durable memories from a conversation transcript.
 
-def format_transcript(turns: list[dict], max_tokens: int = 6000) -> str:
+Speakers in this transcript:
+- {user_name} is the human user the assistant is talking to. Statements
+  attributed to {user_name} (her actions, her decisions, her words) belong
+  to {user_name}, not to anyone else.
+- {assistant_name} is the assistant — the AI persona. Her replies may
+  reference other people by name (from her memories, her soul, her
+  history). Those are HISTORICAL references, not the current speaker.
+  Do NOT attribute the current user's actions to anyone {assistant_name}
+  mentioned by name.
+
+Return ONLY a JSON array. Each item:
+{{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10}}.
+Skip pleasantries. Keep items concrete. No prose, no commentary.
+
+TRANSCRIPT:
+{transcript}
+
+JSON:"""
+
+# Backward-compat alias — older callers still import EXTRACTION_PROMPT.
+EXTRACTION_PROMPT = EXTRACTION_PROMPT_LEGACY
+
+
+def format_transcript(
+    turns: list[dict],
+    max_tokens: int = 6000,
+    *,
+    user_name: str | None = None,
+    assistant_name: str | None = None,
+) -> str:
     """Format turns as "speaker: text" lines, capped to max_tokens*4 chars.
 
     The crude 4-chars-per-token estimate matches the OG implementation.
     When the transcript is too long, the *tail* is kept — recent context
     is more relevant for extraction.
+
+    user_name / assistant_name: when provided, replace the generic
+    "user:" / "assistant:" speaker labels with the actual names. This
+    disambiguates extraction when the assistant's replies reference
+    historical figures by name (Bug A in the 2026-05-05 audit-3:
+    Hana's framework work was attributed to Jordan because Jordan was
+    mentioned in the assistant's soul-context lines).
     """
-    lines = [f"{t.get('speaker', '?')}: {t.get('text', '')}" for t in turns]
+    user_label = user_name if user_name else "user"
+    assistant_label = assistant_name if assistant_name else "assistant"
+    lines = []
+    for t in turns:
+        speaker = t.get("speaker", "?")
+        if speaker == "user":
+            label = user_label
+        elif speaker == "assistant":
+            label = assistant_label
+        else:
+            label = speaker
+        lines.append(f"{label}: {t.get('text', '')}")
     text = "\n".join(lines)
     cap = max_tokens * 4
     if len(text) > cap:
@@ -113,16 +161,30 @@ def extract_items(
     *,
     provider: LLMProvider,
     max_retries: int = 1,
+    user_name: str | None = None,
+    assistant_name: str | None = None,
 ) -> list[ExtractedItem]:
     """Call the provider, parse the JSON array. Retry once on failure.
 
     On all retries exhausted, logs a warning and returns [].
     Errors are never raised — the pipeline must keep running.
+
+    When user_name AND assistant_name are both provided, uses the named
+    extraction prompt that explicitly disambiguates current-user
+    statements from assistant references to historical figures.
+    Otherwise falls back to the legacy prompt (backward-compatible).
     """
     if not transcript.strip():
         return []
 
-    prompt = EXTRACTION_PROMPT.format(transcript=transcript)
+    if user_name and assistant_name:
+        prompt = EXTRACTION_PROMPT_NAMED.format(
+            transcript=transcript,
+            user_name=user_name,
+            assistant_name=assistant_name,
+        )
+    else:
+        prompt = EXTRACTION_PROMPT_LEGACY.format(transcript=transcript)
 
     for attempt in range(max_retries + 1):
         raw_text: str | None = None
