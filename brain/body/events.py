@@ -24,6 +24,7 @@ Per spec §2 (climax as full vocabulary citizen) + journal-as-safe-space memo
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,7 +73,9 @@ def record_climax_event(
             },
         )
         store.create(journal)
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        # Narrow: I/O + parse + storage errors absorb. Programming bugs
+        # (TypeError, AttributeError, KeyError) propagate so we see them.
         logger.warning(
             "record_climax_event: journal_entry write failed (originating=%s): %s",
             originating_memory.id, exc,

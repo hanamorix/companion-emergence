@@ -94,8 +94,11 @@ def dispatch(
     """
     fn = _DISPATCH.get(name)
     if fn is None:
-        known = ", ".join(sorted(_DISPATCH.keys()))
-        raise ToolDispatchError(f"unknown tool: {name!r}. Known tools: {known}")
+        # M-10: don't enumerate known tools in the error returned to the LLM.
+        # The tool surface is implementation detail; the unknown-tool message
+        # ends up in invocation logs and (via tool_loop) the next LLM context
+        # window. Dispatch errors are for operators, not training signal.
+        raise ToolDispatchError(f"unknown tool: {name!r}")
 
     schema = SCHEMAS.get(name, {})
     params = schema.get("parameters", {})
@@ -116,12 +119,16 @@ def dispatch(
 
     if name == "get_body_state" and "session_hours" in arguments:
         try:
-            arguments["session_hours"] = float(arguments["session_hours"])
+            session_hours_float = float(arguments["session_hours"])
         except (TypeError, ValueError) as exc:
             raise ToolDispatchError(
                 f"tool 'get_body_state' arg 'session_hours' must be a number, "
                 f"got {type(arguments['session_hours']).__name__!r}"
             ) from exc
+        # M-4: don't mutate the caller's dict — shallow-copy then update.
+        # The chat engine logs `arguments` straight into the invocations
+        # record; mutating it bleeds float coercion into the audit trail.
+        arguments = {**arguments, "session_hours": session_hours_float}
 
     if name in _WORKS_TOOLS:
         try:
