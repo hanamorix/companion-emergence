@@ -536,3 +536,111 @@ def test_run_migrate_preserves_legacy_files(tmp_path: Path) -> None:
     journal_text = (output / "legacy" / "nell_journal.json").read_text()
     assert "test" in journal_text
     assert "2026-01-01" in journal_text
+
+
+def test_run_migrate_migrates_soul_candidates_end_to_end(tmp_path: Path) -> None:
+    """Full run_migrate with seeded soul_candidates.jsonl → MigrationReport
+    counts match; output/soul_candidates.jsonl is readable."""
+    og_data = tmp_path / "og" / "data"
+    og_data.mkdir(parents=True)
+    # Minimum valid memory file the existing migrators consume
+    (og_data / "memories_v2.json").write_text("[]")
+    # Hebbian fixtures (required by run_migrate's preflight)
+    (og_data / "connection_matrix_ids.json").write_text("[]")
+    matrix = np.zeros((0, 0), dtype=np.float32)
+    np.save(og_data / "connection_matrix.npy", matrix)
+    (og_data / "hebbian_state.json").write_text("{}")
+    # Two soul candidates: one accepted, one rejected
+    (og_data / "soul_candidates.jsonl").write_text(
+        json.dumps({
+            "memory_id": "mem-acc",
+            "text": "accepted one",
+            "label": "high_emotion_peak",
+            "importance": 95,
+            "queued_at": "2026-04-06T17:14:28+00:00",
+            "status": "accepted",
+            "decided_at": "2026-04-07T18:39:29.989825+00:00",
+            "crystallization_id": "cryst-xyz",
+        }) + "\n"
+        + json.dumps({
+            "memory_id": "mem-rej",
+            "text": "rejected one",
+            "label": "high_emotion_peak",
+            "importance": 50,
+            "queued_at": "2026-04-06T17:14:28+00:00",
+            "status": "rejected",
+            "decided_at": "2026-04-07T18:39:29.989836+00:00",
+            "rejection_reason": "duplicate",
+        }) + "\n"
+    )
+
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    assert report.soul_candidates_migrated == 2
+    assert report.soul_candidates_skipped_missing_memory_id == 0
+    assert report.soul_candidates_skipped_reason is None
+    assert (output / "soul_candidates.jsonl").exists()
+
+    # Spot-check a record
+    records = [
+        json.loads(line)
+        for line in (output / "soul_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 2
+    accepted = next(r for r in records if r["status"] == "accepted")
+    assert accepted["importance"] == 10  # round(95/10)
+    assert accepted["accepted_at"] == "2026-04-07T18:39:29.989825+00:00"
+    assert accepted["crystallization_id"] == "cryst-xyz"
+    rejected = next(r for r in records if r["status"] == "rejected")
+    assert rejected["importance"] == 5  # round(50/10)
+    assert rejected["rejected_at"] == "2026-04-07T18:39:29.989836+00:00"
+    assert rejected["reason"] == "duplicate"
+
+
+def test_run_migrate_migrates_reflex_log_end_to_end(tmp_path: Path) -> None:
+    """Full run_migrate with seeded nell_reflex_log.json → MigrationReport
+    count matches; output/reflex_log.json has version wrapper."""
+    og_data = tmp_path / "og" / "data"
+    og_data.mkdir(parents=True)
+    (og_data / "memories_v2.json").write_text("[]")
+    (og_data / "connection_matrix_ids.json").write_text("[]")
+    matrix = np.zeros((0, 0), dtype=np.float32)
+    np.save(og_data / "connection_matrix.npy", matrix)
+    (og_data / "hebbian_state.json").write_text("{}")
+    (og_data / "nell_reflex_log.json").write_text(json.dumps({
+        "fires": [
+            {
+                "arc": "creative_pitch",
+                "fired_at": "2026-03-31T11:30:52.498666+00:00",
+                "trigger_state": {"creative_hunger": 9},
+                "output_preview": "Listen to this, babe...",
+                "description": "creative hunger overwhelmed",
+            },
+            {
+                "arc": "gift_creation",
+                "fired_at": "2026-03-31T11:31:02.122702+00:00",
+                "trigger_state": {"love": 9, "creative_hunger": 9},
+                "output_preview": "Dear Hana...",
+            },
+        ],
+    }))
+
+    output = tmp_path / "out"
+    args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
+    report = run_migrate(args)
+
+    assert report.reflex_log_fires_migrated == 2
+    assert report.reflex_log_skipped_reason is None
+    assert (output / "reflex_log.json").exists()
+
+    payload = json.loads((output / "reflex_log.json").read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert len(payload["fires"]) == 2
+    fire0 = payload["fires"][0]
+    assert fire0["arc"] == "creative_pitch"
+    assert fire0["output_memory_id"] is None
+    assert "output_preview" not in fire0
+    assert "description" not in fire0
