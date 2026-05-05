@@ -113,7 +113,7 @@ def stub_daemon(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
 
     calls: dict[str, list] = {"start": [], "stop": [], "status": [], "tail": []}
 
-    monkeypatch.setattr(daemon, "cmd_start", lambda a: (calls["start"].append(a), 0)[1])
+    monkeypatch.setattr(daemon, "cmd_start", lambda a, **kw: (calls["start"].append(a), 0)[1])
     monkeypatch.setattr(daemon, "cmd_stop", lambda a: (calls["stop"].append(a), 0)[1])
     monkeypatch.setattr(daemon, "cmd_status", lambda a: (calls["status"].append(a), 0)[1])
     monkeypatch.setattr(daemon, "cmd_tail", lambda a: (calls["tail"].append(a), 0)[1])
@@ -159,6 +159,6 @@ def test_bridge_alias_preserves_exit_code(monkeypatch: pytest.MonkeyPatch) -> No
     """If the real handler returns 2, the alias must also return 2 (not coerce)."""
     from brain.bridge import daemon
 
-    monkeypatch.setattr(daemon, "cmd_start", lambda a: 2)
+    monkeypatch.setattr(daemon, "cmd_start", lambda a, **kw: 2)
     rc = cli.main(["bridge", "start", "--persona", "nell"])
     assert rc == 2

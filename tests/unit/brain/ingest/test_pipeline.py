@@ -307,3 +307,78 @@ def test_close_stale_sessions_closes_old_sessions(
     assert reports[0].committed >= 0  # May be 0 or 1 depending on extraction.
     # Buffer should be cleaned up.
     assert not buf_file.exists()
+
+
+# ---- Bug A (audit-3): close_session threads user_name through to extract ----
+
+
+def test_close_session_passes_named_speakers_to_extract(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """When persona_config.user_name is set, close_session must pass it
+    plus the persona name to the extractor so the LLM sees a named
+    transcript and the disambiguation prompt header. Bug A regression.
+
+    The persona dir name is the assistant_name (always known); user_name
+    comes from persona_config.json — when None, falls through to legacy."""
+    from brain.persona_config import PersonaConfig
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    PersonaConfig(user_name="Hana").save(persona_dir / "persona_config.json")
+
+    # Buffer with both speaker types
+    ingest_turn(persona_dir, {"session_id": "sess_named", "speaker": "user", "text": "hi"})
+    ingest_turn(persona_dir, {"session_id": "sess_named", "speaker": "assistant", "text": "hey love"})
+
+    captured: list[str] = []
+
+    class _CapProvider(LLMProvider):
+        def name(self): return "cap"
+        def healthy(self): return True
+        def chat(self, *a, **kw): raise NotImplementedError
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "[]"  # empty extraction valid
+
+    close_session(persona_dir, "sess_named", store=store, hebbian=hebbian, provider=_CapProvider())
+
+    assert len(captured) == 1
+    p = captured[0]
+    # Named-prompt disambiguation header present
+    assert "Hana is the human user" in p
+    assert "nell is the assistant" in p
+    # Transcript uses real speaker names instead of generic labels
+    assert "Hana: hi" in p
+    assert "nell: hey love" in p
+
+
+def test_close_session_falls_back_to_legacy_when_user_name_unset(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """No persona_config.json (or user_name unset) → legacy prompt path.
+    Forkers who haven't set the field don't hit a regression."""
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    # No persona_config.json on disk
+
+    ingest_turn(persona_dir, {"session_id": "sess_legacy", "speaker": "user", "text": "hi"})
+
+    captured: list[str] = []
+
+    class _CapProvider(LLMProvider):
+        def name(self): return "cap"
+        def healthy(self): return True
+        def chat(self, *a, **kw): raise NotImplementedError
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "[]"
+
+    close_session(persona_dir, "sess_legacy", store=store, hebbian=hebbian, provider=_CapProvider())
+
+    assert len(captured) == 1
+    p = captured[0]
+    # Legacy path — no disambiguation header
+    assert "is the human user" not in p
+    # Generic 'user:' label preserved
+    assert "user: hi" in p
