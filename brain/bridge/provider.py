@@ -338,6 +338,14 @@ class ClaudeCliProvider(LLMProvider):
 
         The mcp SDK is only imported here — keeps the legacy text path
         usable on systems without the SDK installed.
+
+        Telemetry: snapshots the persona's audit log size before invoking
+        the claude subprocess; reads any newly-appended lines afterward
+        and surfaces them as ChatResponse.dispatched_invocations. Per-
+        session /chat is serialized via in_flight_locks so no other
+        writer interleaves into the snapshot window. Tools dispatched
+        here have ALREADY run inside the subprocess — run_tool_loop
+        must not re-dispatch them.
         """
         try:
             import mcp  # noqa: F401
@@ -363,6 +371,14 @@ class ClaudeCliProvider(LLMProvider):
             }
         }
 
+        # Snapshot audit log size BEFORE subprocess so we can read only
+        # the lines this subprocess appends.
+        audit_log_path = persona_dir / "tool_invocations.log.jsonl"
+        try:
+            audit_offset_before = audit_log_path.stat().st_size
+        except FileNotFoundError:
+            audit_offset_before = 0
+
         tmp_path: str | None = None
         try:
             try:
@@ -383,9 +399,10 @@ class ClaudeCliProvider(LLMProvider):
             # Build the list of allowed MCP tool names for --allowedTools.
             # Claude CLI blocks MCP tool calls in non-interactive (-p) mode
             # unless each tool is explicitly pre-approved.  The MCP server
-            # name in mcp.json is "brain-tools", so Claude registers tools as
-            # "mcp__brain-tools__<name>".  We allow all nine brain-tools here
-            # so the LLM can call them without a permission prompt.
+            # name in mcp.json is "brain-tools", so Claude registers tools
+            # as "mcp__brain-tools__<name>". We allow all registered
+            # brain-tools so the LLM can call them without a permission
+            # prompt.
             from brain.tools import NELL_TOOL_NAMES  # local import — avoids circular
 
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
@@ -424,13 +441,55 @@ class ClaudeCliProvider(LLMProvider):
                     f"unexpected output format: {result.stdout[:200]!r}",
                 ) from exc
 
-            return ChatResponse(content=content, tool_calls=(), raw=None)
+            dispatched = _read_audit_lines_since(audit_log_path, audit_offset_before)
+            return ChatResponse(
+                content=content,
+                tool_calls=(),
+                dispatched_invocations=tuple(dispatched),
+                raw=None,
+            )
         finally:
             if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+
+def _read_audit_lines_since(
+    audit_log_path: Path, offset: int
+) -> list[dict[str, Any]]:
+    """Read audit log lines newly appended after `offset` bytes.
+
+    Returns a list of invocation records in the engine's tool_invocations
+    shape: ``{name, arguments, result_summary, error?}``. Malformed lines
+    are skipped silently — telemetry should never break a chat response.
+    """
+    try:
+        with audit_log_path.open("rb") as fh:
+            fh.seek(offset)
+            new_bytes = fh.read()
+    except (FileNotFoundError, OSError):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for raw_line in new_bytes.splitlines():
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        record: dict[str, Any] = {
+            "name": entry.get("name", "?"),
+            "arguments": entry.get("arguments", {}),
+            "result_summary": entry.get("result_summary", ""),
+        }
+        if entry.get("error"):
+            record["error"] = entry["error"]
+        records.append(record)
+    return records
 
 
 # ---------------------------------------------------------------------------

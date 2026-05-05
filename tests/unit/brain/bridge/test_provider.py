@@ -186,3 +186,126 @@ def test_claude_cli_provider_missing_result_key_surfaces_runtime_error() -> None
         p = ClaudeCliProvider()
         with pytest.raises(RuntimeError, match="unexpected output format"):
             p.generate("p")
+
+
+# ---- Tool telemetry: dispatched_invocations from MCP audit log ----
+
+
+def test_chat_mcp_path_surfaces_dispatched_invocations(tmp_path):
+    """ClaudeCliProvider's MCP path reads the audit log diff and surfaces
+    tool calls as ChatResponse.dispatched_invocations. This closes the
+    telemetry gap from the 2026-04-27 / 2026-05-05 stress tests, where
+    tools fired correctly inside the claude subprocess but the bridge
+    response showed `tool_invocations=[]`."""
+    from brain.bridge.chat import ChatMessage
+    from brain.bridge.provider import ClaudeCliProvider
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    audit = persona_dir / "tool_invocations.log.jsonl"
+    # Pre-existing line — must NOT show up in dispatched_invocations.
+    audit.write_text(
+        '{"timestamp": "2026-05-05T18:00:00Z", "name": "previous_call", '
+        '"audit_level": "redacted", "arguments": {}, "result_summary": "old", "error": null}\n'
+    )
+
+    fresh_lines = (
+        '{"timestamp": "2026-05-05T20:00:00Z", "name": "search_memories", '
+        '"audit_level": "redacted", "arguments": {"query": "foo"}, '
+        '"result_summary": "{\\"count\\": 0}", "error": null}\n'
+        '{"timestamp": "2026-05-05T20:00:01Z", "name": "get_soul", '
+        '"audit_level": "redacted", "arguments": {}, '
+        '"result_summary": "{\\"count\\": 38}", "error": null}\n'
+    )
+
+    def fake_run(cmd, *a, **kw):
+        # Simulate claude subprocess writing 2 audit lines during its run.
+        with audit.open("a") as fh:
+            fh.write(fresh_lines)
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"result": "the assistant reply"})
+        result.stderr = ""
+        return result
+
+    with patch("subprocess.run", side_effect=fake_run):
+        p = ClaudeCliProvider()
+        resp = p.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"type": "function", "function": {"name": "search_memories"}}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    assert resp.content == "the assistant reply"
+    assert len(resp.dispatched_invocations) == 2
+    names = [inv["name"] for inv in resp.dispatched_invocations]
+    assert names == ["search_memories", "get_soul"]
+    # The pre-existing audit line must NOT have leaked in
+    assert "previous_call" not in names
+    # Argument shape preserved
+    assert resp.dispatched_invocations[0]["arguments"] == {"query": "foo"}
+    # tool_calls remains empty (not the OllamaProvider path)
+    assert resp.tool_calls == ()
+
+
+def test_chat_mcp_path_handles_missing_audit_log(tmp_path):
+    """If the audit log doesn't exist (e.g. mcp_audit_log_level=off),
+    dispatched_invocations is empty — no crash."""
+    from brain.bridge.chat import ChatMessage
+    from brain.bridge.provider import ClaudeCliProvider
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    # No audit log file written.
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps({"result": "reply"})
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        resp = p.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"type": "function", "function": {"name": "search_memories"}}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    assert resp.dispatched_invocations == ()
+
+
+def test_chat_mcp_path_skips_malformed_audit_lines(tmp_path):
+    """Malformed JSON in the audit log doesn't break telemetry."""
+    from brain.bridge.chat import ChatMessage
+    from brain.bridge.provider import ClaudeCliProvider
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    audit = persona_dir / "tool_invocations.log.jsonl"
+    audit.write_text("")
+
+    def fake_run(cmd, *a, **kw):
+        # 1 malformed + 1 good line
+        with audit.open("a") as fh:
+            fh.write('not json at all\n')
+            fh.write(
+                '{"timestamp": "2026-05-05T20:00:00Z", "name": "get_soul", '
+                '"audit_level": "redacted", "arguments": {}, '
+                '"result_summary": "ok", "error": null}\n'
+            )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"result": "reply"})
+        result.stderr = ""
+        return result
+
+    with patch("subprocess.run", side_effect=fake_run):
+        p = ClaudeCliProvider()
+        resp = p.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"type": "function", "function": {"name": "search_memories"}}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    assert len(resp.dispatched_invocations) == 1
+    assert resp.dispatched_invocations[0]["name"] == "get_soul"
