@@ -9,7 +9,7 @@ from brain import cli
 
 
 _STUB_HANDLERS = {
-    "cmd_start": lambda args: 0,
+    "cmd_start": lambda args, **kw: 0,
     "cmd_stop": lambda args: 0,
     "cmd_status": lambda args: 0,
     "cmd_tail": lambda args: 0,
