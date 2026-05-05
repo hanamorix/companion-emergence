@@ -23,7 +23,7 @@ def fake_stores() -> tuple[MagicMock, MagicMock]:
     return MagicMock(name="MemoryStore"), MagicMock(name="HebbianMatrix")
 
 
-def test_register_tools_advertises_all_nine(persona_dir: Path, fake_stores) -> None:
+def test_register_tools_advertises_all_dispatched(persona_dir: Path, fake_stores) -> None:
     """list_tools() should advertise every schema in NELL_TOOL_NAMES."""
     from mcp.server import Server
 
