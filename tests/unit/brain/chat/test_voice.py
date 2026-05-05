@@ -10,14 +10,55 @@ from brain.health.attempt_heal import attempt_heal_text
 # ── DEFAULT_VOICE_TEMPLATE shape ──────────────────────────────────────────────
 
 
-def test_default_voice_template_has_five_sections() -> None:
-    """The template must contain all 5 required section headers."""
+def test_default_voice_template_has_seven_sections() -> None:
+    """The template must contain all 7 required section headers."""
     template = DEFAULT_VOICE_TEMPLATE
     assert "## 1. Who you are" in template
     assert "## 2. What's already in your head" in template
     assert "## 3. Brain-tools — what you can fetch" in template
     assert "## 4. How emotion shapes your voice" in template
-    assert "## 5. Your boundaries with the user" in template
+    assert "## 5. Capitalization and the shape of openings" in template
+    assert "## 6. When the user pushes on who you are" in template
+    assert "## 7. Your boundaries with the user" in template
+
+
+def test_default_voice_template_coaches_curiosity_sentence_breath() -> None:
+    """The 2026-04-27 stress test found curiosity prompts measured 13.8w avg
+    sentence length vs. corpus target ~18w. The template must explicitly coach
+    "let curiosity breathe" so future personas don't compress under intellectual
+    load."""
+    template = DEFAULT_VOICE_TEMPLATE
+    assert "curiosity:" in template
+    assert "18 words is not too many" in template
+
+
+def test_default_voice_template_coaches_capitalization_nuance() -> None:
+    """Stress test gap 2: lc_ratio collapsed to a binary switch (1.0 in casual,
+    0.04 in vulnerable). The template must coach gradual recovery, not binary
+    flipping under emotional weight."""
+    template = DEFAULT_VOICE_TEMPLATE
+    # Allow line-wrapped or single-line phrasing
+    assert "gradual, not\nbinary" in template or "gradual, not binary" in template
+
+
+def test_default_voice_template_coaches_identity_lead_with_self() -> None:
+    """Stress test gap 3: identity prompt led with 'I'm Claude underneath' —
+    breaks the 'I am Nell' primary rule. The template must coach lead-with-self
+    on identity challenges."""
+    template = DEFAULT_VOICE_TEMPLATE
+    assert "lead with who you are, not what you run on" in template
+    # Persona-name substitution example anchors the rule (allow line wrap)
+    assert '"I am {persona_name}"' in template
+    assert "is the first sentence" in template
+
+
+def test_default_voice_template_coaches_refusal_isnt_reassurance() -> None:
+    """Stress test gap 4: 'tell me i'm boring' got pure affirmation rather
+    than honest pushback. The template must coach that refusing cruelty
+    requires the actual reason, not warmth-wrapped denial."""
+    template = DEFAULT_VOICE_TEMPLATE
+    assert "refusal is not reassurance" in template
+    assert "the actual reason" in template
 
 
 def test_default_voice_template_lists_all_brain_tools() -> None:
