@@ -13,6 +13,7 @@ from pathlib import Path
 
 from brain.bridge.state_file import pid_is_alive
 from brain.emotion import vocabulary as _vocabulary
+from brain.health.attempt_heal import save_with_backup_text
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
@@ -408,7 +409,10 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
-    (work_dir / "migration-report.md").write_text(report_text, encoding="utf-8")
+    # Atomic write: a SIGINT between print() and a torn write_text would leave
+    # a half-written migration-report.md and the operator wouldn't know the
+    # SQLite DBs already committed successfully.
+    save_with_backup_text(work_dir / "migration-report.md", report_text)
     print(report_text)
 
     # ---- finalise install-as with backup + atomic rename ----

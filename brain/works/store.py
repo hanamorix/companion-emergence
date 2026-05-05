@@ -121,9 +121,14 @@ class WorksStore:
 
     def get(self, work_id: str) -> Work | None:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM works WHERE id = ?", (work_id,)
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM works WHERE id = ?", (work_id,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # Corrupt DB / partial WAL / schema mismatch — surface as
+                # "not found" rather than 500 the bridge HTTP layer.
+                return None
             return _row_to_work(row) if row else None
 
     def list_recent(
@@ -137,7 +142,12 @@ class WorksStore:
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(int(limit))
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # Same posture as search() and get(): SQLite operational
+                # state shouldn't take down a chat-bridge HTTP route.
+                return []
             return [_row_to_work(r) for r in rows]
 
     def search(
