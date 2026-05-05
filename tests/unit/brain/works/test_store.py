@@ -212,3 +212,86 @@ def test_get_returns_none_on_operational_error(
 
     monkeypatch.setattr(store, "_connect", lambda: _RaisingConn(real_connect()))
     assert store.get("222222222222") is None
+
+
+# ---- I-4 (audit-2 follow-up): atomic insert across works + works_fts ----
+
+
+def test_insert_rolls_back_works_row_when_fts_insert_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the works_fts insert fails after the works insert succeeds, the
+    works row must NOT be left dangling. Pre-fix: depending on autocommit
+    semantics, the works row could persist with no FTS index — search_works
+    silently never returns it.
+
+    Repro: monkeypatch sqlite3.Connection.execute to raise OperationalError
+    on the works_fts INSERT (second statement)."""
+    import sqlite3
+    store = WorksStore(tmp_path / "works.db")
+    w = _w(work_id="aaaaaaaaaaaa", title="Atomic Test")
+
+    real_connect = store._connect
+
+    class _ConnWrapper:
+        """Forwards to a real sqlite3.Connection except execute() raises
+        on the works_fts INSERT — sqlite3.Connection itself is immutable
+        so we wrap rather than monkey-patch."""
+        def __init__(self, real): self._real = real
+        def execute(self, sql, *a, **kw):
+            if "INSERT INTO works_fts" in sql:
+                raise sqlite3.OperationalError("simulated FTS5 failure")
+            return self._real.execute(sql, *a, **kw)
+        def close(self): return self._real.close()
+        def __enter__(self): return self
+        def __exit__(self, *a): return self._real.__exit__(*a)
+
+    monkeypatch.setattr(store, "_connect", lambda: _ConnWrapper(real_connect()))
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.insert(w, content="some content")
+
+    monkeypatch.undo()
+    # The works row must be absent — full rollback expected.
+    assert store.get("aaaaaaaaaaaa") is None, (
+        "works row leaked despite works_fts insert failing"
+    )
+
+
+def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
+    """Two threads racing to insert the SAME work id must end with exactly
+    one row (idempotent on id) and zero exceptions. BEGIN IMMEDIATE
+    serializes the SELECT-then-INSERT compound op so the second writer
+    sees the first's row in the same transaction."""
+    import threading
+    store = WorksStore(tmp_path / "works.db")
+    w = _w(work_id="bbbbbbbbbbbb", title="Concurrent")
+
+    errors: list[Exception] = []
+
+    def writer():
+        try:
+            for _ in range(5):
+                store.insert(w, content="payload")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert errors == [], f"unexpected errors: {errors[:3]}"
+    # Exactly one row in works AND exactly one in works_fts
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "works.db"))
+    n_works = conn.execute(
+        "SELECT COUNT(*) FROM works WHERE id = ?", (w.id,)
+    ).fetchone()[0]
+    n_fts = conn.execute(
+        "SELECT COUNT(*) FROM works_fts WHERE id = ?", (w.id,)
+    ).fetchone()[0]
+    conn.close()
+    assert n_works == 1, f"expected 1 works row, got {n_works}"
+    assert n_fts == 1, f"expected 1 fts row, got {n_fts}"

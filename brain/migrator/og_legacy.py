@@ -17,8 +17,27 @@ See docs/superpowers/specs/2026-05-04-migrator-legacy-preservation-design.md.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class LegacyIntegrityIssue:
+    """Diagnostic for a legacy file whose copy doesn't byte-match its source.
+
+    Surfaced in the migration report (non-fatal). The design intent of
+    legacy preservation is to keep broken bytes — but byte mismatches
+    between source and dest after copy are a different signal: the COPY
+    truncated, not the source. The operator should know.
+    """
+
+    name: str
+    src_size: int
+    dest_size: int
+    src_sha256: str
+    dest_sha256: str
 
 
 LEGACY_FILES: tuple[str, ...] = (
@@ -48,7 +67,7 @@ def migrate_legacy_files(
     *,
     og_data_dir: Path,
     persona_dir: Path,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[LegacyIntegrityIssue]]:
     """Copy each LEGACY_FILES entry from og_data_dir to persona_dir/legacy/.
 
     Args:
@@ -56,8 +75,14 @@ def migrate_legacy_files(
         persona_dir: The new framework persona dir (where memories.db will live).
 
     Returns:
-        (preserved, missing) — both lists of basenames. Order matches LEGACY_FILES
-        for deterministic test assertions.
+        (preserved, missing, integrity_issues) — three lists.
+          - preserved + missing: basenames, ordered to match LEGACY_FILES
+            for deterministic test assertions.
+          - integrity_issues: byte-mismatch diagnostics (size or SHA-256
+            differs between source and copy). Non-fatal — the design
+            intent of legacy preservation is "keep broken bytes," but a
+            byte mismatch after copy means the COPY truncated, not the
+            source. Surfaced in the migration report so the operator knows.
 
     Raises:
         OSError if persona_dir is unwritable (e.g. permissions). Otherwise no
@@ -68,6 +93,7 @@ def migrate_legacy_files(
 
     preserved: list[str] = []
     missing: list[str] = []
+    integrity_issues: list[LegacyIntegrityIssue] = []
     for name in LEGACY_FILES:
         src = og_data_dir / name
         if not src.exists():
@@ -79,7 +105,22 @@ def migrate_legacy_files(
         new_path = dest.with_name(dest.name + ".new")
         if new_path.exists():
             new_path.unlink()
-        new_path.write_bytes(src.read_bytes())
+        src_bytes = src.read_bytes()
+        new_path.write_bytes(src_bytes)
         os.replace(new_path, dest)
+        # Integrity diagnostic: hash both. Same-byte-content is the normal
+        # case; a mismatch implicates the copy itself (FS short-read,
+        # disk-full mid-write, etc.) — not the source's design intent.
+        dest_bytes = dest.read_bytes()
+        if len(dest_bytes) != len(src_bytes) or dest_bytes != src_bytes:
+            integrity_issues.append(
+                LegacyIntegrityIssue(
+                    name=name,
+                    src_size=len(src_bytes),
+                    dest_size=len(dest_bytes),
+                    src_sha256=hashlib.sha256(src_bytes).hexdigest(),
+                    dest_sha256=hashlib.sha256(dest_bytes).hexdigest(),
+                )
+            )
         preserved.append(name)
-    return preserved, missing
+    return preserved, missing, integrity_issues
