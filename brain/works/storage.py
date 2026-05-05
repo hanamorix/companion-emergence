@@ -4,18 +4,16 @@ Stores each work as `persona/<name>/data/works/<id>.md` with YAML
 frontmatter mirroring the SQLite row, so the file is self-describing
 if extracted from the index.
 
-Atomic writes via the same write-new + rotate-bak pattern used by
-brain.health.save_with_backup, but operating on raw text rather than
-JSON-encoded payloads. ID is validated at read time to defend against
-path traversal even though make_work_id guarantees hex-only by
-construction.
+Atomic writes via brain.health.attempt_heal.save_with_backup_text. ID
+is validated at read time to defend against path traversal even though
+make_work_id guarantees hex-only by construction.
 """
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
+from brain.health.attempt_heal import save_with_backup_text
 from brain.works import Work
 
 
@@ -47,36 +45,6 @@ def _serialize_yaml_value(value: object) -> str:
     return str(value)
 
 
-def _atomic_write_text(path: Path, text: str, backup_count: int = _BACKUP_COUNT) -> None:
-    """Atomic text save with .bak rotation.
-
-    Mirrors brain.health.save_with_backup's pattern but writes raw text
-    instead of JSON. Writes <path>.new, rotates existing <path> →
-    <path>.bak1 → ... → <path>.bak{N}, drops oldest, then atomically
-    replaces <path>. Stale <path>.new from a prior crash is unlinked
-    before the new write begins.
-    """
-    new_path = path.with_name(path.name + ".new")
-    if new_path.exists():
-        new_path.unlink()  # stale from prior crash; always incomplete
-
-    new_path.write_text(text, encoding="utf-8")
-
-    # Rotate: drop oldest first, then walk down toward live.
-    oldest = path.with_name(f"{path.name}.bak{backup_count}")
-    if oldest.exists():
-        oldest.unlink()
-    for i in range(backup_count - 1, 0, -1):
-        src = path.with_name(f"{path.name}.bak{i}")
-        dst = path.with_name(f"{path.name}.bak{i + 1}")
-        if src.exists():
-            os.replace(src, dst)
-    if path.exists():
-        os.replace(path, path.with_name(f"{path.name}.bak1"))
-
-    os.replace(new_path, path)
-
-
 def write_markdown(persona_dir: Path, work: Work, *, content: str) -> Path:
     """Write a work as <persona_dir>/data/works/<id>.md with frontmatter.
 
@@ -100,7 +68,7 @@ def write_markdown(persona_dir: Path, work: Work, *, content: str) -> Path:
         "",
         content,
     ]
-    _atomic_write_text(dest, "\n".join(fm_lines))
+    save_with_backup_text(dest, "\n".join(fm_lines), backup_count=_BACKUP_COUNT)
     return dest
 
 

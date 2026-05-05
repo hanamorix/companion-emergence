@@ -216,18 +216,22 @@ def _heal_text_from_baks(
     )
 
 
-def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
-    """Atomic save with .bak rotation.
+def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
+    """Atomic raw-text save with .bak rotation.
 
     Writes <path>.new, rotates existing <path> → <path>.bak1 → ... → <path>.bak{N},
     drops oldest, then atomically replaces <path>. Stale <path>.new from a prior
     crash is unlinked before the new write begins.
+
+    The text variant — for callers whose payload is already a string and
+    should not be JSON-encoded (markdown bodies, voice.md, work files).
+    For JSON dicts, use save_with_backup which delegates here after encoding.
     """
     new_path = path.with_name(path.name + ".new")
     if new_path.exists():
         new_path.unlink()  # stale from prior crash; always incomplete
 
-    new_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    new_path.write_text(text, encoding="utf-8")
 
     # Rotate: drop oldest first, then walk down toward live.
     oldest = path.with_name(f"{path.name}.bak{backup_count}")
@@ -242,3 +246,10 @@ def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
         os.replace(path, path.with_name(f"{path.name}.bak1"))
 
     os.replace(new_path, path)
+
+
+def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
+    """Atomic JSON save with .bak rotation. Delegates to save_with_backup_text."""
+    save_with_backup_text(
+        path, json.dumps(data, indent=2) + "\n", backup_count=backup_count
+    )
