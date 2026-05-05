@@ -35,6 +35,7 @@ def _default_persona_config_dict() -> dict:
         "provider": DEFAULT_PROVIDER,
         "searcher": DEFAULT_SEARCHER,
         "mcp_audit_log_level": DEFAULT_MCP_AUDIT_LOG_LEVEL,
+        "user_name": None,
     }
 
 
@@ -46,11 +47,22 @@ class PersonaConfig:
     file is the persona's "who am I" surface, separate from the heartbeat's
     internal calibration. Hand-edited config with wrong-type values
     degrades to defaults rather than crashing the CLI.
+
+    user_name: name the persona's user/owner goes by in conversation.
+    Used to disambiguate transcript extraction so the LLM doesn't
+    conflate the user with historical figures referenced in soul
+    crystallizations or memory context (Bug A from the 2026-05-05
+    audit-3: extracted memories attributed Hana's actions to Jordan
+    because both names appeared in the transcript via assistant
+    references). When None, the extractor falls back to the legacy
+    "user:" / "assistant:" labels — backward-compatible for forkers
+    who haven't set the field yet.
     """
 
     provider: str = DEFAULT_PROVIDER
     searcher: str = DEFAULT_SEARCHER
     mcp_audit_log_level: str = DEFAULT_MCP_AUDIT_LOG_LEVEL
+    user_name: str | None = None
 
     @classmethod
     def _parse_data(cls, data: object) -> PersonaConfig:
@@ -60,6 +72,7 @@ class PersonaConfig:
         provider_raw = data.get("provider", DEFAULT_PROVIDER)
         searcher_raw = data.get("searcher", DEFAULT_SEARCHER)
         audit_raw = data.get("mcp_audit_log_level", DEFAULT_MCP_AUDIT_LOG_LEVEL)
+        user_name_raw = data.get("user_name")
         provider = (
             provider_raw if isinstance(provider_raw, str) and provider_raw else DEFAULT_PROVIDER
         )
@@ -69,7 +82,17 @@ class PersonaConfig:
         audit_level = audit_raw.strip().lower() if isinstance(audit_raw, str) else ""
         if audit_level not in {"off", "metadata", "redacted", "full"}:
             audit_level = DEFAULT_MCP_AUDIT_LOG_LEVEL
-        return cls(provider=provider, searcher=searcher, mcp_audit_log_level=audit_level)
+        user_name = (
+            user_name_raw.strip()
+            if isinstance(user_name_raw, str) and user_name_raw.strip()
+            else None
+        )
+        return cls(
+            provider=provider,
+            searcher=searcher,
+            mcp_audit_log_level=audit_level,
+            user_name=user_name,
+        )
 
     @classmethod
     def load_with_anomaly(cls, path: Path) -> tuple[PersonaConfig, BrainAnomaly | None]:
@@ -104,6 +127,7 @@ class PersonaConfig:
             "provider": self.provider,
             "searcher": self.searcher,
             "mcp_audit_log_level": self.mcp_audit_log_level,
+            "user_name": self.user_name,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
