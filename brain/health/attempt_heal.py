@@ -247,6 +247,24 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
 
     os.replace(new_path, path)
 
+    # M-9: fsync the parent directory so the rename is durable, not just
+    # atomic. POSIX guarantees os.replace's atomicity but not that the
+    # directory entry has flushed to disk. On power loss between the
+    # replace and the dir-block flush, the file may revert to the prior
+    # name — the .bak rotation already preserves data, but durability
+    # of the rename itself matters for the chain to behave correctly.
+    if os.name == "posix":
+        try:
+            dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
+
 
 def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
     """Atomic JSON save with .bak rotation. Delegates to save_with_backup_text."""
