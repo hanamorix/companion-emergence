@@ -101,6 +101,7 @@ class MigrateArgs:
     output_dir: Path | None
     install_as: str | None
     force: bool
+    force_preflight: bool = False
 
     def __post_init__(self) -> None:
         if (self.output_dir is None) == (self.install_as is None):
@@ -110,7 +111,7 @@ class MigrateArgs:
 def run_migrate(args: MigrateArgs) -> MigrationReport:
     """Execute a full migration. Returns the MigrationReport."""
     reader = OGReader(args.input_dir)
-    reader.check_preflight()
+    reader.check_preflight(force=args.force_preflight)
 
     # Determine the lock target. For --output the target is the output dir
     # itself; for --install-as it's the final persona dir (NOT the .new
@@ -554,6 +555,15 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
         action="store_true",
         help="Overwrite non-empty output dir / existing persona (with backup).",
     )
+    p.add_argument(
+        "--force-preflight",
+        action="store_true",
+        help=(
+            "Skip the OG live-bridge live-lock detection. Use only when "
+            "you're certain no OG bridge is running (lock file is from a "
+            "prior crash, etc.)."
+        ),
+    )
     p.set_defaults(func=_dispatch)
     return p
 
@@ -565,6 +575,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         install_as=args.install_as,
         force=args.force,
+        force_preflight=args.force_preflight,
     )
     run_migrate(migrate_args)
     return 0
