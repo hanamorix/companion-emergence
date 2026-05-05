@@ -11,11 +11,17 @@ Reads tolerate corrupt lines via read_jsonl_skipping_corrupt.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+# session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
+# both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
+# other path-traversal characters. Capped at 64 chars to bound the filename.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _now_iso() -> str:
@@ -29,6 +35,19 @@ def _active_conversations_dir(persona_dir: Path) -> Path:
 
 
 def _session_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.jsonl.
+
+    Validates session_id against _SESSION_ID_RE so a path-traversal string
+    (e.g., '../../etc/passwd') or empty string can't escape the buffer dir.
+    The HTTP bridge constrains session_id to UUID at the request-model
+    layer, but other callers (chat engine, future MCP, tests) inherit
+    this validation defensively.
+    """
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(
+            f"invalid session_id {session_id!r} — must match "
+            f"[A-Za-z0-9_-]{{1,64}}"
+        )
     return _active_conversations_dir(persona_dir) / f"{session_id}.jsonl"
 
 

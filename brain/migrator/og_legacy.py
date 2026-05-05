@@ -17,6 +17,7 @@ See docs/superpowers/specs/2026-05-04-migrator-legacy-preservation-design.md.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -73,6 +74,12 @@ def migrate_legacy_files(
             missing.append(name)
             continue
         dest = legacy_dir / name
-        dest.write_bytes(src.read_bytes())
+        # Atomic copy via .new + os.replace so a torn read/write doesn't
+        # leave a half-copied legacy artifact (years-deep biographical data).
+        new_path = dest.with_name(dest.name + ".new")
+        if new_path.exists():
+            new_path.unlink()
+        new_path.write_bytes(src.read_bytes())
+        os.replace(new_path, dest)
         preserved.append(name)
     return preserved, missing

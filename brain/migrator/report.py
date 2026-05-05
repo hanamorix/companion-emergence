@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.health.attempt_heal import save_with_backup_text
 from brain.migrator.og import FileManifest
 from brain.migrator.transform import SkippedMemory
 
@@ -186,4 +187,4 @@ def write_source_manifest(path: Path, manifest: list[FileManifest]) -> None:
             for m in manifest
         ],
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    save_with_backup_text(path, json.dumps(payload, indent=2) + "\n")
