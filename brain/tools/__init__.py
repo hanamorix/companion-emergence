@@ -3,7 +3,7 @@
 Public surface:
     SCHEMAS           — JSON schemas keyed by tool name
     LOVE_TYPES        — enum of crystallization love-types
-    NELL_TOOL_NAMES   — canonical ordered tuple of all 9 tools
+    NELL_TOOL_NAMES   — canonical ordered tuple of registered tools
     dispatch          — dispatch(name, arguments, *, store, hebbian, persona_dir) -> dict
     ToolDispatchError — raised on dispatch failures
 
