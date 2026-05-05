@@ -74,7 +74,7 @@ def dispatch(
     Parameters
     ----------
     name:
-        Tool name — must be one of the 9 registered tools.
+        Tool name — must be a key in the dispatch table (see ``_DISPATCH``).
     arguments:
         Parsed JSON args dict from the LLM tool_call.  Will be validated
         against the schema's "required" list before the impl is called.
