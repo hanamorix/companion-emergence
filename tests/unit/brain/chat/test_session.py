@@ -114,3 +114,58 @@ def test_reset_registry_clears() -> None:
     create_session("nell")
     reset_registry()
     assert all_sessions() == []
+
+
+# ---- I-8 follow-up audit: thread-safe registry ----
+
+
+def test_registry_concurrent_create_remove_no_lost_sessions() -> None:
+    """Stress: 8 threads × 50 ops each (create, get, remove, all_sessions) —
+    no exceptions, no lost sessions. Pre-fix _SESSIONS was an unlocked dict;
+    compound ops (snapshot + check + remove) raced.
+
+    This test is probabilistic — but with 400 ops across 8 threads it
+    surfaces classic dict-corruption races (RuntimeError: dictionary
+    changed size during iteration) within a few seconds on cpython."""
+    import threading
+
+    reset_registry()
+    errors: list[Exception] = []
+    sids: list[str] = []
+    sids_lock = threading.Lock()
+
+    def worker(thread_id: int) -> None:
+        try:
+            for i in range(50):
+                op = i % 4
+                if op == 0:
+                    s = create_session(f"persona_{thread_id}")
+                    with sids_lock:
+                        sids.append(s.session_id)
+                elif op == 1:
+                    list(all_sessions())  # iterate-while-mutating snapshot
+                elif op == 2 and sids:
+                    with sids_lock:
+                        if not sids:
+                            continue
+                        target = sids[-1]
+                    get_session(target)
+                else:
+                    with sids_lock:
+                        if not sids:
+                            continue
+                        target = sids.pop()
+                    from brain.chat.session import remove_session
+                    remove_session(target)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "worker hung"
+
+    assert errors == [], f"unexpected errors under concurrent load: {errors[:3]}"
+    reset_registry()

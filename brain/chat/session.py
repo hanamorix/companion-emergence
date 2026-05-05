@@ -13,6 +13,7 @@ flushes the buffer via close_session → ingest pipeline.
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -69,8 +70,16 @@ class SessionState:
 # ---------------------------------------------------------------------------
 # Module-level in-memory registry
 # ---------------------------------------------------------------------------
+#
+# I-8 from 2026-05-05 follow-up audit: _SESSIONS is touched from both the
+# bridge supervisor thread (heartbeat / close-stale sweep) and the asyncio
+# event loop's HTTP handlers (every /session/new, /chat, /sessions/close).
+# Individual dict ops are GIL-atomic, but compound (get-then-mutate, snapshot
+# + check) sequences race. _LOCK serializes both elementary and compound
+# operations behind a single mutex.
 
 _SESSIONS: dict[str, SessionState] = {}
+_LOCK = threading.RLock()
 
 
 def create_session(persona_name: str) -> SessionState:
@@ -91,13 +100,15 @@ def create_session(persona_name: str) -> SessionState:
         persona_name=persona_name,
         created_at=datetime.now(UTC),
     )
-    _SESSIONS[sid] = state
+    with _LOCK:
+        _SESSIONS[sid] = state
     return state
 
 
 def get_session(session_id: str) -> SessionState | None:
     """Return the session for the given id, or None if unknown."""
-    return _SESSIONS.get(session_id)
+    with _LOCK:
+        return _SESSIONS.get(session_id)
 
 
 def all_sessions() -> list[SessionState]:
@@ -106,8 +117,12 @@ def all_sessions() -> list[SessionState]:
     H-B hardening (2026-04-28): with `remove_session` now wired into
     `/sessions/close`, this returns only LIVE sessions — closed ones are
     pulled from the registry. Long-lived bridges no longer accumulate stale.
+
+    Returns a snapshot list so callers iterating over the result can't see
+    the registry mutate underneath them.
     """
-    return list(_SESSIONS.values())
+    with _LOCK:
+        return list(_SESSIONS.values())
 
 
 def remove_session(session_id: str) -> bool:
@@ -118,9 +133,11 @@ def remove_session(session_id: str) -> bool:
     cleaned up by the caller. Idempotent — calling on an unknown id is
     a silent False return, not an error.
     """
-    return _SESSIONS.pop(session_id, None) is not None
+    with _LOCK:
+        return _SESSIONS.pop(session_id, None) is not None
 
 
 def reset_registry() -> None:
     """Clear the in-memory registry. Test-only helper."""
-    _SESSIONS.clear()
+    with _LOCK:
+        _SESSIONS.clear()

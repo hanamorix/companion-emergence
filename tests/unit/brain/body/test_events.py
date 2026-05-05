@@ -98,26 +98,54 @@ def test_emits_behavioral_log_entry(store, persona_dir):
 
 
 def test_returns_none_on_store_failure(persona_dir, monkeypatch):
-    """Fail-soft: when journal_entry write itself raises, returns None and
-    logs warn — never propagates."""
+    """Fail-soft: I/O + storage errors are caught, return None, log warn.
+    The narrow tuple covers the realistic failure modes (disk full, db
+    locked, type-mismatch on insert)."""
+    import sqlite3
     import tempfile
 
-    with tempfile.TemporaryDirectory() as td:
-        s = MemoryStore(Path(td) / "memories.db")
-        try:
-            origin = _seed_originating(s)
+    for raise_cls in (OSError, sqlite3.OperationalError, ValueError):
+        with tempfile.TemporaryDirectory() as td:
+            s = MemoryStore(Path(td) / "memories.db")
+            try:
+                origin = _seed_originating(s)
 
-            def boom(*a, **k):
-                raise RuntimeError("simulated db failure")
-            monkeypatch.setattr(s, "create", boom)
+                def boom(*a, _exc=raise_cls, **k):
+                    raise _exc("simulated failure")
+                monkeypatch.setattr(s, "create", boom)
 
-            # Should NOT raise
-            new_id = record_climax_event(
-                originating_memory=origin, store=s, persona_dir=persona_dir,
-            )
-            assert new_id is None
-        finally:
-            s.close()
+                # Should NOT raise
+                new_id = record_climax_event(
+                    originating_memory=origin, store=s, persona_dir=persona_dir,
+                )
+                assert new_id is None, f"{raise_cls.__name__} did not absorb"
+            finally:
+                s.close()
+
+
+def test_propagates_programming_bugs(persona_dir, monkeypatch):
+    """Programming bugs (TypeError, KeyError, AttributeError) must surface
+    as crashes — not get swallowed by an over-broad catch. Mirrors the I-3
+    pattern from the original audit fix-pack."""
+    import tempfile
+
+    for raise_cls in (TypeError, KeyError, AttributeError):
+        with tempfile.TemporaryDirectory() as td:
+            s = MemoryStore(Path(td) / "memories.db")
+            try:
+                origin = _seed_originating(s)
+
+                def boom(*a, _exc=raise_cls, **k):
+                    raise _exc("simulated programming bug")
+                monkeypatch.setattr(s, "create", boom)
+
+                import pytest as _pytest
+                with _pytest.raises(raise_cls):
+                    record_climax_event(
+                        originating_memory=origin, store=s, persona_dir=persona_dir,
+                    )
+            finally:
+                s.close()
 
 
 def test_does_not_recurse_when_journal_itself_has_climax(store, persona_dir):

@@ -31,6 +31,44 @@ def test_unknown_tool_raises_dispatch_error(tmp_path: Path) -> None:
         dispatch("no_such_tool", {}, **ctx)
 
 
+def test_unknown_tool_error_does_not_enumerate_known_tools(tmp_path: Path) -> None:
+    """M-10: dispatch's unknown-tool error must NOT include the full list of
+    known tool names. The error round-trips into the LLM's next context via
+    tool_loop, leaking the canonical tool surface as training signal."""
+    ctx = _make_ctx(tmp_path)
+    try:
+        dispatch("no_such_tool", {}, **ctx)
+    except ToolDispatchError as exc:
+        msg = str(exc)
+        # Some sentinel tool names that should NOT appear:
+        for known in ("search_memories", "get_emotional_state", "save_work", "boot"):
+            assert known not in msg, f"leaked known tool name {known!r} in error"
+
+
+def test_get_body_state_does_not_mutate_caller_arguments(tmp_path: Path) -> None:
+    """M-4: dispatch's session_hours float coercion must not mutate the
+    caller's arguments dict. The chat tool loop logs `arguments` straight
+    into the invocations record; mutating it bleeds the float coercion
+    into the audit trail."""
+    ctx = _make_ctx(tmp_path)
+    args = {"session_hours": "1.5"}
+    args_id = id(args)
+    args_snapshot = dict(args)
+
+    # The dispatch may succeed or raise depending on impl — what matters is
+    # that the caller's dict is unchanged either way.
+    try:
+        dispatch("get_body_state", args, **ctx)
+    except Exception:  # noqa: BLE001
+        pass
+
+    assert id(args) == args_id, "caller's dict identity changed"
+    assert args == args_snapshot, f"caller's dict mutated from {args_snapshot} to {args}"
+    # Explicitly: session_hours stays a string in the caller's record
+    assert args["session_hours"] == "1.5"
+    assert isinstance(args["session_hours"], str)
+
+
 def test_missing_required_arg_raises_dispatch_error(tmp_path: Path) -> None:
     """Missing required arg for add_memory raises ToolDispatchError."""
     ctx = _make_ctx(tmp_path)
