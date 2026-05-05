@@ -137,3 +137,26 @@ def test_store_search_returns_empty_on_no_match(tmp_path: Path) -> None:
     store = WorksStore(tmp_path / "works.db")
     store.insert(_w(), content="something else")
     assert store.search("zzzzzzzz", limit=10) == []
+
+
+def test_search_returns_empty_on_malformed_fts5_query(tmp_path: Path) -> None:
+    """Malformed FTS5 queries (unbalanced quotes, bare operators, etc.) must
+    return [] not raise sqlite3.OperationalError. The LLM emitting a bad query
+    should see no matches, not a stack trace."""
+    store = WorksStore(tmp_path / "works.db")
+    w = _w(work_id="111111111111", title="The Lighthouse")
+    store.insert(w, content="content")
+
+    # Each of these is malformed FTS5 syntax that previously raised
+    # sqlite3.OperationalError ("unterminated string", "fts5: syntax error",
+    # "unknown special query: ...").
+    for malformed in [
+        'lighthouse"',     # unbalanced quote
+        'AND',             # bare operator
+        '"lighthouse',     # unclosed quote
+        'NEAR(',           # malformed near
+        '*lighthouse',     # leading wildcard
+        '(lighthouse',     # unbalanced paren
+    ]:
+        result = store.search(malformed, limit=10)
+        assert result == [], f"query {malformed!r} should return [] (got {result!r})"

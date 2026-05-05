@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json as _json
+import json
 import os
 import shutil
 import time
@@ -26,6 +26,8 @@ from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
+
+_MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
 
 
 @dataclass(frozen=True)
@@ -128,12 +130,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             )
             _vocab_tmp = vocab_target.with_suffix(vocab_target.suffix + ".new")
             _vocab_tmp.write_text(
-                _json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
+                json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
                 encoding="utf-8",
             )
             os.replace(_vocab_tmp, vocab_target)
             vocabulary_emotions_migrated = len(vocab_entries)
-        except (ValueError, OSError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             vocabulary_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex arcs ----
@@ -161,7 +163,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
                     force=args.force,
                 )
                 reflex_arcs_migrated = len(og_arcs)
-            except (ValueError, OSError) as exc:
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
                 reflex_arcs_skipped_reason = f"extract_error: {exc}"
     else:
         reflex_arcs_skipped_reason = "og_reflex_engine_py_not_found"
@@ -186,12 +188,12 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
                 og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
                 _interests_tmp = interests_target.with_suffix(interests_target.suffix + ".new")
                 _interests_tmp.write_text(
-                    _json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
+                    json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
                     encoding="utf-8",
                 )
                 os.replace(_interests_tmp, interests_target)
                 interests_migrated = len(og_interests)
-            except (ValueError, FileNotFoundError, OSError) as exc:
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
                 interests_skipped_reason = f"migrate_error: {exc}"
     else:
         interests_skipped_reason = "og_nell_interests_json_not_found"
@@ -229,7 +231,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         if not creative_dna_migrated:
             creative_dna_skipped_reason = "og file not present"
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         creative_dna_skipped_reason = f"migrate_error: {exc}"
 
     # ---- journal memories (reflex_journal -> journal_entry retag) ----
@@ -241,7 +243,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             persona_dir=work_dir,
             store=journal_store,
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         journal_memories_skipped_reason = f"migrate_error: {exc}"
     finally:
         journal_store.close()
@@ -257,7 +259,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         legacy_files_preserved = len(preserved)
         legacy_files_missing = len(missing)
-    except OSError as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         legacy_skipped_reason = f"copy_error: {exc}"
 
     # ---- soul_candidates schema migration ----
@@ -271,7 +273,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         )
         soul_candidates_migrated = sc_migrated
         soul_candidates_skipped_missing_memory_id = sc_skipped
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         soul_candidates_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex_log schema migration ----
@@ -282,7 +284,7 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
             og_data_dir=args.input_dir,
             persona_dir=work_dir,
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         reflex_log_skipped_reason = f"migrate_error: {exc}"
 
     elapsed = time.monotonic() - started
@@ -342,16 +344,33 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
 
 
 def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
-    if path.exists() and any(path.iterdir()):
-        if not force:
-            raise FileExistsError(
-                f"{kind.capitalize()} is non-empty: {path}. Pass --force to overwrite."
-            )
-        for child in path.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+    """Refuse to clobber a non-empty dir without --force, and even with --force
+    refuse to clobber a directory that doesn't look like a prior migration
+    target (no migration-report.md / source-manifest.json / memories.db).
+    """
+    if not path.exists():
+        return
+    if not any(path.iterdir()):
+        return  # empty dir is safe to use
+    if not force:
+        raise FileExistsError(
+            f"{kind.capitalize()} is non-empty: {path}. Pass --force to overwrite."
+        )
+    # --force: only clobber if the directory looks like a prior migration target
+    has_marker = any((path / m).exists() for m in _MIGRATOR_MARKER_FILES)
+    if not has_marker:
+        raise FileExistsError(
+            f"{kind.capitalize()} {path} is not empty and does not contain any of "
+            f"{sorted(_MIGRATOR_MARKER_FILES)} — refusing to clobber an "
+            f"unrelated directory even with --force. Choose a different "
+            f"output path or remove the directory first."
+        )
+    # --force + has marker: safe to clobber
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _verify_sources_unchanged(og_dir: Path, manifest: list[FileManifest]) -> None:

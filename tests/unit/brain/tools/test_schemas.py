@@ -2,28 +2,13 @@
 
 from __future__ import annotations
 
+from brain.tools import NELL_TOOL_NAMES
 from brain.tools.schemas import LOVE_TYPES, SCHEMAS
 
-_EXPECTED_TOOLS = {
-    "get_emotional_state",
-    "get_personality",
-    "get_body_state",
-    "search_memories",
-    "add_journal",
-    "add_memory",
-    "boot",
-    "get_soul",
-    "crystallize_soul",
-    "save_work",
-    "list_works",
-    "search_works",
-    "read_work",
-}
 
-
-def test_schemas_has_all_nine_tools() -> None:
-    """SCHEMAS contains all 13 tool entries (9 brain + 4 works)."""
-    assert set(SCHEMAS.keys()) == _EXPECTED_TOOLS
+def test_schemas_has_all_dispatched_tools() -> None:
+    """SCHEMAS contains a schema entry for every name in NELL_TOOL_NAMES."""
+    assert set(SCHEMAS.keys()) == set(NELL_TOOL_NAMES)
 
 
 def test_each_schema_has_name_description_parameters() -> None:

@@ -1,4 +1,4 @@
-"""Tool schemas — JSON-schema dicts for all 9 brain tools.
+"""Tool schemas — JSON-schema dicts for the brain tools registry.
 
 Ported verbatim from OG NellBrain/nell_tools.py:530-718.
 LOVE_TYPES constant is also ported here (OG nell_brain.py:3270-3304)
@@ -50,7 +50,7 @@ LOVE_TYPES: dict[str, str] = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEMAS — JSON-schema dicts for all 9 brain tools.
+# SCHEMAS — JSON-schema dicts for the brain tools registry.
 # Ported verbatim from OG NellBrain/nell_tools.py:530-718 with LOVE_TYPES
 # inlined from this module instead of the OG import.
 # ─────────────────────────────────────────────────────────────────────────────
