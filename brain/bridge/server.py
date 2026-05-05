@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -522,11 +523,14 @@ def build_app(
         s: BridgeAppState = app.state.bridge
         uptime = (datetime.now(UTC) - s.started_at).total_seconds()
 
-        # Walk + alarms — lightweight; defensive against fresh persona dirs
+        # Walk + alarms — lightweight; defensive against fresh persona dirs.
+        # Narrow tuple so programming bugs (KeyError, AttributeError) inside
+        # walk_persona / compute_pending_alarms surface as 500 rather than
+        # leaving /health silently green forever.
         try:
             anomalies = walk_persona(s.persona_dir)
             alarms = compute_pending_alarms(s.persona_dir)
-        except Exception:
+        except (OSError, sqlite3.Error, ValueError):
             logger.warning("health walk failed", exc_info=True)
             anomalies = []
             alarms = []
