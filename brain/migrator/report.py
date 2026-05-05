@@ -39,6 +39,11 @@ class MigrationReport:
     legacy_files_preserved: int = 0
     legacy_files_missing: int = 0
     legacy_skipped_reason: str | None = None
+    soul_candidates_migrated: int = 0
+    soul_candidates_skipped_missing_memory_id: int = 0
+    soul_candidates_skipped_reason: str | None = None
+    reflex_log_fires_migrated: int = 0
+    reflex_log_skipped_reason: str | None = None
 
 
 def format_report(report: MigrationReport) -> str:
@@ -108,6 +113,27 @@ def format_report(report: MigrationReport) -> str:
         + (
             f" (skipped: {report.legacy_skipped_reason})"
             if report.legacy_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Soul candidates: {report.soul_candidates_migrated:,} migrated"
+        + (
+            f", {report.soul_candidates_skipped_missing_memory_id:,} skipped (missing memory_id)"
+            if report.soul_candidates_skipped_missing_memory_id
+            else ""
+        )
+        + (
+            f" (error: {report.soul_candidates_skipped_reason})"
+            if report.soul_candidates_skipped_reason
+            else ""
+        )
+    )
+    lines.append(
+        f"  Reflex fires:   {report.reflex_log_fires_migrated:,} migrated"
+        + (
+            f" (skipped: {report.reflex_log_skipped_reason})"
+            if report.reflex_log_skipped_reason
             else ""
         )
     )
