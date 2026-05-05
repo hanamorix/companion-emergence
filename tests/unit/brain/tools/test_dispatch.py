@@ -124,11 +124,11 @@ def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# All 9 tools smoke-test
+# All dispatched tools smoke-test
 # ---------------------------------------------------------------------------
 
 
-def test_all_nine_tools_dispatch_without_crash(tmp_path: Path) -> None:
+def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
     """All registered tool names dispatch without raising."""
     ctx = _make_ctx(tmp_path)
 
