@@ -222,3 +222,42 @@ def test_format_report_shows_legacy_line() -> None:
     assert "Legacy files:" in text
     assert "14 preserved" in text
     assert "2 missing" in text
+
+
+def test_format_report_shows_soul_candidates_line() -> None:
+    """soul_candidates_migrated + skipped_missing_memory_id render in the report."""
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+        soul_candidates_migrated=38,
+        soul_candidates_skipped_missing_memory_id=2,
+    )
+    text = format_report(report)
+    assert "Soul candidates:" in text
+    assert "38 migrated" in text
+    assert "2 skipped" in text
+    assert "missing memory_id" in text
+
+
+def test_format_report_shows_reflex_fires_line() -> None:
+    """reflex_log_fires_migrated renders in the report."""
+    report = MigrationReport(
+        memories_migrated=0,
+        memories_skipped=[],
+        edges_migrated=0,
+        edges_skipped=0,
+        elapsed_seconds=0.0,
+        source_manifest=[],
+        next_steps_inspect_cmds=[],
+        next_steps_install_cmd="",
+        reflex_log_fires_migrated=42,
+    )
+    text = format_report(report)
+    assert "Reflex fires:" in text
+    assert "42 migrated" in text
