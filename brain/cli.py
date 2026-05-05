@@ -1144,7 +1144,9 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
     # legacy/dev bridge with auth disabled.
     auth_token = s.auth_token
     http_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    ws_token_qs = f"?token={auth_token}" if auth_token else ""
+    # WS auth is via Sec-WebSocket-Protocol: bearer, <token> — the only
+    # auth path the server accepts. Same fix as cmd_tail (audit-2 I-1).
+    ws_subprotocols = ["bearer", auth_token] if auth_token else None
 
     sid_arg = getattr(args, "session", None)
     if sid_arg:
@@ -1162,7 +1164,10 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
             break
         if not line:
             continue
-        with connect(f"ws://127.0.0.1:{s.port}/stream/{sid}{ws_token_qs}") as ws:
+        with connect(
+            f"ws://127.0.0.1:{s.port}/stream/{sid}",
+            subprotocols=ws_subprotocols,
+        ) as ws:
             ws.send(json.dumps({"message": line}))
             print("nell: ", end="", flush=True)
             while True:
