@@ -157,7 +157,13 @@ class WorksStore:
         sql += " ORDER BY works.created_at DESC LIMIT ?"
         params.append(int(limit))
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # Malformed FTS5 query — return empty results rather than
+                # raise. The LLM's tool path and the bridge endpoint both
+                # benefit from a clean "no matches" instead of a stack trace.
+                return []
             return [_row_to_work(r) for r in rows]
 
 
