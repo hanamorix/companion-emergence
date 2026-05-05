@@ -59,14 +59,23 @@ class WorksStore:
 
     Use as a transient object: construct, call methods, drop. Each method
     opens a fresh sqlite3 connection so handles never cross threads.
+
+    M-3: schema init runs once per (process, db_path). Subsequent
+    WorksStore(same_path) instances skip the CREATE IF NOT EXISTS dance,
+    so the hot-path (per-tool-call) is just a connect + query.
     """
+
+    _INITIALISED_PATHS: set[str] = set()
 
     def __init__(self, db_path: Path | str) -> None:
         self._path = Path(db_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.executescript(_SCHEMA_SQL)
-            conn.commit()
+        key = str(self._path.resolve())
+        if key not in self._INITIALISED_PATHS:
+            with self._connect() as conn:
+                conn.executescript(_SCHEMA_SQL)
+                conn.commit()
+            self._INITIALISED_PATHS.add(key)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._path))
@@ -85,37 +94,60 @@ class WorksStore:
     def insert(self, work: Work, *, content: str) -> None:
         """Insert a work + index its content for FTS. Idempotent on id.
 
-        The transaction inserts into both `works` and `works_fts` so the
-        FTS index never lags the canonical row.
+        Wrapped in BEGIN IMMEDIATE so:
+          - The SELECT-then-INSERT compound op is serialized (writers can't
+            both observe "row absent" and both insert).
+          - If either INSERT raises mid-tx, the rollback is total — works
+            and works_fts stay in sync (no orphan row in either table).
         """
         content_path = f"data/works/{work.id}.md"
-        with self._connect() as conn:
-            cur = conn.execute("SELECT 1 FROM works WHERE id = ?", (work.id,))
-            if cur.fetchone() is not None:
-                return  # idempotent
-            conn.execute(
-                """
-                INSERT INTO works
-                  (id, title, type, created_at, session_id,
-                   content_path, word_count, summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    work.id,
-                    work.title,
-                    work.type,
-                    work.created_at.isoformat(),
-                    work.session_id,
-                    content_path,
-                    work.word_count,
-                    work.summary,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO works_fts (id, title, summary, content) VALUES (?, ?, ?, ?)",
-                (work.id, work.title, work.summary or "", content),
-            )
-            conn.commit()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "SELECT 1 FROM works WHERE id = ?", (work.id,)
+                )
+                if cur.fetchone() is not None:
+                    conn.execute("ROLLBACK")
+                    return  # idempotent
+                conn.execute(
+                    """
+                    INSERT INTO works
+                      (id, title, type, created_at, session_id,
+                       content_path, word_count, summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        work.id,
+                        work.title,
+                        work.type,
+                        work.created_at.isoformat(),
+                        work.session_id,
+                        content_path,
+                        work.word_count,
+                        work.summary,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO works_fts (id, title, summary, content) "
+                    "VALUES (?, ?, ?, ?)",
+                    (work.id, work.title, work.summary or "", content),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                # Roll back the entire transaction so neither table has
+                # the row. The default sqlite3 connection __exit__ does
+                # roll back on exception, but explicit ROLLBACK before
+                # close makes the contract obvious and works regardless
+                # of how the connection is later disposed.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        finally:
+            conn.close()
 
     # ----- reads -----
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,6 +40,7 @@ class MigrationReport:
     legacy_files_preserved: int = 0
     legacy_files_missing: int = 0
     legacy_skipped_reason: str | None = None
+    legacy_integrity_issues: list[str] = field(default_factory=list)
     soul_candidates_migrated: int = 0
     soul_candidates_skipped_missing_memory_id: int = 0
     soul_candidates_skipped_reason: str | None = None
@@ -117,6 +118,13 @@ def format_report(report: MigrationReport) -> str:
             else ""
         )
     )
+    if report.legacy_integrity_issues:
+        lines.append(
+            f"  ⚠ Legacy integrity: {len(report.legacy_integrity_issues)} "
+            f"file(s) byte-mismatched after copy:"
+        )
+        for issue in report.legacy_integrity_issues:
+            lines.append(f"      {issue}")
     lines.append(
         f"  Soul candidates: {report.soul_candidates_migrated:,} migrated"
         + (
