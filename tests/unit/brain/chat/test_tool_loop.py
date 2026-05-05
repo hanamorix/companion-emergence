@@ -314,3 +314,42 @@ def test_run_tool_loop_max_iterations_forces_no_tools_final_pass(
     assert response.content == "Forced final."
     # Invocations capped to max_iterations calls
     assert len(invocations) == 2
+
+
+def test_run_tool_loop_surfaces_dispatched_invocations(
+    store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path
+) -> None:
+    """Provider sets ChatResponse.dispatched_invocations (claude-cli MCP path).
+    run_tool_loop accumulates them into the returned invocations list WITHOUT
+    re-dispatching. Tools already ran inside the provider's subprocess.
+
+    Closes the telemetry gap surfaced by the 2026-05-05 voice stress retest:
+    tools fired correctly but bridge response showed tool_invocations=[]."""
+    class _ProviderWithDispatched(LLMProvider):
+        def name(self) -> str: return "fake-dispatched"
+        def generate(self, prompt: str, *, system: str | None = None) -> str: return ""
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(
+                content="reply text",
+                tool_calls=(),  # not OllamaProvider path
+                dispatched_invocations=(
+                    {"name": "get_soul", "arguments": {}, "result_summary": "{count: 38}"},
+                    {"name": "search_memories", "arguments": {"query": "x"}, "result_summary": "[]"},
+                ),
+                raw=None,
+            )
+
+    messages = _make_messages()
+    provider = _ProviderWithDispatched()
+    response, invocations = run_tool_loop(
+        messages,
+        provider=provider,
+        tools=build_tools_list(),
+        store=store,
+        hebbian=hebbian,
+        persona_dir=persona_dir,
+    )
+    assert response.content == "reply text"
+    assert len(invocations) == 2
+    assert [i["name"] for i in invocations] == ["get_soul", "search_memories"]
+    assert invocations[1]["arguments"] == {"query": "x"}
