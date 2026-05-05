@@ -144,3 +144,35 @@ def test_read_work_missing_id_returns_error(tmp_path: Path) -> None:
     persona_dir = _persona(tmp_path)
     result = read_work(id="zzzzzzzzzzzz", persona_dir=persona_dir)
     assert "error" in result
+
+
+def test_save_work_no_orphan_file_on_store_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If WorksStore.insert raises (e.g. OperationalError, disk full), no
+    markdown file should land on disk. The pre-fix behavior was to write
+    the file first, then attempt insert — a store failure left an orphan
+    .md file unreachable via list/search/read."""
+    import sqlite3
+    from brain.works.store import WorksStore
+
+    persona_dir = _persona(tmp_path)
+
+    def raising_insert(self, work, *, content):
+        raise sqlite3.OperationalError("disk full (simulated)")
+
+    monkeypatch.setattr(WorksStore, "insert", raising_insert)
+
+    with pytest.raises(sqlite3.OperationalError):
+        save_work(
+            title="should not orphan",
+            type="story",
+            content="this content should NOT land on disk",
+            persona_dir=persona_dir,
+        )
+
+    # No file should exist at data/works/<id>.md after the failure.
+    works_dir = persona_dir / "data" / "works"
+    if works_dir.exists():
+        files = list(works_dir.iterdir())
+        assert files == [], f"expected no orphan files; found {[f.name for f in files]}"
