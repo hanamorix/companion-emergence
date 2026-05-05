@@ -142,6 +142,17 @@ class ChatResponse:
         produced tool-calls and no prose.
     tool_calls:
         Tool invocations the assistant wants to make (empty tuple if none).
+        These are NOT yet dispatched — the chat-engine's tool_loop runs
+        them and feeds results back in a follow-up turn. OllamaProvider
+        uses this path.
+    dispatched_invocations:
+        Tool invocations the provider ALREADY dispatched internally during
+        this turn. ClaudeCliProvider's MCP path uses this — the claude
+        subprocess invokes MCP tools via stdio and the provider surfaces
+        the records here for telemetry. tool_loop must NOT re-dispatch
+        these; they are observability data, not actionable requests.
+        Each dict matches the engine invocation schema:
+        ``{name, arguments, result_summary, error?}``.
     raw:
         Provider-native payload for debugging / logging.  None if the provider
         does not expose raw data (e.g. FakeProvider).
@@ -149,4 +160,5 @@ class ChatResponse:
 
     content: str
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
+    dispatched_invocations: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     raw: dict[str, Any] | None = None
