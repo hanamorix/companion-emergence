@@ -52,6 +52,10 @@ def save_work(
         word_count=len(content.split()),
         summary=summary.strip() if summary else None,
     )
-    write_markdown(persona_dir, work, content=content)
+    # Insert into store FIRST. If that fails (OperationalError, disk full,
+    # permissions race), no markdown file is written. The recoverable failure
+    # mode is "indexed row, missing file" (handled by read_work) — strictly
+    # better than "orphan file, no index" (silent loss).
     WorksStore(persona_dir / "data" / "works.db").insert(work, content=content)
+    write_markdown(persona_dir, work, content=content)
     return {"id": work.id, "path": f"data/works/{work.id}.md"}
