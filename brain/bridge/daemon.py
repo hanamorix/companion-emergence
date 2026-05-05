@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -136,7 +137,32 @@ def spawn_detached(
     return proc.pid
 
 
-def cmd_start(args) -> int:
+@dataclass
+class BridgeReadiness:
+    """Verified-live snapshot of the freshly-spawned (or already-running) bridge.
+
+    Returned via the `out` dict mutation pattern so cmd_start's int return
+    code stays compatible with argparse handlers, while callers that need
+    to immediately connect (the chat REPL) can grab the verified
+    pid/port/auth_token directly without re-reading state_file. The
+    re-read was the race in the 2026-05-05 audit-3 Bug B: state_file
+    can be rewritten by the bridge supervisor between cmd_start's
+    /health verification and the caller's read.
+    """
+
+    pid: int
+    port: int
+    auth_token: str | None
+
+
+def cmd_start(args, *, out: dict | None = None) -> int:
+    """Spawn the bridge daemon. Returns 0 on success, 2 on already-running, 1 on error.
+
+    On success (or already-running), if `out` is provided, populates
+    `out["readiness"]` with a BridgeReadiness carrying the verified
+    pid/port/auth_token. Callers that need an immediate WS/HTTP connection
+    should use that instead of re-reading state_file.
+    """
     from brain.paths import get_log_dir, get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)
@@ -147,6 +173,10 @@ def cmd_start(args) -> int:
     if state_file.is_running(persona_dir):
         cur = state_file.read(persona_dir)
         print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
+        if out is not None and cur is not None and cur.pid is not None and cur.port is not None:
+            out["readiness"] = BridgeReadiness(
+                pid=cur.pid, port=cur.port, auth_token=cur.auth_token
+            )
         return 2
 
     fd = acquire_lock(persona_dir)
@@ -181,6 +211,10 @@ def cmd_start(args) -> int:
                     )
                     if r.status_code == 200:
                         print(f"bridge started on port {s.port} (pid {pid})")
+                        if out is not None:
+                            out["readiness"] = BridgeReadiness(
+                                pid=pid, port=s.port, auth_token=s.auth_token
+                            )
                         return 0
                 except httpx.HTTPError:
                     continue

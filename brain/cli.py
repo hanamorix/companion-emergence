@@ -1127,22 +1127,37 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     return 0
 
 
-def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
-    """Chat with a persona via the bridge daemon's WebSocket streaming API."""
+def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=None) -> int:
+    """Chat with a persona via the bridge daemon's WebSocket streaming API.
+
+    `readiness` (BridgeReadiness): the verified port + auth_token captured
+    by `_chat_handler` from cmd_start's out= dict. Using this instead of
+    re-reading state_file closes the race window where state_file could
+    rotate or the bridge could die between /health verification and our
+    read. Falls back to state_file for legacy callers (e.g. tests that
+    instantiate this directly).
+    """
     import json
     import sys as _sys
+    import time as _time
 
     import httpx
+    from websockets.exceptions import InvalidStatus
     from websockets.sync.client import connect
 
     from brain.bridge import state_file
 
-    s = state_file.read(persona_dir)
-    base = f"http://127.0.0.1:{s.port}"
+    if readiness is not None:
+        port = readiness.port
+        auth_token = readiness.auth_token
+    else:
+        s = state_file.read(persona_dir)
+        port = s.port
+        auth_token = s.auth_token
+    base = f"http://127.0.0.1:{port}"
     # H-C: read the bridge's ephemeral auth token from bridge.json and
     # send it on every HTTP/WS request. None when running against a
     # legacy/dev bridge with auth disabled.
-    auth_token = s.auth_token
     http_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     # WS auth is via Sec-WebSocket-Protocol: bearer, <token> — the only
     # auth path the server accepts. Same fix as cmd_tail (audit-2 I-1).
@@ -1164,10 +1179,31 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path) -> int:
             break
         if not line:
             continue
-        with connect(
-            f"ws://127.0.0.1:{s.port}/stream/{sid}",
-            subprotocols=ws_subprotocols,
-        ) as ws:
+        # WS connect with retry-with-backoff. Defends against a transient
+        # port-binding window after auto-spawn — uvicorn's port may close
+        # and reopen during the bind handshake. Three attempts, 200ms
+        # apart. ConnectionRefusedError is the typical symptom.
+        ws_cm = None
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                ws_cm = connect(
+                    f"ws://127.0.0.1:{port}/stream/{sid}",
+                    subprotocols=ws_subprotocols,
+                )
+                break
+            except (ConnectionRefusedError, OSError, InvalidStatus) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    _time.sleep(0.2)
+        if ws_cm is None:
+            print(
+                f"\n[error: could not connect to bridge after 3 attempts: "
+                f"{last_exc.__class__.__name__}: {last_exc}]",
+                file=_sys.stderr,
+            )
+            return 1
+        with ws_cm as ws:
             ws.send(json.dumps({"message": line}))
             print("nell: ", end="", flush=True)
             while True:
@@ -1220,6 +1256,12 @@ def _chat_handler(args: argparse.Namespace) -> int:
     if args.no_bridge:
         return _chat_direct_mode(args)
 
+    # Bug B (2026-05-05 audit-3): we capture cmd_start's verified
+    # BridgeReadiness via the out= dict pattern. _chat_via_bridge then
+    # uses that directly instead of re-reading state_file — eliminates
+    # the race where state_file could rotate or the bridge could die
+    # between /health verification and the caller's read.
+    readiness_out: dict = {}
     if not state_file.is_running(persona_dir):
         if args.bridge_only:
             print("bridge not running (--bridge-only set)", file=sys.stderr)
@@ -1231,11 +1273,21 @@ def _chat_handler(args: argparse.Namespace) -> int:
             idle_shutdown = 30
             client_origin = "cli"
 
-        rc = daemon.cmd_start(_StartArgs())
+        rc = daemon.cmd_start(_StartArgs(), out=readiness_out)
         if rc != 0:
             return rc
+    else:
+        # Bridge already running — capture its readiness so the chat REPL
+        # uses the same handoff-not-re-read path. cmd_start populates the
+        # readiness even when returning 2 (already-running) for this case.
+        class _NoOpStartArgs:
+            persona = args.persona
+            idle_shutdown = 30
+            client_origin = "cli"
 
-    return _chat_via_bridge(args, persona_dir)
+        daemon.cmd_start(_NoOpStartArgs(), out=readiness_out)
+
+    return _chat_via_bridge(args, persona_dir, readiness=readiness_out.get("readiness"))
 
 
 def _build_parser() -> argparse.ArgumentParser:

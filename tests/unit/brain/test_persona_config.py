@@ -99,3 +99,44 @@ def test_save_is_atomic(tmp_path: Path) -> None:
     PersonaConfig(provider="claude-cli", searcher="ddgs").save(path)
     assert path.exists()
     assert not path.with_suffix(path.suffix + ".new").exists()
+
+
+# ---- Bug A (audit-3): user_name field ----
+
+
+def test_persona_config_user_name_defaults_to_none(tmp_path: Path) -> None:
+    """user_name is None when not set in the config file (backward-compat
+    for forkers who haven't migrated yet)."""
+    cfg = PersonaConfig.load(tmp_path / "persona_config.json")
+    assert cfg.user_name is None
+
+
+def test_persona_config_user_name_loads_from_file(tmp_path: Path) -> None:
+    import json
+    p = tmp_path / "persona_config.json"
+    p.write_text(json.dumps({"provider": "claude-cli", "user_name": "Hana"}))
+    cfg = PersonaConfig.load(p)
+    assert cfg.user_name == "Hana"
+
+
+def test_persona_config_user_name_round_trips(tmp_path: Path) -> None:
+    p = tmp_path / "persona_config.json"
+    PersonaConfig(user_name="Hana").save(p)
+    loaded = PersonaConfig.load(p)
+    assert loaded.user_name == "Hana"
+
+
+def test_persona_config_user_name_strips_whitespace_and_treats_empty_as_none(
+    tmp_path: Path,
+) -> None:
+    """Whitespace-only or empty user_name → None (treated as unset)."""
+    import json
+    p = tmp_path / "persona_config.json"
+    p.write_text(json.dumps({"user_name": "  Hana  "}))
+    assert PersonaConfig.load(p).user_name == "Hana"
+    p.write_text(json.dumps({"user_name": "   "}))
+    assert PersonaConfig.load(p).user_name is None
+    p.write_text(json.dumps({"user_name": ""}))
+    assert PersonaConfig.load(p).user_name is None
+    p.write_text(json.dumps({"user_name": 42}))  # wrong type
+    assert PersonaConfig.load(p).user_name is None
