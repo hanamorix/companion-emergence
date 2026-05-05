@@ -354,3 +354,66 @@ def test_cmd_tail_no_subprotocols_when_token_absent(
     rc = daemon.cmd_tail(_args("nell"))
     assert rc == 0
     assert captured["subprotocols"] is None
+
+
+# ---- Bug B (audit-3): readiness handoff via cmd_start out= dict ----
+
+
+def test_cmd_start_populates_readiness_when_already_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the bridge is already running, cmd_start returns 2 AND populates
+    out['readiness'] with the live BridgeReadiness so callers can connect
+    without re-reading state_file (which would race against state_file
+    rewrites by the supervisor). Bug B from the 2026-05-05 audit-3."""
+    from brain.bridge import daemon, state_file
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(
+        "brain.paths.get_persona_dir", lambda name: persona_dir
+    )
+
+    s = state_file.BridgeState(
+        persona="nell", pid=4321, port=51234,
+        started_at="2026-05-05T00:00:00+00:00",
+        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        auth_token="tok-aaa",
+    )
+    state_file.write(persona_dir, s)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+
+    out: dict = {}
+    rc = daemon.cmd_start(_args("nell"), out=out)
+    assert rc == 2  # already-running
+    assert "readiness" in out
+    r = out["readiness"]
+    assert r.pid == 4321
+    assert r.port == 51234
+    assert r.auth_token == "tok-aaa"
+
+
+def test_cmd_start_readiness_is_optional_for_legacy_callers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cmd_start without out= behaves exactly as before (argparse handlers
+    don't pass out=). The new readiness handoff is purely additive."""
+    from brain.bridge import daemon, state_file
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(
+        "brain.paths.get_persona_dir", lambda name: persona_dir
+    )
+
+    s = state_file.BridgeState(
+        persona="nell", pid=4321, port=51234,
+        started_at="2026-05-05T00:00:00+00:00",
+        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        auth_token=None,
+    )
+    state_file.write(persona_dir, s)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+
+    rc = daemon.cmd_start(_args("nell"))  # no out=
+    assert rc == 2

@@ -171,3 +171,88 @@ def test_extract_items_returns_empty_when_provider_raises() -> None:
     provider = _FailingProvider()
     items = extract_items("Hana: test", provider=provider, max_retries=0)
     assert items == []
+
+
+# ---- Bug A (audit-3): named speaker disambiguation ----
+
+
+def test_format_transcript_uses_named_speakers_when_provided() -> None:
+    """format_transcript replaces 'user:' / 'assistant:' with the actual
+    names when both are passed. Bug A from the 2026-05-05 audit-3 — the
+    extractor LLM was conflating the current user with historical figures
+    referenced by the assistant because both showed up unlabeled."""
+    turns = [
+        {"speaker": "user", "text": "Hey Baby, It's Hana"},
+        {"speaker": "assistant", "text": "babe — there you are"},
+    ]
+    result = format_transcript(turns, user_name="Hana", assistant_name="Nell")
+    assert result == "Hana: Hey Baby, It's Hana\nNell: babe — there you are"
+
+
+def test_format_transcript_legacy_path_when_names_missing() -> None:
+    """Both names must be set for the named path. Either one missing
+    falls back to legacy 'user:' / 'assistant:' labels — backward-compat
+    for forkers who haven't set PersonaConfig.user_name."""
+    turns = [
+        {"speaker": "user", "text": "hi"},
+        {"speaker": "assistant", "text": "hey"},
+    ]
+    legacy_result = format_transcript(turns)
+    assert legacy_result == "user: hi\nassistant: hey"
+    # Only assistant_name set → still legacy path
+    one_only = format_transcript(turns, assistant_name="Nell")
+    assert one_only == "user: hi\nNell: hey"
+    # Empty string user_name → falsy → legacy path
+    empty_user = format_transcript(turns, user_name="", assistant_name="Nell")
+    assert empty_user == "user: hi\nNell: hey"
+
+
+def test_extract_items_uses_named_prompt_when_both_names_set() -> None:
+    """extract_items routes to EXTRACTION_PROMPT_NAMED when both names
+    are provided, including the disambiguation header. Verifies the
+    actual provider prompt includes the user_name and assistant_name
+    context lines so the LLM knows who is who."""
+    captured: list[str] = []
+
+    class _CaptureProvider:
+        def name(self): return "capture"
+        def healthy(self): return True
+        def chat(self, *a, **kw): raise NotImplementedError
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "[]"  # empty extraction is valid
+
+    extract_items(
+        "Hana: foo\nNell: bar",
+        provider=_CaptureProvider(),
+        user_name="Hana",
+        assistant_name="Nell",
+    )
+    assert len(captured) == 1
+    p = captured[0]
+    # Named prompt contains the disambiguation header
+    assert "Hana is the human user" in p
+    assert "Nell is the assistant" in p
+    assert "HISTORICAL references" in p
+    # Transcript embedded
+    assert "Hana: foo" in p
+    assert "Nell: bar" in p
+
+
+def test_extract_items_uses_legacy_prompt_when_names_missing() -> None:
+    """extract_items routes to EXTRACTION_PROMPT_LEGACY when names are
+    missing — backward-compat preserved."""
+    captured: list[str] = []
+
+    class _CaptureProvider:
+        def name(self): return "capture"
+        def healthy(self): return True
+        def chat(self, *a, **kw): raise NotImplementedError
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "[]"
+
+    extract_items("user: foo\nassistant: bar", provider=_CaptureProvider())
+    assert len(captured) == 1
+    # Legacy prompt does NOT have the named header
+    assert "is the human user" not in captured[0]
