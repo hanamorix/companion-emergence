@@ -27,6 +27,8 @@ from brain.migrator.report import MigrationReport, format_report, write_source_m
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
 
+_MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
+
 
 @dataclass(frozen=True)
 class MigrateArgs:
@@ -342,16 +344,33 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
 
 
 def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
-    if path.exists() and any(path.iterdir()):
-        if not force:
-            raise FileExistsError(
-                f"{kind.capitalize()} is non-empty: {path}. Pass --force to overwrite."
-            )
-        for child in path.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+    """Refuse to clobber a non-empty dir without --force, and even with --force
+    refuse to clobber a directory that doesn't look like a prior migration
+    target (no migration-report.md / source-manifest.json / memories.db).
+    """
+    if not path.exists():
+        return
+    if not any(path.iterdir()):
+        return  # empty dir is safe to use
+    if not force:
+        raise FileExistsError(
+            f"{kind.capitalize()} is non-empty: {path}. Pass --force to overwrite."
+        )
+    # --force: only clobber if the directory looks like a prior migration target
+    has_marker = any((path / m).exists() for m in _MIGRATOR_MARKER_FILES)
+    if not has_marker:
+        raise FileExistsError(
+            f"{kind.capitalize()} {path} is not empty and does not contain any of "
+            f"{sorted(_MIGRATOR_MARKER_FILES)} — refusing to clobber an "
+            f"unrelated directory even with --force. Choose a different "
+            f"output path or remove the directory first."
+        )
+    # --force + has marker: safe to clobber
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _verify_sources_unchanged(og_dir: Path, manifest: list[FileManifest]) -> None:

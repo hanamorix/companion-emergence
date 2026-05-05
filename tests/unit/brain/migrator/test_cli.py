@@ -644,3 +644,55 @@ def test_run_migrate_migrates_reflex_log_end_to_end(tmp_path: Path) -> None:
     assert fire0["output_memory_id"] is None
     assert "output_preview" not in fire0
     assert "description" not in fire0
+
+
+def test_run_migrate_refuses_force_clobber_of_non_migrator_directory(
+    og_dir: Path, tmp_path: Path
+) -> None:
+    """nell migrate --output X --force must refuse to clobber a directory
+    that doesn't look like a prior migration target. Pre-fix: silently
+    deleted unrelated user files. Post-fix: raises FileExistsError naming
+    the missing migrator marker files."""
+    innocent = tmp_path / "innocent_dir"
+    innocent.mkdir()
+    (innocent / "notes.txt").write_text("important user note")
+    (innocent / "photo.jpg").write_bytes(b"fake jpg bytes")
+    sub = innocent / "projects"
+    sub.mkdir()
+    (sub / "main.rs").write_text("fn main() {}")
+
+    args = MigrateArgs(
+        input_dir=og_dir, output_dir=innocent, install_as=None, force=True
+    )
+
+    with pytest.raises(FileExistsError) as excinfo:
+        run_migrate(args)
+    msg = str(excinfo.value)
+    assert "refusing to clobber" in msg
+    # Marker files are named in the error so the operator knows what's missing
+    assert "migration-report.md" in msg
+
+    # The original files must still exist
+    assert (innocent / "notes.txt").exists()
+    assert (innocent / "notes.txt").read_text() == "important user note"
+    assert (innocent / "photo.jpg").exists()
+    assert (sub / "main.rs").exists()
+
+
+def test_run_migrate_force_clobber_succeeds_when_marker_present(
+    og_dir: Path, tmp_path: Path
+) -> None:
+    """When the --force target has a prior migration's marker file
+    (migration-report.md / source-manifest.json / memories.db), --force
+    is allowed to clobber. This is the normal re-run case."""
+    output = tmp_path / "prior_migration"
+    output.mkdir()
+    # Marker indicating this was a prior migration target
+    (output / "migration-report.md").write_text("prior run")
+
+    args = MigrateArgs(
+        input_dir=og_dir, output_dir=output, install_as=None, force=True
+    )
+    # Should not raise
+    report = run_migrate(args)
+    assert report.memories_migrated > 0
