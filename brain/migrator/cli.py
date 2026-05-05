@@ -332,14 +332,23 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
     # ---- legacy preservation ----
     legacy_files_preserved = 0
     legacy_files_missing = 0
+    legacy_integrity_issues: list[str] = []
     legacy_skipped_reason: str | None = None
     try:
-        preserved, missing = migrate_legacy_files(
+        preserved, missing, integrity_issues = migrate_legacy_files(
             og_data_dir=args.input_dir,
             persona_dir=work_dir,
         )
         legacy_files_preserved = len(preserved)
         legacy_files_missing = len(missing)
+        # Format integrity issues as report-ready strings. Non-fatal: the
+        # legacy preserve-broken-bytes design intent stands; this is a
+        # diagnostic surfacing the rare COPY-time truncation case.
+        legacy_integrity_issues = [
+            f"{i.name}: src {i.src_size}B sha256={i.src_sha256[:12]} != "
+            f"dest {i.dest_size}B sha256={i.dest_sha256[:12]}"
+            for i in integrity_issues
+        ]
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         legacy_skipped_reason = f"copy_error: {exc}"
 
@@ -401,6 +410,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         legacy_files_preserved=legacy_files_preserved,
         legacy_files_missing=legacy_files_missing,
         legacy_skipped_reason=legacy_skipped_reason,
+        legacy_integrity_issues=legacy_integrity_issues,
         soul_candidates_migrated=soul_candidates_migrated,
         soul_candidates_skipped_missing_memory_id=soul_candidates_skipped_missing_memory_id,
         soul_candidates_skipped_reason=soul_candidates_skipped_reason,
@@ -431,20 +441,25 @@ def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
     """Refuse to clobber a non-empty dir without --force, and even with --force
     refuse to clobber a directory that doesn't look like a prior migration
     target (no migration-report.md / source-manifest.json / memories.db).
+
+    `kind` is a short noun phrase used in the error message (e.g.
+    "output directory"). Lowercase by contract — the function uppercases
+    the first character only, so mid-word capitalization is preserved.
     """
+    label = kind[:1].upper() + kind[1:] if kind else kind
     if not path.exists():
         return
     if not any(path.iterdir()):
         return  # empty dir is safe to use
     if not force:
         raise FileExistsError(
-            f"{kind.capitalize()} is non-empty: {path}. Pass --force to overwrite."
+            f"{label} is non-empty: {path}. Pass --force to overwrite."
         )
     # --force: only clobber if the directory looks like a prior migration target
     has_marker = any((path / m).exists() for m in _MIGRATOR_MARKER_FILES)
     if not has_marker:
         raise FileExistsError(
-            f"{kind.capitalize()} {path} is not empty and does not contain any of "
+            f"{label} {path} is not empty and does not contain any of "
             f"{sorted(_MIGRATOR_MARKER_FILES)} — refusing to clobber an "
             f"unrelated directory even with --force. Choose a different "
             f"output path or remove the directory first."
