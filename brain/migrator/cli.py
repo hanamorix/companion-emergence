@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.bridge.state_file import pid_is_alive
 from brain.emotion import vocabulary as _vocabulary
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -28,6 +29,67 @@ from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
 
 _MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
+
+
+def _migrate_lock_path(target: Path) -> Path:
+    """Lockfile path for a migration target.
+
+    Lives as a sibling of the target so rmtree of the target dir (the
+    --install-as flow blows away <name>.new before re-creating it) doesn't
+    take the lock with it.
+    """
+    return target.parent / f".{target.name}.migrate.lock"
+
+
+def _acquire_migrate_lock(lock_path: Path) -> int:
+    """Atomically acquire the migrate lock for a target. Returns open fd.
+
+    Raises RuntimeError if another live process holds the lock. Stale locks
+    (PID is dead, or contents are malformed) are taken over silently.
+
+    Mirrors the brain.bridge.daemon.acquire_lock pattern: O_CREAT | O_EXCL,
+    PID-liveness check on conflict.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        existing_pid: int | None = None
+        try:
+            first_line = lock_path.read_text(encoding="utf-8").splitlines()[0]
+            existing_pid = int(first_line.strip())
+        except (OSError, ValueError, IndexError):
+            existing_pid = None
+        if existing_pid is None or not pid_is_alive(existing_pid):
+            # Stale or unreadable — take over.
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            return _acquire_migrate_lock(lock_path)
+        raise RuntimeError(
+            f"another migrate is in progress: pid={existing_pid} holds {lock_path}. "
+            f"If you're sure no other migrate is running, remove the lockfile."
+        ) from None
+    payload = f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n"
+    os.write(fd, payload.encode("utf-8"))
+    return fd
+
+
+def _release_migrate_lock(lock_path: Path, fd: int) -> None:
+    """Release a migrate lock acquired via _acquire_migrate_lock.
+
+    Idempotent against double-release; tolerates the file having been removed
+    out from under us.
+    """
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -49,6 +111,24 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     reader = OGReader(args.input_dir)
     reader.check_preflight()
 
+    # Determine the lock target. For --output the target is the output dir
+    # itself; for --install-as it's the final persona dir (NOT the .new
+    # working dir, since that gets rmtree'd inside the lock-held region).
+    if args.output_dir is not None:
+        lock_target = args.output_dir
+    else:
+        assert args.install_as is not None
+        lock_target = get_persona_dir(args.install_as)
+    lock_path = _migrate_lock_path(lock_target)
+    lock_fd = _acquire_migrate_lock(lock_path)
+    try:
+        return _run_migrate_locked(args, reader)
+    finally:
+        _release_migrate_lock(lock_path, lock_fd)
+
+
+def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
+    """Migration body — runs under the migrate lock."""
     # Determine the write directory.
     if args.output_dir is not None:
         work_dir = args.output_dir
