@@ -112,7 +112,8 @@ def test_reader_manifest_records_sha256_size_mtime(og_dir: Path) -> None:
 
 
 def test_reader_raises_if_memories_lock_is_recent(og_dir: Path) -> None:
-    """If memories_v2.json.lock is recent (< 5 min), raise LiveLockDetected."""
+    """If memories_v2.json.lock is recent (< 90s — 1.5x OG's 60s tick),
+    raise LiveLockDetected. Bridge is almost certainly actively writing."""
     (og_dir / "memories_v2.json.lock").write_bytes(b"")
     reader = OGReader(og_dir)
     with pytest.raises(LiveLockDetected):
@@ -120,7 +121,7 @@ def test_reader_raises_if_memories_lock_is_recent(og_dir: Path) -> None:
 
 
 def test_reader_preflight_ok_when_lock_is_stale(og_dir: Path) -> None:
-    """A lock file older than 5 minutes is treated as stale (no error)."""
+    """A lock file older than 90 seconds is treated as stale (no error)."""
     lock = og_dir / "memories_v2.json.lock"
     lock.write_bytes(b"")
     old_time = time.time() - 3600  # 1 hour ago
@@ -128,6 +129,31 @@ def test_reader_preflight_ok_when_lock_is_stale(og_dir: Path) -> None:
 
     reader = OGReader(og_dir)
     reader.check_preflight()  # should not raise
+
+
+def test_reader_preflight_threshold_is_90s_not_300s(og_dir: Path) -> None:
+    """M-8 (audit-2 follow-up): threshold tightened from 300s to 90s.
+    Lock at 120s old must now be considered stale (was previously live)."""
+    lock = og_dir / "memories_v2.json.lock"
+    lock.write_bytes(b"")
+    old_time = time.time() - 120  # 2 minutes ago — under old 300s threshold, over new 90s
+    os.utime(lock, (old_time, old_time))
+
+    reader = OGReader(og_dir)
+    reader.check_preflight()  # 120s > 90s → stale, no raise
+
+
+def test_reader_preflight_force_skips_check(og_dir: Path) -> None:
+    """check_preflight(force=True) bypasses the lock detection entirely.
+    Wired to --force-preflight at the CLI for operators who know the lock
+    is stale (e.g. lock file from a prior crash)."""
+    (og_dir / "memories_v2.json.lock").write_bytes(b"")  # fresh lock
+    reader = OGReader(og_dir)
+    # Without force: would raise
+    with pytest.raises(LiveLockDetected):
+        reader.check_preflight()
+    # With force: bypass
+    reader.check_preflight(force=True)
 
 
 def test_reader_preflight_ok_when_no_lock(og_dir: Path) -> None:

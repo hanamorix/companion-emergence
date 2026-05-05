@@ -12,7 +12,19 @@ from typing import Any
 
 import numpy as np
 
-_LIVE_LOCK_THRESHOLD_SECONDS = 5 * 60
+# M-8 (audit-2 follow-up): tightened from 5*60 to 90.
+#
+# Rationale: OG NellBrain's supervisor wakes every ingest_interval_sec=60
+# (see ~/NellBrain/nell_supervisor.py:46). The lock sidecar's
+# mtime gets touched each acquire (open in "a+" mode), so a healthy bridge
+# refreshes the mtime every ~60s during writes. 90s = 1.5× tick interval —
+# tight enough to detect actual hangs (a held-lock for >90s is almost
+# certainly a wedged process), loose enough to not false-positive against
+# a healthy supervisor between writes.
+#
+# Operators can override with --force-preflight when they're certain no
+# OG bridge is running (stale lock, lock file from a prior crash, etc.).
+_LIVE_LOCK_THRESHOLD_SECONDS = 90
 
 
 class LiveLockDetected(Exception):  # noqa: N818
@@ -42,13 +54,21 @@ class OGReader:
         self._dir = Path(data_dir)
         self._manifests: dict[str, FileManifest] = {}
 
-    def check_preflight(self) -> None:
+    def check_preflight(self, *, force: bool = False) -> None:
         """Detect a live OG bridge and refuse to proceed.
 
         Raises LiveLockDetected if `memories_v2.json.lock` exists and its
-        mtime is within the last 5 minutes (bridge is actively writing).
-        Stale locks are tolerated.
+        mtime is within the last 90 seconds (1.5× OG's 60s supervisor
+        cadence — bridge is almost certainly actively writing). Older locks
+        are treated as stale and tolerated.
+
+        Args:
+            force: If True, skip the lock check entirely. Use only when
+                you're certain no OG bridge is running (lock from a prior
+                crash, etc.). The migrator's clobber safety still applies.
         """
+        if force:
+            return
         lock = self._dir / "memories_v2.json.lock"
         if not lock.exists():
             return
@@ -56,7 +76,9 @@ class OGReader:
         if age_s < _LIVE_LOCK_THRESHOLD_SECONDS:
             raise LiveLockDetected(
                 f"Recent lock file at {lock} (age {age_s:.0f}s < "
-                f"{_LIVE_LOCK_THRESHOLD_SECONDS}s). Stop the OG bridge before migrating."
+                f"{_LIVE_LOCK_THRESHOLD_SECONDS}s). Stop the OG bridge "
+                f"before migrating, or pass --force-preflight if you're "
+                f"certain the lock is stale."
             )
 
     def read_memories(self) -> list[dict[str, Any]]:
