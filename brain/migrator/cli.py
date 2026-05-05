@@ -19,7 +19,9 @@ from brain.migrator.og_interests import extract_interests_from_og, extract_soul_
 from brain.migrator.og_journal_dna import migrate_creative_dna, migrate_journal_memories
 from brain.migrator.og_legacy import migrate_legacy_files
 from brain.migrator.og_reflex import migrate_reflex_arcs
+from brain.migrator.og_reflex_log import migrate_reflex_log
 from brain.migrator.og_soul import extract_crystallizations_from_og
+from brain.migrator.og_soul_candidates import migrate_soul_candidates
 from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
@@ -258,6 +260,31 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
     except OSError as exc:
         legacy_skipped_reason = f"copy_error: {exc}"
 
+    # ---- soul_candidates schema migration ----
+    soul_candidates_migrated = 0
+    soul_candidates_skipped_missing_memory_id = 0
+    soul_candidates_skipped_reason: str | None = None
+    try:
+        sc_migrated, sc_skipped = migrate_soul_candidates(
+            og_data_dir=args.input_dir,
+            persona_dir=work_dir,
+        )
+        soul_candidates_migrated = sc_migrated
+        soul_candidates_skipped_missing_memory_id = sc_skipped
+    except Exception as exc:  # noqa: BLE001
+        soul_candidates_skipped_reason = f"migrate_error: {exc}"
+
+    # ---- reflex_log schema migration ----
+    reflex_log_fires_migrated = 0
+    reflex_log_skipped_reason: str | None = None
+    try:
+        reflex_log_fires_migrated = migrate_reflex_log(
+            og_data_dir=args.input_dir,
+            persona_dir=work_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        reflex_log_skipped_reason = f"migrate_error: {exc}"
+
     elapsed = time.monotonic() - started
 
     # ---- post-run source re-stat (detect OG mutation during the run) ----
@@ -291,6 +318,11 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         legacy_files_preserved=legacy_files_preserved,
         legacy_files_missing=legacy_files_missing,
         legacy_skipped_reason=legacy_skipped_reason,
+        soul_candidates_migrated=soul_candidates_migrated,
+        soul_candidates_skipped_missing_memory_id=soul_candidates_skipped_missing_memory_id,
+        soul_candidates_skipped_reason=soul_candidates_skipped_reason,
+        reflex_log_fires_migrated=reflex_log_fires_migrated,
+        reflex_log_skipped_reason=reflex_log_skipped_reason,
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
