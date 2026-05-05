@@ -23,6 +23,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from brain.health.attempt_heal import save_with_backup_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,9 +72,8 @@ def migrate_reflex_log(
     if migrated_fires:
         dest = persona_dir / "reflex_log.json"
         payload = {"version": 1, "fires": migrated_fires}
-        dest.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        save_with_backup_text(
+            dest, json.dumps(payload, ensure_ascii=False, indent=2)
         )
 
     return len(migrated_fires)

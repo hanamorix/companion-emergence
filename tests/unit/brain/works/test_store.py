@@ -160,3 +160,55 @@ def test_search_returns_empty_on_malformed_fts5_query(tmp_path: Path) -> None:
     ]:
         result = store.search(malformed, limit=10)
         assert result == [], f"query {malformed!r} should return [] (got {result!r})"
+
+
+def test_list_recent_returns_empty_on_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symmetric to test_search_returns_empty_on_malformed_fts5_query: a
+    SQLite OperationalError on list_recent must not propagate to the bridge
+    HTTP layer as 500. Returns [] so the caller sees "no rows" instead of
+    a stack trace.
+
+    Reproduces I-3 from the 2026-05-05 follow-up audit: the original I-2 fix
+    only protected search() — list_recent + get were left uncaught."""
+    import sqlite3
+    store = WorksStore(tmp_path / "works.db")
+    w = _w(work_id="111111111111", title="A")
+    store.insert(w, content="content")
+
+    real_connect = store._connect
+
+    class _RaisingConn:
+        def __init__(self, conn): self._conn = conn
+        def __enter__(self): return self
+        def __exit__(self, *a): self._conn.__exit__(*a)
+        def execute(self, *a, **kw):
+            raise sqlite3.OperationalError("simulated DB corruption")
+
+    monkeypatch.setattr(store, "_connect", lambda: _RaisingConn(real_connect()))
+    assert store.list_recent(limit=5) == []
+
+
+def test_get_returns_none_on_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symmetric to list_recent above: get() returns None on
+    sqlite3.OperationalError instead of propagating. Mirrors how the
+    function already handles the missing-row case."""
+    import sqlite3
+    store = WorksStore(tmp_path / "works.db")
+    w = _w(work_id="222222222222", title="B")
+    store.insert(w, content="content")
+
+    real_connect = store._connect
+
+    class _RaisingConn:
+        def __init__(self, conn): self._conn = conn
+        def __enter__(self): return self
+        def __exit__(self, *a): self._conn.__exit__(*a)
+        def execute(self, *a, **kw):
+            raise sqlite3.OperationalError("simulated DB corruption")
+
+    monkeypatch.setattr(store, "_connect", lambda: _RaisingConn(real_connect()))
+    assert store.get("222222222222") is None

@@ -254,7 +254,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_tail(args) -> int:
-    """Subscribe to /events and print every event as a JSON line."""
+    """Subscribe to /events and print every event as a JSON line.
+
+    Auth via Sec-WebSocket-Protocol: bearer, <token> — the only auth path
+    the server accepts. Previously this used a ?token= query string, which
+    (a) the server doesn't read, so tail was silently broken in any
+    config with auth enabled, and (b) leaks the bearer token through
+    process listings and proxy logs.
+    """
     from websockets.sync.client import connect
 
     from brain.paths import get_persona_dir
@@ -264,10 +271,10 @@ def cmd_tail(args) -> int:
     if s is None or not state_file.is_running(persona_dir):
         print("bridge not running", file=sys.stderr)
         return 1
-    token_qs = f"?token={s.auth_token}" if s.auth_token else ""
-    url = f"ws://127.0.0.1:{s.port}/events{token_qs}"
+    url = f"ws://127.0.0.1:{s.port}/events"
+    subprotocols = ["bearer", s.auth_token] if s.auth_token else None
     try:
-        with connect(url) as ws:
+        with connect(url, subprotocols=subprotocols) as ws:
             while True:
                 msg = ws.recv()
                 print(msg)
