@@ -104,7 +104,7 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
             ).fetchall()
             memories = [_row_to_memory(row) for row in rows]
             state = aggregate_state(memories)
-            days = days_since_human(store, now=now)
+            days = days_since_human(store, now=now, persona_dir=persona_dir)
             # session_hours=0 here — the panel snapshot doesn't track per-session
             # time. count_words_in_session falls back to 1-hour window on 0.
             words = count_words_in_session(
