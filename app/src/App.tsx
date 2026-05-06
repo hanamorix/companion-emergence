@@ -2,22 +2,23 @@ import { useEffect, useState } from "react";
 import { fetchPersonaState, type PersonaState } from "./bridge";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
+import { LeftPanel } from "./components/LeftPanel";
 
 const STATE_POLL_MS = 5000;
 
 /**
- * NellFace shell — three columns: TBD-left-panel / NellAvatar / ChatPanel.
+ * NellFace shell — three columns: LeftPanel / NellAvatar / ChatPanel.
  *
- * Phase 2 (this commit) ships avatar + chat working end-to-end against
- * the bridge. Phase 3 fills in the left panels (Inner Weather, Body,
- * Recent Interior, Soul, Connection) reading the same persona state.
+ * Left panel rotates through Inner Weather / Body / Recent Interior /
+ * Soul / Connection via the icon column. All five read the same
+ * /persona/state poll.
  */
 export default function App() {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(false);
 
-  // Poll /persona/state every 5s. Switching to SSE/WS later when the
-  // backend exposes a streaming surface.
   useEffect(() => {
     let cancelled = false;
     async function tick() {
@@ -39,39 +40,50 @@ export default function App() {
     };
   }, []);
 
+  // User-controlled reduced motion — sets a data attribute on <html>
+  // that styles.css picks up. Phase 4 will sync this with PersonaConfig.
+  useEffect(() => {
+    document.documentElement.dataset.reducedMotion = reducedMotion ? "true" : "false";
+  }, [reducedMotion]);
+
   return (
     <div
       style={{
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        gap: 36,
+        gap: 28,
         width: "100vw",
         height: "100vh",
       }}
     >
-      {/* Left column — placeholder until Phase 3 panels land */}
-      <div
-        style={{
-          width: 220,
-          minHeight: 280,
-          opacity: 0.3,
-          fontSize: 10,
-          color: "var(--mauve)",
-          fontFamily: "var(--font-disp)",
-          letterSpacing: "0.08em",
-          textTransform: "uppercase",
-          padding: 8,
-        }}
-      >
-        {stateError ? `state: ${stateError}` : "panels — phase 3"}
-      </div>
+      <LeftPanel
+        state={state}
+        alwaysOnTop={alwaysOnTop}
+        reducedMotion={reducedMotion}
+        onAlwaysOnTopChange={setAlwaysOnTop}
+        onReducedMotionChange={setReducedMotion}
+      />
 
-      {/* Avatar */}
       <NellAvatar state={state} />
 
-      {/* Chat */}
       <ChatPanel />
+
+      {stateError && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 8,
+            left: 8,
+            fontSize: 10,
+            color: "var(--crimson)",
+            fontFamily: "var(--font-disp)",
+            opacity: 0.7,
+          }}
+        >
+          state: {stateError}
+        </div>
+      )}
     </div>
   );
 }
