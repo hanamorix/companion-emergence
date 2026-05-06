@@ -31,6 +31,12 @@ from brain.migrator.cli import build_parser as _build_migrate_parser
 from brain.paths import get_home, get_persona_dir
 from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
+from brain.setup import (
+    VOICE_TEMPLATES,
+    install_voice_template,
+    validate_persona_name,
+    write_persona_config,
+)
 from brain.utils.time import iso_utc
 
 
@@ -1290,6 +1296,154 @@ def _chat_handler(args: argparse.Namespace) -> int:
     return _chat_via_bridge(args, persona_dir, readiness=readiness_out.get("readiness"))
 
 
+def _prompt(question: str, default: str | None = None) -> str:
+    """Interactive prompt with optional default. EOFError → default or "".
+
+    Test seam: monkeypatched in unit tests via input() since this calls it
+    directly. Behavior is intentionally minimal — no readline, no
+    coloring; the wizard is short.
+    """
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        raw = input(f"{question}{suffix}: ").strip()
+    except EOFError:
+        return default if default is not None else ""
+    return raw if raw else (default if default is not None else "")
+
+
+def _prompt_yes_no(question: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = _prompt(f"{question} [{suffix}]").lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def _init_handler(args: argparse.Namespace) -> int:
+    """Set up a new persona — interactive wizard or flag-driven.
+
+    Three things this command guarantees:
+      1. <NELLBRAIN_HOME>/personas/<name>/ exists
+      2. persona_config.json is written with user_name set (closes Bug A
+         attribution drift — extractor needs to know who the user is)
+      3. voice.md is written from the chosen template (or absent, in
+         which case the framework's DEFAULT_VOICE_TEMPLATE applies)
+
+    Optionally migrates OG NellBrain data when --migrate-from is given.
+
+    Non-interactive when all required flags are supplied; otherwise
+    prompts for what's missing.
+    """
+    persona = args.persona
+    user_name = args.user_name
+    migrate_from = args.migrate_from
+    voice_template = args.voice_template
+    force = bool(getattr(args, "force", False))
+
+    # ----- interactive fill-in for missing flags -----
+    if not persona:
+        persona = _prompt("persona name (e.g. 'nell', 'siren')", default="nell")
+    try:
+        validate_persona_name(persona)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if user_name is None:  # explicit empty string allowed (means "leave unset")
+        user_name = _prompt(
+            "your name (the human's — used so the brain knows who's "
+            "talking to her)",
+            default="",
+        ) or None
+
+    if migrate_from is None and not getattr(args, "fresh", False):
+        if _prompt_yes_no("migrate from OG NellBrain data?", default=False):
+            migrate_from = _prompt("path to OG data dir") or None
+            if not migrate_from:
+                print("no path given — skipping migration", file=sys.stderr)
+
+    if voice_template is None:
+        print()
+        print("voice template options:")
+        for key, desc in VOICE_TEMPLATES.items():
+            print(f"  {key}: {desc}")
+        voice_template = _prompt("voice template", default="default")
+    if voice_template not in VOICE_TEMPLATES:
+        print(
+            f"error: unknown voice template {voice_template!r} — must be "
+            f"one of {sorted(VOICE_TEMPLATES.keys())}",
+            file=sys.stderr,
+        )
+        return 1
+
+    persona_dir = get_persona_dir(persona)
+
+    # ----- guard against clobbering an existing persona -----
+    if persona_dir.exists() and any(persona_dir.iterdir()) and not force:
+        if migrate_from:
+            print(
+                f"persona '{persona}' already exists at {persona_dir}.\n"
+                f"to re-migrate over an existing persona, run:\n"
+                f"  uv run nell migrate --input {migrate_from} "
+                f"--install-as {persona} --force",
+                file=sys.stderr,
+            )
+            return 1
+        # Fresh-init over existing persona — refuse unless --force; we
+        # don't want a wizard run to accidentally overwrite a live
+        # voice.md or persona_config.
+        print(
+            f"persona '{persona}' already exists at {persona_dir}.\n"
+            f"re-run with --force to overwrite the persona_config.json + "
+            f"voice.md (existing memories/soul/etc are preserved).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ----- migration path -----
+    if migrate_from:
+        from brain.migrator.cli import MigrateArgs, run_migrate
+
+        try:
+            run_migrate(
+                MigrateArgs(
+                    input_dir=Path(migrate_from).expanduser(),
+                    output_dir=None,
+                    install_as=persona,
+                    force=force,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — migration failure is operator-actionable
+            print(f"migration failed: {exc}", file=sys.stderr)
+            return 1
+
+    # ----- always: write persona_config + voice.md -----
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    config_path = write_persona_config(persona_dir, user_name=user_name)
+    voice_path = install_voice_template(persona_dir, voice_template)
+
+    print()
+    print(f"✓ persona '{persona}' ready at {persona_dir}")
+    print(f"  - {config_path.name}: user_name={user_name!r}")
+    if voice_path is not None:
+        print(f"  - {voice_path.name}: copied from '{voice_template}' template")
+        if voice_template == "nell-example":
+            print(
+                f"    edit it before chatting — replace Nell-specific "
+                f"identity content with your own"
+            )
+    else:
+        print(
+            f"  - voice.md: not written; framework's DEFAULT_VOICE_TEMPLATE "
+            f"applies on first chat"
+        )
+    if migrate_from:
+        print(f"  - migrated from {migrate_from}")
+    print()
+    print(f"next: uv run nell chat --persona {persona}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all stub subcommands."""
     parser = argparse.ArgumentParser(
@@ -1309,6 +1463,52 @@ def _build_parser() -> argparse.ArgumentParser:
             help=f"(stub) {name} — wired in a later week",
         )
         sub.set_defaults(func=_make_stub(name))
+
+    # nell init — interactive setup wizard for new personas (both fresh and
+    # OG-migration paths). Closes the user-experience gap where forkers
+    # had to hand-edit persona_config.json + voice.md.
+    init_sub = subparsers.add_parser(
+        "init",
+        help="Set up a new persona (interactive wizard, with non-interactive flags).",
+    )
+    init_sub.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. Prompts if omitted.",
+    )
+    init_sub.add_argument(
+        "--user-name",
+        default=None,
+        help=(
+            "Your name (the human's). Used by the ingest extractor so the "
+            "brain doesn't conflate you with historical figures referenced "
+            "in soul context. Prompts if omitted; pass empty string ('') "
+            "to leave unset."
+        ),
+    )
+    src_group = init_sub.add_mutually_exclusive_group()
+    src_group.add_argument(
+        "--migrate-from",
+        default=None,
+        help="Path to OG NellBrain data dir to migrate from. Prompts if omitted.",
+    )
+    src_group.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Skip the migrate prompt — start from a clean persona dir.",
+    )
+    init_sub.add_argument(
+        "--voice-template",
+        default=None,
+        choices=sorted(VOICE_TEMPLATES.keys()),
+        help="Voice.md starter. Prompts if omitted.",
+    )
+    init_sub.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing persona's persona_config.json + voice.md.",
+    )
+    init_sub.set_defaults(func=_init_handler)
 
     status_sub = subparsers.add_parser(
         "status",
