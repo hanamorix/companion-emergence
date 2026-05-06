@@ -16,6 +16,7 @@ from brain.bridge.provider import LLMProvider
 from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.utils.memory import list_conversation_memories
 
 
 class NoSeedAvailable(Exception):  # noqa: N818
@@ -121,7 +122,7 @@ class DreamEngine:
             return mem
 
         cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
-        candidates = self.store.list_by_type("conversation", active_only=True)
+        candidates = list_conversation_memories(self.store, active_only=True)
         in_window = [m for m in candidates if m.created_at >= cutoff]
         if not in_window:
             raise NoSeedAvailable(
