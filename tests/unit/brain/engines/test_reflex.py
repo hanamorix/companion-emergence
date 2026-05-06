@@ -337,11 +337,21 @@ def _write_single_arc(
 
 
 def _seed_emotion_memory(store: MemoryStore, emotions: dict[str, float]) -> str:
+    """Seed a memory with the metadata shape production actually writes.
+
+    The ingest pipeline tags each extracted memory with
+    `metadata.source_summary = "conversation:<sid>"` (see
+    brain/ingest/commit.py). days_since_human reads that marker to
+    detect closed-session conversation activity. Tests that want to
+    simulate "user spoke recently" should match this shape — NOT use
+    memory_type="conversation" which no production code path writes.
+    """
     mem = Memory.create_new(
         content="seed",
-        memory_type="conversation",
-        domain="us",
+        memory_type="observation",
+        domain="brain",
         emotions=emotions,
+        metadata={"source_summary": "conversation:test_seed"},
     )
     store.create(mem)
     return mem.id
