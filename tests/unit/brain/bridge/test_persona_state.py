@@ -160,3 +160,39 @@ def test_build_persona_state_does_not_raise_on_corrupt_dbs(tmp_path: Path) -> No
     assert "interior" in state
     assert "soul_highlight" in state
     assert state["mode"] == "live"
+
+
+def test_build_persona_state_connection_block(tmp_path: Path) -> None:
+    """Connection block reads provider from persona_config and model from
+    the provider→default-model map. last_heartbeat_at comes from
+    heartbeat_state.json."""
+    from brain.persona_config import PersonaConfig
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    PersonaConfig(provider="claude-cli", user_name="Hana").save(
+        persona_dir / "persona_config.json"
+    )
+    (persona_dir / "heartbeat_state.json").write_text(
+        '{"last_tick_at": "2026-05-06T13:00:00Z", "tick_count": 5}'
+    )
+
+    state = build_persona_state(persona_dir)
+    conn = state["connection"]
+    assert conn["provider"] == "claude-cli"
+    assert conn["model"] == "sonnet"
+    assert conn["last_heartbeat_at"] == "2026-05-06T13:00:00Z"
+
+
+def test_build_persona_state_connection_block_missing_files_safe(tmp_path: Path) -> None:
+    """No persona_config + no heartbeat_state → connection block has Nones,
+    never raises."""
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    state = build_persona_state(persona_dir)
+    conn = state["connection"]
+    # PersonaConfig.load returns defaults when missing; provider is the
+    # default ("claude-cli" per DEFAULT_PROVIDER).
+    assert conn["provider"] == "claude-cli"  # default
+    assert conn["model"] == "sonnet"
+    assert conn["last_heartbeat_at"] is None
