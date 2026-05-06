@@ -7,14 +7,15 @@ Mirrors brain/memory/store.py conventions:
 
 The store is the index; the canonical content lives in markdown files
 under persona/<name>/data/works/<id>.md (see brain.works.storage).
-The store and the markdown files are kept in sync by the same
-transaction in WorksStore.insert.
+The store transaction is atomic internally; callers that also write markdown
+must roll back the index row if the file write fails.
 
 FTS5 virtual table (works_fts) powers search by title + summary +
 content. Memory store uses LIKE-based search; works establishes the
 FTS5 pattern as the project's first FTS user. Future memory work may
 backport.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -22,7 +23,6 @@ from datetime import datetime
 from pathlib import Path
 
 from brain.works import Work
-
 
 _SCHEMA_VERSION = 1
 
@@ -91,8 +91,12 @@ class WorksStore:
 
     # ----- writes -----
 
-    def insert(self, work: Work, *, content: str) -> None:
+    def insert(self, work: Work, *, content: str) -> bool:
         """Insert a work + index its content for FTS. Idempotent on id.
+
+        Returns True when a new row was inserted, False when the work id was
+        already present. Duplicate ids must not rewrite the markdown sidecar
+        with different metadata.
 
         Wrapped in BEGIN IMMEDIATE so:
           - The SELECT-then-INSERT compound op is serialized (writers can't
@@ -110,7 +114,7 @@ class WorksStore:
                 )
                 if cur.fetchone() is not None:
                     conn.execute("ROLLBACK")
-                    return  # idempotent
+                    return False  # idempotent duplicate
                 conn.execute(
                     """
                     INSERT INTO works
@@ -135,6 +139,7 @@ class WorksStore:
                     (work.id, work.title, work.summary or "", content),
                 )
                 conn.execute("COMMIT")
+                return True
             except Exception:
                 # Roll back the entire transaction so neither table has
                 # the row. The default sqlite3 connection __exit__ does
@@ -146,6 +151,27 @@ class WorksStore:
                 except sqlite3.Error:
                     pass
                 raise
+        finally:
+            conn.close()
+
+    def delete(self, work_id: str) -> None:
+        """Delete a work index row and its FTS row.
+
+        Used by save_work to roll back the SQLite index if the markdown sidecar
+        write fails after a successful insert.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM works_fts WHERE id = ?", (work_id,))
+            conn.execute("DELETE FROM works WHERE id = ?", (work_id,))
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()
 

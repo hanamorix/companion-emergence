@@ -97,6 +97,24 @@ def test_run_cycle_picks_highest_importance_seed_in_window(
     assert result.seed.id == high.id
 
 
+def test_run_cycle_autoselects_production_ingest_memory_shape(
+    engine: DreamEngine, store: MemoryStore
+) -> None:
+    """Dream seeds include extracted chat memories tagged by production ingest."""
+    seed = Memory.create_new(
+        content="Hana told me a meaningful thing in chat",
+        memory_type="fact",
+        domain="brain",
+        tags=["auto_ingest", "conversation", "fact"],
+        importance=9.0,
+        metadata={"source_summary": "conversation:sess-prod"},
+    )
+    store.create(seed)
+
+    result = engine.run_cycle()
+    assert result.seed.id == seed.id
+
+
 def test_run_cycle_explicit_seed_overrides_autoselect(
     engine: DreamEngine, store: MemoryStore
 ) -> None:

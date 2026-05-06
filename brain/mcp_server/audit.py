@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,9 @@ def log_invocation(
         "result_summary": truncated,
         "error": error,
     }
+    request_id = os.environ.get("NELL_MCP_AUDIT_REQUEST_ID")
+    if request_id:
+        record["request_id"] = request_id
 
     log_path = persona_dir / _LOG_FILENAME
     try:

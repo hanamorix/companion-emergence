@@ -179,6 +179,39 @@ def test_review_accept_creates_crystallization(tmp_path: Path) -> None:
     soul_store.close()
 
 
+def test_review_accept_defers_when_audit_write_fails(tmp_path: Path) -> None:
+    """Accept/reject decisions fail closed when the audit trail cannot be written."""
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    provider = _AcceptProvider()
+
+    candidate = _make_candidate("This should not crystallize without audit.")
+    candidate["memory_id"] = "mem-audit-failure"
+    _write_candidates(tmp_path, [candidate])
+
+    with patch("brain.soul.audit.append_audit_entry", return_value=False):
+        report = review_pending_candidates(
+            tmp_path,
+            store=store,
+            soul_store=soul_store,
+            provider=provider,
+        )
+
+    assert report.audit_failures == 1
+    assert report.accepted == 0
+    assert report.deferred == 1
+    assert report.decisions[0].decision == "defer"
+    assert report.decisions[0].forced_defer_reason == "audit write failed"
+    assert soul_store.count() == 0
+
+    updated = json.loads((tmp_path / "soul_candidates.jsonl").read_text().splitlines()[0])
+    assert updated["status"] == "auto_pending"
+    assert "last_deferred_at" in updated
+
+    store.close()
+    soul_store.close()
+
+
 def test_review_accept_is_idempotent_if_candidate_save_failed(tmp_path: Path) -> None:
     """Retrying after candidate-status save failure must not duplicate crystallizations."""
     store = _make_memory_store()

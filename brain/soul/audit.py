@@ -28,14 +28,13 @@ def append_audit_entry(
     emotional_summary: str,
     crystallization_id: str | None,
     dry_run: bool,
-) -> None:
+) -> bool:
     """Append one decision entry to <persona_dir>/soul_audit.jsonl.
 
-    Never raises — a write failure logs a warning and continues.
+    Never raises — a write failure logs a warning and returns False.
     The audit trail is permanent; entries are never deleted or modified.
     """
     audit_path = persona_dir / "soul_audit.jsonl"
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
 
     entry = {
         "ts": datetime.now(UTC).isoformat(),
@@ -58,6 +57,7 @@ def append_audit_entry(
     }
 
     try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
         # fsync after append: the audit trail IS the safety rail. A torn
         # final line means the brain made a decision and lost the audit
         # entry that explained it — exactly the failure mode this log
@@ -66,8 +66,10 @@ def append_audit_entry(
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        return True
     except OSError as exc:
         logger.warning("soul audit log write failed for %s: %s", audit_path, exc)
+        return False
 
 
 def read_audit_log(persona_dir: Path, *, limit: int | None = None) -> list[dict]:
