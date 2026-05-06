@@ -3,6 +3,7 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -84,10 +85,10 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         if anomaly is not None:
             anomalies.append(anomaly)
 
-    # SQLite integrity — constructor runs PRAGMA integrity_check; catch failures.
-    # When SP-5 (soul) added crystallizations.db, walker needs to scan it too —
-    # otherwise corrupt soul data goes undetected by `nell health check`.
-    for db_name in ("memories.db", "hebbian.db", "crystallizations.db"):
+    # SQLite integrity — constructors run PRAGMA integrity_check where available;
+    # works.db is checked explicitly because WorksStore is optimized for hot
+    # request paths and does not deep-scan on every init.
+    for db_name in ("memories.db", "hebbian.db", "crystallizations.db", "data/works.db"):
         db_path = persona_dir / db_name
         if not db_path.exists():
             continue
@@ -101,10 +102,21 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
 
                 HebbianMatrix(db_path=db_path).close()
             else:  # crystallizations.db
-                from brain.soul.store import SoulStore
+                if db_name == "crystallizations.db":
+                    from brain.soul.store import SoulStore
 
-                SoulStore(db_path=db_path).close()
-        except BrainIntegrityError as exc:
+                    SoulStore(db_path=db_path).close()
+                else:  # data/works.db
+                    with sqlite3.connect(str(db_path)) as conn:
+                        result = conn.execute("PRAGMA integrity_check").fetchall()
+                    if result != [("ok",)]:
+                        detail = "; ".join(str(row[0]) for row in result)
+                        raise BrainIntegrityError(str(db_path), detail)
+                    from brain.works.store import WorksStore
+
+                    WorksStore(db_path).schema_version()
+        except (BrainIntegrityError, sqlite3.DatabaseError) as exc:
+            detail = exc.detail if isinstance(exc, BrainIntegrityError) else str(exc)
             anomalies.append(
                 BrainAnomaly(
                     timestamp=datetime.now(UTC),
@@ -113,7 +125,7 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
                     action="alarmed_unrecoverable",
                     quarantine_path=None,
                     likely_cause="disk",
-                    detail=exc.detail[:500],
+                    detail=detail[:500],
                 )
             )
 

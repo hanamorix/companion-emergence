@@ -28,7 +28,7 @@ from brain.ingest.buffer import (
 )
 from brain.ingest.commit import commit_item
 from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
-from brain.ingest.extract import extract_items, format_transcript
+from brain.ingest.extract import extract_items_with_status, format_transcript
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
 from brain.memory.embeddings import EmbeddingCache
@@ -116,13 +116,24 @@ def close_session(
         user_name=user_name,
         assistant_name=assistant_name,
     )
-    items = extract_items(
+    extraction = extract_items_with_status(
         transcript,
         provider=provider,
         max_retries=int(cfg.get("extraction_max_retries", 1)),
         user_name=user_name,
         assistant_name=assistant_name,
     )
+    if extraction.failed:
+        report.errors += 1
+        logger.warning(
+            "conversation_extract_failed session=%s turns=%d error=%s; retaining buffer for retry",
+            session_id,
+            len(turns),
+            extraction.error or "unknown extraction failure",
+        )
+        return report
+
+    items = extraction.items
     report.extracted = len(items)
 
     # ── SCORE (normalize at the boundary) ────────────────────────────────────

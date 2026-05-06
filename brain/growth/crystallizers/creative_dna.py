@@ -25,6 +25,7 @@ from brain.behavioral.log import append_behavioral_event, read_behavioral_log
 from brain.bridge.provider import LLMProvider, ProviderError
 from brain.creative.dna import load_creative_dna, save_creative_dna
 from brain.memory.store import MemoryStore
+from brain.utils.memory import list_conversation_memories
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,7 @@ def _gather_recent_fiction(
 
     # Heuristic prose detection over conversation memories
     try:
-        for m in store.list_by_type("conversation"):
+        for m in list_conversation_memories(store):
             if m.created_at < cutoff:
                 continue
             content = m.content or ""

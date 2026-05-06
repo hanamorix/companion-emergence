@@ -1,12 +1,15 @@
 """save_work tool implementation."""
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.works import WORK_TYPES, Work, make_work_id
 from brain.works.storage import write_markdown
 from brain.works.store import WorksStore
+
+logger = logging.getLogger(__name__)
 
 
 _TITLE_MAX = 200
@@ -53,9 +56,20 @@ def save_work(
         summary=summary.strip() if summary else None,
     )
     # Insert into store FIRST. If that fails (OperationalError, disk full,
-    # permissions race), no markdown file is written. The recoverable failure
-    # mode is "indexed row, missing file" (handled by read_work) — strictly
-    # better than "orphan file, no index" (silent loss).
-    WorksStore(persona_dir / "data" / "works.db").insert(work, content=content)
-    write_markdown(persona_dir, work, content=content)
+    # permissions race), no markdown file is written. If the markdown sidecar
+    # write fails after a new insert, roll back the index row so /works cannot
+    # advertise missing content. Duplicate ids are true idempotent no-ops and
+    # must not rewrite existing markdown with different metadata.
+    store = WorksStore(persona_dir / "data" / "works.db")
+    inserted = store.insert(work, content=content)
+    if not inserted:
+        return {"id": work.id, "path": f"data/works/{work.id}.md", "deduped": True}
+    try:
+        write_markdown(persona_dir, work, content=content)
+    except Exception:
+        try:
+            store.delete(work.id)
+        except Exception:  # noqa: BLE001
+            logger.warning("failed to roll back works index row %s", work.id, exc_info=True)
+        raise
     return {"id": work.id, "path": f"data/works/{work.id}.md"}

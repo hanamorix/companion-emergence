@@ -234,6 +234,31 @@ def test_ollama_chat_includes_tools_when_provided() -> None:
     assert payload["tools"] == tools
 
 
+def test_ollama_chat_filters_provider_context_options() -> None:
+    """persona_dir is bridge context, not an Ollama generation option."""
+    with patch("httpx.post", return_value=_make_ollama_response()) as mock_post:
+        p = OllamaProvider()
+        p.chat(
+            [ChatMessage(role="user", content="x")],
+            options={"persona_dir": "/tmp/persona", "temperature": 0.4},
+        )
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["options"] == {"temperature": 0.4}
+
+
+def test_ollama_chat_omits_options_when_only_context_options() -> None:
+    with patch("httpx.post", return_value=_make_ollama_response()) as mock_post:
+        p = OllamaProvider()
+        p.chat(
+            [ChatMessage(role="user", content="x")],
+            options={"persona_dir": "/tmp/persona"},
+        )
+
+    payload = mock_post.call_args[1]["json"]
+    assert "options" not in payload
+
+
 def test_ollama_chat_parses_content() -> None:
     """Content from message.content lands in ChatResponse.content."""
     with patch("httpx.post", return_value=_make_ollama_response("Nell's reply")):
@@ -445,6 +470,28 @@ def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
     assert server_cfg["args"][1] == "brain.mcp_server"
     assert "--persona-dir" in server_cfg["args"]
     assert str(persona_dir) in server_cfg["args"]
+    assert server_cfg["env"]["NELL_MCP_AUDIT_REQUEST_ID"]
+
+
+def test_read_audit_lines_since_filters_other_request_ids(tmp_path: Path) -> None:
+    from brain.bridge.provider import _read_audit_lines_since
+
+    audit_path = tmp_path / "tool_invocations.log.jsonl"
+    audit_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"name": "mine", "arguments": {}, "result_summary": "ok", "request_id": "req-1"}),
+                json.dumps({"name": "other", "arguments": {}, "result_summary": "ok", "request_id": "req-2"}),
+                json.dumps({"name": "legacy", "arguments": {}, "result_summary": "ok"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = _read_audit_lines_since(audit_path, 0, request_id="req-1")
+
+    assert [record["name"] for record in records] == ["mine", "legacy"]
 
 
 def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:

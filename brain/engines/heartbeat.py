@@ -730,12 +730,13 @@ class HeartbeatEngine:
             return 0
 
         from brain.engines._interests import InterestSet
+        from brain.utils.memory import list_conversation_memories
 
         interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
         if not interests.interests:
             return 0
 
-        all_convos = self.store.list_by_type("conversation", active_only=True, limit=50)
+        all_convos = list_conversation_memories(self.store, active_only=True, limit=50)
         recent = [m for m in all_convos if m.created_at >= state.last_tick_at]
         if not recent:
             return 0

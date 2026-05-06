@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300
+_PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +358,7 @@ class ClaudeCliProvider(LLMProvider):
                 "pip install 'mcp>=1.0.0,<2.0.0'",
             ) from exc
 
+        request_id = uuid.uuid4().hex
         config = {
             "mcpServers": {
                 "brain-tools": {
@@ -366,7 +369,7 @@ class ClaudeCliProvider(LLMProvider):
                         "--persona-dir",
                         str(persona_dir),
                     ],
-                    "env": {},
+                    "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
                 }
             }
         }
@@ -441,7 +444,11 @@ class ClaudeCliProvider(LLMProvider):
                     f"unexpected output format: {result.stdout[:200]!r}",
                 ) from exc
 
-            dispatched = _read_audit_lines_since(audit_log_path, audit_offset_before)
+            dispatched = _read_audit_lines_since(
+                audit_log_path,
+                audit_offset_before,
+                request_id=request_id,
+            )
             return ChatResponse(
                 content=content,
                 tool_calls=(),
@@ -457,7 +464,10 @@ class ClaudeCliProvider(LLMProvider):
 
 
 def _read_audit_lines_since(
-    audit_log_path: Path, offset: int
+    audit_log_path: Path,
+    offset: int,
+    *,
+    request_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read audit log lines newly appended after `offset` bytes.
 
@@ -481,6 +491,14 @@ def _read_audit_lines_since(
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if request_id is not None:
+            entry_request_id = entry.get("request_id")
+            # Records produced by current code carry request_id and can be
+            # strictly correlated. Legacy no-id records are still admitted so
+            # old tests/logs remain readable, but records from another current
+            # request are filtered out.
+            if entry_request_id not in (None, request_id):
+                continue
         record: dict[str, Any] = {
             "name": entry.get("name", "?"),
             "arguments": entry.get("arguments", {}),
@@ -562,7 +580,13 @@ class OllamaProvider(LLMProvider):
         if tools:
             payload["tools"] = tools
         if options:
-            payload["options"] = options
+            generation_options = {
+                key: value
+                for key, value in options.items()
+                if key not in _PROVIDER_CONTEXT_OPTION_KEYS
+            }
+            if generation_options:
+                payload["options"] = generation_options
 
         url = f"{self._host}/api/chat"
         try:
