@@ -57,6 +57,11 @@ export interface PersonaState {
     reflex: string | null;
   };
   soul_highlight: SoulHighlight | null;
+  connection: {
+    provider: string | null;
+    model: string | null;
+    last_heartbeat_at: string | null;
+  };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
 }
 

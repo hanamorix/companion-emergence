@@ -157,3 +157,13 @@ textarea {
     transition: none !important;
   }
 }
+
+/* User-controlled reduced motion (Connection panel toggle) — sets
+ * data-reduced-motion="true" on <html>. Mirrors prefers-reduced-motion
+ * so the user can opt out without OS settings. */
+html[data-reduced-motion="true"] *,
+html[data-reduced-motion="true"] *::before,
+html[data-reduced-motion="true"] *::after {
+  animation: none !important;
+  transition: none !important;
+}

@@ -54,8 +54,53 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
         "soul_highlight": _build_soul_highlight(persona_dir),
+        "connection": _build_connection(persona_dir),
         "mode": "live",
     }
+
+
+def _build_connection(persona_dir: Path) -> dict[str, Any]:
+    """Provider + model + last-heartbeat — drives the Connection panel.
+
+    Provider comes from persona_config (the operator-tier choice).
+    Model is provider-specific; for v1 we surface a sensible default
+    per provider rather than read it from a separate config (the
+    runner-side model isn't currently persisted).
+    Last-heartbeat-at comes from heartbeat_state.json — null when the
+    heartbeat has never run.
+    """
+    out: dict[str, Any] = {
+        "provider": None,
+        "model": None,
+        "last_heartbeat_at": None,
+    }
+    try:
+        from brain.persona_config import PersonaConfig
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        out["provider"] = cfg.provider
+        out["model"] = _default_model_for(cfg.provider)
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: persona_config read failed", exc_info=True)
+    try:
+        hb_path = persona_dir / "heartbeat_state.json"
+        if hb_path.exists():
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            out["last_heartbeat_at"] = hb.get("last_tick_at")
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: heartbeat_state read failed", exc_info=True)
+    return out
+
+
+def _default_model_for(provider: str) -> str | None:
+    """v1 default model per provider. Replace with a real config field
+    when callers need provider-specific overrides."""
+    if provider == "claude-cli":
+        return "sonnet"
+    if provider == "ollama":
+        return "huihui_ai/qwen2.5-abliterated:7b"
+    if provider == "fake":
+        return "fake"
+    return None
 
 
 def _build_emotions(persona_dir: Path) -> dict[str, float]:
