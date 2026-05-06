@@ -1,7 +1,6 @@
 """Tests for the four works MCP tools."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -10,6 +9,7 @@ from brain.tools.impls.list_works import list_works
 from brain.tools.impls.read_work import read_work
 from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_works import search_works
+from brain.works import make_work_id
 
 
 def _persona(tmp_path: Path) -> Path:
@@ -69,12 +69,37 @@ def test_save_work_dedupes_same_content(tmp_path: Path) -> None:
     assert r1["id"] == r2["id"]
 
 
+def test_save_work_duplicate_does_not_rewrite_metadata_or_markdown(tmp_path: Path) -> None:
+    persona_dir = _persona(tmp_path)
+    r1 = save_work(
+        title="original",
+        type="idea",
+        content="same duplicate body",
+        summary="original summary",
+        persona_dir=persona_dir,
+    )
+    r2 = save_work(
+        title="changed title",
+        type="idea",
+        content="same duplicate body",
+        summary="changed summary",
+        persona_dir=persona_dir,
+    )
+
+    assert r1["id"] == r2["id"]
+    assert r2["deduped"] is True
+    listed = list_works(persona_dir=persona_dir)
+    assert listed[0]["title"] == "original"
+    assert listed[0]["summary"] == "original summary"
+    markdown = (persona_dir / "data" / "works" / f"{r1['id']}.md").read_text(encoding="utf-8")
+    assert "title: original" in markdown
+    assert "changed title" not in markdown
+
+
 def test_save_work_word_count_is_recorded(tmp_path: Path) -> None:
     persona_dir = _persona(tmp_path)
     content = "one two three four five six"
-    result = save_work(
-        title="t", type="idea", content=content, persona_dir=persona_dir
-    )
+    save_work(title="t", type="idea", content=content, persona_dir=persona_dir)
     listed = list_works(persona_dir=persona_dir)
     assert listed[0]["word_count"] == 6
 
@@ -154,6 +179,7 @@ def test_save_work_no_orphan_file_on_store_failure(
     the file first, then attempt insert — a store failure left an orphan
     .md file unreachable via list/search/read."""
     import sqlite3
+
     from brain.works.store import WorksStore
 
     persona_dir = _persona(tmp_path)
@@ -176,3 +202,26 @@ def test_save_work_no_orphan_file_on_store_failure(
     if works_dir.exists():
         files = list(works_dir.iterdir())
         assert files == [], f"expected no orphan files; found {[f.name for f in files]}"
+
+
+def test_save_work_rolls_back_index_on_markdown_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona_dir = _persona(tmp_path)
+    content = "indexed row should be rolled back"
+    work_id = make_work_id(content)
+
+    def raising_write_markdown(*args, **kwargs):
+        raise OSError("markdown write failed")
+
+    monkeypatch.setattr(
+        "brain.tools.impls.save_work.write_markdown",
+        raising_write_markdown,
+    )
+
+    with pytest.raises(OSError):
+        save_work(title="rollback me", type="idea", content=content, persona_dir=persona_dir)
+
+    assert list_works(persona_dir=persona_dir) == []
+    assert "error" in read_work(id=work_id, persona_dir=persona_dir)
+    assert not (persona_dir / "data" / "works" / f"{work_id}.md").exists()

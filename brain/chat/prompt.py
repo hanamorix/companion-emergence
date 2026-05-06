@@ -95,7 +95,7 @@ def build_system_message(
         parts.append("\n".join(brain_lines))
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
-    body_block = _build_body_block(store)
+    body_block = _build_body_block(store, persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -174,7 +174,7 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_body_block(store: MemoryStore) -> str:
+def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     """Render the body block: computed energy/temperature/exhaustion +
     six body emotions inline.
 
@@ -202,12 +202,12 @@ def _build_body_block(store: MemoryStore) -> str:
         memories = [_row_to_memory(row) for row in rows]
         state = aggregate_state(memories)
         now = datetime.now(UTC)
-        days = days_since_human(store, now=now)
+        days = days_since_human(store, now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words
         # falls back to 1-hour window. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         words = count_words_in_session(
-            store, persona_dir=Path(""),
+            store, persona_dir=persona_dir,
             session_hours=0.0, now=now,
         )
         body = compute_body_state(

@@ -48,6 +48,26 @@ def test_health_returns_ok(persona_dir: Path):
         assert body["sessions_active"] == 0
         assert "pending_alarms" in body  # from walk_persona/compute_pending_alarms
         assert body["supervisor_thread"] in ("not-started", "alive", "dead")
+        assert body["health_scan"] == "ok"
+        assert body["health_error"] is None
+
+
+def test_health_reports_scan_failure(persona_dir: Path, monkeypatch):
+    import brain.bridge.server as srv
+
+    def boom(_persona_dir):
+        raise OSError("scan broke")
+
+    monkeypatch.setattr(srv, "walk_persona", boom)
+
+    with _make_client(persona_dir) as c:
+        r = c.get("/health")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["liveness"] == "ok"
+    assert body["health_scan"] == "failed"
+    assert "scan broke" in body["health_error"]
 
 
 def test_session_new_returns_uuid_and_tracks_state(persona_dir: Path):

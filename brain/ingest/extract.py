@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 
 from brain.bridge.provider import LLMProvider
 from brain.ingest.types import ExtractedItem
@@ -52,6 +53,20 @@ JSON:"""
 
 # Backward-compat alias — older callers still import EXTRACTION_PROMPT.
 EXTRACTION_PROMPT = EXTRACTION_PROMPT_LEGACY
+
+
+@dataclass(frozen=True)
+class ExtractionOutcome:
+    """Result of an extraction attempt.
+
+    ``items=[]`` is valid when the transcript contained no durable memories.
+    ``failed=True`` means provider/parse failures exhausted retries and the
+    caller should retain the source buffer for a future retry.
+    """
+
+    items: list[ExtractedItem]
+    failed: bool = False
+    error: str | None = None
 
 
 def format_transcript(
@@ -174,8 +189,31 @@ def extract_items(
     statements from assistant references to historical figures.
     Otherwise falls back to the legacy prompt (backward-compatible).
     """
+    return extract_items_with_status(
+        transcript,
+        provider=provider,
+        max_retries=max_retries,
+        user_name=user_name,
+        assistant_name=assistant_name,
+    ).items
+
+
+def extract_items_with_status(
+    transcript: str,
+    *,
+    provider: LLMProvider,
+    max_retries: int = 1,
+    user_name: str | None = None,
+    assistant_name: str | None = None,
+) -> ExtractionOutcome:
+    """Call the provider and distinguish valid-empty from failed-empty.
+
+    Backward-compatible ``extract_items`` intentionally keeps returning just a
+    list. The ingest pipeline uses this richer outcome so provider/parse
+    failures do not look like successful empty extractions.
+    """
     if not transcript.strip():
-        return []
+        return ExtractionOutcome(items=[])
 
     if user_name and assistant_name:
         prompt = EXTRACTION_PROMPT_NAMED.format(
@@ -186,11 +224,13 @@ def extract_items(
     else:
         prompt = EXTRACTION_PROMPT_LEGACY.format(transcript=transcript)
 
+    last_error: str | None = None
     for attempt in range(max_retries + 1):
         raw_text: str | None = None
         try:
             raw_text = provider.generate(prompt)
         except Exception as exc:  # noqa: BLE001
+            last_error = f"provider.generate failed on attempt {attempt}: {exc}"
             logger.warning(
                 "extract_items: provider.generate failed on attempt %d: %s", attempt, exc
             )
@@ -198,9 +238,14 @@ def extract_items(
 
         items = parse_extraction(raw_text)
         if items is not None:
-            return items
+            return ExtractionOutcome(items=items)
 
+        last_error = f"parse failed on attempt {attempt}/{max_retries}"
         logger.warning("extract_items: parse failed on attempt %d/%d", attempt, max_retries)
 
     logger.warning("extract_items: gave up after %d retries", max_retries)
-    return []
+    return ExtractionOutcome(
+        items=[],
+        failed=True,
+        error=last_error or f"gave up after {max_retries} retries",
+    )

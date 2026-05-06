@@ -175,10 +175,10 @@ def test_close_session_soul_candidate_queued_when_importance_above_threshold(
     assert candidates[0]["status"] == "auto_pending"
 
 
-def test_close_session_with_extraction_failure_returns_zero_extracted(
+def test_close_session_with_extraction_failure_counts_error_and_retains_buffer(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    """When the provider returns garbage, extracted=0, committed=0."""
+    """Provider/parse failure is retryable: error counted, source buffer retained."""
     ingest_turn(tmp_path, {"session_id": "sess_fail", "speaker": "Hana", "text": "hi"})
     provider = _GarbageProvider()
     report = close_session(
@@ -192,9 +192,30 @@ def test_close_session_with_extraction_failure_returns_zero_extracted(
 
     assert report.extracted == 0
     assert report.committed == 0
-    assert report.errors == 0  # No errors — just nothing extracted.
-    # Buffer should still be cleaned up.
-    assert not (tmp_path / "active_conversations" / "sess_fail.jsonl").exists()
+    assert report.errors == 1
+    assert (tmp_path / "active_conversations" / "sess_fail.jsonl").exists()
+
+
+def test_close_session_valid_empty_extraction_deletes_buffer_without_error(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """A valid [] extraction is success-empty, not retryable failure."""
+    ingest_turn(tmp_path, {"session_id": "sess_empty", "speaker": "Hana", "text": "hi"})
+    provider = _CannedProvider([])
+
+    report = close_session(
+        tmp_path,
+        "sess_empty",
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
+        config={"extraction_max_retries": 0},
+    )
+
+    assert report.extracted == 0
+    assert report.committed == 0
+    assert report.errors == 0
+    assert not (tmp_path / "active_conversations" / "sess_empty.jsonl").exists()
 
 
 def test_close_session_memory_and_soul_candidate_both_written(

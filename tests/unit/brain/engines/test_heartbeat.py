@@ -1078,9 +1078,11 @@ def test_heartbeat_interest_bump_hook(tmp_path: Path) -> None:
         store.create(
             Memory.create_new(
                 content="Hana sent me a passage about clarice lispector today",
-                memory_type="conversation",
-                domain="us",
+                memory_type="fact",
+                domain="brain",
                 emotions={},
+                tags=["auto_ingest", "conversation", "fact"],
+                metadata={"source_summary": "conversation:sess-bump"},
             )
         )
 

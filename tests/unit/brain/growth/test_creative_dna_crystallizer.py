@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,10 +12,11 @@ from brain.bridge.provider import LLMProvider
 from brain.creative.dna import load_creative_dna, save_creative_dna
 from brain.growth.crystallizers.creative_dna import (
     CreativeDnaCrystallizationResult,
+    _gather_recent_fiction,
     crystallize_creative_dna,
 )
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore
 
 
 class _FakeProvider(LLMProvider):
@@ -79,6 +80,33 @@ def test_happy_path_emerging_addition(persona_dir, store, hebbian):
     dna = load_creative_dna(persona_dir)
     emerging_names = [t["name"] for t in dna["tendencies"]["emerging"]]
     assert "intentional sentence fragments" in emerging_names
+
+
+def test_gather_recent_fiction_includes_production_conversation_prose(persona_dir, store):
+    """Creative DNA scans extracted chat memories, not legacy conversation type only."""
+    prose = (
+        '"Come closer," she said. '\
+        + "The room answered with a hush. " * 80
+        + "\n\nThe sentence kept unfolding into another sentence."
+    )
+    memory = Memory.create_new(
+        content=prose,
+        memory_type="note",
+        domain="brain",
+        tags=["auto_ingest", "conversation", "note"],
+        metadata={"source_summary": "conversation:sess-fiction"},
+    )
+    store.create(memory)
+
+    corpus = _gather_recent_fiction(
+        store,
+        cutoff=datetime.now(UTC) - timedelta(days=1),
+    )
+
+    assert any(
+        item["memory_id"] == memory.id and item["type"] == "conversation_prose"
+        for item in corpus
+    )
 
 
 def test_returns_empty_on_provider_error(persona_dir, store, hebbian):
