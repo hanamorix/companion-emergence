@@ -527,13 +527,17 @@ def build_app(
         # Narrow tuple so programming bugs (KeyError, AttributeError) inside
         # walk_persona / compute_pending_alarms surface as 500 rather than
         # leaving /health silently green forever.
+        health_scan = "ok"
+        health_error: str | None = None
         try:
             anomalies = walk_persona(s.persona_dir)
             alarms = compute_pending_alarms(s.persona_dir)
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, ValueError) as exc:
             logger.warning("health walk failed", exc_info=True)
             anomalies = []
             alarms = []
+            health_scan = "failed"
+            health_error = f"{type(exc).__name__}: {exc}"
 
         sup_thread = s.supervisor_thread
         if sup_thread is None:
@@ -551,6 +555,8 @@ def build_app(
             "sessions_active": len(all_sessions()),
             "last_chat_at": s.last_chat_at.isoformat() if s.last_chat_at else None,
             "supervisor_thread": sup_status,
+            "health_scan": health_scan,
+            "health_error": health_error,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
         }

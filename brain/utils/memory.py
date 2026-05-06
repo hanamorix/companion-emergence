@@ -7,7 +7,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore, _row_to_memory
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,60 @@ def days_since_human(
     return (now - most_recent).total_seconds() / 86400.0
 
 
+def is_conversation_derived(memory: Memory) -> bool:
+    """True when a memory came from a conversation buffer.
+
+    Production ingest stores extracted chat memories under the extracted label
+    (``fact``, ``observation``, ``feeling``, etc.) rather than the legacy
+    ``memory_type="conversation"``. The stable contract is therefore the
+    conversation tag and/or ``metadata.source_summary == "conversation:<sid>"``.
+    Keep the legacy type check so old migrated/test data still works.
+    """
+    if memory.memory_type == "conversation":
+        return True
+    if any(str(tag) == "conversation" for tag in memory.tags):
+        return True
+    source_summary = memory.metadata.get("source_summary")
+    return isinstance(source_summary, str) and source_summary.startswith("conversation:")
+
+
+def list_conversation_memories(
+    store: MemoryStore,
+    *,
+    active_only: bool = True,
+    limit: int | None = None,
+) -> list[Memory]:
+    """List memories derived from chat sessions, newest first.
+
+    This centralizes the conversation-derived contract for engines that need
+    recent chat residue. It deliberately does not query only
+    ``memory_type='conversation'`` because production ingest never writes that
+    type for extracted memories.
+    """
+    sql = "SELECT * FROM memories"
+    if active_only:
+        sql += " WHERE active = 1"
+    sql += " ORDER BY created_at DESC"
+    try:
+        rows = store._conn.execute(sql).fetchall()  # noqa: SLF001 - same-tier utility
+    except Exception:  # noqa: BLE001
+        logger.warning("conversation memory scan failed", exc_info=True)
+        return []
+
+    out: list[Memory] = []
+    for row in rows:
+        try:
+            memory = _row_to_memory(row)
+        except Exception:  # noqa: BLE001
+            continue
+        if not is_conversation_derived(memory):
+            continue
+        out.append(memory)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
 def _latest_user_turn_in_buffers(persona_dir: Path) -> datetime | None:
     """Most-recent user-turn timestamp across all active_conversations/*.jsonl."""
     active_dir = persona_dir / "active_conversations"
@@ -113,26 +167,10 @@ def _latest_conversation_memory_ts(store: MemoryStore) -> datetime | None:
     the ingest pipeline writes one batch of these per closed session,
     so even years of chats stay in the low thousands.
     """
-    try:
-        row = store._conn.execute(  # noqa: SLF001 — same-tier read
-            """
-            SELECT created_at FROM memories
-            WHERE active = 1
-              AND metadata_json LIKE '%"source_summary": "conversation:%'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """
-        ).fetchone()
-    except Exception:  # noqa: BLE001
-        logger.warning("days_since_human: conversation memory scan failed", exc_info=True)
+    memories = list_conversation_memories(store, active_only=True, limit=1)
+    if not memories:
         return None
-    if row is None:
-        return None
-    raw = row["created_at"] if hasattr(row, "keys") else row[0]
-    try:
-        ts = datetime.fromisoformat(raw)
-    except (ValueError, TypeError):
-        return None
+    ts = memories[0].created_at
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
     return ts

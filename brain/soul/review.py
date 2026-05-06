@@ -68,6 +68,7 @@ class ReviewReport:
     crystallization_ids: list[str] = field(default_factory=list)
     decisions: list[Decision] = field(default_factory=list)
     dry_run: bool = False
+    audit_failures: int = 0
 
 
 # ── Prompt construction ───────────────────────────────────────────────────────
@@ -315,24 +316,29 @@ def _current_emotional_summary(store: MemoryStore) -> str:
 # ── Application ───────────────────────────────────────────────────────────────
 
 
+def _crystallization_id_for_candidate(candidate: dict) -> str:
+    """Deterministic crystallization id for a candidate when possible."""
+    source_id = str(candidate.get("memory_id") or candidate.get("id") or "").strip()
+    if source_id:
+        safe_source_id = re.sub(r"[^A-Za-z0-9_.:-]+", "-", source_id)[:120]
+        return f"candidate-{safe_source_id}"
+    return str(uuid.uuid4())
+
+
 def _apply_accept(
     candidate: dict,
     decision: Decision,
     soul_store: SoulStore,
     dry_run: bool,
+    crystallization_id: str | None = None,
 ) -> str | None:
     """Crystallize on accept. Returns crystallization_id or None on dry_run."""
+    if crystallization_id is None:
+        crystallization_id = _crystallization_id_for_candidate(candidate)
     if dry_run:
         return None
 
     from brain.soul.crystallization import Crystallization
-
-    source_id = str(candidate.get("memory_id") or candidate.get("id") or "").strip()
-    if source_id:
-        safe_source_id = re.sub(r"[^A-Za-z0-9_.:-]+", "-", source_id)[:120]
-        crystallization_id = f"candidate-{safe_source_id}"
-    else:
-        crystallization_id = str(uuid.uuid4())
 
     if soul_store.get(crystallization_id) is not None:
         _mark_candidate(
@@ -476,9 +482,10 @@ def review_pending_candidates(
             )
             report.parse_failures += 1
             report.decisions.append(decision)
-            append_audit_entry(
+            if not append_audit_entry(
                 persona_dir, decision, record, related, emotional_summary, None, dry_run
-            )
+            ):
+                report.audit_failures += 1
             report.deferred += 1
             continue
 
@@ -494,9 +501,34 @@ def review_pending_candidates(
             decision.decision = "defer"
 
         crystallization_id: str | None = None
+        planned_crystallization_id: str | None = None
+        if decision.decision == "accept":
+            planned_crystallization_id = _crystallization_id_for_candidate(record)
+
+        audit_ok = append_audit_entry(
+            persona_dir,
+            decision,
+            record,
+            related,
+            emotional_summary,
+            planned_crystallization_id,
+            dry_run,
+        )
+        if not audit_ok:
+            report.audit_failures += 1
+            if decision.decision in {"accept", "reject"} and not dry_run:
+                decision.forced_defer_reason = "audit write failed"
+                decision.decision = "defer"
+                planned_crystallization_id = None
 
         if decision.decision == "accept":
-            crystallization_id = _apply_accept(record, decision, soul_store, dry_run)
+            crystallization_id = _apply_accept(
+                record,
+                decision,
+                soul_store,
+                dry_run,
+                crystallization_id=planned_crystallization_id,
+            )
             report.accepted += 1
             if crystallization_id:
                 report.crystallization_ids.append(crystallization_id)
@@ -508,25 +540,17 @@ def review_pending_candidates(
             report.deferred += 1
 
         report.decisions.append(decision)
-        append_audit_entry(
-            persona_dir,
-            decision,
-            record,
-            related,
-            emotional_summary,
-            crystallization_id,
-            dry_run,
-        )
 
     if not dry_run:
         _save_soul_candidates(persona_dir, records)
 
     logger.info(
-        "soul review complete: accepted=%d rejected=%d deferred=%d parse_failures=%d dry_run=%s",
+        "soul review complete: accepted=%d rejected=%d deferred=%d parse_failures=%d audit_failures=%d dry_run=%s",
         report.accepted,
         report.rejected,
         report.deferred,
         report.parse_failures,
+        report.audit_failures,
         dry_run,
     )
 
