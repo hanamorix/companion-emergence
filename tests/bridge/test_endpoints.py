@@ -201,3 +201,29 @@ def test_stream_accepts_bearer_websocket_subprotocol(persona_dir: Path, monkeypa
                     break
 
     assert frames[-1]["type"] == "done"
+
+
+def test_persona_state_endpoint_returns_aggregated_shape(persona_dir: Path):
+    """GET /persona/state returns the aggregated panel data — emotions, body,
+    interior, soul_highlight, mode. Auth-required like every other surface."""
+    with _make_client(persona_dir) as c:
+        r = c.get("/persona/state")
+        assert r.status_code == 200
+        body = r.json()
+        # All five top-level fields present
+        for k in ("persona", "emotions", "body", "interior", "soul_highlight", "mode"):
+            assert k in body
+        # Mode is "live" by default (provider-failover not yet wired)
+        assert body["mode"] == "live"
+        # Interior keys preserved even on a fresh persona
+        for k in ("dream", "research", "heartbeat", "reflex"):
+            assert k in body["interior"]
+
+
+def test_persona_state_endpoint_requires_auth(persona_dir: Path):
+    """No bearer token → 401, matches every other authed endpoint."""
+    from brain.bridge.server import build_app
+    app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token="secret")
+    with TestClient(app) as c:
+        r = c.get("/persona/state")  # no auth header
+        assert r.status_code in (401, 403)
