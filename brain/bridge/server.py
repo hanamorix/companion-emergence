@@ -584,6 +584,18 @@ def build_app(
             "in_flight": in_flight,
         }
 
+    # ── /persona/state — NellFace app panels' aggregated read ──────────────
+    @app.get("/persona/state", dependencies=[Depends(require_http_auth)])
+    def get_persona_state() -> dict[str, Any]:
+        """Aggregated persona state for the NellFace UI panels.
+
+        Composes emotions / body / interior / soul_highlight / mode in a
+        single round-trip. Fail-soft per subsystem — fresh personas or
+        partial data still return 200 with the available pieces.
+        """
+        from brain.bridge.persona_state import build_persona_state
+        return build_persona_state(persona_dir)
+
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])
     def get_self_works(type: str | None = None, limit: int = 20) -> dict:
