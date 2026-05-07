@@ -1,91 +1,252 @@
 /**
- * Map persona emotional state → which expression PNG to render.
+ * Expression engine — pick a category, render a frame.
  *
- * Phase 2 ships a static default ("smile 4"); Phase 5 will refine the
- * heuristic with multi-axis state (energy, exhaustion, recent
- * crystallization context).
+ * Two responsibilities:
+ *   1. pickExpressionCategory(state) — heuristic stack mapping persona
+ *      state to one of 13 expression categories. Body emotions override
+ *      social emotions ("physiology speaks first"); long absence reads as
+ *      aching; everything else falls through emotion-family routing.
+ *   2. resolveFrameUrl(category, frame) — find the PNG for a (category,
+ *      frame) pair, supporting BOTH the new 4-frame directory format
+ *      (expressions/<category>/<frame>.png) AND the legacy single-file
+ *      variants (expressions/<category> <n>.png). New art drops in by
+ *      adding a directory; nothing else changes.
  *
- * Asset URLs resolve via Vite's `import.meta.glob` over the repo's
- * expressions/ directory. Vite hashes the assets into `dist/assets/`
- * at build time and produces stable URLs for `<img src>` — no
- * symlink, no public-dir copy, works identically in dev + bundled.
+ * Asset URLs resolve via Vite's import.meta.glob — hashed into
+ * dist/assets/ at build time. New expression directories are picked up
+ * automatically next build.
  */
 
+import type { BodyState, PersonaState } from "./bridge";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Categories
+// ────────────────────────────────────────────────────────────────────────────
+
 export type ExpressionCategory =
-  | "angry"
-  | "exhausted"
+  // existing 7 — legacy art in <category> 1.png … <category> 4.png
+  | "smile"
   | "happy"
   | "sad"
+  | "angry"
   | "scared"
   | "shy"
-  | "smile";
+  | "exhausted"
+  // new 6 — Phase 5 art. Falls back to closest legacy category until each
+  // <category>/ directory lands.
+  | "content"
+  | "aching"
+  | "flushed"
+  | "awe"
+  | "intent"
+  | "defiant";
 
-const VARIANTS_PER_CATEGORY = 4;
+/**
+ * Where to render this category from when no art for it exists yet.
+ * Removed from the map as each new directory ships with art.
+ */
+const FALLBACK_CATEGORY: Partial<Record<ExpressionCategory, ExpressionCategory>> = {
+  content: "smile",
+  aching: "sad",
+  flushed: "shy",
+  awe: "happy",
+  intent: "happy",
+  defiant: "angry",
+};
 
-// Vite glob import — resolved at build time. Keys are filesystem-relative
-// paths like "../../expressions/smile 4.png"; values are URL strings.
-const ALL_EXPRESSIONS = import.meta.glob<string>(
+// ────────────────────────────────────────────────────────────────────────────
+// Frames — the 4-frame matrix (mouth × eyes)
+// ────────────────────────────────────────────────────────────────────────────
+
+export type Frame =
+  | "base"            // mouth-closed + eyes-open — the resting frame
+  | "blink"           // mouth-closed + eyes-closed
+  | "speaking"        // mouth-open + eyes-open
+  | "speaking-blink"; // mouth-open + eyes-closed — peak intensity
+
+// ────────────────────────────────────────────────────────────────────────────
+// Asset resolution
+// ────────────────────────────────────────────────────────────────────────────
+
+const NEW_FORMAT_ASSETS = import.meta.glob<string>(
+  "../../expressions/*/*.png",
+  { eager: true, query: "?url", import: "default" },
+);
+
+const LEGACY_FORMAT_ASSETS = import.meta.glob<string>(
   "../../expressions/*.png",
   { eager: true, query: "?url", import: "default" },
 );
 
-/** Resolve to the URL Vite generated for a given expression file. */
-export function expressionPath(category: ExpressionCategory, variant: number): string {
-  const v = Math.min(Math.max(variant, 1), VARIANTS_PER_CATEGORY);
-  const key = `../../expressions/${category} ${v}.png`;
-  const url = ALL_EXPRESSIONS[key];
-  if (!url) {
-    // Should never happen if expressions/ is intact, but fail soft to
-    // a known-good asset rather than render a broken image.
-    const fallback = ALL_EXPRESSIONS["../../expressions/smile 4.png"];
-    if (!fallback) throw new Error(`expressions/ catalog missing — bundle broken`);
-    return fallback;
+// Map a frame → which legacy variant index to substitute for it. We
+// only have 4 generic variants in the legacy format, none of which
+// were authored as eyes-open vs eyes-closed. Best we can do is spread
+// the four variants across the four frames so cycling still produces
+// movement.
+const LEGACY_FRAME_TO_VARIANT: Record<Frame, number> = {
+  base: 1,
+  blink: 1, // legacy has no real blink — show variant 1, the engine can fast-cut to it for blink-effect
+  speaking: 2,
+  "speaking-blink": 3,
+};
+
+/** Resolve a (category, frame) pair to a hashed asset URL. */
+export function resolveFrameUrl(category: ExpressionCategory, frame: Frame): string {
+  // 1. New 4-frame directory format
+  const newKey = `../../expressions/${category}/${frame}.png`;
+  if (NEW_FORMAT_ASSETS[newKey]) return NEW_FORMAT_ASSETS[newKey];
+
+  // 2. Fallback category in new format
+  const fallback = FALLBACK_CATEGORY[category];
+  if (fallback) {
+    const fallbackNewKey = `../../expressions/${fallback}/${frame}.png`;
+    if (NEW_FORMAT_ASSETS[fallbackNewKey]) return NEW_FORMAT_ASSETS[fallbackNewKey];
+    return resolveLegacyUrl(fallback, frame);
   }
-  return url;
+
+  // 3. Legacy single-file format
+  return resolveLegacyUrl(category, frame);
 }
 
-/** Pick a default expression — used while bridge is offline / before first state read. */
-export function defaultExpression(): string {
-  return expressionPath("smile", 4);
+function resolveLegacyUrl(category: ExpressionCategory, frame: Frame): string {
+  const variant = LEGACY_FRAME_TO_VARIANT[frame];
+  const key = `../../expressions/${category} ${variant}.png`;
+  const url = LEGACY_FORMAT_ASSETS[key];
+  if (url) return url;
+  // Last-ditch fallback: smile 4 always exists in legacy art
+  const lastResort = LEGACY_FORMAT_ASSETS["../../expressions/smile 4.png"];
+  if (!lastResort) throw new Error("expressions/ catalog empty — bundle broken");
+  return lastResort;
+}
+
+/** True iff the new 4-frame directory format ships art for this category. */
+export function hasNewFormatArt(category: ExpressionCategory): boolean {
+  return Object.keys(NEW_FORMAT_ASSETS).some((k) =>
+    k.startsWith(`../../expressions/${category}/`),
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Heuristic stack — persona state → category
+// ────────────────────────────────────────────────────────────────────────────
+
+const SMILE_FAMILY = new Set(["love", "tenderness", "belonging", "gratitude", "joy"]);
+const HAPPY_FAMILY = new Set(["curiosity", "creative_hunger", "pride"]);
+const SAD_FAMILY = new Set(["grief", "loneliness", "nostalgia", "anchor_pull"]);
+const ANGRY_FAMILY = new Set(["anger", "frustration"]);
+const SCARED_FAMILY = new Set(["fear", "guilt", "shame"]);
+const SHY_FAMILY = new Set(["vulnerability"]);
+const EXHAUSTED_FAMILY = new Set(["rest_need"]);
+const AWE_FAMILY = new Set(["awe", "emergence", "hope"]);
+const CONTENT_FAMILY = new Set(["contentment", "peace"]);
+const INTENT_FAMILY = new Set(["creative_hunger"]); // also in HAPPY — INTENT wins via order
+const DEFIANT_FAMILY = new Set(["defiance"]);
+const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
+
+/**
+ * Body-emotion thresholds — when these fire, override whatever the
+ * social emotions are saying. Spec principle: physiology speaks first.
+ */
+const CLIMAX_OVERRIDE = 7;
+const AROUSAL_DESIRE_SUM_OVERRIDE = 12;
+const EXHAUSTION_OVERRIDE = 7;
+const DAYS_SINCE_CONTACT_ACHING = 5;
+
+export interface ExpressionInput {
+  emotions: Record<string, number>;
+  body: BodyState | null;
+}
+
+export function pickExpressionCategory(input: ExpressionInput): ExpressionCategory {
+  const { body, emotions } = input;
+  const bodyEmo = body?.body_emotions ?? {};
+
+  // 1. Body overrides — physiology first
+  if ((bodyEmo.climax ?? 0) >= CLIMAX_OVERRIDE) return "flushed";
+  if (((bodyEmo.arousal ?? 0) + (bodyEmo.desire ?? 0)) >= AROUSAL_DESIRE_SUM_OVERRIDE) {
+    return "flushed";
+  }
+  if ((body?.exhaustion ?? 0) >= EXHAUSTION_OVERRIDE) return "exhausted";
+
+  // 2. Long absence reads as bodily yearning
+  if ((body?.days_since_contact ?? 0) >= DAYS_SINCE_CONTACT_ACHING) return "aching";
+
+  // 3. Social emotion families — order matters because some emotion
+  // names appear in multiple families (e.g. creative_hunger). Specific
+  // categories (intent, defiant) win over generic ones (happy, angry).
+  const top = topEmotion(emotions);
+  if (top) {
+    if (INTENT_FAMILY.has(top) && (emotions[top] ?? 0) >= 7) return "intent";
+    if (DEFIANT_FAMILY.has(top)) return "defiant";
+    if (AWE_FAMILY.has(top)) return "awe";
+    if (CONTENT_FAMILY.has(top)) return "content";
+    if (ACHING_FAMILY.has(top)) return "aching";
+    if (SMILE_FAMILY.has(top)) return "smile";
+    if (HAPPY_FAMILY.has(top)) return "happy";
+    if (SAD_FAMILY.has(top)) return "sad";
+    if (ANGRY_FAMILY.has(top)) return "angry";
+    if (SCARED_FAMILY.has(top)) return "scared";
+    if (SHY_FAMILY.has(top)) return "shy";
+    if (EXHAUSTED_FAMILY.has(top)) return "exhausted";
+  }
+
+  // 4. Default — settled resting state
+  return "content";
+}
+
+/** From a state snapshot, pick the dominant emotion name. */
+export function pickExpressionFromState(state: PersonaState | null): ExpressionCategory {
+  if (!state) return "content";
+  return pickExpressionCategory({
+    emotions: state.emotions ?? {},
+    body: state.body ?? null,
+  });
+}
+
+function topEmotion(emotions: Record<string, number>): string | null {
+  let topName: string | null = null;
+  let topValue = 0;
+  for (const [name, value] of Object.entries(emotions)) {
+    if (value > topValue) {
+      topValue = value;
+      topName = name;
+    }
+  }
+  return topValue > 0 ? topName : null;
+}
+
+// Convenience for callers that just want a default render
+export function defaultExpressionUrl(): string {
+  return resolveFrameUrl("content", "base");
 }
 
 /**
- * Heuristic: top-emotion-driven expression mapping. Stable but minimal.
- * Phase 5 will replace this with a richer multi-axis mapping (energy,
- * exhaustion, dominant emotion, recent crystallization context).
+ * Legacy single-category-variant resolver for callers that pick by
+ * intent rather than by state (e.g. wizard Avatar maps step → variant
+ * directly). Kept thin: callers that ARE state-driven should use
+ * pickExpressionFromState + resolveFrameUrl instead.
  */
-export function expressionForEmotions(
-  emotions: Record<string, number>,
-  variantSeed = 1,
-): string {
-  const entries = Object.entries(emotions);
-  if (entries.length === 0) return defaultExpression();
-  // Sort desc; pick the top emotion's family
-  entries.sort(([, a], [, b]) => b - a);
-  const [topName] = entries[0];
-  const v = ((variantSeed - 1) % VARIANTS_PER_CATEGORY) + 1;
+export function expressionPath(category: ExpressionCategory, variant: number): string {
+  // Map variant 1-4 to a frame in the new format. Best-guess pairing
+  // so existing wizard mappings (e.g. "smile 4") look reasonable in
+  // either art format.
+  const variantToFrame: Record<number, Frame> = {
+    1: "base",
+    2: "speaking",
+    3: "speaking-blink",
+    4: "blink",
+  };
+  const frame = variantToFrame[Math.min(Math.max(variant, 1), 4)] ?? "base";
 
-  // Coarse mapping. Refine in Phase 5.
-  if (["love", "tenderness", "belonging", "gratitude", "joy"].includes(topName)) {
-    return expressionPath("smile", v);
-  }
-  if (["curiosity", "creative_hunger"].includes(topName)) {
-    return expressionPath("happy", v);
-  }
-  if (["grief", "loneliness", "nostalgia", "anchor_pull"].includes(topName)) {
-    return expressionPath("sad", v);
-  }
-  if (["anger", "defiance", "frustration"].includes(topName)) {
-    return expressionPath("angry", v);
-  }
-  if (["fear", "guilt", "shame"].includes(topName)) {
-    return expressionPath("scared", v);
-  }
-  if (["vulnerability", "tenderness"].includes(topName)) {
-    return expressionPath("shy", v);
-  }
-  if (["rest_need", "exhaustion"].includes(topName)) {
-    return expressionPath("exhausted", v);
-  }
-  return defaultExpression();
+  // Try new format first
+  const newKey = `../../expressions/${category}/${frame}.png`;
+  if (NEW_FORMAT_ASSETS[newKey]) return NEW_FORMAT_ASSETS[newKey];
+
+  // Legacy path
+  const legacyKey = `../../expressions/${category} ${variant}.png`;
+  const legacyUrl = LEGACY_FORMAT_ASSETS[legacyKey];
+  if (legacyUrl) return legacyUrl;
+
+  // Last resort
+  return defaultExpressionUrl();
 }
