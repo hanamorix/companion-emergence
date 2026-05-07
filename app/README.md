@@ -43,6 +43,7 @@ Subsequent phases shipped:
   wash so the room temperature follows her mood — Phase 5D
 
 Not yet built:
+
 - Python+uv runtime bundling for true zero-install — Phase 7
 
 ## Run it
