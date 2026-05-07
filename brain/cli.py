@@ -57,22 +57,6 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
 # - `nell works` shipped 2026-05-04
 
 
-# Deprecation alias for `nell bridge` — to be removed in v0.1.
-# Note: `nell chat` auto-spawn (see `_chat_handler`) imports
-# brain.bridge.daemon directly and does NOT use this CLI surface, so
-# removing the alias does not break chat. See docs/roadmap.md.
-def _deprecated_bridge(real_handler):
-    def wrapped(args):
-        print(
-            "warning: 'nell bridge' is deprecated; use 'nell supervisor' instead. "
-            "This alias will be removed in v0.1.",
-            file=sys.stderr,
-        )
-        return real_handler(args)
-    wrapped.__name__ = f"deprecated_{real_handler.__name__}"
-    return wrapped
-
-
 def _status_handler(args: argparse.Namespace) -> int:
     """Print local persona/bridge status without making provider calls or writes."""
     persona_dir = get_persona_dir(args.persona)
@@ -1231,10 +1215,9 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
 
 def _chat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` — auto-spawns bridge unless --no-bridge is set."""
-    # Note: this auto-spawn imports brain.bridge.daemon directly. It does
-    # NOT shell out to `nell bridge`/`nell supervisor`, so the deprecated
-    # bridge alias (removed in v0.1) does not affect this path. See
-    # `_deprecated_bridge` above and docs/roadmap.md §3.
+    # Note: auto-spawn imports brain.bridge.daemon directly; it does
+    # NOT shell out to `nell supervisor`, so this path is unaffected
+    # by CLI surface changes.
     from brain.bridge import daemon, state_file
     from brain.paths import get_persona_dir
 
@@ -1698,7 +1681,7 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd_tail_log,
     )
 
-    # nell supervisor — canonical bridge lifecycle (replaces nell bridge in v0.1).
+    # nell supervisor — canonical bridge lifecycle command.
     s_sub = subparsers.add_parser(
         "supervisor",
         help="Manage the per-persona bridge daemon — canonical lifecycle command.",
@@ -1804,42 +1787,6 @@ def _build_parser() -> argparse.ArgumentParser:
     w_read.add_argument("--persona", required=True)
     w_read.add_argument("--id", required=True)
     w_read.set_defaults(func=_works_read_handler)
-
-    # nell bridge — SP-7 daemon control (kept for back-compat; supervisor is canonical)
-    b_sub = subparsers.add_parser(
-        "bridge",
-        help="Manage the bridge daemon (deprecated — use 'nell supervisor').",
-    )
-    b_actions = b_sub.add_subparsers(dest="action", required=True)
-
-    b_start = b_actions.add_parser("start", help="Start the bridge daemon.")
-    b_start.add_argument("--persona", required=True)
-    b_start.add_argument(
-        "--idle-shutdown",
-        type=float,
-        default=30,
-        help="Idle-shutdown threshold in minutes (0 = never).",
-    )
-    b_start.add_argument(
-        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
-    )
-    b_start.set_defaults(func=_deprecated_bridge(cmd_start))
-
-    b_stop = b_actions.add_parser("stop", help="Stop the bridge daemon.")
-    b_stop.add_argument("--persona", required=True)
-    b_stop.add_argument("--timeout", type=float, default=180.0)
-    b_stop.set_defaults(func=_deprecated_bridge(cmd_stop))
-
-    b_status = b_actions.add_parser("status", help="Show bridge daemon status.")
-    b_status.add_argument("--persona", required=True)
-    b_status.set_defaults(func=_deprecated_bridge(cmd_status))
-
-    b_tail = b_actions.add_parser(
-        "tail-events",
-        help="Tail /events as JSON lines. (deprecated — use `nell supervisor tail-events`)",
-    )
-    b_tail.add_argument("--persona", required=True)
-    b_tail.set_defaults(func=_deprecated_bridge(cmd_tail))
 
     # nell growth log — read-only inspection of brain growth biography.
     # Per Phase 2a §8: only `log` action ships; no add/approve/reject/force.

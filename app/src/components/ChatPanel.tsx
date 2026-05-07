@@ -135,6 +135,32 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, streaming]);
 
+  // Paste-from-clipboard: when an image is on the clipboard and the
+  // user pastes inside the textarea, stage it instead of dumping the
+  // base64 string into the input. Mirrors how Slack / Discord handle
+  // Cmd-V'd screenshots.
+  useEffect(() => {
+    function onPaste(e: ClipboardEvent) {
+      if (!e.clipboardData || stagedImage) return;
+      for (const item of e.clipboardData.items) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void handleFile(file);
+            return;
+          }
+        }
+      }
+    }
+    const ta = textareaRef.current;
+    ta?.addEventListener("paste", onPaste);
+    return () => ta?.removeEventListener("paste", onPaste);
+    // handleFile is closed-over and stable enough; stagedImage gates
+    // the re-stage so we re-bind when it clears.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stagedImage]);
+
   async function handleFile(file: File) {
     if (!file.type.startsWith("image/")) {
       setError(`unsupported file type: ${file.type}`);
@@ -269,8 +295,50 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     }
   }
 
+  const [dragOver, setDragOver] = useState(false);
+
+  function onDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (stagedImage || streaming) return;
+    if (Array.from(e.dataTransfer.items).some(
+      (i) => i.kind === "file" && i.type.startsWith("image/"),
+    )) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      setDragOver(true);
+    }
+  }
+
+  function onDragLeave(_e: React.DragEvent<HTMLDivElement>) {
+    setDragOver(false);
+  }
+
+  function onDrop(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragOver(false);
+    if (stagedImage || streaming) return;
+    const file = Array.from(e.dataTransfer.files).find((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (file) void handleFile(file);
+  }
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", width: 290, height: 380 }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        width: 290,
+        height: 380,
+        position: "relative",
+        outline: dragOver ? "2px dashed var(--accent)" : "none",
+        outlineOffset: 4,
+        borderRadius: 8,
+        transition: "outline 0.15s ease",
+      }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <div
         ref={scrollRef}
         style={{
