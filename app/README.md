@@ -42,28 +42,58 @@ Subsequent phases shipped:
 - Emotion-family colour tints on the breathing ring + soft backing
   wash so the room temperature follows her mood — Phase 5D
 
+- Bundled portable Python runtime so the .app is zero-install for
+  Python — `pnpm tauri build` ships a self-contained NellFace.app
+  that doesn't need `uv` or system Python on PATH — Phase 7
+  (macOS arm64 / x86_64 / Linux x86_64 today; Windows next)
+
 Not yet built:
 
-- Python+uv runtime bundling for true zero-install — Phase 7
+- Linux .deb / Windows .msi cross-platform release pipeline
+- App distribution story (signing, notarization, auto-update)
 
-## Run it
+## Run it (development)
 
-The bridge daemon must be running. Start it first:
-
-```bash
-# from the repo root
-uv run nell supervisor start --persona nell
-```
-
-Then in this directory:
+For fast iteration without rebuilding the bundled Python every cycle:
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
 
+The Rust backend's `nell_command` helper falls back to `uv run nell`
+against the source tree when the bundled runtime isn't present — so
+dev mode just needs `uv` on PATH.
+
+Bridge auto-spawn on first chat handles `nell supervisor start` for
+you; if you want to start it manually:
+
+```bash
+# from the repo root
+uv run nell supervisor start --persona nell
+```
+
 The app reads `NELLBRAIN_HOME` from the environment to find the
 persona dir; falls back to platformdirs default (matches `brain.paths`).
+
+## Build the production bundle
+
+```bash
+pnpm tauri build
+```
+
+This runs `app/build_python_runtime.sh` as a `beforeBuildCommand`,
+which downloads `python-build-standalone` for the host arch, creates
+a portable Python tree under `app/src-tauri/python-runtime/`, builds
+the `companion-emergence` wheel, installs the brain into the bundled
+site-packages, and strips `__pycache__` + tests. Tauri then bundles
+that tree into `Resources/python-runtime/` inside `NellFace.app`.
+
+The resulting `.app` is ~190 MB on macOS arm64 (Python + httpx +
+fastapi + sqlite + ML deps; the full size is mostly third-party
+deps, not brain itself). The user does not need `uv`, `python3`,
+or any system Python — only `claude` (claude-cli) on PATH for the
+LLM provider.
 
 ## Browser dev mode (no Tauri)
 
