@@ -25,6 +25,7 @@ import sys
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -823,10 +824,12 @@ class OllamaProvider(LLMProvider):
 
     Streaming
     ---------
-    # TODO(streaming): chat_stream() — Phase 6.5 scope.  The non-streaming
-    # chat() here is sufficient for all SP-1 through SP-5 use-cases.  When
-    # Phase 6.5 lands, add a chat_stream() that POSTs with stream=True and
-    # yields token chunks.
+    ``chat_stream()`` POSTs with ``stream=True`` and yields each content
+    chunk as Ollama emits it. The bridge WS handler (or any other
+    streaming consumer) can pipe these straight to the client without
+    waiting for the full reply. Tool-calling is intentionally not on
+    the streaming path — pass ``tools=`` through :meth:`chat` instead,
+    which returns a structured ChatResponse with parsed tool_calls.
     """
 
     def __init__(
@@ -920,6 +923,94 @@ class OllamaProvider(LLMProvider):
             tool_calls=tuple(parsed_tool_calls),
             raw=data,
         )
+
+    def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
+        """Stream content chunks from /api/chat as Ollama emits them.
+
+        Each yielded value is a str fragment of the assistant's reply.
+        The iterator exhausts when Ollama signals ``done=True``. Joining
+        all yielded chunks reproduces the same content :meth:`chat`
+        returns for the same prompt.
+
+        Tool-calling is not supported here — Ollama's tool_calls arrive
+        on the final stream frame, which complicates the perceived-typing
+        UX this method exists to power. Callers needing tools should use
+        :meth:`chat` and word-chunk the result client-side, or call
+        :meth:`chat` first then stream a follow-up turn.
+
+        Parameters
+        ----------
+        messages:
+            Conversation history in chronological order.
+        options:
+            Provider-specific generation options. Reserved keys
+            (``persona_dir``) are stripped before forwarding.
+
+        Yields
+        ------
+        str
+            Each content chunk Ollama emits. Empty chunks are skipped.
+
+        Raises
+        ------
+        ProviderError("ollama_http", ...)
+            HTTP error response from Ollama (4xx / 5xx).
+        ProviderError("ollama_request", ...)
+            Network-level failure (connection refused, DNS, etc.).
+        ProviderError("ollama_parse", ...)
+            A streamed line could not be JSON-decoded.
+        """
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [m.to_dict() for m in messages],
+            "stream": True,
+        }
+        if options:
+            generation_options = {
+                key: value
+                for key, value in options.items()
+                if key not in _PROVIDER_CONTEXT_OPTION_KEYS
+            }
+            if generation_options:
+                payload["options"] = generation_options
+
+        url = f"{self._host}/api/chat"
+        try:
+            with httpx.stream(
+                "POST", url, json=payload, timeout=self._timeout
+            ) as resp:
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    body = exc.response.read().decode("utf-8", errors="replace")
+                    raise ProviderError(
+                        "ollama_http",
+                        f"{exc.response.status_code}: {body[:200]}",
+                    ) from exc
+                for raw_line in resp.iter_lines():
+                    line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        frame = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError(
+                            "ollama_parse",
+                            f"invalid streaming line json: {exc}",
+                        ) from exc
+                    msg = frame.get("message") or {}
+                    chunk = msg.get("content")
+                    if chunk:
+                        yield chunk
+                    if frame.get("done"):
+                        return
+        except httpx.RequestError as exc:
+            raise ProviderError("ollama_request", str(exc)) from exc
 
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         """Single-turn text generation.
