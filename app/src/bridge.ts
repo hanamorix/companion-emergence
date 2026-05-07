@@ -10,7 +10,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface BridgeCredentials {
-  url: string;
+  url: string;        // http base — for fetch() calls
+  port: number;       // raw port — for ws:// construction
   authToken: string | null;
 }
 
@@ -28,6 +29,7 @@ export async function getBridgeCredentials(persona = "nell"): Promise<BridgeCred
     );
     cached = {
       url: `http://127.0.0.1:${creds.port}`,
+      port: creds.port,
       authToken: creds.auth_token,
     };
     return cached;
@@ -35,7 +37,10 @@ export async function getBridgeCredentials(persona = "nell"): Promise<BridgeCred
     // Browser dev fallback — read from import.meta.env
     const url = (import.meta.env.VITE_BRIDGE_URL as string) ?? "http://127.0.0.1:50000";
     const token = (import.meta.env.VITE_BRIDGE_TOKEN as string) ?? null;
-    cached = { url, authToken: token };
+    // Extract port from url for WS use
+    const portMatch = url.match(/:(\d+)/);
+    const port = portMatch ? parseInt(portMatch[1], 10) : 50000;
+    cached = { url, port, authToken: token };
     return cached;
   }
 }

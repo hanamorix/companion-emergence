@@ -9,6 +9,7 @@ import { fetchPersonaState, type PersonaState } from "./bridge";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
 import { LeftPanel } from "./components/LeftPanel";
+import { useSoulFlash } from "./useSoulFlash";
 import { Wizard } from "./wizard/Wizard";
 
 const STATE_POLL_MS = 5000;
@@ -139,6 +140,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const soulFlashing = useSoulFlash(state);
 
   useEffect(() => {
     let cancelled = false;
@@ -192,6 +194,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
       <NellAvatar
         state={state}
         isSpeaking={isSpeaking}
+        soulFlashing={soulFlashing}
         reducedMotion={config.reduced_motion}
       />
       <ChatPanel onSpeakingChange={setIsSpeaking} />
