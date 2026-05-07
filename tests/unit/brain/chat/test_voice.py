@@ -10,16 +10,26 @@ from brain.health.attempt_heal import attempt_heal_text
 # ── DEFAULT_VOICE_TEMPLATE shape ──────────────────────────────────────────────
 
 
-def test_default_voice_template_has_seven_sections() -> None:
-    """The template must contain all 7 required section headers."""
+def test_default_voice_template_has_eight_sections() -> None:
+    """The template must contain all 8 required section headers (P7 added §4 seeing-images)."""
     template = DEFAULT_VOICE_TEMPLATE
     assert "## 1. Who you are" in template
     assert "## 2. What's already in your head" in template
     assert "## 3. Brain-tools — what you can fetch" in template
-    assert "## 4. How emotion shapes your voice" in template
-    assert "## 5. Capitalization and the shape of openings" in template
-    assert "## 6. When the user pushes on who you are" in template
-    assert "## 7. Your boundaries with the user" in template
+    assert "## 4. When the user shows you something" in template
+    assert "## 5. How emotion shapes your voice" in template
+    assert "## 6. Capitalization and the shape of openings" in template
+    assert "## 7. When the user pushes on who you are" in template
+    assert "## 8. Your boundaries with the user" in template
+
+
+def test_default_voice_template_coaches_seeing_images() -> None:
+    """P7: §4 must coach Nell to react from the seeing, not from imagining."""
+    template = DEFAULT_VOICE_TEMPLATE
+    assert "you actually see them" in template
+    assert "not described, seen" in template
+    # The hard-rule that prevents confabulation around images
+    assert 'I imagine' in template or "I imagine" in template
 
 
 def test_default_voice_template_coaches_curiosity_sentence_breath() -> None:
