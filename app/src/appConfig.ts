@@ -64,6 +64,16 @@ export async function ensureBridgeRunning(persona: string): Promise<void> {
   }
 }
 
+/** Apply always-on-top to the main Tauri window. No-op in browser dev. */
+export async function setAlwaysOnTop(value: boolean): Promise<void> {
+  try {
+    await invoke("set_always_on_top", { value });
+  } catch (e) {
+    if (import.meta.env.DEV) return;
+    throw e;
+  }
+}
+
 export interface InitArgs {
   persona: string;
   user_name: string | null;
