@@ -187,3 +187,48 @@ def test_media_type_for_sha_validates_sha(tmp_path):
 
     with pytest.raises(ValueError, match="image_sha"):
         media_type_for_sha(tmp_path, "../escape")
+
+
+# ---------------------------------------------------------------------------
+# sniff_media_type — magic-byte detection
+# ---------------------------------------------------------------------------
+
+
+def test_sniff_media_type_png():
+    from brain.images import sniff_media_type
+
+    assert sniff_media_type(_TINY_PNG) == "image/png"
+
+
+def test_sniff_media_type_jpeg():
+    from brain.images import sniff_media_type
+
+    # Minimal JPEG SOI marker.
+    assert sniff_media_type(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00") == "image/jpeg"
+
+
+def test_sniff_media_type_gif87():
+    from brain.images import sniff_media_type
+
+    assert sniff_media_type(b"GIF87a\x01\x00\x01\x00") == "image/gif"
+
+
+def test_sniff_media_type_gif89():
+    from brain.images import sniff_media_type
+
+    assert sniff_media_type(b"GIF89a\x01\x00\x01\x00") == "image/gif"
+
+
+def test_sniff_media_type_webp():
+    from brain.images import sniff_media_type
+
+    # 'RIFF' + size + 'WEBP'
+    assert sniff_media_type(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image/webp"
+
+
+def test_sniff_media_type_unknown_returns_none():
+    from brain.images import sniff_media_type
+
+    assert sniff_media_type(b"%PDF-1.7\n") is None
+    assert sniff_media_type(b"not an image at all") is None
+    assert sniff_media_type(b"") is None

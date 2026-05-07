@@ -27,6 +27,14 @@ DEFAULT_PROVIDER = "claude-cli"
 DEFAULT_SEARCHER = "ddgs"
 DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
 
+# Allowlists for hand-edited or migrated config files. A value outside
+# the set degrades to the default with an attempt_heal anomaly logged
+# rather than letting an invalid choice surface as a runtime crash at
+# bridge startup or heartbeat-close time. Keep these in sync with
+# brain/bridge/provider.py:get_provider and brain/search/factory.py.
+KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
+KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,12 +81,26 @@ class PersonaConfig:
         searcher_raw = data.get("searcher", DEFAULT_SEARCHER)
         audit_raw = data.get("mcp_audit_log_level", DEFAULT_MCP_AUDIT_LOG_LEVEL)
         user_name_raw = data.get("user_name")
-        provider = (
+        provider_str = (
             provider_raw if isinstance(provider_raw, str) and provider_raw else DEFAULT_PROVIDER
         )
-        searcher = (
+        provider = provider_str if provider_str in KNOWN_PROVIDERS else DEFAULT_PROVIDER
+        if provider != provider_str:
+            logger.warning(
+                "PersonaConfig: unknown provider %r — falling back to %r",
+                provider_str,
+                DEFAULT_PROVIDER,
+            )
+        searcher_str = (
             searcher_raw if isinstance(searcher_raw, str) and searcher_raw else DEFAULT_SEARCHER
         )
+        searcher = searcher_str if searcher_str in KNOWN_SEARCHERS else DEFAULT_SEARCHER
+        if searcher != searcher_str:
+            logger.warning(
+                "PersonaConfig: unknown searcher %r — falling back to %r",
+                searcher_str,
+                DEFAULT_SEARCHER,
+            )
         audit_level = audit_raw.strip().lower() if isinstance(audit_raw, str) else ""
         if audit_level not in {"off", "metadata", "redacted", "full"}:
             audit_level = DEFAULT_MCP_AUDIT_LOG_LEVEL

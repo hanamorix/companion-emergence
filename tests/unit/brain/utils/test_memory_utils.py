@@ -6,8 +6,6 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.memory import days_since_human
 

@@ -5,6 +5,10 @@
  * bridge.json (port + auth_token). In Vite dev, falls back to env
  * vars VITE_BRIDGE_URL + VITE_BRIDGE_TOKEN so the app still runs in
  * a plain browser tab.
+ *
+ * Every helper takes ``persona`` so the UI cannot accidentally talk
+ * to the wrong bridge when more than one persona exists. The
+ * credential cache is per-persona; switch personas → fresh lookup.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -15,11 +19,20 @@ export interface BridgeCredentials {
   authToken: string | null;
 }
 
-/** Cache after first resolution — bridge port doesn't change mid-session. */
-let cached: BridgeCredentials | null = null;
+/** Per-persona credential cache. bridge.json is persona-scoped, so
+ *  are the credentials. */
+const cache = new Map<string, BridgeCredentials>();
 
-export async function getBridgeCredentials(persona = "nell"): Promise<BridgeCredentials> {
-  if (cached) return cached;
+/** Reset the credential cache. Useful when the user rotates the
+ *  selected persona or a bridge restart invalidates a cached token. */
+export function resetBridgeCredentialCache(persona?: string): void {
+  if (persona) cache.delete(persona);
+  else cache.clear();
+}
+
+export async function getBridgeCredentials(persona: string): Promise<BridgeCredentials> {
+  const hit = cache.get(persona);
+  if (hit) return hit;
 
   // Try Tauri command first (production build path)
   try {
@@ -27,21 +40,24 @@ export async function getBridgeCredentials(persona = "nell"): Promise<BridgeCred
       "get_bridge_credentials",
       { persona },
     );
-    cached = {
+    const result: BridgeCredentials = {
       url: `http://127.0.0.1:${creds.port}`,
       port: creds.port,
       authToken: creds.auth_token,
     };
-    return cached;
+    cache.set(persona, result);
+    return result;
   } catch {
-    // Browser dev fallback — read from import.meta.env
+    // Browser dev fallback — read from import.meta.env. The dev
+    // surface points at whichever bridge the developer started; the
+    // persona name is informational only.
     const url = (import.meta.env.VITE_BRIDGE_URL as string) ?? "http://127.0.0.1:50000";
     const token = (import.meta.env.VITE_BRIDGE_TOKEN as string) ?? null;
-    // Extract port from url for WS use
     const portMatch = url.match(/:(\d+)/);
     const port = portMatch ? parseInt(portMatch[1], 10) : 50000;
-    cached = { url, port, authToken: token };
-    return cached;
+    const result: BridgeCredentials = { url, port, authToken: token };
+    cache.set(persona, result);
+    return result;
   }
 }
 
@@ -89,8 +105,8 @@ export interface SoulHighlight {
   why_it_matters: string | null;
 }
 
-export async function fetchPersonaState(): Promise<PersonaState> {
-  const creds = await getBridgeCredentials();
+export async function fetchPersonaState(persona: string): Promise<PersonaState> {
+  const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) });
   if (!r.ok) throw new Error(`/persona/state ${r.status}`);
   return await r.json();
@@ -102,8 +118,8 @@ export interface NewSessionResponse {
   created_at: string;
 }
 
-export async function newSession(): Promise<string> {
-  const creds = await getBridgeCredentials();
+export async function newSession(persona: string): Promise<string> {
+  const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/session/new`, {
     method: "POST",
     headers: authHeaders(creds),
@@ -123,8 +139,8 @@ export interface ChatResponse {
   metadata: Record<string, unknown>;
 }
 
-export async function sendChat(sessionId: string, message: string): Promise<ChatResponse> {
-  const creds = await getBridgeCredentials();
+export async function sendChat(persona: string, sessionId: string, message: string): Promise<ChatResponse> {
+  const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/chat`, {
     method: "POST",
     headers: authHeaders(creds),
@@ -145,13 +161,11 @@ export interface ImageUploadResponse {
 
 /**
  * Upload an image File to the bridge. Returns the sha-addressable
- * record on success. The caller keeps the sha and includes it in the
- * next chat turn (image_shas field — wired in the brain P4-P6 phases).
- *
- * Throws on non-200 (415 unsupported, 413 too large, 401 unauthorised).
+ * record on success. Throws on non-200 (415 unsupported, 413 too
+ * large, 401 unauthorised).
  */
-export async function uploadImage(file: File): Promise<ImageUploadResponse> {
-  const creds = await getBridgeCredentials();
+export async function uploadImage(persona: string, file: File): Promise<ImageUploadResponse> {
+  const creds = await getBridgeCredentials(persona);
   const fd = new FormData();
   fd.append("file", file);
   // Note: don't set Content-Type — fetch will pick the multipart boundary.
@@ -172,11 +186,20 @@ export async function uploadImage(file: File): Promise<ImageUploadResponse> {
   return (await r.json()) as ImageUploadResponse;
 }
 
-export async function closeSession(sessionId: string): Promise<void> {
-  const creds = await getBridgeCredentials();
-  await fetch(`${creds.url}/sessions/close`, {
+/**
+ * Close a session — flushes its buffer through the ingest pipeline.
+ * Throws on non-2xx so callers can surface "memory save pending/failed"
+ * status to the user; previously this swallowed errors silently.
+ */
+export async function closeSession(persona: string, sessionId: string): Promise<void> {
+  const creds = await getBridgeCredentials(persona);
+  const r = await fetch(`${creds.url}/sessions/close`, {
     method: "POST",
     headers: authHeaders(creds),
     body: JSON.stringify({ session_id: sessionId }),
   });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`/sessions/close ${r.status}: ${text.slice(0, 200)}`);
+  }
 }
