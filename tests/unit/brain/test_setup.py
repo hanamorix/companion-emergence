@@ -89,28 +89,23 @@ def test_install_voice_template_default_writes_no_file(tmp_path: Path) -> None:
         assert not (persona_dir / "voice.md").exists()
 
 
-def test_install_voice_template_nell_example_copies_file(tmp_path: Path) -> None:
-    """nell-example template copies docs/voice-drafts/nell-voice.md verbatim."""
-    # Build a fake repo root with the example file present
-    repo_root = tmp_path / "repo"
-    (repo_root / "docs" / "voice-drafts").mkdir(parents=True)
-    sample = "# fake voice\n\nfor testing\n"
-    (repo_root / "docs" / "voice-drafts" / "nell-voice.md").write_text(sample)
+def test_install_voice_template_nell_example_copies_packaged_file(
+    tmp_path: Path,
+) -> None:
+    """nell-example writes the packaged brain/voice_templates/nell-voice.md.
 
+    The template ships inside the brain wheel so it's available whether
+    the framework is installed from source, from a wheel, or from inside
+    the Phase 7 bundled NellFace.app — no `repo_root` lookup needed.
+    """
     persona_dir = tmp_path / "persona"
-    result = install_voice_template(persona_dir, "nell-example", repo_root=repo_root)
+    result = install_voice_template(persona_dir, "nell-example")
     assert result == persona_dir / "voice.md"
-    assert result.read_text() == sample
-
-
-def test_install_voice_template_nell_example_missing_file_raises(tmp_path: Path) -> None:
-    """If the repo doesn't have the example (e.g. installed without docs/),
-    fail loudly — better than writing nothing silently."""
-    repo_root = tmp_path / "empty_repo"
-    repo_root.mkdir()
-    persona_dir = tmp_path / "persona"
-    with pytest.raises(FileNotFoundError, match="not found"):
-        install_voice_template(persona_dir, "nell-example", repo_root=repo_root)
+    content = result.read_text(encoding="utf-8")
+    # The shipped Nell voice draft is the canonical one — opens with
+    # the section-1 header.
+    assert "## 1. Who you are" in content
+    assert len(content) > 1000  # not an empty file
 
 
 def test_install_voice_template_unknown_raises(tmp_path: Path) -> None:

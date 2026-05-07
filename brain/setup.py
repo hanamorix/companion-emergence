@@ -49,7 +49,6 @@ VOICE_TEMPLATES = {
     ),
 }
 
-_NELL_VOICE_REPO_PATH = Path("docs/voice-drafts/nell-voice.md")
 _PERSONA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
@@ -102,8 +101,6 @@ def write_persona_config(
 def install_voice_template(
     persona_dir: Path,
     template: str,
-    *,
-    repo_root: Path | None = None,
 ) -> Path | None:
     """Drop a starter voice.md into the persona dir based on `template`.
 
@@ -115,10 +112,12 @@ def install_voice_template(
         template: One of VOICE_TEMPLATES keys ("default" / "skip" leave
             no file; "nell-example" copies the canonical Nell voice.md
             as a starting point — the user is expected to edit it).
-        repo_root: Path to the companion-emergence repo (for locating
-            the example voice.md). Defaults to the parent of this file's
-            grandparent (which is the package root in dev installs).
-            Pass an explicit path in tests.
+
+    The Nell example template is packaged inside the brain wheel at
+    ``brain/voice_templates/nell-voice.md`` and read via
+    :mod:`importlib.resources`, so this works whether the framework
+    is installed from source, from a wheel, or from inside the
+    Phase 7 bundled NellFace.app.
     """
     if template not in VOICE_TEMPLATES:
         raise ValueError(
@@ -133,17 +132,20 @@ def install_voice_template(
         return None
 
     if template == VOICE_TEMPLATE_NELL_EXAMPLE:
-        if repo_root is None:
-            # Default: this module lives at brain/setup.py inside the repo
-            repo_root = Path(__file__).resolve().parent.parent
-        src = repo_root / _NELL_VOICE_REPO_PATH
-        if not src.exists():
-            raise FileNotFoundError(
-                f"Nell voice example not found at {src}. The repo may "
-                f"have been installed without docs/. Author your voice.md "
-                f"by hand or use template='default'."
+        from importlib.resources import files
+
+        try:
+            content = (
+                files("brain.voice_templates")
+                .joinpath("nell-voice.md")
+                .read_text(encoding="utf-8")
             )
-        voice_path.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError) as exc:
+            raise FileNotFoundError(
+                "Nell voice example not packaged with this install of brain. "
+                "Reinstall from a recent wheel, or use template='default'."
+            ) from exc
+        voice_path.write_text(content, encoding="utf-8")
         return voice_path
 
     # Defensive — the membership check above should make this unreachable
