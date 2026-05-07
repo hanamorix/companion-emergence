@@ -67,7 +67,6 @@ export async function ensureBridgeRunning(persona: string): Promise<void> {
 export interface InitArgs {
   persona: string;
   user_name: string | null;
-  provider: string | null;
   voice_template: "default" | "nell-example" | "skip";
   migrate_from: string | null;
   force: boolean;
