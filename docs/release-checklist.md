@@ -35,7 +35,68 @@ This project is private/local-first during development. Before sharing a public 
   installer can use the wheel without falling back to the source tree.
 - Do not add release automation until the CLI/API surface is stable enough to version.
 
+## Phase 7 — NellFace.app cross-platform release
+
+The Phase 7 bundled Python runtime ships inside the Tauri .app, so a
+release means producing platform-specific bundles for distribution.
+
+### Building locally
+
+- macOS arm64 / macOS x86_64 / Linux x86_64 / Linux arm64: from `app/`
+  run `pnpm tauri build`. The `beforeBuildCommand` in `tauri.conf.json`
+  invokes `bash build_python_runtime.sh` which downloads
+  `python-build-standalone` for the host arch and installs the brain
+  wheel into the bundled site-packages. Bundle output:
+  `app/src-tauri/target/release/bundle/<platform>/`.
+- Windows x86_64: same command, but the build script must run via
+  Git Bash (ships with Git for Windows) — the `find` / `tar` /
+  `curl` invocations rely on POSIX tooling.
+
+### Building via CI
+
+`.github/workflows/release.yml` matrices across macOS arm64, macOS
+x86_64, Linux x86_64, and Windows x86_64. Triggered by pushing a
+`v*.*.*` tag. Bundles upload as workflow artifacts (`.app`, `.dmg`,
+`.deb`, `.AppImage`, `.msi`, `.exe`). Signing/notarization is NOT
+in CI — see below.
+
+### Signing + notarization
+
+Distribution outside your own machine requires platform signing.
+Without it, Gatekeeper / SmartScreen / package managers will refuse
+to launch the bundle. Manual steps (one-time per release):
+
+**macOS** (Apple Developer ID required, ~$99/yr):
+1. Get a Developer ID Application certificate via Xcode →
+   Preferences → Accounts → Manage Certificates.
+2. Codesign: `codesign --deep --force --options runtime
+   --sign "Developer ID Application: YOUR NAME (TEAM_ID)"
+   NellFace.app`.
+3. Verify: `codesign -dv --verbose=4 NellFace.app`.
+4. Notarize: zip the `.app`, then `xcrun notarytool submit
+   NellFace.zip --apple-id YOU@example.com --team-id TEAMID
+   --password APP_SPECIFIC_PASSWORD --wait`.
+5. Staple: `xcrun stapler staple NellFace.app`.
+
+**Windows** (code-signing certificate required):
+1. Get an OV or EV code-signing cert from a CA (DigiCert,
+   Sectigo, etc.).
+2. Sign: `signtool sign /tr http://timestamp.digicert.com /td
+   sha256 /fd sha256 /a NellFace.exe NellFace.msi`.
+3. Verify: `signtool verify /pa NellFace.msi`.
+
+**Linux** (.deb / AppImage):
+1. .deb signing via dpkg-sig is optional but recommended for
+   public repos.
+2. AppImage zsync + GPG signing for auto-update.
+
+### Auto-update
+
+Tauri ships `tauri-plugin-updater` for in-app updates. Not yet
+wired — needs an update server (S3 + signed manifest, or a managed
+service like updately.app). Defer until the first public release
+gets feedback on actual demand.
+
 ## Known incomplete surfaces
 
-- Stub CLI commands must exit non-zero until implemented.
 - Growth modules that remain incomplete must be called out in release notes.
