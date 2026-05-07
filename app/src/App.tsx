@@ -136,7 +136,7 @@ interface ReadyProps {
   persona: string;
 }
 
-function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
+function Ready({ config, setConfig, persona }: ReadyProps) {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -146,7 +146,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
     let cancelled = false;
     async function tick() {
       try {
-        const s = await fetchPersonaState();
+        const s = await fetchPersonaState(persona);
         if (!cancelled) {
           setState(s);
           setStateError(null);
@@ -161,7 +161,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [persona]);
 
   useEffect(() => {
     document.documentElement.dataset.reducedMotion = config.reduced_motion ? "true" : "false";
@@ -197,7 +197,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
         soulFlashing={soulFlashing}
         reducedMotion={config.reduced_motion}
       />
-      <ChatPanel onSpeakingChange={setIsSpeaking} />
+      <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
       {stateError && (
         <div
           style={{
