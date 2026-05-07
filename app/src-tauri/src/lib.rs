@@ -170,6 +170,35 @@ fn list_personas() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Resolve a Command that runs the `nell` CLI.
+///
+/// Production (Phase 7 bundle): app/src-tauri/python-runtime ships
+/// inside Resources/. The bundled Python's `bin/nell` script is the
+/// entry point. No PATH dependency; user doesn't need uv installed.
+///
+/// Dev (`pnpm tauri dev`): the bundled runtime usually isn't built,
+/// so fall back to `uv run nell` against the source tree. This keeps
+/// the developer iteration loop fast.
+///
+/// Resolution order:
+///   1. Resources/python-runtime/bin/nell (bundled)
+///   2. uv run nell (dev fallback)
+fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
+    use tauri::Manager;
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resolve resource_dir: {}", e))?;
+    let bundled = resource_dir.join("python-runtime").join("bin").join("nell");
+    if bundled.exists() {
+        return Ok(Command::new(bundled));
+    }
+    // Dev fallback — uv on PATH against the source tree.
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("nell");
+    Ok(cmd)
+}
+
 /// Quick liveness check for the bridge — calls /health with the persona's
 /// own auth token. Returns true on 200.
 async fn bridge_healthy(persona: &str) -> bool {
@@ -193,28 +222,25 @@ async fn bridge_healthy(persona: &str) -> bool {
 }
 
 #[tauri::command]
-async fn ensure_bridge_running(persona: String) -> Result<(), String> {
+async fn ensure_bridge_running(
+    app: tauri::AppHandle,
+    persona: String,
+) -> Result<(), String> {
     validate_persona_name(&persona)?;
     if bridge_healthy(&persona).await {
         return Ok(());
     }
-    // Spawn `uv run nell supervisor start --persona <name>` and wait.
-    // The supervisor command itself blocks until /health returns 200
-    // (per cmd_start logic), so when the subprocess exits we can trust
-    // the bridge is up.
-    let output = Command::new("uv")
-        .args([
-            "run",
-            "nell",
-            "supervisor",
-            "start",
-            "--persona",
-            &persona,
-        ])
+    // Resolve nell via the bundled Python runtime (Phase 7) or the
+    // uv-on-PATH dev fallback. Either way we spawn the supervisor's
+    // start command — it blocks until /health returns 200, so when
+    // the subprocess exits we can trust the bridge is up.
+    let mut cmd = nell_command(&app)?;
+    let output = cmd
+        .args(["supervisor", "start", "--persona", &persona])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("spawn `uv run nell supervisor start`: {}", e))?;
+        .map_err(|e| format!("spawn nell supervisor start: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -227,10 +253,10 @@ async fn ensure_bridge_running(persona: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn run_init(args: InitArgs) -> Result<InitResult, String> {
+async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("nell").arg("init");
+    let mut cmd = nell_command(&app)?;
+    cmd.arg("init");
     cmd.args(["--persona", &args.persona]);
     if let Some(name) = &args.user_name {
         cmd.args(["--user-name", name]);
@@ -248,7 +274,7 @@ async fn run_init(args: InitArgs) -> Result<InitResult, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("spawn `uv run nell init`: {}", e))?;
+        .map_err(|e| format!("spawn nell init: {}", e))?;
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
