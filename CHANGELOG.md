@@ -6,6 +6,30 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Added (2026-05-07 — Phase 7 open-source distribution)
+
+- **macOS proper ad-hoc signing.** Tauri's default macOS bundling
+  produced a .app where the main executable was linker-signed but
+  the .app's resources weren't sealed into the signature, so
+  `codesign --verify --deep --strict` failed and Gatekeeper would
+  reject the app even on right-click → Open. Setting
+  `bundle.macOS.signingIdentity = "-"` in `tauri.conf.json` triggers
+  Tauri to do a full ad-hoc codesign across the entire bundle,
+  including the embedded `python-runtime/` tree. `verify: OK` now.
+  The first-launch warning is still "unidentified developer"
+  (no paid Developer ID), but the binary integrity passes — so the
+  right-click → Open bypass works as expected.
+- **`INSTALL.md`** — per-platform installation walkthrough for
+  end-users of the unsigned bundles. Covers macOS Gatekeeper
+  bypass (right-click → Open, System Settings → Open Anyway, or
+  terminal `xattr` route), Windows SmartScreen "More info → Run
+  anyway" path, Linux .deb / AppImage flow, build-from-source path,
+  and SHA256 verification. Includes an honest "why open-source means
+  warnings" section explaining what the warning *is* and isn't.
+- **README link to INSTALL.md** — top-level README now points
+  end-users at the install guide directly, with a per-platform
+  summary and the one external prerequisite (`claude` CLI on PATH).
+
 ### Added (2026-05-07 — Phase 7 cross-platform)
 
 - **Cross-platform Phase 7 release pipeline.** Code paths in tree for
