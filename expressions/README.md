@@ -7,14 +7,15 @@ intensity on emotional spikes.
 
 ## Format
 
-Each category lives in its own directory with exactly four PNGs:
+Each category lives in its own directory with exactly four PNGs,
+numbered 1-4 by the authoring convention:
 
 ```
 <category>/
-  base.png            ← mouth-closed + eyes-open  (resting frame, ~95% of the time)
-  blink.png           ← mouth-closed + eyes-closed (random flash, 150ms)
-  speaking.png        ← mouth-open + eyes-open    (talking frame)
-  speaking-blink.png  ← mouth-open + eyes-closed  (peak intensity)
+  1.png    ← Eyes Open,   Mouth Closed   (base — resting; shown ~95% of the time)
+  2.png    ← Eyes Open,   Mouth Open     (speaking — mouth animates while replying)
+  3.png    ← Eyes Closed, Mouth Closed   (blink — random 150ms flash)
+  4.png    ← Eyes Closed, Mouth Open     (speaking-blink — peak intensity)
 ```
 
 Drop the PNGs in. The runtime picks them up on next build — no code
@@ -73,15 +74,21 @@ immediately. The other three frames can follow per category.
 ## Legacy single-file format (still works)
 
 The pre-Phase-5 art shape — `<category> 1.png` through `<category> 4.png`
-in this directory's root — continues to function as a fallback. The
-runtime's frame → variant mapping:
+at this directory's root — continues to function as a fallback. The
+runtime treats the numeric index identically to the new directory
+format:
 
 ```
-base               ← variant 1
-blink              ← variant 1  (no real blink frame in legacy)
-speaking           ← variant 2
-speaking-blink     ← variant 3
+<category> 1.png   ← Eyes Open,   Mouth Closed   (base)
+<category> 2.png   ← Eyes Open,   Mouth Open     (speaking)
+<category> 3.png   ← Eyes Closed, Mouth Closed   (blink)
+<category> 4.png   ← Eyes Closed, Mouth Open     (speaking-blink)
 ```
+
+So the existing legacy art (smile/happy/sad/angry/scared/shy/exhausted
++ defiant) works without moving anything. New art can ship in either
+location — the runtime tries the new directory first, falls back to
+the legacy single-file path.
 
 Categories without a populated directory and without legacy variants
 cascade through the fallback chain (e.g. `content` → `smile`,
