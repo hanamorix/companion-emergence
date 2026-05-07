@@ -82,3 +82,51 @@ def test_commit_item_auto_hebbian_links_related_memories(
     assert len(neighbors) >= 1
     weights = [w for _, w in neighbors]
     assert all(w == 0.5 for w in weights)
+
+
+# ---------------------------------------------------------------------------
+# image_shas — multimodal metadata
+# ---------------------------------------------------------------------------
+
+
+def test_commit_item_persists_image_shas_in_metadata(
+    store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """Image-bearing memory carries the sha list in metadata."""
+    item = ExtractedItem(
+        text="Hana shared a photo of her mirror selfie", label="fact", importance=7
+    )
+    mem_id = commit_item(
+        item,
+        session_id="sess_img",
+        store=store,
+        hebbian=hebbian,
+        image_shas=["a" * 64, "b" * 64],
+    )
+    assert mem_id is not None
+    memory = store.get(mem_id)
+    assert memory.metadata.get("image_shas") == ["a" * 64, "b" * 64]
+
+
+def test_commit_item_no_image_shas_metadata_when_unset(
+    store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """Existing text-only flow leaves metadata as before — no image_shas key."""
+    item = ExtractedItem(text="Plain text fact", label="fact", importance=4)
+    mem_id = commit_item(item, session_id="sess_text", store=store, hebbian=hebbian)
+    assert mem_id is not None
+    memory = store.get(mem_id)
+    assert "image_shas" not in memory.metadata
+
+
+def test_commit_item_empty_image_shas_treated_as_unset(
+    store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """An empty list is dropped — keeps metadata clean for downstream consumers."""
+    item = ExtractedItem(text="Plain text", label="fact", importance=4)
+    mem_id = commit_item(
+        item, session_id="s", store=store, hebbian=hebbian, image_shas=[]
+    )
+    assert mem_id is not None
+    memory = store.get(mem_id)
+    assert "image_shas" not in memory.metadata
