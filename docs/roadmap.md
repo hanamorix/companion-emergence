@@ -119,26 +119,29 @@ fine without them.
 - Wheel/sdist clean-install smoke test never recorded
 - Public contributor/onboarding docs missing
 - Public API/CLI compatibility policy undefined
-- Deprecated `nell bridge` alias still in tree (removing it doesn't
-  affect `nell chat` auto-spawn — that uses `brain.bridge.daemon`
-  internals directly)
 - Tauri app distribution story (signing, notarization, auto-update)
   unwritten — not blocking private use but blocking public ship
-- Phase 7 — Python+uv runtime bundling so the Tauri app is true
-  zero-install (today still needs `uv run nell supervisor start`
-  separately or relies on `uv` being on PATH)
+- Linux .deb / Windows .msi cross-platform release of the Phase 7
+  bundle — the macOS arm64 path is shipping as of 2026-05-07; Linux
+  x86_64 is supported by `python-build-standalone` and the build
+  script branches on platform but hasn't been smoke-tested; Windows
+  needs `Scripts/python.exe` instead of `bin/python3` and a separate
+  branch in `nell_command`
 
 ## Forward direction (after the backlog drains)
 
 These are framework-shaped, not patch-shaped. Picked from current
 spec drafts and the natural extensions of the multimodal turn work:
 
-- **Phase 7 bundling** — see public-release blockers above
-- **NellFace richer image surfaces** — past-image gallery in panels,
-  drag-and-drop upload, paste-from-clipboard, multi-image turns
+- **NellFace past-image gallery** — drag-and-drop + paste-from-
+  clipboard already shipped 2026-05-07; the remaining piece is a
+  panel-based gallery to browse what's been shared in past turns
 - **Voice gap remediation past the asymptote** — sampling controls
   or finetuned model for true corpus-target voice (current state is
   "moved in the right direction, asymptotic" per 2026-05-05 retest)
+- **JSONL bounded-tail retention** — companion to the streaming
+  reader shipped 2026-05-07; needs a per-log-type design call about
+  retention windows
 - **Public release plan** — once the backlog above is clean, write a
   proper release plan covering signing, distribution, contributor
   workflow, version policy
