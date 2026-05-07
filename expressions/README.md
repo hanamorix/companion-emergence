@@ -94,11 +94,27 @@ Categories without a populated directory and without legacy variants
 cascade through the fallback chain (e.g. `content` → `smile`,
 `aching` → `sad`, `flushed` → `shy`) until each new directory ships.
 
-## Pre-existing files in this directory (review before deleting)
+## Orphaned legacy files needing a home
 
-- `arsoual 1-4.png` — looks like "arousal" misspelled. Likely belongs
-  in `flushed/` (or `arousal/` if you'd prefer that as a category).
-  Rename + drop into the right directory when you decide.
-- `climax 1-3.png` + `clmiax 4.png` — climax frames; one filename has
-  a typo. Could go in `flushed/` (current heuristic) OR a new `climax/`
-  category if we want a distinct peak expression.
+Two batches of legacy art at this directory's root don't yet match
+any of the 13 categories the runtime knows about. They render
+nothing today; the heuristic stack just falls back through the
+chain to whichever category is closest.
+
+- `arousal 1-4.png` — covers the cheeks-colored / lidded-eyes
+  register. Two options:
+  1. Copy into `flushed/1.png` … `flushed/4.png`. The current
+     heuristic routes `body_emotions.arousal + desire >= 12`
+     and `body_emotions.climax >= 7` to `flushed`, so this
+     instantly lights up.
+  2. Add `arousal` as its own category in
+     `app/src/expressions.ts` (small code change) if you want
+     it distinct from `flushed` for some reason.
+- `climax 1-4.png` — same situation. Today routes to `flushed`
+  via the heuristic. Drop into `flushed/` (overwriting `arousal`
+  if you copy that there too) OR add `climax` as a distinct
+  peak-only category.
+
+`defiant 1-4.png` exists at root and is consumed correctly via
+legacy fallback for the `defiant` category — no action needed
+unless you want to also drop into `defiant/` directory.
