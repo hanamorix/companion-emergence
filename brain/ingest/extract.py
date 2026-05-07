@@ -100,7 +100,16 @@ def format_transcript(
             label = assistant_label
         else:
             label = speaker
-        lines.append(f"{label}: {t.get('text', '')}")
+        body = t.get("text", "")
+        # Surface attached images as inline markers so the extractor
+        # records that an image was shared in this turn — the marker
+        # carries the first 8 hex of the sha so commit.py can match
+        # back to the buffer's image_shas list. Bytes never inline.
+        shas = t.get("image_shas") or []
+        if shas:
+            markers = " ".join(f"[image: {s[:8]}]" for s in shas)
+            body = f"{markers} {body}".strip() if body else markers
+        lines.append(f"{label}: {body}")
     text = "\n".join(lines)
     cap = max_tokens * 4
     if len(text) > cap:
