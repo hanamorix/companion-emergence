@@ -247,3 +247,124 @@ def test_persona_state_endpoint_requires_auth(persona_dir: Path):
     with TestClient(app) as c:
         r = c.get("/persona/state")  # no auth header
         assert r.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# image_shas — multimodal chat threading
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+_TINY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c63606060600000000400015e36b8c80000000049454e44ae426082"
+)
+
+
+def test_chat_accepts_image_shas_and_records_in_buffer(
+    persona_dir: Path, monkeypatch
+):
+    """POST /chat with image_shas: ingest buffer JSONL has the shas on the user turn."""
+    _patch_fake_provider(monkeypatch, reply="I see you.")
+    with _make_client(persona_dir) as c:
+        # Upload a real image first so media_type lookup succeeds.
+        up = c.post(
+            "/upload",
+            files={"file": ("p.png", _TINY_PNG, "image/png")},
+        )
+        assert up.status_code == 200
+        sha = up.json()["sha"]
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        r = c.post(
+            "/chat",
+            json={"session_id": sid, "message": "look at this", "image_shas": [sha]},
+        )
+        assert r.status_code == 200, r.text
+        # Buffer JSONL should have the user record with image_shas.
+        from brain.ingest.buffer import read_session
+
+        turns = read_session(persona_dir, sid)
+        user_turn = next(t for t in turns if t["speaker"] == "user")
+        assert user_turn["image_shas"] == [sha]
+
+
+def test_chat_rejects_too_many_image_shas(persona_dir: Path, monkeypatch):
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        r = c.post(
+            "/chat",
+            json={
+                "session_id": sid,
+                "message": "lots",
+                "image_shas": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(9)],
+            },
+        )
+        assert r.status_code == 422
+
+
+def test_chat_image_shas_default_empty_works(persona_dir: Path, monkeypatch):
+    """No image_shas key — backward compat, behaves like text-only chat."""
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        r = c.post("/chat", json={"session_id": sid, "message": "no images"})
+        assert r.status_code == 200
+        from brain.ingest.buffer import read_session
+
+        turns = read_session(persona_dir, sid)
+        user_turn = next(t for t in turns if t["speaker"] == "user")
+        assert "image_shas" not in user_turn
+
+
+def test_chat_with_missing_image_sha_still_completes(persona_dir: Path, monkeypatch):
+    """Sha references a file that doesn't exist — chat still completes; image is dropped."""
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        ghost = "f" * 64
+        r = c.post(
+            "/chat",
+            json={"session_id": sid, "message": "ghost image", "image_shas": [ghost]},
+        )
+        # Chat must succeed — the engine logs and skips the missing image,
+        # passing the user's text portion through unchanged.
+        assert r.status_code == 200
+
+
+def test_stream_accepts_image_shas_in_request_frame(persona_dir: Path, monkeypatch):
+    """WS /stream/{sid} accepts image_shas alongside message; buffer carries them."""
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="seen")
+    with _make_client(persona_dir) as c:
+        up = c.post(
+            "/upload",
+            files={"file": ("p.png", _TINY_PNG, "image/png")},
+        )
+        sha = up.json()["sha"]
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "look", "image_shas": [sha]})
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    break
+        from brain.ingest.buffer import read_session
+
+        turns = read_session(persona_dir, sid)
+        user_turn = next(t for t in turns if t["speaker"] == "user")
+        assert user_turn["image_shas"] == [sha]
+
+
+def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch):
+    """WS frame with non-list image_shas closes with an error frame."""
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            # Too many shas
+            ws.send_json({"message": "x", "image_shas": ["a" * 64] * 9})
+            f = ws.receive_json()
+            assert f.get("type") == "error"
+            assert f.get("code") == "invalid_image_shas"
