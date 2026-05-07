@@ -58,16 +58,26 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
     Optional:
         session_id  — if absent, a new UUID-based session id is generated.
         ts          — ISO-8601 timestamp; defaults to now (UTC).
+        image_shas  — list of sha-strings for images attached to this
+                      turn. References content stored under
+                      ``<persona_dir>/images/<sha>.<ext>``. Recorded on
+                      the JSONL line so downstream stages (extract,
+                      commit) can surface images to memory metadata.
 
     Buffer path: <persona_dir>/active_conversations/<session_id>.jsonl
     """
     session_id: str = turn.get("session_id") or f"sess_{uuid.uuid4().hex[:8]}"
-    record = {
+    record: dict = {
         "session_id": session_id,
         "speaker": turn.get("speaker", "unknown"),
         "text": (turn.get("text") or "").strip(),
         "ts": turn.get("ts") or _now_iso(),
     }
+    image_shas = turn.get("image_shas")
+    if image_shas:
+        # Defensive copy so callers passing tuples or generators end up
+        # with a JSON-serialisable list on the record.
+        record["image_shas"] = list(image_shas)
     path = _session_path(persona_dir, session_id)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
