@@ -114,30 +114,92 @@ def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
     assert "hello" in cmd
 
 
-def test_claude_cli_chat_flattens_image_block_to_marker() -> None:
-    """Image-bearing ChatMessages flatten to ``[image: <sha[:8]>]`` text.
-
-    Until ClaudeCliProvider gains native multimodal passthrough, image
-    blocks survive into the prompt as markers so Nell at least
-    acknowledges that an image was shared.
-    """
-    sha = "a" * 64
-    blocks = (
-        TextBlock(text="look at this"),
-        ImageBlock(image_sha=sha, media_type="image/png"),
-        TextBlock(text="what do you think?"),
+def _make_stream_json_result(text: str = "I see it.") -> MagicMock:
+    """Build a stream-json subprocess result with one assistant + one result frame."""
+    m = MagicMock()
+    m.returncode = 0
+    m.stdout = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "subtype": "success", "result": text}),
+        ]
     )
-    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+    m.stderr = ""
+    return m
+
+
+def test_claude_cli_chat_image_passthrough_routes_through_stream_json(tmp_path) -> None:
+    """Image-bearing messages route through --input-format stream-json with base64 image."""
+    import hashlib
+
+    from brain.images import save_image_bytes
+
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c63606060600000000400015e36b8c80000000049454e44ae426082"
+    )
+    save_image_bytes(tmp_path, tiny_png, "image/png")
+    sha = hashlib.sha256(tiny_png).hexdigest()
+
+    blocks = (
+        TextBlock(text="describe this"),
+        ImageBlock(image_sha=sha, media_type="image/png"),
+    )
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_make_stream_json_result("a tiny png"),
+    ) as mock_run:
         p = ClaudeCliProvider(model="sonnet")
+        resp = p.chat(
+            [ChatMessage(role="user", content=blocks)],
+            options={"persona_dir": str(tmp_path)},
+        )
+
+    assert resp.content == "a tiny png"
+    cmd = mock_run.call_args[0][0]
+    assert "--input-format" in cmd
+    assert "stream-json" in cmd
+    assert "--output-format" in cmd
+    # Base64 of the bytes should land on stdin via input=
+    stdin_bytes = mock_run.call_args.kwargs["input"]
+    import base64
+
+    expected_b64 = base64.b64encode(tiny_png).decode("ascii")
+    assert expected_b64 in stdin_bytes
+    # describe this text block also serialised
+    assert "describe this" in stdin_bytes
+
+
+def test_claude_cli_chat_image_without_persona_dir_raises() -> None:
+    """Image blocks need persona_dir to resolve image bytes — no fallback."""
+    blocks = (
+        TextBlock(text="x"),
+        ImageBlock(image_sha="a" * 64, media_type="image/png"),
+    )
+    p = ClaudeCliProvider(model="sonnet")
+    with pytest.raises(Exception, match="image_passthrough_unavailable"):
         p.chat([ChatMessage(role="user", content=blocks)])
 
+
+def test_claude_cli_chat_text_only_still_uses_p_flag() -> None:
+    """Pure-text turns continue using the legacy -p path — no stream-json overhead."""
+    with patch(
+        "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
+    ) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat([ChatMessage(role="user", content="hello")])
     cmd = mock_run.call_args[0][0]
-    # The flattened prompt is the value after the -p flag.
-    p_index = cmd.index("-p")
-    flattened = cmd[p_index + 1]
-    assert "look at this" in flattened
-    assert "[image: aaaaaaaa]" in flattened
-    assert "what do you think?" in flattened
+    assert "-p" in cmd
+    assert "stream-json" not in cmd
 
 
 def test_claude_cli_chat_passes_system_prompt_flag() -> None:
