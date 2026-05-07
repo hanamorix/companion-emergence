@@ -253,7 +253,7 @@ def test_persona_state_endpoint_requires_auth(persona_dir: Path):
 # image_shas — multimodal chat threading
 # ---------------------------------------------------------------------------
 
-import hashlib
+import hashlib  # noqa: E402 — late import groups with the image-tests block below
 
 _TINY_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"

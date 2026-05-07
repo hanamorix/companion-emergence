@@ -5,7 +5,6 @@ const STEP_TO_EXPRESSION: Record<string, string> = {
   welcome: expressionPath("smile", 4),
   name: expressionPath("shy", 1),
   user: expressionPath("happy", 1),
-  llm: expressionPath("shy", 3),
   voice: expressionPath("smile", 1),
   migrate: expressionPath("exhausted", 2),
   review: expressionPath("happy", 3),
