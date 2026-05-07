@@ -30,7 +30,13 @@ from typing import Any
 
 import httpx
 
-from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
+from brain.bridge.chat import (
+    ChatMessage,
+    ChatResponse,
+    ImageBlock,
+    TextBlock,
+    ToolCall,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -271,11 +277,26 @@ class ClaudeCliProvider(LLMProvider):
             else:
                 conversation_messages.append(msg)
 
-        # ImageBlocks render through content_text() as
-        # ``[image: <sha[:8]>]`` markers so the CLI text path at least
-        # acknowledges the presence of an image until ClaudeCliProvider
-        # gains native multimodal passthrough (Anthropic SDK, separate
-        # session). The bytes are still on disk under <persona_dir>/images/.
+        # If any conversation message carries an ImageBlock, route through
+        # the stream-json input path so claude actually sees the pixels.
+        # The legacy text path stays the default for text-only turns —
+        # cheaper, no JSON-stream framing overhead.
+        has_images = any(_message_has_image(m) for m in conversation_messages)
+        if has_images:
+            persona_dir_str = (options or {}).get("persona_dir")
+            if not persona_dir_str:
+                raise ProviderError(
+                    "image_passthrough_unavailable",
+                    "image-bearing turns require options['persona_dir'] "
+                    "to resolve <persona_dir>/images/<sha>.<ext>",
+                )
+            return self._chat_with_images(
+                conversation_messages=conversation_messages,
+                system_prompt=system_prompt,
+                persona_dir=Path(persona_dir_str),
+                tools_enabled=bool(tools),
+            )
+
         if not conversation_messages:
             flat_prompt = ""
         elif len(conversation_messages) == 1:
@@ -336,6 +357,175 @@ class ClaudeCliProvider(LLMProvider):
             ) from exc
 
         return ChatResponse(content=content, tool_calls=(), raw=None)
+
+    def _chat_with_images(
+        self,
+        conversation_messages: list[ChatMessage],
+        system_prompt: str | None,
+        persona_dir: Path,
+        tools_enabled: bool,
+    ) -> ChatResponse:
+        """Multimodal chat path — pipes Anthropic-shaped messages via stream-json.
+
+        Why: claude CLI has no native ``--image`` flag. ``--input-format
+        stream-json`` does accept SDK-shape messages with content blocks
+        including ``{type: image, source: {type: base64, ...}}`` (verified
+        2026-05-07). This path is reserved for turns that actually carry
+        ImageBlocks; pure text turns continue through the legacy ``-p``
+        path which avoids the JSON-stream framing overhead.
+
+        Tool-calling: when ``tools_enabled`` is True we still write a
+        temp mcp.json + ``--mcp-config`` + ``--allowedTools`` so MCP tool
+        calls inside the claude subprocess work the same as in the
+        text-only path. Stream-json input is orthogonal to MCP.
+
+        Persisted history: only the LAST user turn is sent as a
+        multimodal block list — earlier turns are flattened into the
+        system prompt because stream-json sends one user message at a
+        time. This matches how the legacy text path collapses prior
+        turns into the prompt body.
+        """
+        # Split: history (everything but the last user turn) goes into
+        # system prompt as a flat transcript; the final user turn goes
+        # through stream-json as Anthropic content blocks.
+        if not conversation_messages:
+            raise ProviderError(
+                "image_passthrough_unavailable",
+                "no conversation messages to send",
+            )
+        last_user = conversation_messages[-1]
+        if last_user.role != "user":
+            raise ProviderError(
+                "image_passthrough_unavailable",
+                f"last message must be role=user; got {last_user.role!r}",
+            )
+        history = conversation_messages[:-1]
+
+        # Compose the final system prompt: original system + transcript
+        # of prior turns. Multi-turn image conversations work; what
+        # changes is that earlier images render as [image: <sha[:8]>]
+        # text markers in the history, not as visible blocks.
+        history_text = ""
+        if history:
+            role_labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
+            history_text = "\n".join(
+                f"{role_labels.get(m.role, m.role.capitalize())}: {m.content_text()}"
+                for m in history
+            )
+        full_system: str | None = system_prompt
+        if history_text:
+            full_system = (
+                f"{system_prompt}\n\n# Prior turns\n{history_text}"
+                if system_prompt
+                else f"# Prior turns\n{history_text}"
+            )
+
+        # Build the SDK-shape user message frame.
+        user_frame = _build_stream_json_user_message(last_user, persona_dir)
+        stdin_payload = json.dumps(user_frame, ensure_ascii=False) + "\n"
+
+        cmd = [
+            "claude",
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", self._model,
+        ]
+        if full_system is not None:
+            cmd.extend(["--system-prompt", full_system])
+
+        # Set up MCP if tools are enabled — same shape as the
+        # legacy-text tool path so the brain's tools remain available
+        # for image-bearing turns.
+        tmp_mcp_path: str | None = None
+        request_id = uuid.uuid4().hex
+        env_overrides = {**os.environ, "NELL_MCP_AUDIT_REQUEST_ID": request_id}
+        audit_offset_before = 0
+        audit_log_path = persona_dir / "tool_invocations.log.jsonl"
+        if tools_enabled:
+            try:
+                import mcp  # noqa: F401
+            except ImportError as exc:
+                raise ProviderError(
+                    "mcp_unavailable",
+                    "the 'mcp' SDK is required for image-passthrough + tools",
+                ) from exc
+            mcp_config = {
+                "mcpServers": {
+                    "brain-tools": {
+                        "command": sys.executable,
+                        "args": [
+                            "-m",
+                            "brain.mcp_server",
+                            "--persona-dir",
+                            str(persona_dir),
+                        ],
+                        "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
+                    }
+                }
+            }
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", delete=False, encoding="utf-8",
+                ) as tmp:
+                    json.dump(mcp_config, tmp)
+                    tmp_mcp_path = tmp.name
+            except OSError as exc:
+                raise ProviderError(
+                    "claude_cli_setup",
+                    f"failed to write temp mcp.json: {exc}",
+                ) from exc
+            from brain.tools import NELL_TOOL_NAMES
+
+            allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
+            cmd.extend(["--mcp-config", tmp_mcp_path])
+            cmd.extend(["--allowedTools", *allowed_mcp])
+            try:
+                audit_offset_before = audit_log_path.stat().st_size
+            except FileNotFoundError:
+                audit_offset_before = 0
+
+        try:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    env=env_overrides,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError(
+                    "claude_cli_timeout",
+                    f"image-passthrough subprocess timed out after {self._timeout}s",
+                ) from exc
+
+            if result.returncode != 0:
+                raise ProviderError(
+                    "claude_cli_exit",
+                    f"exit {result.returncode}: {result.stderr.strip()[:300]}",
+                )
+
+            content = _parse_stream_json_result(result.stdout)
+            dispatched: tuple[dict[str, Any], ...] = ()
+            if tools_enabled:
+                dispatched = tuple(
+                    _read_audit_lines_since(
+                        audit_log_path, audit_offset_before, request_id=request_id
+                    )
+                )
+            return ChatResponse(
+                content=content, tool_calls=(), dispatched_invocations=dispatched, raw=None
+            )
+        finally:
+            if tmp_mcp_path:
+                try:
+                    os.unlink(tmp_mcp_path)
+                except OSError:
+                    pass
 
     def _chat_with_mcp_tools(
         self,
@@ -515,6 +705,105 @@ def _read_audit_lines_since(
             record["error"] = entry["error"]
         records.append(record)
     return records
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCliProvider — image passthrough helpers
+# ---------------------------------------------------------------------------
+
+
+def _message_has_image(msg: ChatMessage) -> bool:
+    """True if ``msg.content`` carries any ImageBlock."""
+    if isinstance(msg.content, str):
+        return False
+    return any(isinstance(b, ImageBlock) for b in msg.content)
+
+
+def _build_stream_json_user_message(
+    msg: ChatMessage,
+    persona_dir: Path,
+) -> dict[str, Any]:
+    """Convert a ChatMessage with image blocks into Anthropic-shaped JSON.
+
+    Reads image bytes from disk, base64-encodes inline, and emits the
+    SDK-shape envelope claude --input-format stream-json expects:
+
+        {"type": "user", "message": {"role": "user", "content": [...]}}
+
+    where each content block is either ``{type: text, text}`` or
+    ``{type: image, source: {type: base64, media_type, data}}``.
+
+    Image-block bytes are read via ``brain.images.read_image_bytes``;
+    missing files surface as ProviderError("image_missing", ...) so the
+    caller can decide whether to skip or fail.
+    """
+    import base64
+
+    from brain.images import read_image_bytes
+
+    blocks_out: list[dict[str, Any]] = []
+    for block in msg.content_blocks():
+        if isinstance(block, TextBlock):
+            if block.text:
+                blocks_out.append({"type": "text", "text": block.text})
+        elif isinstance(block, ImageBlock):
+            try:
+                raw = read_image_bytes(persona_dir, block.image_sha, block.media_type)
+            except FileNotFoundError as exc:
+                raise ProviderError(
+                    "image_missing",
+                    f"image_sha={block.image_sha[:8]} not on disk: {exc}",
+                ) from exc
+            blocks_out.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block.media_type,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    },
+                }
+            )
+    return {
+        "type": "user",
+        "message": {"role": msg.role, "content": blocks_out},
+    }
+
+
+def _parse_stream_json_result(stdout: str) -> str:
+    """Extract the final assistant reply from a claude stream-json output.
+
+    The stream emits a sequence of JSON-line events; the canonical reply
+    text lives on the ``{"type": "result", "result": "..."}`` frame
+    emitted last. If no result frame is present, fall back to
+    concatenating any ``{"type":"assistant"}`` content with type "text".
+    """
+    result_text: str | None = None
+    assistant_chunks: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            frame = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ftype = frame.get("type")
+        if ftype == "result" and "result" in frame:
+            result_text = str(frame["result"])
+        elif ftype == "assistant":
+            content = frame.get("message", {}).get("content") or []
+            for block in content:
+                if block.get("type") == "text":
+                    assistant_chunks.append(str(block.get("text", "")))
+    if result_text is not None:
+        return result_text
+    if assistant_chunks:
+        return "".join(assistant_chunks)
+    raise ProviderError(
+        "claude_cli_parse",
+        f"no result frame in stream-json output: {stdout[:300]!r}",
+    )
 
 
 # ---------------------------------------------------------------------------
