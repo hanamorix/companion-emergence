@@ -24,7 +24,6 @@ import type { BodyState, PersonaState } from "./bridge";
 // ────────────────────────────────────────────────────────────────────────────
 
 export type ExpressionCategory =
-  // existing 7 — legacy art in <category> 1.png … <category> 4.png
   | "smile"
   | "happy"
   | "sad"
@@ -32,14 +31,14 @@ export type ExpressionCategory =
   | "scared"
   | "shy"
   | "exhausted"
-  // new 6 — Phase 5 art. Falls back to closest legacy category until each
-  // <category>/ directory lands.
+  | "defiant"
+  | "arousal"
+  | "climax"
   | "content"
   | "aching"
   | "flushed"
   | "awe"
-  | "intent"
-  | "defiant";
+  | "intent";
 
 /**
  * Where to render this category from when no art for it exists yet.
@@ -48,7 +47,7 @@ export type ExpressionCategory =
 const FALLBACK_CATEGORY: Partial<Record<ExpressionCategory, ExpressionCategory>> = {
   content: "smile",
   aching: "sad",
-  flushed: "shy",
+  flushed: "arousal",
   awe: "happy",
   intent: "happy",
   defiant: "angry",
@@ -174,9 +173,9 @@ export function pickExpressionCategory(input: ExpressionInput): ExpressionCatego
   const bodyEmo = body?.body_emotions ?? {};
 
   // 1. Body overrides — physiology first
-  if ((bodyEmo.climax ?? 0) >= CLIMAX_OVERRIDE) return "flushed";
+  if ((bodyEmo.climax ?? 0) >= CLIMAX_OVERRIDE) return "climax";
   if (((bodyEmo.arousal ?? 0) + (bodyEmo.desire ?? 0)) >= AROUSAL_DESIRE_SUM_OVERRIDE) {
-    return "flushed";
+    return "arousal";
   }
   if ((body?.exhaustion ?? 0) >= EXHAUSTION_OVERRIDE) return "exhausted";
 
