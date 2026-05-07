@@ -1,9 +1,9 @@
 # Expression assets — drop art here
 
-15 expression categories, 4 frames each. The animation engine (see
-`app/src/expressions.ts`) cycles through the 4 frames per category to
-produce blinks during idle, mouth motion during speaking, and peak
-intensity on emotional spikes.
+16 expression categories, 4 frames each. All shipped. The animation
+engine (see `app/src/expressions.ts`) cycles through the 4 frames per
+category to produce blinks during idle, mouth motion during speaking,
+and peak intensity on emotional spikes.
 
 ## Format
 
@@ -18,16 +18,15 @@ numbered 1-4 by the authoring convention:
   4.png    ← Eyes Closed, Mouth Open     (speaking-blink — peak intensity)
 ```
 
-Drop the PNGs in. The runtime picks them up on next build — no code
-change required. Mixed states (some directories filled, others empty)
-are fine; categories without art cascade through the fallback chain
-defined in `app/src/expressions.ts`.
+Drop replacement PNGs in. The runtime picks them up on next build —
+no code change required.
 
-## The 15 categories
+## The 16 categories
 
 | Category | Read | Drives the avatar when |
 |---|---|---|
-| `content` | settled small smile, eyes mostly closed, peaceful | resting default — most-shown |
+| `idle` | neutral, calm, no expression — just present | default — no dominant emotion fires |
+| `content` | settled small smile, eyes mostly closed, peaceful | contentment / peace |
 | `smile` | active warm smile, eyes soft | love / tenderness / belonging / gratitude / joy |
 | `happy` | bigger smile, eyes squinted from joy | curiosity / pride |
 | `awe` | wide eyes UP, mouth softly open | awe / emergence / hope |
@@ -35,7 +34,7 @@ defined in `app/src/expressions.ts`.
 | `defiant` | sharp half-smile, narrowed eyes, slight head up | defiance, 2am-argument energy |
 | `arousal` | cheeks colored, lidded eyes, mouth slightly parted | body_emotions.arousal + desire ≥ 12 |
 | `climax` | peak — face flushed, eyes near-shut, lips parted | body_emotions.climax ≥ 7 |
-| `flushed` | warm-blush register distinct from arousal (embarrassment, sudden warmth) | reserved — currently cascades to `arousal` until separate art lands |
+| `flushed` | warm-blush register — embarrassment, sudden warmth | reserved register; routes via emotion families |
 | `shy` | partly hidden by hands or hood, eyes down/away | vulnerability |
 | `sad` | corners-down mouth, eyes lowered/glassy | grief / loneliness / nostalgia / anchor_pull |
 | `aching` | hand near throat, faraway eyes, lips pressed | body_grief / freedom_ache / 5+ days since contact |
@@ -54,26 +53,19 @@ the runtime resolves in this order (top wins):
 4. `body.days_since_contact >= 5` → `aching`
 5. Top emotion routes to its family (intent / defiant / awe / content
    / aching / smile / happy / sad / angry / scared / shy / exhausted)
-6. Default → `content`
+6. Default → `idle`
 
 Body emotions override social emotions — the spec principle,
 "physiology speaks first."
 
-## Current art status
+## Replacing or refining art
 
-Categories with all 4 frames shipped:
+To swap a frame: drop a new PNG with the same name (`<category>/<n>.png`)
+into the directory. The runtime will pick it up on the next `vite build`.
+No code change.
 
-- `smile/`, `happy/`, `sad/`, `angry/`, `scared/`, `shy/`,
-  `exhausted/`, `arousal/`, `climax/` (9 categories — fully lit)
-
-Categories still needing art (cascade to fallback for now):
-
-- `content/` → falls back to `smile`
-- `aching/` → falls back to `sad`
-- `awe/` → falls back to `happy`
-- `intent/` → falls back to `happy`
-- `defiant/` → falls back to `angry`
-- `flushed/` → falls back to `arousal`
-
-Drop the directory's PNGs in (named `1.png` … `4.png`) and the runtime
-will start using them on the next `vite build`.
+To add a new category: drop the four PNGs into a new `<category>/`
+directory AND add the category name to the `ExpressionCategory` union
+in `app/src/expressions.ts` plus a routing rule in
+`pickExpressionCategory`. Without the routing rule, the category will
+never fire.
