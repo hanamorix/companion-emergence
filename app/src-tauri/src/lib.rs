@@ -173,15 +173,17 @@ fn list_personas() -> Result<Vec<String>, String> {
 /// Resolve a Command that runs the `nell` CLI.
 ///
 /// Production (Phase 7 bundle): app/src-tauri/python-runtime ships
-/// inside Resources/. The bundled Python's `bin/nell` script is the
-/// entry point. No PATH dependency; user doesn't need uv installed.
+/// inside Resources/. Path differs per OS because python-build-standalone
+/// uses different layouts:
+///   * macOS / Linux: Resources/python-runtime/bin/nell
+///   * Windows:       Resources/python-runtime/Scripts/nell.exe
 ///
 /// Dev (`pnpm tauri dev`): the bundled runtime usually isn't built,
-/// so fall back to `uv run nell` against the source tree. This keeps
-/// the developer iteration loop fast.
+/// so fall back to `uv run nell` against the source tree. Keeps the
+/// dev iteration loop fast.
 ///
 /// Resolution order:
-///   1. Resources/python-runtime/bin/nell (bundled)
+///   1. Bundled per-OS path (production)
 ///   2. uv run nell (dev fallback)
 fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
     use tauri::Manager;
@@ -189,7 +191,12 @@ fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
         .path()
         .resource_dir()
         .map_err(|e| format!("resolve resource_dir: {}", e))?;
-    let bundled = resource_dir.join("python-runtime").join("bin").join("nell");
+    let runtime_dir = resource_dir.join("python-runtime");
+    let bundled = if cfg!(windows) {
+        runtime_dir.join("Scripts").join("nell.exe")
+    } else {
+        runtime_dir.join("bin").join("nell")
+    };
     if bundled.exists() {
         return Ok(Command::new(bundled));
     }
