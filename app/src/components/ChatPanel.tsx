@@ -11,17 +11,31 @@ interface Message {
 const formatTime = () =>
   new Date().toLocaleTimeString("en", { hour: "numeric", minute: "2-digit" });
 
+interface Props {
+  /** Notifier called when chat is in-flight; drives NellAvatar's
+   * speaking animation. true = waiting for reply, false = idle. */
+  onSpeakingChange?: (speaking: boolean) => void;
+}
+
 /**
  * ChatPanel — text-only HTTP /chat for Phase 2. Phase 6 will switch
  * to WS /stream for token-by-token streaming.
+ *
+ * Reports its in-flight state via onSpeakingChange so the avatar can
+ * cycle to the speaking frames while a reply is being composed.
  */
-export function ChatPanel() {
+export function ChatPanel({ onSpeakingChange }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Pipe typing state up so the avatar can do the talking animation
+  useEffect(() => {
+    onSpeakingChange?.(typing);
+  }, [typing, onSpeakingChange]);
 
   // Open session on mount
   useEffect(() => {
