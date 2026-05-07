@@ -256,3 +256,57 @@ def test_extract_items_uses_legacy_prompt_when_names_missing() -> None:
     assert len(captured) == 1
     # Legacy prompt does NOT have the named header
     assert "is the human user" not in captured[0]
+
+
+# ---------------------------------------------------------------------------
+# image_shas — markers in the formatted transcript
+# ---------------------------------------------------------------------------
+
+
+def test_format_transcript_inlines_image_marker():
+    from brain.ingest.extract import format_transcript
+
+    turns = [
+        {"speaker": "user", "text": "look at this", "image_shas": ["a" * 64]},
+        {"speaker": "assistant", "text": "I see something familiar."},
+    ]
+    out = format_transcript(turns)
+    assert "[image: aaaaaaaa] look at this" in out
+    assert "I see something familiar" in out
+
+
+def test_format_transcript_image_only_turn_emits_marker():
+    """Image with no text — marker stands on its own."""
+    from brain.ingest.extract import format_transcript
+
+    turns = [
+        {"speaker": "user", "text": "", "image_shas": ["c" * 64]},
+    ]
+    out = format_transcript(turns)
+    assert "[image: cccccccc]" in out
+    # No leading whitespace garbage
+    assert "user: [image: cccccccc]" in out
+
+
+def test_format_transcript_multiple_images():
+    from brain.ingest.extract import format_transcript
+
+    turns = [
+        {
+            "speaker": "user",
+            "text": "two of them",
+            "image_shas": ["a" * 64, "b" * 64],
+        },
+    ]
+    out = format_transcript(turns)
+    assert "[image: aaaaaaaa]" in out
+    assert "[image: bbbbbbbb]" in out
+
+
+def test_format_transcript_no_image_shas_unchanged():
+    """Pre-multimodal turns format identically to before."""
+    from brain.ingest.extract import format_transcript
+
+    turns = [{"speaker": "user", "text": "hi nell"}]
+    out = format_transcript(turns)
+    assert out == "user: hi nell"
