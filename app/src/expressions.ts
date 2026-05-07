@@ -57,12 +57,28 @@ const FALLBACK_CATEGORY: Partial<Record<ExpressionCategory, ExpressionCategory>>
 // ────────────────────────────────────────────────────────────────────────────
 // Frames — the 4-frame matrix (mouth × eyes)
 // ────────────────────────────────────────────────────────────────────────────
+//
+// Hana's authoring scheme inside each <category>/ directory:
+//   1.png — Eyes Open,  Mouth Closed   (base, resting)
+//   2.png — Eyes Open,  Mouth Open     (speaking)
+//   3.png — Eyes Closed, Mouth Closed  (blink)
+//   4.png — Eyes Closed, Mouth Open    (speaking-blink, peak intensity)
+//
+// We keep the named Frame type internally for readability; the file-on-
+// disk lookup uses the numeric index.
 
 export type Frame =
   | "base"            // mouth-closed + eyes-open — the resting frame
-  | "blink"           // mouth-closed + eyes-closed
   | "speaking"        // mouth-open + eyes-open
+  | "blink"           // mouth-closed + eyes-closed
   | "speaking-blink"; // mouth-open + eyes-closed — peak intensity
+
+const FRAME_TO_INDEX: Record<Frame, number> = {
+  base: 1,
+  speaking: 2,
+  blink: 3,
+  "speaking-blink": 4,
+};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Asset resolution
@@ -78,39 +94,35 @@ const LEGACY_FORMAT_ASSETS = import.meta.glob<string>(
   { eager: true, query: "?url", import: "default" },
 );
 
-// Map a frame → which legacy variant index to substitute for it. We
-// only have 4 generic variants in the legacy format, none of which
-// were authored as eyes-open vs eyes-closed. Best we can do is spread
-// the four variants across the four frames so cycling still produces
-// movement.
-const LEGACY_FRAME_TO_VARIANT: Record<Frame, number> = {
-  base: 1,
-  blink: 1, // legacy has no real blink — show variant 1, the engine can fast-cut to it for blink-effect
-  speaking: 2,
-  "speaking-blink": 3,
-};
-
-/** Resolve a (category, frame) pair to a hashed asset URL. */
+/** Resolve a (category, frame) pair to a hashed asset URL.
+ *
+ *  Lookup order:
+ *    1. New format: expressions/<category>/<n>.png   (n = 1..4)
+ *    2. Fallback category in new format               (e.g. content → smile)
+ *    3. Legacy single-file format: expressions/<category> <n>.png
+ *    4. Last resort: smile 4 from legacy
+ */
 export function resolveFrameUrl(category: ExpressionCategory, frame: Frame): string {
-  // 1. New 4-frame directory format
-  const newKey = `../../expressions/${category}/${frame}.png`;
+  const idx = FRAME_TO_INDEX[frame];
+
+  // 1. New 4-frame directory format — numeric naming
+  const newKey = `../../expressions/${category}/${idx}.png`;
   if (NEW_FORMAT_ASSETS[newKey]) return NEW_FORMAT_ASSETS[newKey];
 
   // 2. Fallback category in new format
   const fallback = FALLBACK_CATEGORY[category];
   if (fallback) {
-    const fallbackNewKey = `../../expressions/${fallback}/${frame}.png`;
+    const fallbackNewKey = `../../expressions/${fallback}/${idx}.png`;
     if (NEW_FORMAT_ASSETS[fallbackNewKey]) return NEW_FORMAT_ASSETS[fallbackNewKey];
-    return resolveLegacyUrl(fallback, frame);
+    return resolveLegacyUrl(fallback, idx);
   }
 
   // 3. Legacy single-file format
-  return resolveLegacyUrl(category, frame);
+  return resolveLegacyUrl(category, idx);
 }
 
-function resolveLegacyUrl(category: ExpressionCategory, frame: Frame): string {
-  const variant = LEGACY_FRAME_TO_VARIANT[frame];
-  const key = `../../expressions/${category} ${variant}.png`;
+function resolveLegacyUrl(category: ExpressionCategory, idx: number): string {
+  const key = `../../expressions/${category} ${idx}.png`;
   const url = LEGACY_FORMAT_ASSETS[key];
   if (url) return url;
   // Last-ditch fallback: smile 4 always exists in legacy art
@@ -227,23 +239,14 @@ export function defaultExpressionUrl(): string {
  * pickExpressionFromState + resolveFrameUrl instead.
  */
 export function expressionPath(category: ExpressionCategory, variant: number): string {
-  // Map variant 1-4 to a frame in the new format. Best-guess pairing
-  // so existing wizard mappings (e.g. "smile 4") look reasonable in
-  // either art format.
-  const variantToFrame: Record<number, Frame> = {
-    1: "base",
-    2: "speaking",
-    3: "speaking-blink",
-    4: "blink",
-  };
-  const frame = variantToFrame[Math.min(Math.max(variant, 1), 4)] ?? "base";
+  const v = Math.min(Math.max(variant, 1), 4);
 
-  // Try new format first
-  const newKey = `../../expressions/${category}/${frame}.png`;
+  // Try new format (numeric file naming)
+  const newKey = `../../expressions/${category}/${v}.png`;
   if (NEW_FORMAT_ASSETS[newKey]) return NEW_FORMAT_ASSETS[newKey];
 
   // Legacy path
-  const legacyKey = `../../expressions/${category} ${variant}.png`;
+  const legacyKey = `../../expressions/${category} ${v}.png`;
   const legacyUrl = LEGACY_FORMAT_ASSETS[legacyKey];
   if (legacyUrl) return legacyUrl;
 
