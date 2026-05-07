@@ -221,6 +221,18 @@ class MemoryStore:
                 from brain.health.anomaly import BrainIntegrityError
 
                 raise BrainIntegrityError(str(db_path), detail)
+        # WAL + 5s busy_timeout — the bridge runs concurrent writers
+        # (chat tool calls, supervisor stale-close sweep, heartbeat,
+        # growth). Without WAL these can surface as `database is
+        # locked` under realistic desktop timing. In-memory dbs reject
+        # WAL; the fallback keeps tests using `:memory:` working. We
+        # set these AFTER the integrity check so a corrupt-file probe
+        # still surfaces BrainIntegrityError instead of a pragma crash.
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()

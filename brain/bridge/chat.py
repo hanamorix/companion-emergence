@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
@@ -58,7 +58,7 @@ class ImageBlock:
             )
 
 
-ContentBlock = Union[TextBlock, ImageBlock]
+ContentBlock = TextBlock | ImageBlock
 
 
 @dataclass(frozen=True)

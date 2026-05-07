@@ -332,10 +332,12 @@ class HeartbeatResult:
     initialized: bool
     reflex_fired: tuple[str, ...] = ()
     reflex_skipped_count: int = 0
+    reflex_error: str | None = None
     research_fired: str | None = None
     research_gated_reason: str | None = None
     interests_bumped: int = 0
     growth_emotions_added: int = 0
+    growth_error: str | None = None
     anomalies: tuple[BrainAnomaly, ...] = ()
     pending_alarms_count: int = 0
 
@@ -481,7 +483,9 @@ class HeartbeatEngine:
             persona_dir = self.state_path.parent
 
         # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
-        reflex_fired, reflex_skipped_count = self._try_fire_reflex(trigger, dry_run, config)
+        reflex_fired, reflex_skipped_count, reflex_error = self._try_fire_reflex(
+            trigger, dry_run, config
+        )
 
         # Write daemon_state for any reflex fires (fault-isolated).
         if not dry_run and reflex_fired:
@@ -523,7 +527,7 @@ class HeartbeatEngine:
         # anomalies (e.g., vocab corruption discovered while reading current
         # vocabulary names) surface in the audit log alongside the engine's
         # own load anomalies.
-        growth_emotions_added, growth_ran = self._try_run_growth(
+        growth_emotions_added, growth_ran, growth_error = self._try_run_growth(
             state, now, config, dry_run, anomalies_collector=tick_anomalies
         )
 
@@ -571,6 +575,7 @@ class HeartbeatEngine:
                         "enabled": config.reflex_enabled,
                         "fired": list(reflex_fired),
                         "skipped_count": reflex_skipped_count,
+                        "error": reflex_error,
                     },
                     "research": {
                         "fired": research_fired,
@@ -581,6 +586,7 @@ class HeartbeatEngine:
                         "enabled": config.growth_enabled,
                         "ran": growth_ran,
                         "emotions_added": growth_emotions_added,
+                        "error": growth_error,
                     },
                     "tick_count": state.tick_count,
                     "anomalies": [a.to_dict() for a in tick_anomalies],
@@ -600,10 +606,12 @@ class HeartbeatEngine:
             initialized=False,
             reflex_fired=reflex_fired,
             reflex_skipped_count=reflex_skipped_count,
+            reflex_error=reflex_error,
             research_fired=research_fired,
             research_gated_reason=research_gated_reason,
             interests_bumped=interests_bumped,
             growth_emotions_added=growth_emotions_added,
+            growth_error=growth_error,
             anomalies=tuple(tick_anomalies),
             pending_alarms_count=pending_alarms_count,
         )
@@ -681,15 +689,15 @@ class HeartbeatEngine:
 
     def _try_fire_reflex(
         self, trigger: str, dry_run: bool, config: HeartbeatConfig
-    ) -> tuple[tuple[str, ...], int]:
-        """Run one reflex tick. Returns (fired_arc_names, skipped_count)."""
+    ) -> tuple[tuple[str, ...], int, str | None]:
+        """Run one reflex tick. Returns (fired_arc_names, skipped_count, error_reason)."""
         if not config.reflex_enabled:
-            return ((), 0)
+            return ((), 0, None)
         if self.reflex_arcs_path is None or self.reflex_log_path is None:
             # Heartbeat was constructed without explicit reflex paths (common
             # in unit tests that don't exercise reflex). Skip silently rather
             # than writing arc/log files to cwd.
-            return ((), 0)
+            return ((), 0, None)
         from brain.engines.reflex import ReflexEngine
 
         engine = ReflexEngine(
@@ -706,12 +714,14 @@ class HeartbeatEngine:
         except Exception as exc:
             # Fault-isolate reflex failures from the heartbeat tick per spec §7:
             # a misbehaving arc/provider must not abort decay, dream-gate, or
-            # audit-log writes that follow. The exception is logged; the tick
-            # continues with an empty reflex result.
+            # audit-log writes that follow. The exception is logged AND
+            # surfaced through HeartbeatResult.reflex_error + the audit
+            # JSON so operators tailing heartbeats.log.jsonl can tell
+            # "nothing fired" apart from "the engine crashed."
             logger.warning("reflex tick raised; isolating: %.200s", exc)
-            return ((), 0)
+            return ((), 0, f"{type(exc).__name__}: {exc}"[:200])
         fired = tuple(f.arc_name for f in result.arcs_fired)
-        return (fired, len(result.arcs_skipped))
+        return (fired, len(result.arcs_skipped), None)
 
     def _try_bump_interests(
         self,
@@ -769,11 +779,14 @@ class HeartbeatEngine:
         config: HeartbeatConfig,
         dry_run: bool,
         anomalies_collector: list[BrainAnomaly] | None = None,
-    ) -> tuple[int, bool]:
-        """Run a growth tick if due. Returns (emotions_added, ran).
+    ) -> tuple[int, bool, str | None]:
+        """Run a growth tick if due. Returns (emotions_added, ran, error_reason).
 
-        Fault-isolated: any exception logs a warning and returns (0, False).
-        Heartbeat tick continues normally — same pattern as reflex/research.
+        Fault-isolated: any exception logs a warning and returns
+        (0, False, "<class>: <msg>"). Heartbeat tick continues normally
+        — same pattern as reflex/research. The error reason surfaces to
+        HeartbeatResult.growth_error + the audit JSON so operators can
+        tell "didn't run" apart from "crashed."
 
         `anomalies_collector` is forwarded to `run_growth_tick` so any
         anomaly produced inside growth (e.g., vocabulary file corruption
@@ -781,15 +794,15 @@ class HeartbeatEngine:
         heartbeat tick's audit log alongside engine-level anomalies.
         """
         if not config.growth_enabled:
-            return (0, False)
+            return (0, False, None)
         if self.interests_path is None:
             # Use interests_path as a proxy for "persona dir is wired" — Phase 2a
             # doesn't add a separate persona_dir field.
-            return (0, False)
+            return (0, False, None)
 
         hours_since = (now - state.last_growth_at).total_seconds() / 3600.0
         if hours_since < config.growth_every_hours:
-            return (0, False)
+            return (0, False, None)
 
         persona_dir = self.interests_path.parent
         try:
@@ -804,12 +817,12 @@ class HeartbeatEngine:
             )
         except Exception as exc:
             logger.warning("growth tick raised; isolating: %.200s", exc)
-            return (0, False)
+            return (0, False, f"{type(exc).__name__}: {exc}"[:200])
 
         if not dry_run:
             state.last_growth_at = now
 
-        return (result.emotions_added, True)
+        return (result.emotions_added, True, None)
 
     def _try_fire_research(
         self,
