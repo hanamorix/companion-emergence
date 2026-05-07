@@ -118,10 +118,55 @@ def save_image_bytes(
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
-    tmp = target.with_suffix(target.suffix + ".new")
-    tmp.write_bytes(data)
-    os.replace(tmp, target)
+    # Unique tmp path per writer so identical concurrent uploads of the
+    # same sha don't race on a shared `<sha>.<ext>.new` file. The pid +
+    # uuid suffix is enough to disambiguate threads + processes; final
+    # `os.replace` is atomic so the target reflects exactly one writer.
+    import uuid
+
+    tmp = target.with_suffix(
+        f"{target.suffix}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
+    )
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    except (FileNotFoundError, OSError):
+        # If a concurrent writer beat us to the punch, the target should
+        # now exist with the same sha (content-addressed). Fall through
+        # to a final-state check before re-raising.
+        if target.exists():
+            tmp.unlink(missing_ok=True)
+            return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
+        tmp.unlink(missing_ok=True)
+        raise
     return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
+
+
+# Magic-byte signatures for the four allowed image types. Trusting the
+# multipart `Content-Type` header alone lets a local client store
+# arbitrary bytes under an image extension; sniffing closes that gap.
+_IMAGE_MAGIC_BYTES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def sniff_media_type(data: bytes) -> str | None:
+    """Return the inferred media_type for ``data`` or None if unknown.
+
+    Recognises PNG, JPEG, GIF, and WebP (the four allowed types).
+    Unknown/corrupt bytes return None — the caller should treat that as
+    "reject this upload at the boundary."
+    """
+    for prefix, media_type in _IMAGE_MAGIC_BYTES:
+        if data.startswith(prefix):
+            return media_type
+    # WebP: 'RIFF' + 4 size bytes + 'WEBP'
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 _EXT_TO_MEDIA_TYPE = {ext: mt for mt, ext in _MEDIA_TYPE_TO_EXT.items()}
