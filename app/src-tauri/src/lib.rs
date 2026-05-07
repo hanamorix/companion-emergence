@@ -34,7 +34,6 @@ pub struct AppConfig {
 pub struct InitArgs {
     pub persona: String,
     pub user_name: Option<String>,
-    pub provider: Option<String>,
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
@@ -196,9 +195,6 @@ async fn run_init(args: InitArgs) -> Result<InitResult, String> {
     cmd.args(["--persona", &args.persona]);
     if let Some(name) = &args.user_name {
         cmd.args(["--user-name", name]);
-    }
-    if let Some(provider) = &args.provider {
-        cmd.args(["--provider", provider]);
     }
     cmd.args(["--voice-template", &args.voice_template]);
     if let Some(path) = &args.migrate_from {

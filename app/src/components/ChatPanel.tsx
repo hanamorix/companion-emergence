@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { newSession, uploadImage } from "../bridge";
+import { closeSession, newSession, uploadImage } from "../bridge";
 import { streamChat } from "../streamChat";
 
 interface Message {
@@ -63,6 +63,9 @@ const formatTime = () =>
   new Date().toLocaleTimeString("en", { hour: "numeric", minute: "2-digit" });
 
 interface Props {
+  /** Persona name — every bridge call is scoped to this so the UI
+   *  cannot accidentally talk to a different persona's daemon. */
+  persona: string;
   /** Notifier called when chat is in-flight; drives NellAvatar's
    * speaking animation. true = streaming reply, false = idle. */
   onSpeakingChange?: (speaking: boolean) => void;
@@ -76,7 +79,7 @@ interface Props {
  * message on the `done` frame. Avatar speaking animation runs from
  * stream-open until done, so the mouth animates while text appears.
  */
-export function ChatPanel({ onSpeakingChange }: Props) {
+export function ChatPanel({ persona, onSpeakingChange }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -88,18 +91,23 @@ export function ChatPanel({ onSpeakingChange }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // All bubble-resident object URLs — revoked on unmount so long
+  // image-heavy sessions don't leak browser memory for preview blobs.
+  const trackedUrlsRef = useRef<Set<string>>(new Set());
 
   // Pipe streaming state up so the avatar speaks during chunks
   useEffect(() => {
     onSpeakingChange?.(streaming);
   }, [streaming, onSpeakingChange]);
 
-  // Open session on mount
+  // Open session on mount, close it on unmount so the buffer flushes
+  // through ingest immediately instead of waiting on the supervisor's
+  // stale-close loop. Errors during close surface as a visible status.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const sid = await newSession();
+        const sid = await newSession(persona);
         if (!cancelled) sessionRef.current = sid;
       } catch (e) {
         if (!cancelled) setError(`bridge unreachable: ${(e as Error).message}`);
@@ -108,8 +116,19 @@ export function ChatPanel({ onSpeakingChange }: Props) {
     return () => {
       cancelled = true;
       cancelRef.current?.();
+      const sid = sessionRef.current;
+      if (sid) {
+        // Best-effort — fire and forget. The component is unmounting,
+        // there's nowhere meaningful to surface a close failure; the
+        // supervisor's stale-close still catches it as a fallback.
+        void closeSession(persona, sid).catch(() => undefined);
+      }
+      // Free any object URLs we still hold for bubble thumbnails so
+      // the renderer doesn't keep blob bytes pinned across unmount.
+      for (const url of trackedUrlsRef.current) URL.revokeObjectURL(url);
+      trackedUrlsRef.current.clear();
     };
-  }, []);
+  }, [persona]);
 
   // Auto-scroll on new message or chunk
   useEffect(() => {
@@ -134,7 +153,7 @@ export function ChatPanel({ onSpeakingChange }: Props) {
       status: "uploading",
     });
     try {
-      const result = await uploadImage(file);
+      const result = await uploadImage(persona, file);
       setStagedImage((prev) =>
         prev && prev.previewUrl === previewUrl
           ? { ...prev, sha: result.sha, status: "ready" }
@@ -186,8 +205,9 @@ export function ChatPanel({ onSpeakingChange }: Props) {
       time: formatTime(),
       imageThumb: readySha ? stagedImage?.previewUrl : undefined,
     };
-    // Don't revoke the previewUrl here — the message bubble still needs it.
-    // Bubble lifetime > stagedImage lifetime; the URL is freed on app teardown.
+    // The bubble holds onto the previewUrl until unmount — track it so
+    // the unmount cleanup revokes it. Don't revoke here.
+    if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
     setStagedImage(null);
     setEmojiOpen(false);
     const replyId = Date.now() + 1;
@@ -206,6 +226,7 @@ export function ChatPanel({ onSpeakingChange }: Props) {
 
     try {
       cancelRef.current = await streamChat(
+        persona,
         sessionRef.current,
         text,
         {
