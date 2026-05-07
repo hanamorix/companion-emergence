@@ -1,36 +1,68 @@
-import { useEffect, useState } from "react";
-import { defaultExpression, expressionForEmotions } from "../expressions";
+import { useEffect, useMemo, useState } from "react";
+import {
+  pickExpressionFromState,
+  resolveFrameUrl,
+  type ExpressionCategory,
+} from "../expressions";
+import { useAnimatedFrame } from "../useAnimatedFrame";
 import type { PersonaState } from "../bridge";
 
 interface Props {
   state: PersonaState | null;
-  /** "live" | "bridge_down" | "provider_down" | "offline" — drives glow color + filter */
+  /** True while the chat is awaiting a reply — drives the speaking animation. */
+  isSpeaking?: boolean;
+  /** Honor the user's reduced-motion toggle / OS pref. */
+  reducedMotion?: boolean;
   size?: number;
 }
 
 /**
- * NellAvatar — breathing face with mode-aware glow.
+ * NellAvatar — breathing face with the 4-frame animation engine.
  *
- * The image src is driven by persona state's top emotion. While
- * loading or when state is null, falls back to the default smile
- * expression so the screen never goes blank.
+ * Pipeline:
+ *   1. pickExpressionFromState(state) → category (heuristic stack:
+ *      body emotions override social emotions, etc.)
+ *   2. useAnimatedFrame({isSpeaking}) → frame (idle blinks, speaking
+ *      mouth-cycling, speaking-blink at intensity peaks)
+ *   3. resolveFrameUrl(category, frame) → asset URL (prefers new
+ *      4-frame directory format; falls back to legacy single-file
+ *      variants when art for that category isn't ready yet)
+ *
+ * Mode-aware: glow color (crimson when provider_down) + grayscale
+ * filter (when offline). Breathing animation continues.
  */
-export function NellAvatar({ state, size = 280 }: Props) {
+export function NellAvatar({
+  state,
+  isSpeaking = false,
+  reducedMotion = false,
+  size = 280,
+}: Props) {
   const mode = state?.mode ?? "live";
   const dimmed = mode === "offline";
   const glowColor = mode === "provider_down" ? "#8A3033" : "#823329";
 
-  const [src, setSrc] = useState(defaultExpression());
+  const category: ExpressionCategory = useMemo(
+    () => pickExpressionFromState(state),
+    [state],
+  );
+
+  const frame = useAnimatedFrame({ isSpeaking, reducedMotion });
+
+  // Resolve asset URL whenever category or frame changes
+  const [src, setSrc] = useState(() => resolveFrameUrl(category, frame));
   useEffect(() => {
-    if (!state || !state.emotions) {
-      setSrc(defaultExpression());
-      return;
-    }
-    setSrc(expressionForEmotions(state.emotions));
-  }, [state]);
+    setSrc(resolveFrameUrl(category, frame));
+  }, [category, frame]);
+
+  // Energy-driven breath cadence: faster when fresh, slower when tired
+  const energy = state?.body?.energy ?? 6;
+  const breathSeconds = clamp(5 + (10 - energy) * 0.35, 4.5, 8);
 
   return (
-    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+    <div
+      style={{ position: "relative", width: size, height: size, flexShrink: 0 }}
+      data-category={category}
+    >
       {/* warm lacquer glow */}
       <div
         style={{
@@ -39,7 +71,7 @@ export function NellAvatar({ state, size = 280 }: Props) {
           borderRadius: "50%",
           background: `radial-gradient(ellipse at 50% 58%, ${glowColor}44 0%, transparent 68%)`,
           filter: "blur(20px)",
-          animation: "breathe 5s ease-in-out infinite",
+          animation: reducedMotion ? "none" : `breathe ${breathSeconds}s ease-in-out infinite`,
           opacity: dimmed ? 0.15 : 0.9,
           transition: "opacity 1.2s ease",
           pointerEvents: "none",
@@ -57,12 +89,16 @@ export function NellAvatar({ state, size = 280 }: Props) {
           height: size,
           objectFit: "contain",
           objectPosition: "center top",
-          animation: "breathe 5s ease-in-out infinite",
+          animation: reducedMotion ? "none" : `breathe ${breathSeconds}s ease-in-out infinite`,
           filter: dimmed ? "grayscale(0.6) brightness(0.65) sepia(0.2)" : "none",
-          transition: "filter 1.2s ease, opacity 0.3s ease",
+          transition: "filter 1.2s ease, opacity 0.18s ease",
           userSelect: "none",
         }}
       />
     </div>
   );
+}
+
+function clamp(v: number, min: number, max: number): number {
+  return Math.min(Math.max(v, min), max);
 }
