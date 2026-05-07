@@ -28,8 +28,9 @@ def test_default_voice_template_coaches_seeing_images() -> None:
     template = DEFAULT_VOICE_TEMPLATE
     assert "you actually see them" in template
     assert "not described, seen" in template
-    # The hard-rule that prevents confabulation around images
-    assert 'I imagine' in template or "I imagine" in template
+    # The hard-rule that prevents confabulation around images — the
+    # phrase "I imagine" is forbidden when she could just look.
+    assert "I imagine" in template
 
 
 def test_default_voice_template_coaches_curiosity_sentence_breath() -> None:
