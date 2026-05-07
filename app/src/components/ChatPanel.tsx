@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { newSession, sendChat } from "../bridge";
+import { newSession } from "../bridge";
+import { streamChat } from "../streamChat";
 
 interface Message {
   id: number;
   from: "hana" | "nell";
   text: string;
   time: string;
+  /** Words still arriving — the bubble is rendering live during stream. */
+  streaming?: boolean;
 }
 
 const formatTime = () =>
@@ -13,29 +16,31 @@ const formatTime = () =>
 
 interface Props {
   /** Notifier called when chat is in-flight; drives NellAvatar's
-   * speaking animation. true = waiting for reply, false = idle. */
+   * speaking animation. true = streaming reply, false = idle. */
   onSpeakingChange?: (speaking: boolean) => void;
 }
 
 /**
- * ChatPanel — text-only HTTP /chat for Phase 2. Phase 6 will switch
- * to WS /stream for token-by-token streaming.
+ * ChatPanel — WebSocket streaming via /stream/{sid}.
  *
- * Reports its in-flight state via onSpeakingChange so the avatar can
- * cycle to the speaking frames while a reply is being composed.
+ * Each user turn opens a WS to the bridge, receives tool_call events
+ * + reply_chunk frames (word-by-word), and commits the assembled
+ * message on the `done` frame. Avatar speaking animation runs from
+ * stream-open until done, so the mouth animates while text appears.
  */
 export function ChatPanel({ onSpeakingChange }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [typing, setTyping] = useState(false);
+  const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
+  const cancelRef = useRef<(() => void) | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Pipe typing state up so the avatar can do the talking animation
+  // Pipe streaming state up so the avatar speaks during chunks
   useEffect(() => {
-    onSpeakingChange?.(typing);
-  }, [typing, onSpeakingChange]);
+    onSpeakingChange?.(streaming);
+  }, [streaming, onSpeakingChange]);
 
   // Open session on mount
   useEffect(() => {
@@ -50,35 +55,61 @@ export function ChatPanel({ onSpeakingChange }: Props) {
     })();
     return () => {
       cancelled = true;
+      cancelRef.current?.();
     };
   }, []);
 
-  // Auto-scroll on new message
+  // Auto-scroll on new message or chunk
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, typing]);
+  }, [messages, streaming]);
 
   async function send() {
     const text = input.trim();
-    if (!text || typing || !sessionRef.current) return;
+    if (!text || streaming || !sessionRef.current) return;
+
     const userMsg: Message = { id: Date.now(), from: "hana", text, time: formatTime() };
-    setMessages((m) => [...m, userMsg]);
+    const replyId = Date.now() + 1;
+    const replyStub: Message = {
+      id: replyId,
+      from: "nell",
+      text: "",
+      time: formatTime(),
+      streaming: true,
+    };
+
+    setMessages((m) => [...m, userMsg, replyStub]);
     setInput("");
-    setTyping(true);
+    setStreaming(true);
     setError(null);
+
     try {
-      const resp = await sendChat(sessionRef.current, text);
-      const nellMsg: Message = {
-        id: Date.now() + 1,
-        from: "nell",
-        text: resp.reply,
-        time: formatTime(),
-      };
-      setMessages((m) => [...m, nellMsg]);
+      cancelRef.current = await streamChat(sessionRef.current, text, {
+        onChunk: (chunkText) => {
+          setMessages((m) =>
+            m.map((msg) =>
+              msg.id === replyId ? { ...msg, text: msg.text + chunkText } : msg,
+            ),
+          );
+        },
+        onDone: () => {
+          setMessages((m) =>
+            m.map((msg) =>
+              msg.id === replyId ? { ...msg, streaming: false, time: formatTime() } : msg,
+            ),
+          );
+          setStreaming(false);
+          cancelRef.current = null;
+        },
+        onError: (msg) => {
+          setError(msg);
+          setStreaming(false);
+          cancelRef.current = null;
+        },
+      });
     } catch (e) {
       setError((e as Error).message);
-    } finally {
-      setTyping(false);
+      setStreaming(false);
     }
   }
 
@@ -105,7 +136,9 @@ export function ChatPanel({ onSpeakingChange }: Props) {
         {messages.map((m) => (
           <Bubble key={m.id} msg={m} />
         ))}
-        {typing && <TypingDots />}
+        {streaming && messages.length > 0 && messages[messages.length - 1]?.text === "" && (
+          <TypingDots />
+        )}
         {error && (
           <div style={{ fontSize: 11, color: "var(--crimson)", padding: "6px 4px" }}>
             {error}
@@ -136,14 +169,14 @@ export function ChatPanel({ onSpeakingChange }: Props) {
         />
         <button
           onClick={send}
-          disabled={!input.trim() || typing}
+          disabled={!input.trim() || streaming}
           style={{
             background: "var(--accent)",
             color: "var(--linen)",
             padding: "7px 11px",
             borderRadius: 6,
             fontSize: 14,
-            opacity: !input.trim() || typing ? 0.4 : 1,
+            opacity: !input.trim() || streaming ? 0.4 : 1,
             transition: "opacity 0.2s",
           }}
           aria-label="send"
