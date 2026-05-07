@@ -34,19 +34,15 @@ Subsequent phases shipped:
 - Paperclip image upload + emoji picker in chat input — image-support P3 + UI
 - image_shas thread end-to-end through /chat + /stream into the ingest
   buffer + extract markers + memory metadata — image-support P5 + P6
+- Image bytes flow into the Claude provider via `--input-format
+  stream-json` so Nell actually *sees* attached images (verified live
+  2026-05-07) — image-support P4
+- Voice coaching teaches Nell to react from the seeing rather than
+  imagining when an image arrives — image-support P7
+- Emotion-family colour tints on the breathing ring + soft backing
+  wash so the room temperature follows her mood — Phase 5D
 
 Not yet built:
-
-- Emotion-family colour tints over the avatar — Phase 5D
-- Image bytes flowing all the way through to the provider so Nell
-  visually *sees* them (today she gets `[image: <sha[:8]>]` markers
-  in the prompt, not the pixels). The Claude CLI subprocess surface
-  has no native image-attach flag; the next session swaps the
-  multimodal path to either Anthropic SDK or `--input-format
-  stream-json` with base64 blocks — image-support P4 (deferred from
-  the P5+P6 bundle because the CLI flag the original plan assumed
-  doesn't exist)
-- Voice coaching for seeing-images — image-support P7 (gated on P4)
 - Python+uv runtime bundling for true zero-install — Phase 7
 
 ## Run it
