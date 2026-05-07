@@ -177,12 +177,14 @@ export function ChatPanel({ onSpeakingChange }: Props) {
     if (!text || streaming || !sessionRef.current) return;
     if (stagedImage && stagedImage.status === "uploading") return;
 
+    const readySha =
+      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
     const userMsg: Message = {
       id: Date.now(),
       from: "hana",
       text,
       time: formatTime(),
-      imageThumb: stagedImage?.status === "ready" ? stagedImage.previewUrl : undefined,
+      imageThumb: readySha ? stagedImage?.previewUrl : undefined,
     };
     // Don't revoke the previewUrl here — the message bubble still needs it.
     // Bubble lifetime > stagedImage lifetime; the URL is freed on app teardown.
@@ -203,29 +205,36 @@ export function ChatPanel({ onSpeakingChange }: Props) {
     setError(null);
 
     try {
-      cancelRef.current = await streamChat(sessionRef.current, text, {
-        onChunk: (chunkText) => {
-          setMessages((m) =>
-            m.map((msg) =>
-              msg.id === replyId ? { ...msg, text: msg.text + chunkText } : msg,
-            ),
-          );
+      cancelRef.current = await streamChat(
+        sessionRef.current,
+        text,
+        {
+          onChunk: (chunkText) => {
+            setMessages((m) =>
+              m.map((msg) =>
+                msg.id === replyId ? { ...msg, text: msg.text + chunkText } : msg,
+              ),
+            );
+          },
+          onDone: () => {
+            setMessages((m) =>
+              m.map((msg) =>
+                msg.id === replyId
+                  ? { ...msg, streaming: false, time: formatTime() }
+                  : msg,
+              ),
+            );
+            setStreaming(false);
+            cancelRef.current = null;
+          },
+          onError: (msg) => {
+            setError(msg);
+            setStreaming(false);
+            cancelRef.current = null;
+          },
         },
-        onDone: () => {
-          setMessages((m) =>
-            m.map((msg) =>
-              msg.id === replyId ? { ...msg, streaming: false, time: formatTime() } : msg,
-            ),
-          );
-          setStreaming(false);
-          cancelRef.current = null;
-        },
-        onError: (msg) => {
-          setError(msg);
-          setStreaming(false);
-          cancelRef.current = null;
-        },
-      });
+        readySha ? { imageShas: [readySha] } : undefined,
+      );
     } catch (e) {
       setError((e as Error).message);
       setStreaming(false);
