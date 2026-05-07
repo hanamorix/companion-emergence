@@ -34,7 +34,6 @@ pub struct AppConfig {
 pub struct InitArgs {
     pub persona: String,
     pub user_name: Option<String>,
-    pub provider: Option<String>,
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
@@ -59,7 +58,31 @@ fn nellbrain_home() -> Result<PathBuf, String> {
     Ok(base.join("companion-emergence"))
 }
 
+/// Mirror of brain.setup's persona-name validation. Anything outside
+/// `[A-Za-z0-9_-]{1,40}` is rejected — defends against renderer
+/// compromise constructing path-traversal segments before any
+/// std::fs::read_to_string sees them.
+fn validate_persona_name(persona: &str) -> Result<(), String> {
+    if persona.is_empty() || persona.len() > 40 {
+        return Err(format!(
+            "persona name must be 1..=40 chars (got {} chars)",
+            persona.len()
+        ));
+    }
+    for c in persona.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!(
+                "persona name {:?} contains invalid character {:?} \
+                 (allowed: A-Za-z0-9_-)",
+                persona, c
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn persona_dir(persona: &str) -> Result<PathBuf, String> {
+    validate_persona_name(persona)?;
     Ok(nellbrain_home()?.join("personas").join(persona))
 }
 
@@ -95,11 +118,24 @@ fn read_app_config() -> Result<AppConfig, String> {
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    serde_json::from_str(&raw).map_err(|e| format!("parse app_config.json: {}", e))
+    let mut cfg: AppConfig = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse app_config.json: {}", e))?;
+    // A hand-edited or stale app_config.json with an invalid persona
+    // name would otherwise feed straight into persona_dir() at the next
+    // command call. Heal to None here so the wizard fires instead.
+    if let Some(persona) = &cfg.selected_persona {
+        if validate_persona_name(persona).is_err() {
+            cfg.selected_persona = None;
+        }
+    }
+    Ok(cfg)
 }
 
 #[tauri::command]
 fn write_app_config(config: AppConfig) -> Result<(), String> {
+    if let Some(persona) = &config.selected_persona {
+        validate_persona_name(persona)?;
+    }
     let path = app_config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -158,6 +194,7 @@ async fn bridge_healthy(persona: &str) -> bool {
 
 #[tauri::command]
 async fn ensure_bridge_running(persona: String) -> Result<(), String> {
+    validate_persona_name(&persona)?;
     if bridge_healthy(&persona).await {
         return Ok(());
     }
@@ -191,14 +228,12 @@ async fn ensure_bridge_running(persona: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn run_init(args: InitArgs) -> Result<InitResult, String> {
+    validate_persona_name(&args.persona)?;
     let mut cmd = Command::new("uv");
     cmd.arg("run").arg("nell").arg("init");
     cmd.args(["--persona", &args.persona]);
     if let Some(name) = &args.user_name {
         cmd.args(["--user-name", name]);
-    }
-    if let Some(provider) = &args.provider {
-        cmd.args(["--provider", provider]);
     }
     cmd.args(["--voice-template", &args.voice_template]);
     if let Some(path) = &args.migrate_from {
@@ -222,6 +257,22 @@ async fn run_init(args: InitArgs) -> Result<InitResult, String> {
     })
 }
 
+/// Apply the always-on-top toggle to the main window. Hits the Tauri
+/// Manager API directly — the previous implementation only persisted
+/// the bool to app_config.json without ever calling the window API,
+/// so the UI showed a working toggle that didn't actually do anything
+/// (audit 2026-05-07 P3).
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    window
+        .set_always_on_top(value)
+        .map_err(|e| format!("set_always_on_top: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -232,6 +283,7 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             run_init,
+            set_always_on_top,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

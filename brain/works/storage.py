@@ -16,7 +16,6 @@ from pathlib import Path
 from brain.health.attempt_heal import save_with_backup_text
 from brain.works import Work
 
-
 _ID_REGEX = re.compile(r"^[0-9a-f]{12}$")
 _BACKUP_COUNT = 3
 

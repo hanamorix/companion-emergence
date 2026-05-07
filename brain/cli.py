@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 from brain import __version__
@@ -53,16 +52,15 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
 
 
 # All Week-1 framework stubs have been resolved:
-# - `nell supervisor` shipped 2026-05-04 (see docs/superpowers/specs/2026-05-04-nell-supervisor-design.md)
-# - `nell rest` removed 2026-05-04 (rest is body-state physiology, not a command — see docs/superpowers/specs/2026-05-04-nell-rest-physiology-design.md)
-# - `nell works` shipped 2026-05-04 (see docs/superpowers/specs/2026-05-04-nell-works-design.md)
-_STUB_COMMANDS: tuple[str, ...] = ()
+# - `nell supervisor` shipped 2026-05-04
+# - `nell rest` removed 2026-05-04 (rest is body-state physiology, not a command)
+# - `nell works` shipped 2026-05-04
 
 
 # Deprecation alias for `nell bridge` — to be removed in v0.1.
 # Note: `nell chat` auto-spawn (see `_chat_handler`) imports
 # brain.bridge.daemon directly and does NOT use this CLI surface, so
-# removing the alias does not break chat. See docs/roadmap.md §3.
+# removing the alias does not break chat. See docs/roadmap.md.
 def _deprecated_bridge(real_handler):
     def wrapped(args):
         print(
@@ -73,24 +71,6 @@ def _deprecated_bridge(real_handler):
         return real_handler(args)
     wrapped.__name__ = f"deprecated_{real_handler.__name__}"
     return wrapped
-
-
-def _make_stub(name: str) -> Callable[[argparse.Namespace], int]:
-    """Factory: build a stub command handler that prints + returns 2.
-
-    The returned handler accepts `args: argparse.Namespace` as required by
-    the `args.func(args)` dispatch protocol — stubs don't read it, but the
-    signature shape is load-bearing and should not be "cleaned up" to `_args`.
-    """
-
-    def _handler(args: argparse.Namespace) -> int:
-        print(
-            f"nell {name} — not implemented yet. "
-            "This subcommand is wired in a future week per the implementation plan."
-        )
-        return 2
-
-    return _handler
 
 
 def _status_handler(args: argparse.Namespace) -> int:
@@ -1429,13 +1409,13 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
             print(
-                f"    edit it before chatting — replace Nell-specific "
-                f"identity content with your own"
+                "    edit it before chatting — replace Nell-specific "
+                "identity content with your own"
             )
     else:
         print(
-            f"  - voice.md: not written; framework's DEFAULT_VOICE_TEMPLATE "
-            f"applies on first chat"
+            "  - voice.md: not written; framework's DEFAULT_VOICE_TEMPLATE "
+            "applies on first chat"
         )
     if migrate_from:
         print(f"  - migrated from {migrate_from}")
@@ -1456,13 +1436,6 @@ def _build_parser() -> argparse.ArgumentParser:
         version=f"companion-emergence {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", title="subcommands")
-
-    for name in _STUB_COMMANDS:
-        sub = subparsers.add_parser(
-            name,
-            help=f"(stub) {name} — wired in a later week",
-        )
-        sub.set_defaults(func=_make_stub(name))
 
     # nell init — interactive setup wizard for new personas (both fresh and
     # OG-migration paths). Closes the user-experience gap where forkers
@@ -1611,10 +1584,10 @@ def _build_parser() -> argparse.ArgumentParser:
     hb_sub.add_argument(
         "--searcher",
         default=None,
-        choices=["ddgs", "noop", "claude-tool"],
+        choices=["ddgs", "noop"],
         help=(
             "(developer override) Web searcher for research engine — ddgs, noop, "
-            "claude-tool. Defaults to the value in {persona}/persona_config.json."
+            "Defaults to the value in {persona}/persona_config.json."
         ),
     )
     hb_sub.add_argument("--dry-run", action="store_true")
@@ -1685,9 +1658,9 @@ def _build_parser() -> argparse.ArgumentParser:
     r_sub.add_argument(
         "--searcher",
         default=None,
-        choices=["ddgs", "noop", "claude-tool"],
+        choices=["ddgs", "noop"],
         help=(
-            "(developer override) Web searcher — ddgs, noop, claude-tool. "
+            "(developer override) Web searcher — ddgs, noop. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
