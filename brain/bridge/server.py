@@ -101,7 +101,11 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
 
 
 def _respond_blocking(
-    persona_dir: Path, sess: Any, message: str, provider: LLMProvider,
+    persona_dir: Path,
+    sess: Any,
+    message: str,
+    provider: LLMProvider,
+    image_shas: list[str] | None = None,
 ) -> Any:
     """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
 
@@ -125,6 +129,7 @@ def _respond_blocking(
             hebbian=hebbian,
             provider=provider,
             session=sess,
+            image_shas=image_shas,
         )
 
 
@@ -276,6 +281,12 @@ class NewSessionResp(BaseModel):
 class ChatReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     message: str = Field(..., min_length=1, max_length=20_000)
+    # Optional image attachments — sha-strings as returned by /upload.
+    # Capped at 8 images per turn; each sha must be 64 lowercase hex.
+    image_shas: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+    )
 
 
 class CloseReq(BaseModel):
@@ -685,7 +696,12 @@ def build_app(
             events.publish("chat_started", session_id=req.session_id, client=s.client_origin)
             try:
                 result = await asyncio.to_thread(
-                    _respond_blocking, s.persona_dir, sess, req.message, s.provider,
+                    _respond_blocking,
+                    s.persona_dir,
+                    sess,
+                    req.message,
+                    s.provider,
+                    req.image_shas or None,
                 )
             except Exception as exc:
                 logger.exception("chat failed session=%s", req.session_id)
@@ -742,6 +758,19 @@ def build_app(
             await ws.close()
             return
 
+        # Optional image attachments — sha-strings as returned by /upload.
+        # Defensive validation: list of strings only, max 8 entries.
+        raw_shas = req.get("image_shas") or []
+        image_shas: list[str] | None = None
+        if isinstance(raw_shas, list) and raw_shas:
+            if len(raw_shas) > 8 or not all(isinstance(x, str) for x in raw_shas):
+                await ws.send_json(
+                    {"type": "error", "code": "invalid_image_shas", "done": True}
+                )
+                await ws.close()
+                return
+            image_shas = list(raw_shas)
+
         chunk_delay_ms = int(os.environ.get("NELL_STREAM_CHUNK_DELAY_MS", "30"))
 
         async with lock:
@@ -751,7 +780,12 @@ def build_app(
 
             try:
                 result = await asyncio.to_thread(
-                    _respond_blocking, s.persona_dir, sess, message, s.provider,
+                    _respond_blocking,
+                    s.persona_dir,
+                    sess,
+                    message,
+                    s.provider,
+                    image_shas,
                 )
             except Exception as exc:
                 logger.exception("stream failed session=%s", session_id)

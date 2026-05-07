@@ -35,6 +35,11 @@ export interface StreamChatHandlers {
   onError?: (msg: string) => void;
 }
 
+export interface StreamChatOptions {
+  /** Sha-strings for any /upload-staged images attached to this turn. */
+  imageShas?: string[];
+}
+
 /**
  * Open a WS stream, send the message, and dispatch frames to the
  * provided handlers. Returns a `cancel()` function the caller can
@@ -44,6 +49,7 @@ export async function streamChat(
   sessionId: string,
   message: string,
   handlers: StreamChatHandlers,
+  options: StreamChatOptions = {},
 ): Promise<() => void> {
   const creds = await getBridgeCredentials();
   const url = `ws://127.0.0.1:${creds.port}/stream/${sessionId}`;
@@ -54,7 +60,11 @@ export async function streamChat(
 
   ws.addEventListener("open", () => {
     if (cancelled) return;
-    ws.send(JSON.stringify({ message }));
+    const frame: { message: string; image_shas?: string[] } = { message };
+    if (options.imageShas && options.imageShas.length > 0) {
+      frame.image_shas = options.imageShas;
+    }
+    ws.send(JSON.stringify(frame));
   });
 
   ws.addEventListener("message", (event) => {

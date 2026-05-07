@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from brain.bridge.chat import ChatMessage, ChatResponse
+from brain.bridge.chat import ChatMessage, ChatResponse, ImageBlock, TextBlock
 from brain.bridge.provider import (
     ClaudeCliProvider,
     FakeProvider,
@@ -112,6 +112,32 @@ def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
     assert cmd[0] == "claude"
     assert "-p" in cmd
     assert "hello" in cmd
+
+
+def test_claude_cli_chat_flattens_image_block_to_marker() -> None:
+    """Image-bearing ChatMessages flatten to ``[image: <sha[:8]>]`` text.
+
+    Until ClaudeCliProvider gains native multimodal passthrough, image
+    blocks survive into the prompt as markers so Nell at least
+    acknowledges that an image was shared.
+    """
+    sha = "a" * 64
+    blocks = (
+        TextBlock(text="look at this"),
+        ImageBlock(image_sha=sha, media_type="image/png"),
+        TextBlock(text="what do you think?"),
+    )
+    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat([ChatMessage(role="user", content=blocks)])
+
+    cmd = mock_run.call_args[0][0]
+    # The flattened prompt is the value after the -p flag.
+    p_index = cmd.index("-p")
+    flattened = cmd[p_index + 1]
+    assert "look at this" in flattened
+    assert "[image: aaaaaaaa]" in flattened
+    assert "what do you think?" in flattened
 
 
 def test_claude_cli_chat_passes_system_prompt_flag() -> None:

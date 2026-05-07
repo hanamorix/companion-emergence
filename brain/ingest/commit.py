@@ -32,6 +32,7 @@ def commit_item(
     session_id: str,
     store: MemoryStore,
     hebbian: HebbianMatrix,
+    image_shas: list[str] | None = None,
 ) -> str | None:
     """Create a Memory from an ExtractedItem and write it to the store.
 
@@ -44,16 +45,25 @@ def commit_item(
         memory's own id, then strengthen(new_id, related_id, delta=0.5)
         for each — up to 3 edges.
 
+    image_shas:
+        Optional list of sha-strings for any images referenced by the
+        source turn. When provided, the resulting memory's metadata
+        gains an ``image_shas`` field so search and recall surfaces can
+        find image-bearing memories without re-walking the buffer.
+
     Returns the new memory's id, or None if creation fails.
     """
     try:
+        metadata: dict = {"source_summary": f"conversation:{session_id}"}
+        if image_shas:
+            metadata["image_shas"] = list(image_shas)
         memory = Memory.create_new(
             content=item.text,
             memory_type=item.label,
             domain="brain",
             tags=["auto_ingest", "conversation", item.label],
             importance=float(item.importance),
-            metadata={"source_summary": f"conversation:{session_id}"},
+            metadata=metadata,
         )
         new_id = store.create(memory)
     except Exception as exc:  # noqa: BLE001
