@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from brain.migrator.og_soul_candidates import migrate_soul_candidates
 
 

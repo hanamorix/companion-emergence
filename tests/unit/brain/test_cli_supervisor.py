@@ -7,7 +7,6 @@ import pytest
 
 from brain import cli
 
-
 _STUB_HANDLERS = {
     "cmd_start": lambda args, **kw: 0,
     "cmd_stop": lambda args: 0,

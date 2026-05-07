@@ -278,6 +278,7 @@ def test_cmd_tail_uses_subprotocol_auth_not_url_token(
     the token leaked into URL space (process listing, proxy logs).
     """
     from contextlib import contextmanager
+
     from brain.bridge import state_file
 
     persona_dir = tmp_path / "persona"
@@ -324,6 +325,7 @@ def test_cmd_tail_no_subprotocols_when_token_absent(
 ) -> None:
     """If auth_token is None (auth-disabled config), pass subprotocols=None."""
     from contextlib import contextmanager
+
     from brain.bridge import state_file
 
     persona_dir = tmp_path / "persona"
