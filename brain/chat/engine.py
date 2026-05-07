@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from brain.bridge.chat import ChatMessage
+from brain.bridge.chat import ChatMessage, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
 from brain.chat.prompt import build_system_message
 from brain.chat.session import SessionState, create_session
@@ -75,6 +75,7 @@ def respond(
     provider: LLMProvider,
     session: SessionState | None = None,
     voice_md_override: str | None = None,
+    image_shas: list[str] | None = None,
 ) -> ChatResult:
     """One chat turn end-to-end.
 
@@ -152,10 +153,11 @@ def respond(
         soul_store.close()
 
     # 6. Messages list: [system, ...history, user]
+    user_msg = _build_user_message(persona_dir, user_input, image_shas)
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_msg),
         *session.history,
-        ChatMessage(role="user", content=user_input),
+        user_msg,
     ]
 
     # 7. Tool loop
@@ -176,6 +178,7 @@ def respond(
         session_id=session.session_id,
         user_text=user_input,
         assistant_text=content,
+        image_shas=image_shas,
     )
     session.append_turn(user_input, content)
 
@@ -195,11 +198,50 @@ def respond(
     )
 
 
+def _build_user_message(
+    persona_dir: Path,
+    user_input: str,
+    image_shas: list[str] | None,
+) -> ChatMessage:
+    """Compose the per-turn user ChatMessage.
+
+    Text-only turns produce the legacy str-content shape. Image-bearing
+    turns produce a tuple of TextBlock + ImageBlocks; ImageBlock
+    media_type is sniffed from disk via brain.images.media_type_for_sha.
+    Missing or malformed images are logged and skipped — the chat must
+    not break because an attachment vanished between upload and send.
+    """
+    if not image_shas:
+        return ChatMessage(role="user", content=user_input)
+
+    from brain.bridge.chat import ContentBlock
+    from brain.images import media_type_for_sha
+
+    blocks: list[ContentBlock] = []
+    if user_input:
+        blocks.append(TextBlock(text=user_input))
+    for sha in image_shas:
+        try:
+            media_type = media_type_for_sha(persona_dir, sha)
+            blocks.append(ImageBlock(image_sha=sha, media_type=media_type))
+        except (FileNotFoundError, ValueError) as exc:
+            # Don't let a missing or malformed sha break the turn — log
+            # and skip. The user's text portion still goes through.
+            logger.warning(
+                "skipping image_sha=%s: %s", sha[:8] if len(sha) >= 8 else sha, exc
+            )
+    if not blocks:
+        # Defensive: every block dropped (unlikely). Fall back to text.
+        return ChatMessage(role="user", content=user_input or "")
+    return ChatMessage(role="user", content=tuple(blocks))
+
+
 def _persist_turn(
     persona_dir: Path,
     session_id: str,
     user_text: str,
     assistant_text: str,
+    image_shas: list[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
@@ -208,7 +250,14 @@ def _persist_turn(
     buffer on session close (via nell chat REPL exit or supervisor sweep).
     """
     try:
-        ingest_turn(persona_dir, {"session_id": session_id, "speaker": "user", "text": user_text})
+        user_record: dict = {
+            "session_id": session_id,
+            "speaker": "user",
+            "text": user_text,
+        }
+        if image_shas:
+            user_record["image_shas"] = list(image_shas)
+        ingest_turn(persona_dir, user_record)
         ingest_turn(
             persona_dir,
             {"session_id": session_id, "speaker": "assistant", "text": assistant_text},
