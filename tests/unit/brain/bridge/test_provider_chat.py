@@ -179,6 +179,55 @@ def test_claude_cli_chat_image_passthrough_routes_through_stream_json(tmp_path) 
     assert "describe this" in stdin_bytes
 
 
+def test_claude_cli_chat_image_history_uses_jsonl_context_not_role_labels(tmp_path) -> None:
+    """Image path also keeps prior turns out of User:/Assistant: transcript form."""
+    import hashlib
+
+    from brain.images import save_image_bytes
+
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c63606060600000000400015e36b8c80000000049454e44ae426082"
+    )
+    save_image_bytes(tmp_path, tiny_png, "image/png")
+    sha = hashlib.sha256(tiny_png).hexdigest()
+    blocks = (
+        TextBlock(text="describe this new image"),
+        ImageBlock(image_sha=sha, media_type="image/png"),
+    )
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_make_stream_json_result("a tiny png"),
+    ) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat(
+            [
+                ChatMessage(role="system", content="you are nell"),
+                ChatMessage(role="user", content="remember this earlier moment"),
+                ChatMessage(role="assistant", content="i remember it softly"),
+                ChatMessage(role="user", content=blocks),
+            ],
+            options={"persona_dir": str(tmp_path)},
+        )
+
+    cmd = mock_run.call_args[0][0]
+    system_prompt = cmd[cmd.index("--system-prompt") + 1]
+    assert system_prompt.startswith("you are nell")
+    assert "User:" not in system_prompt
+    assert "Assistant:" not in system_prompt
+    assert "Conversation context is encoded below as JSONL data" in system_prompt
+    records = [json.loads(line) for line in system_prompt.splitlines() if line.startswith("{")]
+    assert [record["speaker"] for record in records] == ["human", "companion"]
+    assert [record["text"] for record in records] == [
+        "remember this earlier moment",
+        "i remember it softly",
+    ]
+
+    stdin_bytes = mock_run.call_args.kwargs["input"]
+    assert "describe this new image" in stdin_bytes
+
+
 def test_claude_cli_chat_image_without_persona_dir_raises() -> None:
     """Image blocks need persona_dir to resolve image bytes — no fallback."""
     blocks = (
@@ -200,6 +249,33 @@ def test_claude_cli_chat_text_only_still_uses_p_flag() -> None:
     cmd = mock_run.call_args[0][0]
     assert "-p" in cmd
     assert "stream-json" not in cmd
+
+
+def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None:
+    """Multi-turn -p prompts must not prime Claude with User:/Assistant: labels."""
+    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat(
+            [
+                ChatMessage(role="user", content="hey nell"),
+                ChatMessage(role="assistant", content="i am here"),
+                ChatMessage(role="user", content="what do you remember?"),
+            ]
+        )
+
+    cmd = mock_run.call_args[0][0]
+    prompt = cmd[cmd.index("-p") + 1]
+    assert "User:" not in prompt
+    assert "Assistant:" not in prompt
+    assert "Conversation context is encoded below as JSONL data" in prompt
+    assert "Do not prefix the reply" in prompt
+    records = [json.loads(line) for line in prompt.splitlines() if line.startswith("{")]
+    assert [record["speaker"] for record in records] == ["human", "companion", "human"]
+    assert [record["text"] for record in records] == [
+        "hey nell",
+        "i am here",
+        "what do you remember?",
+    ]
 
 
 def test_claude_cli_chat_passes_system_prompt_flag() -> None:
