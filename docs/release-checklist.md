@@ -27,6 +27,12 @@ This project is private/local-first during development. Before sharing a public 
 - Add or update `CHANGELOG.md` before tagging or sharing a build.
 - Review `docs/roadmap.md` and confirm known stubs/incomplete surfaces are documented.
 - Build the wheel/sdist only after tests and lint pass.
+- **Run `bash scripts/smoke_test_wheel.sh`** — builds the wheel + sdist,
+  installs into a fresh `uv venv`, exercises `nell --version` /
+  `nell init` / `nell status` against a temp `NELLBRAIN_HOME` to
+  confirm the package metadata + entry points are honest. The script
+  exits non-zero on the first failure; passing means an outside
+  installer can use the wheel without falling back to the source tree.
 - Do not add release automation until the CLI/API surface is stable enough to version.
 
 ## Known incomplete surfaces
