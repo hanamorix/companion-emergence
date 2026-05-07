@@ -149,6 +149,21 @@ textarea {
   }
 }
 
+@keyframes soul-flash {
+  0% {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  20% {
+    transform: scale(1);
+    opacity: 0.95;
+  }
+  100% {
+    transform: scale(1.18);
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
