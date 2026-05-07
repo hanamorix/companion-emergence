@@ -23,8 +23,10 @@ def test_get_searcher_unknown_raises_value_error():
         get_searcher("not_a_searcher")
 
 
-def test_get_searcher_claude_tool_raises_user_friendly_error():
-    """claude-tool is a Phase 1 stub — factory should give user a clear
-    message instead of returning an instance that crashes on first use."""
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
+def test_get_searcher_claude_tool_now_unknown():
+    """claude-tool was a Phase 1 stub; removed from the public surface in
+    the 2026-05-07 audit P2 round. It now reads as any other unknown name
+    so legacy hand-edited config doesn't surface NotImplementedError to
+    users — PersonaConfig allowlists heal it to the default first."""
+    with pytest.raises(ValueError, match="Unknown searcher"):
         get_searcher("claude-tool")
