@@ -7,18 +7,25 @@
 # extracted runtime's site-packages. The result is a self-contained
 # Python tree that the Tauri bundle ships in Resources/.
 #
-# Result layout:
-#   app/src-tauri/python-runtime/bin/python3
-#   app/src-tauri/python-runtime/lib/python3.13/site-packages/brain/...
+# Cross-platform layout — python-build-standalone uses different
+# directory shapes per OS:
 #
-# Re-runnable: deletes the previous python-runtime/ tree first.
+#   macOS / Linux:  python-runtime/bin/python3
+#                   python-runtime/bin/nell           ← entry point
+#                   python-runtime/lib/python3.13/site-packages/brain/
+#
+#   Windows:        python-runtime/python.exe
+#                   python-runtime/Scripts/nell.exe   ← entry point
+#                   python-runtime/Lib/site-packages/brain/
+#
+# The Rust `nell_command(app)` helper resolves the right entry point
+# at runtime via cfg!(windows).
 #
 # Usage:
 #   bash app/build_python_runtime.sh
 #
-# Cross-platform note: this script targets macOS arm64 + x86_64. The
-# python-build-standalone manifest URL contains the platform triple
-# so other platforms work by changing the asset selector.
+# On Windows, run via Git Bash (ships with Git for Windows) so the
+# tar/curl/find toolchain works the same.
 
 set -euo pipefail
 
@@ -29,18 +36,31 @@ PY_VERSION="3.13.1"
 # checking https://github.com/astral-sh/python-build-standalone/releases
 PBS_TAG="20250115"
 
+# Host platform → python-build-standalone target triple + paths.
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64)
     PBS_TARGET="aarch64-apple-darwin"
+    HOST_OS="unix"
     ;;
   Darwin/x86_64)
     PBS_TARGET="x86_64-apple-darwin"
+    HOST_OS="unix"
     ;;
   Linux/x86_64)
     PBS_TARGET="x86_64-unknown-linux-gnu"
+    HOST_OS="unix"
+    ;;
+  Linux/aarch64 | Linux/arm64)
+    PBS_TARGET="aarch64-unknown-linux-gnu"
+    HOST_OS="unix"
+    ;;
+  MINGW*/x86_64 | MSYS*/x86_64 | CYGWIN*/x86_64)
+    PBS_TARGET="x86_64-pc-windows-msvc-shared"
+    HOST_OS="windows"
     ;;
   *)
     echo "[build] unsupported platform $(uname -s)/$(uname -m)" >&2
+    echo "[build] supported: macOS arm64, macOS x86_64, Linux x86_64, Linux arm64, Windows x86_64" >&2
     exit 1
     ;;
 esac
@@ -48,14 +68,27 @@ esac
 PBS_ASSET="cpython-${PY_VERSION}+${PBS_TAG}-${PBS_TARGET}-install_only.tar.gz"
 PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${PBS_ASSET}"
 
+if [ "$HOST_OS" = "windows" ]; then
+  PY_BIN="$RUNTIME_DIR/python.exe"
+  NELL_BIN="$RUNTIME_DIR/Scripts/nell.exe"
+  SITE_PACKAGES="$RUNTIME_DIR/Lib/site-packages"
+else
+  PY_BIN="$RUNTIME_DIR/bin/python3"
+  NELL_BIN="$RUNTIME_DIR/bin/nell"
+  SITE_PACKAGES="$RUNTIME_DIR/lib/python3.13/site-packages"
+fi
+
 echo "[build] target: ${PBS_TARGET}"
 echo "[build] python: ${PY_VERSION}+${PBS_TAG}"
 echo "[build] runtime dir: ${RUNTIME_DIR}"
+echo "[build] host OS: ${HOST_OS}"
 
-# 1. Clean previous runtime
-echo "[build] removing previous runtime tree"
-rm -rf "$RUNTIME_DIR"
+# 1. Clean previous runtime — preserve .gitkeep placeholder so Tauri's
+# bundle.resources glob keeps resolving in clean checkouts where the
+# build hasn't run yet.
+echo "[build] removing previous runtime tree (keeping .gitkeep)"
 mkdir -p "$RUNTIME_DIR"
+find "$RUNTIME_DIR" -mindepth 1 -not -name ".gitkeep" -prune -exec rm -rf {} + 2>/dev/null || true
 
 # 2. Fetch + extract python-build-standalone
 TMP_TAR="$(mktemp -t pbs-XXXX.tar.gz)"
@@ -68,10 +101,10 @@ if ! curl -fsSL -o "$TMP_TAR" "$PBS_URL"; then
 fi
 echo "[build] extracting"
 # python-build-standalone tarballs contain a top-level `python/` dir;
-# strip it so our runtime root is bin/, lib/, share/.
+# strip it so our runtime root is bin/, lib/, share/ (or python.exe +
+# Scripts/ + Lib/ on Windows).
 tar -xzf "$TMP_TAR" -C "$RUNTIME_DIR" --strip-components=1
 
-PY_BIN="$RUNTIME_DIR/bin/python3"
 [ -x "$PY_BIN" ] || { echo "[build] FAIL: extracted python missing at $PY_BIN" >&2; exit 1; }
 
 echo "[build] python sanity check"
@@ -94,13 +127,13 @@ echo "[build] installing brain + deps into bundled python"
 
 # 5. Verify the brain entry point + import work in the bundled python
 echo "[build] verify brain import + entry point"
-"$PY_BIN" -c "import brain; import brain.cli; print('  brain.__file__:', brain.__file__)"
-"$RUNTIME_DIR/bin/nell" --version
+"$PY_BIN" -c "import brain; import brain.cli; print('  brain:', brain.__file__)"
+"$NELL_BIN" --version
 
 # 6. Strip pyc cache + tests dirs to shrink the bundle a bit
 echo "[build] strip __pycache__ + tests from site-packages"
-find "$RUNTIME_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} +
-find "$RUNTIME_DIR/lib" -type d -name "tests" -prune -exec rm -rf {} +
+find "$RUNTIME_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$SITE_PACKAGES" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
 
 SIZE="$(du -sh "$RUNTIME_DIR" | cut -f1)"
 echo "[build] PASS — bundled runtime ready at $RUNTIME_DIR ($SIZE)"
