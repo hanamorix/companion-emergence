@@ -36,6 +36,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["python-runtime/**/*"]
+    "resources": ["python-runtime/**/*"],
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }
