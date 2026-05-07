@@ -11,6 +11,8 @@ interface Props {
   state: PersonaState | null;
   /** True while the chat is awaiting a reply — drives the speaking animation. */
   isSpeaking?: boolean;
+  /** Brief peak-frame + warm overlay when a soul crystallization just landed. */
+  soulFlashing?: boolean;
   /** Honor the user's reduced-motion toggle / OS pref. */
   reducedMotion?: boolean;
   size?: number;
@@ -34,6 +36,7 @@ interface Props {
 export function NellAvatar({
   state,
   isSpeaking = false,
+  soulFlashing = false,
   reducedMotion = false,
   size = 280,
 }: Props) {
@@ -48,11 +51,15 @@ export function NellAvatar({
 
   const frame = useAnimatedFrame({ isSpeaking, reducedMotion });
 
+  // During a soul-flash, override the frame to peak intensity. Looks
+  // most "moved" when she does this. Otherwise use the animated frame.
+  const effectiveFrame = soulFlashing ? "speaking-blink" : frame;
+
   // Resolve asset URL whenever category or frame changes
-  const [src, setSrc] = useState(() => resolveFrameUrl(category, frame));
+  const [src, setSrc] = useState(() => resolveFrameUrl(category, effectiveFrame));
   useEffect(() => {
-    setSrc(resolveFrameUrl(category, frame));
-  }, [category, frame]);
+    setSrc(resolveFrameUrl(category, effectiveFrame));
+  }, [category, effectiveFrame]);
 
   // Energy-driven breath cadence: faster when fresh, slower when tired
   const energy = state?.body?.energy ?? 6;
@@ -78,6 +85,26 @@ export function NellAvatar({
           zIndex: 0,
         }}
       />
+      {/* Soul-crystallization flash overlay — expanding amber bloom that
+       * fades. Fires once when soulFlashing flips true; the CSS keyframes
+       * own the timing, the `key` re-trigger ensures replay on each new
+       * crystallization. */}
+      {soulFlashing && !reducedMotion && (
+        <div
+          key={`flash-${state?.soul_highlight?.id ?? "?"}`}
+          style={{
+            position: "absolute",
+            inset: -42,
+            borderRadius: "50%",
+            background:
+              "radial-gradient(ellipse at 50% 58%, #d99e5e 0%, #c97e3955 35%, transparent 72%)",
+            filter: "blur(14px)",
+            animation: "soul-flash 1.5s ease-out forwards",
+            pointerEvents: "none",
+            zIndex: 2,
+          }}
+        />
+      )}
       <img
         src={src}
         alt="Nell"
