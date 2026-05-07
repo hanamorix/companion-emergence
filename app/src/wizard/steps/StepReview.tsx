@@ -34,7 +34,6 @@ export function StepReview({ step, totalSteps, state, onInstall, onBack, avatar 
       <Row label="Mode" value={state.mode === "fresh" ? "Fresh brain" : "Migrate"} />
       <Row label="Persona name" value={state.personaName} mono />
       <Row label="Your name" value={state.userName || "(unset)"} mono />
-      <Row label="Provider" value={state.provider} mono />
       <Row label="Voice template" value={state.voiceTemplate} mono />
       {state.mode === "migrate" && (
         <Row label="OG data path" value={state.migrateFromPath} mono small />
@@ -103,7 +102,6 @@ function buildEquivalentCli(s: WizardState): string {
   const lines = ["uv run nell init \\"];
   lines.push(`  --persona ${s.personaName} \\`);
   if (s.userName.trim()) lines.push(`  --user-name "${s.userName}" \\`);
-  lines.push(`  --provider ${s.provider} \\`);
   lines.push(`  --voice-template ${s.voiceTemplate}${s.mode === "migrate" ? " \\" : ""}`);
   if (s.mode === "migrate") {
     lines.push(`  --migrate-from ${s.migrateFromPath}`);
