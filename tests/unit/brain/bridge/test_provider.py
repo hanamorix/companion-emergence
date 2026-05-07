@@ -391,8 +391,9 @@ def test_ollama_chat_stream_stops_at_done() -> None:
 
 
 def test_ollama_chat_stream_request_error_raises_provider_error() -> None:
-    from brain.bridge.chat import ChatMessage
     import httpx as _httpx
+
+    from brain.bridge.chat import ChatMessage
 
     with patch("httpx.stream", side_effect=_httpx.RequestError("connection refused")):
         p = OllamaProvider()
