@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
 from brain import works

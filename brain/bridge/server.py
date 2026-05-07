@@ -475,7 +475,7 @@ def build_app(
     # not a security boundary, just a same-origin policy waiver.
     from fastapi.middleware.cors import CORSMiddleware
 
-    _DEV_ORIGINS = (
+    _DEV_ORIGINS = (  # noqa: N806 — local frozen constant, deliberate uppercase
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:5174",
@@ -665,8 +665,8 @@ def build_app(
     # ── POST /upload — multimodal image upload ────────────────────────────
     # Image upload limit (matches the spec D2 default; per-persona override
     # via PersonaConfig.image_max_bytes can come later if needed).
-    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
-    _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(
+    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
+    _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(  # noqa: N806
         {"image/png", "image/jpeg", "image/webp", "image/gif"}
     )
 
@@ -683,14 +683,14 @@ def build_app(
           * 415 — unsupported media_type (only PNG / JPEG / WebP / GIF)
           * 413 — file exceeds the 20 MB cap
         """
-        from brain.images import save_image_bytes
+        from brain.images import save_image_bytes, sniff_media_type
 
         s: BridgeAppState = app.state.bridge
-        media_type = (file.content_type or "").lower()
-        if media_type not in _ALLOWED_UPLOAD_MEDIA_TYPES:
+        declared_media_type = (file.content_type or "").lower()
+        if declared_media_type not in _ALLOWED_UPLOAD_MEDIA_TYPES:
             raise HTTPException(
                 status_code=415,
-                detail=f"unsupported media_type {media_type!r}; "
+                detail=f"unsupported media_type {declared_media_type!r}; "
                 f"must be one of {sorted(_ALLOWED_UPLOAD_MEDIA_TYPES)}",
             )
         # Read up to limit + 1 so we can detect overrun without buffering
@@ -701,7 +701,25 @@ def build_app(
                 status_code=413,
                 detail=f"file too large; max {_IMAGE_MAX_BYTES} bytes",
             )
-        record = save_image_bytes(s.persona_dir, raw, media_type)
+        # Sniff the actual bytes — the multipart Content-Type header is
+        # client-controlled and a renderer compromise could ship arbitrary
+        # bytes under an image MIME label. The disk's ground truth is
+        # what gets passed to the provider later, so this is the gate.
+        sniffed = sniff_media_type(raw)
+        if sniffed is None:
+            raise HTTPException(
+                status_code=422,
+                detail="image bytes don't match any supported format",
+            )
+        if sniffed != declared_media_type:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"declared {declared_media_type!r} but bytes look like "
+                    f"{sniffed!r}"
+                ),
+            )
+        record = save_image_bytes(s.persona_dir, raw, sniffed)
         return {
             "sha": record.sha,
             "media_type": record.media_type,

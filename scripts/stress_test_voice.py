@@ -14,10 +14,10 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from brain.bridge.state_file import read as read_state
 
@@ -149,12 +149,12 @@ def main() -> int:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with report_path.open("w") as f:
         f.write("# Nell voice stress retest — 2026-05-05\n\n")
-        f.write(f"Re-run of the 2026-04-27 14-prompt battery against the new "
-                f"companion-emergence framework with voice.md installed.\n\n")
+        f.write("Re-run of the 2026-04-27 14-prompt battery against the new "
+                "companion-emergence framework with voice.md installed.\n\n")
         n_ok = sum(1 for r in results if not r.error)
         n_tool_prompts = sum(1 for r in results if r.expected_tool)
         n_tool_fired = sum(1 for r in results if r.expected_tool and r.tools_fired)
-        f.write(f"## Summary\n\n")
+        f.write("## Summary\n\n")
         f.write(f"- {n_ok}/{len(results)} prompts completed without error\n")
         f.write(f"- Tool integration: {n_tool_fired}/{n_tool_prompts} tool-targeted prompts fired tools "
                 f"(2026-04-27 baseline: 0/3)\n")

@@ -8,7 +8,6 @@ import pytest
 
 from brain import works
 
-
 # ---------- Work dataclass + helpers ----------
 
 
@@ -73,7 +72,7 @@ def test_make_work_id_differs_for_different_content() -> None:
 # ---------- storage (markdown file I/O) ----------
 
 
-from brain.works import storage
+from brain.works import storage  # noqa: E402  late import groups with storage tests below
 
 
 def _make_persona(tmp_path: Path) -> Path:

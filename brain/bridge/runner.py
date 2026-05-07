@@ -26,16 +26,19 @@ logger = logging.getLogger(__name__)
 
 
 def _allocate_port(max_attempts: int = 3) -> int:
-    """Bind ephemeral, read assigned port, close. Retry with backoff if the
-    bind→close→rebind race loses the port.
+    """Bind ephemeral, read assigned port, close. Retry with backoff if
+    the *initial* bind itself fails.
 
-    Per SP-7 spec §11: 3× retry with backoff. Uvicorn re-binds the port
-    we discovered, so there's a race window between our close and uvicorn's
-    bind. Almost never fires in practice (sub-millisecond window) but
-    cheap to defend against.
+    NOTE: this only retries the port-discovery bind here. The actual
+    server bind happens later inside ``uvicorn.run(..., port=port)`` and
+    is NOT wrapped in this retry loop — the bind→close→rebind race
+    between our discovery and uvicorn's bind isn't actively defended,
+    only narrowed (sub-millisecond window). The supervisor's startup
+    handshake (``cmd_start`` waits for /health 200 and kills orphan
+    children on timeout) is what closes the loop if the race does fire.
 
-    Backoff schedule: 10ms, 100ms, 1s — total worst-case ~1.1s before
-    giving up.
+    Backoff schedule on failed discovery: 10ms, 100ms, 1s — total
+    worst-case ~1.1s before giving up.
     """
     import time
 

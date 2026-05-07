@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ensureBridgeRunning,
   readAppConfig,
+  setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
 } from "./appConfig";
@@ -136,7 +137,7 @@ interface ReadyProps {
   persona: string;
 }
 
-function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
+function Ready({ config, setConfig, persona }: ReadyProps) {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -146,7 +147,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
     let cancelled = false;
     async function tick() {
       try {
-        const s = await fetchPersonaState();
+        const s = await fetchPersonaState(persona);
         if (!cancelled) {
           setState(s);
           setStateError(null);
@@ -161,11 +162,17 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [persona]);
 
   useEffect(() => {
     document.documentElement.dataset.reducedMotion = config.reduced_motion ? "true" : "false";
   }, [config.reduced_motion]);
+
+  // Apply always-on-top to the actual Tauri window — both on mount
+  // (for the saved value) and whenever the user toggles it.
+  useEffect(() => {
+    void setAlwaysOnTop(config.always_on_top);
+  }, [config.always_on_top]);
 
   function updateConfig(patch: Partial<AppConfig>) {
     const next = { ...config, ...patch };
@@ -197,7 +204,7 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
         soulFlashing={soulFlashing}
         reducedMotion={config.reduced_motion}
       />
-      <ChatPanel onSpeakingChange={setIsSpeaking} />
+      <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
       {stateError && (
         <div
           style={{
