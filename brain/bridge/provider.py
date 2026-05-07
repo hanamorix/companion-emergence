@@ -179,8 +179,11 @@ class ClaudeCliProvider(LLMProvider):
     Therefore ClaudeCliProvider.chat() flattens the messages array into the
     text surface:
       - The first "system" message → ``--system-prompt``.
-      - Remaining messages are serialised as a "User: …\\nAssistant: …" script
-        ending at the final user turn, passed via ``-p``.
+      - A single remaining user message is passed verbatim via ``-p``.
+      - Multi-turn history is serialised as JSONL context data, not a
+        ``User:`` / ``Assistant:`` transcript. Those canonical labels make
+        Claude more likely to continue the transcript and leak labels into
+        Nell's reply.
 
     Tool-calling via --mcp-config
     -----------------------------
@@ -191,8 +194,8 @@ class ClaudeCliProvider(LLMProvider):
     always empty.  Requires ``options["persona_dir"]`` so the spawned server
     knows which persona directory to load.
 
-    When ``tools`` is None, the legacy text-flattening path applies — behaviour
-    is unchanged from before SP-3.
+    When ``tools`` is None, the text ``-p`` path applies. Multi-turn history
+    is encoded as JSONL context to avoid role-label leakage.
     """
 
     def __init__(
@@ -247,7 +250,8 @@ class ClaudeCliProvider(LLMProvider):
         """Flatten messages into Claude CLI; route through MCP when tools given.
 
         When ``tools`` is None:
-          - Flattens messages into "User: ...\\nAssistant: ..." script via -p.
+          - Sends the current user turn, plus multi-turn JSONL context when
+            needed, via ``-p``.
           - Returns ChatResponse(content=<text>, tool_calls=()).
 
         When ``tools`` is provided:
@@ -298,17 +302,7 @@ class ClaudeCliProvider(LLMProvider):
                 tools_enabled=bool(tools),
             )
 
-        if not conversation_messages:
-            flat_prompt = ""
-        elif len(conversation_messages) == 1:
-            flat_prompt = conversation_messages[0].content_text()
-        else:
-            parts: list[str] = []
-            role_labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
-            for msg in conversation_messages:
-                label = role_labels.get(msg.role, msg.role.capitalize())
-                parts.append(f"{label}: {msg.content_text()}")
-            flat_prompt = "\n".join(parts)
+        flat_prompt = _format_claude_print_prompt(conversation_messages)
 
         if tools:
             persona_dir_str = (options or {}).get("persona_dir")
@@ -323,7 +317,9 @@ class ClaudeCliProvider(LLMProvider):
                 persona_dir=Path(persona_dir_str),
             )
 
-        # ── Legacy text path (no tools) — unchanged from before SP-3 ──
+        # Text path for turns without image blocks. Multi-turn history is
+        # formatted as JSONL context data instead of a script with canonical
+        # User:/Assistant: labels, because those labels can leak into replies.
         cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
         if system_prompt is not None:
             cmd.extend(["--system-prompt", system_prompt])
@@ -402,24 +398,18 @@ class ClaudeCliProvider(LLMProvider):
             )
         history = conversation_messages[:-1]
 
-        # Compose the final system prompt: original system + transcript
-        # of prior turns. Multi-turn image conversations work; what
+        # Compose the final system prompt: original system + JSONL context
+        # data for prior turns. Multi-turn image conversations work; what
         # changes is that earlier images render as [image: <sha[:8]>]
-        # text markers in the history, not as visible blocks.
+        # text markers in the history, not as visible blocks. We deliberately
+        # avoid ``User:`` / ``Assistant:`` transcript labels here too; those
+        # labels prime Claude to continue the script in its own reply.
         history_text = ""
         if history:
-            role_labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
-            history_text = "\n".join(
-                f"{role_labels.get(m.role, m.role.capitalize())}: {m.content_text()}"
-                for m in history
-            )
+            history_text = _format_claude_context_block(history, includes_latest_user=False)
         full_system: str | None = system_prompt
         if history_text:
-            full_system = (
-                f"{system_prompt}\n\n# Prior turns\n{history_text}"
-                if system_prompt
-                else f"# Prior turns\n{history_text}"
-            )
+            full_system = f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
 
         # Build the SDK-shape user message frame.
         user_frame = _build_stream_json_user_message(last_user, persona_dir)
@@ -706,6 +696,82 @@ def _read_audit_lines_since(
             record["error"] = entry["error"]
         records.append(record)
     return records
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCliProvider — prompt/context formatting helpers
+# ---------------------------------------------------------------------------
+
+
+_CLAUDE_SAFE_SPEAKERS = {
+    "user": "human",
+    "assistant": "companion",
+    "tool": "tool_result",
+}
+
+
+def _format_claude_print_prompt(messages: list[ChatMessage]) -> str:
+    """Format messages for ``claude -p`` without transcript role labels.
+
+    A single text turn stays verbatim to preserve the simple generation shape.
+    Multi-turn history is encoded as JSONL data with non-canonical speaker
+    names. The previous ``User:`` / ``Assistant:`` script shape primed Claude
+    to continue that transcript, which sometimes leaked role labels into
+    Nell's visible reply.
+    """
+    if not messages:
+        return ""
+    if len(messages) == 1:
+        return messages[0].content_text()
+    return _format_claude_context_block(messages, includes_latest_user=True)
+
+
+def _format_claude_context_block(
+    messages: list[ChatMessage],
+    *,
+    includes_latest_user: bool,
+) -> str:
+    """Return a JSONL context block for Claude CLI prompt/system text.
+
+    The wording intentionally avoids the canonical ``User:`` and
+    ``Assistant:`` delimiters. JSON-string encoding also keeps embedded
+    newlines or user-supplied delimiter-looking text inside the data field
+    instead of creating new transcript lines.
+    """
+    if includes_latest_user:
+        instruction = (
+            "Answer the final human entry directly in the companion's voice. "
+            "Do not prefix the reply with any speaker name, role label, JSON, "
+            "or transcript marker."
+        )
+    else:
+        instruction = (
+            "Use this only as context for the next human message. Do not "
+            "prefix the reply with any speaker name, role label, JSON, or "
+            "transcript marker."
+        )
+
+    lines = [
+        "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
+        instruction,
+        "",
+    ]
+    lines.extend(_claude_context_jsonl_lines(messages))
+    return "\n".join(lines)
+
+
+def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
+    """Yield one JSON object per chat turn using leak-resistant speaker names."""
+    for msg in messages:
+        record: dict[str, Any] = {
+            "speaker": _CLAUDE_SAFE_SPEAKERS.get(msg.role, msg.role),
+            "text": msg.content_text(),
+        }
+        if msg.tool_call_id:
+            record["tool_call_id"] = msg.tool_call_id
+        if msg.tool_calls:
+            record["tool_calls"] = [tc.to_dict() for tc in msg.tool_calls]
+        yield json.dumps(record, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
