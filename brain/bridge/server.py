@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from brain.bridge import events
@@ -623,6 +623,52 @@ def build_app(
         if "error" in result:
             raise HTTPException(status_code=404, detail=result["error"])
         return result
+
+    # ── POST /upload — multimodal image upload ────────────────────────────
+    # Image upload limit (matches the spec D2 default; per-persona override
+    # via PersonaConfig.image_max_bytes can come later if needed).
+    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+    _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(
+        {"image/png", "image/jpeg", "image/webp", "image/gif"}
+    )
+
+    @app.post("/upload", dependencies=[Depends(require_http_auth)])
+    async def upload(file: UploadFile) -> dict[str, Any]:
+        """Accept a multipart-uploaded image, persist content-addressably.
+
+        Returns ``{sha, media_type, size_bytes}`` on success. Image lands at
+        ``<persona_dir>/images/<sha>.<ext>``. Identical content (same sha)
+        is deduped — second upload of the same bytes returns the same sha
+        without writing a duplicate file.
+
+        Errors:
+          * 415 — unsupported media_type (only PNG / JPEG / WebP / GIF)
+          * 413 — file exceeds the 20 MB cap
+        """
+        from brain.images import save_image_bytes
+
+        s: BridgeAppState = app.state.bridge
+        media_type = (file.content_type or "").lower()
+        if media_type not in _ALLOWED_UPLOAD_MEDIA_TYPES:
+            raise HTTPException(
+                status_code=415,
+                detail=f"unsupported media_type {media_type!r}; "
+                f"must be one of {sorted(_ALLOWED_UPLOAD_MEDIA_TYPES)}",
+            )
+        # Read up to limit + 1 so we can detect overrun without buffering
+        # arbitrarily large payloads in memory.
+        raw = await file.read(_IMAGE_MAX_BYTES + 1)
+        if len(raw) > _IMAGE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file too large; max {_IMAGE_MAX_BYTES} bytes",
+            )
+        record = save_image_bytes(s.persona_dir, raw, media_type)
+        return {
+            "sha": record.sha,
+            "media_type": record.media_type,
+            "size_bytes": record.size_bytes,
+        }
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
