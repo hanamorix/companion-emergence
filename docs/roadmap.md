@@ -1,160 +1,269 @@
 # Roadmap
 
 This roadmap keeps the project's remaining work honest after the
-2026-05-07 audit cycle. It is not a public release promise;
-companion-emergence is still private/local-first during development.
-Last refreshed 2026-05-07.
+2026-05-07 audit cycle + Phase 7 cross-platform open-source bundling.
+It is not a public release promise. companion-emergence stays
+private/local-first during development, but as of this refresh it is
+genuinely shareable on macOS arm64 (and code-path-shareable on the
+other three target platforms pending CI smoke).
+Last refreshed 2026-05-07 (end-of-day after wizard-validation +
+WS-close + voice-template-packaging fixes).
 
 ## Current posture
 
-The framework is a private prototype with a working desktop client
-and a fully multimodal chat path. Local smoke testing covers:
+The framework is a private prototype with a working desktop client,
+a fully multimodal chat path, and a relocatable bundle. Local smoke
+testing covers:
 
 **Brain (Python):**
 
 - CLI entry point: `nell` (init, status, memory, supervisor, works,
   health, soul, chat, dream, heartbeat, reflex, research, interest,
-  growth, migrate)
-- local persona storage via `NELLBRAIN_HOME`
+  growth, migrate). The deprecated `nell bridge` alias has been
+  removed; `nell supervisor` is canonical.
+- local persona storage via `NELLBRAIN_HOME` (heals invalid
+  `selected_persona` to None on read; persona names validated against
+  `[A-Za-z0-9_-]{1,40}` everywhere)
 - bridge daemon: HTTP + WebSocket, ephemeral bearer token, CORS
-  scoped to allowed origins
+  scoped to allowed origins (Vite dev ports included), explicit
+  `ws.close(code=1000)` after stream `done`
 - chat/session lifecycle with multimodal turns (text + base64 images
-  via `--input-format stream-json` to claude-cli)
+  via `--input-format stream-json` to claude-cli; verified live —
+  Nell described a 4×4 red-X PNG correctly)
 - memory ingest pipeline (buffer → extract → commit) with image-sha
   metadata
 - safe memory inspection (`nell memory list/search/show`)
 - body/emotion context, soul candidate review, growth crystallizers
 - MCP tool server with privacy-aware audit logging
 - health checks and data-file self-healing
-- 1468 unit + integration tests
+- SQLite WAL + 5s busy_timeout on MemoryStore + HebbianMatrix +
+  WorksStore
+- JSONL readers stream line-by-line (no full-file memory spike)
+- 1470 unit + integration tests; ruff clean
 
 **NellFace (Tauri 2 + React 18 + Vite):**
 
-- install wizard + bridge auto-spawn + first-launch routing
+- install wizard + bridge auto-spawn + first-launch routing —
+  validated end-to-end against a fresh `NELLBRAIN_HOME` 2026-05-07
 - breathing avatar with 16-category 4-frame expression engine
 - emotion-family colour tints on the breathing ring + soft backing
   wash (Phase 5D)
 - soul-crystallization flash overlay
-- WebSocket streaming chat (`/stream/:sid`) with word-by-word reply
-- paperclip image upload + emoji picker + per-bubble thumbnails
+- WebSocket streaming chat (`/stream/:sid`) with word-by-word reply +
+  clean close (1000) handshake after `done`
+- paperclip image upload, emoji picker, drag-and-drop image upload,
+  paste-from-clipboard image upload, per-bubble thumbnails, object-URL
+  cleanup on unmount
 - 5 left-column panels (inner weather, body, recent interior, soul,
   connection)
+- always-on-top toggle wired to the actual Tauri window API
+- 6 frontend Vitest tests pinning the persona-cache contract +
+  wizard InitArgs shape
 
-## Active backlog — 2026-05-07 audit cycle
+**Phase 7 — bundled portable Python runtime:**
 
-The 2026-05-07 full code audit (`docs/audits/2026-05-07-full-code-audit.md`)
-found 2×P1 + 8×P2 + 7×P3 + 2×P4 = 19 issues, all verified reproducible
-against current main. Backend is healthier than the April baseline;
-the largest current risk is the new Tauri/NellFace onboarding wiring.
+- `app/build_python_runtime.sh` branches on `uname -s/-m` for macOS
+  arm64 / x86_64, Linux x86_64 / arm64, Windows x86_64; downloads
+  `python-build-standalone`, installs the brain wheel into the
+  bundled site-packages, and replaces the pip-generated `nell` entry
+  point with a relocatable `/bin/sh` wrapper (the original baked an
+  absolute path to the build host's python)
+- the `nell-example` voice template ships *inside* the wheel at
+  `brain/voice_templates/nell-voice.md` and loads via
+  `importlib.resources` so no `docs/` dir lookup is needed
+- `tauri.conf.json:bundle.macOS.signingIdentity = "-"` triggers a
+  full ad-hoc codesign over the embedded `python-runtime/` tree;
+  `codesign --verify --deep --strict` passes on every build
+- macOS arm64 verified live: a fresh `NELLBRAIN_HOME` walks the
+  wizard end-to-end, persona created, chat round-trips with the
+  bundled python, no external `uv` or system Python on PATH
+- `INSTALL.md` walks end-users through the macOS Gatekeeper bypass,
+  Windows SmartScreen "More info → Run anyway", Linux .deb /
+  AppImage flows
+- `.github/workflows/release.yml` cross-platform CI matrix on
+  macos-14 (arm64) / macos-13 (x86_64) / ubuntu-22.04 / windows-2022;
+  triggered by `v*.*.*` tags; bundles upload as workflow artifacts
 
-**P1 — block fresh-install or non-`nell` use:**
+## Active backlog
 
-1. `nell init --provider <X>` flag missing — wizard install step fails
-   on every fresh install because the React side sends `provider:` and
-   the Rust shim builds `--provider`, but the CLI parser doesn't accept
-   it. Smallest fix: add the flag + persist to `persona_config.json`.
-2. Frontend hard-codes persona to `nell` — `App.tsx` discards the
-   selected persona; `bridge.ts` defaults `persona = "nell"` and caches
-   credentials globally. Any non-`nell` persona starts the right bridge
-   but the chat UI talks to the wrong one. Smallest fix: thread persona
-   through every bridge helper, scope the credential cache.
+The 2026-05-07 audit cycle (19 issues) is **closed** — all P1/P2
+shipped, both P4 cleanups landed, the JSONL streaming P3 shipped,
+and the cross-platform Phase 7 follow-up wrapped up the public-
+release blocker on the macOS side. What remains:
 
-**P2 — local hardening + release gates:**
+**Validation gaps (run-once, not code work):**
 
-- Tauri commands skip the persona-name validation Python enforces
-- `tauri.conf.json` has `csp: null` while exposing token-reading and
-  process-spawning commands
-- `uv run ruff check .` returns 30 errors (24 auto-fixable) — the
-  documented release gate is broken
-- `PersonaConfig` doesn't constrain provider/searcher to known values;
-  CLI exposes `--searcher claude-tool` which always raises
-- `MemoryStore` + `HebbianMatrix` lack WAL / busy_timeout (the works
-  store already has the pattern — copy it)
-- Heartbeat reflex/growth exceptions log+swallow without surfacing
-  to the audit JSON (research already does this right)
-- `closeSession()` not wired into ChatPanel unmount + doesn't check
-  r.ok — chat memory creation depends on supervisor stale-close
-- Frontend has no automated tests beyond `tsc` + `vite build`
+- macOS x86_64 / Linux x86_64 / Linux arm64 / Windows x86_64 — all
+  four code paths compile cleanly; only macOS arm64 has been
+  smoke-tested on a real host. First CI matrix run from a tagged
+  commit will surface any platform-specific gotchas.
+- DMG installer flow (`Path B` in the wizard runbook) — pending
+  Hana's manual click-through after the recent fixes.
+- First-time user testing — the wizard works end-to-end, but no
+  outsider has actually tried installing from scratch; live
+  feedback is the next signal.
 
-**P3 — UX correctness, bloat, doc drift:**
+**Intentionally deferred (design call needed, not urgent):**
 
-- `brain/images.py` shared `<sha>.<ext>.new` temp path can race on
-  concurrent identical uploads
-- Image upload trusts client MIME type (no magic-byte sniff)
-- Object URLs leak on long sessions (no unmount cleanup)
-- Always-on-top toggle persists config but never calls Tauri
-  `setAlwaysOnTop`
-- 47MB of expression PNGs eager-globbed into the bundle
-- Docs / CHANGELOG / roadmap disagree about which CLI surfaces are
-  stubs (this refresh tries to fix the roadmap side)
-- JSONL readers `read_text().splitlines()` — full file into memory;
-  most logs lack retention
+- 47 MB of expression PNGs eager-globbed into the bundle. WebP/AVIF
+  conversion would degrade fidelity on art Hana drew with intent;
+  spritesheets break the per-frame addressability the animation
+  engine relies on; lazy globs trade jank for size. Revisit when
+  install-size signal makes it worth a fidelity hit.
+- JSONL bounded-tail retention. Streaming reader shipped — that
+  closed the memory-spike vector. The retention piece needs a
+  per-log-type design call (1 MB? 10 MB? 30 days? 90?) and isn't
+  urgent until any single log file actually grows large enough to
+  bite.
 
-**P4 — cleanup:**
+**External prerequisites (paid signing, when budget permits):**
 
-- `brain/cli.py` keeps `_STUB_COMMANDS = ()` + `_make_stub` + a no-op
-  registration loop after all CLI stubs were resolved
-- `brain/bridge/runner.py:_allocate_port` comment overstates retry —
-  uvicorn's bind isn't wrapped
+- Apple Developer ID Application certificate (~$99/yr) — replaces
+  ad-hoc with proper Gatekeeper-friendly signing on macOS; users
+  stop seeing the "unidentified developer" dialog. The
+  release-checklist's signing section already documents the
+  `codesign` / `notarytool` / `stapler` commands.
+- Microsoft OV or EV code-signing certificate — same for Windows
+  SmartScreen.
+- Linux .deb dpkg-sig + AppImage GPG signing — only meaningful if
+  the project gets added to a third-party APT source or wants
+  delta-update support.
 
-**Suggested fix order:**
+## Public release blockers (open)
 
-1. Both P1s together (the pair is the wizard-fresh-install path)
-2. Frontend test coverage so P1-class regressions can't recur
-3. Tauri shell hardening — persona validation + app_config validation
-   + explicit CSP
-4. Restore Ruff gate (mostly `--fix`, then handle remaining E402)
-5. Hide `claude-tool` searcher choice or implement it; add
-   PersonaConfig value validation + healing
-6. WAL + busy_timeout on memory/Hebbian stores + a small contention
-   stress test
-7. Doc/changelog/release-checklist reconciliation
+These keep a public/tagged release honest. None of them block private
+development:
 
-## Public release blockers
-
-These block a public/tagged release; private local development is
-fine without them.
-
-- Both P1s above (would surface immediately to a fresh user)
-- Wheel/sdist clean-install smoke test recorded
-  (`scripts/smoke_test_wheel.sh`, see release-checklist)
-- Public contributor/onboarding docs missing
-- Public API/CLI compatibility policy undefined
-- Code paths for cross-platform Phase 7 builds (macOS arm64 / x86_64,
-  Linux x86_64 / arm64, Windows x86_64) are in tree as of 2026-05-07
-  — `app/build_python_runtime.sh` branches on `uname -s/-m` for the
-  python-build-standalone target, `lib.rs:nell_command` resolves the
-  per-OS entry point via `cfg!(windows)`, and
-  `.github/workflows/release.yml` matrices the build across all four
-  platforms. macOS arm64 verified live; the others compile cleanly
-  but haven't been smoke-tested on actual hosts.
-- App-distribution signing + notarization — Apple Developer ID +
-  Microsoft code-signing cert are external prerequisites the
-  release-checklist now walks through step-by-step (`codesign`,
-  `notarytool`, `signtool`). Auto-update via `tauri-plugin-updater`
-  deferred until first public release shows demand.
+- First CI matrix run from a tagged commit + manual smoke on the
+  three not-yet-verified hosts (macOS x86_64, Linux x86_64, Windows
+  x86_64).
+- Public contributor / onboarding docs.
+- Public API / CLI compatibility policy.
+- Auto-update story — `tauri-plugin-updater` infra exists but isn't
+  wired. Defer until a first public release shows actual demand;
+  needs an update-server hosting decision (S3 + signed manifest, or
+  managed service like updately.app).
 
 ## Forward direction (after the backlog drains)
 
-These are framework-shaped, not patch-shaped. Picked from current
-spec drafts and the natural extensions of the multimodal turn work:
+Framework-shaped, not patch-shaped. Picked from spec drafts and
+natural extensions of the multimodal + bundled-runtime work:
 
 - **NellFace past-image gallery** — drag-and-drop + paste-from-
-  clipboard already shipped 2026-05-07; the remaining piece is a
-  panel-based gallery to browse what's been shared in past turns
+  clipboard shipped; the remaining piece is a panel-based gallery to
+  browse what's been shared in past turns (memory metadata's
+  `image_shas` field is already where you'd source it from).
 - **Voice gap remediation past the asymptote** — sampling controls
-  or finetuned model for true corpus-target voice (current state is
-  "moved in the right direction, asymptotic" per 2026-05-05 retest)
-- **JSONL bounded-tail retention** — companion to the streaming
-  reader shipped 2026-05-07; needs a per-log-type design call about
-  retention windows
-- **Public release plan** — once the backlog above is clean, write a
-  proper release plan covering signing, distribution, contributor
-  workflow, version policy
+  or finetuned model for true corpus-target voice. Current state is
+  "moved in the right direction, asymptotic" per the 2026-05-05
+  retest. Real progress here needs either generation-param control
+  inside ClaudeCliProvider or a swap to a Hana-finetuned model.
+- **Public release plan** — once the validation gaps close and the
+  contributor docs land, write a proper release plan covering
+  signing (paid path), distribution (DMG / .msi / .deb), contributor
+  workflow, version policy, and the auto-update story.
 
 ## Recently shipped (reverse chronological)
 
-**2026-05-07 — multimodal + UI polish bundle**
+**2026-05-07 (end-of-day) — wizard validation + close-handshake fixes**
+
+- Wizard validation runbook + staging env at `~/wizard-validation/`
+  (excluded from VCS) — fresh `NELLBRAIN_HOME`, launcher script that
+  inherits the env into the .app's process, cleanup script, full
+  test plan with expected behavior per step.
+- `install_voice_template` packaged inside `brain/voice_templates/`
+  + read via `importlib.resources` — closes the FileNotFoundError
+  end-users hit when picking the `nell-example` voice template
+  against any wheel install (including the Phase 7 .app).
+- Relocatable `nell` launcher in the bundled `python-runtime/bin/`
+  — replaced pip's absolute-path shebang with a `/bin/sh` wrapper
+  that resolves `$SCRIPT_DIR` and execs the bundled python next
+  door. The runtime tree is now genuinely portable across machines.
+- Bridge `WS /stream` sends explicit `ws.close(code=1000)` after the
+  `done` frame — closes Hana's "ws closed (1006): unknown" finding
+  during validation. Regression test pinned.
+
+**2026-05-07 — Phase 7 open-source distribution**
+
+- macOS proper ad-hoc signing via `bundle.macOS.signingIdentity = "-"`
+  — Tauri's default produced an unsealed bundle whose
+  `codesign --verify --deep --strict` failed; explicit ad-hoc fixes it.
+- `INSTALL.md` walking end-users through Gatekeeper / SmartScreen
+  bypass per platform.
+- README link to INSTALL + per-platform first-launch summary.
+- Release-checklist signing section reframed: ad-hoc is the OSS
+  default, paid signing is optional.
+
+**2026-05-07 — Phase 7 cross-platform**
+
+- `app/build_python_runtime.sh` branches across all five target
+  triples (macOS arm64 / x86_64, Linux x86_64 / arm64, Windows x86_64).
+- `lib.rs:nell_command` resolves bundled entry point via
+  `cfg!(windows)`.
+- `app/src-tauri/python-runtime/.gitkeep` placeholder so Tauri's
+  `bundle.resources` glob always resolves in clean checkouts.
+- `.github/workflows/release.yml` matrix builds on `macos-14`,
+  `macos-13`, `ubuntu-22.04`, `windows-2022` from `v*.*.*` tags.
+- Release-checklist gains "Phase 7 cross-platform release" section.
+
+**2026-05-07 — Phase 7 bundling (macOS arm64 verified live)**
+
+- `python-build-standalone` cpython 3.13.1 fetched + extracted into
+  `app/src-tauri/python-runtime/`; brain wheel pip-installed into
+  the bundled site-packages; `__pycache__` + tests stripped.
+- `tauri.conf.json` `beforeBuildCommand` chains the runtime build;
+  `bundle.resources` ships it inside `Resources/python-runtime/`.
+- Rust `nell_command(app)` helper resolves the bundled entry point
+  with a `uv run nell` dev fallback.
+- Verified live with `env -i` (no PATH, no uv, no system Python):
+  bundled `nell init` creates a persona, `nell status` reads it back.
+  .app size ~190 MB.
+
+**2026-05-07 — audit-followups + JSONL streaming**
+
+- `nell bridge` deprecated CLI alias removed (12 alias-deprecation
+  tests replaced by 1 that asserts the subcommand is now unknown).
+- ChatPanel drag-and-drop + paste-from-clipboard image upload.
+- `scripts/smoke_test_wheel.sh` — wheel build → fresh uv venv →
+  install → `nell --version` / `nell init` / `nell status` against
+  tmp NELLBRAIN_HOME. Verified passing live.
+- `iter_jsonl_skipping_corrupt(path) → Iterator[dict]` streaming
+  variant; `read_jsonl_skipping_corrupt` now a thin list wrapper.
+  Closes the audit P3 memory-spike vector — peak goes from ~2× file
+  size to one line regardless of log size.
+
+**2026-05-07 — full audit-fix-pack (19 issues from the 2026-05-07 audit)**
+
+- P1-1 wizard provider step removed (claude-cli is the sole GUI
+  surface, per `PersonaConfig` docstring); StepLLMSetup deleted.
+- P1-2 frontend persona threading — every bridge helper takes
+  `persona`, credential cache scoped per-persona,
+  `resetBridgeCredentialCache(persona?)` exposed.
+- P2 Tauri persona-name validation in lib.rs + `read_app_config`
+  heals invalid `selected_persona` to None.
+- P2 explicit narrow CSP in `tauri.conf.json`.
+- P2 Ruff clean (30 errors → 0; mostly `--fix`, three N806 + two
+  E402 noqa for intentional patterns).
+- P2 `PersonaConfig` allowlists for provider/searcher with graceful
+  fallback + warning. `claude-tool` searcher removed from CLI.
+- P2 SQLite `journal_mode = WAL` + 5s `busy_timeout` on MemoryStore
+  + HebbianMatrix (after integrity check, so corrupt-db probes still
+  surface BrainIntegrityError).
+- P2 heartbeat `reflex_error` + `growth_error` fields surfaced
+  through HeartbeatResult + audit JSON.
+- P2 `closeSession()` throws on non-2xx; ChatPanel calls it on
+  unmount as best-effort flush.
+- P2 first Vitest harness + 6 frontend tests pinning both P1 fixes.
+- P3 image upload unique-tmp-path race fix + magic-byte sniff
+  (PNG/JPEG/GIF/WebP); 422 on declared/sniffed mismatch.
+- P3 object-URL leak fix on chat unmount.
+- P3 always-on-top toggle calls Tauri `setAlwaysOnTop` window API
+  (was previously a config-persisted no-op).
+- P4 dead `_STUB_COMMANDS` + `_make_stub` scaffolding removed.
+- P4 `_allocate_port` docstring honest about which bind it actually
+  retries.
+
+**2026-05-07 — multimodal + UI polish**
 
 - Image-support epic — all 8 phases (commits b279334 → 9c6baf7).
   Bytes upload via `POST /upload`, `image_shas` thread end-to-end
@@ -162,6 +271,7 @@ spec drafts and the natural extensions of the multimodal turn work:
   through `--input-format stream-json` (verified live: Nell
   described a 4×4 red-X PNG correctly), voice.md gained §4
   "When the user shows you something."
+- Live persona voice.md deployed (backup at `voice.md.pre-p7-bak-…`).
 - NellFace Phase 5D — emotion-family colour tints on the breathing
   ring + soft backing wash, smooth ~0.85s transitions per category.
 - NellFace input row — paperclip + emoji picker, both styled to
