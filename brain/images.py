@@ -124,6 +124,31 @@ def save_image_bytes(
     return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
 
 
+_EXT_TO_MEDIA_TYPE = {ext: mt for mt, ext in _MEDIA_TYPE_TO_EXT.items()}
+
+
+def media_type_for_sha(persona_dir: Path, sha: str) -> str:
+    """Look up the on-disk file for ``sha`` and return its media_type.
+
+    Walks the allowed extensions; first match wins. Useful when a caller
+    only has the sha (e.g. from a chat request body) and needs to
+    construct an ImageBlock without round-tripping the media_type.
+
+    Raises
+    ------
+    ValueError
+        If ``sha`` is malformed.
+    FileNotFoundError
+        If no file exists for the sha under any allowed extension.
+    """
+    _validate_sha(sha)
+    images_dir = persona_dir / "images"
+    for ext, media_type in _EXT_TO_MEDIA_TYPE.items():
+        if (images_dir / f"{sha}.{ext}").exists():
+            return media_type
+    raise FileNotFoundError(f"no image found for sha {sha} in {images_dir}")
+
+
 def read_image_bytes(persona_dir: Path, sha: str, media_type: str) -> bytes:
     """Read image bytes for ``sha`` from ``persona_dir/images/``.
 
