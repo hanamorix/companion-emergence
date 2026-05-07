@@ -50,7 +50,18 @@ export async function listPersonas(): Promise<string[]> {
 }
 
 export async function ensureBridgeRunning(persona: string): Promise<void> {
-  await invoke("ensure_bridge_running", { persona });
+  try {
+    await invoke("ensure_bridge_running", { persona });
+  } catch (e) {
+    // Browser dev mode — Tauri's `invoke` is undefined. Treat as a no-op
+    // and assume the bridge is already running externally; the next
+    // fetch through bridge.ts will surface a real failure if it isn't.
+    if (import.meta.env.DEV) {
+      console.warn("[appConfig] ensure_bridge_running unavailable in browser dev; assuming external bridge:", e);
+      return;
+    }
+    throw e;
+  }
 }
 
 export interface InitArgs {
