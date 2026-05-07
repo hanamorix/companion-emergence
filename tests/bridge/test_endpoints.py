@@ -368,3 +368,39 @@ def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch)
             f = ws.receive_json()
             assert f.get("type") == "error"
             assert f.get("code") == "invalid_image_shas"
+
+
+def test_stream_closes_cleanly_after_done(persona_dir: Path, monkeypatch):
+    """The WS Close frame after `done` carries code 1000 (not 1006).
+
+    Regression guard for the 2026-05-07 wizard-validation finding:
+    Hana saw 'ws closed (1006): unknown' in the chat panel after every
+    successful chat round-trip because the bridge handler returned
+    without explicitly closing the WS, so FastAPI tore down the
+    underlying TCP without sending a Close frame and the browser
+    reported abnormal closure.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="all good")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "hi"})
+            saw_done = False
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    saw_done = True
+                    break
+            assert saw_done, "stream never sent the done frame"
+            # After done the server should close cleanly. Starlette's
+            # TestClient surfaces this via WebSocketDisconnect with the
+            # close code on .code.
+            from starlette.websockets import WebSocketDisconnect
+
+            try:
+                # Any further receive should raise with the close code.
+                ws.receive_json()
+                raise AssertionError("server did not close after done")
+            except WebSocketDisconnect as exc:
+                assert exc.code == 1000, f"expected clean close 1000, got {exc.code}"
