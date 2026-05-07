@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ensureBridgeRunning,
   readAppConfig,
+  setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
 } from "./appConfig";
@@ -166,6 +167,12 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   useEffect(() => {
     document.documentElement.dataset.reducedMotion = config.reduced_motion ? "true" : "false";
   }, [config.reduced_motion]);
+
+  // Apply always-on-top to the actual Tauri window — both on mount
+  // (for the saved value) and whenever the user toggles it.
+  useEffect(() => {
+    void setAlwaysOnTop(config.always_on_top);
+  }, [config.always_on_top]);
 
   function updateConfig(patch: Partial<AppConfig>) {
     const next = { ...config, ...patch };
