@@ -6,6 +6,27 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Added (2026-05-07 — Phase 7)
+
+- **Phase 7 — Python runtime bundling.** `pnpm tauri build` now
+  produces a self-contained `NellFace.app` that doesn't need `uv`,
+  `python3`, or any system Python on PATH. macOS arm64 / x86_64 /
+  Linux x86_64 supported today; Windows pending. Build flow:
+  - `app/build_python_runtime.sh` downloads `python-build-standalone`
+    for the host arch (~30 MB compressed), extracts to
+    `app/src-tauri/python-runtime/`, builds the
+    `companion-emergence` wheel, installs the brain into the
+    bundled site-packages, strips `__pycache__` + tests.
+  - `tauri.conf.json` `bundle.resources` ships the runtime tree
+    inside `Resources/python-runtime/`.
+  - `lib.rs` `nell_command(app)` resolves the bundled
+    `Resources/python-runtime/bin/nell` in production and falls back
+    to `uv run nell` against the source tree for `pnpm tauri dev`.
+    `ensure_bridge_running` and `run_init` both use it.
+  - End-to-end verified live 2026-05-07: bundled `nell init`
+    against a tmp `NELLBRAIN_HOME` with `env -i` (no PATH) creates
+    a persona; `nell status` reads it back. .app size: ~190 MB.
+
 ### Fixed (2026-05-07 audit cycle)
 
 - **P1**: `nell init` no longer needs a `--provider` flag — wizard
