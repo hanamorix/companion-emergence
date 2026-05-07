@@ -116,17 +116,23 @@ These block a public/tagged release; private local development is
 fine without them.
 
 - Both P1s above (would surface immediately to a fresh user)
-- Wheel/sdist clean-install smoke test never recorded
+- Wheel/sdist clean-install smoke test recorded
+  (`scripts/smoke_test_wheel.sh`, see release-checklist)
 - Public contributor/onboarding docs missing
 - Public API/CLI compatibility policy undefined
-- Tauri app distribution story (signing, notarization, auto-update)
-  unwritten — not blocking private use but blocking public ship
-- Linux .deb / Windows .msi cross-platform release of the Phase 7
-  bundle — the macOS arm64 path is shipping as of 2026-05-07; Linux
-  x86_64 is supported by `python-build-standalone` and the build
-  script branches on platform but hasn't been smoke-tested; Windows
-  needs `Scripts/python.exe` instead of `bin/python3` and a separate
-  branch in `nell_command`
+- Code paths for cross-platform Phase 7 builds (macOS arm64 / x86_64,
+  Linux x86_64 / arm64, Windows x86_64) are in tree as of 2026-05-07
+  — `app/build_python_runtime.sh` branches on `uname -s/-m` for the
+  python-build-standalone target, `lib.rs:nell_command` resolves the
+  per-OS entry point via `cfg!(windows)`, and
+  `.github/workflows/release.yml` matrices the build across all four
+  platforms. macOS arm64 verified live; the others compile cleanly
+  but haven't been smoke-tested on actual hosts.
+- App-distribution signing + notarization — Apple Developer ID +
+  Microsoft code-signing cert are external prerequisites the
+  release-checklist now walks through step-by-step (`codesign`,
+  `notarytool`, `signtool`). Auto-update via `tauri-plugin-updater`
+  deferred until first public release shows demand.
 
 ## Forward direction (after the backlog drains)
 
