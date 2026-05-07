@@ -4,7 +4,6 @@ import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
 import { StepPersonaName } from "./steps/StepPersonaName";
 import { StepUserName } from "./steps/StepUserName";
-import { StepLLMSetup } from "./steps/StepLLMSetup";
 import { StepVoiceTemplate } from "./steps/StepVoiceTemplate";
 import { StepMigrate } from "./steps/StepMigrate";
 import { StepReview } from "./steps/StepReview";
@@ -17,7 +16,6 @@ export interface WizardState {
   mode: WizardMode;
   personaName: string;
   userName: string;
-  provider: "claude-cli" | "ollama" | "fake";
   voiceTemplate: VoiceTemplate;
   migrateFromPath: string;
 }
@@ -26,16 +24,18 @@ const INITIAL_STATE: WizardState = {
   mode: "fresh",
   personaName: "",
   userName: "",
-  provider: "claude-cli",
   voiceTemplate: "default",
   migrateFromPath: "",
 };
 
+// Provider is fixed to claude-cli (per project decision 2026-05-07).
+// Ollama / fake providers stay valid for tests + scripts but are not
+// user-facing GUI choices. PersonaConfig.DEFAULT_PROVIDER picks the
+// right value when nell init runs without --provider.
 type Step =
   | "welcome"
   | "name"
   | "user"
-  | "llm"
   | "voice"
   | "migrate"
   | "review"
@@ -55,16 +55,15 @@ export function Wizard({ onDone }: Props) {
   } | null>(null);
 
   // Total steps depends on mode — migrate adds the migrate step
-  const totalSteps = state.mode === "migrate" ? 7 : 6;
+  const totalSteps = state.mode === "migrate" ? 6 : 5;
   const stepNum: Record<Step, number> = {
     welcome: 1,
     name: 2,
     user: 3,
-    llm: 4,
-    voice: 5,
-    migrate: 6,
-    review: state.mode === "migrate" ? 7 : 6,
-    installing: state.mode === "migrate" ? 7 : 6,
+    voice: 4,
+    migrate: 5,
+    review: state.mode === "migrate" ? 6 : 5,
+    installing: state.mode === "migrate" ? 6 : 5,
   };
 
   function update<K extends keyof WizardState>(key: K, value: WizardState[K]) {
@@ -76,7 +75,6 @@ export function Wizard({ onDone }: Props) {
     welcome: "welcome",
     name: "name",
     user: "user",
-    llm: "llm",
     voice: "voice",
     migrate: "migrate",
     review: "review",
@@ -88,7 +86,6 @@ export function Wizard({ onDone }: Props) {
     const args: InitArgs = {
       persona: state.personaName,
       user_name: state.userName.trim() || null,
-      provider: state.provider,
       voice_template: state.voiceTemplate,
       migrate_from: state.mode === "migrate" ? state.migrateFromPath : null,
       force: false,
@@ -153,20 +150,8 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           value={state.userName}
           onChange={(v) => update("userName", v)}
-          onNext={() => setStep("llm")}
-          onBack={() => setStep("name")}
-          avatar={avatar}
-        />
-      );
-    case "llm":
-      return (
-        <StepLLMSetup
-          step={stepNum.llm}
-          totalSteps={totalSteps}
-          provider={state.provider}
-          onProviderChange={(p) => update("provider", p)}
           onNext={() => setStep("voice")}
-          onBack={() => setStep("user")}
+          onBack={() => setStep("name")}
           avatar={avatar}
         />
       );
@@ -178,7 +163,7 @@ export function Wizard({ onDone }: Props) {
           template={state.voiceTemplate}
           onTemplateChange={(t) => update("voiceTemplate", t)}
           onNext={() => setStep(state.mode === "migrate" ? "migrate" : "review")}
-          onBack={() => setStep("llm")}
+          onBack={() => setStep("user")}
           avatar={avatar}
         />
       );

@@ -46,12 +46,13 @@ export interface StreamChatOptions {
  * invoke to abort the in-flight reply (closes the WS).
  */
 export async function streamChat(
+  persona: string,
   sessionId: string,
   message: string,
   handlers: StreamChatHandlers,
   options: StreamChatOptions = {},
 ): Promise<() => void> {
-  const creds = await getBridgeCredentials();
+  const creds = await getBridgeCredentials(persona);
   const url = `ws://127.0.0.1:${creds.port}/stream/${sessionId}`;
   const protocols = creds.authToken ? ["bearer", creds.authToken] : undefined;
 

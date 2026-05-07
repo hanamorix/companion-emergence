@@ -13,7 +13,6 @@ from brain.setup import (
     write_persona_config,
 )
 
-
 # ---- validate_persona_name ----
 
 
