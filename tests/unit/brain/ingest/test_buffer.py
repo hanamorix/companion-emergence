@@ -151,3 +151,68 @@ def test_ingest_turn_accepts_uuid_and_sess_prefix_session_ids(tmp_path: Path) ->
     ingest_turn(tmp_path, {"session_id": sid_sess, "speaker": "u", "text": "b"})
     assert (tmp_path / "active_conversations" / f"{sid_uuid}.jsonl").exists()
     assert (tmp_path / "active_conversations" / f"{sid_sess}.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# image_shas — multimodal turns
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_turn_records_image_shas(tmp_path):
+    from brain.ingest.buffer import ingest_turn, read_session
+
+    sid = ingest_turn(
+        tmp_path,
+        {
+            "session_id": "sess_abc12345",
+            "speaker": "user",
+            "text": "look at this",
+            "image_shas": ["a" * 64, "b" * 64],
+        },
+    )
+    rec = read_session(tmp_path, sid)[0]
+    assert rec["image_shas"] == ["a" * 64, "b" * 64]
+
+
+def test_ingest_turn_omits_image_shas_when_absent(tmp_path):
+    from brain.ingest.buffer import ingest_turn, read_session
+
+    sid = ingest_turn(
+        tmp_path,
+        {"session_id": "sess_def67890", "speaker": "user", "text": "hi"},
+    )
+    rec = read_session(tmp_path, sid)[0]
+    assert "image_shas" not in rec
+
+
+def test_ingest_turn_omits_image_shas_when_empty_list(tmp_path):
+    from brain.ingest.buffer import ingest_turn, read_session
+
+    sid = ingest_turn(
+        tmp_path,
+        {
+            "session_id": "sess_e0e0e0e0",
+            "speaker": "user",
+            "text": "hi",
+            "image_shas": [],
+        },
+    )
+    rec = read_session(tmp_path, sid)[0]
+    assert "image_shas" not in rec
+
+
+def test_ingest_turn_image_shas_accepts_tuple(tmp_path):
+    """Caller passing a tuple — record stores a list."""
+    from brain.ingest.buffer import ingest_turn, read_session
+
+    sid = ingest_turn(
+        tmp_path,
+        {
+            "session_id": "sess_aabbccdd",
+            "speaker": "user",
+            "text": "hi",
+            "image_shas": ("a" * 64, "b" * 64),
+        },
+    )
+    rec = read_session(tmp_path, sid)[0]
+    assert rec["image_shas"] == ["a" * 64, "b" * 64]
