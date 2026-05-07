@@ -3,7 +3,7 @@
  *
  * Two responsibilities:
  *   1. pickExpressionCategory(state) — heuristic stack mapping persona
- *      state to one of 13 expression categories. Body emotions override
+ *      state to one of 16 expression categories. Body emotions override
  *      social emotions ("physiology speaks first"); long absence reads as
  *      aching; everything else falls through emotion-family routing.
  *   2. resolveFrameUrl(category, frame) — find the PNG for a (category,
@@ -24,6 +24,7 @@ import type { BodyState, PersonaState } from "./bridge";
 // ────────────────────────────────────────────────────────────────────────────
 
 export type ExpressionCategory =
+  | "idle"
   | "smile"
   | "happy"
   | "sad"
@@ -42,16 +43,10 @@ export type ExpressionCategory =
 
 /**
  * Where to render this category from when no art for it exists yet.
- * Removed from the map as each new directory ships with art.
+ * All 16 categories ship art today — map is empty but kept as a
+ * structural escape hatch for future categories added without art.
  */
-const FALLBACK_CATEGORY: Partial<Record<ExpressionCategory, ExpressionCategory>> = {
-  content: "smile",
-  aching: "sad",
-  flushed: "arousal",
-  awe: "happy",
-  intent: "happy",
-  defiant: "angry",
-};
+const FALLBACK_CATEGORY: Partial<Record<ExpressionCategory, ExpressionCategory>> = {};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Frames — the 4-frame matrix (mouth × eyes)
@@ -201,13 +196,13 @@ export function pickExpressionCategory(input: ExpressionInput): ExpressionCatego
     if (EXHAUSTED_FAMILY.has(top)) return "exhausted";
   }
 
-  // 4. Default — settled resting state
-  return "content";
+  // 4. Default — neutral resting state, no dominant emotion
+  return "idle";
 }
 
 /** From a state snapshot, pick the dominant emotion name. */
 export function pickExpressionFromState(state: PersonaState | null): ExpressionCategory {
-  if (!state) return "content";
+  if (!state) return "idle";
   return pickExpressionCategory({
     emotions: state.emotions ?? {},
     body: state.body ?? null,
@@ -228,7 +223,7 @@ function topEmotion(emotions: Record<string, number>): string | null {
 
 // Convenience for callers that just want a default render
 export function defaultExpressionUrl(): string {
-  return resolveFrameUrl("content", "base");
+  return resolveFrameUrl("idle", "base");
 }
 
 /**
