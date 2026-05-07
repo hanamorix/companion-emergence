@@ -60,35 +60,58 @@ x86_64, Linux x86_64, and Windows x86_64. Triggered by pushing a
 `.deb`, `.AppImage`, `.msi`, `.exe`). Signing/notarization is NOT
 in CI — see below.
 
-### Signing + notarization
+### Signing — open-source default
 
-Distribution outside your own machine requires platform signing.
-Without it, Gatekeeper / SmartScreen / package managers will refuse
-to launch the bundle. Manual steps (one-time per release):
+This project is open source and ships **without paid signing**. The
+default state is:
 
-**macOS** (Apple Developer ID required, ~$99/yr):
+- **macOS**: ad-hoc signed (`bundle.macOS.signingIdentity = "-"` in
+  `tauri.conf.json`). All binaries, including the embedded
+  `python-runtime/` tree, get sealed into the .app's signature
+  via `codesign --deep`. `codesign --verify --deep --strict` passes.
+  Gatekeeper still warns "unidentified developer" on first launch
+  because there's no paid Apple Developer ID, but right-click →
+  Open works as expected. Users get the steps in `INSTALL.md`.
+- **Windows**: unsigned. SmartScreen warns "Windows protected your
+  PC"; the user clicks "More info → Run anyway." Documented in
+  `INSTALL.md`.
+- **Linux**: unsigned. `.deb` and `.AppImage` install without a
+  signing dance.
+
+Confirm before any tagged release:
+
+- Run `pnpm tauri build` locally on each target host
+- macOS: `codesign --verify --deep --strict NellFace.app` exits 0
+- macOS: `codesign -dv --verbose=2 NellFace.app | grep "Signature=adhoc"`
+- All three platforms: launch the bundle from a clean user
+  directory and verify a chat turn round-trips with `claude` on PATH
+
+### Optional — paid signing (if/when budget permits)
+
+If you decide to pay for signing later, the manual steps:
+
+**macOS** (Apple Developer ID, ~$99/yr):
 1. Get a Developer ID Application certificate via Xcode →
    Preferences → Accounts → Manage Certificates.
-2. Codesign: `codesign --deep --force --options runtime
-   --sign "Developer ID Application: YOUR NAME (TEAM_ID)"
-   NellFace.app`.
-3. Verify: `codesign -dv --verbose=4 NellFace.app`.
-4. Notarize: zip the `.app`, then `xcrun notarytool submit
-   NellFace.zip --apple-id YOU@example.com --team-id TEAMID
-   --password APP_SPECIFIC_PASSWORD --wait`.
-5. Staple: `xcrun stapler staple NellFace.app`.
+2. Replace `signingIdentity = "-"` in `tauri.conf.json` with
+   `"Developer ID Application: YOUR NAME (TEAM_ID)"`.
+3. Add notarization keys to your keychain (`xcrun notarytool
+   store-credentials`).
+4. Build: `pnpm tauri build`. Tauri handles signing inline.
+5. Notarize the resulting .dmg: `xcrun notarytool submit
+   NellFace.dmg --keychain-profile <stored-name> --wait`.
+6. Staple: `xcrun stapler staple NellFace.dmg`.
 
-**Windows** (code-signing certificate required):
-1. Get an OV or EV code-signing cert from a CA (DigiCert,
-   Sectigo, etc.).
+**Windows** (OV or EV code-signing cert):
+1. Get an OV or EV cert from a CA (DigiCert, Sectigo, etc.).
 2. Sign: `signtool sign /tr http://timestamp.digicert.com /td
-   sha256 /fd sha256 /a NellFace.exe NellFace.msi`.
+   sha256 /fd sha256 /a NellFace.msi`.
 3. Verify: `signtool verify /pa NellFace.msi`.
 
 **Linux** (.deb / AppImage):
 1. .deb signing via dpkg-sig is optional but recommended for
-   public repos.
-2. AppImage zsync + GPG signing for auto-update.
+   public repos that want to be added to a third-party APT source.
+2. AppImage zsync + GPG signing for delta updates.
 
 ### Auto-update
 
