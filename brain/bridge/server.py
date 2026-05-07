@@ -467,6 +467,33 @@ def build_app(
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
 
+    # CORS — narrowly scoped to the same allowed_origins used for WS auth,
+    # plus localhost dev origins (Vite default ports). Tauri prod calls
+    # don't need CORS (the webview origin is privileged); the localhost
+    # origins exist so `pnpm dev` browser mode can talk to the bridge
+    # without proxying. Bearer auth still gates every route — CORS is
+    # not a security boundary, just a same-origin policy waiver.
+    from fastapi.middleware.cors import CORSMiddleware
+
+    _DEV_ORIGINS = (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    )
+    cors_origins = list(allowed_origins) + list(_DEV_ORIGINS)
+    # Extend the WS Origin allowlist with the same dev origins so
+    # browser-mode WebSocket connections to /stream pass the Origin
+    # check. Bearer subprotocol auth still gates every connection.
+    allowed_origins = tuple(list(allowed_origins) + list(_DEV_ORIGINS))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
     # ── H-C: auth + Origin check helpers ──────────────────────────────────
     # HTTP: require `Authorization: Bearer <token>` when auth_token is set.
     # WS: require `Sec-WebSocket-Protocol: bearer, <token>` + Origin allowlist.
