@@ -138,6 +138,7 @@ interface ReadyProps {
 function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -188,8 +189,12 @@ function Ready({ config, setConfig, persona: _persona }: ReadyProps) {
         onAlwaysOnTopChange={(v) => updateConfig({ always_on_top: v })}
         onReducedMotionChange={(v) => updateConfig({ reduced_motion: v })}
       />
-      <NellAvatar state={state} />
-      <ChatPanel />
+      <NellAvatar
+        state={state}
+        isSpeaking={isSpeaking}
+        reducedMotion={config.reduced_motion}
+      />
+      <ChatPanel onSpeakingChange={setIsSpeaking} />
       {stateError && (
         <div
           style={{
