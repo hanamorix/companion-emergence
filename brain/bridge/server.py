@@ -883,6 +883,13 @@ def build_app(
                 turn=result.turn,
                 duration_ms=duration_ms,
             )
+            # Explicit clean close — without this, FastAPI/Starlette
+            # tears down the WS when the handler returns and the
+            # browser sees an abnormal closure (1006). Sending
+            # code=1000 completes the WS close handshake so the
+            # client gets the clean shutdown it expects after the
+            # `done` frame.
+            await ws.close(code=1000)
 
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")
