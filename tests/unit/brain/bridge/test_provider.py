@@ -309,3 +309,136 @@ def test_chat_mcp_path_skips_malformed_audit_lines(tmp_path):
 
     assert len(resp.dispatched_invocations) == 1
     assert resp.dispatched_invocations[0]["name"] == "get_soul"
+
+
+# ---------------------------------------------------------------------------
+# OllamaProvider.chat_stream — token streaming
+# ---------------------------------------------------------------------------
+
+
+def _make_streaming_response(lines, status_code=200):
+    """Build a context-manager mock that mimics httpx.stream's response."""
+    import httpx as _httpx
+
+    response = MagicMock()
+    response.status_code = status_code
+    response.iter_lines = MagicMock(return_value=iter(lines))
+    response.read = MagicMock(return_value=b"")
+
+    def _raise():
+        if status_code >= 400:
+            raise _httpx.HTTPStatusError(
+                "boom", request=MagicMock(), response=response
+            )
+
+    response.raise_for_status = MagicMock(side_effect=_raise)
+
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=response)
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+def test_ollama_chat_stream_yields_content_chunks() -> None:
+    """Each Ollama frame's message.content is yielded in order; done halts."""
+    from brain.bridge.chat import ChatMessage
+
+    lines = [
+        json.dumps({"message": {"role": "assistant", "content": "hello "}, "done": False}),
+        json.dumps({"message": {"role": "assistant", "content": "there, "}, "done": False}),
+        json.dumps({"message": {"role": "assistant", "content": "hana"}, "done": False}),
+        json.dumps({"message": {}, "done": True}),
+    ]
+    with patch("httpx.stream", return_value=_make_streaming_response(lines)):
+        p = OllamaProvider()
+        chunks = list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+    assert chunks == ["hello ", "there, ", "hana"]
+    assert "".join(chunks) == "hello there, hana"
+
+
+def test_ollama_chat_stream_skips_empty_chunks() -> None:
+    """Frames with no content (e.g. role-only) are skipped, not yielded as ''."""
+    from brain.bridge.chat import ChatMessage
+
+    lines = [
+        json.dumps({"message": {"role": "assistant", "content": ""}, "done": False}),
+        json.dumps({"message": {"role": "assistant", "content": "ok"}, "done": False}),
+        json.dumps({"done": True}),
+    ]
+    with patch("httpx.stream", return_value=_make_streaming_response(lines)):
+        p = OllamaProvider()
+        chunks = list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+    assert chunks == ["ok"]
+
+
+def test_ollama_chat_stream_stops_at_done() -> None:
+    """A frame with done=True halts iteration even if more lines follow."""
+    from brain.bridge.chat import ChatMessage
+
+    lines = [
+        json.dumps({"message": {"role": "assistant", "content": "first"}, "done": False}),
+        json.dumps({"message": {"role": "assistant", "content": "."}, "done": True}),
+        # This SHOULDN'T be yielded — done already fired.
+        json.dumps({"message": {"role": "assistant", "content": "ghost"}, "done": False}),
+    ]
+    with patch("httpx.stream", return_value=_make_streaming_response(lines)):
+        p = OllamaProvider()
+        chunks = list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+    assert chunks == ["first", "."]
+
+
+def test_ollama_chat_stream_request_error_raises_provider_error() -> None:
+    from brain.bridge.chat import ChatMessage
+    import httpx as _httpx
+
+    with patch("httpx.stream", side_effect=_httpx.RequestError("connection refused")):
+        p = OllamaProvider()
+        with pytest.raises(Exception, match="ollama_request"):
+            list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+
+def test_ollama_chat_stream_http_error_raises_provider_error() -> None:
+    from brain.bridge.chat import ChatMessage
+
+    lines: list[str] = []
+    with patch("httpx.stream", return_value=_make_streaming_response(lines, status_code=500)):
+        p = OllamaProvider()
+        with pytest.raises(Exception, match="ollama_http"):
+            list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+
+def test_ollama_chat_stream_invalid_json_line_raises_provider_error() -> None:
+    from brain.bridge.chat import ChatMessage
+
+    lines = ["this is not json"]
+    with patch("httpx.stream", return_value=_make_streaming_response(lines)):
+        p = OllamaProvider()
+        with pytest.raises(Exception, match="ollama_parse"):
+            list(p.chat_stream([ChatMessage(role="user", content="hi")]))
+
+
+def test_ollama_chat_stream_includes_options_in_payload() -> None:
+    """Generation options (temperature, etc.) forward; persona_dir is stripped."""
+    from brain.bridge.chat import ChatMessage
+
+    captured: dict = {}
+
+    def _stream_capture(method, url, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return _make_streaming_response([json.dumps({"done": True})])
+
+    with patch("httpx.stream", side_effect=_stream_capture):
+        p = OllamaProvider()
+        list(
+            p.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                options={"temperature": 0.7, "persona_dir": "/should/be/stripped"},
+            )
+        )
+
+    assert captured["json"]["stream"] is True
+    assert captured["json"]["options"] == {"temperature": 0.7}
+    assert "persona_dir" not in captured["json"].get("options", {})
