@@ -257,6 +257,22 @@ async fn run_init(args: InitArgs) -> Result<InitResult, String> {
     })
 }
 
+/// Apply the always-on-top toggle to the main window. Hits the Tauri
+/// Manager API directly — the previous implementation only persisted
+/// the bool to app_config.json without ever calling the window API,
+/// so the UI showed a working toggle that didn't actually do anything
+/// (audit 2026-05-07 P3).
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    window
+        .set_always_on_top(value)
+        .map_err(|e| format!("set_always_on_top: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -267,6 +283,7 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             run_init,
+            set_always_on_top,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
