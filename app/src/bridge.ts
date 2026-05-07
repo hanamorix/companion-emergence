@@ -137,6 +137,41 @@ export async function sendChat(sessionId: string, message: string): Promise<Chat
   return await r.json();
 }
 
+export interface ImageUploadResponse {
+  sha: string;
+  media_type: string;
+  size_bytes: number;
+}
+
+/**
+ * Upload an image File to the bridge. Returns the sha-addressable
+ * record on success. The caller keeps the sha and includes it in the
+ * next chat turn (image_shas field — wired in the brain P4-P6 phases).
+ *
+ * Throws on non-200 (415 unsupported, 413 too large, 401 unauthorised).
+ */
+export async function uploadImage(file: File): Promise<ImageUploadResponse> {
+  const creds = await getBridgeCredentials();
+  const fd = new FormData();
+  fd.append("file", file);
+  // Note: don't set Content-Type — fetch will pick the multipart boundary.
+  const headers: HeadersInit = creds.authToken
+    ? { Authorization: `Bearer ${creds.authToken}` }
+    : {};
+  const r = await fetch(`${creds.url}/upload`, { method: "POST", headers, body: fd });
+  if (!r.ok) {
+    let detail = "";
+    try {
+      const body = await r.json();
+      detail = body?.detail ?? "";
+    } catch {
+      detail = await r.text();
+    }
+    throw new Error(`/upload ${r.status}: ${detail.slice(0, 200)}`);
+  }
+  return (await r.json()) as ImageUploadResponse;
+}
+
 export async function closeSession(sessionId: string): Promise<void> {
   const creds = await getBridgeCredentials();
   await fetch(`${creds.url}/sessions/close`, {
