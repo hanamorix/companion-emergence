@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-
 WORK_TYPES: frozenset[str] = frozenset(
     {"story", "code", "planning", "idea", "role_play", "letter", "other"}
 )

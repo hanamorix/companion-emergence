@@ -52,6 +52,14 @@ class HebbianMatrix:
             from brain.health.anomaly import BrainIntegrityError
 
             raise BrainIntegrityError(str(db_path), detail)
+        # WAL + 5s busy_timeout — set AFTER the integrity check so a
+        # corrupt-file probe surfaces BrainIntegrityError, not a pragma
+        # crash. In-memory dbs reject WAL; fallback keeps `:memory:` ok.
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(self._SCHEMA)
         self._conn.commit()
 

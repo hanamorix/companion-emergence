@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from brain.migrator.og_reflex_log import migrate_reflex_log
 
 

@@ -114,3 +114,27 @@ def test_upload_rejects_wrong_bearer(persona_dir: Path) -> None:
             headers={"Authorization": "Bearer wrong"},
         )
     assert r.status_code == 401
+
+
+def test_upload_rejects_mismatched_magic_bytes(persona_dir: Path) -> None:
+    """Client claims PNG but bytes don't have the PNG signature → 422."""
+    client = _client(persona_dir)
+    with client:
+        r = client.post(
+            "/upload",
+            files={"file": ("fake.png", b"GIF89a" + b"\x00" * 20, "image/png")},
+        )
+    assert r.status_code == 422
+    assert "look like" in r.json()["detail"]
+
+
+def test_upload_rejects_unrecognised_bytes(persona_dir: Path) -> None:
+    """Bytes don't match any supported format → 422."""
+    client = _client(persona_dir)
+    with client:
+        r = client.post(
+            "/upload",
+            files={"file": ("mystery.png", b"this is not any image", "image/png")},
+        )
+    assert r.status_code == 422
+    assert "supported format" in r.json()["detail"]

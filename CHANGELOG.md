@@ -6,6 +6,50 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Fixed (2026-05-07 audit cycle)
+
+- **P1**: `nell init` no longer needs a `--provider` flag — wizard
+  doesn't pass one, Rust shim doesn't build it, `PersonaConfig`'s
+  `claude-cli` default does the right thing. StepLLMSetup wizard step
+  removed (project decision: stick with claude-cli). Fresh-install
+  path no longer breaks at install time.
+- **P1**: NellFace bridge helpers now take `persona` as first arg
+  and the credential cache is per-persona. Any non-`nell` persona
+  that the wizard creates and selects is talked to correctly instead
+  of silently routing to `personas/nell/bridge.json`.
+- **P2**: Tauri `validate_persona_name` mirrors the Python rule
+  (`[A-Za-z0-9_-]{1,40}`) on every command; `read_app_config` heals
+  invalid `selected_persona` to None.
+- **P2**: Explicit CSP in `tauri.conf.json` — narrow `default-src
+  'self'` + scoped image/font/style/connect rules.
+- **P2**: `uv run ruff check .` clean again — 30 errors → 0.
+- **P2**: `PersonaConfig` allowlists for provider/searcher with
+  graceful fallback + warning. `claude-tool` searcher removed from
+  the public CLI surface and the factory.
+- **P2**: SQLite `journal_mode = WAL` + 5s `busy_timeout` on
+  `MemoryStore` and `HebbianMatrix` — concurrent bridge writers no
+  longer race to `database is locked`.
+- **P2**: Heartbeat reflex/growth crashes surface to
+  `HeartbeatResult` and the audit JSON via `reflex_error` /
+  `growth_error`.
+- **P2**: `closeSession()` on the WS chat panel + visible failures.
+  Chat memory creation no longer relies entirely on the supervisor
+  stale-close timer.
+- **P2**: First Vitest harness for the frontend — pins both P1 fixes
+  so they can't regress silently. `pnpm test` runs them.
+- **P3**: Image upload uses unique `<sha>.<ext>.<pid>.<uuid>.new`
+  temp files; identical concurrent uploads can no longer race.
+- **P3**: `/upload` sniffs magic bytes (PNG/JPEG/GIF/WebP) and
+  rejects declared/sniffed mismatches with 422.
+- **P3**: Object-URL leak on chat unmount — `ChatPanel` tracks every
+  bubble-resident preview URL and revokes them on unmount.
+- **P3**: Always-on-top toggle now actually calls the Tauri window
+  API instead of only persisting the bool to `app_config.json`.
+- **P4**: Removed dead `_STUB_COMMANDS` + `_make_stub` scaffolding
+  from `brain/cli.py`.
+- **P4**: `_allocate_port` docstring honest about which bind it
+  actually retries.
+
 ### Added
 
 - Local-first persona data layout under the platform-aware `NELLBRAIN_HOME` root.
