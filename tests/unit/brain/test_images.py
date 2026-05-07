@@ -161,3 +161,29 @@ def test_read_image_bytes_missing_raises(tmp_path: Path) -> None:
 def test_read_image_bytes_validates_sha(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="image_sha"):
         read_image_bytes(tmp_path, "../escape", "image/png")
+
+
+# ---------------------------------------------------------------------------
+# media_type_for_sha
+# ---------------------------------------------------------------------------
+
+
+def test_media_type_for_sha_finds_png(tmp_path):
+    from brain.images import media_type_for_sha, save_image_bytes
+
+    save_image_bytes(tmp_path, _TINY_PNG, "image/png")
+    assert media_type_for_sha(tmp_path, _TINY_PNG_SHA) == "image/png"
+
+
+def test_media_type_for_sha_missing_raises(tmp_path):
+    from brain.images import media_type_for_sha
+
+    with pytest.raises(FileNotFoundError):
+        media_type_for_sha(tmp_path, _TINY_PNG_SHA)
+
+
+def test_media_type_for_sha_validates_sha(tmp_path):
+    from brain.images import media_type_for_sha
+
+    with pytest.raises(ValueError, match="image_sha"):
+        media_type_for_sha(tmp_path, "../escape")
