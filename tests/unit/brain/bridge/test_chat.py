@@ -6,7 +6,13 @@ import json
 
 import pytest
 
-from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
+from brain.bridge.chat import (
+    ChatMessage,
+    ChatResponse,
+    ImageBlock,
+    TextBlock,
+    ToolCall,
+)
 
 # ---------------------------------------------------------------------------
 # ChatMessage construction + to_dict round-trip
@@ -167,3 +173,90 @@ def test_chat_response_empty_tool_calls_default() -> None:
 def test_chat_response_raw_defaults_to_none() -> None:
     resp = ChatResponse(content="hi")
     assert resp.raw is None
+
+
+# ---------------------------------------------------------------------------
+# ContentBlock / multimodal support
+# ---------------------------------------------------------------------------
+
+_VALID_SHA = "a" * 64
+
+
+def test_chat_message_str_content_backward_compat() -> None:
+    """A ChatMessage built with a str continues to serialise as text."""
+    msg = ChatMessage(role="user", content="hi")
+    assert msg.content_text() == "hi"
+
+
+def test_chat_message_typed_blocks_text_and_image() -> None:
+    """Typed-block messages flatten via content_text()."""
+    blocks = (
+        TextBlock(text="look at this"),
+        ImageBlock(image_sha=_VALID_SHA, media_type="image/png"),
+        TextBlock(text="what do you think"),
+    )
+    msg = ChatMessage(role="user", content=blocks)
+    assert msg.content_text() == "look at this\n[image: aaaaaaaa]\nwhat do you think"
+
+
+def test_chat_message_to_dict_serialises_blocks() -> None:
+    """to_dict() emits Anthropic-shaped block list when content is blocks."""
+    blocks = (
+        TextBlock(text="hi"),
+        ImageBlock(image_sha=_VALID_SHA, media_type="image/png"),
+    )
+    msg = ChatMessage(role="user", content=blocks)
+    d = msg.to_dict()
+    assert d["role"] == "user"
+    assert d["content"] == [
+        {"type": "text", "text": "hi"},
+        {"type": "image", "image_sha": _VALID_SHA, "media_type": "image/png"},
+    ]
+
+
+def test_chat_message_to_dict_keeps_str_path() -> None:
+    """Pure-string content stays serialised as a string for legacy callers."""
+    msg = ChatMessage(role="user", content="hi")
+    d = msg.to_dict()
+    assert d["content"] == "hi"
+
+
+def test_image_block_rejects_non_hex_sha() -> None:
+    with pytest.raises(ValueError, match="image_sha"):
+        ImageBlock(image_sha="not_hex_at_all_" + "z" * 49, media_type="image/png")
+
+
+def test_image_block_rejects_short_sha() -> None:
+    with pytest.raises(ValueError, match="image_sha"):
+        ImageBlock(image_sha="a" * 63, media_type="image/png")
+
+
+def test_image_block_rejects_uppercase_sha() -> None:
+    with pytest.raises(ValueError, match="image_sha"):
+        ImageBlock(image_sha="A" * 64, media_type="image/png")
+
+
+def test_image_block_rejects_unknown_media_type() -> None:
+    with pytest.raises(ValueError, match="media_type"):
+        ImageBlock(image_sha=_VALID_SHA, media_type="application/pdf")
+
+
+def test_image_block_accepts_all_allowed_media_types() -> None:
+    for mt in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        ImageBlock(image_sha=_VALID_SHA, media_type=mt)
+
+
+def test_image_block_with_description() -> None:
+    """Optional description for cached single-turn descriptions (D5)."""
+    block = ImageBlock(
+        image_sha=_VALID_SHA,
+        media_type="image/png",
+        description="A cropped Korn-hoodie selfie.",
+    )
+    assert block.description == "A cropped Korn-hoodie selfie."
+
+
+def test_text_block_basic() -> None:
+    block = TextBlock(text="hi")
+    assert block.text == "hi"
+    assert block.type == "text"
