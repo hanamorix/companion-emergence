@@ -265,20 +265,27 @@ class ClaudeCliProvider(LLMProvider):
         conversation_messages: list[ChatMessage] = []
         for msg in messages:
             if msg.role == "system" and system_prompt is None:
-                system_prompt = msg.content
+                # content_text() flattens both legacy str content and the
+                # tuple[ContentBlock, ...] multimodal shape uniformly.
+                system_prompt = msg.content_text()
             else:
                 conversation_messages.append(msg)
 
+        # ImageBlocks render through content_text() as
+        # ``[image: <sha[:8]>]`` markers so the CLI text path at least
+        # acknowledges the presence of an image until ClaudeCliProvider
+        # gains native multimodal passthrough (Anthropic SDK, separate
+        # session). The bytes are still on disk under <persona_dir>/images/.
         if not conversation_messages:
             flat_prompt = ""
         elif len(conversation_messages) == 1:
-            flat_prompt = conversation_messages[0].content
+            flat_prompt = conversation_messages[0].content_text()
         else:
             parts: list[str] = []
             role_labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
             for msg in conversation_messages:
                 label = role_labels.get(msg.role, msg.role.capitalize())
-                parts.append(f"{label}: {msg.content}")
+                parts.append(f"{label}: {msg.content_text()}")
             flat_prompt = "\n".join(parts)
 
         if tools:
