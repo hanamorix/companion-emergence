@@ -24,15 +24,22 @@ Shipped:
   expression variants (7 categories × 4 each).
 - `/persona/state` polling every 5s — drives the avatar's expression.
 
+Subsequent phases shipped:
+
+- Inner Weather, Recent Interior, Soul highlight, Connection panels — Phase 3
+- Install wizard + bridge auto-spawn + first-launch routing — Phase 4
+- Animation engine + heuristic stack mapping — Phase 5A
+- Soul-crystallization flash overlay — Phase 5C
+- WS streaming chat (`/stream/:sid`) — Phase 6
+- Paperclip image upload + emoji picker in chat input — image-support P3 + UI
+
 Not yet built:
 
-- Inner Weather panel (emotion bars + body block) — Phase 3
-- Recent Interior panel (dream/heartbeat/reflex/research) — Phase 3
-- Soul highlight panel — Phase 3
-- Connection panel — Phase 3
-- WS streaming chat (`/stream/:sid`) — Phase 6
-- Image-input upload — separate workstream (see
-  docs/superpowers/specs/2026-05-06-image-support-design.md)
+- Emotion-family colour tints over the avatar — Phase 5D
+- Image bytes flowing through to the provider so Nell *sees* them —
+  image-support P4-P6 (upload + UI staging is live; provider passthrough
+  + ingest awareness + voice coaching land in the next bundle)
+- Python+uv runtime bundling for true zero-install — Phase 7
 
 ## Run it
 
