@@ -6,6 +6,30 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Added (2026-05-07 — Phase 7 cross-platform)
+
+- **Cross-platform Phase 7 release pipeline.** Code paths in tree for
+  all four target platforms:
+  - `app/build_python_runtime.sh` branches on `uname -s/-m` for
+    macOS arm64, macOS x86_64, Linux x86_64, Linux arm64, Windows
+    x86_64. Windows uses `python.exe` + `Scripts/nell.exe` (vs
+    `bin/python3` + `bin/nell` everywhere else).
+  - `lib.rs:nell_command` resolves the per-OS entry point via
+    `cfg!(windows)` so the same Rust binary works on every target.
+  - `.github/workflows/release.yml` matrices the build on
+    `macos-14` (arm64), `macos-13` (x86_64), `ubuntu-22.04`, and
+    `windows-2022`. Triggered by `v*.*.*` tags. Bundles upload as
+    workflow artifacts (.app, .dmg, .deb, .AppImage, .msi, .exe).
+  - macOS arm64 verified live; the other three compile cleanly but
+    haven't been smoke-tested on real hosts yet.
+- `app/src-tauri/python-runtime/.gitkeep` placeholder so Tauri's
+  `bundle.resources` glob always resolves in clean checkouts where
+  the build hasn't run yet. The build script preserves it across
+  re-runs via `find -mindepth 1 -not -name .gitkeep`.
+- Release checklist gains step-by-step signing/notarization walkthroughs
+  for macOS (Developer ID + `notarytool` + stapler), Windows (signtool),
+  and Linux (.deb dpkg-sig + AppImage GPG).
+
 ### Added (2026-05-07 — Phase 7)
 
 - **Phase 7 — Python runtime bundling.** `pnpm tauri build` now
