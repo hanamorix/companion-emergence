@@ -537,7 +537,7 @@ class ClaudeCliProvider(LLMProvider):
             if result.returncode != 0:
                 raise ProviderError(
                     "claude_cli_exit",
-                    f"exit {result.returncode}: {result.stderr.strip()[:300]}",
+                    f"exit {result.returncode}: {_claude_failure_detail(result)}",
                 )
 
             content = _parse_stream_json_result(result.stdout)
@@ -663,7 +663,7 @@ class ClaudeCliProvider(LLMProvider):
             if result.returncode != 0:
                 raise ProviderError(
                     "claude_cli_exit",
-                    f"exit {result.returncode}: {result.stderr.strip()}",
+                    f"exit {result.returncode}: {_claude_failure_detail(result)}",
                 )
 
             try:
