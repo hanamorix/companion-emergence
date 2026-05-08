@@ -1,22 +1,19 @@
 /**
- * WS streaming chat client — talks to /stream/{session_id}.
+ * WS streaming chat client, talks to /stream/{session_id}.
  *
  * Wire protocol (from brain/bridge/server.py):
- *   client → server: {message: string} (one-shot, after WS open)
- *   server → client (sequence):
+ *   client -> server: {message: string, image_shas?: string[]} after WS open
+ *   server -> client:
  *     {type: "started", session_id, at}
- *     {type: "tool_call", tool, session_id, at}     × per tool
- *     {type: "tool_result", tool, summary, ...}     × per tool
- *     {type: "reply_chunk", text}                   × per word
+ *     {type: "tool_call", tool, session_id, at}
+ *     {type: "tool_result", tool, summary, ...}
+ *     {type: "reply_chunk", text}
  *     {type: "done", session_id, turn, duration_ms, metadata, at}
  *   on error:
  *     {type: "error", code, detail?, done: true}
- *
- * Auth: Sec-WebSocket-Protocol: bearer, <token>. Same shape as the CLI's
- * `nell bridge tail` after the audit-2 I-1 fix.
  */
 
-import { getBridgeCredentials } from "./bridge";
+import { getBridgeCredentials, resetBridgeCredentialCache } from "./bridge";
 
 export interface StreamChatHandlers {
   /** Called once when the server confirms it's about to respond. */
@@ -38,7 +35,17 @@ export interface StreamChatHandlers {
 export interface StreamChatOptions {
   /** Sha-strings for any /upload-staged images attached to this turn. */
   imageShas?: string[];
+  /** Time to establish the socket before surfacing an error. */
+  openTimeoutMs?: number;
+  /** Time after open to receive the first bridge frame. */
+  firstFrameTimeoutMs?: number;
+  /** Overall stream budget. */
+  overallTimeoutMs?: number;
 }
+
+const DEFAULT_OPEN_TIMEOUT_MS = 10_000;
+const DEFAULT_FIRST_FRAME_TIMEOUT_MS = 20_000;
+const DEFAULT_OVERALL_TIMEOUT_MS = 120_000;
 
 /**
  * Open a WS stream, send the message, and dispatch frames to the
@@ -52,77 +59,135 @@ export async function streamChat(
   handlers: StreamChatHandlers,
   options: StreamChatOptions = {},
 ): Promise<() => void> {
-  const creds = await getBridgeCredentials(persona);
-  const url = `ws://127.0.0.1:${creds.port}/stream/${sessionId}`;
-  const protocols = creds.authToken ? ["bearer", creds.authToken] : undefined;
-
-  const ws = new WebSocket(url, protocols);
+  let ws: WebSocket | null = null;
   let cancelled = false;
+  let completed = false;
+  let started = false;
+  let retriedCredentials = false;
+  let errorSent = false;
+  let openTimer: ReturnType<typeof setTimeout> | null = null;
+  let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
+  let overallTimer: ReturnType<typeof setTimeout> | null = null;
 
-  ws.addEventListener("open", () => {
-    if (cancelled) return;
-    const frame: { message: string; image_shas?: string[] } = { message };
-    if (options.imageShas && options.imageShas.length > 0) {
-      frame.image_shas = options.imageShas;
-    }
-    ws.send(JSON.stringify(frame));
-  });
+  const openTimeoutMs = options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
+  const firstFrameTimeoutMs = options.firstFrameTimeoutMs ?? DEFAULT_FIRST_FRAME_TIMEOUT_MS;
+  const overallTimeoutMs = options.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS;
 
-  ws.addEventListener("message", (event) => {
-    if (cancelled) return;
-    let frame: { type: string; [key: string]: unknown };
-    try {
-      frame = JSON.parse(event.data as string);
-    } catch {
-      handlers.onError?.("malformed frame");
-      ws.close();
-      return;
-    }
-    switch (frame.type) {
-      case "started":
-        handlers.onStarted?.();
-        break;
-      case "tool_call":
-        handlers.onToolCall?.((frame.tool as string) ?? "?");
-        break;
-      case "tool_result":
-        // tool result events arrive between tool_call and chunks — UI
-        // doesn't surface them in v1; bridge audit log is canonical.
-        break;
-      case "reply_chunk":
-        handlers.onChunk((frame.text as string) ?? "");
-        break;
-      case "done":
-        handlers.onDone?.({
-          turn: (frame.turn as number) ?? 0,
-          duration_ms: (frame.duration_ms as number) ?? 0,
-          metadata: (frame.metadata as Record<string, unknown>) ?? {},
-        });
-        ws.close();
-        break;
-      case "error":
-        handlers.onError?.(
-          (frame.detail as string) ?? (frame.code as string) ?? "stream error",
-        );
-        ws.close();
-        break;
-    }
-  });
+  const clearTimer = (timer: ReturnType<typeof setTimeout> | null) => {
+    if (timer !== null) clearTimeout(timer);
+  };
+  const clearTimers = () => {
+    clearTimer(openTimer);
+    clearTimer(firstFrameTimer);
+    clearTimer(overallTimer);
+    openTimer = null;
+    firstFrameTimer = null;
+    overallTimer = null;
+  };
 
-  ws.addEventListener("error", () => {
-    if (cancelled) return;
-    handlers.onError?.("websocket error");
-  });
+  const fail = (message: string) => {
+    if (cancelled || completed || errorSent) return;
+    errorSent = true;
+    clearTimers();
+    handlers.onError?.(message);
+    ws?.close();
+  };
 
-  ws.addEventListener("close", (event) => {
+  const connect = async () => {
+    clearTimers();
+    const creds = await getBridgeCredentials(persona);
     if (cancelled) return;
-    if (event.code !== 1000 && event.code !== 1005) {
-      handlers.onError?.(`ws closed (${event.code}): ${event.reason || "unknown"}`);
-    }
-  });
+
+    const url = `ws://127.0.0.1:${creds.port}/stream/${sessionId}`;
+    const protocols = creds.authToken ? ["bearer", creds.authToken] : undefined;
+    ws = new WebSocket(url, protocols);
+    started = false;
+    completed = false;
+    errorSent = false;
+
+    openTimer = setTimeout(() => fail("websocket open timed out"), openTimeoutMs);
+    overallTimer = setTimeout(() => fail("stream timed out"), overallTimeoutMs);
+
+    ws.addEventListener("open", () => {
+      if (cancelled || !ws) return;
+      clearTimer(openTimer);
+      openTimer = null;
+      firstFrameTimer = setTimeout(
+        () => fail("stream timed out waiting for first frame"),
+        firstFrameTimeoutMs,
+      );
+      const frame: { message: string; image_shas?: string[] } = { message };
+      if (options.imageShas && options.imageShas.length > 0) frame.image_shas = options.imageShas;
+      ws.send(JSON.stringify(frame));
+    });
+
+    ws.addEventListener("message", (event) => {
+      if (cancelled || completed) return;
+      clearTimer(firstFrameTimer);
+      firstFrameTimer = null;
+      let frame: { type: string; [key: string]: unknown };
+      try {
+        frame = JSON.parse(event.data as string);
+      } catch {
+        fail("malformed frame");
+        return;
+      }
+      switch (frame.type) {
+        case "started":
+          started = true;
+          handlers.onStarted?.();
+          break;
+        case "tool_call":
+          handlers.onToolCall?.((frame.tool as string) ?? "?");
+          break;
+        case "tool_result":
+          break;
+        case "reply_chunk":
+          handlers.onChunk((frame.text as string) ?? "");
+          break;
+        case "done":
+          completed = true;
+          clearTimers();
+          handlers.onDone?.({
+            turn: (frame.turn as number) ?? 0,
+            duration_ms: (frame.duration_ms as number) ?? 0,
+            metadata: (frame.metadata as Record<string, unknown>) ?? {},
+          });
+          ws?.close();
+          break;
+        case "error":
+          fail((frame.detail as string) ?? (frame.code as string) ?? "stream error");
+          break;
+        default:
+          fail(`unknown stream frame: ${frame.type}`);
+          break;
+      }
+    });
+
+    ws.addEventListener("error", () => {
+      if (cancelled || completed) return;
+      if (!started && !retriedCredentials) return;
+      fail("websocket error");
+    });
+
+    ws.addEventListener("close", (event) => {
+      if (cancelled || completed || errorSent) return;
+      const authishClose = event.code === 4001 || event.code === 1006;
+      if (!started && authishClose && !retriedCredentials) {
+        retriedCredentials = true;
+        resetBridgeCredentialCache(persona);
+        void connect().catch((e) => fail((e as Error).message));
+        return;
+      }
+      fail(`ws closed before completion (${event.code || "unknown"}): ${event.reason || "no reason"}`);
+    });
+  };
+
+  await connect();
 
   return () => {
     cancelled = true;
-    ws.close();
+    clearTimers();
+    ws?.close();
   };
 }
