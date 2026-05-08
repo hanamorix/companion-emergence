@@ -99,6 +99,37 @@ if ! curl -fsSL -o "$TMP_TAR" "$PBS_URL"; then
   echo "[build] FAIL: download ${PBS_URL}" >&2
   exit 1
 fi
+
+# Audit 2026-05-07 P3-7: verify the tarball against the
+# upstream SHA256SUMS manifest before extraction. Catches transit
+# corruption, mirror tampering, accidental upstream replacement.
+# Does NOT defend against a coordinated upstream compromise where
+# the asset + SHA256SUMS get replaced together — for that level of
+# supply-chain rigor, hardcode a known-good SHA256SUMS hash and
+# verify the manifest itself. We accept the upstream-trust posture
+# here since python-build-standalone is Astral-published.
+TMP_SUMS="$(mktemp -t pbs-sums-XXXX)"
+trap 'rm -f "$TMP_TAR" "$TMP_SUMS"' EXIT
+SUMS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/SHA256SUMS"
+echo "[build] fetching SHA256SUMS for verification"
+if ! curl -fsSL -o "$TMP_SUMS" "$SUMS_URL"; then
+  echo "[build] FAIL: download ${SUMS_URL}" >&2
+  exit 1
+fi
+EXPECTED_SHA="$(grep "  ${PBS_ASSET}\$" "$TMP_SUMS" | awk '{print $1}' | head -n1)"
+if [ -z "$EXPECTED_SHA" ]; then
+  echo "[build] FAIL: ${PBS_ASSET} not listed in SHA256SUMS" >&2
+  exit 1
+fi
+ACTUAL_SHA="$(shasum -a 256 "$TMP_TAR" | awk '{print $1}')"
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "[build] FAIL: SHA256 mismatch for ${PBS_ASSET}" >&2
+  echo "[build]   expected: $EXPECTED_SHA" >&2
+  echo "[build]   actual:   $ACTUAL_SHA" >&2
+  exit 1
+fi
+echo "[build] sha256 verified: ${EXPECTED_SHA:0:16}…"
+
 echo "[build] extracting"
 # python-build-standalone tarballs contain a top-level `python/` dir;
 # strip it so our runtime root is bin/, lib/, share/ (or python.exe +
@@ -165,10 +196,55 @@ content = files('brain.voice_templates').joinpath('nell-voice.md').read_text(enc
 print('  nell-voice.md:', len(content), 'bytes')
 "
 
-# 6b. Strip pyc cache + tests dirs to shrink the bundle a bit
-echo "[build] strip __pycache__ + tests from site-packages"
+# 6b. Strip everything we don't need at runtime to shrink the bundle.
+# Audit 2026-05-07 P3-9: the previous prune only removed __pycache__
+# and site-packages tests; the bundle stayed ~135 MB. This pass also
+# removes IDLE/Tk/Tkinter (NellFace doesn't use the stdlib GUI),
+# python-config / Makefile / static libs / headers (all dev-only),
+# upstream test packages from the stdlib, idle stubs, and pyc files.
+echo "[build] strip dev-only and unused stdlib from bundled runtime"
+PRUNE_SIZE_BEFORE="$(du -sk "$RUNTIME_DIR" | cut -f1)"
+
+# Universal: pyc caches everywhere
 find "$RUNTIME_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$RUNTIME_DIR" -type f -name "*.pyc" -delete 2>/dev/null || true
+
+# Universal: site-packages test directories (third-party dep tests)
 find "$SITE_PACKAGES" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$SITE_PACKAGES" -type d -name "test" -prune -exec rm -rf {} + 2>/dev/null || true
+
+if [ "$HOST_OS" = "unix" ]; then
+  STDLIB_DIR="$RUNTIME_DIR/lib/python3.13"
+  # Stdlib test packages — unittest framework stays (used at runtime),
+  # but the test corpora are dev-only.
+  rm -rf "$STDLIB_DIR/test" 2>/dev/null || true
+  # IDLE and turtle demo — interactive stdlib GUI tools, not used.
+  rm -rf "$STDLIB_DIR/idlelib" "$STDLIB_DIR/turtledemo" 2>/dev/null || true
+  # Tcl/Tk + tkinter — Python's GUI bindings; NellFace UI is React/Tauri.
+  rm -rf "$STDLIB_DIR/tkinter" 2>/dev/null || true
+  rm -rf "$RUNTIME_DIR/lib/tcl"* "$RUNTIME_DIR/lib/tk"* "$RUNTIME_DIR/lib/itcl"* "$RUNTIME_DIR/lib/thread"* 2>/dev/null || true
+  # Dev-only: Python C headers, static libs, Makefiles, pkg-config.
+  rm -rf "$RUNTIME_DIR/include" 2>/dev/null || true
+  rm -rf "$RUNTIME_DIR/lib/pkgconfig" 2>/dev/null || true
+  find "$RUNTIME_DIR/lib" -name "*.a" -delete 2>/dev/null || true
+  find "$RUNTIME_DIR/lib" -name "Makefile*" -delete 2>/dev/null || true
+  find "$RUNTIME_DIR/lib" -name "config-*" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  # Man pages — interactive doc, not used by the .app.
+  rm -rf "$RUNTIME_DIR/share/man" 2>/dev/null || true
+else
+  # Windows layout — stdlib at Lib/, no separate include/lib split for
+  # most dev-only artifacts. Same prune set, mapped paths.
+  STDLIB_DIR="$RUNTIME_DIR/Lib"
+  rm -rf "$STDLIB_DIR/test" 2>/dev/null || true
+  rm -rf "$STDLIB_DIR/idlelib" "$STDLIB_DIR/turtledemo" 2>/dev/null || true
+  rm -rf "$STDLIB_DIR/tkinter" 2>/dev/null || true
+  rm -rf "$RUNTIME_DIR/tcl" 2>/dev/null || true
+  rm -rf "$RUNTIME_DIR/Doc" 2>/dev/null || true
+fi
+
+PRUNE_SIZE_AFTER="$(du -sk "$RUNTIME_DIR" | cut -f1)"
+PRUNE_SAVED_KB=$((PRUNE_SIZE_BEFORE - PRUNE_SIZE_AFTER))
+echo "[build] prune saved: $((PRUNE_SAVED_KB / 1024)) MB (before $((PRUNE_SIZE_BEFORE / 1024)) MB → after $((PRUNE_SIZE_AFTER / 1024)) MB)"
 
 SIZE="$(du -sh "$RUNTIME_DIR" | cut -f1)"
 echo "[build] PASS — bundled runtime ready at $RUNTIME_DIR ($SIZE)"
