@@ -72,6 +72,44 @@ inside are intact and tamper-checked) rather than a paid Apple Developer
 ID. Gatekeeper warns on first launch because it can't tie the signature
 back to a known developer. Once you've confirmed once, macOS trusts it.
 
+### What the wizard installs (macOS)
+
+On the first wizard run after creating a persona, the app writes a
+LaunchAgent at:
+
+```
+~/Library/LaunchAgents/com.companion-emergence.supervisor.<persona>.plist
+```
+
+`launchctl bootstrap` brings it up immediately and `launchctl
+kickstart -k` starts the supervisor process. From that moment on the
+brain (heartbeat / dreams / reflex / research / memory ingest) lives
+under launchd's lifecycle — `KeepAlive` restarts it on crash, `RunAtLoad`
+starts it at login, and **closing or rebuilding the desktop app does
+not stop the brain**. The app reads `bridge.json` and reconnects to
+the supervisor that's already running.
+
+To verify or manage the agent:
+
+```bash
+nell service status --persona nell      # installed? loaded? pid?
+nell service doctor  --persona nell     # preflight (claude path, etc.)
+nell service uninstall --persona nell   # remove (data is preserved)
+launchctl list | grep companion-emergence
+```
+
+Logs land in `~/Library/Logs/companion-emergence/supervisor-<persona>.{out,err}.log`.
+
+If the wizard install failed for any reason (an unusual `~/.local/bin`
+layout, a launchctl quirk, etc.), the wizard's success pane shows the
+stderr inline and the brain falls back to the legacy "spawned by the
+desktop app" lifecycle. You can retry from the Connection panel's
+**install launchd supervisor** button or from the terminal:
+
+```bash
+nell service install --persona nell
+```
+
 ---
 
 ## Windows
