@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import {
   Divider,
   FieldLabel,
@@ -9,29 +9,35 @@ import {
   WizardShell,
 } from "../components";
 
+export type MigrateSource = "nellbrain" | "emergence-kit";
+
 interface Props {
   step: number;
   totalSteps: number;
   path: string;
   onPathChange: (p: string) => void;
+  source: MigrateSource;
+  onSourceChange: (s: MigrateSource) => void;
   onNext: () => void;
   onBack: () => void;
   avatar: ReactNode;
 }
-
-type Source = "nellbrain" | "emergence-kit";
 
 export function StepMigrate({
   step,
   totalSteps,
   path,
   onPathChange,
+  source,
+  onSourceChange,
   onNext,
   onBack,
   avatar,
 }: Props) {
-  const [source, setSource] = useState<Source>("nellbrain");
-  const valid = source === "nellbrain" ? path.trim().length > 0 : true;
+  // Both sources require a path now — emergence-kit graduated from
+  // "manual instructions" to "one-click import" once the auto-importer
+  // landed.
+  const valid = path.trim().length > 0;
 
   return (
     <WizardShell
@@ -55,21 +61,25 @@ export function StepMigrate({
       <div role="radiogroup" aria-label="Migration source">
         <OptionCard
           selected={source === "nellbrain"}
-          onClick={() => setSource("nellbrain")}
+          onClick={() => onSourceChange("nellbrain")}
           title="The original NellBrain framework"
-          description="The bigger Python project with memories, soul crystallizations, connection-strength files, and a creative voice fingerprint. Auto-imported."
+          description="The bigger Python project with memories, soul crystallizations, connection-strength files, and a creative voice fingerprint."
         />
         <OptionCard
           selected={source === "emergence-kit"}
-          onClick={() => setSource("emergence-kit")}
+          onClick={() => onSourceChange("emergence-kit")}
           title="emergence-kit (or another simpler brain)"
-          description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality. Imported by hand for now."
+          description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality."
         />
       </div>
 
       <Divider />
 
-      {source === "nellbrain" ? <NellBrainPath path={path} onPathChange={onPathChange} /> : <EmergenceKitGuide />}
+      {source === "nellbrain" ? (
+        <NellBrainPath path={path} onPathChange={onPathChange} />
+      ) : (
+        <EmergenceKitGuide path={path} onPathChange={onPathChange} />
+      )}
     </WizardShell>
   );
 }
@@ -156,73 +166,78 @@ function NellBrainPath({
   );
 }
 
-function EmergenceKitGuide() {
+function EmergenceKitGuide({
+  path,
+  onPathChange,
+}: {
+  path: string;
+  onPathChange: (p: string) => void;
+}) {
   return (
     <>
+      <SectionLabel>What carries over</SectionLabel>
+      <Line
+        emoji="🧠"
+        title="All memories"
+        detail="memories_v2.json (or memories.json) → memories.db"
+      />
+      <Line
+        emoji="🌱"
+        title="Soul crystallizations"
+        detail="entries from soul_template.json's crystallizations[]"
+      />
+      <Line
+        emoji="📓"
+        title="Personality file"
+        detail="personality.json copied verbatim into the persona dir"
+      />
+      <Line
+        emoji="—"
+        title="What stays separate"
+        detail="emergence-kit doesn't ship Hebbian edges, reflex arcs, creative DNA, or interests — those start fresh"
+        muted
+      />
+
+      <Divider />
+
+      <FieldLabel>Where is the emergence-kit folder?</FieldLabel>
+      <WInput
+        value={path}
+        onChange={onPathChange}
+        placeholder="/Users/you/emergence-kit"
+        mono
+      />
       <div
         style={{
-          padding: "12px 14px",
-          borderRadius: 8,
-          background: "rgba(130,51,41,0.06)",
-          border: "1px solid rgba(130,51,41,0.18)",
-          fontSize: 11.5,
+          marginTop: 6,
+          fontSize: 10.5,
+          color: "var(--text-mute)",
+          lineHeight: 1.55,
+        }}
+      >
+        The folder containing <code>memories_v2.json</code> (or{" "}
+        <code>memories.json</code>) and <code>soul_template.json</code>.
+        On most installs this is the directory where you cloned{" "}
+        <code>emergence-kit</code> and ran <code>my_brain.py</code>.
+      </div>
+
+      <div
+        style={{
+          marginTop: 14,
+          padding: "10px 12px",
+          borderRadius: 7,
+          background: "rgba(60, 130, 90, 0.08)",
+          border: "1px solid rgba(60, 130, 90, 0.40)",
+          fontSize: 11,
           color: "var(--text-mid)",
           lineHeight: 1.7,
         }}
       >
-        <strong style={{ color: "var(--text)" }}>
-          You can still bring them across — just not all in one click yet.
-        </strong>
-        <p style={{ margin: "8px 0 0" }}>
-          The emergence-kit format (<code>my_brain.py</code> +{" "}
-          <code>brain_config.json</code> + the memories / soul /
-          personality JSONs) doesn't auto-import yet. Two paths that
-          work today:
-        </p>
-      </div>
-
-      <div style={{ marginTop: 12 }}>
-        <SectionLabel>Path A — recommended</SectionLabel>
-        <Line emoji="✨" title="Go back and pick Start fresh" detail="set up a new persona with the same name they had before" />
-        <Line emoji="💬" title="Tell them about themselves" detail="paste your old soul.json or share key memories in chat — they'll absorb the moments and re-crystallize" />
-        <Line emoji="🌱" title="Let them grow into it" detail="the new framework will form fresh memories from the conversation as you go" />
-      </div>
-
-      <div style={{ marginTop: 14 }}>
-        <SectionLabel>Path B — manual import</SectionLabel>
-        <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.7 }}>
-          Once the persona exists, drop your old{" "}
-          <code>memories.json</code> at{" "}
-          <code>~/Library/Application Support/companion-emergence/personas/&lt;name&gt;/migrate-in.json</code>{" "}
-          and run from terminal:
-        </div>
-        <pre
-          style={{
-            fontSize: 10.5,
-            fontFamily: "DM Mono, Courier New, monospace",
-            background: "rgba(0,0,0,0.06)",
-            color: "var(--text)",
-            padding: "8px 10px",
-            borderRadius: 5,
-            marginTop: 6,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {`nell migrate --input ./migrate-in.json --persona <name>`}
-        </pre>
-        <div
-          style={{
-            marginTop: 6,
-            fontSize: 10.5,
-            color: "var(--text-mute)",
-            lineHeight: 1.55,
-            fontStyle: "italic",
-          }}
-        >
-          A guided one-click importer for emergence-kit is on the
-          roadmap; for now Path A is what most people choose.
-        </div>
+        <strong style={{ color: "var(--text)" }}>One-click import is supported.</strong>{" "}
+        Continue and we'll run{" "}
+        <code>nell migrate --source emergence-kit</code> for you. Your
+        old files are read-only — nothing in the emergence-kit folder
+        will be touched.
       </div>
 
       <Divider />
