@@ -293,6 +293,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         height: "100vh",
       }}
     >
+      <GlobalStatusDot mode={state?.mode ?? "live"} stateError={stateError} />
       <LeftPanel
         state={state}
         persona={persona}
@@ -318,5 +319,67 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       </div>
       <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
     </div>
+  );
+}
+
+/**
+ * GlobalStatusDot — always-visible degraded-state indicator.
+ *
+ * Renders nothing in the healthy case so the UI stays clean. Surfaces
+ * a small floating pill at the top-right of the app whenever:
+ *
+ *  - state polling has failed (`stateError`), or
+ *  - bridge mode is anything but "live".
+ *
+ * Crimson dot for hard errors (state-poll failure, bridge offline /
+ * down), amber for soft warnings (provider down). Tooltip describes
+ * the issue for screen readers + hover. The full detail still lives
+ * in the Connection panel's StatusBanner; this exists so the user
+ * doesn't have to open a panel to know something's wrong.
+ */
+function GlobalStatusDot({
+  mode,
+  stateError,
+}: {
+  mode: PersonaState["mode"];
+  stateError: string | null;
+}) {
+  let kind: "error" | "warn" | null = null;
+  let title = "";
+  if (stateError) {
+    kind = "error";
+    title = `State poll failed: ${stateError}`;
+  } else if (mode === "bridge_down" || mode === "offline") {
+    kind = "error";
+    title = mode === "offline" ? "Brain offline." : "Bridge offline.";
+  } else if (mode === "provider_down") {
+    kind = "warn";
+    title = "LLM provider unreachable — backup voice in use.";
+  }
+  if (kind === null) return null;
+
+  const palette =
+    kind === "error"
+      ? { bg: "rgba(178, 42, 42, 0.95)", ring: "rgba(178, 42, 42, 0.35)" }
+      : { bg: "rgba(216, 154, 88, 0.95)", ring: "rgba(216, 154, 88, 0.35)" };
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      title={title}
+      style={{
+        position: "absolute",
+        top: 8,
+        right: 12,
+        width: 12,
+        height: 12,
+        borderRadius: "50%",
+        background: palette.bg,
+        boxShadow: `0 0 0 4px ${palette.ring}`,
+        zIndex: 50,
+        animation: "pulse 1.6s ease-in-out infinite",
+      }}
+    />
   );
 }
