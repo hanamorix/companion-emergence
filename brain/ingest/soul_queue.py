@@ -65,14 +65,18 @@ def queue_soul_candidate(
     }
     path = _soul_candidates_path(persona_dir)
     try:
-        # fsync after append so a SIGKILL between write() and the next OS
-        # buffer flush can't leave a torn line that the next append would
-        # silently concatenate to. soul_candidates is the upstream of the
-        # autonomous-soul safety rail — durability matters here.
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Audit 2026-05-07 P2-2: append under the same exclusive lock
+        # the review path uses for its read-modify-rewrite cycle. Without
+        # this, candidates queued between review's read and replace are
+        # silently dropped. fsync remains so a SIGKILL between write and
+        # the next OS buffer flush can't leave a torn line.
+        from brain.utils.file_lock import file_lock
+
+        with file_lock(path):
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         return True
     except OSError as exc:
         logger.warning("queue_soul_candidate: failed to write to %s: %s", path, exc)

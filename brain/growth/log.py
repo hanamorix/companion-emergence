@@ -47,17 +47,29 @@ class GrowthLogEvent:
 
 
 def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
-    """Atomic append: write `path + ".new"` containing existing-content + new-line, then os.replace.
+    """Append one event line via OS append semantics.
 
-    A crash between write and rename leaves the previous valid file intact.
-    A crash after rename leaves the new line in the file. No partial-line
-    state is ever observable to readers.
+    Audit 2026-05-07 P2-1: the previous read-rewrite-replace shape
+    could lose events when two writers (e.g. heartbeat-driven growth
+    + autonomous reflex emergence) overlapped — both read the same
+    old file, both replaced with old + their one new line, the later
+    rename clobbered the earlier writer's event. Switching to true
+    append mode means each writer's one-line write goes through the
+    OS append-mode contract: writes ≤ PIPE_BUF (~4096 bytes on
+    POSIX) are atomic at the filesystem layer, so concurrent
+    appends interleave at line boundaries instead of clobbering.
+
+    For the rare event line above the per-OS atomic-append size, a
+    cross-platform interprocess lock would be the next layer; not
+    needed today (events are <1 KB) but documented as the upgrade
+    path if growth ever serializes large events.
     """
-    line = json.dumps(_event_to_dict(event)) + "\n"
-    existing = path.read_bytes() if path.exists() else b""
-    tmp = path.with_suffix(path.suffix + ".new")
-    tmp.write_bytes(existing + line.encode("utf-8"))
-    os.replace(tmp, path)
+    line = (json.dumps(_event_to_dict(event)) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "ab") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
