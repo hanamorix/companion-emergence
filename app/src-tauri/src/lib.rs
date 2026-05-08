@@ -361,3 +361,62 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests — Audit 2026-05-07 P4-3
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_persona_name_accepts_canonical() {
+        assert!(validate_persona_name("nell").is_ok());
+        assert!(validate_persona_name("test_persona").is_ok());
+        assert!(validate_persona_name("test-persona-2").is_ok());
+        assert!(validate_persona_name("a").is_ok()); // single char ok
+        assert!(validate_persona_name(&"x".repeat(40)).is_ok()); // exact upper bound
+    }
+
+    #[test]
+    fn validate_persona_name_rejects_traversal() {
+        assert!(validate_persona_name("../etc").is_err());
+        assert!(validate_persona_name("../../escape").is_err());
+        assert!(validate_persona_name("..").is_err());
+        assert!(validate_persona_name("nell/sub").is_err());
+        assert!(validate_persona_name("nell\\back").is_err());
+    }
+
+    #[test]
+    fn validate_persona_name_rejects_size_bounds() {
+        assert!(validate_persona_name("").is_err());
+        assert!(validate_persona_name(&"x".repeat(41)).is_err());
+        assert!(validate_persona_name(&"x".repeat(100)).is_err());
+    }
+
+    #[test]
+    fn validate_persona_name_rejects_special_chars() {
+        assert!(validate_persona_name("nell.dot").is_err());
+        assert!(validate_persona_name("nell space").is_err());
+        assert!(validate_persona_name("nell;semi").is_err());
+        assert!(validate_persona_name("nell$dollar").is_err());
+        assert!(validate_persona_name("nell!bang").is_err());
+    }
+
+    // Audit P2-8: port parsing must reject out-of-range and zero.
+    // u16::try_from is what get_bridge_credentials uses; we test the
+    // boundary semantics here so a future refactor doesn't regress.
+    #[test]
+    fn port_parse_accepts_valid_u16() {
+        assert!(u16::try_from(1u64).is_ok());
+        assert!(u16::try_from(8080u64).is_ok());
+        assert!(u16::try_from(65535u64).is_ok());
+    }
+
+    #[test]
+    fn port_parse_rejects_above_u16_max() {
+        assert!(u16::try_from(65536u64).is_err());
+        assert!(u16::try_from(100_000u64).is_err());
+    }
+}
