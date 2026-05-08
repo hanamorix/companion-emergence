@@ -38,7 +38,7 @@ class BridgeState:
     started_at: str
     stopped_at: str | None
     shutdown_clean: bool
-    client_origin: str  # "cli" | "tauri" | "tests"
+    client_origin: str  # "cli" | "tauri" | "tests" | "launchd"
     # H-C auth: ephemeral bearer token generated at start, persisted in
     # bridge.json so local clients (CLI / Tauri) can read it. Must NOT be
     # committed to git or logged. None for legacy state files (auth disabled

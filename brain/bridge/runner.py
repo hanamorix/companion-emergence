@@ -76,16 +76,21 @@ def _write_clean_shutdown(persona_dir: Path) -> None:
         logger.warning("clean-shutdown write failed", exc_info=True)
 
 
-def main() -> int:
+def run_bridge_foreground(
+    persona_dir: Path,
+    *,
+    client_origin: str = "cli",
+    idle_shutdown_seconds: float | None = None,
+) -> int:
+    """Run one bridge process in the foreground until shutdown.
+
+    This is the long-lived process body used by both ``python -m
+    brain.bridge.runner`` and the launchd-friendly ``nell supervisor run``
+    command. It does not detach or fork: the caller owns this process and can
+    supervise it directly.
+    """
     import secrets
 
-    p = argparse.ArgumentParser()
-    p.add_argument("--persona-dir", required=True, type=Path)
-    p.add_argument("--client-origin", default="cli")
-    p.add_argument("--idle-shutdown-seconds", type=float, default=None)
-    args = p.parse_args()
-
-    persona_dir = args.persona_dir
     port = _allocate_port()
     # H-C: ephemeral bearer token persisted in bridge.json. 32 bytes from
     # secrets.token_urlsafe — cryptographically random and subprotocol-safe.
@@ -99,7 +104,7 @@ def main() -> int:
         started_at=datetime.now(UTC).isoformat(),
         stopped_at=None,
         shutdown_clean=False,
-        client_origin=args.client_origin,
+        client_origin=client_origin,
         auth_token=auth_token,
     )
     state_file.write(persona_dir, initial_state)
@@ -124,8 +129,8 @@ def main() -> int:
 
     app = build_app(
         persona_dir=persona_dir,
-        client_origin=args.client_origin,
-        idle_shutdown_seconds=args.idle_shutdown_seconds,
+        client_origin=client_origin,
+        idle_shutdown_seconds=idle_shutdown_seconds,
         auth_token=auth_token,
     )
     try:
@@ -133,6 +138,20 @@ def main() -> int:
     finally:
         _write_clean_shutdown(persona_dir)
     return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--persona-dir", required=True, type=Path)
+    p.add_argument("--client-origin", default="cli")
+    p.add_argument("--idle-shutdown-seconds", type=float, default=None)
+    args = p.parse_args()
+
+    return run_bridge_foreground(
+        args.persona_dir,
+        client_origin=args.client_origin,
+        idle_shutdown_seconds=args.idle_shutdown_seconds,
+    )
 
 
 if __name__ == "__main__":
