@@ -36,19 +36,21 @@ export function StepWelcome({ step, totalSteps, mode, onModeChange, onNext, avat
       }
     >
       <SectionLabel>What would you like to do?</SectionLabel>
-      <OptionCard
-        selected={mode === "fresh"}
-        onClick={() => onModeChange("fresh")}
-        title="Start fresh"
-        badge="recommended"
-        description="Create a brand-new persona. Pick a name, a voice, and we'll set up the brain from a blank slate."
-      />
-      <OptionCard
-        selected={mode === "migrate"}
-        onClick={() => onModeChange("migrate")}
-        title="Migrate from the original framework"
-        description="Carry an existing brain over: memories, soul crystallizations, Hebbian edges, and creative DNA. We'll guide you through it."
-      />
+      <div role="radiogroup" aria-label="Setup mode">
+        <OptionCard
+          selected={mode === "fresh"}
+          onClick={() => onModeChange("fresh")}
+          title="Start fresh"
+          badge="recommended"
+          description="Create a brand-new persona. Pick a name, a voice, and we'll set up the brain from a blank slate."
+        />
+        <OptionCard
+          selected={mode === "migrate"}
+          onClick={() => onModeChange("migrate")}
+          title="Migrate from the original framework"
+          description="Carry an existing brain over: memories, soul crystallizations, Hebbian edges, and creative DNA. We'll guide you through it."
+        />
+      </div>
       <Divider />
       <div style={{ fontSize: 10.5, color: "var(--text-mid)", lineHeight: 1.7 }}>
         Either path goes through the same setup: prerequisites check,

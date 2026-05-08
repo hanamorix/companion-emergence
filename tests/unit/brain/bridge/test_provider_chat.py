@@ -658,6 +658,26 @@ def test_read_audit_lines_since_filters_other_request_ids(tmp_path: Path) -> Non
     assert [record["name"] for record in records] == ["mine", "legacy"]
 
 
+def test_read_audit_lines_since_logs_malformed_lines(tmp_path: Path, caplog) -> None:
+    import logging
+
+    from brain.bridge.provider import _read_audit_lines_since
+
+    audit_path = tmp_path / "tool_invocations.log.jsonl"
+    audit_path.write_text(
+        "not json\n"
+        + json.dumps({"name": "ok", "arguments": {}, "result_summary": "done"})
+        + "\n",
+        encoding="utf-8",
+    )
+    caplog.set_level(logging.WARNING)
+
+    records = _read_audit_lines_since(audit_path, 0)
+
+    assert [record["name"] for record in records] == ["ok"]
+    assert "malformed" in caplog.text
+
+
 def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
     """The other flags (-p, --output-format, --model, --system-prompt)
     must remain — only --json-schema is replaced."""

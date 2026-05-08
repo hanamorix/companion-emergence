@@ -130,6 +130,12 @@ textarea {
   }
 }
 
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @keyframes msg-in {
   from {
     opacity: 0;
@@ -165,6 +171,21 @@ textarea {
   100% {
     transform: scale(1.18);
     opacity: 0;
+  }
+}
+
+@media (max-width: 900px), (max-height: 620px) {
+  html,
+  body,
+  #root {
+    overflow: auto;
+  }
+
+  #root {
+    align-items: flex-start;
+    justify-content: flex-start;
+    min-width: 900px;
+    min-height: 620px;
   }
 }
 
