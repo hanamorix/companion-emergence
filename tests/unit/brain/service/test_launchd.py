@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -146,3 +147,115 @@ def test_doctor_checks_reports_missing_claude(tmp_path: Path, monkeypatch: pytes
     by_name = {check.name: check for check in checks}
     assert by_name["claude_cli"].ok is False
     assert "claude not found" in by_name["claude_cli"].detail
+
+
+def _completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    return subprocess.CompletedProcess(
+        args=["launchctl"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def test_install_service_writes_plist_and_bootstraps_launchd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    data_home = home / "data"
+    (data_home / "personas" / "nell").mkdir(parents=True)
+    (home / "Library").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(data_home))
+    nell = _make_executable(tmp_path / "nell")
+    calls: list[list[str]] = []
+
+    def fake_launchctl(args: list[str]):
+        calls.append(args)
+        return _completed(0)
+
+    monkeypatch.setattr(launchd, "run_launchctl", fake_launchctl)
+
+    plist_path = launchd.install_service(persona="nell", nell_path=nell)
+
+    assert plist_path.exists()
+    target = launchd.launchctl_target("nell")
+    assert calls == [
+        ["bootout", target],
+        ["bootstrap", launchd.launchctl_domain(), str(plist_path)],
+        ["kickstart", "-k", target],
+    ]
+
+
+def test_install_service_raises_on_bootstrap_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    data_home = home / "data"
+    (data_home / "personas" / "nell").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(data_home))
+    nell = _make_executable(tmp_path / "nell")
+
+    def fake_launchctl(args: list[str]):
+        if args[0] == "bootstrap":
+            return _completed(5, stderr="boom")
+        return _completed(0)
+
+    monkeypatch.setattr(launchd, "run_launchctl", fake_launchctl)
+
+    with pytest.raises(launchd.LaunchdCommandError, match="bootstrap.*boom"):
+        launchd.install_service(persona="nell", nell_path=nell)
+
+
+def test_uninstall_service_boots_out_and_removes_plist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    data_home = home / "data"
+    (data_home / "personas" / "nell").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(data_home))
+    nell = _make_executable(tmp_path / "nell")
+    plist_path = launchd.write_launchd_plist(persona="nell", nell_path=nell)
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        launchd,
+        "run_launchctl",
+        lambda args: calls.append(args) or _completed(0),
+    )
+
+    removed_path = launchd.uninstall_service(persona="nell")
+
+    assert removed_path == plist_path
+    assert not plist_path.exists()
+    assert calls == [["bootout", launchd.launchctl_target("nell")]]
+
+
+def test_service_status_combines_plist_and_launchctl_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    data_home = home / "data"
+    (data_home / "personas" / "nell").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(data_home))
+    nell = _make_executable(tmp_path / "nell")
+    plist_path = launchd.write_launchd_plist(persona="nell", nell_path=nell)
+    monkeypatch.setattr(
+        launchd,
+        "run_launchctl",
+        lambda args: _completed(0, stdout="state = running"),
+    )
+
+    status = launchd.service_status(persona="nell")
+
+    assert status.installed is True
+    assert status.loaded is True
+    assert status.plist_path == plist_path
+    assert "running" in status.detail

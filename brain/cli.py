@@ -154,6 +154,74 @@ def _service_doctor_handler(args: argparse.Namespace) -> int:
     return 0 if all(check.ok for check in checks) else 1
 
 
+def _service_install_handler(args: argparse.Namespace) -> int:
+    """Install/bootstrap the macOS LaunchAgent for one persona."""
+    from brain.service.launchd import (
+        LaunchdCommandError,
+        LaunchdConfigError,
+        build_launchd_plist_xml,
+        install_service,
+        resolve_nell_path,
+    )
+
+    try:
+        nell_path = resolve_nell_path(args.nell_path)
+        if args.dry_run:
+            print(
+                build_launchd_plist_xml(
+                    persona=args.persona,
+                    nell_path=nell_path,
+                    env_path=args.env_path,
+                    nellbrain_home=args.nellbrain_home,
+                ),
+                end="",
+            )
+            return 0
+        plist_path = install_service(
+            persona=args.persona,
+            nell_path=nell_path,
+            env_path=args.env_path,
+            nellbrain_home=args.nellbrain_home,
+        )
+    except (LaunchdConfigError, LaunchdCommandError) as exc:
+        print(f"service install: {exc}", file=sys.stderr)
+        return 1
+    print(f"service installed: {plist_path}")
+    return 0
+
+
+def _service_uninstall_handler(args: argparse.Namespace) -> int:
+    """Boot out the persona LaunchAgent and remove the plist."""
+    from brain.service.launchd import LaunchdConfigError, uninstall_service
+
+    try:
+        plist_path = uninstall_service(persona=args.persona, keep_plist=args.keep_plist)
+    except LaunchdConfigError as exc:
+        print(f"service uninstall: {exc}", file=sys.stderr)
+        return 1
+    action = "kept" if args.keep_plist else "removed"
+    print(f"service uninstalled: plist {action} at {plist_path}")
+    return 0
+
+
+def _service_status_handler(args: argparse.Namespace) -> int:
+    """Print launchd service status without changing service state."""
+    from brain.service.launchd import LaunchdConfigError, service_status
+
+    try:
+        status = service_status(persona=args.persona)
+    except LaunchdConfigError as exc:
+        print(f"service status: {exc}", file=sys.stderr)
+        return 1
+    print(f"label: {status.label}")
+    print(f"plist: {status.plist_path}")
+    print(f"installed: {'yes' if status.installed else 'no'}")
+    print(f"loaded: {'yes' if status.loaded else 'no'}")
+    if status.detail:
+        print(f"detail: {status.detail}")
+    return 0
+
+
 def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
     """Open a persona memory store for read-only CLI inspection."""
     persona_dir = get_persona_dir(persona)
@@ -1842,6 +1910,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional NELLBRAIN_HOME value to embed in the LaunchAgent environment.",
     )
     svc_print.set_defaults(func=_service_print_plist_handler)
+
+    svc_install = svc_actions.add_parser(
+        "install",
+        help="Write and bootstrap the LaunchAgent for a persona.",
+    )
+    _add_service_common(svc_install)
+    svc_install.add_argument(
+        "--nellbrain-home",
+        default=None,
+        help="Optional NELLBRAIN_HOME value to embed in the LaunchAgent environment.",
+    )
+    svc_install.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plist that would be installed; do not write or bootstrap.",
+    )
+    svc_install.set_defaults(func=_service_install_handler)
+
+    svc_uninstall = svc_actions.add_parser(
+        "uninstall",
+        help="Boot out the LaunchAgent and remove its plist.",
+    )
+    svc_uninstall.add_argument("--persona", required=True)
+    svc_uninstall.add_argument(
+        "--keep-plist",
+        action="store_true",
+        help="Boot out the service but leave the plist file in place.",
+    )
+    svc_uninstall.set_defaults(func=_service_uninstall_handler)
+
+    svc_status = svc_actions.add_parser(
+        "status",
+        help="Show LaunchAgent installed/loaded state.",
+    )
+    svc_status.add_argument("--persona", required=True)
+    svc_status.set_defaults(func=_service_status_handler)
 
     svc_doctor = svc_actions.add_parser(
         "doctor",
