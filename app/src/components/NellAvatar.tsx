@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   pickExpressionFromState,
   resolveFrameUrl,
@@ -7,50 +8,23 @@ import {
 import { useAnimatedFrame } from "../useAnimatedFrame";
 import type { PersonaState } from "../bridge";
 
-/**
- * Phase 5D — emotion-family colour tints.
- *
- * Each category gets a `glow` colour for the breathing ring behind the
- * face, plus an optional `tint` rgba for a soft backing wash. We never
- * filter the avatar PNG itself — Hana drew that art with intent — only
- * the surrounding atmosphere shifts.
- *
- * Smooth transitions (~0.8s) so the room temperature changes with her
- * mood instead of snapping. Mode-overrides (provider_down crimson,
- * offline grayscale) take precedence over the per-category palette.
- */
-interface CategoryPalette {
-  /** Hex colour for the radial breathing glow ring. */
-  glow: string;
-  /** Optional rgba behind the image — null = no extra wash. */
-  tint: string | null;
+// macOS drag region via Tauri JS API. CSS `-webkit-app-region: drag`
+// fails for the avatar — the breathing transform on the <img> element
+// breaks WKWebView's hit-test for the drag attribute. Calling
+// startDragging() directly from a mousedown handler is deterministic
+// and survives transforms / blend-modes / overlay title bars.
+function startWindowDrag(e: React.MouseEvent) {
+  if (e.button !== 0) return;
+  void getCurrentWindow().startDragging();
 }
 
-const CATEGORY_PALETTE: Record<ExpressionCategory, CategoryPalette> = {
-  // baseline — warm but neutral
-  idle:      { glow: "#8a5a48", tint: null },
-  content:   { glow: "#a8754f", tint: "rgba(180,130,90,0.12)" },
-  // joy — push toward gold/yellow so it reads against the brown bg
-  smile:     { glow: "#d18a3a", tint: "rgba(232,176,90,0.20)" },
-  happy:     { glow: "#e8b85a", tint: "rgba(240,200,110,0.26)" },
-  // wonder — cool blue-violet, distinct from warm baseline
-  awe:       { glow: "#8295c4", tint: "rgba(170,190,228,0.18)" },
-  intent:    { glow: "#b0a070", tint: "rgba(190,170,110,0.14)" },
-  // edge / fight — push toward true red, away from the bg's brown-red
-  defiant:   { glow: "#cc3a3d", tint: "rgba(220,70,75,0.22)" },
-  angry:     { glow: "#b22a2a", tint: "rgba(200,40,40,0.24)" },
-  // body / intimate — saturated rose/peach, reads strongly against dark warm
-  arousal:   { glow: "#d65a85", tint: "rgba(228,124,150,0.26)" },
-  climax:    { glow: "#e85a8a", tint: "rgba(240,140,165,0.34)" },
-  flushed:   { glow: "#c87080", tint: "rgba(218,150,160,0.18)" },
-  shy:       { glow: "#b08482", tint: "rgba(210,170,168,0.15)" },
-  // grief / cool — cool blue-grey, very distinct
-  sad:       { glow: "#5470a0", tint: "rgba(120,150,200,0.18)" },
-  aching:    { glow: "#705a8a", tint: "rgba(150,124,178,0.18)" },
-  // fear / fade
-  scared:    { glow: "#7898b8", tint: "rgba(160,190,220,0.14)" },
-  exhausted: { glow: "#82756d", tint: "rgba(140,128,118,0.12)" },
-};
+// The emotion palette (per-category glow + tint colors) was retired
+// when the app went transparent — circular radial gradients read as
+// dark perceptual rings against any colored wallpaper. Mood is now
+// carried by the soul-flash + the panels themselves; the avatar gets
+// a cream drop-shadow halo that tracks her silhouette. See git for
+// the original CATEGORY_PALETTE if we ever bring per-emotion glow
+// back as a non-circular technique.
 
 interface Props {
   state: PersonaState | null;
@@ -95,9 +69,9 @@ export function NellAvatar({
 
   // Mode overrides win over the emotion palette (a degraded provider
   // should read as a fault, not as her emotional state).
-  const palette = CATEGORY_PALETTE[category];
-  const glowColor = mode === "provider_down" ? "#8A3033" : palette.glow;
-  const tintRgba = mode === "live" ? palette.tint : null;
+  // Cream warmth around her by default; crimson when the LLM is down.
+  const dropShadowColor =
+    mode === "provider_down" ? "rgba(138,48,51,0.55)" : "rgba(245,225,205,0.6)";
 
   const frame = useAnimatedFrame({ isSpeaking, reducedMotion });
 
@@ -117,43 +91,26 @@ export function NellAvatar({
 
   return (
     <div
-      style={{ position: "relative", width: size, height: size, flexShrink: 0 }}
+      onMouseDown={startWindowDrag}
+      style={{
+        position: "relative",
+        width: size,
+        height: size,
+        flexShrink: 0,
+        cursor: "grab",
+      }}
       data-category={category}
     >
       {/* Emotion-family glow ring — colour shifts with the dominant
        * expression category, smooth ~0.8s ease so the room temperature
        * follows her mood instead of snapping. */}
-      <div
-        style={{
-          position: "absolute",
-          inset: -28,
-          borderRadius: "50%",
-          background: `radial-gradient(ellipse at 50% 58%, ${glowColor}5a 0%, transparent 70%)`,
-          filter: "blur(20px)",
-          animation: reducedMotion ? "none" : `breathe ${breathSeconds}s ease-in-out infinite`,
-          opacity: dimmed ? 0.15 : 0.9,
-          transition: "opacity 1.2s ease, background 0.85s ease",
-          pointerEvents: "none",
-          zIndex: 0,
-        }}
-      />
-      {/* Soft category tint behind the avatar — a low-opacity wash that
-       * picks up cheek-warm-pink for arousal, dusky blue for grief, etc.
-       * Sits behind the PNG (zIndex 0) so it never recolours the art
-       * Hana drew, only the atmosphere around her. */}
-      {tintRgba && (
-        <div
-          style={{
-            position: "absolute",
-            inset: -8,
-            borderRadius: "50%",
-            background: `radial-gradient(ellipse at 50% 55%, ${tintRgba} 0%, transparent 78%)`,
-            transition: "background 0.85s ease, opacity 0.85s ease",
-            pointerEvents: "none",
-            zIndex: 0,
-          }}
-        />
-      )}
+      {/* Glow + tint were circular radial gradients — they read as a
+       * dark perceptual ring against any colored wallpaper because the
+       * brain interprets the alpha-fade boundary as an edge. Replaced
+       * with a drop-shadow on the img itself (see below) which follows
+       * the avatar silhouette exactly. The emotional color is now
+       * carried by the soul-flash overlay and the panel chrome rather
+       * than a wash around her. */}
       {/* Soul-crystallization flash overlay — expanding amber bloom that
        * fades. Fires once when soulFlashing flips true; the CSS keyframes
        * own the timing, the `key` re-trigger ensures replay on each new
@@ -186,7 +143,15 @@ export function NellAvatar({
           objectFit: "contain",
           objectPosition: "center top",
           animation: reducedMotion ? "none" : `breathe ${breathSeconds}s ease-in-out infinite`,
-          filter: dimmed ? "grayscale(0.6) brightness(0.65) sepia(0.2)" : "none",
+          // No halo: any cream/colored shadow renders as a warm tone
+          // against cool wallpapers (or vice versa) and reads as a
+          // ring. Provider-down still gets a crimson silhouette to
+          // signal a real fault — that's a feature, not a halo.
+          filter: dimmed
+            ? "grayscale(0.6) brightness(0.65) sepia(0.2)"
+            : mode === "provider_down"
+              ? `drop-shadow(0 0 8px ${dropShadowColor}) drop-shadow(0 0 3px ${dropShadowColor})`
+              : "none",
           transition: "filter 1.2s ease, opacity 0.18s ease",
           userSelect: "none",
         }}
