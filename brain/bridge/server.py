@@ -20,6 +20,7 @@ Singletons are constructed once at lifespan startup and held on app.state.bridge
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -750,7 +751,12 @@ def build_app(
                 )
             except Exception as exc:
                 logger.exception("chat failed session=%s", req.session_id)
-                raise HTTPException(status_code=502, detail=f"provider error: {exc}") from exc
+                # Audit 2026-05-07 P3-2: keep detailed exception text in
+                # logs only — clients get a stable code, not stderr or
+                # local paths from the underlying provider/process.
+                raise HTTPException(
+                    status_code=502, detail="provider_failed"
+                ) from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -789,9 +795,38 @@ def build_app(
             await ws.close()
             return
 
+        # Audit 2026-05-07 P3-1: receive raw text + bound the frame
+        # before json.loads. The local + authenticated bridge isn't
+        # internet-exposed, but a compromised renderer could still
+        # cause a memory spike by sending a huge JSON frame; reject
+        # at the byte boundary so the parser never sees oversized
+        # payloads. 64 KB is generous against a 20k-char message
+        # plus image_shas (each ≤64 hex × ≤8 = ~520 bytes) plus
+        # JSON overhead.
+        _WS_FRAME_MAX_BYTES = 64 * 1024
         try:
-            req = await ws.receive_json()
+            raw_frame = await ws.receive_text()
         except (WebSocketDisconnect, ValueError):
+            return
+        if len(raw_frame.encode("utf-8")) > _WS_FRAME_MAX_BYTES:
+            await ws.send_json(
+                {"type": "error", "code": "frame_too_large", "done": True}
+            )
+            await ws.close()
+            return
+        try:
+            req = json.loads(raw_frame)
+        except (ValueError, json.JSONDecodeError):
+            await ws.send_json(
+                {"type": "error", "code": "invalid_json", "done": True}
+            )
+            await ws.close()
+            return
+        if not isinstance(req, dict):
+            await ws.send_json(
+                {"type": "error", "code": "invalid_frame_shape", "done": True}
+            )
+            await ws.close()
             return
         message = req.get("message", "")
         if not isinstance(message, str) or not message:
@@ -832,10 +867,12 @@ def build_app(
                     s.provider,
                     image_shas,
                 )
-            except Exception as exc:
+            except Exception:
                 logger.exception("stream failed session=%s", session_id)
+                # Audit 2026-05-07 P3-2: stable code for clients;
+                # full exception text stays in the log only.
                 await ws.send_json(
-                    {"type": "error", "code": "provider_failed", "detail": str(exc), "done": True}
+                    {"type": "error", "code": "provider_failed", "done": True}
                 )
                 await ws.close()
                 return
@@ -927,30 +964,35 @@ def build_app(
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
 
-        # H-A: per-call stores inside the worker thread, not shared singletons.
-        # Wrap the pipeline call so internal exceptions don't crash the handler —
-        # surface them as 502 with a counted-error report. Spec §11 says the
-        # ingest pipeline should catch + count internally, but the current
-        # implementation lets some commit exceptions propagate; the handler
-        # converts those to a uniform error shape so the caller never sees
-        # a silent success and never sees a stack trace.
-        try:
-            report = await asyncio.to_thread(
-                _close_session_blocking, s.persona_dir, req.session_id, s.provider,
-            )
-        except Exception as exc:
-            logger.exception("close_session failed session=%s", req.session_id)
-            # Still clean up the registry — the buffer is whatever the pipeline
-            # left it as; future supervisor ticks may retry per spec §11.
-            remove_session(req.session_id)
-            s.in_flight_locks.pop(req.session_id, None)
-            raise HTTPException(
-                status_code=502,
-                detail=f"ingest pipeline error: {type(exc).__name__}: {exc}",
-            ) from exc
+        # Audit 2026-05-07 P2-4: serialise close behind the same per-
+        # session lock /chat and /stream use. Without this, a renderer
+        # close (e.g. Cmd-Q during a streaming reply) could close the
+        # session mid-turn — ingesting a partial buffer, removing the
+        # in-memory session, and dropping the lock while the chat
+        # worker still thought the session was active. Acquiring the
+        # lock here means close waits for any in-flight turn to
+        # finish before running ingest.
+        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        async with lock:
+            # H-A: per-call stores inside the worker thread, not shared singletons.
+            # Wrap the pipeline call so internal exceptions don't crash the handler.
+            try:
+                report = await asyncio.to_thread(
+                    _close_session_blocking, s.persona_dir, req.session_id, s.provider,
+                )
+            except Exception as exc:
+                logger.exception("close_session failed session=%s", req.session_id)
+                # Still clean up the registry; future supervisor ticks may retry
+                # per spec §11. Sanitised client message — full detail in logs.
+                remove_session(req.session_id)
+                s.in_flight_locks.pop(req.session_id, None)
+                raise HTTPException(
+                    status_code=502,
+                    detail="ingest_failed",
+                ) from exc
 
-        # H2: clean up registry + lock so sessions_active stays accurate.
-        remove_session(req.session_id)
+            # H2: clean up registry + lock so sessions_active stays accurate.
+            remove_session(req.session_id)
         s.in_flight_locks.pop(req.session_id, None)
 
         events.publish(
