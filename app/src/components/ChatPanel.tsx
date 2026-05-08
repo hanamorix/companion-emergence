@@ -92,6 +92,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [memorySaveWarning, setMemorySaveWarning] = useState<string | null>(null);
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const sessionRef = useRef<string | null>(null);
@@ -102,6 +103,14 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
   // All bubble-resident object URLs — revoked on unmount so long
   // image-heavy sessions don't leak browser memory for preview blobs.
   const trackedUrlsRef = useRef<Set<string>>(new Set());
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Pipe streaming state up so the avatar speaks during chunks
   useEffect(() => {
@@ -117,10 +126,20 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
       const sid = sessionRef.current;
       sessionRef.current = null;
       if (sid) {
-        // Best-effort — fire and forget. The component is unmounting,
-        // there's nowhere meaningful to surface a close failure; the
-        // supervisor's stale-close still catches it as a fallback.
-        void closeSession(persona, sid, { keepalive }).catch(() => undefined);
+        void closeSession(persona, sid, { keepalive })
+          .then(() => {
+            if (!keepalive && mountedRef.current) setMemorySaveWarning(null);
+          })
+          .catch((e) => {
+            // Page unload remains best-effort. In-app persona changes keep the
+            // component mounted, so surface the retryable failure instead of
+            // silently discarding the user's expectation that memory was saved.
+            if (!keepalive && mountedRef.current) {
+              setMemorySaveWarning(
+                `Memory save pending for the previous chat: ${(e as Error).message}`,
+              );
+            }
+          });
       }
     };
     const onBeforeUnload = () => closeCurrentSession(true);
@@ -266,6 +285,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     setInput("");
     setStreaming(true);
     setError(null);
+    setMemorySaveWarning(null);
 
     try {
       cancelRef.current = await streamChat(
@@ -404,6 +424,11 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
         {error && (
           <div style={{ fontSize: 11, color: "var(--crimson)", padding: "6px 4px" }}>
             {error}
+          </div>
+        )}
+        {memorySaveWarning && (
+          <div style={{ fontSize: 11, color: "var(--lacquer)", padding: "6px 4px" }}>
+            {memorySaveWarning}
           </div>
         )}
       </div>

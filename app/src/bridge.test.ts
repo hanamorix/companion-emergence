@@ -92,10 +92,12 @@ describe("getBridgeCredentials", () => {
   });
 
   it("can keep session-close alive during app unload", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "session-1", closed: true, committed: 0, deduped: 0, soul_candidates: 0, soul_queue_errors: 0, errors: 0 }), { status: 200 }),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
-    await closeSession("alice", "session-1", { keepalive: true });
+    await expect(closeSession("alice", "session-1", { keepalive: true })).resolves.toMatchObject({ closed: true });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:41001/sessions/close",
@@ -105,5 +107,28 @@ describe("getBridgeCredentials", () => {
         body: JSON.stringify({ session_id: "session-1" }),
       }),
     );
+  });
+
+  it("surfaces retryable close-session failures with closed=false detail", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: {
+            code: "ingest_failed",
+            session_id: "session-1",
+            closed: false,
+            committed: 0,
+            deduped: 0,
+            soul_candidates: 0,
+            soul_queue_errors: 0,
+            errors: 1,
+          },
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(closeSession("alice", "session-1")).rejects.toThrow("closed=false; errors=1");
   });
 });
