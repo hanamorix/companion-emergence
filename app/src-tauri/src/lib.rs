@@ -335,6 +335,66 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MigrateArgs {
+    pub persona: String,
+    pub source: String, // "nellbrain" | "emergence-kit"
+    pub input_dir: String,
+    pub force: bool,
+}
+
+#[tauri::command]
+async fn run_migrate(
+    app: tauri::AppHandle,
+    args: MigrateArgs,
+) -> Result<InitResult, String> {
+    validate_persona_name(&args.persona)?;
+    if args.source != "nellbrain" && args.source != "emergence-kit" {
+        return Err(format!(
+            "unknown migrate source {:?} (expected nellbrain or emergence-kit)",
+            args.source
+        ));
+    }
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args([
+        "migrate",
+        "--source",
+        &args.source,
+        "--input",
+        &args.input_dir,
+        "--install-as",
+        &args.persona,
+    ]);
+    if args.force {
+        cmd.arg("--force");
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    // 5-minute timeout — emergence-kit imports finish in seconds, but
+    // a large NellBrain memory store with rebuild-embeddings can take
+    // a couple of minutes on slower disks. The wizard surfaces a
+    // ``migrate_timeout`` if anything stalls past this cap.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("spawn nell migrate: {}", e)),
+        Err(_) => return Err("migrate_timeout".to_string()),
+    };
+    Ok(InitResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
+}
+
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
@@ -570,6 +630,7 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             run_init,
+            run_migrate,
             install_supervisor_service,
             check_claude_cli,
             set_always_on_top,
