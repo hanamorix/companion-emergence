@@ -102,6 +102,25 @@ def test_build_persona_state_interior_from_daemon_state(tmp_path: Path) -> None:
     assert interior["reflex"] is None  # not seeded
 
 
+def test_build_persona_state_interior_strips_self_narrated_label(tmp_path: Path) -> None:
+    """Models sometimes prefix the theme with the section name they're
+    writing in (``DREAM: I was back…``). Strip it once so the UI doesn't
+    show the heading twice (heading + leading prefix in body).
+    """
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    (persona_dir / "daemon_state.json").write_text(json.dumps({
+        "last_dream": {"theme": "DREAM: I was back in every conversation"},
+        "last_research": {"theme": "research — Lispector diagonal syntax"},
+        "last_reflex": {"summary": "Reflex: love and grief in the same chest"},
+    }))
+    state = build_persona_state(persona_dir)
+    interior = state["interior"]
+    assert interior["dream"] == "I was back in every conversation"
+    assert interior["research"] == "Lispector diagonal syntax"
+    assert interior["reflex"] == "love and grief in the same chest"
+
+
 def test_build_persona_state_interior_corrupt_daemon_state_fails_soft(tmp_path: Path) -> None:
     """Malformed daemon_state.json → empty interior, never raises."""
     persona_dir = tmp_path / "nell"

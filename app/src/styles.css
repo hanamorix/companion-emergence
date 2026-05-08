@@ -1,4 +1,4 @@
-/* NellFace — anime palette + shoji panel design language.
+/* Companion Emergence — anime palette + shoji panel design language.
  * Lifted from mock-ups/app-interface/NellFace_mock.html. */
 
 :root {
@@ -38,7 +38,7 @@ body,
 #root {
   width: 100%;
   height: 100%;
-  background: var(--bg-scene);
+  background: transparent;
   font-family: var(--font-ui);
   font-size: 13px;
   line-height: 1.5;
@@ -46,27 +46,31 @@ body,
   color: var(--text);
 }
 
-/* Warm radial glow + washi grain */
-body::before {
-  content: "";
+/* Transparent title bar (Overlay style) — traffic lights float on top.
+ * The drag handle hugs the top edge so the user can move the window
+ * without a visible bar; the inset keeps content below the lights.
+ * Drag itself is wired via onMouseDown -> getCurrentWindow().startDragging()
+ * because CSS -webkit-app-region: drag is fragile under transforms +
+ * mix-blend-mode (notably the breathing avatar). */
+.titlebar-drag {
   position: fixed;
-  inset: 0;
-  z-index: 0;
-  background:
-    radial-gradient(ellipse 70% 60% at 35% 55%, #3d2020 0%, transparent 65%),
-    radial-gradient(ellipse 55% 70% at 70% 45%, #2a1818 0%, transparent 65%);
-  pointer-events: none;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  z-index: 100;
+  cursor: grab;
+}
+.titlebar-drag:active {
+  cursor: grabbing;
+}
+#root {
+  padding-top: 28px;
 }
 
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  opacity: 0.03;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 180px 180px;
-  pointer-events: none;
+.chat-input::placeholder {
+  color: var(--mauve);
+  opacity: 0.85;
 }
 
 #root {
