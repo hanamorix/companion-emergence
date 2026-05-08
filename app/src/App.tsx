@@ -62,7 +62,7 @@ export default function App() {
     })();
   }, []);
 
-  if (phase.kind === "loading") return <BootScreen subtitle="loading…" />;
+  if (phase.kind === "loading") return <BootScreen subtitle="Loading…" />;
 
   if (phase.kind === "wizard") {
     return (
@@ -89,8 +89,8 @@ export default function App() {
       <BootScreen
         subtitle={
           phase.error
-            ? `bridge failed to start: ${phase.error}`
-            : `starting brain for ${phase.persona}…`
+            ? `Bridge failed to start: ${phase.error}`
+            : `Starting brain for ${phase.persona}…`
         }
       />
     );
@@ -205,6 +205,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       <LeftPanel
         state={state}
         persona={persona}
+        stateError={stateError}
         alwaysOnTop={config.always_on_top}
         reducedMotion={config.reduced_motion}
         onAlwaysOnTopChange={(v) => updateConfig({ always_on_top: v })}
@@ -217,21 +218,6 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         reducedMotion={config.reduced_motion}
       />
       <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
-      {stateError && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: 8,
-            left: 8,
-            fontSize: 10,
-            color: "var(--crimson)",
-            fontFamily: "var(--font-disp)",
-            opacity: 0.7,
-          }}
-        >
-          state: {stateError}
-        </div>
-      )}
     </div>
   );
 }

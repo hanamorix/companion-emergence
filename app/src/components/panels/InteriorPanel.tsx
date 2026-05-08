@@ -35,13 +35,13 @@ export function InteriorPanel({ state }: Props) {
             !interior.heartbeat &&
             !interior.reflex && (
               <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-                quiet inside
+                Quiet inside.
               </div>
             )}
         </>
       ) : (
         <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-          no signal yet
+          No signal yet.
         </div>
       )}
     </PanelShell>
