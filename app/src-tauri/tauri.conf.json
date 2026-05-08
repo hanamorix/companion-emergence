@@ -21,6 +21,7 @@
         "alwaysOnTop": false
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: blob:; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* https://fonts.googleapis.com https://fonts.gstatic.com"
     }
