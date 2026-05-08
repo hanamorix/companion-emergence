@@ -2,9 +2,10 @@
 
 > **Status (2026-05-08):** `v0.0.1-alpha` exists as a private alpha
 > release with pre-built macOS arm64, Linux x86_64, and Windows x86_64
-> assets. macOS Intel users should build from source until an x86_64
-> DMG appears. New `v*.*.*` tags and manual retries of existing tags
-> publish bundles to the GitHub Releases page.
+> assets. macOS Intel users should build from source until a reliable
+> Intel runner is available. New `v*.*.*` tags and manual retries of
+> existing tags publish bundles to the GitHub Releases page after a
+> bundled-CLI smoke test.
 >
 > The bypass instructions below apply to downloaded release bundles.
 > Build-from-source artifacts launch without any of these warnings
@@ -40,7 +41,7 @@ take.
 ### Download
 Grab `Companion.Emergence_<version>_aarch64.dmg` (Apple Silicon / M1+)
 from the Releases page. Intel macOS users should build from source
-until an x86_64 DMG is attached.
+until a reliable hosted Intel runner is available.
 
 ### Open the .dmg and drag NellFace.app to Applications
 
