@@ -32,16 +32,27 @@ export function WizardShell({
     >
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
         {avatar}
-        <div style={{ width: 200 }}>
+        <div
+          style={{
+            width: 220,
+            padding: "10px 14px",
+            borderRadius: 9,
+            background: "var(--panel-bg)",
+            border: "1px solid var(--border)",
+            boxShadow:
+              "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+          }}
+        >
           <ProgressBar current={step} total={totalSteps} />
           <div
             style={{
               textAlign: "center",
               marginTop: 6,
-              fontSize: 10,
-              color: "var(--mauve)",
+              fontSize: 10.5,
+              color: "var(--text-mid)",
               fontFamily: "var(--font-disp)",
-              letterSpacing: "0.06em",
+              letterSpacing: "0.08em",
+              fontWeight: 500,
             }}
           >
             Step {step} of {totalSteps}
@@ -115,9 +126,9 @@ export function ProgressBar({ current, total }: { current: number; total: number
   return (
     <div
       style={{
-        height: 3,
-        background: "rgba(191,184,173,0.3)",
-        borderRadius: 2,
+        height: 5,
+        background: "rgba(130,51,41,0.18)",
+        borderRadius: 3,
         overflow: "hidden",
       }}
     >
