@@ -1,10 +1,22 @@
 # Installing NellFace
 
-NellFace is open source and unsigned — we don't pay for an Apple
-Developer ID or a Microsoft code-signing certificate. Your operating
-system's first-launch security warnings will reflect that. Below are
-the steps to launch the app despite the warnings, per platform. The
-app itself is the same regardless of which path you take.
+> **Status (2026-05-08):** there is no published `v*.*.*` release yet.
+> Pre-built download URLs do not exist on the GitHub Releases page.
+> The release pipeline is in place — pushing a `v*.*.*` tag will run
+> the cross-platform build matrix and publish signed ad-hoc bundles
+> as release assets — but until that tag exists, the only install
+> path is **build from source** (see the bottom of this file).
+>
+> The bypass instructions below apply to bundles produced by that
+> pipeline once it runs. Build-from-source artifacts launch without
+> any of these warnings because they inherit your local keychain.
+
+NellFace is open source and ships **unsigned** — we don't pay for an
+Apple Developer ID or a Microsoft code-signing certificate. Your
+operating system's first-launch security warnings will reflect that.
+Below are the steps to launch the app despite the warnings, per
+platform. The app itself is the same regardless of which path you
+take.
 
 > **One external prerequisite on every platform:** you need
 > [`claude`](https://docs.claude.com/en/docs/claude-code/setup) (the
