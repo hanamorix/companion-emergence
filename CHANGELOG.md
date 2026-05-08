@@ -58,8 +58,11 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 - **Phase 7 — Python runtime bundling.** `pnpm tauri build` now
   produces a self-contained `NellFace.app` that doesn't need `uv`,
-  `python3`, or any system Python on PATH. macOS arm64 / x86_64 /
-  Linux x86_64 supported today; Windows pending. Build flow:
+  `python3`, or any system Python on PATH. Initial implementation
+  shipped macOS arm64 / x86_64 / Linux x86_64; the cross-platform
+  block above (2026-05-07) extended this to Linux arm64 + Windows
+  x86_64. See that block for the canonical platform support matrix.
+  Build flow:
   - `app/build_python_runtime.sh` downloads `python-build-standalone`
     for the host arch (~30 MB compressed), extracts to
     `app/src-tauri/python-runtime/`, builds the

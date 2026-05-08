@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from brain.bridge import events
 from brain.bridge.events import EventBus
@@ -48,6 +48,11 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
+
+# Audit 2026-05-07 P4-1: ChatReq.image_shas item-level validator. The
+# ingest path keys cache lookups on these values, so a renderer compromise
+# that posted "../../etc/passwd" would otherwise traverse the cache root.
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +288,24 @@ class ChatReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     message: str = Field(..., min_length=1, max_length=20_000)
     # Optional image attachments — sha-strings as returned by /upload.
-    # Capped at 8 images per turn; each sha must be 64 lowercase hex.
+    # Audit 2026-05-07 P4-1: comment used to promise 64-char-hex
+    # validation but the model only enforced the list length cap.
+    # Now Pydantic enforces it at the API boundary too. Deeper image
+    # handling stays as defense in depth.
     image_shas: list[str] = Field(
         default_factory=list,
         max_length=8,
     )
+
+    @field_validator("image_shas")
+    @classmethod
+    def _validate_image_shas(cls, v: list[str]) -> list[str]:
+        for sha in v:
+            if not _SHA256_HEX_RE.fullmatch(sha):
+                raise ValueError(
+                    f"image_sha must be 64 lowercase hex chars, got {sha!r}"
+                )
+        return v
 
 
 class CloseReq(BaseModel):
@@ -839,11 +857,18 @@ def build_app(
             return
 
         # Optional image attachments — sha-strings as returned by /upload.
-        # Defensive validation: list of strings only, max 8 entries.
+        # Audit 2026-05-07 P4-1: same item-level constraints as the
+        # HTTP /chat ChatReq path — list of strings only, ≤ 8 entries,
+        # each entry must be 64 lowercase hex chars.
         raw_shas = req.get("image_shas") or []
         image_shas: list[str] | None = None
         if isinstance(raw_shas, list) and raw_shas:
-            if len(raw_shas) > 8 or not all(isinstance(x, str) for x in raw_shas):
+            valid = (
+                len(raw_shas) <= 8
+                and all(isinstance(x, str) for x in raw_shas)
+                and all(_SHA256_HEX_RE.fullmatch(x) for x in raw_shas)
+            )
+            if not valid:
                 await ws.send_json(
                     {"type": "error", "code": "invalid_image_shas", "done": True}
                 )
