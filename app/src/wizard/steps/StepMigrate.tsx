@@ -52,18 +52,20 @@ export function StepMigrate({
       }
     >
       <SectionLabel>Where are you coming from?</SectionLabel>
-      <OptionCard
-        selected={source === "nellbrain"}
-        onClick={() => setSource("nellbrain")}
-        title="The original NellBrain framework"
-        description="The bigger Python project with memories, soul crystallizations, connection-strength files, and a creative voice fingerprint. Auto-imported."
-      />
-      <OptionCard
-        selected={source === "emergence-kit"}
-        onClick={() => setSource("emergence-kit")}
-        title="emergence-kit (or another simpler brain)"
-        description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality. Imported by hand for now."
-      />
+      <div role="radiogroup" aria-label="Migration source">
+        <OptionCard
+          selected={source === "nellbrain"}
+          onClick={() => setSource("nellbrain")}
+          title="The original NellBrain framework"
+          description="The bigger Python project with memories, soul crystallizations, connection-strength files, and a creative voice fingerprint. Auto-imported."
+        />
+        <OptionCard
+          selected={source === "emergence-kit"}
+          onClick={() => setSource("emergence-kit")}
+          title="emergence-kit (or another simpler brain)"
+          description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality. Imported by hand for now."
+        />
+      </div>
 
       <Divider />
 
@@ -97,6 +99,7 @@ function NellBrainPath({
       <div style={{ marginTop: 14 }}>
         <FieldLabel>Where is the original brain's data folder?</FieldLabel>
         <WInput
+          label="Original brain data folder"
           value={path}
           onChange={onPathChange}
           placeholder="/Users/you/NellBrain/data"
