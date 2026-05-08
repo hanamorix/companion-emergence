@@ -1057,14 +1057,60 @@ def build_app(
                 )
             except Exception as exc:
                 logger.exception("close_session failed session=%s", req.session_id)
-                # Still clean up the registry; future supervisor ticks may retry
-                # per spec §11. Sanitised client message — full detail in logs.
-                remove_session(req.session_id)
-                s.in_flight_locks.pop(req.session_id, None)
+                events.publish(
+                    "session_close_failed",
+                    session_id=req.session_id,
+                    committed=0,
+                    deduped=0,
+                    soul_candidates=0,
+                    soul_queue_errors=0,
+                    errors=1,
+                )
+                # Keep the in-memory session and lock entry registered. The
+                # buffer is still on disk when close_session raises, and a
+                # caller or supervisor retry should be able to close the same
+                # session id instead of seeing a false "closed" success.
                 raise HTTPException(
                     status_code=502,
-                    detail="ingest_failed",
+                    detail={
+                        "code": "ingest_failed",
+                        "session_id": req.session_id,
+                        "closed": False,
+                        "committed": 0,
+                        "deduped": 0,
+                        "soul_candidates": 0,
+                        "soul_queue_errors": 0,
+                        "errors": 1,
+                    },
                 ) from exc
+
+            if report.errors > 0:
+                events.publish(
+                    "session_close_failed",
+                    session_id=req.session_id,
+                    committed=report.committed,
+                    deduped=report.deduped,
+                    soul_candidates=report.soul_candidates,
+                    soul_queue_errors=report.soul_queue_errors,
+                    errors=report.errors,
+                )
+                # Extraction failures deliberately retain the JSONL buffer for
+                # retry. Do not remove the in-memory session or drop its lock
+                # entry, otherwise the retry path turns into 404 while the
+                # client was told nothing actionable.
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "ingest_failed",
+                        "session_id": req.session_id,
+                        "closed": False,
+                        "committed": report.committed,
+                        "deduped": report.deduped,
+                        "soul_candidates": report.soul_candidates,
+                        "soul_queue_errors": report.soul_queue_errors,
+                        "errors": report.errors,
+                    },
+                )
 
             # H2: clean up registry + lock so sessions_active stays accurate.
             remove_session(req.session_id)
