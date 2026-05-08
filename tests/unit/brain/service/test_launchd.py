@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from brain.service import launchd
 
 
 def _make_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(0o755)
     return path
@@ -95,6 +97,29 @@ def test_resolve_nell_path_requires_absolute_executable(tmp_path: Path) -> None:
     assert launchd.resolve_nell_path(str(executable)) == executable.resolve()
 
 
+def test_resolve_nell_path_prefers_absolute_argv0(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundled = _make_executable(tmp_path / "python-runtime" / "bin" / "nell")
+    monkeypatch.setattr(sys, "argv", [str(bundled), "service", "install"])
+    monkeypatch.setattr(launchd.shutil, "which", lambda name: None)
+
+    assert launchd.resolve_nell_path() == bundled.resolve()
+
+
+def test_unstable_nell_path_reason_flags_dmg_and_translocation() -> None:
+    assert launchd.unstable_nell_path_reason(
+        "/Volumes/Companion Emergence/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
+    )
+    assert launchd.unstable_nell_path_reason(
+        "/private/var/folders/x/AppTranslocation/ABC/d/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
+    )
+    assert launchd.unstable_nell_path_reason(
+        "/Applications/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
+    ) is None
+
+
 def test_doctor_checks_reports_launchd_prerequisites(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -124,7 +149,37 @@ def test_doctor_checks_reports_launchd_prerequisites(
     assert by_name["persona_name"].ok is True
     assert by_name["persona_dir"].ok is True
     assert by_name["nell_path"].ok is True
+    assert by_name["nell_path_stable"].ok is True
     assert by_name["claude_cli"].ok is True
+
+
+def test_install_service_rejects_unstable_nell_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        launchd,
+        "unstable_nell_path_reason",
+        lambda path: "unstable test path",
+    )
+
+    with pytest.raises(launchd.LaunchdConfigError, match="unstable test path"):
+        launchd.install_service(persona="nell", nell_path="/Applications/Nell.app/nell")
+
+
+def test_truncate_launchd_logs_if_large(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    data_home = home / "data"
+    (data_home / "personas" / "nell").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(data_home))
+    paths = launchd.paths_for_persona("nell")
+    paths.stdout_path.parent.mkdir(parents=True)
+    paths.stdout_path.write_text("x" * 20, encoding="utf-8")
+    paths.stderr_path.write_text("small", encoding="utf-8")
+
+    truncated = launchd.truncate_launchd_logs_if_large("nell", max_bytes=10)
+
+    assert truncated == [paths.stdout_path]
+    assert paths.stdout_path.read_text(encoding="utf-8") == ""
+    assert paths.stderr_path.read_text(encoding="utf-8") == "small"
 
 
 def test_doctor_checks_reports_missing_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -13,6 +13,7 @@ import platform
 import plistlib
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,12 +124,43 @@ def resolve_nell_path(explicit: str | None = None) -> Path:
             raise LaunchdConfigError(f"--nell-path is not executable: {candidate}")
         return candidate.resolve()
 
+    # When the bundled app invokes ``.../Resources/python-runtime/bin/nell
+    # service install`` from Finder, that executable is not necessarily on
+    # PATH. Prefer the current absolute argv[0] before falling back to PATH so
+    # launchd can still be installed from a bundled runtime even if the caller
+    # forgot to pass --nell-path.
+    argv0 = Path(sys.argv[0]).expanduser()
+    if argv0.is_absolute() and argv0.exists() and os.access(argv0, os.X_OK):
+        return argv0.resolve()
+
     found = shutil.which("nell")
     if found:
         return Path(found).resolve()
     raise LaunchdConfigError(
         "could not resolve 'nell' on PATH; pass --nell-path /absolute/path/to/nell"
     )
+
+
+def unstable_nell_path_reason(nell_path: str | Path) -> str | None:
+    """Return why a launchd ProgramArguments path is not stable enough.
+
+    LaunchAgents persist across reboots. Pointing them at a DMG mount or a
+    translocated app bundle produces a plist that works only until eject or
+    until macOS picks a new translocation path.
+    """
+    path_text = str(Path(nell_path).expanduser())
+    if path_text.startswith("/Volumes/"):
+        return (
+            "nell executable is under /Volumes; move Companion Emergence to "
+            "/Applications before installing the launchd service"
+        )
+    if "/AppTranslocation/" in path_text:
+        return (
+            "nell executable is in a macOS AppTranslocation path; move "
+            "Companion Emergence to /Applications and relaunch before "
+            "installing the launchd service"
+        )
+    return None
 
 
 def build_launchd_plist(
@@ -222,6 +254,31 @@ def write_launchd_plist(
     return paths.plist_path
 
 
+def truncate_launchd_logs_if_large(
+    persona: str,
+    *,
+    max_bytes: int = 5 * 1024 * 1024,
+) -> list[Path]:
+    """Truncate launchd-captured stdout/stderr logs if they exceed a budget.
+
+    Python's normal rotating logging does not cover the file descriptors that
+    launchd opens for StandardOutPath/StandardErrorPath before the interpreter
+    starts. This bounded truncation keeps crash-loop stderr from growing without
+    limit while retaining small recent logs for diagnosis.
+    """
+    paths = paths_for_persona(persona)
+    truncated: list[Path] = []
+    for log_path in (paths.stdout_path, paths.stderr_path):
+        try:
+            if log_path.exists() and log_path.stat().st_size > max_bytes:
+                log_path.write_text("", encoding="utf-8")
+                truncated.append(log_path)
+        except OSError:
+            # Log management must never prevent service startup/install.
+            continue
+    return truncated
+
+
 def launchctl_domain() -> str:
     """Current user's launchd GUI domain."""
     return f"gui/{os.getuid()}"
@@ -250,6 +307,10 @@ def install_service(
     nellbrain_home: str | Path | None = None,
 ) -> Path:
     """Write, bootstrap, and kickstart the persona LaunchAgent."""
+    reason = unstable_nell_path_reason(nell_path)
+    if reason is not None:
+        raise LaunchdConfigError(reason)
+    truncate_launchd_logs_if_large(persona)
     plist_path = write_launchd_plist(
         persona=persona,
         nell_path=nell_path,
@@ -334,6 +395,14 @@ def doctor_checks(
     try:
         resolved_nell = resolve_nell_path(nell_path)
         checks.append(DoctorCheck("nell_path", True, str(resolved_nell)))
+        stable_reason = unstable_nell_path_reason(resolved_nell)
+        checks.append(
+            DoctorCheck(
+                "nell_path_stable",
+                stable_reason is None,
+                stable_reason or "launchd executable path is stable",
+            )
+        )
     except LaunchdConfigError as exc:
         checks.append(DoctorCheck("nell_path", False, str(exc)))
 
