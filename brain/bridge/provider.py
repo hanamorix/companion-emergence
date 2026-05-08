@@ -162,6 +162,40 @@ class FakeProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 
+def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Return a useful error detail for failed Claude CLI subprocesses.
+
+    Claude Code sometimes exits non-zero with an empty stderr but a structured
+    JSON stdout payload, for example subscription quota responses:
+    ``{"is_error": true, "api_error_status": 429, "result": "..."}``.
+    If we only log stderr, background heartbeat failures become opaque
+    ``exit 1:`` lines. Prefer the structured result when present, then fall
+    back to stderr/stdout snippets.
+    """
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            parts: list[str] = []
+            if payload.get("api_error_status") is not None:
+                parts.append(f"api_error_status={payload['api_error_status']}")
+            if payload.get("is_error") is not None:
+                parts.append(f"is_error={payload['is_error']}")
+            if payload.get("result"):
+                parts.append(str(payload["result"]))
+            if parts:
+                if stderr:
+                    parts.append(f"stderr={stderr}")
+                return "; ".join(parts)
+        if not stderr:
+            return f"stdout={stdout[:500]}"
+    return stderr
+
+
 class ClaudeCliProvider(LLMProvider):
     """Shells out to `claude -p <prompt> --output-format json`.
 
@@ -227,7 +261,8 @@ class ClaudeCliProvider(LLMProvider):
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"ClaudeCliProvider failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"ClaudeCliProvider failed (exit {result.returncode}): "
+                f"{_claude_failure_detail(result)}"
             )
 
         try:
@@ -342,7 +377,7 @@ class ClaudeCliProvider(LLMProvider):
         if result.returncode != 0:
             raise ProviderError(
                 "claude_cli_exit",
-                f"exit {result.returncode}: {result.stderr.strip()}",
+                f"exit {result.returncode}: {_claude_failure_detail(result)}",
             )
 
         try:

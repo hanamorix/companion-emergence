@@ -29,6 +29,23 @@ def test_supervisor_tick_emits_event(persona_dir: Path):
             assert seen, "supervisor_tick not received within 3s"
 
 
+def test_supervisor_prunes_old_empty_sessions(persona_dir: Path):
+    """Empty app-created sessions have no buffer file, so supervisor must prune registry."""
+    from brain.chat.session import all_sessions, reset_registry
+
+    reset_registry()
+    try:
+        with _client(persona_dir, tick_interval_s=0.1, silence_minutes=0.001) as c:
+            c.post("/session/new", json={"client": "tests"})
+            assert len(all_sessions()) == 1
+            deadline = time.time() + 3
+            while time.time() < deadline and all_sessions():
+                time.sleep(0.05)
+            assert all_sessions() == []
+    finally:
+        reset_registry()
+
+
 def test_graceful_shutdown_closes_active_sessions(persona_dir: Path, monkeypatch):
     """With one chat session, lifespan teardown drains via close_stale_sessions(silence_minutes=0)."""
     from tests.bridge.test_endpoints import _patch_fake_provider
