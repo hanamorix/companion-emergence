@@ -31,10 +31,49 @@ _DAEMON_TYPES: tuple[str, ...] = ("dream", "heartbeat", "reflex", "research")
 _RESIDUE_WINDOW_HOURS = 48
 # Residue decay window: how long emotional residue lingers.
 _RESIDUE_DECAY_HOURS = 12
-# Max summary bytes stored.
-_SUMMARY_MAX_CHARS = 250
+# Max summary bytes stored — bumped 2026-05-08 from 250 → 1500 so a
+# full reflex/dream paragraph fits without mid-clause cuts. (250 was the
+# OG NellBrain cap; reflex summaries average ~500 chars and journal
+# arcs can run ~1k.) Truncation, when it does kick in, now lands on a
+# sentence boundary via ``_truncate_at_sentence`` rather than a hard
+# character slice.
+_SUMMARY_MAX_CHARS = 1500
 # Max summary bytes exposed to prompts.
-_CONTEXT_SUMMARY_CHARS = 200
+_CONTEXT_SUMMARY_CHARS = 600
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    """Truncate ``text`` to ``max_chars`` ending on a sentence boundary.
+
+    Avoids the mid-clause cut that the previous hard slice produced
+    ("...like her body still expects him to" — original screenshot).
+    Searches the slice for the rightmost ``. ``, ``! ``, ``? ``,
+    ``."``, or end-of-line break and cuts there. If no sentence break
+    exists in the window, falls back to the hard slice with an
+    ellipsis so it's at least visibly truncated rather than implying
+    the model produced an incomplete sentence.
+    """
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    # Sentence terminators: any of `. `, `! `, `? `, plus paragraph breaks.
+    # `.\n` and `?\n` count as terminators too (poetic-prose newlines).
+    candidates = [
+        window.rfind(". "),
+        window.rfind("! "),
+        window.rfind("? "),
+        window.rfind(".\n"),
+        window.rfind("!\n"),
+        window.rfind("?\n"),
+        window.rfind("\n\n"),
+    ]
+    cut = max(candidates)
+    if cut <= 0:
+        # No sentence break in the window — fall back to hard slice with
+        # an ellipsis so the truncation is at least visible to the reader.
+        return window.rstrip() + "…"
+    # cut is the index of the punctuation; include the punctuation itself.
+    return text[: cut + 1].rstrip()
 
 
 @dataclass(frozen=True)
@@ -53,9 +92,14 @@ class DaemonFireEntry:
     trigger: str | None = None  # only set for reflex fires
 
     def __post_init__(self) -> None:
-        # Enforce summary truncation even if caller forgets.
+        # Enforce summary truncation even if caller forgets. Cuts on the
+        # last sentence boundary inside the cap so the panel never shows
+        # a half-sentence (e.g. "...like her body still expects him to"
+        # was the symptom that drove this fix).
         if len(self.summary) > _SUMMARY_MAX_CHARS:
-            object.__setattr__(self, "summary", self.summary[:_SUMMARY_MAX_CHARS])
+            object.__setattr__(
+                self, "summary", _truncate_at_sentence(self.summary, _SUMMARY_MAX_CHARS),
+            )
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -324,7 +368,7 @@ def get_residue_context(state: DaemonState, *, now: datetime | None = None) -> s
             if hours_ago > _RESIDUE_WINDOW_HOURS:
                 continue
             label = key.replace("last_", "").replace("_", " ")
-            summary = entry.summary[:_CONTEXT_SUMMARY_CHARS]
+            summary = _truncate_at_sentence(entry.summary, _CONTEXT_SUMMARY_CHARS)
             lines.append(f'Previous {label} ({hours_ago:.0f}h ago): "{summary}"')
         except (TypeError, ValueError):
             continue
