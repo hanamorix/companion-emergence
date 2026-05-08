@@ -120,3 +120,108 @@ def test_voice_templates_keys_are_documented() -> None:
     assert set(VOICE_TEMPLATES.keys()) == {"default", "nell-example", "skip"}
     for desc in VOICE_TEMPLATES.values():
         assert isinstance(desc, str) and len(desc) > 20
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-05-07 P2-1 + P2-2 — concurrent-write race regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -> None:
+    """Two concurrent appenders must each land their event line — the
+    previous read-rewrite-replace shape lost one event under contention."""
+    import threading
+    from datetime import UTC, datetime as _dt
+
+    from brain.growth.log import GrowthLogEvent, append_growth_event, read_growth_log
+
+    log_path = tmp_path / "growth_log.jsonl"
+    NUM_THREADS = 8
+    EVENTS_PER_THREAD = 5
+
+    def worker(thread_id: int) -> None:
+        for i in range(EVENTS_PER_THREAD):
+            append_growth_event(
+                log_path,
+                GrowthLogEvent(
+                    timestamp=_dt.now(UTC),
+                    type="emotion_added",
+                    name=f"thread_{thread_id}_event_{i}",
+                    description="concurrent test",
+                    decay_half_life_days=None,
+                    reason="race regression guard",
+                    evidence_memory_ids=(),
+                    score=0.0,
+                    relational_context=None,
+                ),
+            )
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(NUM_THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    events = read_growth_log(log_path)
+    expected = NUM_THREADS * EVENTS_PER_THREAD
+    assert len(events) == expected, (
+        f"expected {expected} events from concurrent appenders; got {len(events)} "
+        f"— races dropped {expected - len(events)} events"
+    )
+    # Every (thread, event) pair must be present exactly once
+    names = {e.name for e in events}
+    expected_names = {
+        f"thread_{t}_event_{i}"
+        for t in range(NUM_THREADS)
+        for i in range(EVENTS_PER_THREAD)
+    }
+    assert names == expected_names
+
+
+def test_soul_candidate_review_holds_lock_against_concurrent_queue(tmp_path: Path) -> None:
+    """While review is in its read-modify-rewrite window, queue_soul_candidate
+    must block until review releases the lock; previously the queued candidate
+    could be silently dropped when review replaced the file."""
+    import threading
+    import time as _time
+
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+    from brain.utils.file_lock import file_lock
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    candidates_path.write_text("")  # empty file so the lock has a sidecar to attach to
+
+    queue_finished = threading.Event()
+
+    def queue_worker():
+        # This MUST block while the lock is held by the test.
+        queue_soul_candidate(
+            persona_dir,
+            memory_id="m1",
+            item=ExtractedItem(text="test", label="fact", importance=5),
+            session_id="s1",
+        )
+        queue_finished.set()
+
+    with file_lock(candidates_path):
+        t = threading.Thread(target=queue_worker, daemon=True)
+        t.start()
+        # Give the worker a chance to attempt + block
+        _time.sleep(0.2)
+        assert not queue_finished.is_set(), (
+            "queue_soul_candidate completed while review held the lock — "
+            "the file_lock guard isn't engaging"
+        )
+    # Lock released — worker should now finish promptly
+    t.join(timeout=2.0)
+    assert queue_finished.is_set(), "queue_soul_candidate didn't finish after lock released"
+
+    # Candidate did persist
+    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+    records = read_jsonl_skipping_corrupt(candidates_path)
+    assert len(records) == 1
+    assert records[0]["memory_id"] == "m1"
