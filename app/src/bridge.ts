@@ -105,11 +105,27 @@ export interface SoulHighlight {
   why_it_matters: string | null;
 }
 
-export async function fetchPersonaState(persona: string): Promise<PersonaState> {
+async function fetchPersonaStateOnce(persona: string): Promise<PersonaState> {
   const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) });
   if (!r.ok) throw new Error(`/persona/state ${r.status}`);
   return await r.json();
+}
+
+export async function fetchPersonaState(persona: string): Promise<PersonaState> {
+  try {
+    return await fetchPersonaStateOnce(persona);
+  } catch (e) {
+    // A bridge restart rotates port + bearer token in bridge.json. The app polls
+    // state continuously, so one failed read is a good signal to invalidate the
+    // per-persona credential cache and retry once against fresh bridge.json.
+    resetBridgeCredentialCache(persona);
+    try {
+      return await fetchPersonaStateOnce(persona);
+    } catch {
+      throw e;
+    }
+  }
 }
 
 export interface NewSessionResponse {
