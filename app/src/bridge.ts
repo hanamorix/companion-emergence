@@ -207,12 +207,22 @@ export async function uploadImage(persona: string, file: File): Promise<ImageUpl
  * Throws on non-2xx so callers can surface "memory save pending/failed"
  * status to the user; previously this swallowed errors silently.
  */
-export async function closeSession(persona: string, sessionId: string): Promise<void> {
+export interface CloseSessionOptions {
+  /** Keep the close request alive during page/app unload when supported. */
+  keepalive?: boolean;
+}
+
+export async function closeSession(
+  persona: string,
+  sessionId: string,
+  options: CloseSessionOptions = {},
+): Promise<void> {
   const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/sessions/close`, {
     method: "POST",
     headers: authHeaders(creds),
     body: JSON.stringify({ session_id: sessionId }),
+    keepalive: options.keepalive,
   });
   if (!r.ok) {
     const text = await r.text().catch(() => "");
