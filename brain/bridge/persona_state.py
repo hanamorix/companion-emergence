@@ -147,6 +147,51 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
         return {}
 
 
+def _active_session_hours(persona_dir: Path, *, now: datetime) -> float:
+    """How long the current chat session has been live, in hours.
+
+    Reads the earliest entry timestamp from any active conversation
+    buffer in ``<persona>/active_conversations/`` — if a session is
+    open, that's when the user started this turn-block. If multiple
+    buffers exist (rare; concurrent sessions), takes the earliest.
+    Returns 0.0 when no session is open, which matches the panel's
+    "fresh session" expectation.
+    """
+    conv_dir = persona_dir / "active_conversations"
+    if not conv_dir.exists():
+        return 0.0
+    earliest_ts: datetime | None = None
+    try:
+        for buffer in conv_dir.glob("*.jsonl"):
+            try:
+                with buffer.open("r", encoding="utf-8") as fh:
+                    first = fh.readline().strip()
+                if not first:
+                    continue
+                entry = json.loads(first)
+                ts_raw = entry.get("timestamp") or entry.get("ts")
+                if not ts_raw:
+                    continue
+                if isinstance(ts_raw, str):
+                    if ts_raw.endswith("Z"):
+                        ts_raw = ts_raw[:-1] + "+00:00"
+                    ts = datetime.fromisoformat(ts_raw)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
+                else:
+                    continue
+                if earliest_ts is None or ts < earliest_ts:
+                    earliest_ts = ts
+            except (json.JSONDecodeError, OSError, ValueError):
+                continue
+    except OSError:
+        return 0.0
+    if earliest_ts is None:
+        return 0.0
+    elapsed = (now - earliest_ts).total_seconds() / 3600.0
+    return max(0.0, elapsed)
+
+
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
     """Body block from compute_body_state. None on failure."""
     try:
@@ -158,21 +203,30 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
 
         store = MemoryStore(persona_dir / "memories.db")
         try:
+            # Same fix as _build_emotions: filter to memories that
+            # actually carry an emotion vector. The naive last-50-by-date
+            # slice was almost all heartbeats / observations / facts
+            # (empty emotions_json), so body_emotions stayed at zero
+            # even when the underlying brain had strong signal.
             rows = store._conn.execute(  # noqa: SLF001
-                "SELECT * FROM memories WHERE active = 1 "
-                "ORDER BY created_at DESC LIMIT 50"
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
             ).fetchall()
             memories = [_row_to_memory(row) for row in rows]
             state = aggregate_state(memories)
             days = days_since_human(store, now=now, persona_dir=persona_dir)
-            # session_hours=0 here — the panel snapshot doesn't track per-session
-            # time. count_words_in_session falls back to 1-hour window on 0.
+            # session_hours from the active conversation buffer's
+            # earliest entry — 0 when no session is open.
+            session_hours = _active_session_hours(persona_dir, now=now)
             words = count_words_in_session(
-                store, persona_dir=persona_dir, session_hours=0.0, now=now,
+                store, persona_dir=persona_dir, session_hours=session_hours, now=now,
             )
             body = compute_body_state(
                 emotions=state.emotions,
-                session_hours=0.0,
+                session_hours=session_hours,
                 words_written=words,
                 days_since_contact=days,
                 now=now,
