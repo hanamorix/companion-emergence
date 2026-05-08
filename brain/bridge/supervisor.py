@@ -41,6 +41,7 @@ from pathlib import Path
 
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
+from brain.chat.session import prune_empty_sessions, remove_session
 from brain.ingest.pipeline import close_stale_sessions
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -98,6 +99,13 @@ def run_folded(
                     provider=provider,
                     embeddings=embeddings,
                 )
+                closed_session_ids = [r.session_id for r in reports if r.errors == 0]
+                for sid in closed_session_ids:
+                    remove_session(sid)
+                pruned_empty_sessions = prune_empty_sessions(
+                    older_than_seconds=silence_minutes * 60.0,
+                    persona_name=persona_dir.name,
+                )
 
             # Publish events outside the with-block — events don't need stores.
             for r in reports:
@@ -116,6 +124,7 @@ def run_folded(
                 {
                     "type": "supervisor_tick",
                     "closed_sessions": len(reports),
+                    "pruned_empty_sessions": len(pruned_empty_sessions),
                     "next_tick_in_s": tick_interval_s,
                     "at": _now_iso(),
                 }

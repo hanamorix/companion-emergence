@@ -21,6 +21,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import {
+  closeSession,
   fetchPersonaState,
   getBridgeCredentials,
   resetBridgeCredentialCache,
@@ -88,5 +89,21 @@ describe("getBridgeCredentials", () => {
     await expect(fetchPersonaState("alice")).resolves.toMatchObject({ persona: "alice" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("can keep session-close alive during app unload", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await closeSession("alice", "session-1", { keepalive: true });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:41001/sessions/close",
+      expect.objectContaining({
+        method: "POST",
+        keepalive: true,
+        body: JSON.stringify({ session_id: "session-1" }),
+      }),
+    );
   });
 });

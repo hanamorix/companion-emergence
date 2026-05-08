@@ -137,6 +137,37 @@ def remove_session(session_id: str) -> bool:
         return _SESSIONS.pop(session_id, None) is not None
 
 
+def prune_empty_sessions(
+    *,
+    older_than_seconds: float,
+    now: datetime | None = None,
+    persona_name: str | None = None,
+) -> list[str]:
+    """Remove idle sessions that never completed a turn.
+
+    The desktop app used to open a bridge session on mount. If the app quit
+    before the renderer's best-effort close request completed, those zero-turn
+    sessions lived forever in the in-memory bridge registry because there is no
+    ``active_conversations/<sid>.jsonl`` buffer for the stale-session sweeper to
+    discover. Pruning only zero-turn sessions is safe: no transcript exists, so
+    there is nothing to ingest or remember.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    removed: list[str] = []
+    with _LOCK:
+        for sid, session in list(_SESSIONS.items()):
+            if persona_name is not None and session.persona_name != persona_name:
+                continue
+            if session.turns != 0 or session.history:
+                continue
+            age = (now - session.created_at).total_seconds()
+            if age >= older_than_seconds:
+                _SESSIONS.pop(sid, None)
+                removed.append(sid)
+    return removed
+
+
 def reset_registry() -> None:
     """Clear the in-memory registry. Test-only helper."""
     with _LOCK:
