@@ -32,10 +32,10 @@ const POLL_INTERVAL_MS = 800;
  * through:
  *   1. Bridge starting (ensureBridgeRunning resolves)
  *   2. State poll (the persona-state endpoint returns 200)
- *   3. Emotions populated (aggregate has at least one non-zero entry)
+ *   3. Emotion warm-up checked (optional; first heartbeat may lag)
  *
  * Each stage shows pending / running / ok / error so the user can see
- * what's happening instead of staring at a spinner. When all green
+ * what's happening instead of staring at a spinner. When state is reachable
  * the wizard auto-transitions; if anything stalls past
  * ``READY_TIMEOUT_MS`` we surface a "continue anyway" button so the
  * user isn't trapped (the main app's status banner will surface the
@@ -45,7 +45,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
   const [stages, setStages] = useState<Stage[]>([
     { key: "bridge", label: "Bringing the brain online", status: "running" },
     { key: "state", label: "Reading persona state", status: "pending" },
-    { key: "emotions", label: "Aggregating emotions", status: "pending" },
+    { key: "emotions", label: "Emotion warm-up", status: "pending" },
   ]);
   const [fellThrough, setFellThrough] = useState(false);
   const cancelledRef = useRef(false);
@@ -73,7 +73,9 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
         return;
       }
 
-      // Stage 2 + 3: poll state until emotions populate or timeout.
+      // Stage 2 + 3: poll state until /persona/state responds. Emotions are a
+      // warm-up signal, not a readiness gate: a fresh persona may not have a
+      // heartbeat-derived aggregate for several minutes.
       update("state", { status: "running" });
       while (!cancelledRef.current) {
         if (Date.now() - startedAt > READY_TIMEOUT_MS) {
@@ -94,13 +96,17 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
                 ? `${top[0]} ${(top[1] as number).toFixed(1)} + ${emotionCount - 1} more`
                 : undefined,
             });
-            // Auto-transition into the main app once everything's green.
-            timeoutId = setTimeout(() => {
-              if (!cancelledRef.current) onDone();
-            }, 1200);
-            return;
+          } else {
+            update("emotions", {
+              status: "ok",
+              detail: "No emotions yet; heartbeat will warm this up shortly.",
+            });
           }
-          update("emotions", { status: "running", detail: "No emotions yet — heartbeat will fire shortly." });
+          // Auto-transition into the main app once state is reachable.
+          timeoutId = setTimeout(() => {
+            if (!cancelledRef.current) onDone();
+          }, 1200);
+          return;
         } catch (e) {
           // Don't flip state to error on the first failed poll —
           // bridge might still be coming up. Only surface after the
@@ -124,7 +130,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
       step={step}
       totalSteps={totalSteps}
       title="Coming online"
-      subtitle="Your persona's brain is starting up. Watch them wake — emotions, body state, and recent interior should populate within a few seconds."
+      subtitle="Your persona's brain is starting up. Once state is reachable, the app can open while emotions and interior warm up in the background."
       avatar={avatar}
       footer={
         <>
@@ -163,10 +169,8 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
             The brain didn't reply within {READY_TIMEOUT_MS / 1000} seconds.
             That's almost always one of: <em>claude</em> not on the
             launchd PATH, the supervisor needing a kickstart, or the
-            first heartbeat not having fired yet (heartbeats run every
-            15 minutes and the very first one happens 15 min after
-            startup). The Connection panel inside the app will surface
-            whichever it is.
+            bridge still warming up. The Connection panel inside the app
+            will surface whichever it is.
           </div>
         </>
       )}
