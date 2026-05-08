@@ -212,11 +212,33 @@ export interface CloseSessionOptions {
   keepalive?: boolean;
 }
 
+export interface CloseSessionResponse {
+  session_id: string;
+  closed: boolean;
+  committed: number;
+  deduped: number;
+  soul_candidates: number;
+  soul_queue_errors: number;
+  errors: number;
+}
+
+function closeErrorDetail(body: unknown): string {
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail?: unknown }).detail;
+    if (detail && typeof detail === "object") {
+      const d = detail as Partial<CloseSessionResponse> & { code?: string };
+      return `${d.code ?? "ingest_failed"}; closed=${d.closed ?? false}; errors=${d.errors ?? "?"}`;
+    }
+    if (typeof detail === "string") return detail;
+  }
+  return "ingest_failed";
+}
+
 export async function closeSession(
   persona: string,
   sessionId: string,
   options: CloseSessionOptions = {},
-): Promise<void> {
+): Promise<CloseSessionResponse> {
   const creds = await getBridgeCredentials(persona);
   const r = await fetch(`${creds.url}/sessions/close`, {
     method: "POST",
@@ -225,7 +247,14 @@ export async function closeSession(
     keepalive: options.keepalive,
   });
   if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`/sessions/close ${r.status}: ${text.slice(0, 200)}`);
+    let detail = "";
+    try {
+      detail = closeErrorDetail(await r.json());
+    } catch {
+      const text = await r.text().catch(() => "");
+      detail = text.slice(0, 200);
+    }
+    throw new Error(`/sessions/close ${r.status}: ${detail}`);
   }
+  return (await r.json()) as CloseSessionResponse;
 }

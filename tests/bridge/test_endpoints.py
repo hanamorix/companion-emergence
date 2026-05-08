@@ -14,7 +14,7 @@ def _make_client(persona_dir: Path) -> TestClient:
     return TestClient(app)
 
 
-def _patch_fake_provider(monkeypatch, reply: str = "default reply"):
+def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: str = "[]"):
     """Replace get_provider so the lifespan returns a stub that yields `reply`.
 
     Patches brain.bridge.server.get_provider (not build_provider — Task 4 used
@@ -32,7 +32,7 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply"):
             return ChatResponse(content=reply, tool_calls=[])
 
         def generate(self, prompt, *, system=None):
-            return reply
+            return extraction
 
     monkeypatch.setattr(srv, "get_provider", lambda _name: _Fake())
 
@@ -171,6 +171,62 @@ def test_sessions_close_returns_ingest_report(persona_dir: Path, monkeypatch):
         assert "deduped" in body
         assert "soul_queue_errors" in body
         assert "errors" in body
+
+
+def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, monkeypatch):
+    """A retryable ingest report must not remove the live session registry entry."""
+    from brain.ingest.types import IngestReport
+
+    calls = 0
+
+    def fake_close(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        report = IngestReport(session_id=args[1])
+        if calls == 1:
+            report.errors = 1
+        return report
+
+    monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        first = c.post("/sessions/close", json={"session_id": sid})
+        assert first.status_code == 502
+        detail = first.json()["detail"]
+        assert detail["closed"] is False
+        assert detail["errors"] == 1
+
+        # The same session id is still known and can be retried.
+        assert c.get(f"/state/{sid}").status_code == 200
+        second = c.post("/sessions/close", json={"session_id": sid})
+        assert second.status_code == 200
+        assert second.json()["closed"] is True
+
+
+def test_sessions_close_exception_stays_retryable(persona_dir: Path, monkeypatch):
+    calls = 0
+
+    def fake_close(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("extractor exploded")
+        from brain.ingest.types import IngestReport
+
+        return IngestReport(session_id=args[1])
+
+    monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        first = c.post("/sessions/close", json={"session_id": sid})
+        assert first.status_code == 502
+        assert first.json()["detail"]["closed"] is False
+
+        second = c.post("/sessions/close", json={"session_id": sid})
+        assert second.status_code == 200
+        assert second.json()["closed"] is True
 
 
 def test_stream_round_trip(persona_dir: Path, monkeypatch):
