@@ -254,11 +254,34 @@ def _strip_label(text: str | None, label: str) -> str | None:
     return pattern.sub("", text, count=1).lstrip() or None
 
 
+def _entry_iso_timestamp(entry: dict) -> str | None:
+    """Pull the iso timestamp off a daemon_state ``last_*`` entry.
+
+    Different writers use different field names — accept any of
+    ``timestamp`` / ``ts`` / ``written_at`` / ``fired_at`` and
+    return None if none parses.
+    """
+    for key in ("timestamp", "ts", "written_at", "fired_at"):
+        raw = entry.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
 def _build_interior(persona_dir: Path) -> dict[str, Any]:
-    """Recent interior — dream / research / heartbeat / reflex themes.
+    """Recent interior — dream / research / heartbeat / reflex themes
+    plus per-entry timestamps so the UI can render "X ago" badges.
 
     Reads daemon_state.json directly (no LLM call). Empty dict on
     failure; missing fields default to None.
+
+    Output shape:
+        {
+          "dream":     {"summary": "...", "ts": "2026-...Z"} | null,
+          "research":  {"summary": "...", "ts": "..."}        | null,
+          "heartbeat": {"summary": "love 9/10", "ts": "..."}  | null,
+          "reflex":    {"summary": "...", "ts": "..."}        | null,
+        }
     """
     out: dict[str, Any] = {
         "dream": None,
@@ -278,22 +301,29 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
             # not like" was the screenshot symptom). Reflex already used
             # ``summary``; dream is brought into line.
             dream_text = last_dream.get("summary") or last_dream.get("theme")
-            out["dream"] = _strip_label(dream_text, "dream")
+            summary = _strip_label(dream_text, "dream")
+            if summary:
+                out["dream"] = {"summary": summary, "ts": _entry_iso_timestamp(last_dream)}
         if last_research := ds.get("last_research"):
             research_text = last_research.get("summary") or last_research.get("theme")
-            out["research"] = _strip_label(research_text, "research")
+            summary = _strip_label(research_text, "research")
+            if summary:
+                out["research"] = {"summary": summary, "ts": _entry_iso_timestamp(last_research)}
         if last_heartbeat := ds.get("last_heartbeat"):
-            # Heartbeat doesn't have a "theme" field by convention; surface a
-            # short summary built from its dominant emotion.
             dom = last_heartbeat.get("dominant_emotion")
             intensity = last_heartbeat.get("intensity")
             if dom and intensity is not None:
-                out["heartbeat"] = f"{dom} {intensity}/10"
+                out["heartbeat"] = {
+                    "summary": f"{dom} {intensity}/10",
+                    "ts": _entry_iso_timestamp(last_heartbeat),
+                }
         if last_reflex := ds.get("last_reflex"):
-            out["reflex"] = _strip_label(
+            summary = _strip_label(
                 last_reflex.get("summary") or last_reflex.get("arc_name"),
                 "reflex",
             )
+            if summary:
+                out["reflex"] = {"summary": summary, "ts": _entry_iso_timestamp(last_reflex)}
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: interior read failed", exc_info=True)
     return out
