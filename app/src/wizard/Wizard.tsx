@@ -1,5 +1,10 @@
 import { useState } from "react";
-import { runInit, writeAppConfig, type InitArgs } from "../appConfig";
+import {
+  installSupervisorService,
+  runInit,
+  writeAppConfig,
+  type InitArgs,
+} from "../appConfig";
 import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
 import { StepPersonaName } from "./steps/StepPersonaName";
@@ -92,22 +97,42 @@ export function Wizard({ onDone }: Props) {
     };
     try {
       const result = await runInit(args);
-      if (result.success) {
-        await writeAppConfig({
-          selected_persona: state.personaName,
-          always_on_top: false,
-          reduced_motion: false,
-        });
-        setInstallResult({ ok: true, output: result.stdout, error: "" });
-        // Brief pause so user sees the success state, then route to main app
-        setTimeout(() => onDone(state.personaName), 1500);
-      } else {
+      if (!result.success) {
         setInstallResult({
           ok: false,
           output: result.stdout,
           error: result.stderr || `exit ${result.exit_code}`,
         });
+        return;
       }
+      await writeAppConfig({
+        selected_persona: state.personaName,
+        always_on_top: false,
+        reduced_motion: false,
+      });
+      // Plan C — install the launchd LaunchAgent so the supervisor
+      // outlives the .app from the very first run. Best-effort: a
+      // failure here doesn't block the wizard (the legacy Tauri-spawn
+      // path still works), but we surface the stderr in the success
+      // pane so the user can fix it from the connection panel later.
+      let serviceTrailer = "";
+      try {
+        const svc = await installSupervisorService(state.personaName);
+        serviceTrailer = svc.success
+          ? `\n\n[service] launchd agent installed`
+          : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
+      } catch (e) {
+        serviceTrailer =
+          `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
+          " — supervisor will fall back to the .app's lifecycle.";
+      }
+      setInstallResult({
+        ok: true,
+        output: result.stdout + serviceTrailer,
+        error: "",
+      });
+      // Brief pause so user sees the success state, then route to main app
+      setTimeout(() => onDone(state.personaName), 1500);
     } catch (e) {
       setInstallResult({ ok: false, output: "", error: (e as Error).message });
     }

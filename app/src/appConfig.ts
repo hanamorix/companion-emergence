@@ -92,3 +92,19 @@ export interface InitResult {
 export async function runInit(args: InitArgs): Promise<InitResult> {
   return await invoke<InitResult>("run_init", { args });
 }
+
+/**
+ * Install the launchd LaunchAgent for the persona's supervisor.
+ *
+ * Run this after a successful ``runInit`` so first-launch users land
+ * on the launchd-managed-supervisor model directly. The supervisor
+ * then survives .app quit/relaunch cycles via launchd's KeepAlive,
+ * which solves the "talk to Nell, close the app, brain dies" issue
+ * the audit cycle motivated.
+ *
+ * macOS-only — non-darwin platforms get a synthetic success and the
+ * legacy Tauri-spawn-supervisor path keeps working unchanged.
+ */
+export async function installSupervisorService(persona: string): Promise<InitResult> {
+  return await invoke<InitResult>("install_supervisor_service", { persona });
+}
