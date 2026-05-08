@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ensureBridgeRunning,
   readAppConfig,
@@ -6,6 +7,11 @@ import {
   writeAppConfig,
   type AppConfig,
 } from "./appConfig";
+
+function dragWindow(e: React.MouseEvent) {
+  if (e.button !== 0) return;
+  void getCurrentWindow().startDragging();
+}
 import { fetchPersonaState, type PersonaState } from "./bridge";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
@@ -22,12 +28,12 @@ type AppPhase =
   | { kind: "ready"; persona: string };
 
 /**
- * NellFace top-level routing.
+ * Companion Emergence top-level routing.
  *
  *   loading           — initial config read
  *   wizard            — first launch (no persona) or re-init triggered
  *   starting-bridge   — calling ensure_bridge_running for the persona
- *   ready             — main NellFace UI: avatar + panels + chat
+ *   ready             — main UI: avatar + panels + chat
  */
 export default function App() {
   const [phase, setPhase] = useState<AppPhase>({ kind: "loading" });
@@ -90,7 +96,12 @@ export default function App() {
     );
   }
 
-  return <Ready config={config!} setConfig={setConfig} persona={phase.persona} />;
+  return (
+    <>
+      <div className="titlebar-drag" onMouseDown={dragWindow} />
+      <Ready config={config!} setConfig={setConfig} persona={phase.persona} />
+    </>
+  );
 }
 
 function BootScreen({ subtitle }: { subtitle: string }) {

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -170,6 +171,21 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
         return None
 
 
+def _strip_label(text: str | None, label: str) -> str | None:
+    """Strip a leading section-label prefix from interior text.
+
+    Dream/reflex/research themes are written by a model that sometimes
+    self-narrates with a header (``"DREAM: I was back in..."``). The UI
+    renders the section name above the text already, so the in-body
+    prefix shows up twice. Strip it once at the data boundary so every
+    consumer benefits.
+    """
+    if not text:
+        return text
+    pattern = re.compile(rf"^\s*{re.escape(label)}\s*[:\-—]\s*", re.IGNORECASE)
+    return pattern.sub("", text, count=1).lstrip() or None
+
+
 def _build_interior(persona_dir: Path) -> dict[str, Any]:
     """Recent interior — dream / research / heartbeat / reflex themes.
 
@@ -188,9 +204,9 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
             return out
         ds = json.loads(ds_path.read_text(encoding="utf-8"))
         if last_dream := ds.get("last_dream"):
-            out["dream"] = last_dream.get("theme")
+            out["dream"] = _strip_label(last_dream.get("theme"), "dream")
         if last_research := ds.get("last_research"):
-            out["research"] = last_research.get("theme")
+            out["research"] = _strip_label(last_research.get("theme"), "research")
         if last_heartbeat := ds.get("last_heartbeat"):
             # Heartbeat doesn't have a "theme" field by convention; surface a
             # short summary built from its dominant emotion.
@@ -199,7 +215,10 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
             if dom and intensity is not None:
                 out["heartbeat"] = f"{dom} {intensity}/10"
         if last_reflex := ds.get("last_reflex"):
-            out["reflex"] = last_reflex.get("summary") or last_reflex.get("arc_name")
+            out["reflex"] = _strip_label(
+                last_reflex.get("summary") or last_reflex.get("arc_name"),
+                "reflex",
+            )
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: interior read failed", exc_info=True)
     return out

@@ -145,7 +145,7 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
         border: "1px solid var(--border)",
         borderRadius: 8,
         padding: "14px 14px 16px",
-        boxShadow: "0 2px 12px rgba(42,31,31,0.18), 0 0 0 1px rgba(130,51,41,0.06)",
+        boxShadow: "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
         width: 220,
         maxHeight: 360,
         overflowY: "auto",
