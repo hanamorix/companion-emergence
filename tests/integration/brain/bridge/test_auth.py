@@ -124,6 +124,39 @@ def test_http_health_also_protected(persona_dir_for_auth: Path, monkeypatch):
         assert r_yes.status_code == 200
 
 
+def test_http_cors_allows_tauri_dev_origin(persona_dir_for_auth: Path, monkeypatch):
+    """Tauri dev uses http://localhost:1420; WebKit reports CORS blocks as 'Load failed'."""
+    _patch_provider(monkeypatch, _FakeProvider())
+    app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
+    with TestClient(app) as c:
+        r = c.options(
+            "/persona/state",
+            headers={
+                "Origin": "http://localhost:1420",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "http://localhost:1420"
+        assert "Authorization" in r.headers["access-control-allow-headers"]
+
+
+def test_http_cors_still_rejects_untrusted_origin(persona_dir_for_auth: Path, monkeypatch):
+    _patch_provider(monkeypatch, _FakeProvider())
+    app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
+    with TestClient(app) as c:
+        r = c.options(
+            "/persona/state",
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        assert r.status_code == 400
+
+
 # ---------- WebSocket auth ----------
 
 
