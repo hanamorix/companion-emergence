@@ -31,12 +31,13 @@ export function BodyPanel({ state }: Props) {
             {Object.entries(body.body_emotions)
               .filter(([, v]) => v > 0.4)
               .sort(([, a], [, b]) => b - a)
+              .slice(0, 5)
               .map(([name, value]) => (
                 <Bar key={name} label={name} value={value} max={10} />
               ))}
             {Object.values(body.body_emotions).every((v) => v <= 0.4) && (
               <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-                quiet
+                Quiet.
               </div>
             )}
           </div>
@@ -53,7 +54,7 @@ export function BodyPanel({ state }: Props) {
         </>
       ) : (
         <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-          body offline
+          Body offline.
         </div>
       )}
     </PanelShell>
