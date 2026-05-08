@@ -128,14 +128,17 @@ def spawn_detached(
     if idle_shutdown_seconds is not None:
         cmd += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    return proc.pid
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc.pid
+    finally:
+        log_fh.close()
 
 
 @dataclass
@@ -186,6 +189,15 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         return 2
 
     try:
+        client_origin = getattr(args, "client_origin", "cli")
+        if client_origin == "launchd":
+            try:
+                from brain.service.launchd import truncate_launchd_logs_if_large
+
+                truncate_launchd_logs_if_large(args.persona)
+            except Exception:
+                logger.debug("launchd log truncation skipped", exc_info=True)
+
         drained = run_recovery_if_needed(persona_dir)
         if drained is not None:
             if drained > 0:
@@ -260,6 +272,15 @@ def cmd_run(args) -> int:
         return 2
 
     try:
+        client_origin = getattr(args, "client_origin", "cli")
+        if client_origin == "launchd":
+            try:
+                from brain.service.launchd import truncate_launchd_logs_if_large
+
+                truncate_launchd_logs_if_large(args.persona)
+            except Exception:
+                logger.debug("launchd log truncation skipped", exc_info=True)
+
         drained = run_recovery_if_needed(persona_dir)
         if drained is not None:
             if drained > 0:
@@ -270,7 +291,6 @@ def cmd_run(args) -> int:
         from brain.bridge.runner import run_bridge_foreground
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
-        client_origin = getattr(args, "client_origin", "cli")
         return run_bridge_foreground(
             persona_dir,
             client_origin=client_origin,

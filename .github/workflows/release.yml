@@ -158,6 +158,18 @@ jobs:
         run: pnpm tauri build --bundles ${{ matrix.platform.bundles }}
         shell: bash
 
+      - name: Validate bundled Python runtime
+        working-directory: app/src-tauri
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY="python-runtime/python.exe"
+          else
+            PY="python-runtime/bin/python3"
+            file "$PY" || true
+          fi
+          "$PY" -c "import platform, sys; import brain, fastapi, uvicorn; print(sys.executable); print(platform.platform(), platform.machine())"
+        shell: bash
+
       - name: Upload bundle artifacts (workflow retention)
         uses: actions/upload-artifact@v4
         with:
