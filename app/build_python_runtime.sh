@@ -92,7 +92,14 @@ find "$RUNTIME_DIR" -mindepth 1 -not -name ".gitkeep" -prune -exec rm -rf {} + 2
 
 # 2. Fetch + extract python-build-standalone
 TMP_TAR="$(mktemp -t pbs-XXXX.tar.gz)"
-trap 'rm -f "$TMP_TAR"' EXIT
+TMP_SUMS="$(mktemp -t pbs-sums-XXXX)"
+TMP_REQ="$(mktemp -t companion-runtime-reqs-XXXX.txt)"
+TMP_VERIFY="$(mktemp -d -t companion-runtime-verify-XXXX)"
+cleanup() {
+  rm -f "$TMP_TAR" "$TMP_SUMS" "$TMP_REQ"
+  rm -rf "$TMP_VERIFY"
+}
+trap cleanup EXIT
 
 echo "[build] downloading ${PBS_ASSET}"
 if ! curl -fsSL -o "$TMP_TAR" "$PBS_URL"; then
@@ -108,8 +115,6 @@ fi
 # supply-chain rigor, hardcode a known-good SHA256SUMS hash and
 # verify the manifest itself. We accept the upstream-trust posture
 # here since python-build-standalone is Astral-published.
-TMP_SUMS="$(mktemp -t pbs-sums-XXXX)"
-trap 'rm -f "$TMP_TAR" "$TMP_SUMS"' EXIT
 SUMS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/SHA256SUMS"
 echo "[build] fetching SHA256SUMS for verification"
 if ! curl -fsSL -o "$TMP_SUMS" "$SUMS_URL"; then
@@ -142,7 +147,7 @@ echo "[build] python sanity check"
 "$PY_BIN" --version
 
 # 3. Build the brain wheel from the source tree
-echo "[build] uv build → wheel"
+echo "[build] uv build -> wheel"
 cd "$REPO_ROOT"
 rm -rf dist/
 uv build --wheel >/dev/null
@@ -150,11 +155,22 @@ WHEEL="$(ls dist/*.whl | head -n1)"
 [ -n "$WHEEL" ] || { echo "[build] FAIL: no wheel produced" >&2; exit 1; }
 echo "[build] wheel: $(basename "$WHEEL")"
 
-# 4. Install the wheel into the bundled runtime
-echo "[build] installing brain + deps into bundled python"
-"$PY_BIN" -m ensurepip --upgrade >/dev/null
-"$PY_BIN" -m pip install --quiet --upgrade pip
-"$PY_BIN" -m pip install --quiet "$WHEEL"
+# 4. Install locked runtime dependencies + the wheel into the bundled runtime.
+# The previous pip install resolved broad pyproject ranges at build time, so two
+# release builds from the same commit could ship different dependency versions.
+echo "[build] exporting locked runtime requirements"
+uv export \
+  --format requirements.txt \
+  --no-dev \
+  --no-emit-project \
+  --locked \
+  --output-file "$TMP_REQ" >/dev/null
+
+echo "[build] installing locked deps into bundled python"
+uv pip install --python "$PY_BIN" --require-hashes --requirements "$TMP_REQ" --quiet
+
+echo "[build] installing companion-emergence wheel into bundled python"
+uv pip install --python "$PY_BIN" --no-deps --quiet "$WHEEL"
 
 # 5. Replace the pip-generated nell entry point with a relocatable
 # wrapper. pip bakes the absolute path of *this build's* python into
@@ -187,14 +203,25 @@ fi
 
 # 6a. Verify the brain entry point + import work in the bundled python
 echo "[build] verify brain import + entry point"
-"$PY_BIN" -c "import brain; import brain.cli; print('  brain:', brain.__file__)"
-"$NELL_BIN" --version
-echo "[build] verify nell can resolve brain.voice_templates"
-"$PY_BIN" -c "
+(
+  cd "$TMP_VERIFY"
+  "$PY_BIN" -c "
+from pathlib import Path
+import brain
+import brain.cli
+brain_file = Path(brain.__file__).resolve()
+runtime_root = Path('$RUNTIME_DIR').resolve()
+print('  brain:', brain_file)
+assert str(brain_file).startswith(str(runtime_root)), brain_file
+"
+  "$NELL_BIN" --version
+  echo "[build] verify nell can resolve brain.voice_templates"
+  "$PY_BIN" -c "
 from importlib.resources import files
 content = files('brain.voice_templates').joinpath('nell-voice.md').read_text(encoding='utf-8')
 print('  nell-voice.md:', len(content), 'bytes')
 "
+)
 
 # 6b. Strip everything we don't need at runtime to shrink the bundle.
 # Audit 2026-05-07 P3-9: the previous prune only removed __pycache__
@@ -231,6 +258,12 @@ if [ "$HOST_OS" = "unix" ]; then
   find "$RUNTIME_DIR/lib" -name "config-*" -type d -prune -exec rm -rf {} + 2>/dev/null || true
   # Man pages — interactive doc, not used by the .app.
   rm -rf "$RUNTIME_DIR/share/man" 2>/dev/null || true
+  # Runtime should not self-mutate. Remove package managers and interactive/dev
+  # helper entry points after the locked install is complete.
+  rm -f "$RUNTIME_DIR/bin/pip" "$RUNTIME_DIR/bin/pip3" "$RUNTIME_DIR/bin/pip3.13" 2>/dev/null || true
+  rm -f "$RUNTIME_DIR/bin/idle3" "$RUNTIME_DIR/bin/idle3.13" "$RUNTIME_DIR/bin/pydoc3" "$RUNTIME_DIR/bin/pydoc3.13" 2>/dev/null || true
+  rm -f "$RUNTIME_DIR/bin/python3-config" "$RUNTIME_DIR/bin/python3.13-config" 2>/dev/null || true
+  rm -f "$RUNTIME_DIR/bin/f2py" "$RUNTIME_DIR/bin/numpy-config" 2>/dev/null || true
 else
   # Windows layout — stdlib at Lib/, no separate include/lib split for
   # most dev-only artifacts. Same prune set, mapped paths.
@@ -240,11 +273,30 @@ else
   rm -rf "$STDLIB_DIR/tkinter" 2>/dev/null || true
   rm -rf "$RUNTIME_DIR/tcl" 2>/dev/null || true
   rm -rf "$RUNTIME_DIR/Doc" 2>/dev/null || true
+  rm -f "$RUNTIME_DIR/Scripts/pip"* "$RUNTIME_DIR/Scripts/idle"* "$RUNTIME_DIR/Scripts/pydoc"* 2>/dev/null || true
+  rm -f "$RUNTIME_DIR/Scripts/f2py"* "$RUNTIME_DIR/Scripts/numpy-config"* 2>/dev/null || true
 fi
+
+rm -rf "$SITE_PACKAGES"/pip "$SITE_PACKAGES"/pip-*.dist-info 2>/dev/null || true
+rm -rf "$SITE_PACKAGES"/setuptools "$SITE_PACKAGES"/setuptools-*.dist-info 2>/dev/null || true
+rm -rf "$SITE_PACKAGES"/wheel "$SITE_PACKAGES"/wheel-*.dist-info 2>/dev/null || true
 
 PRUNE_SIZE_AFTER="$(du -sk "$RUNTIME_DIR" | cut -f1)"
 PRUNE_SAVED_KB=$((PRUNE_SIZE_BEFORE - PRUNE_SIZE_AFTER))
 echo "[build] prune saved: $((PRUNE_SAVED_KB / 1024)) MB (before $((PRUNE_SIZE_BEFORE / 1024)) MB → after $((PRUNE_SIZE_AFTER / 1024)) MB)"
 
+if [ "$HOST_OS" = "unix" ]; then
+  echo "[build] runtime binary architecture"
+  file "$PY_BIN" || true
+fi
+"$PY_BIN" -c "import platform, sys; print('  executable:', sys.executable); print('  machine:', platform.machine())"
+
+SIZE_KB="$(du -sk "$RUNTIME_DIR" | cut -f1)"
 SIZE="$(du -sh "$RUNTIME_DIR" | cut -f1)"
-echo "[build] PASS — bundled runtime ready at $RUNTIME_DIR ($SIZE)"
+MAX_RUNTIME_MB="${MAX_RUNTIME_MB:-220}"
+MAX_RUNTIME_KB=$((MAX_RUNTIME_MB * 1024))
+if [ "$SIZE_KB" -gt "$MAX_RUNTIME_KB" ]; then
+  echo "[build] FAIL: bundled runtime is $SIZE, budget is ${MAX_RUNTIME_MB}M" >&2
+  exit 1
+fi
+echo "[build] PASS - bundled runtime ready at $RUNTIME_DIR ($SIZE, budget ${MAX_RUNTIME_MB}M)"
