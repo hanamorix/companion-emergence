@@ -7,8 +7,9 @@ interface Props {
   state: PersonaState | null;
   /** Active persona — needed by the supervisor install button. */
   persona: string;
-  /** Caller-controlled "always on top" flag — Phase 4 wires to the
-   * Tauri window. For now just visual. */
+  /** Last `/state` poll error, if any — surfaced to the user in the
+   * Status section so silent failures don't go unnoticed. */
+  stateError?: string | null;
   alwaysOnTop?: boolean;
   reducedMotion?: boolean;
   onAlwaysOnTopChange?: (next: boolean) => void;
@@ -22,13 +23,13 @@ type InstallState =
   | { kind: "error"; detail: string };
 
 /**
- * Connection — bridge mode + provider + model + last-heartbeat,
- * plus integrations + window settings. Matches mockup
- * nell_face_example_4.png and nell_face_example_5.png.
+ * Connection — bridge mode, provider, model, last-heartbeat, status
+ * warnings, supervisor install, and window settings.
  */
 export function ConnectionPanel({
   state,
   persona,
+  stateError = null,
   alwaysOnTop = false,
   reducedMotion = false,
   onAlwaysOnTopChange,
@@ -61,11 +62,13 @@ export function ConnectionPanel({
   return (
     <PanelShell>
       <SectionLabel>Connection</SectionLabel>
-      <Row label="bridge" value={modeLabel(mode)} accent={mode !== "live"} />
-      <Row label="provider" value={conn?.provider ?? "—"} />
-      <Row label="model" value={conn?.model ?? "—"} />
-      <Row label="heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
-      <Row label="privacy" value="local-only" accent />
+      <Row label="Bridge" value={modeLabel(mode)} accent={mode !== "live"} />
+      <Row label="Provider" value={conn?.provider ?? "—"} />
+      <Row label="Model" value={conn?.model ?? "—"} />
+      <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
+      <Row label="Privacy" value="Local-only" accent />
+
+      <StatusBanner mode={mode} stateError={stateError} />
 
       <Divider />
       <SectionLabel>Supervisor</SectionLabel>
@@ -84,56 +87,124 @@ export function ConnectionPanel({
       <InstallSupervisorButton state={install} onClick={onInstallSupervisor} />
 
       <Divider />
-      <SectionLabel>Integrations</SectionLabel>
-      <Toggle enabled={false} label="Obsidian — journal + vault" disabled />
-      <Toggle enabled={false} label="IPC — inter-process events" disabled />
-
-      <Divider />
       <SectionLabel>Window</SectionLabel>
       <Toggle
         enabled={alwaysOnTop}
-        label="always on top"
+        label="Always on top"
         onChange={onAlwaysOnTopChange}
       />
       <Toggle
         enabled={reducedMotion}
-        label="reduced motion"
+        label="Reduced motion"
         onChange={onReducedMotionChange}
       />
+    </PanelShell>
+  );
+}
 
+/**
+ * StatusBanner — surfaces failures and degraded modes inside the
+ * settings menu so silent issues don't go unnoticed. Renders nothing
+ * when everything is live + no error; otherwise shows a coloured
+ * banner with a one-line headline + the underlying detail.
+ */
+function StatusBanner({
+  mode,
+  stateError,
+}: {
+  mode: PersonaState["mode"];
+  stateError: string | null;
+}) {
+  // Pick the worst signal — bridge_down is more critical than provider_down.
+  let kind: "warning" | "error" | null = null;
+  let headline = "";
+  let detail = "";
+  if (stateError) {
+    kind = "error";
+    headline = "State poll failed.";
+    detail = stateError;
+  } else if (mode === "bridge_down") {
+    kind = "error";
+    headline = "Bridge offline.";
+    detail =
+      "The brain isn't reachable. Try installing the launchd supervisor below, or run `nell service status` from terminal.";
+  } else if (mode === "offline") {
+    kind = "error";
+    headline = "Offline.";
+    detail = "No bridge or provider available. Chat is disabled until the brain comes back.";
+  } else if (mode === "provider_down") {
+    kind = "warning";
+    headline = "LLM provider unreachable.";
+    detail =
+      "Replies will fall back to a local backup voice. Check that `claude` is on PATH for the launchd agent.";
+  }
+
+  if (kind === null) return null;
+
+  const palette =
+    kind === "error"
+      ? {
+          bg: "rgba(178, 42, 42, 0.10)",
+          border: "rgba(178, 42, 42, 0.40)",
+          headline: "var(--crimson)",
+        }
+      : {
+          bg: "rgba(216, 154, 88, 0.14)",
+          border: "rgba(216, 154, 88, 0.45)",
+          headline: "#a07434",
+        };
+
+  return (
+    <div
+      role="alert"
+      style={{
+        marginTop: 12,
+        padding: "8px 10px",
+        borderRadius: 6,
+        background: palette.bg,
+        border: `1px solid ${palette.border}`,
+      }}
+    >
       <div
         style={{
-          marginTop: 10,
-          fontSize: 9.5,
-          color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
-          fontStyle: "italic",
-          letterSpacing: "0.04em",
-          lineHeight: 1.5,
+          fontSize: 11.5,
+          fontWeight: 500,
+          color: palette.headline,
+          marginBottom: 3,
         }}
       >
-        You configure the room. Nell owns the weather.
+        {headline}
       </div>
-    </PanelShell>
+      <div
+        style={{
+          fontSize: 10.5,
+          color: "var(--text-mid)",
+          lineHeight: 1.5,
+          wordBreak: "break-word",
+        }}
+      >
+        {detail}
+      </div>
+    </div>
   );
 }
 
 function modeLabel(mode: PersonaState["mode"]): string {
   return mode === "live"
-    ? "live"
+    ? "Live"
     : mode === "bridge_down"
-    ? "catching up"
+    ? "Catching up"
     : mode === "provider_down"
-    ? "backup voice"
-    : "offline";
+    ? "Backup voice"
+    : "Offline";
 }
 
 function formatHeartbeat(iso: string | null | undefined): string {
-  if (!iso) return "never";
+  if (!iso) return "Never";
   try {
     const ts = new Date(iso);
     const mins = Math.round((Date.now() - ts.getTime()) / 60_000);
-    if (mins < 1) return "just now";
+    if (mins < 1) return "Just now";
     if (mins < 60) return `${mins}m ago`;
     const hrs = Math.round(mins / 60);
     if (hrs < 24) return `${hrs}h ago`;

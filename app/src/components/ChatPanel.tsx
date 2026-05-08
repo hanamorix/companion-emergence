@@ -163,11 +163,11 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
 
   async function handleFile(file: File) {
     if (!file.type.startsWith("image/")) {
-      setError(`unsupported file type: ${file.type}`);
+      setError(`Unsupported file type: ${file.type}.`);
       return;
     }
     if (file.size > MAX_BYTES) {
-      setError(`image too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB)`);
+      setError(`Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB).`);
       return;
     }
     setError(null);
@@ -228,7 +228,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
         sessionId = await newSession(persona);
         sessionRef.current = sessionId;
       } catch (e) {
-        setError(`bridge unreachable: ${(e as Error).message}`);
+        setError(`Bridge unreachable: ${(e as Error).message}`);
         return;
       }
     }
@@ -300,7 +300,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
                 b.id === replyId
                   ? {
                       ...b,
-                      text: "(nell couldn't answer — see the error below)",
+                      text: "(Nell couldn't answer — see the error below.)",
                       streaming: false,
                       time: formatTime(),
                     }

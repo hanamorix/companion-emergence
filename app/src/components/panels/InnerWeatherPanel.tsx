@@ -1,7 +1,7 @@
 import type { PersonaState } from "../../bridge";
 import { Bar, PanelShell, SectionLabel } from "../ui";
 
-const TOP_N_EMOTIONS = 8;
+const TOP_N_EMOTIONS = 5;
 const BODY_HIGHLIGHT_FIELDS: Array<{ key: "energy" | "temperature"; label: string; max: number }> = [
   { key: "energy", label: "Energy", max: 10 },
   { key: "temperature", label: "Temp", max: 9 },
@@ -53,7 +53,7 @@ export function InnerWeatherPanel({ state }: Props) {
 function Empty() {
   return (
     <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-      no signal yet
+      No signal yet.
     </div>
   );
 }
