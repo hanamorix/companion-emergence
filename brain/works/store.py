@@ -18,11 +18,14 @@ backport.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from brain.works import Work
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
 
@@ -183,9 +186,16 @@ class WorksStore:
                 row = conn.execute(
                     "SELECT * FROM works WHERE id = ?", (work_id,)
                 ).fetchone()
-            except sqlite3.OperationalError:
-                # Corrupt DB / partial WAL / schema mismatch — surface as
-                # "not found" rather than 500 the bridge HTTP layer.
+            except sqlite3.OperationalError as exc:
+                # Audit 2026-05-07 P3-5: corrupt DB / partial WAL /
+                # schema mismatch is operationally distinct from
+                # "no work with that id." Log loudly + still return
+                # None so the chat path stays graceful, but operators
+                # tailing the log + future health-anomaly readers can
+                # spot a real data-integrity problem.
+                logger.warning(
+                    "WorksStore.get operational error for id=%s: %s", work_id, exc
+                )
                 return None
             return _row_to_work(row) if row else None
 
@@ -202,9 +212,12 @@ class WorksStore:
         with self._connect() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
-            except sqlite3.OperationalError:
-                # Same posture as search() and get(): SQLite operational
-                # state shouldn't take down a chat-bridge HTTP route.
+            except sqlite3.OperationalError as exc:
+                # Audit 2026-05-07 P3-5: log + return empty rather
+                # than silent. Same posture as get() / search().
+                logger.warning(
+                    "WorksStore.list_recent operational error: %s", exc
+                )
                 return []
             return [_row_to_work(r) for r in rows]
 
@@ -227,10 +240,21 @@ class WorksStore:
         with self._connect() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
-            except sqlite3.OperationalError:
-                # Malformed FTS5 query — return empty results rather than
-                # raise. The LLM's tool path and the bridge endpoint both
-                # benefit from a clean "no matches" instead of a stack trace.
+            except sqlite3.OperationalError as exc:
+                # Audit 2026-05-07 P3-5: malformed FTS5 query is the
+                # common case (user-typed query). Distinguish it from
+                # a real DB problem in the log: the FTS5 messages
+                # mention 'syntax' / 'fts5'. Both still return empty
+                # to keep chat graceful.
+                msg = str(exc).lower()
+                if "fts5" in msg or "syntax" in msg or "malformed" in msg:
+                    logger.debug("WorksStore.search FTS5 syntax: %s", exc)
+                else:
+                    logger.warning(
+                        "WorksStore.search operational error (likely "
+                        "data-integrity, not user input): %s",
+                        exc,
+                    )
                 return []
             return [_row_to_work(r) for r in rows]
 

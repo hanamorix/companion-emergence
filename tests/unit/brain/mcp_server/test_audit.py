@@ -21,7 +21,10 @@ def test_log_invocation_writes_jsonl_line(tmp_path: Path) -> None:
     assert len(lines) == 1
     rec = json.loads(lines[0])
     assert rec["name"] == "search_memories"
-    assert rec["arguments"] == {"query": "morning"}
+    # Audit 2026-05-07 P3-3: 'query' joined the sensitive-keys allowlist
+    # so search terms get redacted in 'redacted' mode — they can be as
+    # identifying as content.
+    assert rec["arguments"] == {"query": "[REDACTED]"}
     assert rec["result_summary"] == "3 hits"
     assert rec["error"] is None
     # Timestamp ends with Z (UTC)
