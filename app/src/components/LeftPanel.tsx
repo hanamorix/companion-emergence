@@ -11,6 +11,7 @@ type Tab = "weather" | "body" | "interior" | "soul" | "connection";
 interface Props {
   state: PersonaState | null;
   persona: string;
+  stateError?: string | null;
   alwaysOnTop: boolean;
   reducedMotion: boolean;
   onAlwaysOnTopChange: (next: boolean) => void;
@@ -28,6 +29,7 @@ const TABS: Array<{ id: Tab; label: string; icon: string }> = [
 export function LeftPanel({
   state,
   persona,
+  stateError = null,
   alwaysOnTop,
   reducedMotion,
   onAlwaysOnTopChange,
@@ -38,6 +40,7 @@ export function LeftPanel({
     <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
       {renderPanel(tab, state, {
         persona,
+        stateError,
         alwaysOnTop,
         reducedMotion,
         onAlwaysOnTopChange,
@@ -89,6 +92,7 @@ export function LeftPanel({
 
 interface PanelOpts {
   persona: string;
+  stateError: string | null;
   alwaysOnTop: boolean;
   reducedMotion: boolean;
   onAlwaysOnTopChange: (next: boolean) => void;
@@ -110,6 +114,7 @@ function renderPanel(tab: Tab, state: PersonaState | null, opts: PanelOpts) {
         <ConnectionPanel
           state={state}
           persona={opts.persona}
+          stateError={opts.stateError}
           alwaysOnTop={opts.alwaysOnTop}
           reducedMotion={opts.reducedMotion}
           onAlwaysOnTopChange={opts.onAlwaysOnTopChange}
