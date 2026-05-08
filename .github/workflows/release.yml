@@ -1,5 +1,8 @@
 name: release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
@@ -46,7 +49,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install Python deps
-        run: uv sync --all-extras
+        run: uv sync --all-extras --locked
 
       - name: Run pytest
         run: uv run pytest -q
@@ -84,6 +87,13 @@ jobs:
       - name: cargo check
         working-directory: app/src-tauri
         run: cargo check
+
+      - name: cargo test
+        working-directory: app/src-tauri
+        run: cargo test
+
+      - name: Wheel/sdist smoke
+        run: bash scripts/smoke_test_wheel.sh
 
   build:
     name: ${{ matrix.platform.label }}
@@ -140,7 +150,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Python wheel + sync uv env
-        run: uv sync
+        run: uv sync --all-extras --locked
 
       - name: Build Tauri bundle (runs build_python_runtime.sh
               via beforeBuildCommand)
