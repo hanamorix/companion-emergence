@@ -204,6 +204,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
     >
       <LeftPanel
         state={state}
+        persona={persona}
         alwaysOnTop={config.always_on_top}
         reducedMotion={config.reduced_motion}
         onAlwaysOnTopChange={(v) => updateConfig({ always_on_top: v })}
