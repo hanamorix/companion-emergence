@@ -18,6 +18,15 @@ Below are the steps to launch the app despite the warnings, per
 platform. The app itself is the same regardless of which path you
 take.
 
+> **Platform support today:** macOS (arm64 + x86_64) is the primary
+> distribution target. The window chrome (transparent background +
+> overlay title bar) and supervisor-as-LaunchAgent lifecycle are tuned
+> for macOS. Linux + Windows bundles compile from the same source and
+> the brain itself runs everywhere, but the transparent chrome and
+> persistent OS-service supervisor are not yet validated on those
+> platforms — `nell service install` reports unsupported there, and
+> the brain falls back to the "spawned by the .app" lifecycle.
+
 > **One external prerequisite on every platform:** you need
 > [`claude`](https://docs.claude.com/en/docs/claude-code/setup) (the
 > Claude CLI) on your `PATH`. NellFace shells out to it for the LLM
@@ -172,11 +181,15 @@ Building locally bypasses every signing question:
 ```bash
 git clone https://github.com/<your-fork>/companion-emergence
 cd companion-emergence
-uv sync                                 # python deps
+uv sync --all-extras                    # python deps + pytest/ruff/coverage
 cd app
 pnpm install                            # node deps
 pnpm tauri build                        # produces a local .app / .deb / .msi
 ```
+
+`--all-extras` pulls in `pytest`, `ruff`, and `coverage` so the dev
+loop works (`uv run pytest`, `uv run ruff check .`). Plain `uv sync`
+gives a runtime-only environment.
 
 The bundled binary lands at
 `app/src-tauri/target/release/bundle/<platform>/`. Locally-built
