@@ -45,7 +45,12 @@ export function LeftPanel({
           display: "flex",
           flexDirection: "column",
           gap: 6,
-          paddingTop: 4,
+          padding: 6,
+          background: "var(--panel-bg)",
+          border: "1px solid var(--border)",
+          borderRadius: 10,
+          boxShadow:
+            "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
         }}
       >
         {TABS.map((t) => (
@@ -58,9 +63,12 @@ export function LeftPanel({
               width: 26,
               height: 26,
               borderRadius: 6,
-              background: tab === t.id ? "var(--accent)" : "rgba(234,222,218,0.12)",
-              color: tab === t.id ? "var(--linen)" : "var(--mauve)",
-              border: tab === t.id ? "1px solid var(--accent)" : "1px solid var(--border-dk)",
+              background: tab === t.id ? "var(--accent)" : "transparent",
+              color: tab === t.id ? "var(--linen)" : "var(--text-mid)",
+              border:
+                tab === t.id
+                  ? "1px solid var(--accent)"
+                  : "1px solid rgba(130,51,41,0.18)",
               fontSize: 13,
               transition: "all 0.18s ease",
               display: "flex",

@@ -93,13 +93,20 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
     """True if bridge should auto-shutdown.
 
     Pure predicate — no side effects. Conditions:
-      - last_chat_at is None OR older than threshold
+      - last activity (chat OR bridge startup) older than threshold
       - no active session has its in_flight lock held
+
+    Bridge startup counts as activity so a freshly launched app has the
+    full idle window before the watcher fires. Without that fallback,
+    ``last_chat_at is None`` collapsed to "idle" and the bridge SIGTERM'd
+    itself ~60s after every launch — which then triggered the
+    close-heartbeat (decay + dream + reflex + growth) on every relaunch,
+    looking from the UI like the brain was 'flooding'.
     """
     now = datetime.now(UTC)
-    if state.last_chat_at is not None:
-        if (now - state.last_chat_at).total_seconds() < idle_shutdown_seconds:
-            return False
+    last_activity = state.last_chat_at or state.started_at
+    if (now - last_activity).total_seconds() < idle_shutdown_seconds:
+        return False
     for lock in state.in_flight_locks.values():
         if lock.locked():
             return False
@@ -188,12 +195,21 @@ async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 3
                        held, timeout)
 
 
+_CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
+
+
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     """Fire HeartbeatEngine.run_tick(trigger='close') in-process.
 
     Per SP-7 spec §7 step 5 + Reflex Phase 2's anchor for weekly growth.
     Best-effort: any exception is logged by the caller; we don't block
     shutdown on heartbeat issues.
+
+    Debounced: when a close-heartbeat fired within the last 5 minutes
+    (e.g. during a dev cycle of repeated rebuild+relaunch), skip the
+    decay/dream/reflex/growth tail and exit. The session-drain step
+    above this call already saved everything; the tail is what causes
+    the 'flooding' perception when the bridge restarts often.
 
     Per H-A: opens its own per-call stores inside the worker thread.
     Constructor pattern mirrors brain/cli.py:_heartbeat_handler.
@@ -203,6 +219,27 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     from brain.engines.heartbeat import HeartbeatEngine
     from brain.persona_config import PersonaConfig
     from brain.search.factory import get_searcher
+
+    state_path = persona_dir / "heartbeat_state.json"
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            last_run = state.get("last_close_at") or state.get("last_run")
+            if last_run:
+                if last_run.endswith("Z"):
+                    last_run = last_run[:-1] + "+00:00"
+                last_dt = datetime.fromisoformat(last_run)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=UTC)
+                age = (datetime.now(UTC) - last_dt).total_seconds()
+                if age < _CLOSE_HEARTBEAT_DEBOUNCE_S:
+                    logger.info(
+                        "close-heartbeat debounced (last fire %.0fs ago < %.0fs)",
+                        age, _CLOSE_HEARTBEAT_DEBOUNCE_S,
+                    )
+                    return
+        except Exception:  # noqa: BLE001
+            logger.debug("close-heartbeat debounce check failed", exc_info=True)
 
     config = PersonaConfig.load(persona_dir / "persona_config.json")
     searcher = get_searcher(config.searcher)
