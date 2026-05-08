@@ -4,7 +4,7 @@
  * Lives at <NELLBRAIN_HOME>/app_config.json so it sits alongside the
  * personas/ directory the brain owns. Read on app boot to decide
  * whether to show the wizard (no persona selected → first launch)
- * or the main NellFace UI.
+ * or the main Companion Emergence UI.
  */
 
 import { invoke } from "@tauri-apps/api/core";

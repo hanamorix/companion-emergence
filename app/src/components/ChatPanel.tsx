@@ -62,7 +62,13 @@ const EMOJI_GROUPS: { label: string; chars: string[] }[] = [
 const formatTime = () =>
   new Date().toLocaleTimeString("en", { hour: "numeric", minute: "2-digit" });
 
-const capitalize = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+// Persona names match [A-Za-z0-9_-]{1,40}; render them human:
+// underscores → spaces, then capitalize. ``my_companion`` -> "My companion".
+const capitalize = (s: string) => {
+  if (!s) return s;
+  const cleaned = s.replace(/_/g, " ");
+  return cleaned[0].toUpperCase() + cleaned.slice(1);
+};
 
 interface Props {
   /** Persona name — every bridge call is scoped to this so the UI
@@ -291,16 +297,16 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
             cancelRef.current = null;
             // Audit 2026-05-07 P2-10: replace the empty streaming
             // stub with a visible failure marker. Previously onError
-            // only set the error string, leaving an empty Nell bubble
-            // in the transcript that didn't match what was actually
-            // said. The bubble now shows a clear failure note so the
-            // transcript matches reality.
+            // only set the error string, leaving an empty persona
+            // bubble in the transcript that didn't match what was
+            // actually said. The bubble now shows a clear failure
+            // note so the transcript matches reality.
             setMessages((m) =>
               m.map((b) =>
                 b.id === replyId
                   ? {
                       ...b,
-                      text: "(Nell couldn't answer — see the error below.)",
+                      text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
                       streaming: false,
                       time: formatTime(),
                     }
@@ -320,7 +326,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
           b.id === replyId
             ? {
                 ...b,
-                text: "(nell couldn't answer — see the error below)",
+                text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
                 streaming: false,
                 time: formatTime(),
               }
