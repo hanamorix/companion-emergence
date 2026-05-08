@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -12,6 +12,7 @@ from brain.chat.session import (
     all_sessions,
     create_session,
     get_session,
+    prune_empty_sessions,
     reset_registry,
 )
 
@@ -114,6 +115,38 @@ def test_reset_registry_clears() -> None:
     create_session("nell")
     reset_registry()
     assert all_sessions() == []
+
+
+def test_prune_empty_sessions_removes_only_old_zero_turn_sessions() -> None:
+    now = datetime.now(UTC)
+    old_empty = create_session("nell")
+    old_empty.created_at = now - timedelta(minutes=10)
+    fresh_empty = create_session("nell")
+    fresh_empty.created_at = now
+    with_turn = create_session("nell")
+    with_turn.created_at = now - timedelta(minutes=10)
+    with_turn.append_turn("hi", "hello")
+
+    removed = prune_empty_sessions(older_than_seconds=300, now=now, persona_name="nell")
+
+    assert removed == [old_empty.session_id]
+    assert get_session(old_empty.session_id) is None
+    assert get_session(fresh_empty.session_id) is fresh_empty
+    assert get_session(with_turn.session_id) is with_turn
+
+
+def test_prune_empty_sessions_respects_persona_filter() -> None:
+    now = datetime.now(UTC)
+    nell = create_session("nell")
+    nell.created_at = now - timedelta(minutes=10)
+    other = create_session("siren")
+    other.created_at = now - timedelta(minutes=10)
+
+    removed = prune_empty_sessions(older_than_seconds=300, now=now, persona_name="nell")
+
+    assert removed == [nell.session_id]
+    assert get_session(nell.session_id) is None
+    assert get_session(other.session_id) is other
 
 
 # ---- I-8 follow-up audit: thread-safe registry ----
