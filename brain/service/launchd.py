@@ -12,6 +12,7 @@ import os
 import platform
 import plistlib
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,10 @@ DEFAULT_LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin
 
 class LaunchdConfigError(ValueError):
     """Raised when service plist configuration is invalid."""
+
+
+class LaunchdCommandError(RuntimeError):
+    """Raised when a launchctl operation fails."""
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,17 @@ class DoctorCheck:
 
     name: str
     ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class ServiceStatus:
+    """launchd status summary for one persona service."""
+
+    label: str
+    plist_path: Path
+    installed: bool
+    loaded: bool
     detail: str
 
 
@@ -162,6 +178,109 @@ def build_launchd_plist_xml(
     return plistlib.dumps(plist, sort_keys=False).decode("utf-8")
 
 
+def write_launchd_plist(
+    *,
+    persona: str,
+    nell_path: str | Path,
+    env_path: str = DEFAULT_LAUNCHD_PATH,
+    nellbrain_home: str | Path | None = None,
+    working_directory: str | Path | None = None,
+) -> Path:
+    """Atomically write the persona LaunchAgent plist and return its path."""
+    paths = paths_for_persona(persona)
+    xml = build_launchd_plist_xml(
+        persona=persona,
+        nell_path=nell_path,
+        env_path=env_path,
+        nellbrain_home=nellbrain_home,
+        working_directory=working_directory,
+    )
+    paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = paths.plist_path.with_suffix(paths.plist_path.suffix + ".tmp")
+    tmp.write_text(xml, encoding="utf-8")
+    tmp.chmod(0o644)
+    os.replace(tmp, paths.plist_path)
+    paths.plist_path.chmod(0o644)
+    return paths.plist_path
+
+
+def launchctl_domain() -> str:
+    """Current user's launchd GUI domain."""
+    return f"gui/{os.getuid()}"
+
+
+def launchctl_target(persona: str) -> str:
+    """launchctl target string for one persona service."""
+    return f"{launchctl_domain()}/{service_label(persona)}"
+
+
+def run_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run launchctl with captured output. Tests mock this seam."""
+    return subprocess.run(
+        ["launchctl", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def install_service(
+    *,
+    persona: str,
+    nell_path: str | Path,
+    env_path: str = DEFAULT_LAUNCHD_PATH,
+    nellbrain_home: str | Path | None = None,
+) -> Path:
+    """Write, bootstrap, and kickstart the persona LaunchAgent."""
+    plist_path = write_launchd_plist(
+        persona=persona,
+        nell_path=nell_path,
+        env_path=env_path,
+        nellbrain_home=nellbrain_home,
+    )
+    # Idempotent reinstall: ignore bootout failure when the job is not loaded.
+    run_launchctl(["bootout", launchctl_target(persona)])
+
+    result = run_launchctl(["bootstrap", launchctl_domain(), str(plist_path)])
+    if result.returncode != 0:
+        raise LaunchdCommandError(_format_launchctl_error("bootstrap", result))
+
+    result = run_launchctl(["kickstart", "-k", launchctl_target(persona)])
+    if result.returncode != 0:
+        raise LaunchdCommandError(_format_launchctl_error("kickstart", result))
+
+    return plist_path
+
+
+def uninstall_service(*, persona: str, keep_plist: bool = False) -> Path:
+    """Boot out the persona LaunchAgent and remove its plist unless requested."""
+    paths = paths_for_persona(persona)
+    # Uninstall should be idempotent: a not-loaded service is already stopped.
+    run_launchctl(["bootout", launchctl_target(persona)])
+    if not keep_plist:
+        try:
+            paths.plist_path.unlink()
+        except FileNotFoundError:
+            pass
+    return paths.plist_path
+
+
+def service_status(*, persona: str) -> ServiceStatus:
+    """Return launchd installed/loaded state for one persona."""
+    paths = paths_for_persona(persona)
+    result = run_launchctl(["print", launchctl_target(persona)])
+    loaded = result.returncode == 0
+    detail = result.stdout.strip() if loaded else result.stderr.strip()
+    return ServiceStatus(
+        label=paths.label,
+        plist_path=paths.plist_path,
+        installed=paths.plist_path.exists(),
+        loaded=loaded,
+        detail=detail,
+    )
+
+
 def doctor_checks(
     *,
     persona: str,
@@ -236,3 +355,8 @@ def doctor_checks(
 def _which_in_path(executable: str, path_value: str) -> str | None:
     """shutil.which against an explicit PATH string."""
     return shutil.which(executable, path=path_value)
+
+
+def _format_launchctl_error(action: str, result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    return f"launchctl {action} failed (exit {result.returncode}): {detail}"
