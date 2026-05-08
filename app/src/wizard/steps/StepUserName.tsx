@@ -30,6 +30,7 @@ export function StepUserName({ step, totalSteps, value, onChange, onNext, onBack
     >
       <FieldLabel>Your name (optional)</FieldLabel>
       <WInput
+        label="Your name"
         value={value}
         onChange={onChange}
         placeholder="e.g. Hana"

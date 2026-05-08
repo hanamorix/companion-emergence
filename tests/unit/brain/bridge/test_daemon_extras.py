@@ -145,6 +145,25 @@ def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str =
     return log_dir
 
 
+def test_acquire_lock_does_not_unlink_new_lock_after_stale_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    lock_path.write_text("999999", encoding="utf-8")
+
+    def fake_pid_is_alive(_pid: int) -> bool:
+        lock_path.write_text("123456", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(daemon.state_file, "pid_is_alive", fake_pid_is_alive)
+
+    assert daemon.acquire_lock(persona_dir) is None
+    assert lock_path.read_text(encoding="utf-8") == "123456"
+
+
 # ---------- cmd_run ----------
 
 

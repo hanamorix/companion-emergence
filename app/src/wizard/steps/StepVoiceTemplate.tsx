@@ -38,26 +38,28 @@ export function StepVoiceTemplate({
       }
     >
       <SectionLabel>Choose a starter</SectionLabel>
-      <OptionCard
-        selected={template === "nell-example"}
-        onClick={() => onTemplateChange("nell-example")}
-        title="Original Brain example"
-        badge="starter"
-        description="Start from the canonical voice.md template. Edit the placeholders to make it your persona's own identity before continuing."
-      />
-      <OptionCard
-        selected={template === "default"}
-        onClick={() => onTemplateChange("default")}
-        title="Framework default"
-        badge="minimal"
-        description="Use the framework's built-in DEFAULT_VOICE_TEMPLATE. No file written — you can author voice.md later."
-      />
-      <OptionCard
-        selected={template === "skip"}
-        onClick={() => onTemplateChange("skip")}
-        title="Skip"
-        description="Same as default — no voice.md is written. Provided for scripted setups."
-      />
+      <div role="radiogroup" aria-label="Voice template">
+        <OptionCard
+          selected={template === "nell-example"}
+          onClick={() => onTemplateChange("nell-example")}
+          title="Original Brain example"
+          badge="starter"
+          description="Start from the canonical voice.md template. Edit the placeholders to make it your persona's own identity before continuing."
+        />
+        <OptionCard
+          selected={template === "default"}
+          onClick={() => onTemplateChange("default")}
+          title="Framework default"
+          badge="minimal"
+          description="Use the framework's built-in DEFAULT_VOICE_TEMPLATE. No file written — you can author voice.md later."
+        />
+        <OptionCard
+          selected={template === "skip"}
+          onClick={() => onTemplateChange("skip")}
+          title="Skip"
+          description="Same as default — no voice.md is written. Provided for scripted setups."
+        />
+      </div>
       <div
         style={{
           marginTop: 8,

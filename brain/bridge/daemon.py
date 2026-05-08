@@ -87,10 +87,17 @@ def acquire_lock(persona_dir: Path) -> int | None:
         return fd
     except FileExistsError:
         try:
-            existing_pid = int(path.read_text().strip())
+            existing_text = path.read_text().strip()
+            existing_pid = int(existing_text)
             if not state_file.pid_is_alive(existing_pid):
+                # Avoid unlinking a newly-created lock if another starter won
+                # the race after our first read.
+                if path.read_text().strip() != existing_text:
+                    return None
                 path.unlink()
                 return acquire_lock(persona_dir)
+        except FileNotFoundError:
+            return acquire_lock(persona_dir)
         except (ValueError, OSError):
             pass
         return None
