@@ -40,18 +40,10 @@ export function WizardAvatar({ step, size = 200 }: Props) {
 
   return (
     <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
-      <div
-        style={{
-          position: "absolute",
-          inset: -24,
-          borderRadius: "50%",
-          background:
-            "radial-gradient(ellipse at 50% 58%, rgba(130,51,41,0.35) 0%, transparent 68%)",
-          filter: "blur(18px)",
-          animation: "breathe 5s ease-in-out infinite",
-          pointerEvents: "none",
-        }}
-      />
+      {/* Halo retired 2026-05-08: a warm-brown radial gradient under
+       *  the avatar reads as a dark perceptual ring against any
+       *  colored wallpaper through the transparent window. The PNG's
+       *  own anti-aliased silhouette is enough on its own. */}
       <img
         src={src}
         alt="Persona avatar"
