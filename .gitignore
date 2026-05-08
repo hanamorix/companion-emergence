@@ -97,3 +97,7 @@ migrated-*/
 
 # Local worktrees for parallel development
 .worktrees/
+
+# ── Local reference screenshots / mockups ─────────────────
+bugs/
+mock-ups/
