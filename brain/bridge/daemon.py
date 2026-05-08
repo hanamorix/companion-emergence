@@ -2,6 +2,7 @@
 
 Public surface used by CLI handlers in brain.cli:
   cmd_start(args)    -> int
+  cmd_run(args)      -> int
   cmd_stop(args)     -> int
   cmd_restart(args)  -> int
   cmd_status(args)   -> int
@@ -229,6 +230,52 @@ def cmd_start(args, *, out: dict | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        release_lock(persona_dir, fd)
+
+
+def cmd_run(args) -> int:
+    """Run the bridge in the foreground for OS service managers.
+
+    Unlike ``cmd_start``, this does not fork or detach. The current process is
+    the bridge process until uvicorn exits, which is exactly what launchd wants
+    to supervise. A per-persona lock is held for the lifetime of the process so
+    parallel starts fail cleanly and stale locks can be recovered by pid.
+    """
+    from brain.paths import get_persona_dir
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
+
+    if state_file.is_running(persona_dir):
+        cur = state_file.read(persona_dir)
+        print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
+        return 2
+
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        print("bridge already starting (lockfile held)", file=sys.stderr)
+        return 2
+
+    try:
+        drained = run_recovery_if_needed(persona_dir)
+        if drained is not None:
+            if drained > 0:
+                print(f"recovered from dirty shutdown — drained {drained} orphan sessions")
+            else:
+                print("recovered from dirty shutdown (no orphan sessions to drain)")
+
+        from brain.bridge.runner import run_bridge_foreground
+
+        idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+        client_origin = getattr(args, "client_origin", "cli")
+        return run_bridge_foreground(
+            persona_dir,
+            client_origin=client_origin,
+            idle_shutdown_seconds=idle,
+        )
     finally:
         release_lock(persona_dir, fd)
 
