@@ -2,22 +2,22 @@
 
 The supervisor runs as a user-level OS service so the brain stays alive
 when the desktop app is closed. macOS uses launchd via
-``brain.service.launchd``; Linux ``systemd --user`` and Windows Service /
-Task Scheduler analogs are planned but not yet implemented (the stubs
-return ``UnsupportedPlatformError`` until real validation has happened
-on those targets).
+``brain.service.launchd``; Linux uses ``systemd --user`` via
+``brain.service.systemd``; Windows uses a per-user Task Scheduler task
+via ``brain.service.windows_service``. Non-supported platforms raise
+``UnsupportedPlatformError``.
 
 Public surface — everything the ``nell service`` CLI needs:
 
-* :class:`UnsupportedPlatformError` — raised by the stubs on
-  unimplemented platforms; callers should catch it and surface a
-  user-readable "this OS isn't supported yet" message.
+* :class:`UnsupportedPlatformError` — raised for platforms without a
+  service backend; callers should catch it and surface a user-readable
+  "this OS isn't supported yet" message.
 * :func:`current_backend` — picks the right backend module for the
   running OS, or raises ``UnsupportedPlatformError``.
 
 Existing macOS-only call sites import from ``brain.service.launchd``
 directly. New callers should prefer ``current_backend()`` so they pick
-up Linux/Windows support automatically when those backends ship.
+up the OS-appropriate backend automatically.
 """
 
 from __future__ import annotations
@@ -38,10 +38,8 @@ def current_backend() -> ModuleType:
     """Return the OS-appropriate service backend module.
 
     The returned module is one of ``brain.service.launchd`` (macOS),
-    ``brain.service.systemd`` (Linux user services — stub), or
-    ``brain.service.windows_service`` (Windows — stub). The two stub
-    backends raise ``UnsupportedPlatformError`` on every call so the
-    abstraction is in place but no half-working install gets attempted.
+    ``brain.service.systemd`` (Linux user services), or
+    ``brain.service.windows_service`` (Windows Task Scheduler).
     """
     if sys.platform == "darwin":
         from brain.service import launchd
