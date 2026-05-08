@@ -53,6 +53,37 @@ launch without warnings.
 `PATH` for the LLM provider. NellFace shells out to it using your
 existing Claude Code subscription.
 
+### How the brain stays alive
+
+On macOS, the wizard's first run installs a user LaunchAgent at
+`~/Library/LaunchAgents/com.companion-emergence.supervisor.<persona>.plist`.
+That agent owns the brain — heartbeat, dreams, reflex, research,
+memory ingest — and runs whether the desktop app is open or not.
+launchd restarts it on crash and starts it at login. **Closing,
+uninstalling, or rebuilding the desktop app does not touch the
+supervisor.** The app is a thin viewer that reads
+`bridge.json` and connects to the running brain over localhost.
+
+If you skipped the wizard auto-install (an existing persona, or a
+launchctl error during first run), open the **Connection** panel and
+click "install launchd supervisor" — that wires the same agent
+without touching your data. Or run `nell service install --persona <name>`
+from terminal.
+
+On Linux and Windows the equivalent service abstraction (systemd
+user agent / Windows Service) is planned but not implemented yet;
+on those platforms the brain currently lives for the lifetime of
+the desktop app.
+
+Useful commands:
+
+```bash
+nell service status --persona nell      # is the LaunchAgent loaded?
+nell service doctor --persona nell      # preflight checks
+nell service uninstall --persona nell   # remove the agent
+nell daemon-state refresh --persona nell  # repair stale residue cache
+```
+
 Operational quick check: `nell status --persona nell` reports local persona/config/memory/bridge state without contacting live providers.
 
 Memory inspection is local-only and explicit: use `nell memory list --persona nell`, `nell memory search "query" --persona nell`, and `nell memory show <memory_id> --persona nell`.
