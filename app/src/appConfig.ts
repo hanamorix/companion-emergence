@@ -93,6 +93,25 @@ export async function runInit(args: InitArgs): Promise<InitResult> {
   return await invoke<InitResult>("run_init", { args });
 }
 
+export interface ClaudeCliCheck {
+  found: boolean;
+  path: string | null;
+  version: string | null;
+}
+
+/**
+ * Probe the host for Anthropic's ``claude`` CLI — the LLM provider
+ * the framework shells out to. Powers the wizard's prerequisites
+ * step: when ``found`` is false the user gets install instructions
+ * and re-checks until it passes. The Tauri side checks several
+ * common install paths AND tries a bare ``claude --version`` so
+ * Homebrew, ``~/.local/bin``, and ``/usr/local/bin`` installs all
+ * resolve.
+ */
+export async function checkClaudeCli(): Promise<ClaudeCliCheck> {
+  return await invoke<ClaudeCliCheck>("check_claude_cli");
+}
+
 /**
  * Install the launchd LaunchAgent for the persona's supervisor.
  *
