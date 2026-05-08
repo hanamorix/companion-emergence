@@ -131,16 +131,17 @@ def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -
     """Two concurrent appenders must each land their event line — the
     previous read-rewrite-replace shape lost one event under contention."""
     import threading
-    from datetime import UTC, datetime as _dt
+    from datetime import UTC
+    from datetime import datetime as _dt
 
     from brain.growth.log import GrowthLogEvent, append_growth_event, read_growth_log
 
     log_path = tmp_path / "growth_log.jsonl"
-    NUM_THREADS = 8
-    EVENTS_PER_THREAD = 5
+    num_threads = 8
+    events_per_thread = 5
 
     def worker(thread_id: int) -> None:
-        for i in range(EVENTS_PER_THREAD):
+        for i in range(events_per_thread):
             append_growth_event(
                 log_path,
                 GrowthLogEvent(
@@ -156,14 +157,14 @@ def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -
                 ),
             )
 
-    threads = [threading.Thread(target=worker, args=(t,)) for t in range(NUM_THREADS)]
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=10.0)
 
     events = read_growth_log(log_path)
-    expected = NUM_THREADS * EVENTS_PER_THREAD
+    expected = num_threads * events_per_thread
     assert len(events) == expected, (
         f"expected {expected} events from concurrent appenders; got {len(events)} "
         f"— races dropped {expected - len(events)} events"
@@ -172,8 +173,8 @@ def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -
     names = {e.name for e in events}
     expected_names = {
         f"thread_{t}_event_{i}"
-        for t in range(NUM_THREADS)
-        for i in range(EVENTS_PER_THREAD)
+        for t in range(num_threads)
+        for i in range(events_per_thread)
     }
     assert names == expected_names
 

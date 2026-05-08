@@ -803,7 +803,7 @@ def build_app(
         # payloads. 64 KB is generous against a 20k-char message
         # plus image_shas (each ≤64 hex × ≤8 = ~520 bytes) plus
         # JSON overhead.
-        _WS_FRAME_MAX_BYTES = 64 * 1024
+        _WS_FRAME_MAX_BYTES = 64 * 1024  # noqa: N806 — local constant
         try:
             raw_frame = await ws.receive_text()
         except (WebSocketDisconnect, ValueError):
