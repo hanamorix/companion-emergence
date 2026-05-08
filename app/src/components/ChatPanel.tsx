@@ -835,7 +835,7 @@ function Bubble({ msg }: { msg: Message }) {
             }}
           />
         )}
-        {msg.streaming && !msg.text ? <TypingDots /> : msg.text}
+        {msg.streaming && !msg.text ? <TypingDots /> : renderBubbleText(msg.text)}
       </div>
       <div
         style={{
@@ -850,6 +850,43 @@ function Bubble({ msg }: { msg: Message }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Inline rendering for chat bubble text:
+ *   - Normalizes literal ``\n`` / ``\r\n`` escape sequences (some
+ *     models emit those as text rather than real newlines) into
+ *     actual newlines so ``white-space: pre-wrap`` can show them
+ *     as paragraph breaks.
+ *   - Renders ``*italic*`` as ``<em>`` (single-asterisk-pair, no
+ *     nesting). Pairs spread across line breaks aren't matched —
+ *     the regex stops at newlines so an unclosed ``*`` doesn't eat
+ *     the rest of the bubble.
+ *
+ * Deliberately small: full markdown (bold, links, code, lists) is
+ * out of scope for chat — this just covers the two formatting
+ * shapes the model actually emits in voice prose.
+ */
+function renderBubbleText(text: string): React.ReactNode {
+  if (!text) return text;
+  // Normalize escaped newlines (``\\n``, ``\\r\\n``) to real ones.
+  // Some Claude outputs interleave escape sequences with prose when
+  // the model is reasoning about its own format — normalize before
+  // splitting so the italic pass sees clean line content.
+  const normalized = text.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
+
+  const parts: React.ReactNode[] = [];
+  const re = /\*([^*\n]+)\*/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = re.exec(normalized)) !== null) {
+    if (match.index > last) parts.push(normalized.slice(last, match.index));
+    parts.push(<em key={`em-${key++}`}>{match[1]}</em>);
+    last = match.index + match[0].length;
+  }
+  if (last < normalized.length) parts.push(normalized.slice(last));
+  return parts.length ? parts : normalized;
 }
 
 function TypingDots() {
