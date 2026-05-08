@@ -211,13 +211,20 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         onAlwaysOnTopChange={(v) => updateConfig({ always_on_top: v })}
         onReducedMotionChange={(v) => updateConfig({ reduced_motion: v })}
       />
-      <NellAvatar
-        state={state}
-        persona={persona}
-        isSpeaking={isSpeaking}
-        soulFlashing={soulFlashing}
-        reducedMotion={config.reduced_motion}
-      />
+      {/* The flex row centers everyone vertically, but the chat panel
+          is taller (380) than the avatar (280), so avatar's bottom
+          floats ~50px above the chat input. translateY drops the
+          avatar so her silhouette ends at the same line as the
+          textbox without disturbing layout flow for the panels. */}
+      <div style={{ transform: "translateY(50px)" }}>
+        <NellAvatar
+          state={state}
+          persona={persona}
+          isSpeaking={isSpeaking}
+          soulFlashing={soulFlashing}
+          reducedMotion={config.reduced_motion}
+        />
+      </div>
       <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
     </div>
   );

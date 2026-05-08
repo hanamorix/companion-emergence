@@ -35,17 +35,21 @@ export function LeftPanel({
   onAlwaysOnTopChange,
   onReducedMotionChange,
 }: Props) {
-  const [tab, setTab] = useState<Tab>("weather");
+  // null = no panel open, just the icon rail. Click an icon to open
+  // its panel; click the same icon again to close it. Lets the user
+  // hide the cards when they want a clean view of the avatar + chat.
+  const [tab, setTab] = useState<Tab | null>(null);
   return (
     <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-      {renderPanel(tab, state, {
-        persona,
-        stateError,
-        alwaysOnTop,
-        reducedMotion,
-        onAlwaysOnTopChange,
-        onReducedMotionChange,
-      })}
+      {tab !== null &&
+        renderPanel(tab, state, {
+          persona,
+          stateError,
+          alwaysOnTop,
+          reducedMotion,
+          onAlwaysOnTopChange,
+          onReducedMotionChange,
+        })}
       <div
         style={{
           display: "flex",
@@ -59,32 +63,35 @@ export function LeftPanel({
             "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
         }}
       >
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            title={t.label}
-            aria-label={t.label}
-            style={{
-              width: 26,
-              height: 26,
-              borderRadius: 6,
-              background: tab === t.id ? "var(--accent)" : "transparent",
-              color: tab === t.id ? "var(--linen)" : "var(--text-mid)",
-              border:
-                tab === t.id
+        {TABS.map((t) => {
+          const active = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setTab((prev) => (prev === t.id ? null : t.id))}
+              title={`${t.label}${active ? " (click to close)" : ""}`}
+              aria-label={t.label}
+              aria-pressed={active}
+              style={{
+                width: 26,
+                height: 26,
+                borderRadius: 6,
+                background: active ? "var(--accent)" : "transparent",
+                color: active ? "var(--linen)" : "var(--text-mid)",
+                border: active
                   ? "1px solid var(--accent)"
                   : "1px solid rgba(130,51,41,0.18)",
-              fontSize: 13,
-              transition: "all 0.18s ease",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            {t.icon}
-          </button>
-        ))}
+                fontSize: 13,
+                transition: "all 0.18s ease",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+            >
+              {t.icon}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
