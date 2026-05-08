@@ -89,15 +89,23 @@ async function bridgeFetch(
   return await makeRequest(fresh);
 }
 
+export interface InteriorEntry {
+  summary: string;
+  /** ISO-8601 timestamp the entry was written at, or null if the
+   *  writer didn't record one (legacy entries pre-2026-05-08 may
+   *  not have it). */
+  ts: string | null;
+}
+
 export interface PersonaState {
   persona: string;
   emotions: Record<string, number>;
   body: BodyState | null;
   interior: {
-    dream: string | null;
-    research: string | null;
-    heartbeat: string | null;
-    reflex: string | null;
+    dream: InteriorEntry | null;
+    research: InteriorEntry | null;
+    heartbeat: InteriorEntry | null;
+    reflex: InteriorEntry | null;
   };
   soul_highlight: SoulHighlight | null;
   connection: {

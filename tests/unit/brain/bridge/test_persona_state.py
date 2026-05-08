@@ -86,19 +86,36 @@ def test_build_persona_state_body_block_when_memories_exist(tmp_path: Path) -> N
 
 
 def test_build_persona_state_interior_from_daemon_state(tmp_path: Path) -> None:
-    """daemon_state.json is read directly — no LLM call."""
+    """daemon_state.json is read directly — no LLM call. Each entry is
+    returned as ``{"summary": str, "ts": str | None}`` so the UI can
+    render "X ago" badges (added 2026-05-08 to make the panel feel
+    live instead of static)."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
     (persona_dir / "daemon_state.json").write_text(json.dumps({
-        "last_dream": {"theme": "a window facing nothing", "dominant_emotion": "awe"},
-        "last_research": {"theme": "Lispector diagonal syntax"},
-        "last_heartbeat": {"dominant_emotion": "love", "intensity": 9.0},
+        "last_dream": {
+            "theme": "a window facing nothing",
+            "dominant_emotion": "awe",
+            "timestamp": "2026-05-08T12:00:00+00:00",
+        },
+        "last_research": {
+            "theme": "Lispector diagonal syntax",
+            "ts": "2026-05-08T11:30:00Z",
+        },
+        "last_heartbeat": {
+            "dominant_emotion": "love",
+            "intensity": 9.0,
+            "written_at": "2026-05-08T13:15:00+00:00",
+        },
     }))
     state = build_persona_state(persona_dir)
     interior = state["interior"]
-    assert interior["dream"] == "a window facing nothing"
-    assert interior["research"] == "Lispector diagonal syntax"
-    assert interior["heartbeat"] == "love 9.0/10"
+    assert interior["dream"]["summary"] == "a window facing nothing"
+    assert interior["dream"]["ts"] == "2026-05-08T12:00:00+00:00"
+    assert interior["research"]["summary"] == "Lispector diagonal syntax"
+    assert interior["research"]["ts"] == "2026-05-08T11:30:00Z"
+    assert interior["heartbeat"]["summary"] == "love 9.0/10"
+    assert interior["heartbeat"]["ts"] == "2026-05-08T13:15:00+00:00"
     assert interior["reflex"] is None  # not seeded
 
 
@@ -116,9 +133,11 @@ def test_build_persona_state_interior_strips_self_narrated_label(tmp_path: Path)
     }))
     state = build_persona_state(persona_dir)
     interior = state["interior"]
-    assert interior["dream"] == "I was back in every conversation"
-    assert interior["research"] == "Lispector diagonal syntax"
-    assert interior["reflex"] == "love and grief in the same chest"
+    assert interior["dream"]["summary"] == "I was back in every conversation"
+    assert interior["research"]["summary"] == "Lispector diagonal syntax"
+    assert interior["reflex"]["summary"] == "love and grief in the same chest"
+    # Timestamps are nullable when the writer didn't record one.
+    assert interior["dream"]["ts"] is None
 
 
 def test_build_persona_state_interior_corrupt_daemon_state_fails_soft(tmp_path: Path) -> None:
