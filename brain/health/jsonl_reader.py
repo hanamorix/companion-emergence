@@ -37,8 +37,11 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     char preview of the bad content — enough for a human to find and
     quarantine the line.
 
-    Non-dict JSON (lists, scalars, null) is silently skipped — the
-    JSONL contract every caller assumes is "one dict per line."
+    Non-dict JSON (lists, scalars, null) is skipped because the JSONL
+    contract every caller assumes is "one dict per line." Audit
+    2026-05-07 P3-4 added a warning for that case so a hand-edit or
+    schema-drifted line can't disappear from readers without leaving
+    a trail.
     """
     if not path.exists():
         return
@@ -60,6 +63,15 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
                 continue
             if isinstance(data, dict):
                 yield data
+            else:
+                logger.warning(
+                    "skipping non-dict jsonl line %d in %s "
+                    "(value type=%s) | content: %r",
+                    line_index,
+                    path,
+                    type(data).__name__,
+                    stripped[:201],
+                )
 
 
 def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:

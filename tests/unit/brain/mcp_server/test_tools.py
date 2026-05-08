@@ -76,7 +76,8 @@ def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stor
     log_path = persona_dir / "tool_invocations.log.jsonl"
     rec = json.loads(log_path.read_text(encoding="utf-8"))
     assert rec["name"] == "search_memories"
-    assert rec["arguments"] == {"query": "x"}
+    # Audit 2026-05-07 P3-3: 'query' is now redacted in default mode.
+    assert rec["arguments"] == {"query": "[REDACTED]"}
     assert rec["error"] is None
 
 
