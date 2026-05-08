@@ -76,6 +76,55 @@ def _write_clean_shutdown(persona_dir: Path) -> None:
         logger.warning("clean-shutdown write failed", exc_info=True)
 
 
+_RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+_RUNTIME_LOG_BACKUPS = 3
+
+
+def _setup_runtime_logging(persona_dir: Path) -> None:
+    """Attach a size-rotating handler to the runner's root logger.
+
+    launchd's ``StandardOutPath`` / ``StandardErrorPath`` (and the legacy
+    ``spawn_detached`` log file) capture everything Python writes to
+    stdout/stderr but **don't rotate** — a long-lived supervisor would
+    grow those files unbounded. Adding a Python-side ``RotatingFileHandler``
+    on the root logger gives us a primary log we control: 5MB cap with
+    3 backups (~15MB ceiling per persona). The launchd-captured stdout/
+    stderr files become a secondary catch-all for unhandled exceptions
+    and uvicorn boot noise; those stay tiny in steady state.
+
+    Path: ``<log_dir>/runtime-<persona>.log``. Best-effort — failures
+    here must NOT prevent bridge startup, so any exception is swallowed
+    after a stderr breadcrumb.
+    """
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        from brain.paths import get_log_dir
+
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / f"runtime-{persona_dir.name}.log"
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=_RUNTIME_LOG_MAX_BYTES,
+            backupCount=_RUNTIME_LOG_BACKUPS,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S%z",
+            )
+        )
+        handler.setLevel(logging.INFO)
+        root = logging.getLogger()
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+        root.addHandler(handler)
+    except Exception as exc:  # noqa: BLE001
+        print(f"runtime logging setup failed: {exc}", file=sys.stderr)
+
+
 def run_bridge_foreground(
     persona_dir: Path,
     *,
@@ -90,6 +139,8 @@ def run_bridge_foreground(
     supervise it directly.
     """
     import secrets
+
+    _setup_runtime_logging(persona_dir)
 
     port = _allocate_port()
     # H-C: ephemeral bearer token persisted in bridge.json. 32 bytes from
