@@ -39,6 +39,16 @@ export default function App() {
   const [phase, setPhase] = useState<AppPhase>({ kind: "loading" });
   const [config, setConfig] = useState<AppConfig | null>(null);
 
+  async function startPersona(persona: string) {
+    setPhase({ kind: "starting-bridge", persona, error: null });
+    try {
+      await ensureBridgeRunning(persona);
+      setPhase({ kind: "ready", persona });
+    } catch (e) {
+      setPhase({ kind: "starting-bridge", persona, error: (e as Error).message });
+    }
+  }
+
   // Boot: read config, decide first-launch vs ready, ensure bridge, etc.
   useEffect(() => {
     (async () => {
@@ -48,17 +58,7 @@ export default function App() {
         setPhase({ kind: "wizard" });
         return;
       }
-      setPhase({ kind: "starting-bridge", persona: cfg.selected_persona, error: null });
-      try {
-        await ensureBridgeRunning(cfg.selected_persona);
-        setPhase({ kind: "ready", persona: cfg.selected_persona });
-      } catch (e) {
-        setPhase({
-          kind: "starting-bridge",
-          persona: cfg.selected_persona,
-          error: (e as Error).message,
-        });
-      }
+      await startPersona(cfg.selected_persona);
     })();
   }, []);
 
@@ -72,26 +72,27 @@ export default function App() {
           // any defaults the install step may have set.
           const cfg = await readAppConfig();
           setConfig(cfg);
-          setPhase({ kind: "starting-bridge", persona, error: null });
-          try {
-            await ensureBridgeRunning(persona);
-            setPhase({ kind: "ready", persona });
-          } catch (e) {
-            setPhase({ kind: "starting-bridge", persona, error: (e as Error).message });
-          }
+          await startPersona(persona);
         }}
       />
     );
   }
 
   if (phase.kind === "starting-bridge") {
+    if (phase.error) {
+      return (
+        <BridgeErrorScreen
+          persona={phase.persona}
+          error={phase.error}
+          onRetry={() => void startPersona(phase.persona)}
+          onOpenAnyway={() => setPhase({ kind: "ready", persona: phase.persona })}
+          onRunSetup={() => setPhase({ kind: "wizard" })}
+        />
+      );
+    }
     return (
       <BootScreen
-        subtitle={
-          phase.error
-            ? `Bridge failed to start: ${phase.error}`
-            : `Starting brain for ${phase.persona}…`
-        }
+        subtitle={`Starting brain for ${phase.persona}…`}
       />
     );
   }
@@ -101,6 +102,96 @@ export default function App() {
       <div className="titlebar-drag" onMouseDown={dragWindow} />
       <Ready config={config!} setConfig={setConfig} persona={phase.persona} />
     </>
+  );
+}
+
+function BridgeErrorScreen({
+  persona,
+  error,
+  onRetry,
+  onOpenAnyway,
+  onRunSetup,
+}: {
+  persona: string;
+  error: string;
+  onRetry: () => void;
+  onOpenAnyway: () => void;
+  onRunSetup: () => void;
+}) {
+  const diagnostics = `persona=${persona}\nbridge_start_error=${error}`;
+  async function copyDiagnostics() {
+    try {
+      await navigator.clipboard.writeText(diagnostics);
+    } catch {
+      // Clipboard is best-effort only; the visible diagnostics remain on screen.
+    }
+  }
+
+  return (
+    <>
+      <div className="titlebar-drag" onMouseDown={dragWindow} />
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 14,
+          width: "100vw",
+          height: "100vh",
+          padding: 28,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontFamily: "var(--font-disp)", color: "var(--linen)", fontSize: 18 }}>
+          Brain startup needs attention
+        </div>
+        <div style={{ maxWidth: 420, color: "var(--mauve)", fontSize: 12, lineHeight: 1.6 }}>
+          Companion Emergence could not start the bridge for <strong>{persona}</strong>.
+          You can retry, open the app in degraded mode, or re-run setup.
+        </div>
+        <pre
+          style={{
+            maxWidth: 460,
+            maxHeight: 120,
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            textAlign: "left",
+            padding: 10,
+            borderRadius: 8,
+            background: "rgba(234,222,218,0.08)",
+            border: "1px solid rgba(234,222,218,0.18)",
+            color: "var(--linen)",
+            fontSize: 11,
+          }}
+        >
+          {diagnostics}
+        </pre>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+          <BootButton onClick={onRetry}>Retry</BootButton>
+          <BootButton onClick={onOpenAnyway}>Open degraded</BootButton>
+          <BootButton onClick={onRunSetup}>Re-run setup</BootButton>
+          <BootButton onClick={() => void copyDiagnostics()}>Copy diagnostics</BootButton>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function BootButton(props: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      {...props}
+      style={{
+        padding: "7px 10px",
+        borderRadius: 7,
+        border: "1px solid rgba(234,222,218,0.25)",
+        background: "rgba(234,222,218,0.12)",
+        color: "var(--linen)",
+        fontSize: 11,
+        cursor: "pointer",
+      }}
+    />
   );
 }
 
