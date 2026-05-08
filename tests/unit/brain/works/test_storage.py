@@ -175,3 +175,79 @@ def test_write_markdown_atomic_via_save_with_backup(tmp_path: Path) -> None:
     # save_with_backup pattern's responsibility.
     main_file = persona_dir / "data" / "works" / "abc123def456.md"
     assert "second version" in main_file.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-05-07 P3-6 — YAML-safe frontmatter
+# ---------------------------------------------------------------------------
+
+
+def test_yaml_frontmatter_handles_colons_in_title(tmp_path: Path) -> None:
+    """Titles with ':' used to corrupt frontmatter parsing."""
+    persona_dir = _make_persona(tmp_path)
+    w = works.Work(
+        id="aaa111bbb222",
+        title="Notes: a colon-bearing title",
+        type="idea",
+        created_at=datetime(2026, 5, 4, tzinfo=UTC),
+        session_id=None,
+        word_count=2,
+        summary=None,
+    )
+    storage.write_markdown(persona_dir, w, content="body")
+    out, _ = storage.read_markdown(persona_dir, "aaa111bbb222")
+    assert out.title == "Notes: a colon-bearing title"
+
+
+def test_yaml_frontmatter_handles_yaml_reserved_words(tmp_path: Path) -> None:
+    """A title that's literally 'yes' / 'true' / 'null' must round-trip
+    as the string, not get coerced to bool/None."""
+    persona_dir = _make_persona(tmp_path)
+    for tricky in ["yes", "no", "true", "false", "null", "123", "1.5"]:
+        w = works.Work(
+            id="bbb222ccc333",
+            title=tricky,
+            type="idea",
+            created_at=datetime(2026, 5, 4, tzinfo=UTC),
+            session_id=None,
+            word_count=1,
+            summary=None,
+        )
+        storage.write_markdown(persona_dir, w, content="body")
+        out, _ = storage.read_markdown(persona_dir, "bbb222ccc333")
+        assert out.title == tricky, f"title {tricky!r} did not round-trip"
+
+
+def test_yaml_frontmatter_handles_multiline_summary(tmp_path: Path) -> None:
+    """Summaries with newlines round-trip as a YAML literal block scalar."""
+    persona_dir = _make_persona(tmp_path)
+    multi = "First line.\nSecond line.\nThird."
+    w = works.Work(
+        id="ccc333ddd444",
+        title="multi-line summary test",
+        type="story",
+        created_at=datetime(2026, 5, 4, tzinfo=UTC),
+        session_id=None,
+        word_count=3,
+        summary=multi,
+    )
+    storage.write_markdown(persona_dir, w, content="body")
+    out, _ = storage.read_markdown(persona_dir, "ccc333ddd444")
+    assert out.summary == multi
+
+
+def test_yaml_frontmatter_handles_quote_chars(tmp_path: Path) -> None:
+    """Embedded double-quotes in a quoted scalar round-trip via escaping."""
+    persona_dir = _make_persona(tmp_path)
+    w = works.Work(
+        id="ddd444eee555",
+        title='She said "hello" — like that',
+        type="idea",
+        created_at=datetime(2026, 5, 4, tzinfo=UTC),
+        session_id=None,
+        word_count=4,
+        summary=None,
+    )
+    storage.write_markdown(persona_dir, w, content="body")
+    out, _ = storage.read_markdown(persona_dir, "ddd444eee555")
+    assert out.title == 'She said "hello" — like that'

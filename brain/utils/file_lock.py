@@ -19,9 +19,10 @@ the supervisor, this module gets the platform branch.
 from __future__ import annotations
 
 import fcntl
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO
 
 
 @contextmanager
