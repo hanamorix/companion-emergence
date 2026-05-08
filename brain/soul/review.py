@@ -424,7 +424,43 @@ def review_pending_candidates(
     dry_run:
         If True, evaluate + log but skip all writes.
     """
-    from brain.soul.audit import append_audit_entry
+    from brain.soul.audit import append_audit_entry  # noqa: F401  used below
+    from brain.utils.file_lock import file_lock
+
+    # Audit 2026-05-07 P2-2: hold the soul_candidates.jsonl lock for
+    # the full read-modify-rewrite window so queue_soul_candidate
+    # appends block briefly during review instead of getting clobbered
+    # when _save_soul_candidates rewrites the file. Review takes
+    # seconds to minutes per candidate — short enough that blocking
+    # the queue is preferable to silent data loss.
+    with file_lock(persona_dir / "soul_candidates.jsonl"):
+        return _review_pending_candidates_locked(
+            persona_dir,
+            store=store,
+            soul_store=soul_store,
+            provider=provider,
+            max_decisions=max_decisions,
+            confidence_threshold=confidence_threshold,
+            dry_run=dry_run,
+        )
+
+
+def _review_pending_candidates_locked(
+    persona_dir: Path,
+    *,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    provider: LLMProvider,
+    max_decisions: int = DEFAULT_MAX_DECISIONS,
+    confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
+    dry_run: bool = False,
+) -> ReviewReport:
+    """Read-modify-rewrite body of :func:`review_pending_candidates`.
+
+    Caller must hold the soul_candidates.jsonl file lock; concurrent
+    queue appends would otherwise race the rewrite.
+    """
+    from brain.soul.audit import append_audit_entry  # noqa: F401  used below
 
     records = _load_soul_candidates(persona_dir)
     pending_indices = [
