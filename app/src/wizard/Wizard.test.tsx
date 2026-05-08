@@ -60,4 +60,25 @@ describe("Wizard InitArgs shape", () => {
     const sentArgs = calls[0][1].args;
     expect("provider" in sentArgs).toBe(false);
   });
+
+  it("installSupervisorService dispatches install_supervisor_service with persona", async () => {
+    // Reset module cache so the dynamic re-import picks up the new mock
+    // (the previous test cached @tauri-apps/api/core's resolution and
+    // would otherwise reuse its invoke spy instead of this one).
+    vi.resetModules();
+    const invoke = vi.fn(async () => ({
+      success: true,
+      stdout: "service installed: /Users/x/Library/LaunchAgents/...plist",
+      stderr: "",
+      exit_code: 0,
+    }));
+    vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+
+    const { installSupervisorService } = await import("../appConfig");
+    const result = await installSupervisorService("alice");
+    expect(invoke).toHaveBeenCalledWith("install_supervisor_service", {
+      persona: "alice",
+    });
+    expect(result.success).toBe(true);
+  });
 });
