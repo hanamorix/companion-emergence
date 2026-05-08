@@ -121,8 +121,8 @@ export async function checkClaudeCli(): Promise<ClaudeCliCheck> {
  * which solves the "talk to Nell, close the app, brain dies" issue
  * the audit cycle motivated.
  *
- * macOS-only — non-darwin platforms get a synthetic success and the
- * legacy Tauri-spawn-supervisor path keeps working unchanged.
+ * macOS-only. Non-Darwin platforms return an explicit unsupported
+ * result and the legacy Tauri-spawn-supervisor path keeps working unchanged.
  */
 export async function installSupervisorService(persona: string): Promise<InitResult> {
   return await invoke<InitResult>("install_supervisor_service", { persona });
