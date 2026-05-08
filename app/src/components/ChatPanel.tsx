@@ -62,6 +62,8 @@ const EMOJI_GROUPS: { label: string; chars: string[] }[] = [
 const formatTime = () =>
   new Date().toLocaleTimeString("en", { hour: "numeric", minute: "2-digit" });
 
+const capitalize = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
 interface Props {
   /** Persona name — every bridge call is scoped to this so the UI
    *  cannot accidentally talk to a different persona's daemon. */
@@ -384,9 +386,6 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
         {messages.map((m) => (
           <Bubble key={m.id} msg={m} />
         ))}
-        {streaming && messages.length > 0 && messages[messages.length - 1]?.text === "" && (
-          <TypingDots />
-        )}
         {error && (
           <div style={{ fontSize: 11, color: "var(--crimson)", padding: "6px 4px" }}>
             {error}
@@ -398,11 +397,16 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
       )}
       <div
         style={{
-          paddingTop: 10,
+          marginTop: 10,
           display: "flex",
           gap: 6,
           alignItems: "flex-end",
           position: "relative",
+          background: "var(--panel-bg)",
+          border: "1px solid var(--border)",
+          borderRadius: 10,
+          padding: "8px 8px",
+          boxShadow: "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
         }}
       >
         <input
@@ -448,15 +452,15 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKey}
-          placeholder="write to nell..."
+          placeholder={`Write to ${capitalize(persona)}…`}
           rows={1}
+          className="chat-input"
           style={{
             flex: 1,
-            background: "rgba(26, 18, 18, 0.6)",
-            border: "1px solid var(--border-dk)",
-            borderRadius: 6,
-            padding: "8px 10px",
-            color: "var(--linen)",
+            background: "transparent",
+            border: "none",
+            padding: "6px 6px",
+            color: "var(--text)",
             fontFamily: "var(--font-ui)",
             fontSize: 12,
             resize: "none",
@@ -508,7 +512,7 @@ function IconButton({
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "var(--linen)",
+        color: "var(--text-mid)",
         cursor: rest.disabled ? "default" : "pointer",
         opacity: rest.disabled ? 0.35 : 0.85,
         transition: "background 0.15s, opacity 0.15s",
@@ -731,7 +735,7 @@ function Bubble({ msg }: { msg: Message }) {
             }}
           />
         )}
-        {msg.text}
+        {msg.streaming && !msg.text ? <TypingDots /> : msg.text}
       </div>
       <div
         style={{
@@ -752,12 +756,12 @@ function TypingDots() {
   return (
     <div
       style={{
-        display: "flex",
+        display: "inline-flex",
         alignItems: "center",
         gap: 5,
-        padding: "8px 0",
-        animation: "msg-in 0.28s ease",
+        height: 14,
       }}
+      aria-label="thinking"
     >
       {[0, 1, 2].map((i) => (
         <div

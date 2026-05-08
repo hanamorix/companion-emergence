@@ -63,7 +63,34 @@ function Section({ heading, body }: { heading: string; body: string }) {
       >
         {heading}
       </div>
-      <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.55 }}>{body}</div>
+      <div
+        style={{
+          fontSize: 11,
+          color: "var(--text-mid)",
+          lineHeight: 1.55,
+          whiteSpace: "pre-wrap",
+        }}
+      >
+        {renderInlineMarkdown(body)}
+      </div>
     </div>
   );
+}
+
+// Reflex/dream summaries arrive with single-asterisk italic markers
+// (`*setting line*`). Render them as <em> so the cards read cleanly
+// instead of leaking raw asterisks.
+function renderInlineMarkdown(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  const re = /\*([^*\n]+)\*/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push(<em key={key++}>{match[1]}</em>);
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts.length ? parts : [text];
 }
