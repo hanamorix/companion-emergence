@@ -93,6 +93,25 @@ export async function runInit(args: InitArgs): Promise<InitResult> {
   return await invoke<InitResult>("run_init", { args });
 }
 
+export interface MigrateArgs {
+  persona: string;
+  /** "nellbrain" or "emergence-kit". */
+  source: "nellbrain" | "emergence-kit";
+  /** Absolute path to the source brain's data directory. */
+  input_dir: string;
+  force: boolean;
+}
+
+/**
+ * Run ``nell migrate`` against the given source brain. Used by the
+ * wizard's StepInstalling to one-click import a NellBrain or
+ * emergence-kit dataset into the new persona before the launchd
+ * agent installs over it.
+ */
+export async function runMigrate(args: MigrateArgs): Promise<InitResult> {
+  return await invoke<InitResult>("run_migrate", { args });
+}
+
 export interface ClaudeCliCheck {
   found: boolean;
   path: string | null;

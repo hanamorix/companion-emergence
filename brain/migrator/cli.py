@@ -523,19 +523,31 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
     if subparsers is not None:
         p = subparsers.add_parser(
             "migrate",
-            help="Port OG NellBrain data into a new persona.",
+            help="Port an existing brain (NellBrain or emergence-kit) into a new persona.",
         )
     else:
         p = argparse.ArgumentParser(
             prog="nell migrate",
-            description="Port OG NellBrain data into a new persona.",
+            description="Port an existing brain into a new persona.",
         )
+    p.add_argument(
+        "--source",
+        choices=["nellbrain", "emergence-kit"],
+        default="nellbrain",
+        help=(
+            "Source format. ``nellbrain`` (default) expects a full OG "
+            "NellBrain data/ directory with memories_v2.json, "
+            "connection_matrix.npy, nell_soul.json, etc. ``emergence-kit`` "
+            "expects the lighter github.com/hanamorix/emergence-kit layout: "
+            "memories_v2.json + soul_template.json (+ optional personality.json)."
+        ),
+    )
     p.add_argument(
         "--input",
         dest="input_dir",
         type=Path,
         required=True,
-        help="Path to the OG NellBrain data/ directory.",
+        help="Path to the source brain's data directory.",
     )
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument(
@@ -569,7 +581,27 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
 
 
 def _dispatch(args: argparse.Namespace) -> int:
-    """Argparse-compatible handler: convert Namespace → MigrateArgs → run_migrate."""
+    """Argparse-compatible handler: convert Namespace → run the right
+    migrator for the chosen ``--source`` (nellbrain or emergence-kit).
+    """
+    source = getattr(args, "source", "nellbrain")
+    if source == "emergence-kit":
+        from brain.migrator.emergence_kit import (
+            EmergenceKitMigrateArgs,
+            migrate_emergence_kit,
+        )
+        from brain.migrator.report import format_report
+
+        kit_args = EmergenceKitMigrateArgs(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            install_as=args.install_as,
+            force=args.force,
+        )
+        report = migrate_emergence_kit(kit_args)
+        print(format_report(report))
+        return 0
+
     migrate_args = MigrateArgs(
         input_dir=args.input_dir,
         output_dir=args.output_dir,

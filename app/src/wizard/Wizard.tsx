@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   installSupervisorService,
   runInit,
+  runMigrate,
   writeAppConfig,
   type InitArgs,
 } from "../appConfig";
@@ -18,6 +19,7 @@ import { StepReady } from "./steps/StepReady";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
+export type MigrateSource = "nellbrain" | "emergence-kit";
 
 export interface WizardState {
   mode: WizardMode;
@@ -25,6 +27,7 @@ export interface WizardState {
   userName: string;
   voiceTemplate: VoiceTemplate;
   migrateFromPath: string;
+  migrateSource: MigrateSource;
 }
 
 const INITIAL_STATE: WizardState = {
@@ -33,6 +36,7 @@ const INITIAL_STATE: WizardState = {
   userName: "",
   voiceTemplate: "default",
   migrateFromPath: "",
+  migrateSource: "nellbrain",
 };
 
 // Provider is fixed to claude-cli (per project decision 2026-05-07).
@@ -96,15 +100,57 @@ export function Wizard({ onDone }: Props) {
 
   async function runInstall() {
     setStep("installing");
+    // emergence-kit takes the new auto-importer path: ``nell migrate
+    // --source emergence-kit --install-as <name>`` builds the persona
+    // dir directly from the kit's JSON files. NellBrain still flows
+    // through ``nell init --migrate-from`` because the OG migrator's
+    // preflight + lock checks live there.
+    const useEmergenceKitMigrator =
+      state.mode === "migrate" && state.migrateSource === "emergence-kit";
+
     const args: InitArgs = {
       persona: state.personaName,
       user_name: state.userName.trim() || null,
       voice_template: state.voiceTemplate,
-      migrate_from: state.mode === "migrate" ? state.migrateFromPath : null,
+      migrate_from:
+        state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
       force: false,
     };
     try {
-      const result = await runInit(args);
+      let result;
+      if (useEmergenceKitMigrator) {
+        // Run the kit migrator first, which creates the persona dir
+        // and seeds memories.db / crystallizations.db / personality.json.
+        const migrateResult = await runMigrate({
+          persona: state.personaName,
+          source: "emergence-kit",
+          input_dir: state.migrateFromPath,
+          force: false,
+        });
+        if (!migrateResult.success) {
+          setInstallResult({
+            ok: false,
+            output: migrateResult.stdout,
+            error: migrateResult.stderr || `exit ${migrateResult.exit_code}`,
+          });
+          return;
+        }
+        // Then ``nell init --force`` writes the voice template +
+        // persona_config.json on top of the migrated dir without
+        // touching memories.db. ``--force`` is needed because the
+        // dir now exists.
+        result = await runInit({ ...args, force: true });
+        if (result.success) {
+          // Stitch the migrate output and init output together so
+          // the user sees both summaries in the install pane.
+          result = {
+            ...result,
+            stdout: migrateResult.stdout + "\n\n" + result.stdout,
+          };
+        }
+      } else {
+        result = await runInit(args);
+      }
       if (!result.success) {
         setInstallResult({
           ok: false,
@@ -219,6 +265,8 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           path={state.migrateFromPath}
           onPathChange={(p) => update("migrateFromPath", p)}
+          source={state.migrateSource}
+          onSourceChange={(s) => update("migrateSource", s)}
           onNext={() => setStep("review")}
           onBack={() => setStep("voice")}
           avatar={avatar}
