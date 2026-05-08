@@ -58,11 +58,16 @@ def append_removed_arc(
         "description_snapshot": arc.description,
         "prompt_template_snapshot": arc.prompt_template,
     }
-    line = json.dumps(entry) + "\n"
-    existing = path.read_bytes() if path.exists() else b""
-    tmp = path.with_suffix(path.suffix + ".new")
-    tmp.write_bytes(existing + line.encode("utf-8"))
-    os.replace(tmp, path)
+    # Audit 2026-05-07 P2-1: append via OS append-mode semantics
+    # rather than read-rewrite-replace. Concurrent removals (e.g.
+    # supervisor heartbeat pruning + user-edit detection) used to
+    # race on the .new temp path and clobber entries.
+    line = (json.dumps(entry) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "ab") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def read_removed_arcs(persona_dir: Path) -> list[dict]:
