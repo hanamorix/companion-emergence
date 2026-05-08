@@ -5,6 +5,7 @@ at the integration layer; we don't duplicate that here."""
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,95 @@ def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str =
     _make_persona(tmp_path, persona)
     monkeypatch.setenv("NELLBRAIN_HOME", str(home))
     return log_dir
+
+
+# ---------- cmd_run ----------
+
+
+def test_cmd_run_calls_foreground_runner_without_detaching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Foreground service mode runs in-process; launchd must own this process."""
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    calls: dict[str, object] = {}
+
+    def fail_detach(*args, **kwargs):
+        pytest.fail("cmd_run must not call spawn_detached")
+
+    def fake_foreground(persona_dir_arg, *, client_origin, idle_shutdown_seconds):
+        calls["persona_dir"] = persona_dir_arg
+        calls["client_origin"] = client_origin
+        calls["idle_shutdown_seconds"] = idle_shutdown_seconds
+        return 0
+
+    monkeypatch.setattr(daemon, "spawn_detached", fail_detach)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda persona_dir: None)
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fake_foreground)
+
+    rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
+
+    assert rc == 0
+    assert calls == {
+        "persona_dir": persona_dir,
+        "client_origin": "launchd",
+        "idle_shutdown_seconds": None,
+    }
+    assert not (persona_dir / daemon.LOCKFILE).exists()
+
+
+def test_cmd_run_converts_idle_shutdown_minutes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_paths(monkeypatch, tmp_path)
+    calls: dict[str, object] = {}
+
+    def fake_foreground(persona_dir_arg, *, client_origin, idle_shutdown_seconds):
+        calls["idle_shutdown_seconds"] = idle_shutdown_seconds
+        return 0
+
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda persona_dir: None)
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fake_foreground)
+
+    rc = daemon.cmd_run(_args("nell", idle_shutdown=2.5, client_origin="cli"))
+
+    assert rc == 0
+    assert calls["idle_shutdown_seconds"] == 150.0
+
+
+def test_cmd_run_refuses_when_bridge_already_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell",
+            pid=os.getpid(),
+            port=51234,
+            started_at="2026-05-08T00:00:00+00:00",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="launchd",
+        ),
+    )
+
+    def fail_foreground(*args, **kwargs):
+        pytest.fail("cmd_run must not start a second foreground runner")
+
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fail_foreground)
+
+    rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
+
+    assert rc == 2
+    assert "bridge already running" in capsys.readouterr().err
 
 
 def _tail_args(persona: str, **kw) -> argparse.Namespace:

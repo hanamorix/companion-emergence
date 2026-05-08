@@ -1674,6 +1674,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Daemon handlers — shared by `supervisor` (canonical) and `bridge` (deprecated alias).
     from brain.bridge.daemon import (
         cmd_restart,
+        cmd_run,
         cmd_start,
         cmd_status,
         cmd_stop,
@@ -1697,6 +1698,8 @@ def _build_parser() -> argparse.ArgumentParser:
             raise argparse.ArgumentTypeError("must be a non-negative integer")
         return iv
 
+    client_origin_choices = ["cli", "tauri", "tests", "launchd"]
+
     s_start = s_actions.add_parser("start", help="Start the bridge daemon.")
     _add_persona_arg(s_start)
     s_start.add_argument(
@@ -1705,10 +1708,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Idle-shutdown threshold in minutes (0 = never).",
     )
-    s_start.add_argument(
-        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
-    )
+    s_start.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_start.set_defaults(func=cmd_start)
+
+    s_run = s_actions.add_parser(
+        "run",
+        help="Run the bridge in the foreground for launchd/system service managers.",
+    )
+    _add_persona_arg(s_run)
+    s_run.add_argument(
+        "--idle-shutdown",
+        type=float,
+        default=0,
+        help="Idle-shutdown threshold in minutes (0 = never, default for service mode).",
+    )
+    s_run.add_argument("--client-origin", default="launchd", choices=client_origin_choices)
+    s_run.set_defaults(func=cmd_run)
 
     s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
     _add_persona_arg(s_stop)
@@ -1724,9 +1739,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_persona_arg(s_restart)
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
-    s_restart.add_argument(
-        "--client-origin", default="cli", choices=["cli", "tauri", "tests"]
-    )
+    s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
     s_restart.set_defaults(func=cmd_restart)
 
