@@ -387,6 +387,94 @@ async fn install_supervisor_service(
     })
 }
 
+/// Result of probing the host for Anthropic's ``claude`` CLI.
+///
+/// Powers the wizard's prerequisites step: when ``found`` is false the
+/// wizard surfaces an install-instructions panel and blocks ``Continue``
+/// until a re-check passes. ``path`` is the resolved absolute path on
+/// success so the user can see exactly which binary was picked
+/// (helpful when multiple installs collide).
+#[derive(Debug, Serialize)]
+pub struct ClaudeCliCheck {
+    pub found: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+}
+
+#[tauri::command]
+async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
+    // Anthropic's installer puts the binary at ``~/.local/bin/claude``,
+    // which launchd / Finder-launched processes don't see by default
+    // because they inherit a stripped PATH. Probe a small set of known
+    // locations PLUS try a bare ``claude`` lookup so Homebrew /
+    // ``/usr/local`` installs are still found when the user's shell
+    // PATH happens to be inherited.
+    let candidates: Vec<PathBuf> = {
+        let mut v: Vec<PathBuf> = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            v.push(PathBuf::from(&home).join(".local/bin/claude"));
+        }
+        v.push(PathBuf::from("/opt/homebrew/bin/claude"));
+        v.push(PathBuf::from("/usr/local/bin/claude"));
+        if cfg!(target_os = "windows") {
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                v.push(
+                    PathBuf::from(local_app_data)
+                        .join("Programs")
+                        .join("claude")
+                        .join("claude.exe"),
+                );
+            }
+        }
+        v
+    };
+    let mut resolved: Option<PathBuf> = None;
+    for cand in &candidates {
+        if cand.is_file() {
+            resolved = Some(cand.clone());
+            break;
+        }
+    }
+    // Fallback: ask the OS to resolve ``claude`` directly. tokio uses
+    // the inherited PATH; if the shell rc happened to seed it (the
+    // app was launched from terminal), this can succeed even when
+    // the path probe missed.
+    if resolved.is_none() {
+        if let Ok(out) = tokio::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            .await
+        {
+            if out.status.success() {
+                let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return Ok(ClaudeCliCheck {
+                    found: true,
+                    path: None,
+                    version: if version.is_empty() { None } else { Some(version) },
+                });
+            }
+        }
+        return Ok(ClaudeCliCheck { found: false, path: None, version: None });
+    }
+    let path = resolved.unwrap();
+    let version = match tokio::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if v.is_empty() { None } else { Some(v) }
+        }
+        _ => None,
+    };
+    Ok(ClaudeCliCheck {
+        found: true,
+        path: Some(path.to_string_lossy().to_string()),
+        version,
+    })
+}
+
 /// Apply the always-on-top toggle to the main window. Hits the Tauri
 /// Manager API directly — the previous implementation only persisted
 /// the bool to app_config.json without ever calling the window API,
@@ -414,6 +502,7 @@ pub fn run() {
             ensure_bridge_running,
             run_init,
             install_supervisor_service,
+            check_claude_cli,
             set_always_on_top,
         ])
         .run(tauri::generate_context!())
