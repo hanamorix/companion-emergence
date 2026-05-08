@@ -1,5 +1,13 @@
-import type { ReactNode } from "react";
-import { Divider, FieldLabel, SectionLabel, WButton, WInput, WizardShell } from "../components";
+import { useState, type ReactNode } from "react";
+import {
+  Divider,
+  FieldLabel,
+  OptionCard,
+  SectionLabel,
+  WButton,
+  WInput,
+  WizardShell,
+} from "../components";
 
 interface Props {
   step: number;
@@ -11,6 +19,8 @@ interface Props {
   avatar: ReactNode;
 }
 
+type Source = "nellbrain" | "emergence-kit";
+
 export function StepMigrate({
   step,
   totalSteps,
@@ -20,13 +30,15 @@ export function StepMigrate({
   onBack,
   avatar,
 }: Props) {
-  const valid = path.trim().length > 0;
+  const [source, setSource] = useState<Source>("nellbrain");
+  const valid = source === "nellbrain" ? path.trim().length > 0 : true;
+
   return (
     <WizardShell
       step={step}
       totalSteps={totalSteps}
-      title="Migrate from the original framework"
-      subtitle="Point us at the original brain's data folder and we'll port the memories, soul, Hebbian edges, and creative DNA into the new layout."
+      title="Bring your brain over"
+      subtitle="Tell us where your old companion lives. We'll carry their memories and personality across so the new framework starts already knowing who they are."
       avatar={avatar}
       footer={
         <>
@@ -39,39 +51,70 @@ export function StepMigrate({
         </>
       }
     >
-      <SectionLabel>What gets migrated</SectionLabel>
-      <ListLine emoji="🧠" title="Memories" detail="memories_v2.json → memories.db with embeddings rebuilt" />
-      <ListLine emoji="🌱" title="Soul" detail="nell_soul.json crystallizations and resonance scores" />
-      <ListLine emoji="🕸️" title="Hebbian edges" detail="connection_matrix.npy → hebbian.db" />
-      <ListLine emoji="✨" title="Creative DNA" detail="creative_dna.json (writing voice fingerprint)" />
-      <ListLine emoji="📓" title="Reflex log" detail="recent journal-arc fires retained for trajectory" />
-      <ListLine
-        emoji="—"
-        title="Stays separate"
-        detail="provider config, voice template, daemon cron schedules — re-set in this wizard"
-        muted
+      <SectionLabel>Where are you coming from?</SectionLabel>
+      <OptionCard
+        selected={source === "nellbrain"}
+        onClick={() => setSource("nellbrain")}
+        title="The original NellBrain framework"
+        description="The bigger Python project with memories, soul crystallizations, connection-strength files, and a creative voice fingerprint. Auto-imported."
+      />
+      <OptionCard
+        selected={source === "emergence-kit"}
+        onClick={() => setSource("emergence-kit")}
+        title="emergence-kit (or another simpler brain)"
+        description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality. Imported by hand for now."
       />
 
       <Divider />
 
-      <FieldLabel>Original brain data directory</FieldLabel>
-      <WInput
-        value={path}
-        onChange={onPathChange}
-        placeholder="/Users/you/NellBrain/data"
-        mono
+      {source === "nellbrain" ? <NellBrainPath path={path} onPathChange={onPathChange} /> : <EmergenceKitGuide />}
+    </WizardShell>
+  );
+}
+
+function NellBrainPath({
+  path,
+  onPathChange,
+}: {
+  path: string;
+  onPathChange: (p: string) => void;
+}) {
+  return (
+    <>
+      <SectionLabel>What carries over</SectionLabel>
+      <Line emoji="🧠" title="Every memory" detail="how your companion remembers you and what mattered" />
+      <Line emoji="🌱" title="Soul" detail="the moments they've crystallized as core to who they are" />
+      <Line emoji="🕸️" title="Connections" detail="which memories light up together (Hebbian edges)" />
+      <Line emoji="✨" title="Creative voice" detail="the writing-style fingerprint built up over time" />
+      <Line emoji="📓" title="Recent journals" detail="reflex-arc entries that show their last few weeks" />
+      <Line
+        emoji="—"
+        title="What you'll set fresh"
+        detail="provider config, voice template, scheduling — picked in this wizard"
+        muted
       />
-      <div
-        style={{
-          marginTop: 6,
-          fontSize: 10.5,
-          color: "var(--text-mute)",
-          lineHeight: 1.5,
-        }}
-      >
-        The folder containing <code>memories_v2.json</code>, <code>nell_soul.json</code>,
-        <code> connection_matrix.npy</code>. On a typical macOS install
-        the path is <code>~/NellBrain/data</code>.
+
+      <div style={{ marginTop: 14 }}>
+        <FieldLabel>Where is the original brain's data folder?</FieldLabel>
+        <WInput
+          value={path}
+          onChange={onPathChange}
+          placeholder="/Users/you/NellBrain/data"
+          mono
+        />
+        <div
+          style={{
+            marginTop: 6,
+            fontSize: 10.5,
+            color: "var(--text-mute)",
+            lineHeight: 1.55,
+          }}
+        >
+          The folder with <code>memories_v2.json</code>,{" "}
+          <code>nell_soul.json</code>, and{" "}
+          <code>connection_matrix.npy</code> inside. On most macOS
+          installs this is <code>~/NellBrain/data</code>.
+        </div>
       </div>
 
       <div
@@ -94,23 +137,101 @@ export function StepMigrate({
             fontWeight: 500,
           }}
         >
-          Before you continue
+          One safety check
         </div>
         <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.7 }}>
-          <strong>Stop the original brain's bridge first.</strong> The
-          migrator checks <code>memories_v2.json.lock</code> and refuses
-          if the OG bridge has touched it within the last 90 seconds —
-          this prevents a half-written migration. From the original
-          repo: <code>./bin/stop-bridge</code>, or kill the
-          <code> nell_bridge</code> process. The migration is read-only
-          on the original data.
+          <strong>Stop the original brain's bridge first</strong> if
+          it's running. We won't touch your old files (the migration is
+          read-only), but having two brains writing to the same memory
+          file at the same time would corrupt it. From the original
+          repo: <code>./bin/stop-bridge</code>, or kill the{" "}
+          <code>nell_bridge</code> process. We'll check for the lock
+          file and refuse if your old brain still looks active.
         </div>
       </div>
-    </WizardShell>
+    </>
   );
 }
 
-function ListLine({
+function EmergenceKitGuide() {
+  return (
+    <>
+      <div
+        style={{
+          padding: "12px 14px",
+          borderRadius: 8,
+          background: "rgba(130,51,41,0.06)",
+          border: "1px solid rgba(130,51,41,0.18)",
+          fontSize: 11.5,
+          color: "var(--text-mid)",
+          lineHeight: 1.7,
+        }}
+      >
+        <strong style={{ color: "var(--text)" }}>
+          You can still bring them across — just not all in one click yet.
+        </strong>
+        <p style={{ margin: "8px 0 0" }}>
+          The emergence-kit format (<code>my_brain.py</code> +{" "}
+          <code>brain_config.json</code> + the memories / soul /
+          personality JSONs) doesn't auto-import yet. Two paths that
+          work today:
+        </p>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <SectionLabel>Path A — recommended</SectionLabel>
+        <Line emoji="✨" title="Go back and pick Start fresh" detail="set up a new persona with the same name they had before" />
+        <Line emoji="💬" title="Tell them about themselves" detail="paste your old soul.json or share key memories in chat — they'll absorb the moments and re-crystallize" />
+        <Line emoji="🌱" title="Let them grow into it" detail="the new framework will form fresh memories from the conversation as you go" />
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <SectionLabel>Path B — manual import</SectionLabel>
+        <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.7 }}>
+          Once the persona exists, drop your old{" "}
+          <code>memories.json</code> at{" "}
+          <code>~/Library/Application Support/companion-emergence/personas/&lt;name&gt;/migrate-in.json</code>{" "}
+          and run from terminal:
+        </div>
+        <pre
+          style={{
+            fontSize: 10.5,
+            fontFamily: "DM Mono, Courier New, monospace",
+            background: "rgba(0,0,0,0.06)",
+            color: "var(--text)",
+            padding: "8px 10px",
+            borderRadius: 5,
+            marginTop: 6,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+          }}
+        >
+          {`nell migrate --input ./migrate-in.json --persona <name>`}
+        </pre>
+        <div
+          style={{
+            marginTop: 6,
+            fontSize: 10.5,
+            color: "var(--text-mute)",
+            lineHeight: 1.55,
+            fontStyle: "italic",
+          }}
+        >
+          A guided one-click importer for emergence-kit is on the
+          roadmap; for now Path A is what most people choose.
+        </div>
+      </div>
+
+      <Divider />
+      <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.65 }}>
+        Whichever path you pick, your old files stay where they are.
+        Nothing here touches the emergence-kit folder.
+      </div>
+    </>
+  );
+}
+
+function Line({
   emoji,
   title,
   detail,
@@ -133,12 +254,7 @@ function ListLine({
     >
       <span
         aria-hidden="true"
-        style={{
-          flexShrink: 0,
-          fontSize: 13,
-          width: 18,
-          textAlign: "center",
-        }}
+        style={{ flexShrink: 0, fontSize: 13, width: 18, textAlign: "center" }}
       >
         {emoji}
       </span>
