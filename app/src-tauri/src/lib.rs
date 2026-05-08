@@ -53,8 +53,7 @@ fn nellbrain_home() -> Result<PathBuf, String> {
     if let Ok(home) = std::env::var("NELLBRAIN_HOME") {
         return Ok(PathBuf::from(home));
     }
-    let base = dirs::data_dir()
-        .ok_or_else(|| "could not resolve user data dir".to_string())?;
+    let base = dirs::data_dir().ok_or_else(|| "could not resolve user data dir".to_string())?;
     Ok(base.join("companion-emergence"))
 }
 
@@ -124,10 +123,10 @@ fn read_app_config() -> Result<AppConfig, String> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut cfg: AppConfig = serde_json::from_str(&raw)
-        .map_err(|e| format!("parse app_config.json: {}", e))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut cfg: AppConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("parse app_config.json: {}", e))?;
     // A hand-edited or stale app_config.json with an invalid persona
     // name would otherwise feed straight into persona_dir() at the next
     // command call. Heal to None here so the wizard fires instead.
@@ -149,10 +148,9 @@ fn write_app_config(config: AppConfig) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    let serialized = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("serialize: {}", e))?;
-    std::fs::write(&path, serialized)
-        .map_err(|e| format!("write {}: {}", path.display(), e))
+    let serialized =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(&path, serialized).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
 #[tauri::command]
@@ -161,8 +159,7 @@ fn list_personas() -> Result<Vec<String>, String> {
     if !dir.exists() {
         return Ok(vec![]);
     }
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| format!("read {}: {}", dir.display(), e))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {}", dir.display(), e))?;
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -190,10 +187,8 @@ fn list_personas() -> Result<Vec<String>, String> {
 /// so fall back to `uv run nell` against the source tree. Keeps the
 /// dev iteration loop fast.
 ///
-/// Resolution order:
-///   1. Bundled per-OS path (production)
-///   2. uv run nell (dev fallback)
-fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
+/// Return the bundled production `nell` entry point when it exists.
+fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
     use tauri::Manager;
     let resource_dir = app
         .path()
@@ -205,13 +200,39 @@ fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
     } else {
         runtime_dir.join("bin").join("nell")
     };
-    if bundled.exists() {
+    Ok(if bundled.exists() {
+        Some(bundled)
+    } else {
+        None
+    })
+}
+
+/// Resolution order:
+///   1. Bundled per-OS path (production)
+///   2. uv run nell (dev fallback)
+fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
+    if let Some(bundled) = bundled_nell_path(app)? {
         return Ok(Command::new(bundled));
     }
     // Dev fallback — uv on PATH against the source tree.
     let mut cmd = Command::new("uv");
     cmd.arg("run").arg("nell");
     Ok(cmd)
+}
+
+fn unstable_macos_app_path_reason(path: &std::path::Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    if text.starts_with("/Volumes/") {
+        return Some(
+            "Move Companion Emergence to /Applications before installing the launchd service; the bundled runtime is currently under /Volumes.".to_string(),
+        );
+    }
+    if text.contains("/AppTranslocation/") {
+        return Some(
+            "Move Companion Emergence to /Applications and relaunch before installing the launchd service; macOS is running this app from an AppTranslocation path.".to_string(),
+        );
+    }
+    None
 }
 
 /// Quick liveness check for the bridge — calls /health with the persona's
@@ -237,10 +258,7 @@ async fn bridge_healthy(persona: &str) -> bool {
 }
 
 #[tauri::command]
-async fn ensure_bridge_running(
-    app: tauri::AppHandle,
-    persona: String,
-) -> Result<(), String> {
+async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result<(), String> {
     validate_persona_name(&persona)?;
     if bridge_healthy(&persona).await {
         return Ok(());
@@ -262,11 +280,7 @@ async fn ensure_bridge_running(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        cmd.output(),
-    )
-    .await
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("spawn nell supervisor start: {}", e)),
@@ -312,11 +326,7 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
     // persona dir, writes config + voice.md. Typical run is <2s.
     // First-run deadlocks would leave the wizard's installing step
     // forever-spinning; the timeout surfaces `init_timeout`.
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        cmd.output(),
-    )
-    .await
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("spawn nell init: {}", e)),
@@ -343,8 +353,8 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
 /// exit_code) so the wizard can surface failures inline. Non-zero exit
 /// is reported but does NOT block the wizard transition: install can be
 /// retried from the connection panel later if it failed for a transient
-/// reason. macOS-only — non-darwin platforms get a synthetic success
-/// (the wizard treats it as "no-op for this OS").
+/// reason. macOS-only: non-Darwin platforms get an explicit unsupported
+/// result so the UI can avoid implying that a persistent service was installed.
 #[tauri::command]
 async fn install_supervisor_service(
     app: tauri::AppHandle,
@@ -353,27 +363,41 @@ async fn install_supervisor_service(
     validate_persona_name(&persona)?;
     if !cfg!(target_os = "macos") {
         return Ok(InitResult {
-            success: true,
-            stdout: "(skipped: launchd is macOS-only)".to_string(),
-            stderr: String::new(),
-            exit_code: 0,
+            success: false,
+            stdout: String::new(),
+            stderr: "persistent supervisor service install is currently macOS-only".to_string(),
+            exit_code: 78,
         });
     }
-    let std_cmd = nell_command(&app)?;
+    let bundled = bundled_nell_path(&app)?;
+    if let Some(path) = &bundled {
+        if let Some(reason) = unstable_macos_app_path_reason(path) {
+            return Ok(InitResult {
+                success: false,
+                stdout: String::new(),
+                stderr: reason,
+                exit_code: 78,
+            });
+        }
+    }
+    let std_cmd = if let Some(path) = &bundled {
+        Command::new(path)
+    } else {
+        nell_command(&app)?
+    };
     let mut cmd = tokio::process::Command::from(std_cmd);
-    cmd.args(["service", "install", "--persona", &persona])
-        .stdout(Stdio::piped())
+    cmd.args(["service", "install", "--persona", &persona]);
+    if let Some(path) = &bundled {
+        cmd.arg("--nell-path").arg(path);
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     // 30s budget — install writes a plist (cheap) + bootstraps via
     // launchctl (~1-3s). The hard cap is here so a wedged launchctl
     // can't hang the wizard indefinitely.
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        cmd.output(),
-    )
-    .await
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("spawn nell service install: {}", e)),
@@ -450,11 +474,19 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
                 return Ok(ClaudeCliCheck {
                     found: true,
                     path: None,
-                    version: if version.is_empty() { None } else { Some(version) },
+                    version: if version.is_empty() {
+                        None
+                    } else {
+                        Some(version)
+                    },
                 });
             }
         }
-        return Ok(ClaudeCliCheck { found: false, path: None, version: None });
+        return Ok(ClaudeCliCheck {
+            found: false,
+            path: None,
+            version: None,
+        });
     }
     let path = resolved.unwrap();
     let version = match tokio::process::Command::new(&path)
@@ -464,7 +496,11 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
     {
         Ok(out) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         _ => None,
     };
@@ -565,5 +601,27 @@ mod tests {
     fn port_parse_rejects_above_u16_max() {
         assert!(u16::try_from(65536u64).is_err());
         assert!(u16::try_from(100_000u64).is_err());
+    }
+
+    #[test]
+    fn unstable_macos_app_path_detects_dmg_and_translocation() {
+        let dmg = std::path::Path::new(
+            "/Volumes/Companion Emergence/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell",
+        );
+        assert!(unstable_macos_app_path_reason(dmg)
+            .unwrap()
+            .contains("/Applications"));
+
+        let translocated = std::path::Path::new(
+            "/private/var/folders/xx/AppTranslocation/ABC/d/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell",
+        );
+        assert!(unstable_macos_app_path_reason(translocated)
+            .unwrap()
+            .contains("AppTranslocation"));
+
+        let stable = std::path::Path::new(
+            "/Applications/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell",
+        );
+        assert!(unstable_macos_app_path_reason(stable).is_none());
     }
 }
