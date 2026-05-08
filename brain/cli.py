@@ -116,8 +116,28 @@ def _print_bridge_status(state: state_file.BridgeState | None) -> None:
     print(f"stopped_at: {state.stopped_at or 'unknown'}")
 
 
+def _service_unsupported_message(action: str) -> int:
+    """Print the dispatcher's UnsupportedPlatformError message and return 1.
+
+    Surfaces the friendly "this OS isn't wired yet" hint instead of
+    letting users hit the launchctl-not-found / SCM-missing failure
+    deeper in the call stack. Returns 1 so non-mac shells signal
+    failure cleanly.
+    """
+    from brain.service import UnsupportedPlatformError, current_backend
+
+    try:
+        current_backend()
+    except UnsupportedPlatformError as exc:
+        print(f"service {action}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _service_print_plist_handler(args: argparse.Namespace) -> int:
     """Print the macOS LaunchAgent plist for a persona without installing it."""
+    if (rc := _service_unsupported_message("print-plist")) != 0:
+        return rc
     from brain.service.launchd import (
         LaunchdConfigError,
         build_launchd_plist_xml,
@@ -141,6 +161,8 @@ def _service_print_plist_handler(args: argparse.Namespace) -> int:
 
 def _service_doctor_handler(args: argparse.Namespace) -> int:
     """Run non-mutating preflight checks for launchd service install."""
+    if (rc := _service_unsupported_message("doctor")) != 0:
+        return rc
     from brain.service.launchd import doctor_checks
 
     checks = doctor_checks(
@@ -156,6 +178,8 @@ def _service_doctor_handler(args: argparse.Namespace) -> int:
 
 def _service_install_handler(args: argparse.Namespace) -> int:
     """Install/bootstrap the macOS LaunchAgent for one persona."""
+    if (rc := _service_unsupported_message("install")) != 0:
+        return rc
     from brain.service.launchd import (
         LaunchdCommandError,
         LaunchdConfigError,
@@ -192,6 +216,8 @@ def _service_install_handler(args: argparse.Namespace) -> int:
 
 def _service_uninstall_handler(args: argparse.Namespace) -> int:
     """Boot out the persona LaunchAgent and remove the plist."""
+    if (rc := _service_unsupported_message("uninstall")) != 0:
+        return rc
     from brain.service.launchd import LaunchdConfigError, uninstall_service
 
     try:
@@ -206,6 +232,8 @@ def _service_uninstall_handler(args: argparse.Namespace) -> int:
 
 def _service_status_handler(args: argparse.Namespace) -> int:
     """Print launchd service status without changing service state."""
+    if (rc := _service_unsupported_message("status")) != 0:
+        return rc
     from brain.service.launchd import LaunchdConfigError, service_status
 
     try:
