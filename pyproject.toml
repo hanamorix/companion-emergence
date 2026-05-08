@@ -35,6 +35,29 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["brain"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/brain",
+    "/tests",
+    "/scripts",
+    "/README.md",
+    "/INSTALL.md",
+    "/pyproject.toml",
+    "/uv.lock",
+]
+exclude = [
+    "/app/src-tauri/python-runtime",
+    "/app/src-tauri/target",
+    "/app/node_modules",
+    "/dist",
+    "/.venv",
+    "/bugs",
+    "/mock-ups",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "**/.DS_Store",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]

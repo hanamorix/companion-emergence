@@ -26,21 +26,34 @@ echo "[smoke] tmp venv dir: $TMP_DIR"
 echo "[smoke] tmp NELLBRAIN_HOME: $TMP_HOME"
 
 # Build the wheel + sdist into a temp dist/.
-echo "[smoke] uv build → wheel + sdist"
+echo "[smoke] uv build -> wheel + sdist"
 cd "$REPO_ROOT"
 rm -rf dist/
 uv build --wheel --sdist >/dev/null
 
-WHEEL="$(ls dist/*.whl | head -n1)"
-SDIST="$(ls dist/*.tar.gz | head -n1)"
+WHEEL="$(ls "$REPO_ROOT"/dist/*.whl | head -n1)"
+SDIST="$(ls "$REPO_ROOT"/dist/*.tar.gz | head -n1)"
 [ -n "$WHEEL" ] || { echo "[smoke] FAIL: no wheel produced"; exit 1; }
 [ -n "$SDIST" ] || { echo "[smoke] FAIL: no sdist produced"; exit 1; }
 echo "[smoke] wheel: $(basename "$WHEEL") ($(du -h "$WHEEL" | cut -f1))"
 echo "[smoke] sdist: $(basename "$SDIST") ($(du -h "$SDIST" | cut -f1))"
 
+echo "[smoke] sdist content guard"
+SDIST_BYTES="$(wc -c < "$SDIST" | tr -d ' ')"
+SDIST_MAX_BYTES="$((10 * 1024 * 1024))"
+if [ "$SDIST_BYTES" -gt "$SDIST_MAX_BYTES" ]; then
+  echo "[smoke] FAIL: sdist is $SDIST_BYTES bytes, expected <= $SDIST_MAX_BYTES"
+  exit 1
+fi
+if tar -tzf "$SDIST" | grep -E '(^|/)(python-runtime|target|node_modules|bugs|mock-ups|dist)(/|$)' >/dev/null; then
+  echo "[smoke] FAIL: sdist contains generated/local-only content"
+  tar -tzf "$SDIST" | grep -E '(^|/)(python-runtime|target|node_modules|bugs|mock-ups|dist)(/|$)' | head -20
+  exit 1
+fi
+
 # Fresh venv. uv venv + uv pip install bypasses the project's lockfile
 # so we're testing what an outside installer would see.
-echo "[smoke] uv venv → fresh interpreter"
+echo "[smoke] uv venv -> fresh interpreter"
 uv venv "$TMP_DIR/venv" >/dev/null
 VENV_PY="$TMP_DIR/venv/bin/python"
 VENV_NELL="$TMP_DIR/venv/bin/nell"
@@ -51,7 +64,7 @@ VIRTUAL_ENV="$TMP_DIR/venv" uv pip install --quiet "$WHEEL"
 # The nell entry point should land on PATH inside the venv.
 [ -x "$VENV_NELL" ] || { echo "[smoke] FAIL: nell script missing at $VENV_NELL"; exit 1; }
 
-# --version + --help — fast read-only confirmations.
+# --version + --help: fast read-only confirmations.
 echo "[smoke] nell --version"
 "$VENV_NELL" --version
 echo "[smoke] nell --help (first 5 lines)"
@@ -59,11 +72,17 @@ echo "[smoke] nell --help (first 5 lines)"
 
 # Ensure the brain package is fully importable from the wheel.
 echo "[smoke] brain package import"
-"$VENV_PY" -c "
+(
+  cd "$TMP_DIR"
+  "$VENV_PY" -c "
+from pathlib import Path
 import brain
 import brain.cli, brain.bridge.server, brain.images, brain.chat.engine
-print('  brain.__file__:', brain.__file__)
+brain_file = Path(brain.__file__).resolve()
+print('  brain.__file__:', brain_file)
+assert str(brain_file).startswith(str(Path('$TMP_DIR/venv').resolve())), brain_file
 "
+)
 
 # Smoke a non-interactive nell init against the tmp NELLBRAIN_HOME so
 # we exercise persona creation against the installed code path.
@@ -83,4 +102,4 @@ cat "$TMP_HOME/personas/smoke_persona/persona_config.json"
 echo "[smoke] nell status"
 NELLBRAIN_HOME="$TMP_HOME" "$VENV_NELL" status --persona smoke_persona
 
-echo "[smoke] PASS — wheel installs clean, nell runs, persona init works"
+echo "[smoke] PASS - wheel installs clean, nell runs, persona init works"
