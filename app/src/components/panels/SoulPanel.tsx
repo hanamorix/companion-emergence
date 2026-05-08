@@ -38,7 +38,7 @@ export function SoulPanel({ state }: Props) {
             }}
           >
             <Tag>{soul.love_type}</Tag>
-            <span style={{ color: "var(--text-mute)" }}>resonance {soul.resonance}</span>
+            <span style={{ color: "var(--text-mute)" }}>Resonance {soul.resonance}</span>
             <span style={{ color: "var(--text-mute)" }}>·</span>
             <span style={{ color: "var(--text-mute)", fontFamily: "var(--font-disp)" }}>
               {formatDate(soul.crystallized_at)}
@@ -59,7 +59,7 @@ export function SoulPanel({ state }: Props) {
         </>
       ) : (
         <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-          no crystallizations yet
+          No crystallizations yet.
         </div>
       )}
     </PanelShell>
@@ -67,6 +67,12 @@ export function SoulPanel({ state }: Props) {
 }
 
 function Tag({ children }: { children: React.ReactNode }) {
+  // Replace underscores with spaces and title-case so engine-internal
+  // labels like ``creative_hunger`` render as ``Creative hunger``.
+  const display =
+    typeof children === "string"
+      ? humanize(children)
+      : children;
   return (
     <span
       style={{
@@ -77,12 +83,17 @@ function Tag({ children }: { children: React.ReactNode }) {
         fontSize: 10,
         fontFamily: "var(--font-disp)",
         letterSpacing: "0.04em",
-        textTransform: "lowercase",
       }}
     >
-      {children}
+      {display}
     </span>
   );
+}
+
+function humanize(s: string): string {
+  const cleaned = s.replace(/_/g, " ").trim();
+  if (!cleaned) return cleaned;
+  return cleaned[0].toUpperCase() + cleaned.slice(1);
 }
 
 function formatDate(iso: string): string {
