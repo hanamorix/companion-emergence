@@ -1,6 +1,6 @@
 /** Wizard-specific UI primitives. Lifted from mock-ups/wizard-interface/Nell Wizard.html. */
 
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 
 export function WizardShell({
   step,
@@ -65,8 +65,13 @@ export function WizardShell({
           background: "rgba(234,222,218,0.97)",
           border: "1px solid var(--border)",
           borderRadius: 12,
+          // Soft chrome — matches the panel-shell shadow used by the
+          // main app's Inner Weather / chat input / icon rail. The
+          // previous "0 4px 32px rgba(42,31,31,0.28)" cast a 32px-spread
+          // dark halo that read as a black ring against any bright
+          // wallpaper through the transparent window.
           boxShadow:
-            "0 4px 32px rgba(42,31,31,0.28), 0 0 0 1px rgba(130,51,41,0.07)",
+            "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
           overflow: "hidden",
           color: "var(--text)",
           animation: "msg-in 0.22s ease",
@@ -125,6 +130,11 @@ export function ProgressBar({ current, total }: { current: number; total: number
   const pct = (current / total) * 100;
   return (
     <div
+      role="progressbar"
+      aria-label="Wizard progress"
+      aria-valuemin={1}
+      aria-valuemax={total}
+      aria-valuenow={current}
       style={{
         height: 5,
         background: "rgba(130,51,41,0.18)",
@@ -181,6 +191,8 @@ export function WButton({
 }
 
 export function WInput({
+  id,
+  label,
   value,
   onChange,
   placeholder,
@@ -189,6 +201,8 @@ export function WInput({
   maxLength,
   onKeyDown,
 }: {
+  id?: string;
+  label?: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
@@ -197,8 +211,12 @@ export function WInput({
   maxLength?: number;
   onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }) {
+  const generatedId = useId();
+  const inputId = id ?? generatedId;
   return (
     <input
+      id={inputId}
+      aria-label={label ?? placeholder}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={onKeyDown}
@@ -300,9 +318,15 @@ export function OptionCard({
   return (
     <div
       onClick={onClick}
-      role="button"
+      role="radio"
+      aria-checked={selected}
       tabIndex={0}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
       style={{
         padding: "11px 14px",
         background: selected ? "rgba(130,51,41,0.08)" : "rgba(255,255,255,0.4)",
@@ -322,6 +346,7 @@ export function OptionCard({
         }}
       >
         <div
+          aria-hidden="true"
           style={{
             width: 12,
             height: 12,

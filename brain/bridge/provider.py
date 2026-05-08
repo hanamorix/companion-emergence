@@ -710,10 +710,14 @@ def _read_audit_lines_since(
         with audit_log_path.open("rb") as fh:
             fh.seek(offset)
             new_bytes = fh.read()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        logger.warning("MCP audit telemetry read failed for %s: %s", audit_log_path, exc)
         return []
 
     records: list[dict[str, Any]] = []
+    malformed = 0
     for raw_line in new_bytes.splitlines():
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
@@ -721,6 +725,7 @@ def _read_audit_lines_since(
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
+            malformed += 1
             continue
         if request_id is not None:
             entry_request_id = entry.get("request_id")
@@ -738,6 +743,12 @@ def _read_audit_lines_since(
         if entry.get("error"):
             record["error"] = entry["error"]
         records.append(record)
+    if malformed:
+        logger.warning(
+            "MCP audit telemetry skipped %d malformed line(s) from %s",
+            malformed,
+            audit_log_path,
+        )
     return records
 
 

@@ -58,6 +58,7 @@ export function StepPersonaName({
     >
       <FieldLabel>Persona name</FieldLabel>
       <WInput
+        label="Persona name"
         value={value}
         onChange={(v) => {
           onChange(v);
