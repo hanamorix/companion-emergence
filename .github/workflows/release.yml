@@ -10,9 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag to attach to the release (e.g. v0.1.0)'
-        required: false
-        default: 'manual'
+        description: 'Existing version tag to build and attach to the release (e.g. v0.1.0)'
+        required: true
 
 # Cross-platform Phase 7 release pipeline. Builds NellFace.app /
 # .deb / .msi by running app/build_python_runtime.sh as part of
@@ -28,9 +27,17 @@ on:
 # only used upload-artifact (14-day retention), which contradicted
 # README/INSTALL pointing users at "the Releases page".
 #
+# Manual dispatch builds the supplied existing tag rather than whatever
+# happens to be at the default branch tip, and publishes to that tag's
+# GitHub Release. This keeps manual retries equivalent to tag-push runs.
+#
 # Signing + notarization are NOT included here — those need
 # Apple Developer / Microsoft / Linux distro keys, and the manual
 # release-checklist walks through the steps.
+
+env:
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   validate:
@@ -39,6 +46,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Validate manual release tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          case "$RELEASE_TAG" in
+            v*.*.*) ;;
+            *) echo "manual release tag must look like vX.Y.Z (got '$RELEASE_TAG')" >&2; exit 1 ;;
+          esac
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -120,6 +137,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -195,9 +214,10 @@ jobs:
           retention-days: 14
 
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(env.RELEASE_TAG, 'v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: false
           files: |
             app/src-tauri/target/release/bundle/macos/*.app

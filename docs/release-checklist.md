@@ -46,10 +46,11 @@ Run these commands locally — same shape as CI runs on every PR (`uv`
   exits non-zero on the first failure; passing means an outside
   installer can use the wheel without falling back to the source tree.
 - Audit P3-12: release automation now exists (`.github/workflows/release.yml`).
-  When you push a `v*.*.*` tag, the workflow runs the validation
-  job first (Python tests + lint + frontend tests + frontend build
-  + cargo check) and only then builds bundles. Successful builds
-  publish to a GitHub Release via `softprops/action-gh-release`.
+  When you push a `v*.*.*` tag, or manually dispatch the workflow with
+  an existing tag, it checks out that tag, runs the validation job
+  first (Python tests + lint + frontend tests + frontend build + cargo
+  check), and only then builds bundles. Successful builds publish to a
+  GitHub Release via `softprops/action-gh-release`.
 
 ## Phase 7 — NellFace.app cross-platform release
 
@@ -77,9 +78,10 @@ release means producing platform-specific bundles for distribution.
 
 `.github/workflows/release.yml` matrices across macOS arm64, macOS
 x86_64, Linux x86_64, and Windows x86_64. Triggered by pushing a
-`v*.*.*` tag. Bundles upload as workflow artifacts (`.app`, `.dmg`,
-`.deb`, `.AppImage`, `.msi`, `.exe`). Signing/notarization is NOT
-in CI — see below.
+`v*.*.*` tag, or manually dispatching with an existing tag for a
+retry. Bundles upload as workflow artifacts (`.app`, `.dmg`, `.deb`,
+`.AppImage`, `.msi`, `.exe`) and attach to the GitHub Release.
+Signing/notarization is NOT in CI — see below.
 
 ### Signing — open-source default
 
