@@ -126,7 +126,25 @@ if [ -z "$EXPECTED_SHA" ]; then
   echo "[build] FAIL: ${PBS_ASSET} not listed in SHA256SUMS" >&2
   exit 1
 fi
-ACTUAL_SHA="$(shasum -a 256 "$TMP_TAR" | awk '{print $1}')"
+# shasum on macOS / typical *nix; sha256sum on Linux / Windows Git Bash.
+# Pick whichever the host has so the script runs on every CI runner.
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(shasum -a 256 "$TMP_TAR" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(sha256sum "$TMP_TAR" | awk '{print $1}')"
+elif command -v certutil >/dev/null 2>&1; then
+  # Windows fallback — certutil ships with the OS. Output looks like:
+  #   SHA256 hash of ...:
+  #   AB CD EF ...   (hex words separated by spaces)
+  #   CertUtil: -hashfile command completed successfully.
+  ACTUAL_SHA="$(certutil -hashfile "$TMP_TAR" SHA256 \
+    | grep -v -i "hash\|certutil" \
+    | tr -d ' \r\n' \
+    | tr 'A-Z' 'a-z')"
+else
+  echo "[build] FAIL: no sha256 tool found (shasum / sha256sum / certutil)" >&2
+  exit 1
+fi
 if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
   echo "[build] FAIL: SHA256 mismatch for ${PBS_ASSET}" >&2
   echo "[build]   expected: $EXPECTED_SHA" >&2
@@ -293,7 +311,14 @@ fi
 
 SIZE_KB="$(du -sk "$RUNTIME_DIR" | cut -f1)"
 SIZE="$(du -sh "$RUNTIME_DIR" | cut -f1)"
-MAX_RUNTIME_MB="${MAX_RUNTIME_MB:-220}"
+# Default budget covers all current targets:
+#   macOS arm64/x86_64 land at ~125-140 MB after pruning.
+#   Linux x86_64 lands at ~390 MB (python-build-standalone ships
+#     more shared objects than the macOS tarball).
+#   Windows ships an embedded .pyd-heavy tree at ~250 MB.
+# 450 MB gives all three headroom while still tripping if a future
+# unrelated dep drags hundreds of megabytes of bloat in.
+MAX_RUNTIME_MB="${MAX_RUNTIME_MB:-450}"
 MAX_RUNTIME_KB=$((MAX_RUNTIME_MB * 1024))
 if [ "$SIZE_KB" -gt "$MAX_RUNTIME_KB" ]; then
   echo "[build] FAIL: bundled runtime is $SIZE, budget is ${MAX_RUNTIME_MB}M" >&2
