@@ -1887,6 +1887,14 @@ def _build_parser() -> argparse.ArgumentParser:
     svc_actions = svc_sub.add_subparsers(dest="action", required=True)
 
     def _add_service_common(p: argparse.ArgumentParser) -> None:
+        # Lazy-import so the CLI default tracks the launchd library's
+        # current default — without this they drifted (the library
+        # added ``~/.local/bin`` for claude lookup, the CLI kept the
+        # OG path string, and ``nell service doctor`` reported
+        # ``claude not found in launchd PATH`` even though the plist
+        # builder would have included it).
+        from brain.service.launchd import DEFAULT_LAUNCHD_PATH
+
         p.add_argument("--persona", required=True)
         p.add_argument(
             "--nell-path",
@@ -1895,7 +1903,7 @@ def _build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument(
             "--env-path",
-            default="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            default=DEFAULT_LAUNCHD_PATH,
             help="PATH value launchd should provide to the service.",
         )
 

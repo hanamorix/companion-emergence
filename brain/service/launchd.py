@@ -20,7 +20,24 @@ from brain.paths import get_home, get_log_dir, get_persona_dir
 from brain.setup import validate_persona_name
 
 LABEL_PREFIX = "com.companion-emergence.supervisor"
-DEFAULT_LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _default_launchd_path() -> str:
+    """Resolve the launchd PATH at plist-build time.
+
+    launchd starts agents with a stripped environment — the user's shell
+    PATH is NOT inherited. The classic ``/opt/homebrew/bin`` /
+    ``/usr/local/bin`` chain covers Homebrew's Python and the official
+    macOS layout, but ``claude`` (Anthropic's CLI) installs to
+    ``~/.local/bin/claude`` by default, which isn't on any system path.
+    Resolving the user's home means the agent can find ``claude``
+    without manual ``--env-path`` overrides on first install.
+    """
+    user_local = str(Path("~/.local/bin").expanduser())
+    return f"{user_local}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+DEFAULT_LAUNCHD_PATH = _default_launchd_path()
 
 
 class LaunchdConfigError(ValueError):
