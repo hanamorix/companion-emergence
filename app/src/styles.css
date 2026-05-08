@@ -81,15 +81,17 @@ body,
   justify-content: center;
 }
 
+/* Scroll bars are hidden but scrolling stays — wheel + trackpad +
+ * keyboard PageUp/Down still work everywhere. The 4px ash bar
+ * felt heavy on transparent panels; this gives the same fluid
+ * feel of a polished native app without the visible chrome. */
 ::-webkit-scrollbar {
-  width: 4px;
+  width: 0;
+  height: 0;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--ash);
-  border-radius: 99px;
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 button {
