@@ -333,12 +333,12 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
 ) -> None:
     """Follow mode polls the log; KeyboardInterrupt exits cleanly with code 0.
 
-    Timing: the writer thread sleeps 150ms, appends two lines, sleeps another
-    150ms, then sets the stop_event. The daemon polls every 200ms. If this
-    test ever flakes on a heavily loaded Windows CI runner where the test
-    thread is starved between the writer flush and stop_event.set(), widen
-    the writer's first sleep (200-300ms) rather than lengthening t.join's
-    timeout — the issue would be the chunk-read race, not the join.
+    Timing: the writer thread sleeps 350ms, appends two lines, sleeps
+    another 350ms, then sets the stop_event. The daemon polls every
+    200ms. Widened from 150ms on 2026-05-08 — the macOS CI runner
+    started flaking under the bigger workspace, the writer's first
+    sleep needs to be greater than the daemon's poll interval to avoid
+    the daemon checking stop_event before the writer has flushed.
     """
     import threading
     import time
@@ -352,12 +352,12 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
 
     # writer thread appends two lines after a short delay, then signals interrupt
     def writer():
-        time.sleep(0.15)
+        time.sleep(0.35)
         with log_path.open("a") as f:
             f.write("new1\n")
             f.write("new2\n")
             f.flush()
-        time.sleep(0.15)
+        time.sleep(0.35)
         stop_event.set()
 
     t = threading.Thread(target=writer, daemon=True)
