@@ -47,29 +47,34 @@ class GrowthLogEvent:
 
 
 def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
-    """Append one event line via OS append semantics.
+    """Append one event line through a cross-process file lock.
 
     Audit 2026-05-07 P2-1: the previous read-rewrite-replace shape
     could lose events when two writers (e.g. heartbeat-driven growth
     + autonomous reflex emergence) overlapped — both read the same
     old file, both replaced with old + their one new line, the later
-    rename clobbered the earlier writer's event. Switching to true
-    append mode means each writer's one-line write goes through the
-    OS append-mode contract: writes ≤ PIPE_BUF (~4096 bytes on
-    POSIX) are atomic at the filesystem layer, so concurrent
-    appends interleave at line boundaries instead of clobbering.
+    rename clobbered the earlier writer's event.
 
-    For the rare event line above the per-OS atomic-append size, a
-    cross-platform interprocess lock would be the next layer; not
-    needed today (events are <1 KB) but documented as the upgrade
-    path if growth ever serializes large events.
+    Cross-platform note (2026-05-08): POSIX guarantees writes ≤
+    PIPE_BUF (~4096 bytes) in ``O_APPEND`` mode are atomic at the
+    filesystem layer, so on macOS / Linux the explicit lock is
+    technically redundant. Windows does NOT have that guarantee —
+    concurrent appends from different file handles can interleave
+    mid-line and drop events under contention (the
+    ``test_growth_log_concurrent_appends_dont_clobber_each_other``
+    test reproduces this with 8×5 = 40 threaded appends). Always
+    taking the lock costs ~µs on the happy path and gives us
+    correct semantics on every platform.
     """
+    from brain.utils.file_lock import file_lock
+
     line = (json.dumps(_event_to_dict(event)) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "ab") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
+    with file_lock(path):
+        with open(path, "ab") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
