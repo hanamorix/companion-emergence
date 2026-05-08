@@ -244,8 +244,11 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
 
   async function send() {
     const text = input.trim();
-    if (!text || streaming) return;
+    const readySha =
+      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
+    if ((!text && !readySha) || streaming) return;
     if (stagedImage && stagedImage.status === "uploading") return;
+    const outboundText = text || "Please look at this image.";
 
     let sessionId = sessionRef.current;
     if (!sessionId) {
@@ -258,12 +261,10 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
       }
     }
 
-    const readySha =
-      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
     const userMsg: Message = {
       id: Date.now(),
       from: "hana",
-      text,
+      text: outboundText,
       time: formatTime(),
       imageThumb: readySha ? stagedImage?.previewUrl : undefined,
     };
@@ -291,7 +292,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
       cancelRef.current = await streamChat(
         persona,
         sessionId,
-        text,
+        outboundText,
         {
           onChunk: (chunkText) => {
             setMessages((m) =>
@@ -356,6 +357,19 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     }
   }
 
+  function stopStreaming() {
+    cancelRef.current?.();
+    cancelRef.current = null;
+    setStreaming(false);
+    setMessages((m) =>
+      m.map((msg) =>
+        msg.streaming
+          ? { ...msg, text: msg.text || "(stopped)", streaming: false, time: formatTime() }
+          : msg,
+      ),
+    );
+  }
+
   function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -389,6 +403,10 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     );
     if (file) void handleFile(file);
   }
+
+  const hasReadyImage = stagedImage?.status === "ready" && !!stagedImage.sha;
+  const sendDisabled =
+    !streaming && ((!input.trim() && !hasReadyImage) || stagedImage?.status === "uploading");
 
   return (
     <div
@@ -510,21 +528,20 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
           }}
         />
         <button
-          onClick={send}
-          disabled={!input.trim() || streaming || stagedImage?.status === "uploading"}
+          onClick={streaming ? stopStreaming : send}
+          disabled={sendDisabled}
           style={{
             background: "var(--accent)",
             color: "var(--linen)",
             padding: "7px 11px",
             borderRadius: 6,
             fontSize: 14,
-            opacity:
-              !input.trim() || streaming || stagedImage?.status === "uploading" ? 0.4 : 1,
+            opacity: sendDisabled ? 0.4 : 1,
             transition: "opacity 0.2s",
           }}
-          aria-label="send"
+          aria-label={streaming ? "stop response" : "send"}
         >
-          ↑
+          {streaming ? "×" : "↑"}
         </button>
       </div>
     </div>

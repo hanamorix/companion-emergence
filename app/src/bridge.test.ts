@@ -24,7 +24,9 @@ import {
   closeSession,
   fetchPersonaState,
   getBridgeCredentials,
+  newSession,
   resetBridgeCredentialCache,
+  uploadImage,
 } from "./bridge";
 
 describe("getBridgeCredentials", () => {
@@ -91,6 +93,21 @@ describe("getBridgeCredentials", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 
+  it("refreshes credentials and retries session creation after auth failure", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("unauthorized", { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        session_id: "session-2",
+        persona: "alice",
+        created_at: "2026-05-08T00:00:00Z",
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(newSession("alice")).resolves.toBe("session-2");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
   it("can keep session-close alive during app unload", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ session_id: "session-1", closed: true, committed: 0, deduped: 0, soul_candidates: 0, soul_queue_errors: 0, errors: 0 }), { status: 200 }),
@@ -130,5 +147,21 @@ describe("getBridgeCredentials", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(closeSession("alice", "session-1")).rejects.toThrow("closed=false; errors=1");
+  });
+
+  it("refreshes credentials and retries uploads after a network failure", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection refused"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sha: "a".repeat(64),
+        media_type: "image/png",
+        size_bytes: 12,
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File([new Uint8Array([1, 2, 3])], "tiny.png", { type: "image/png" });
+    await expect(uploadImage("alice", file)).resolves.toMatchObject({ media_type: "image/png" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });

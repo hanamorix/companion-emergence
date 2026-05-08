@@ -67,6 +67,28 @@ function authHeaders(creds: BridgeCredentials): HeadersInit {
     : { "Content-Type": "application/json" };
 }
 
+function authOnlyHeaders(creds: BridgeCredentials): HeadersInit {
+  return creds.authToken ? { Authorization: `Bearer ${creds.authToken}` } : {};
+}
+
+async function bridgeFetch(
+  persona: string,
+  makeRequest: (creds: BridgeCredentials) => Promise<Response>,
+): Promise<Response> {
+  const creds = await getBridgeCredentials(persona);
+  try {
+    const response = await makeRequest(creds);
+    if (response.status !== 401 && response.status !== 403) return response;
+  } catch {
+    // Network failures usually mean the bridge restarted and rewrote bridge.json.
+    // Fall through to the single credential refresh below.
+  }
+
+  resetBridgeCredentialCache(persona);
+  const fresh = await getBridgeCredentials(persona);
+  return await makeRequest(fresh);
+}
+
 export interface PersonaState {
   persona: string;
   emotions: Record<string, number>;
@@ -106,26 +128,15 @@ export interface SoulHighlight {
 }
 
 async function fetchPersonaStateOnce(persona: string): Promise<PersonaState> {
-  const creds = await getBridgeCredentials(persona);
-  const r = await fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) });
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) }),
+  );
   if (!r.ok) throw new Error(`/persona/state ${r.status}`);
   return await r.json();
 }
 
 export async function fetchPersonaState(persona: string): Promise<PersonaState> {
-  try {
-    return await fetchPersonaStateOnce(persona);
-  } catch (e) {
-    // A bridge restart rotates port + bearer token in bridge.json. The app polls
-    // state continuously, so one failed read is a good signal to invalidate the
-    // per-persona credential cache and retry once against fresh bridge.json.
-    resetBridgeCredentialCache(persona);
-    try {
-      return await fetchPersonaStateOnce(persona);
-    } catch {
-      throw e;
-    }
-  }
+  return await fetchPersonaStateOnce(persona);
 }
 
 export interface NewSessionResponse {
@@ -135,12 +146,11 @@ export interface NewSessionResponse {
 }
 
 export async function newSession(persona: string): Promise<string> {
-  const creds = await getBridgeCredentials(persona);
-  const r = await fetch(`${creds.url}/session/new`, {
+  const r = await bridgeFetch(persona, (creds) => fetch(`${creds.url}/session/new`, {
     method: "POST",
     headers: authHeaders(creds),
     body: JSON.stringify({ client: "tauri" }),
-  });
+  }));
   if (!r.ok) throw new Error(`/session/new ${r.status}`);
   const data = (await r.json()) as NewSessionResponse;
   return data.session_id;
@@ -156,12 +166,11 @@ export interface ChatResponse {
 }
 
 export async function sendChat(persona: string, sessionId: string, message: string): Promise<ChatResponse> {
-  const creds = await getBridgeCredentials(persona);
-  const r = await fetch(`${creds.url}/chat`, {
+  const r = await bridgeFetch(persona, (creds) => fetch(`${creds.url}/chat`, {
     method: "POST",
     headers: authHeaders(creds),
     body: JSON.stringify({ session_id: sessionId, message }),
-  });
+  }));
   if (!r.ok) {
     const text = await r.text();
     throw new Error(`/chat ${r.status}: ${text.slice(0, 200)}`);
@@ -181,14 +190,12 @@ export interface ImageUploadResponse {
  * large, 401 unauthorised).
  */
 export async function uploadImage(persona: string, file: File): Promise<ImageUploadResponse> {
-  const creds = await getBridgeCredentials(persona);
   const fd = new FormData();
   fd.append("file", file);
   // Note: don't set Content-Type — fetch will pick the multipart boundary.
-  const headers: HeadersInit = creds.authToken
-    ? { Authorization: `Bearer ${creds.authToken}` }
-    : {};
-  const r = await fetch(`${creds.url}/upload`, { method: "POST", headers, body: fd });
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/upload`, { method: "POST", headers: authOnlyHeaders(creds), body: fd }),
+  );
   if (!r.ok) {
     let detail = "";
     try {
@@ -239,13 +246,12 @@ export async function closeSession(
   sessionId: string,
   options: CloseSessionOptions = {},
 ): Promise<CloseSessionResponse> {
-  const creds = await getBridgeCredentials(persona);
-  const r = await fetch(`${creds.url}/sessions/close`, {
+  const r = await bridgeFetch(persona, (creds) => fetch(`${creds.url}/sessions/close`, {
     method: "POST",
     headers: authHeaders(creds),
     body: JSON.stringify({ session_id: sessionId }),
     keepalive: options.keepalive,
-  });
+  }));
   if (!r.ok) {
     let detail = "";
     try {
