@@ -2,22 +2,24 @@
 """End-to-end image stress test.
 
 Builds a temp persona, starts an in-process bridge with the real
-ClaudeCliProvider, uploads a 4×4 red-X PNG, sends a chat with
+ClaudeCliProvider, uploads a 4x4 red-X PNG, sends a chat with
 image_shas, and asserts Nell's reply mentions visual content (red /
-square / pixels / etc) — proof she actually saw the pixels through
+square / pixels / etc), proof she actually saw the pixels through
 the stream-json passthrough, not just the [image: ...] marker.
 
 Usage:
     uv run python scripts/stress_test_image.py
 
-Cost: one ClaudeCliProvider subprocess call (~$0.10-0.20 on Hana's
-subscription depending on cache state). Tears down the temp persona
-on exit so nothing pollutes nell.sandbox or the live persona.
+Cost: one live ClaudeCliProvider subprocess call. Set
+RUN_LIVE_CLAUDE_STRESS=1 so quota-consuming runs are explicit. Tears
+down the temp persona on exit so nothing pollutes nell.sandbox or the
+live persona.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -28,7 +30,7 @@ from fastapi.testclient import TestClient
 
 
 def _make_red_x_png() -> bytes:
-    """Generate a 4×4 PNG with a red X on white — small but unambiguous."""
+    """Generate a 4x4 PNG with a red X on white, small but unambiguous."""
     red = (255, 0, 0, 255)
     white = (255, 255, 255, 255)
     pixels = [
@@ -54,6 +56,14 @@ def _make_red_x_png() -> bytes:
 def main() -> int:
     from brain.bridge.server import build_app
 
+    if os.environ.get("RUN_LIVE_CLAUDE_STRESS") != "1":
+        print(
+            "[stress] SKIP: set RUN_LIVE_CLAUDE_STRESS=1 to run the live "
+            "Claude image passthrough stress test",
+            file=sys.stderr,
+        )
+        return 2
+
     with tempfile.TemporaryDirectory() as tmp_str:
         persona_dir = Path(tmp_str) / "stress-test-persona"
         persona_dir.mkdir()
@@ -73,40 +83,50 @@ def main() -> int:
             )
             assert r.status_code == 200, f"upload failed: {r.status_code} {r.text}"
             sha = r.json()["sha"]
-            print(f"[stress] uploaded sha={sha[:16]}…")
+            print(f"[stress] uploaded sha={sha[:16]}...")
 
             # Open session
             sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
             print(f"[stress] session={sid}")
 
             # Send chat with image
-            print("[stress] calling /chat with image_shas — this hits claude-cli, ~10-30s")
+            print("[stress] calling /chat with image_shas - this hits claude-cli, ~10-30s")
             r = c.post(
                 "/chat",
                 json={
                     "session_id": sid,
                     "message": (
-                        "I'm sharing a small image with you — describe what you "
+                        "I'm sharing a small image with you, describe what you "
                         "see. Be specific about colour and shape."
                     ),
                     "image_shas": [sha],
                 },
             )
-            assert r.status_code == 200, f"chat failed: {r.status_code} {r.text}"
+            if r.status_code != 200:
+                try:
+                    payload = r.json()
+                except ValueError:
+                    payload = {"raw": r.text}
+                print(
+                    "[stress] FAIL: chat failed "
+                    f"status={r.status_code} detail={payload!r}",
+                    file=sys.stderr,
+                )
+                return 1
             reply = r.json()["reply"]
             print(f"\n[stress] reply:\n{reply}\n")
 
-        # Acceptance: reply must reference something visible — the red, the
+        # Acceptance: reply must reference something visible: the red, the
         # square shape, the pixel-grid look, or the X pattern. If Nell only
         # said "[image: ...]" or generic "I saw an image" without colour or
         # form, the passthrough isn't actually working.
         lowered = reply.lower()
         visible_words = ("red", "crimson", "scarlet", "square", "pixel", "x", "cross", "corner", "white")
         if any(w in lowered for w in visible_words):
-            print("[stress] PASS — reply references visible content")
+            print("[stress] PASS - reply references visible content")
             return 0
         print(
-            f"[stress] FAIL — reply doesn't mention any of {visible_words}; "
+            f"[stress] FAIL - reply doesn't mention any of {visible_words}; "
             "passthrough may be silently degraded"
         )
         return 1
