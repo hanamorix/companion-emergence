@@ -102,29 +102,27 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     onSpeakingChange?.(streaming);
   }, [streaming, onSpeakingChange]);
 
-  // Open session on mount, close it on unmount so the buffer flushes
-  // through ingest immediately instead of waiting on the supervisor's
-  // stale-close loop. Errors during close surface as a visible status.
+  // Close the active session on unmount/app unload so the buffer flushes
+  // through ingest promptly. Sessions are created lazily on first send —
+  // opening the app should not create empty bridge sessions that then linger
+  // after quit/reload.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const sid = await newSession(persona);
-        if (!cancelled) sessionRef.current = sid;
-      } catch (e) {
-        if (!cancelled) setError(`bridge unreachable: ${(e as Error).message}`);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      cancelRef.current?.();
+    const closeCurrentSession = (keepalive = false) => {
       const sid = sessionRef.current;
+      sessionRef.current = null;
       if (sid) {
         // Best-effort — fire and forget. The component is unmounting,
         // there's nowhere meaningful to surface a close failure; the
         // supervisor's stale-close still catches it as a fallback.
-        void closeSession(persona, sid).catch(() => undefined);
+        void closeSession(persona, sid, { keepalive }).catch(() => undefined);
       }
+    };
+    const onBeforeUnload = () => closeCurrentSession(true);
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      cancelRef.current?.();
+      closeCurrentSession();
       // Free any object URLs we still hold for bubble thumbnails so
       // the renderer doesn't keep blob bytes pinned across unmount.
       for (const url of trackedUrlsRef.current) URL.revokeObjectURL(url);
@@ -221,8 +219,19 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
 
   async function send() {
     const text = input.trim();
-    if (!text || streaming || !sessionRef.current) return;
+    if (!text || streaming) return;
     if (stagedImage && stagedImage.status === "uploading") return;
+
+    let sessionId = sessionRef.current;
+    if (!sessionId) {
+      try {
+        sessionId = await newSession(persona);
+        sessionRef.current = sessionId;
+      } catch (e) {
+        setError(`bridge unreachable: ${(e as Error).message}`);
+        return;
+      }
+    }
 
     const readySha =
       stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
@@ -255,7 +264,7 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     try {
       cancelRef.current = await streamChat(
         persona,
-        sessionRef.current,
+        sessionId,
         text,
         {
           onChunk: (chunkText) => {

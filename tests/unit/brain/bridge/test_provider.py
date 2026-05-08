@@ -121,6 +121,24 @@ def test_claude_cli_provider_raises_on_nonzero_exit() -> None:
             p.generate("p")
 
 
+def test_claude_cli_provider_nonzero_exit_includes_json_stdout_error() -> None:
+    """Claude quota errors can arrive as JSON stdout with empty stderr."""
+    mock_result = MagicMock()
+    mock_result.returncode = 1
+    mock_result.stdout = json.dumps({
+        "is_error": True,
+        "api_error_status": 429,
+        "result": "You're out of extra usage · resets 1:50pm",
+    })
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        p = ClaudeCliProvider()
+        with pytest.raises(RuntimeError, match="api_error_status=429") as exc_info:
+            p.generate("p")
+    assert "out of extra usage" in str(exc_info.value)
+
+
 def test_claude_cli_provider_name() -> None:
     """Name includes the model identifier."""
     assert ClaudeCliProvider(model="sonnet").name() == "claude-cli:sonnet"
