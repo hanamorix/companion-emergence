@@ -39,17 +39,30 @@ export function LeftPanel({
   // its panel; click the same icon again to close it. Lets the user
   // hide the cards when they want a clean view of the avatar + chat.
   const [tab, setTab] = useState<Tab | null>(null);
+  // The icon rail stays in normal flow (its vertical extent defines
+  // LeftPanel's box, which the parent flex centers). The panel floats
+  // out to its left via absolute positioning when open, so toggling
+  // a panel never changes LeftPanel's width — avatar + chat stay put.
   return (
-    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-      {tab !== null &&
-        renderPanel(tab, state, {
-          persona,
-          stateError,
-          alwaysOnTop,
-          reducedMotion,
-          onAlwaysOnTopChange,
-          onReducedMotionChange,
-        })}
+    <div style={{ position: "relative" }}>
+      {tab !== null && (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            right: "calc(100% + 8px)",
+          }}
+        >
+          {renderPanel(tab, state, {
+            persona,
+            stateError,
+            alwaysOnTop,
+            reducedMotion,
+            onAlwaysOnTopChange,
+            onReducedMotionChange,
+          })}
+        </div>
+      )}
       <div
         style={{
           display: "flex",
