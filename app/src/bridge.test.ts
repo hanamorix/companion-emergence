@@ -1,7 +1,7 @@
 // Vitest smoke tests for bridge.ts — pins the audit-2026-05-07 P1-2
 // fix so the persona scoping + per-persona cache can't regress silently.
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock the Tauri invoke so we can drive get_bridge_credentials
 // without a real Tauri runtime under jsdom. Two distinct personas →
@@ -21,6 +21,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import {
+  fetchPersonaState,
   getBridgeCredentials,
   resetBridgeCredentialCache,
 } from "./bridge";
@@ -29,6 +30,10 @@ describe("getBridgeCredentials", () => {
   beforeEach(() => {
     resetBridgeCredentialCache();
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("invokes get_bridge_credentials with the supplied persona", async () => {
@@ -63,5 +68,25 @@ describe("getBridgeCredentials", () => {
     await getBridgeCredentials("alice"); // re-invokes
     await getBridgeCredentials("bob");   // still cached
     expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("refreshes credentials and retries persona state after one Load failed", async () => {
+    const state = {
+      persona: "alice",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: null, model: null, last_heartbeat_at: null },
+      mode: "live",
+    };
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("Load failed"))
+      .mockResolvedValueOnce(new Response(JSON.stringify(state), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchPersonaState("alice")).resolves.toMatchObject({ persona: "alice" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });
