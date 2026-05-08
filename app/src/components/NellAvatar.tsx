@@ -28,6 +28,10 @@ function startWindowDrag(e: React.MouseEvent) {
 
 interface Props {
   state: PersonaState | null;
+  /** Persona name — used for the img ``alt`` attribute so screen
+   *  readers / a11y tools announce the right name regardless of
+   *  whether the user named their brain Nell, Alice, or anything else. */
+  persona?: string;
   /** True while the chat is awaiting a reply — drives the speaking animation. */
   isSpeaking?: boolean;
   /** Brief peak-frame + warm overlay when a soul crystallization just landed. */
@@ -54,6 +58,7 @@ interface Props {
  */
 export function NellAvatar({
   state,
+  persona,
   isSpeaking = false,
   soulFlashing = false,
   reducedMotion = false,
@@ -133,7 +138,7 @@ export function NellAvatar({
       )}
       <img
         src={src}
-        alt="Nell"
+        alt={persona ?? "Companion"}
         draggable={false}
         style={{
           position: "relative",
