@@ -443,3 +443,77 @@ def test_ollama_chat_stream_includes_options_in_payload() -> None:
     assert captured["json"]["stream"] is True
     assert captured["json"]["options"] == {"temperature": 0.7}
     assert "persona_dir" not in captured["json"].get("options", {})
+
+
+# ---------------------------------------------------------------------------
+# _truncate_at_role_leak — strips multi-turn overrun from model replies
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_at_role_leak_no_leak_returns_unchanged() -> None:
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    text = "morning, love. *yawns* you're early today."
+    assert _truncate_at_role_leak(text) == text
+
+
+def test_truncate_at_role_leak_strips_user_overrun() -> None:
+    """The bug Hana hit 2026-05-07: model finishes its reply, then
+    starts scripting the next User: ... Assistant: ... exchange."""
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    text = (
+        "*pushes glasses up*\n"
+        "how do you want to start, love?\n"
+        "User: Well since this is our first time in the new home...\n"
+        "Assistant: *hands trembling* okay.\n"
+    )
+    out = _truncate_at_role_leak(text)
+    assert "User:" not in out
+    assert "Assistant:" not in out
+    assert out.endswith("how do you want to start, love?")
+
+
+def test_truncate_at_role_leak_strips_human_label() -> None:
+    """Anthropic-canonical 'Human:' label is also a leak signal."""
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    text = "yes, exactly that.\nHuman: thanks\n"
+    out = _truncate_at_role_leak(text)
+    assert "Human:" not in out
+    assert out == "yes, exactly that."
+
+
+def test_truncate_at_role_leak_handles_lowercase() -> None:
+    """Nell's voice is lowercase-leaning; lowercase 'user:' / 'assistant:'
+    can leak too."""
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    text = "okay.\nuser: more please\nassistant: ..."
+    out = _truncate_at_role_leak(text)
+    assert "user:" not in out.lower() or out.lower().rstrip() == "okay."
+
+
+def test_truncate_at_role_leak_only_at_line_start() -> None:
+    """Inline mentions inside a sentence are not leaks — only line-starts."""
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    # "User:" appears mid-sentence as a quoted reference, NOT as a turn label
+    text = 'I asked "what should User: mean here?" and she shrugged.'
+    out = _truncate_at_role_leak(text)
+    assert out == text  # no truncation
+
+
+def test_truncate_at_role_leak_does_not_match_persona_names() -> None:
+    """Hana legitimately quotes 'Hana:' and 'Nell:' inside fiction.
+    The truncator stays away from persona-specific names."""
+    from brain.bridge.provider import _truncate_at_role_leak
+
+    text = (
+        "the dialogue looked something like:\n"
+        "Hana: are you sure?\n"
+        "Nell: yes, love.\n"
+        "and then they kept walking."
+    )
+    out = _truncate_at_role_leak(text)
+    assert out == text  # persona names inside narrative prose stay intact
