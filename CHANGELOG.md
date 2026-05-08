@@ -6,6 +6,94 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Added (2026-05-08 — second full repository audit + targeted hardening)
+
+- **`docs/audits/2026-05-08-full-audit.md`** — second whole-repo
+  audit, covering release integrity, stress coverage, lifecycle
+  edge cases, supply chain, observability, security, and
+  accessibility. 0×P0, 2×P1, 11×P2, 12×P3, 6×P4 = 31 findings
+  across the codebase. The doc captures both the failure mode and
+  a four-phase plan of action (release blockers → launchd
+  production hardening → runtime/release reproducibility → app
+  lifecycle/UX resilience → polish + a11y + coverage).
+
+### Fixed (2026-05-08 — audit follow-through, phases 0-4 partial)
+
+- **P1-1: image provider error detail surfaces.** `claude --print`
+  failures on the image path were collapsing to bare `502
+  provider_failed` without the structured quota/API detail the
+  text path already exposed. Provider now extracts the same
+  diagnostic shape across both surfaces; isolated image stress
+  test rewritten + 66 new chat-provider tests cover the parity.
+- **P1-2: sdist no longer ships generated runtime + local
+  scratch.** `pyproject.toml` gains explicit `[tool.hatch.build]`
+  exclusions for `app/src-tauri/python-runtime/`, `app/src-tauri/target/`,
+  `bugs/`, `mock-ups/`, and `dist/`. Wheel smoke script tightens
+  the import check so it can't false-positive against the source
+  tree. Sdist size will track wheel size on the next release.
+- **P2-1, P2-2: production launchd install is now resilient.**
+  Tauri's `install_supervisor_service` resolves and passes the
+  *bundled* `nell` path to `nell service install` instead of
+  whatever happened to be on PATH at install time, so a
+  Finder-launched .app installs against its own embedded runtime.
+  A new helper detects DMG-translocated and unstable bundle
+  paths up front and refuses with a friendly "Move the .app to
+  /Applications first" message rather than wiring a plist that
+  breaks on app upgrade. Cargo unit test
+  (`unstable_macos_app_path_detects_dmg_and_translocation`)
+  guards the regression.
+- **P2-3: bundled runtime install honors `uv.lock`.**
+  `build_python_runtime.sh` reproduces the locked dep set instead
+  of resolving fresh on every build, so two builds from the same
+  commit produce byte-identical runtime trees.
+- **P2-5: non-macOS service install is honest.** The launchd
+  service-install path now returns `success=false` with a "not
+  yet implemented on this OS" message on Linux/Windows instead of
+  the previous synthetic success that pretended the agent had
+  been wired.
+- **P2-7, P3-5: `/sessions/close` reports errors honestly.** The
+  endpoint stops reporting `closed: true` when ingest fails;
+  callers now get a 4xx/5xx with the underlying error and the
+  session buffer is preserved for retry. The chat panel surfaces
+  close failures inline instead of silently swallowing them.
+- **P2-8: bridge-start failure is recoverable.** App.tsx no
+  longer parks the user on an unrecoverable boot screen; the
+  failure surface gets a "Retry" button and a "Go to settings"
+  escape hatch so a transient launchd hiccup doesn't trap them.
+- **P2-9: WebSocket chat stream has timeouts + cancel.**
+  `streamChat` gained connection / first-byte / inactivity
+  timeouts plus an explicit cancel signal wired to UI cancel.
+  Hung claude-cli calls no longer leave the UI staring at a
+  spinning bubble forever.
+- **P2-10: credential rotation retry covers every bridge call.**
+  `bridge.ts` was previously only retrying state-poll on auth
+  failure; chat / session / upload / stream now go through the
+  same retry-after-rotate path.
+- **P2-11: StepReady doesn't gate on emotions.** Emotion
+  aggregation can take up to 15 minutes (next heartbeat) for a
+  fresh persona; the wizard now treats reachable `/persona/state`
+  as ready and surfaces "emotions warming up" as a separate,
+  non-blocking signal.
+- **P3-1: bundled runtime trimmed further.** `build_python_runtime.sh`
+  removes pip / idle / pydoc / Tcl-Tk / setuptools internals
+  from the shipped tree on top of the earlier prune, dropping the
+  bundle by another ~15-20 MB.
+- **P3-3: stress harnesses are safe to share.** `stress_test_voice.py`
+  rewritten with explicit budget caps, a dry-run mode, and clear
+  "this hits the live provider" warnings. Image stress mirrors
+  the pattern.
+- **P3-9: missing `@keyframes spin`.** Several spinners across the
+  wizard / boot screens referenced an undefined `spin` animation;
+  added to `styles.css`.
+- **P4-1: wizard accessibility (first pass).** Radio-group
+  semantics on mode pickers, `aria-pressed` on toggle-style
+  cards, label associations on form inputs, focus-ring rules in
+  CSS for keyboard nav.
+- **P4-5: detached bridge spawn closes its parent log fd.**
+  `spawn_detached` was leaking the wrapper's log filehandle into
+  the daemon child, so the wrapper's pipe stayed alive longer
+  than intended.
+
 ### Added (2026-05-08 — Plan C: launchd supervisor agent)
 
 - **Brain-as-a-service.** The supervisor now runs as a user-level
