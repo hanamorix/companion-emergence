@@ -278,6 +278,24 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
             setError(msg);
             setStreaming(false);
             cancelRef.current = null;
+            // Audit 2026-05-07 P2-10: replace the empty streaming
+            // stub with a visible failure marker. Previously onError
+            // only set the error string, leaving an empty Nell bubble
+            // in the transcript that didn't match what was actually
+            // said. The bubble now shows a clear failure note so the
+            // transcript matches reality.
+            setMessages((m) =>
+              m.map((b) =>
+                b.id === replyId
+                  ? {
+                      ...b,
+                      text: "(nell couldn't answer — see the error below)",
+                      streaming: false,
+                      time: formatTime(),
+                    }
+                  : b,
+              ),
+            );
           },
         },
         readySha ? { imageShas: [readySha] } : undefined,
@@ -285,6 +303,19 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     } catch (e) {
       setError((e as Error).message);
       setStreaming(false);
+      // Same defense for synchronous failures before streamChat returns.
+      setMessages((m) =>
+        m.map((b) =>
+          b.id === replyId
+            ? {
+                ...b,
+                text: "(nell couldn't answer — see the error below)",
+                streaming: false,
+                time: formatTime(),
+              }
+            : b,
+        ),
+      );
     }
   }
 

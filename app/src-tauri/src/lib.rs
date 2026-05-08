@@ -98,11 +98,19 @@ fn get_bridge_credentials(persona: String) -> Result<BridgeCredentials, String> 
         .map_err(|e| format!("read {}: {}", bridge_json.display(), e))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse bridge.json: {}", e))?;
+    // Audit 2026-05-07 P2-8: was `port_u64 as u16` which silently
+    // wraps anything > 65535. A corrupt or hand-edited bridge.json
+    // could then make the renderer hand the bridge token to an
+    // unrelated local service. try_from rejects out-of-range and 0.
     let port_u64 = parsed
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "bridge.json missing port".to_string())?;
-    let port = port_u64 as u16;
+    if port_u64 == 0 {
+        return Err("bridge.json port is 0".to_string());
+    }
+    let port = u16::try_from(port_u64)
+        .map_err(|_| format!("bridge.json port {} out of u16 range", port_u64))?;
     let auth_token = parsed
         .get("auth_token")
         .and_then(|v| v.as_str())
@@ -241,13 +249,31 @@ async fn ensure_bridge_running(
     // uv-on-PATH dev fallback. Either way we spawn the supervisor's
     // start command — it blocks until /health returns 200, so when
     // the subprocess exits we can trust the bridge is up.
-    let mut cmd = nell_command(&app)?;
-    let output = cmd
-        .args(["supervisor", "start", "--persona", &persona])
+    //
+    // Audit 2026-05-07 P2-9: 60s timeout. Without a bound, a hung
+    // Python init / supervisor stall would freeze the Tauri renderer
+    // through `await ensureBridgeRunning(...)` indefinitely. 60s is
+    // generous against typical 5-15s startup; if it triggers, the
+    // user gets `supervisor_start_timeout` instead of a stuck UI.
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["supervisor", "start", "--persona", &persona])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("spawn nell supervisor start: {}", e))?;
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("spawn nell supervisor start: {}", e)),
+        Err(_) => {
+            return Err("supervisor_start_timeout".to_string());
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -262,7 +288,8 @@ async fn ensure_bridge_running(
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
-    let mut cmd = nell_command(&app)?;
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.arg("init");
     cmd.args(["--persona", &args.persona]);
     if let Some(name) = &args.user_name {
@@ -277,11 +304,24 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
     if args.force {
         cmd.arg("--force");
     }
-    let output = cmd
-        .stdout(Stdio::piped())
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("spawn nell init: {}", e))?;
+        .kill_on_drop(true);
+
+    // Audit 2026-05-07 P2-9: 30s timeout — nell init creates a
+    // persona dir, writes config + voice.md. Typical run is <2s.
+    // First-run deadlocks would leave the wizard's installing step
+    // forever-spinning; the timeout surfaces `init_timeout`.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("spawn nell init: {}", e)),
+        Err(_) => return Err("init_timeout".to_string()),
+    };
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
