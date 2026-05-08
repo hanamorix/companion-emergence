@@ -76,12 +76,19 @@ release means producing platform-specific bundles for distribution.
 
 ### Building via CI
 
-`.github/workflows/release.yml` matrices across macOS arm64, macOS
-x86_64, Linux x86_64, and Windows x86_64. Triggered by pushing a
-`v*.*.*` tag, or manually dispatching with an existing tag for a
-retry. Bundles upload as workflow artifacts (`.app`, `.dmg`, `.deb`,
-`.AppImage`, `.msi`, `.exe`) and attach to the GitHub Release.
+`.github/workflows/release.yml` matrices across macOS arm64, Linux
+x86_64, and Windows x86_64. Triggered by pushing a `v*.*.*` tag, or
+manually dispatching with an existing tag for a retry. Bundles upload
+as workflow artifacts (`.app`, `.dmg`, `.deb`, `.AppImage`, `.msi`,
+`.exe`) and attach to the GitHub Release. Each platform also runs a
+bundled-CLI smoke (`nell --version`, `nell init`, `nell status`)
+against a temp `NELLBRAIN_HOME`, which is the automated substitute for
+manual Linux/Windows smoke until real host access exists.
 Signing/notarization is NOT in CI — see below.
+
+macOS x86_64 is source-build-only for the alpha: GitHub's Intel macOS
+runner stayed queued indefinitely in this private repo. Re-add it to
+the matrix once a reliable hosted or self-hosted Intel runner exists.
 
 ### Signing — open-source default
 
