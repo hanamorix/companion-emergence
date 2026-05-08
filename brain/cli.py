@@ -222,6 +222,72 @@ def _service_status_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _daemon_state_refresh_handler(args: argparse.Namespace) -> int:
+    """Rewrite daemon_state.json's last_<type> entries from active memories.
+
+    Useful when a constant change (e.g. summary cap bump) means existing
+    daemon_state.json entries were truncated under the old rules but
+    the underlying memory in memories.db is intact. Walks each daemon
+    type, finds the most recent active memory of the matching type,
+    and overwrites the corresponding ``last_<type>.summary`` field.
+
+    Idempotent: re-running with the same memories produces the same
+    output. Engine fires write fresh entries on next tick anyway, so
+    this is a recovery tool, not part of the normal flow.
+    """
+    from brain.engines.daemon_state import load_daemon_state, update_daemon_state
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        state, _ = load_daemon_state(persona_dir)
+        # Memory-type keyed by daemon_type. The engine's writer functions
+        # use the same names; keep this in sync if a new daemon_type lands.
+        type_map = {
+            "dream": "dream",
+            "reflex": "reflex_journal",
+            "research": "research",
+            # Heartbeat memories exist but the daemon_state writer for
+            # heartbeat synthesizes its summary from dominant_emotion +
+            # intensity rather than copying the memory content, so
+            # there's nothing to refresh from a memory row.
+            "heartbeat": None,
+        }
+        refreshed = 0
+        for daemon_type, memory_type in type_map.items():
+            existing = getattr(state, f"last_{daemon_type}", None)
+            if existing is None or memory_type is None:
+                continue
+            mems = store.list_by_type(memory_type, active_only=True, limit=1)
+            if not mems:
+                continue
+            mem = mems[0]
+            old_len = len(existing.summary)
+            new_len = len(mem.content)
+            if old_len == new_len and existing.summary == mem.content:
+                continue  # Already in sync — nothing to refresh.
+            update_daemon_state(
+                persona_dir,
+                daemon_type=daemon_type,  # type: ignore[arg-type]
+                dominant_emotion=existing.dominant_emotion,
+                intensity=existing.intensity,
+                theme=existing.theme,
+                summary=mem.content,
+                trigger=existing.trigger,
+            )
+            print(f"refreshed last_{daemon_type}: {old_len} → {new_len} chars")
+            refreshed += 1
+        if refreshed == 0:
+            print("daemon_state already in sync with memories")
+        return 0
+    finally:
+        store.close()
+
+
 def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
     """Open a persona memory store for read-only CLI inspection."""
     persona_dir = get_persona_dir(persona)
@@ -1961,6 +2027,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_service_common(svc_doctor)
     svc_doctor.set_defaults(func=_service_doctor_handler)
+
+    # nell daemon-state — recovery + maintenance for daemon_state.json.
+    # This file holds the cross-process residue (last_dream / last_reflex /
+    # last_research / last_heartbeat) that the chat layer reads to colour
+    # its responses. When a constant or format changes (e.g. summary cap
+    # bump), existing entries can be stale-by-truncation; refresh rebuilds
+    # them from active memories instead of waiting for the next engine fire.
+    ds_sub = subparsers.add_parser(
+        "daemon-state",
+        help="Maintain daemon_state.json (residue cache for engine fires).",
+    )
+    ds_actions = ds_sub.add_subparsers(dest="action", required=True)
+
+    ds_refresh = ds_actions.add_parser(
+        "refresh",
+        help=(
+            "Rewrite last_dream / last_reflex / last_research summaries from "
+            "the most recent active memory of each type. Useful after a "
+            "summary-cap or format change so existing entries pick up the new "
+            "cap without waiting for the next engine fire."
+        ),
+    )
+    ds_refresh.add_argument("--persona", required=True, help="Persona name (required).")
+    ds_refresh.set_defaults(func=_daemon_state_refresh_handler)
 
     # nell works — read-only inspection of brain-authored creative artifacts.
     # Saving is brain-territory via the save_work MCP tool, not a CLI command.
