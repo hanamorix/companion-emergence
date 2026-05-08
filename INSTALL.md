@@ -1,15 +1,14 @@
 # Installing NellFace
 
-> **Status (2026-05-08):** there is no published `v*.*.*` release yet.
-> Pre-built download URLs do not exist on the GitHub Releases page.
-> The release pipeline is in place — pushing a `v*.*.*` tag will run
-> the cross-platform build matrix and publish signed ad-hoc bundles
-> as release assets — but until that tag exists, the only install
-> path is **build from source** (see the bottom of this file).
+> **Status (2026-05-08):** `v0.0.1-alpha` exists as a private alpha
+> release with pre-built macOS arm64, Linux x86_64, and Windows x86_64
+> assets. macOS Intel users should build from source until an x86_64
+> DMG appears. New `v*.*.*` tags and manual retries of existing tags
+> publish bundles to the GitHub Releases page.
 >
-> The bypass instructions below apply to bundles produced by that
-> pipeline once it runs. Build-from-source artifacts launch without
-> any of these warnings because they inherit your local keychain.
+> The bypass instructions below apply to downloaded release bundles.
+> Build-from-source artifacts launch without any of these warnings
+> because they inherit your local keychain.
 
 NellFace is open source and ships **unsigned** — we don't pay for an
 Apple Developer ID or a Microsoft code-signing certificate. Your
@@ -23,9 +22,10 @@ take.
 > overlay title bar) and supervisor-as-LaunchAgent lifecycle are tuned
 > for macOS. Linux + Windows bundles compile from the same source and
 > the brain itself runs everywhere, but the transparent chrome and
-> persistent OS-service supervisor are not yet validated on those
-> platforms — `nell service install` reports unsupported there, and
-> the brain falls back to the "spawned by the .app" lifecycle.
+> persistent OS-service supervisor have less live-host validation on
+> those platforms than macOS. `nell service install` is implemented via
+> `systemd --user` on Linux and Task Scheduler on Windows, but treat
+> those as alpha surfaces until they have more real-machine smoke.
 
 > **One external prerequisite on every platform:** you need
 > [`claude`](https://docs.claude.com/en/docs/claude-code/setup) (the
@@ -38,8 +38,9 @@ take.
 ## macOS
 
 ### Download
-Grab `NellFace_<version>_aarch64.dmg` (Apple Silicon / M1+) or
-`NellFace_<version>_x64.dmg` (Intel) from the Releases page.
+Grab `Companion.Emergence_<version>_aarch64.dmg` (Apple Silicon / M1+)
+from the Releases page. Intel macOS users should build from source
+until an x86_64 DMG is attached.
 
 ### Open the .dmg and drag NellFace.app to Applications
 
@@ -124,8 +125,8 @@ nell service install --persona nell
 ## Windows
 
 ### Download
-Grab `NellFace_<version>_x64-setup.exe` or
-`NellFace_<version>_x64_en-US.msi` from the Releases page.
+Grab `Companion.Emergence_<version>_x64-setup.exe` or
+`Companion.Emergence_<version>_x64_en-US.msi` from the Releases page.
 
 ### First launch
 
@@ -157,7 +158,7 @@ Windows shows the prompt.
 
 ### .deb (Debian / Ubuntu)
 ```bash
-sudo dpkg -i nellface_<version>_amd64.deb
+sudo dpkg -i Companion.Emergence_<version>_amd64.deb
 # fix any missing deps:
 sudo apt-get install -f
 nellface
@@ -165,8 +166,8 @@ nellface
 
 ### AppImage
 ```bash
-chmod +x NellFace_<version>_amd64.AppImage
-./NellFace_<version>_amd64.AppImage
+chmod +x Companion.Emergence_<version>_amd64.AppImage
+./Companion.Emergence_<version>_amd64.AppImage
 ```
 
 Linux generally doesn't gate on signatures the way macOS / Windows

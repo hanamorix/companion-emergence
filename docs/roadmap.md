@@ -3,11 +3,11 @@
 This roadmap keeps the project's remaining work honest after the
 2026-05-07 audit cycle + Phase 7 cross-platform open-source bundling.
 It is not a public release promise. companion-emergence stays
-private/local-first during development, but as of this refresh it is
-genuinely shareable on macOS arm64 (and code-path-shareable on the
-other three target platforms pending CI smoke).
-Last refreshed 2026-05-07 (end-of-day after wizard-validation +
-WS-close + voice-template-packaging fixes).
+private/local-first during development, but as of this refresh it has
+private alpha bundles for macOS arm64, Linux x86_64, and Windows
+x86_64. macOS x86_64 remains source-build-only until the missing DMG
+asset is produced.
+Last refreshed 2026-05-08 after the release-readiness audit.
 
 ## Current posture
 
@@ -39,7 +39,7 @@ testing covers:
 - SQLite WAL + 5s busy_timeout on MemoryStore + HebbianMatrix +
   WorksStore
 - JSONL readers stream line-by-line (no full-file memory spike)
-- 1470 unit + integration tests; ruff clean
+- 1587 unit + integration tests; ruff clean
 
 **NellFace (Tauri 2 + React 18 + Vite):**
 
@@ -57,8 +57,8 @@ testing covers:
 - 5 left-column panels (inner weather, body, recent interior, soul,
   connection)
 - always-on-top toggle wired to the actual Tauri window API
-- 6 frontend Vitest tests pinning the persona-cache contract +
-  wizard InitArgs shape
+- 29 frontend Vitest tests pinning chat, connection-panel,
+  persona-cache, wizard InitArgs, and StepReady behavior
 
 **Phase 7 — bundled portable Python runtime:**
 
@@ -82,7 +82,8 @@ testing covers:
   AppImage flows
 - `.github/workflows/release.yml` cross-platform CI matrix on
   macos-14 (arm64) / macos-13 (x86_64) / ubuntu-22.04 / windows-2022;
-  triggered by `v*.*.*` tags; bundles upload as workflow artifacts
+  triggered by `v*.*.*` tags or manual retries of an existing tag;
+  bundles upload as workflow artifacts and GitHub Release assets
 
 ## Active backlog
 
@@ -93,10 +94,12 @@ release blocker on the macOS side. What remains:
 
 **Validation gaps (run-once, not code work):**
 
-- macOS x86_64 / Linux x86_64 / Linux arm64 / Windows x86_64 — all
-  four code paths compile cleanly; only macOS arm64 has been
-  smoke-tested on a real host. First CI matrix run from a tagged
-  commit will surface any platform-specific gotchas.
+- macOS x86_64 DMG asset — the first alpha release produced macOS
+  arm64, Linux x86_64, and Windows x86_64 assets, but no Intel macOS
+  DMG is attached yet.
+- Manual smoke on downloaded Linux x86_64 / Windows x86_64 bundles —
+  CI produced assets, but macOS arm64 is still the only host with a
+  full local wizard/chat click-through.
 - DMG installer flow (`Path B` in the wizard runbook) — pending
   Hana's manual click-through after the recent fixes.
 - First-time user testing — the wizard works end-to-end, but no

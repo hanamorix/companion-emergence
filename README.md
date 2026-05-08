@@ -16,18 +16,16 @@ Known incomplete surfaces remain intentional and visible: see [`docs/roadmap.md`
 
 ## Installing the desktop app (NellFace)
 
-> **Status (2026-05-08):** companion-emergence has not yet cut a
-> tagged release. There are no public download URLs yet. The release
-> pipeline is wired (CI matrix on `v*.*.*` tags publishes signed
-> ad-hoc bundles to a GitHub Release across macOS arm64 / x86_64,
-> Linux x86_64, Windows x86_64), but no `v*.*.*` tag has been pushed.
-> Until then, **build from source** is the only install path.
+> **Status (2026-05-08):** `v0.0.1-alpha` exists as a private alpha
+> release with pre-built macOS arm64, Linux x86_64, and Windows x86_64
+> assets. macOS Intel users should build from source until an x86_64
+> DMG appears. The release workflow also supports manual retries for an
+> existing `v*.*.*` tag.
 
-When release assets are eventually published, NellFace will ship
-**unsigned** — binaries are integrity-sealed (ad-hoc code-signed)
-but we don't pay for an Apple Developer ID or a Microsoft
-code-signing cert. See [`INSTALL.md`](INSTALL.md) for the per-platform
-bypass dance you'll do once downloads exist:
+NellFace ships **unsigned** — binaries are integrity-sealed (ad-hoc
+code-signed on macOS) but we don't pay for an Apple Developer ID or a
+Microsoft code-signing cert. See [`INSTALL.md`](INSTALL.md) for the
+per-platform bypass dance:
 
 - **macOS** — right-click → Open (one-time), or
   `xattr -d com.apple.quarantine /Applications/NellFace.app`
@@ -74,10 +72,10 @@ click "install launchd supervisor" — that wires the same agent
 without touching your data. Or run `nell service install --persona <name>`
 from terminal.
 
-On Linux and Windows the equivalent service abstraction (systemd
-user agent / Windows Service) is planned but not implemented yet;
-on those platforms the brain currently lives for the lifetime of
-the desktop app.
+On Linux and Windows the equivalent service abstraction exists as a
+systemd user unit / Windows Task Scheduler task. Those code paths are
+unit-tested and bundled, but still need more live-host validation than
+macOS before we call them primary.
 
 Useful commands:
 
