@@ -1,4 +1,5 @@
-import type { PersonaState } from "../../bridge";
+import { useEffect, useState } from "react";
+import type { InteriorEntry, PersonaState } from "../../bridge";
 import { PanelShell, SectionLabel } from "../ui";
 
 interface Props {
@@ -7,29 +8,34 @@ interface Props {
 
 /**
  * Recent Interior — dream / research / heartbeat / reflex narrative
- * paragraphs. Matches mockup nell_face_example_3.png. Each section
- * shows its theme; absent sections render nothing rather than "n/a"
- * to match the "silence is meaningful" voice principle.
+ * paragraphs. Each section shows its summary plus a live "X ago"
+ * badge driven by the entry's timestamp so the panel feels alive
+ * instead of a static snapshot of the last fire. Sections fired
+ * within the last 5 minutes pulse with a small accent dot. Absent
+ * sections render nothing rather than "n/a" to match the
+ * "silence is meaningful" voice principle.
  */
 export function InteriorPanel({ state }: Props) {
   const interior = state?.interior;
+  // Tick once a minute so the "ago" labels stay current without a
+  // round-trip to the bridge. The state poll itself only refreshes
+  // every 5s when something actually changed; the ago label needs
+  // to advance even when nothing fires.
+  const [, force] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => force((n) => n + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   return (
     <PanelShell>
       <SectionLabel>Recent Interior</SectionLabel>
       {interior ? (
         <>
-          {interior.dream && (
-            <Section heading="Dream" body={interior.dream} />
-          )}
-          {interior.research && (
-            <Section heading="Research" body={interior.research} />
-          )}
-          {interior.heartbeat && (
-            <Section heading="Heartbeat" body={interior.heartbeat} />
-          )}
-          {interior.reflex && (
-            <Section heading="Reflex" body={interior.reflex} />
-          )}
+          {interior.dream && <Section heading="Dream" entry={interior.dream} />}
+          {interior.research && <Section heading="Research" entry={interior.research} />}
+          {interior.heartbeat && <Section heading="Heartbeat" entry={interior.heartbeat} />}
+          {interior.reflex && <Section heading="Reflex" entry={interior.reflex} />}
           {!interior.dream &&
             !interior.research &&
             !interior.heartbeat &&
@@ -48,20 +54,59 @@ export function InteriorPanel({ state }: Props) {
   );
 }
 
-function Section({ heading, body }: { heading: string; body: string }) {
+function Section({ heading, entry }: { heading: string; entry: InteriorEntry }) {
+  const ageInfo = entry.ts ? agoLabel(entry.ts) : null;
+  const fresh = ageInfo !== null && ageInfo.seconds < 300; // <5 min
   return (
     <div style={{ marginBottom: 12 }}>
       <div
         style={{
-          fontSize: "9.5px",
-          color: "var(--text-mute)",
-          textTransform: "uppercase",
-          letterSpacing: "0.12em",
-          fontFamily: "var(--font-disp)",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
           marginBottom: 4,
         }}
       >
-        {heading}
+        {fresh && (
+          <span
+            aria-hidden="true"
+            title="just fired"
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "var(--accent)",
+              animation: "pulse 1.6s ease-in-out infinite",
+              flexShrink: 0,
+            }}
+          />
+        )}
+        <div
+          style={{
+            fontSize: "9.5px",
+            color: "var(--text-mute)",
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+            fontFamily: "var(--font-disp)",
+            flex: 1,
+          }}
+        >
+          {heading}
+        </div>
+        {ageInfo && (
+          <div
+            style={{
+              fontSize: "9.5px",
+              color: "var(--text-mute)",
+              fontFamily: "var(--font-disp)",
+              letterSpacing: "0.04em",
+              fontStyle: "italic",
+            }}
+            title={entry.ts ?? undefined}
+          >
+            {ageInfo.label}
+          </div>
+        )}
       </div>
       <div
         style={{
@@ -71,10 +116,26 @@ function Section({ heading, body }: { heading: string; body: string }) {
           whiteSpace: "pre-wrap",
         }}
       >
-        {renderInlineMarkdown(body)}
+        {renderInlineMarkdown(entry.summary)}
       </div>
     </div>
   );
+}
+
+/**
+ * Format the gap between ``ts`` and now as a short human label
+ * ("just now", "5m ago", "2h ago", "3d ago"). Returns null when
+ * ts is unparseable so the caller can skip rendering.
+ */
+function agoLabel(iso: string): { label: string; seconds: number } | null {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  const seconds = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (seconds < 30) return { label: "just now", seconds };
+  if (seconds < 3600) return { label: `${Math.round(seconds / 60)}m ago`, seconds };
+  const hours = Math.round(seconds / 3600);
+  if (hours < 24) return { label: `${hours}h ago`, seconds };
+  return { label: `${Math.round(hours / 24)}d ago`, seconds };
 }
 
 // Reflex/dream summaries arrive with single-asterisk italic markers
