@@ -89,11 +89,14 @@ fn app_config_path() -> Result<PathBuf, String> {
     Ok(nellbrain_home()?.join("app_config.json"))
 }
 
-#[tauri::command]
-fn get_bridge_credentials(persona: String) -> Result<BridgeCredentials, String> {
-    let dir = persona_dir(&persona)?;
-    let bridge_json = dir.join("bridge.json");
-    let raw = std::fs::read_to_string(&bridge_json)
+/// Parse a bridge.json file at the given path and return validated
+/// credentials. Pure function — no Tauri dependency, takes a path.
+/// Extracted from ``get_bridge_credentials`` so the parse path can be
+/// unit-tested independently of the Tauri runtime (audit 2026-05-08 P4-3).
+fn parse_bridge_credentials_at(
+    bridge_json: &std::path::Path,
+) -> Result<BridgeCredentials, String> {
+    let raw = std::fs::read_to_string(bridge_json)
         .map_err(|e| format!("read {}: {}", bridge_json.display(), e))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse bridge.json: {}", e))?;
@@ -118,24 +121,34 @@ fn get_bridge_credentials(persona: String) -> Result<BridgeCredentials, String> 
 }
 
 #[tauri::command]
-fn read_app_config() -> Result<AppConfig, String> {
-    let path = app_config_path()?;
+fn get_bridge_credentials(persona: String) -> Result<BridgeCredentials, String> {
+    let dir = persona_dir(&persona)?;
+    parse_bridge_credentials_at(&dir.join("bridge.json"))
+}
+
+/// Parse app_config.json at the given path with persona-name healing.
+/// Pure function — extracted for unit testing (audit 2026-05-08 P4-3).
+/// Missing file returns default; invalid JSON returns Err; valid JSON
+/// with invalid ``selected_persona`` heals to None so the wizard fires.
+fn parse_app_config_at(path: &std::path::Path) -> Result<AppConfig, String> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
     let raw =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut cfg: AppConfig =
         serde_json::from_str(&raw).map_err(|e| format!("parse app_config.json: {}", e))?;
-    // A hand-edited or stale app_config.json with an invalid persona
-    // name would otherwise feed straight into persona_dir() at the next
-    // command call. Heal to None here so the wizard fires instead.
     if let Some(persona) = &cfg.selected_persona {
         if validate_persona_name(persona).is_err() {
             cfg.selected_persona = None;
         }
     }
     Ok(cfg)
+}
+
+#[tauri::command]
+fn read_app_config() -> Result<AppConfig, String> {
+    parse_app_config_at(&app_config_path()?)
 }
 
 #[tauri::command]
@@ -153,26 +166,49 @@ fn write_app_config(config: AppConfig) -> Result<(), String> {
     std::fs::write(&path, serialized).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
-#[tauri::command]
-fn list_personas() -> Result<Vec<String>, String> {
-    let dir = nellbrain_home()?.join("personas");
-    if !dir.exists() {
+/// Walk a personas directory and return the visible persona names.
+/// Pure function — extracted for unit testing (audit 2026-05-08 P4-3).
+/// Filters out: ``<name>.new`` migrator working dirs, ``<name>.backup-*``
+/// install-as archives, and dotfiles.
+fn list_personas_at(personas_dir: &std::path::Path) -> Result<Vec<String>, String> {
+    if !personas_dir.exists() {
         return Ok(vec![]);
     }
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {}", dir.display(), e))?;
+    let entries = std::fs::read_dir(personas_dir)
+        .map_err(|e| format!("read {}: {}", personas_dir.display(), e))?;
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|e| e.file_name().into_string().ok())
-        // Skip the `<name>.new` working dirs the migrator uses
         .filter(|n| !n.ends_with(".new"))
-        // Skip `<name>.backup-*` archives the install-as flow leaves behind
         .filter(|n| !n.contains(".backup-"))
-        // Skip dotfiles
         .filter(|n| !n.starts_with('.'))
         .collect();
     names.sort();
     Ok(names)
+}
+
+#[tauri::command]
+fn list_personas() -> Result<Vec<String>, String> {
+    list_personas_at(&nellbrain_home()?.join("personas"))
+}
+
+/// Build the argv vector that ``install_supervisor_service`` passes to
+/// ``nell service install``. Extracted so the argument-construction
+/// logic (especially the optional ``--nell-path`` injection) is
+/// covered by a deterministic unit test (audit 2026-05-08 P4-3).
+fn build_service_install_args(persona: &str, bundled_nell: Option<&std::path::Path>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "service".to_string(),
+        "install".to_string(),
+        "--persona".to_string(),
+        persona.to_string(),
+    ];
+    if let Some(path) = bundled_nell {
+        args.push("--nell-path".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
+    args
 }
 
 /// Resolve a Command that runs the `nell` CLI.
@@ -386,10 +422,7 @@ async fn install_supervisor_service(
         nell_command(&app)?
     };
     let mut cmd = tokio::process::Command::from(std_cmd);
-    cmd.args(["service", "install", "--persona", &persona]);
-    if let Some(path) = &bundled {
-        cmd.arg("--nell-path").arg(path);
-    }
+    cmd.args(build_service_install_args(&persona, bundled.as_deref()));
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -623,5 +656,190 @@ mod tests {
             "/Applications/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell",
         );
         assert!(unstable_macos_app_path_reason(stable).is_none());
+    }
+
+    // Audit 2026-05-08 P4-3: command-level coverage. The previous test
+    // suite stayed at the helper boundary (validate_persona_name, port
+    // parsing, app-path classification); refactors could break the
+    // valid/missing/corrupt bridge.json paths, app_config healing, and
+    // service-install argument construction without anything failing.
+    // The block below pins those behaviors with tempfile-based tests.
+
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_valid_returns_port_and_token() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(
+            &path,
+            r#"{"port": 55703, "auth_token": "abc123", "pid": 4242}"#,
+        );
+        let creds = parse_bridge_credentials_at(&path).unwrap();
+        assert_eq!(creds.port, 55703);
+        assert_eq!(creds.auth_token.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_missing_file_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent-bridge.json");
+        let err = parse_bridge_credentials_at(&path).unwrap_err();
+        assert!(err.contains("read"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_invalid_json_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(&path, "{not valid json");
+        let err = parse_bridge_credentials_at(&path).unwrap_err();
+        assert!(err.contains("parse bridge.json"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_missing_port_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(&path, r#"{"auth_token": "abc"}"#);
+        let err = parse_bridge_credentials_at(&path).unwrap_err();
+        assert!(err.contains("missing port"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_zero_port_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(&path, r#"{"port": 0, "auth_token": null}"#);
+        let err = parse_bridge_credentials_at(&path).unwrap_err();
+        assert!(err.contains("port is 0"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_out_of_range_port_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(&path, r#"{"port": 70000, "auth_token": null}"#);
+        let err = parse_bridge_credentials_at(&path).unwrap_err();
+        assert!(err.contains("70000"));
+        assert!(err.contains("u16"));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_null_auth_token_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        write(&path, r#"{"port": 12345, "auth_token": null}"#);
+        let creds = parse_bridge_credentials_at(&path).unwrap();
+        assert_eq!(creds.port, 12345);
+        assert!(creds.auth_token.is_none());
+    }
+
+    #[test]
+    fn parse_app_config_at_missing_file_returns_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        let cfg = parse_app_config_at(&path).unwrap();
+        assert!(cfg.selected_persona.is_none());
+        assert!(!cfg.always_on_top);
+    }
+
+    #[test]
+    fn parse_app_config_at_valid_persona_passes_through() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        write(
+            &path,
+            r#"{"selected_persona": "nell", "always_on_top": true, "reduced_motion": false}"#,
+        );
+        let cfg = parse_app_config_at(&path).unwrap();
+        assert_eq!(cfg.selected_persona.as_deref(), Some("nell"));
+        assert!(cfg.always_on_top);
+    }
+
+    #[test]
+    fn parse_app_config_at_invalid_persona_heals_to_none() {
+        // A hand-edited or stale config with an invalid name (../, dots,
+        // spaces, oversized) heals to None so the wizard fires instead of
+        // feeding the bad name to persona_dir() at the next command call.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        write(
+            &path,
+            r#"{"selected_persona": "../etc/passwd", "always_on_top": false, "reduced_motion": false}"#,
+        );
+        let cfg = parse_app_config_at(&path).unwrap();
+        assert!(cfg.selected_persona.is_none());
+    }
+
+    #[test]
+    fn parse_app_config_at_corrupt_json_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        write(&path, "{not valid");
+        let err = parse_app_config_at(&path).unwrap_err();
+        assert!(err.contains("parse app_config.json"));
+    }
+
+    #[test]
+    fn list_personas_at_filters_migrator_and_backup_dirs() {
+        let dir = tempdir().unwrap();
+        let personas = dir.path().join("personas");
+        fs::create_dir_all(personas.join("nell")).unwrap();
+        fs::create_dir_all(personas.join("alice")).unwrap();
+        fs::create_dir_all(personas.join("nell.new")).unwrap();
+        fs::create_dir_all(personas.join("nell.backup-2026-05-08T12:00:00")).unwrap();
+        fs::create_dir_all(personas.join(".hidden")).unwrap();
+        // Stray non-dir file shouldn't show up either.
+        write(&personas.join("README.md"), "not a persona");
+
+        let names = list_personas_at(&personas).unwrap();
+        assert_eq!(names, vec!["alice".to_string(), "nell".to_string()]);
+    }
+
+    #[test]
+    fn list_personas_at_missing_dir_returns_empty() {
+        let dir = tempdir().unwrap();
+        let names = list_personas_at(&dir.path().join("does-not-exist")).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn build_service_install_args_without_nell_path() {
+        let args = build_service_install_args("nell", None);
+        assert_eq!(args, vec!["service", "install", "--persona", "nell"]);
+    }
+
+    #[test]
+    fn build_service_install_args_with_nell_path() {
+        let path = std::path::PathBuf::from("/Applications/CE.app/Contents/Resources/python-runtime/bin/nell");
+        let args = build_service_install_args("alice", Some(&path));
+        assert_eq!(
+            args,
+            vec![
+                "service",
+                "install",
+                "--persona",
+                "alice",
+                "--nell-path",
+                "/Applications/CE.app/Contents/Resources/python-runtime/bin/nell",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_service_install_args_persona_with_underscore() {
+        // validate_persona_name allows ``[A-Za-z0-9_-]`` so my_companion is
+        // a real possible value; ensure it round-trips verbatim into the args.
+        let args = build_service_install_args("my_companion", None);
+        assert!(args.contains(&"my_companion".to_string()));
     }
 }
