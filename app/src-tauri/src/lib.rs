@@ -330,6 +330,63 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
     })
 }
 
+/// Install the launchd LaunchAgent for the persona's supervisor.
+///
+/// Runs ``nell service install --persona <name>``. Idempotent — if the
+/// service is already installed, the CLI rewrites the plist and
+/// kickstarts. Designed to be called from the wizard's StepInstalling
+/// after ``nell init`` succeeds, so first-launch users get the
+/// supervisor under launchd's lifecycle from the very first run rather
+/// than the legacy Tauri-spawn-then-detach model.
+///
+/// Returns the same shape as ``run_init`` (success bool, stdout, stderr,
+/// exit_code) so the wizard can surface failures inline. Non-zero exit
+/// is reported but does NOT block the wizard transition: install can be
+/// retried from the connection panel later if it failed for a transient
+/// reason. macOS-only — non-darwin platforms get a synthetic success
+/// (the wizard treats it as "no-op for this OS").
+#[tauri::command]
+async fn install_supervisor_service(
+    app: tauri::AppHandle,
+    persona: String,
+) -> Result<InitResult, String> {
+    validate_persona_name(&persona)?;
+    if !cfg!(target_os = "macos") {
+        return Ok(InitResult {
+            success: true,
+            stdout: "(skipped: launchd is macOS-only)".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+    }
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["service", "install", "--persona", &persona])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    // 30s budget — install writes a plist (cheap) + bootstraps via
+    // launchctl (~1-3s). The hard cap is here so a wedged launchctl
+    // can't hang the wizard indefinitely.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("spawn nell service install: {}", e)),
+        Err(_) => return Err("service_install_timeout".to_string()),
+    };
+    Ok(InitResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
+}
+
 /// Apply the always-on-top toggle to the main window. Hits the Tauri
 /// Manager API directly — the previous implementation only persisted
 /// the bool to app_config.json without ever calling the window API,
@@ -356,6 +413,7 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             run_init,
+            install_supervisor_service,
             set_always_on_top,
         ])
         .run(tauri::generate_context!())
