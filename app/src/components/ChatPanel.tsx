@@ -288,10 +288,15 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
     setError(null);
     setMemorySaveWarning(null);
 
-    try {
+    // Wraps the streamChat call so we can rerun it with a fresh
+    // session on ``session_not_found`` (the bridge dropped the
+    // session — usually after KeepAlive restart, idle shutdown, or
+    // a launchctl kickstart). One retry is enough; a second
+    // failure is real.
+    const runStream = async (sid: string, isRetry: boolean): Promise<void> => {
       cancelRef.current = await streamChat(
         persona,
-        sessionId,
+        sid,
         outboundText,
         {
           onChunk: (chunkText) => {
@@ -313,6 +318,40 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
             cancelRef.current = null;
           },
           onError: (msg) => {
+            // Self-healing path: the bridge forgot our session
+            // (KeepAlive restart, idle shutdown, kickstart), so the
+            // sessionRef cached here is stale. Clear it, ask the
+            // bridge for a fresh session, and replay this turn.
+            // Cap at one retry — a second session_not_found is real.
+            const isSessionGone =
+              !isRetry && /session_not_found/i.test(msg);
+            if (isSessionGone) {
+              cancelRef.current = null;
+              sessionRef.current = null;
+              void (async () => {
+                try {
+                  const fresh = await newSession(persona);
+                  sessionRef.current = fresh;
+                  await runStream(fresh, /* isRetry */ true);
+                } catch (e) {
+                  setError(`Bridge unreachable: ${(e as Error).message}`);
+                  setStreaming(false);
+                  setMessages((m) =>
+                    m.map((b) =>
+                      b.id === replyId
+                        ? {
+                            ...b,
+                            text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
+                            streaming: false,
+                            time: formatTime(),
+                          }
+                        : b,
+                    ),
+                  );
+                }
+              })();
+              return;
+            }
             setError(msg);
             setStreaming(false);
             cancelRef.current = null;
@@ -338,6 +377,10 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
         },
         readySha ? { imageShas: [readySha] } : undefined,
       );
+    };
+
+    try {
+      await runStream(sessionId, /* isRetry */ false);
     } catch (e) {
       setError((e as Error).message);
       setStreaming(false);
