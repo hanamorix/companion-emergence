@@ -39,11 +39,15 @@ bypass dance you'll do once downloads exist:
 ```bash
 git clone <this repo>
 cd companion-emergence
-uv sync                # python deps
+uv sync --all-extras   # python deps + pytest/ruff/coverage
 cd app
 pnpm install           # node deps
 pnpm tauri build       # produces a local .app / .deb / .msi
 ```
+
+> Note: `uv sync` alone leaves a runtime-only environment without
+> pytest / ruff / coverage. Use `--all-extras` (or `--extra dev`) for
+> contributor work.
 
 Locally-built artifacts inherit your machine's keychain trust so they
 launch without warnings.
