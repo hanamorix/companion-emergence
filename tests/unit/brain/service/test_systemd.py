@@ -13,11 +13,23 @@ shape without ever talking to systemd.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from brain.service import systemd
+
+# systemd-user backend is Linux-only at runtime. The unit-file
+# generator is pure string work and runs on macOS just fine via the
+# monkeypatched HOME, but Windows ``Path.home()`` reads
+# ``USERPROFILE`` regardless of $HOME, so the fake-home pattern these
+# tests use can't be honored. Skip on Windows — the dispatcher's
+# Windows branch returns the windows_service stub anyway.
+pytestmark = pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="systemd backend is Linux-only; tests rely on POSIX $HOME semantics",
+)
 
 
 def _make_executable(path: Path) -> Path:
