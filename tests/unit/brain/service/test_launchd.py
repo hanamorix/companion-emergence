@@ -9,6 +9,15 @@ import pytest
 
 from brain.service import launchd
 
+# launchd is macOS-only. The tests construct shell-style executables
+# and rely on POSIX file modes + launchctl semantics; running them on
+# Linux/Windows surfaces unrelated failures (chmod no-ops on Windows,
+# AppTranslocation paths don't exist, etc). Skip the whole module on
+# non-darwin — Linux/Windows backends are covered by test_dispatch.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin", reason="launchd backend is macOS-only"
+)
+
 
 def _make_executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
