@@ -83,10 +83,13 @@ const NEW_FORMAT_ASSETS = import.meta.glob<string>(
   { eager: true, query: "?url", import: "default" },
 );
 
-const LEGACY_FORMAT_ASSETS = import.meta.glob<string>(
-  "../../expressions/*.png",
-  { eager: true, query: "?url", import: "default" },
-);
+// Audit 2026-05-07 P3-8 (partial): the legacy single-file format
+// (`expressions/<category> N.png` at the root) was emptied when art
+// was sorted into category subdirectories on 2026-05-07. The glob
+// returns {} now, but Vite still walks the directory each build.
+// Keeping the resolver fallback path defensive in case future art
+// lands at the root before being sorted, but the eager glob is gone.
+const LEGACY_FORMAT_ASSETS: Record<string, string> = {};
 
 /** Resolve a (category, frame) pair to a hashed asset URL.
  *
@@ -119,8 +122,8 @@ function resolveLegacyUrl(category: ExpressionCategory, idx: number): string {
   const key = `../../expressions/${category} ${idx}.png`;
   const url = LEGACY_FORMAT_ASSETS[key];
   if (url) return url;
-  // Last-ditch fallback: smile 4 always exists in legacy art
-  const lastResort = LEGACY_FORMAT_ASSETS["../../expressions/smile 4.png"];
+  // Last-ditch fallback to a known-present new-format frame.
+  const lastResort = NEW_FORMAT_ASSETS["../../expressions/smile/4.png"];
   if (!lastResort) throw new Error("expressions/ catalog empty — bundle broken");
   return lastResort;
 }
