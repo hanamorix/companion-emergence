@@ -57,17 +57,11 @@ def file_lock(path: Path) -> Iterator[None]:
     fh: IO[bytes] = open(lock_path, "ab")
     try:
         if _IS_WINDOWS:
-            # msvcrt.locking blocks until the lock is acquired when
-            # called with LK_LOCK; the byte region is one byte at the
-            # current file position, which is fine for advisory use.
-            # We always lock the same byte (offset 0, size 1).
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            _windows_lock_acquire(fh)
             try:
                 yield
             finally:
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                _windows_lock_release(fh)
         else:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
@@ -76,3 +70,39 @@ def file_lock(path: Path) -> Iterator[None]:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     finally:
         fh.close()
+
+
+# Windows: msvcrt.locking with LK_LOCK only retries every second for
+# ~10s then raises. Under high contention (the concurrent-appenders
+# test runs 8×5 = 40 ops fighting for the same lock) that 10s window
+# can starve. Wrap with our own non-blocking attempt + sleep loop so
+# we never give up — matches fcntl.flock's "block until acquired"
+# semantics on POSIX.
+import time as _time  # noqa: E402
+
+_WIN_LOCK_INITIAL_SLEEP = 0.005
+_WIN_LOCK_MAX_SLEEP = 0.2
+
+
+def _windows_lock_acquire(fh: IO[bytes]) -> None:
+    fh.seek(0)
+    sleep_s = _WIN_LOCK_INITIAL_SLEEP
+    while True:
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            _time.sleep(sleep_s)
+            if sleep_s < _WIN_LOCK_MAX_SLEEP:
+                sleep_s = min(sleep_s * 2, _WIN_LOCK_MAX_SLEEP)
+
+
+def _windows_lock_release(fh: IO[bytes]) -> None:
+    fh.seek(0)
+    try:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        # Releasing an already-released lock isn't fatal; defensive
+        # because the file handle close that follows will release any
+        # remaining locks anyway.
+        pass
