@@ -4,16 +4,28 @@ This project is private/local-first during development. Before sharing a public 
 
 ## Pre-release verification
 
-- Run the full test suite: `python3 -m pytest -q`
-- Run lint: `python3 -m ruff check .`
-- Confirm the bridge starts locally and writes `bridge.json` with owner-only file permissions.
+Run these commands locally — same shape as CI runs on every PR (`uv`
++ `pnpm` + `cargo`). Audit 2026-05-07 P3-12 ratched these from
+`python3 -m pytest` to the actual env CI uses:
+
+- `uv run pytest -q` — Python tests
+- `uv run ruff check .` — lint
+- `cd app && pnpm test` — frontend Vitest
+- `cd app && pnpm build` — frontend tsc + vite production bundle
+- `cd app/src-tauri && cargo check` — Rust compile gate
+- `cd app/src-tauri && cargo test` — Rust unit tests (currently 0
+  but will grow per audit P4-3)
+- Confirm the bridge starts locally and writes `bridge.json` with
+  owner-only file permissions.
 - Smoke-test a complete companion loop:
   - create a session
   - send a chat turn
   - close the session
   - confirm memories ingest
-  - run soul review/growth paths that are meant to be active for this release
-- Review `docs/audits/` and confirm no unresolved P1/P2 findings apply to the release candidate.
+  - run soul review/growth paths that are meant to be active for
+    this release
+- Review `docs/audits/` and confirm no unresolved P1/P2 findings
+  apply to the release candidate.
 
 ## Privacy and local-data checks
 
@@ -33,7 +45,11 @@ This project is private/local-first during development. Before sharing a public 
   confirm the package metadata + entry points are honest. The script
   exits non-zero on the first failure; passing means an outside
   installer can use the wheel without falling back to the source tree.
-- Do not add release automation until the CLI/API surface is stable enough to version.
+- Audit P3-12: release automation now exists (`.github/workflows/release.yml`).
+  When you push a `v*.*.*` tag, the workflow runs the validation
+  job first (Python tests + lint + frontend tests + frontend build
+  + cargo check) and only then builds bundles. Successful builds
+  publish to a GitHub Release via `softprops/action-gh-release`.
 
 ## Phase 7 — NellFace.app cross-platform release
 
@@ -42,12 +58,17 @@ release means producing platform-specific bundles for distribution.
 
 ### Building locally
 
-- macOS arm64 / macOS x86_64 / Linux x86_64 / Linux arm64: from `app/`
-  run `pnpm tauri build`. The `beforeBuildCommand` in `tauri.conf.json`
-  invokes `bash build_python_runtime.sh` which downloads
-  `python-build-standalone` for the host arch and installs the brain
-  wheel into the bundled site-packages. Bundle output:
+- macOS arm64, macOS x86_64, Linux x86_64, Windows x86_64 (via Git
+  Bash): from `app/` run `pnpm tauri build`. The `beforeBuildCommand`
+  in `tauri.conf.json` invokes `bash build_python_runtime.sh` which
+  downloads `python-build-standalone` for the host arch and installs
+  the brain wheel into the bundled site-packages. Bundle output:
   `app/src-tauri/target/release/bundle/<platform>/`.
+- Linux arm64: the build script branches for `aarch64-unknown-linux-gnu`
+  and the Rust path resolution in `lib.rs` works on it, but the
+  `release.yml` CI matrix does NOT include a Linux arm64 runner
+  (audit P3-11). Treat Linux arm64 as **source-build-only** for now;
+  add a CI arm64 job before advertising it as a target tier.
 - Windows x86_64: same command, but the build script must run via
   Git Bash (ships with Git for Windows) — the `find` / `tar` /
   `curl` invocations rely on POSIX tooling.

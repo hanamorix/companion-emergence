@@ -7,13 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: ${{ matrix.os }} / py ${{ matrix.python-version }}
+  python:
+    name: python ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -25,8 +24,8 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python 3.12
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras
@@ -36,3 +35,62 @@ jobs:
 
       - name: Lint with ruff
         run: uv run ruff check .
+
+  # Audit 2026-05-07 P2-5: frontend tests + production build now gate
+  # PRs the same way Python does. The previous release cycle's biggest
+  # regressions were React/Tauri glue (wizard provider field, persona
+  # threading, role-label leaks, stale bubbles); none would have been
+  # caught by the python-only matrix.
+  frontend:
+    name: frontend (vitest + vite build)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm test (vitest)
+        working-directory: app
+        run: pnpm test
+
+      - name: pnpm build (tsc + vite)
+        working-directory: app
+        run: pnpm build
+
+  # Audit 2026-05-07 P2-5: Rust check + test on every PR. Tauri
+  # commands (port parsing, persona validation, app config healing,
+  # nell_command resolution, subprocess timeouts) are mostly Rust;
+  # without a CI gate, regressions only surface at release-build
+  # time or on first user double-click.
+  tauri:
+    name: tauri (cargo check + test)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check
+        working-directory: app/src-tauri
+        run: cargo check
+
+      - name: cargo test
+        working-directory: app/src-tauri
+        run: cargo test

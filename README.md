@@ -16,21 +16,37 @@ Known incomplete surfaces remain intentional and visible: see [`docs/roadmap.md`
 
 ## Installing the desktop app (NellFace)
 
-Pre-built bundles ship for macOS arm64 / x86_64, Linux x86_64, and
-Windows x86_64. NellFace is open source and ships **unsigned** — the
-binaries are integrity-sealed (ad-hoc code-signed) but we don't pay
-for an Apple Developer ID or a Microsoft code-signing cert. Your OS
-will warn on first launch.
+> **Status (2026-05-08):** companion-emergence has not yet cut a
+> tagged release. There are no public download URLs yet. The release
+> pipeline is wired (CI matrix on `v*.*.*` tags publishes signed
+> ad-hoc bundles to a GitHub Release across macOS arm64 / x86_64,
+> Linux x86_64, Windows x86_64), but no `v*.*.*` tag has been pushed.
+> Until then, **build from source** is the only install path.
 
-See [`INSTALL.md`](INSTALL.md) for the per-platform bypass:
+When release assets are eventually published, NellFace will ship
+**unsigned** — binaries are integrity-sealed (ad-hoc code-signed)
+but we don't pay for an Apple Developer ID or a Microsoft
+code-signing cert. See [`INSTALL.md`](INSTALL.md) for the per-platform
+bypass dance you'll do once downloads exist:
 
 - **macOS** — right-click → Open (one-time), or
   `xattr -d com.apple.quarantine /Applications/NellFace.app`
 - **Windows** — More info → Run anyway in the SmartScreen dialog
 - **Linux** — no signing dance; just `dpkg -i` or `chmod +x` the AppImage
 
-Or build from source (`pnpm tauri build`) for a locally-trusted bundle
-that launches without warnings.
+### Build from source today
+
+```bash
+git clone <this repo>
+cd companion-emergence
+uv sync                # python deps
+cd app
+pnpm install           # node deps
+pnpm tauri build       # produces a local .app / .deb / .msi
+```
+
+Locally-built artifacts inherit your machine's keychain trust so they
+launch without warnings.
 
 **One external prerequisite on every platform**: the
 [`claude`](https://docs.claude.com/en/docs/claude-code/setup) CLI on
