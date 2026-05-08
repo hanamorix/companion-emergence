@@ -105,7 +105,18 @@ def _default_model_for(provider: str) -> str | None:
 
 
 def _build_emotions(persona_dir: Path) -> dict[str, float]:
-    """Top non-zero emotions from recent memories, sorted desc by intensity."""
+    """Top non-zero emotions from recent emotion-carrying memories.
+
+    The previous query took the last 50 memories by ``created_at``
+    regardless of whether they actually carried an emotion vector.
+    On a steady-state brain the most recent 50 are almost all
+    heartbeats, observations, and facts — engine-internal records
+    with ``emotions_json = '{}'`` — so the aggregator returned 2-3
+    emotions even when 16+ were live in the underlying memory
+    store. Filtering to non-empty emotion rows fixes the surface
+    Inner Weather panel without aggregating over every active row
+    on each /state poll.
+    """
     try:
         from brain.emotion.aggregate import aggregate_state
         from brain.memory.store import MemoryStore, _row_to_memory
@@ -113,8 +124,11 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
         store = MemoryStore(persona_dir / "memories.db")
         try:
             rows = store._conn.execute(  # noqa: SLF001
-                "SELECT * FROM memories WHERE active = 1 "
-                "ORDER BY created_at DESC LIMIT 50"
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
             ).fetchall()
             memories = [_row_to_memory(row) for row in rows]
             state = aggregate_state(memories)
@@ -204,9 +218,16 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
             return out
         ds = json.loads(ds_path.read_text(encoding="utf-8"))
         if last_dream := ds.get("last_dream"):
-            out["dream"] = _strip_label(last_dream.get("theme"), "dream")
+            # Prefer the full summary over the 80-char theme slice; theme is
+            # a hard-cut headline (``mem.content[:80]``) that lands
+            # mid-sentence ("DREAM: I was back in every conversation —
+            # not like" was the screenshot symptom). Reflex already used
+            # ``summary``; dream is brought into line.
+            dream_text = last_dream.get("summary") or last_dream.get("theme")
+            out["dream"] = _strip_label(dream_text, "dream")
         if last_research := ds.get("last_research"):
-            out["research"] = _strip_label(last_research.get("theme"), "research")
+            research_text = last_research.get("summary") or last_research.get("theme")
+            out["research"] = _strip_label(research_text, "research")
         if last_heartbeat := ds.get("last_heartbeat"):
             # Heartbeat doesn't have a "theme" field by convention; surface a
             # short summary built from its dominant emotion.
