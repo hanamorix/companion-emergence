@@ -60,10 +60,16 @@ def test_check_idle_predicate(persona_dir: Path):
 
     class FakeState:
         last_chat_at = None
+        started_at = datetime.now(UTC) - timedelta(seconds=5)
         in_flight_locks: dict = {}
 
     s = FakeState()
-    assert _check_idle(s, idle_shutdown_seconds=1) is True  # never chatted
+    assert _check_idle(s, idle_shutdown_seconds=1) is True  # startup older than threshold
+
+    s.started_at = datetime.now(UTC)
+    assert _check_idle(s, idle_shutdown_seconds=1) is False  # fresh startup grace
+
+    s.started_at = datetime.now(UTC) - timedelta(seconds=5)
 
     s.last_chat_at = datetime.now(UTC) - timedelta(seconds=5)
     assert _check_idle(s, idle_shutdown_seconds=1) is True

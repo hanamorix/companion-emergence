@@ -4,6 +4,7 @@
   "description": "default permissions for nellface",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-start-dragging"
   ]
 }
