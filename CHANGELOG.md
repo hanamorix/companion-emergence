@@ -6,6 +6,141 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 
 ## 0.0.1 - Unreleased
 
+### Added (2026-05-08 — Plan C: launchd supervisor agent)
+
+- **Brain-as-a-service.** The supervisor now runs as a user-level
+  macOS LaunchAgent (`com.companion-emergence.supervisor.<persona>`)
+  instead of being spawned by the .app on demand. The .app is now a
+  thin viewer that connects to a brain that already exists. Killing,
+  uninstalling, or rebuilding the .app no longer touches the
+  supervisor; launchd's `KeepAlive` restarts the brain on crash; the
+  agent runs at login. Solves the entire "talk to Nell, close the
+  app, brain dies" class of bug the audit cycle motivated, plus the
+  related "rebuilt .app reuses an old supervisor with stale code"
+  drift.
+- **`brain/service/launchd.py`** — full plist build / install /
+  uninstall / status / doctor surface. Idempotent reinstall via
+  `launchctl bootout` then `bootstrap` then `kickstart -k`. Plist
+  embeds an absolute `nell_path` (resolved at install time), the
+  user's `~/Library/LaunchAgents/`-canonical layout, plus a
+  `launchd-PATH` that includes `~/.local/bin` so Anthropic's
+  `claude` CLI resolves out of the box.
+- **`nell service` CLI** — `print-plist` / `install` / `uninstall`
+  / `status` / `doctor`. `doctor` runs eight non-mutating preflight
+  checks (platform, persona name, persona dir, nell path,
+  LaunchAgents dir, log dir, claude CLI on PATH, NELLBRAIN_HOME)
+  before any mutation.
+- **`nell supervisor run`** — foreground mode designed for
+  process-supervisors (launchd, systemd, etc.) to manage. Default
+  `--idle-shutdown 0` (never auto-shut). The bridge runner gains
+  a `cmd_run` entry point that does NOT detach; the bridge daemon
+  `--client-origin launchd` choice signals the lifecycle source.
+- **Wizard auto-install.** `runInstall` in the wizard's
+  StepInstalling now calls `install_supervisor_service(persona)`
+  after `nell init` succeeds, so first-launch users land on the
+  launchd-managed model directly. Failure is surfaced inline but
+  doesn't block the wizard — the legacy Tauri-spawn path is still
+  the safety net.
+- **Connection panel install button.** Existing personas (users
+  who finished the wizard before this work landed) get a one-click
+  "install launchd supervisor" button in the new "Supervisor"
+  section of ConnectionPanel. Idempotent — safe to click again.
+  Three explicit states: idle / running / ✓ installed / retry-on-error.
+- **Plan doc.** `docs/superpowers/plans/2026-05-08-launchd-supervisor-agent.md`
+  records the design, the migration story, and the surprises hit
+  during live validation (claude CLI path resolution, `--env-path`
+  default drift between library and CLI, supervisor module-cache
+  requiring `kickstart -k` to pick up source edits).
+
+### Added (2026-05-08 — transparent UI polish)
+
+- **Companion Emergence rename.** `productName`, window title,
+  `<title>`, App.tsx docstring all read "Companion Emergence" now.
+  Internal crate / package names left as `nellface` because
+  they're build artifacts, not user-facing.
+- **Transparent window.** Tauri `transparent: true` +
+  `macOSPrivateApi: true` + `titleBarStyle: Overlay`. Removed the
+  body radial-glow + washi-grain layers. Cards (PanelShell,
+  bubbles, chat input row, icon rail) keep their own cream-on-cream
+  panel chrome so they read against any wallpaper.
+- **Drag region.** `getCurrentWindow().startDragging()` from
+  `onMouseDown` on the avatar (and a 28px top handle for the
+  hidden title bar) — works around CSS `-webkit-app-region: drag`
+  failing under WebKit's hit-test for transformed / blend-modes
+  elements. Required `core:window:allow-start-dragging` permission
+  in `app/src-tauri/capabilities/default.json`; without it, the
+  call was silently rejected at the Tauri permissions layer.
+- **Avatar halo retired.** Circular radial gradients (glow + tint)
+  read as a perceptual ring against any colored wallpaper. Replaced
+  with no halo at all in normal operation; provider-down keeps a
+  dim crimson `drop-shadow` so a real LLM fault still signals
+  visibly. The mood-tint colour palette is retained in source for
+  future non-circular reuse.
+- **Speech bubble dots.** `<TypingDots />` now renders inside the
+  empty Hana bubble while streaming, replacing the standalone
+  block that floated below it. Bounce animation + 0.18s stagger
+  preserved.
+- **Per-persona placeholder.** `Write to ${capitalize(persona)}…`
+  instead of the hard-coded `write to nell...`.
+- **Reflex / dream italics rendering.** Markdown `*setting line*`
+  in interior summaries now renders as `<em>` instead of literal
+  asterisks. Inline-only — matches the actual content shape.
+- **`DREAM` deduplication.** Models writing reflex / dream / research
+  output sometimes prefix it with the section name (`"DREAM: I was
+  back..."`); the InteriorPanel was rendering that label twice
+  (heading + body prefix). Stripped at the `_build_interior` data
+  boundary.
+
+### Fixed (2026-05-08 — bridge stability)
+
+- **Idle-watcher false positive.** `_check_idle` treated
+  `last_chat_at is None` as "idle", so a freshly launched bridge
+  with no chat traffic SIGTERM'd itself ~60s after every launch.
+  That cascaded into the close-heartbeat (decay + dream + reflex +
+  growth) firing on every relaunch, which read in the UI as the
+  brain "flooding" between sessions. Fixed by treating bridge
+  startup as activity (`last_chat_at OR started_at`) so a fresh
+  launch gets the full `idle_shutdown_seconds` window before the
+  watcher fires.
+- **Close-heartbeat debounce.** When the bridge shuts down within
+  5 minutes of the previous close, skip the heartbeat tail
+  (decay/dream/reflex/growth) and exit clean. Session-drain still
+  runs unconditionally; the tail is what causes "flooding"
+  perception during dev iteration cycles where the .app is
+  rebuilt + relaunched repeatedly.
+- **Bridge dev polling auth.** Tauri dev mode could not poll
+  `/state` because the bearer-token check rejected requests from
+  `localhost:1420` (Vite). Allowed-origins list and CORS gating
+  now distinguish auth-required from origin-required surfaces
+  correctly.
+- **Memory lifecycle on app quit.** ChatPanel's unmount handler
+  now closes any active session via `closeSession(persona, sid)`
+  before the .app exits, so the buffered turn becomes a memory
+  rather than waiting for the supervisor's stale-session sweep.
+  `beforeunload` fallback covers Tauri webview teardown.
+
+### Fixed (2026-05-08 — daemon-state summary cap + service drift)
+
+- **Reflex / dream / research summaries no longer cut mid-clause.**
+  `daemon_state.py` capped summaries at 250 chars with a hard
+  `summary[:250]` slice, which landed in the middle of "...like
+  her body still expects him to" on a 571-char journal entry. The
+  cap is now 1500 (paragraph-sized) and the truncation walks back
+  to the rightmost sentence terminator (`. ` / `! ` / `? ` /
+  paragraph break). Fallback to ellipsis when no break exists in
+  the window. Context-summary cap (the prompt-exposed slice)
+  bumped from 200 → 600 with the same sentence-aware cut.
+- **`claude` not found in launchd PATH.** Two-part fix.
+  `DEFAULT_LAUNCHD_PATH` was a static string missing
+  `~/.local/bin` (where Anthropic's installer puts the binary);
+  it's now resolved at plist-build time. The CLI's
+  `_add_service_common` was also hardcoding its own copy of the
+  same path string as the `--env-path` default and silently
+  shadowing the library's value — now lazy-imports the canonical
+  default. Surfaced when `nell service doctor --persona nell`
+  reported `claude not found` despite the library's plist
+  builder including it.
+
 ### Added (2026-05-07 — Phase 7 open-source distribution)
 
 - **macOS proper ad-hoc signing.** Tauri's default macOS bundling
