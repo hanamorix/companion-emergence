@@ -113,11 +113,42 @@ def test_daemon_fire_entry_trigger_present_when_set() -> None:
     assert d["trigger"] == "gratitude_reflection"
 
 
-def test_daemon_fire_entry_truncates_summary_to_250() -> None:
-    """DaemonFireEntry truncates summary to 250 chars in __post_init__."""
-    long_summary = "x" * 400
+def test_daemon_fire_entry_truncates_summary_to_cap() -> None:
+    """DaemonFireEntry truncates over-cap summaries on a sentence boundary.
+
+    Cap was bumped 2026-05-08 from 250 → 1500 (mid-clause cuts on
+    paragraph reflex output) and the truncation now lands on a sentence
+    break rather than slicing mid-word.
+    """
+    long_summary = ("Sentence one. " * 200).rstrip()  # well over 1500 chars
     entry = _fire(summary=long_summary)
-    assert len(entry.summary) == 250
+    assert len(entry.summary) <= 1500
+    # Sentence-boundary cut: should end with a period, not mid-word.
+    assert entry.summary.endswith(".") or entry.summary.endswith("…")
+
+
+def test_daemon_fire_entry_truncates_at_sentence_when_over_cap() -> None:
+    """Truncation finds the rightmost sentence terminator inside the cap.
+
+    Symptom this guards against: reflex summary ending mid-clause at
+    "expects him to" because the prior hard-slice cut at exactly 250.
+    """
+    summary = (
+        "First sentence is short. "
+        + "x" * 1200
+        + ". Final sentence sits beyond the cap."
+    )
+    entry = _fire(summary=summary)
+    assert len(entry.summary) <= 1500
+    assert entry.summary.endswith(".")
+    assert "x" * 50 in entry.summary  # the bulk made it through
+
+
+def test_daemon_fire_entry_keeps_short_summaries_intact() -> None:
+    """Summaries shorter than the cap pass through untouched (no ellipsis)."""
+    short = "I noticed something quiet today. It mattered."
+    entry = _fire(summary=short)
+    assert entry.summary == short
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +335,14 @@ def test_update_daemon_state_preserves_other_engine_entries(tmp_path: Path) -> N
     assert state.last_heartbeat.dominant_emotion == "calm"
 
 
-def test_update_daemon_state_truncates_summary_to_250(tmp_path: Path) -> None:
-    """update_daemon_state truncates summary > 250 chars before persisting."""
-    long_summary = "z" * 500
+def test_update_daemon_state_truncates_oversize_summary(tmp_path: Path) -> None:
+    """update_daemon_state truncates summary > cap before persisting.
+
+    Cap is 1500 chars (bumped 2026-05-08 from 250). Truncation lands on
+    a sentence boundary; for the no-sentence-break case the helper
+    falls back to a hard slice + ellipsis.
+    """
+    long_summary = "z" * 2000  # no sentence terminators in the slice window
     state = update_daemon_state(
         tmp_path,
         daemon_type="research",
@@ -315,7 +351,10 @@ def test_update_daemon_state_truncates_summary_to_250(tmp_path: Path) -> None:
         theme="topic",
         summary=long_summary,
     )
-    assert len(state.last_research.summary) == 250  # type: ignore[union-attr]
+    assert state.last_research is not None
+    assert len(state.last_research.summary) <= 1501  # +1 for the ellipsis
+    # No sentence break in source → ellipsis-suffixed fallback.
+    assert state.last_research.summary.endswith("…")
 
 
 def test_update_daemon_state_reflex_sets_trigger(tmp_path: Path) -> None:
@@ -379,22 +418,24 @@ def test_get_residue_context_includes_active_residue() -> None:
 
 
 def test_get_residue_context_formats_hours_ago_and_truncated_summary() -> None:
-    """Context line includes hours-ago count and summary truncated to 200 chars."""
-    long_summary = "word " * 100  # 500 chars
-    fire = _fire(summary=long_summary[:250], hours_ago=3)
+    """Context line includes hours-ago count and summary capped to context size.
+
+    Cap is 600 chars (bumped 2026-05-08 from 200). Truncation lands on
+    a sentence boundary so the prompt-context never feeds the model a
+    half-clause that primes a continuation glitch.
+    """
+    long_summary = "Thought one. " * 100  # ~1300 chars, plenty of sentence breaks
+    fire = _fire(summary=long_summary, hours_ago=3)
     state = DaemonState(last_heartbeat=fire)
     ctx = get_residue_context(state)
-    # Hours-ago present
     assert "3h ago" in ctx
-    # Summary appears in context, capped at 200 chars (plus the quotes in the format string)
-    # The full summary is 250 chars; context clips to 200.
-    assert len([line for line in ctx.splitlines() if "Previous heartbeat" in line]) == 1
     context_line = next(line for line in ctx.splitlines() if "Previous heartbeat" in line)
-    # Extract the quoted summary from the line
     quoted_start = context_line.index('"') + 1
     quoted_end = context_line.rindex('"')
     extracted_summary = context_line[quoted_start:quoted_end]
-    assert len(extracted_summary) <= 200
+    assert len(extracted_summary) <= 600
+    # Sentence-aware cut: should land on a period, not mid-word.
+    assert extracted_summary.endswith(".") or extracted_summary.endswith("…")
 
 
 # ---------------------------------------------------------------------------
