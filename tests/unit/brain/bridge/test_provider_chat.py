@@ -772,6 +772,72 @@ def test_chat_with_tools_nonzero_exit_raises_exit(persona_dir: Path) -> None:
     assert ei.value.stage == "claude_cli_exit"
 
 
+def test_chat_with_tools_nonzero_exit_includes_json_stdout_detail(persona_dir: Path) -> None:
+    provider = ClaudeCliProvider()
+    stdout = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "You're out of extra usage",
+        }
+    )
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(stdout, returncode=1, stderr=""),
+    ):
+        with pytest.raises(ProviderError) as ei:
+            provider.chat(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "x"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+    assert ei.value.stage == "claude_cli_exit"
+    assert "api_error_status=429" in ei.value.detail
+    assert "out of extra usage" in ei.value.detail
+
+
+def test_chat_with_image_nonzero_exit_includes_json_stdout_detail(tmp_path: Path) -> None:
+    import hashlib
+
+    from brain.images import save_image_bytes
+
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c63606060600000000400015e36b8c80000000049454e44ae426082"
+    )
+    save_image_bytes(tmp_path, tiny_png, "image/png")
+    sha = hashlib.sha256(tiny_png).hexdigest()
+    stdout = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "You're out of extra usage",
+        }
+    )
+
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(stdout, returncode=1, stderr=""),
+    ):
+        with pytest.raises(ProviderError) as ei:
+            ClaudeCliProvider().chat(
+                [
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            TextBlock(text="describe this"),
+                            ImageBlock(image_sha=sha, media_type="image/png"),
+                        ),
+                    )
+                ],
+                options={"persona_dir": str(tmp_path)},
+            )
+    assert ei.value.stage == "claude_cli_exit"
+    assert "api_error_status=429" in ei.value.detail
+    assert "out of extra usage" in ei.value.detail
+
+
 def test_chat_with_tools_missing_persona_dir_option_raises(tmp_path: Path) -> None:
     """tools= without options['persona_dir'] is a programmer bug — fail fast."""
     provider = ClaudeCliProvider()
