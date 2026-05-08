@@ -116,6 +116,44 @@ def _print_bridge_status(state: state_file.BridgeState | None) -> None:
     print(f"stopped_at: {state.stopped_at or 'unknown'}")
 
 
+def _service_print_plist_handler(args: argparse.Namespace) -> int:
+    """Print the macOS LaunchAgent plist for a persona without installing it."""
+    from brain.service.launchd import (
+        LaunchdConfigError,
+        build_launchd_plist_xml,
+        resolve_nell_path,
+    )
+
+    try:
+        nell_path = resolve_nell_path(args.nell_path)
+        xml = build_launchd_plist_xml(
+            persona=args.persona,
+            nell_path=nell_path,
+            env_path=args.env_path,
+            nellbrain_home=args.nellbrain_home,
+        )
+    except LaunchdConfigError as exc:
+        print(f"service print-plist: {exc}", file=sys.stderr)
+        return 1
+    print(xml, end="")
+    return 0
+
+
+def _service_doctor_handler(args: argparse.Namespace) -> int:
+    """Run non-mutating preflight checks for launchd service install."""
+    from brain.service.launchd import doctor_checks
+
+    checks = doctor_checks(
+        persona=args.persona,
+        nell_path=args.nell_path,
+        env_path=args.env_path,
+    )
+    for check in checks:
+        status = "ok" if check.ok else "FAIL"
+        print(f"{status:4} {check.name}: {check.detail}")
+    return 0 if all(check.ok for check in checks) else 1
+
+
 def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
     """Open a persona memory store for read-only CLI inspection."""
     persona_dir = get_persona_dir(persona)
@@ -1770,6 +1808,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Follow the log: emit new lines as written. Ctrl-c to exit.",
     )
     s_tail_log.set_defaults(func=cmd_tail_log)
+
+    # nell service — OS integration surface. First slice is deliberately
+    # non-mutating: generate the LaunchAgent plist and run doctor checks
+    # before install/bootstrap commands are exposed.
+    svc_sub = subparsers.add_parser(
+        "service",
+        help="Inspect OS service integration for the per-persona supervisor.",
+    )
+    svc_actions = svc_sub.add_subparsers(dest="action", required=True)
+
+    def _add_service_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--persona", required=True)
+        p.add_argument(
+            "--nell-path",
+            default=None,
+            help="Absolute path to the nell executable for launchd ProgramArguments[0].",
+        )
+        p.add_argument(
+            "--env-path",
+            default="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            help="PATH value launchd should provide to the service.",
+        )
+
+    svc_print = svc_actions.add_parser(
+        "print-plist",
+        help="Print the LaunchAgent plist XML without installing it.",
+    )
+    _add_service_common(svc_print)
+    svc_print.add_argument(
+        "--nellbrain-home",
+        default=None,
+        help="Optional NELLBRAIN_HOME value to embed in the LaunchAgent environment.",
+    )
+    svc_print.set_defaults(func=_service_print_plist_handler)
+
+    svc_doctor = svc_actions.add_parser(
+        "doctor",
+        help="Run non-mutating launchd service preflight checks.",
+    )
+    _add_service_common(svc_doctor)
+    svc_doctor.set_defaults(func=_service_doctor_handler)
 
     # nell works — read-only inspection of brain-authored creative artifacts.
     # Saving is brain-territory via the save_work MCP tool, not a CLI command.
