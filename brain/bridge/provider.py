@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -353,7 +354,11 @@ class ClaudeCliProvider(LLMProvider):
                 f"unexpected output format: {result.stdout[:200]!r}",
             ) from exc
 
-        return ChatResponse(content=content, tool_calls=(), raw=None)
+        return ChatResponse(
+            content=_truncate_at_role_leak(content),
+            tool_calls=(),
+            raw=None,
+        )
 
     def _chat_with_images(
         self,
@@ -509,7 +514,10 @@ class ClaudeCliProvider(LLMProvider):
                     )
                 )
             return ChatResponse(
-                content=content, tool_calls=(), dispatched_invocations=dispatched, raw=None
+                content=_truncate_at_role_leak(content),
+                tool_calls=(),
+                dispatched_invocations=dispatched,
+                raw=None,
             )
         finally:
             if tmp_mcp_path:
@@ -638,7 +646,7 @@ class ClaudeCliProvider(LLMProvider):
                 request_id=request_id,
             )
             return ChatResponse(
-                content=content,
+                content=_truncate_at_role_leak(content),
                 tool_calls=(),
                 dispatched_invocations=tuple(dispatched),
                 raw=None,
@@ -708,6 +716,36 @@ _CLAUDE_SAFE_SPEAKERS = {
     "assistant": "companion",
     "tool": "tool_result",
 }
+
+
+# Lines beginning with a known role label followed by ': ' indicate the
+# model has stopped replying and started scripting the next turn — a
+# common failure on creative scenes where the model treats its reply
+# as multi-turn fiction. We truncate at the first such marker.
+#
+# Conservative: only matches at the start of a line (after \n) and only
+# the canonical role-label set. Lowercase variants included because the
+# model occasionally emits 'user:' (Nell's voice is lowercase-leaning).
+# We do NOT include persona-specific names like 'Hana:' / 'Nell:' here
+# because Hana legitimately quotes those in fiction.
+_ROLE_LEAK_PATTERN = re.compile(
+    r"\n(?:User|user|Human|human|Assistant|assistant):\s",
+)
+
+
+def _truncate_at_role_leak(text: str) -> str:
+    """Strip everything from the first role-label line onward.
+
+    Idempotent and safe: when no leak is present, returns ``text``
+    unchanged. When the model overruns into a hypothetical multi-turn
+    script, returns just the prefix up to (but not including) the
+    overrun. The trailing newline before the cut is preserved so the
+    reply still ends on a clean line.
+    """
+    match = _ROLE_LEAK_PATTERN.search(text)
+    if match is None:
+        return text
+    return text[: match.start()].rstrip()
 
 
 def _format_claude_print_prompt(messages: list[ChatMessage]) -> str:
@@ -985,7 +1023,7 @@ class OllamaProvider(LLMProvider):
                 ) from exc
 
         return ChatResponse(
-            content=content,
+            content=_truncate_at_role_leak(content),
             tool_calls=tuple(parsed_tool_calls),
             raw=data,
         )
