@@ -15,7 +15,10 @@ on:
 
 # Cross-platform Phase 7 release pipeline. Builds NellFace.app /
 # .deb / .msi by running app/build_python_runtime.sh as part of
-# tauri-build's beforeBuildCommand on each runner.
+# tauri-build's beforeBuildCommand on each runner. The alpha hosted
+# runner matrix intentionally omits macOS x86_64: GitHub's Intel macOS
+# runner has been stuck queued indefinitely for this private repo. Intel
+# Mac users are source-build-only until we have a reliable runner.
 #
 # Audit 2026-05-07 P3-10: validation job runs Python tests + Ruff +
 # frontend tests + frontend build + Rust check before any matrix
@@ -129,9 +132,8 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { label: macos-arm64,   os: macos-14,     bundles: 'app,dmg' }
-          - { label: macos-x86_64,  os: macos-13,     bundles: 'app,dmg' }
-          - { label: linux-x86_64,  os: ubuntu-22.04, bundles: 'deb,appimage' }
+          - { label: macos-arm64,    os: macos-14,     bundles: 'app,dmg' }
+          - { label: linux-x86_64,   os: ubuntu-22.04, bundles: 'deb,appimage' }
           - { label: windows-x86_64, os: windows-2022, bundles: 'msi,nsis' }
     runs-on: ${{ matrix.platform.os }}
     steps:
@@ -197,6 +199,32 @@ jobs:
             file "$PY" || true
           fi
           "$PY" -c "import platform, sys; import brain, fastapi, uvicorn; print(sys.executable); print(platform.platform(), platform.machine())"
+        shell: bash
+
+      - name: Smoke bundled brain CLI
+        working-directory: app/src-tauri
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY="python-runtime/python.exe"
+            NELL="python-runtime/Scripts/nell.exe"
+          else
+            PY="python-runtime/bin/python3"
+            NELL="python-runtime/bin/nell"
+          fi
+          TMP_HOME="$("$PY" -c "import tempfile; print(tempfile.mkdtemp(prefix='nell-smoke-'))")"
+          cleanup() {
+            NELLBRAIN_HOME="$TMP_HOME" "$PY" -c "import os, shutil; shutil.rmtree(os.environ['NELLBRAIN_HOME'], ignore_errors=True)"
+          }
+          trap cleanup EXIT
+
+          "$NELL" --version
+          NELLBRAIN_HOME="$TMP_HOME" "$NELL" init \
+            --persona smoke_persona \
+            --user-name Smoke \
+            --voice-template default \
+            --fresh
+          NELLBRAIN_HOME="$TMP_HOME" "$PY" -c "import os; from pathlib import Path; assert (Path(os.environ['NELLBRAIN_HOME']) / 'personas' / 'smoke_persona' / 'persona_config.json').is_file()"
+          NELLBRAIN_HOME="$TMP_HOME" "$NELL" status --persona smoke_persona
         shell: bash
 
       - name: Upload bundle artifacts (workflow retention)
