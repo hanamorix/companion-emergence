@@ -7,12 +7,14 @@ import {
 } from "../appConfig";
 import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
+import { StepPrerequisites } from "./steps/StepPrerequisites";
 import { StepPersonaName } from "./steps/StepPersonaName";
 import { StepUserName } from "./steps/StepUserName";
 import { StepVoiceTemplate } from "./steps/StepVoiceTemplate";
 import { StepMigrate } from "./steps/StepMigrate";
 import { StepReview } from "./steps/StepReview";
 import { StepInstalling } from "./steps/StepInstalling";
+import { StepReady } from "./steps/StepReady";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
@@ -39,12 +41,14 @@ const INITIAL_STATE: WizardState = {
 // right value when nell init runs without --provider.
 type Step =
   | "welcome"
+  | "prereq"
   | "name"
   | "user"
   | "voice"
   | "migrate"
   | "review"
-  | "installing";
+  | "installing"
+  | "ready";
 
 interface Props {
   onDone: (persona: string) => void;
@@ -60,15 +64,17 @@ export function Wizard({ onDone }: Props) {
   } | null>(null);
 
   // Total steps depends on mode — migrate adds the migrate step
-  const totalSteps = state.mode === "migrate" ? 6 : 5;
+  const totalSteps = state.mode === "migrate" ? 8 : 7;
   const stepNum: Record<Step, number> = {
     welcome: 1,
-    name: 2,
-    user: 3,
-    voice: 4,
-    migrate: 5,
-    review: state.mode === "migrate" ? 6 : 5,
-    installing: state.mode === "migrate" ? 6 : 5,
+    prereq: 2,
+    name: 3,
+    user: 4,
+    voice: 5,
+    migrate: 6,
+    review: state.mode === "migrate" ? 7 : 6,
+    installing: state.mode === "migrate" ? 8 : 7,
+    ready: state.mode === "migrate" ? 8 : 7,
   };
 
   function update<K extends keyof WizardState>(key: K, value: WizardState[K]) {
@@ -78,12 +84,14 @@ export function Wizard({ onDone }: Props) {
   // Step → expression mapping for the avatar
   const stepToExpression: Record<Step, string> = {
     welcome: "welcome",
+    prereq: "welcome",
     name: "name",
     user: "user",
     voice: "voice",
     migrate: "migrate",
     review: "review",
     installing: "installing",
+    ready: "review",
   };
 
   async function runInstall() {
@@ -131,8 +139,10 @@ export function Wizard({ onDone }: Props) {
         output: result.stdout + serviceTrailer,
         error: "",
       });
-      // Brief pause so user sees the success state, then route to main app
-      setTimeout(() => onDone(state.personaName), 1500);
+      // Brief pause so the user reads the install summary, then move
+      // to the verification step which polls /persona/state until the
+      // brain is fully alive.
+      setTimeout(() => setStep("ready"), 1200);
     } catch (e) {
       setInstallResult({ ok: false, output: "", error: (e as Error).message });
     }
@@ -152,7 +162,17 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           mode={state.mode}
           onModeChange={(m) => update("mode", m)}
+          onNext={() => setStep("prereq")}
+          avatar={avatar}
+        />
+      );
+    case "prereq":
+      return (
+        <StepPrerequisites
+          step={stepNum.prereq}
+          totalSteps={totalSteps}
           onNext={() => setStep("name")}
+          onBack={() => setStep("welcome")}
           avatar={avatar}
         />
       );
@@ -164,7 +184,7 @@ export function Wizard({ onDone }: Props) {
           value={state.personaName}
           onChange={(v) => update("personaName", v)}
           onNext={() => setStep("user")}
-          onBack={() => setStep("welcome")}
+          onBack={() => setStep("prereq")}
           avatar={avatar}
         />
       );
@@ -226,6 +246,16 @@ export function Wizard({ onDone }: Props) {
             setInstallResult(null);
             setStep("review");
           }}
+          avatar={avatar}
+        />
+      );
+    case "ready":
+      return (
+        <StepReady
+          step={stepNum.ready}
+          totalSteps={totalSteps}
+          persona={state.personaName}
+          onDone={() => onDone(state.personaName)}
           avatar={avatar}
         />
       );
