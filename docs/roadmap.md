@@ -5,8 +5,8 @@ This roadmap keeps the project's remaining work honest after the
 It is not a public release promise. companion-emergence stays
 private/local-first during development, but as of this refresh it has
 private alpha bundles for macOS arm64, Linux x86_64, and Windows
-x86_64. macOS x86_64 remains source-build-only until the missing DMG
-asset is produced.
+x86_64. macOS x86_64 remains source-build-only until GitHub provides a
+reliable hosted Intel runner for this private repo.
 Last refreshed 2026-05-08 after the release-readiness audit.
 
 ## Current posture
@@ -81,9 +81,10 @@ testing covers:
   Windows SmartScreen "More info → Run anyway", Linux .deb /
   AppImage flows
 - `.github/workflows/release.yml` cross-platform CI matrix on
-  macos-14 (arm64) / macos-13 (x86_64) / ubuntu-22.04 / windows-2022;
-  triggered by `v*.*.*` tags or manual retries of an existing tag;
-  bundles upload as workflow artifacts and GitHub Release assets
+  macos-14 (arm64) / ubuntu-22.04 / windows-2022; triggered by
+  `v*.*.*` tags or manual retries of an existing tag; bundles upload
+  as workflow artifacts and GitHub Release assets after bundled
+  `nell --version` / `nell init` / `nell status` smoke on each runner
 
 ## Active backlog
 
@@ -92,19 +93,22 @@ shipped, both P4 cleanups landed, the JSONL streaming P3 shipped,
 and the cross-platform Phase 7 follow-up wrapped up the public-
 release blocker on the macOS side. What remains:
 
-**Validation gaps (run-once, not code work):**
+**Validation gaps (non-blocking for private alpha):**
 
-- macOS x86_64 DMG asset — the first alpha release produced macOS
-  arm64, Linux x86_64, and Windows x86_64 assets, but no Intel macOS
-  DMG is attached yet.
-- Manual smoke on downloaded Linux x86_64 / Windows x86_64 bundles —
-  CI produced assets, but macOS arm64 is still the only host with a
-  full local wizard/chat click-through.
-- DMG installer flow (`Path B` in the wizard runbook) — pending
-  Hana's manual click-through after the recent fixes.
-- First-time user testing — the wizard works end-to-end, but no
-  outsider has actually tried installing from scratch; live
-  feedback is the next signal.
+- macOS x86_64 DMG asset — GitHub's Intel macOS runner stayed queued
+  indefinitely for this private repo, so the alpha matrix intentionally
+  excludes it. Intel Mac users build from source for now.
+- Human click-through on Linux x86_64 / Windows x86_64 bundles — not
+  available before this alpha. In its place, CI builds the bundles on
+  native hosted runners and runs bundled Python + `nell` CLI smoke
+  (`--version`, `init`, `status`) against a temp `NELLBRAIN_HOME`.
+- DMG installer flow — automated macOS arm64 alpha smoke now downloads
+  the release DMG, mounts it with `hdiutil`, verifies the bundled
+  `python-runtime` imports `brain` from inside the mounted app, and
+  passes `codesign --verify --deep --strict` (`Signature=adhoc`).
+- First-time outside-user testing — the wizard works end-to-end and the
+  bundle smokes pass, but live feedback from someone other than Hana is
+  still the next product signal, not a private-alpha blocker.
 
 **Intentionally deferred (design call needed, not urgent):**
 
@@ -206,7 +210,8 @@ natural extensions of the multimodal + bundled-runtime work:
 - `app/src-tauri/python-runtime/.gitkeep` placeholder so Tauri's
   `bundle.resources` glob always resolves in clean checkouts.
 - `.github/workflows/release.yml` matrix builds on `macos-14`,
-  `macos-13`, `ubuntu-22.04`, `windows-2022` from `v*.*.*` tags.
+  `ubuntu-22.04`, `windows-2022` from `v*.*.*` tags, with macOS
+  x86_64 deferred until a reliable Intel runner is available.
 - Release-checklist gains "Phase 7 cross-platform release" section.
 
 **2026-05-07 — Phase 7 bundling (macOS arm64 verified live)**
