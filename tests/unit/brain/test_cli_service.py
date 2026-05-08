@@ -4,7 +4,7 @@ import plistlib
 from pathlib import Path
 
 from brain import cli
-from brain.service.launchd import DoctorCheck
+from brain.service.launchd import DoctorCheck, ServiceStatus
 
 
 def _make_executable(path: Path) -> Path:
@@ -92,3 +92,112 @@ def test_service_doctor_prints_checks_and_returns_1_on_failure(monkeypatch, caps
     out = capsys.readouterr().out
     assert "ok   platform" in out
     assert "FAIL claude_cli" in out
+
+
+def test_service_install_dry_run_prints_plist_without_bootstrap(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(home / "data"))
+    nell = _make_executable(tmp_path / "nell")
+
+    def fail_install(*args, **kwargs):
+        raise AssertionError("dry-run must not call install_service")
+
+    monkeypatch.setattr("brain.service.launchd.install_service", fail_install)
+
+    rc = cli.main(
+        [
+            "service",
+            "install",
+            "--persona",
+            "nell",
+            "--nell-path",
+            str(nell),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    parsed = plistlib.loads(capsys.readouterr().out.encode("utf-8"))
+    assert parsed["ProgramArguments"][:3] == [str(nell.resolve()), "supervisor", "run"]
+
+
+def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, capsys) -> None:
+    nell = _make_executable(tmp_path / "nell")
+    installed = {}
+
+    def fake_install(*, persona, nell_path, env_path, nellbrain_home):
+        installed.update(
+            persona=persona,
+            nell_path=nell_path,
+            env_path=env_path,
+            nellbrain_home=nellbrain_home,
+        )
+        return tmp_path / "com.companion-emergence.supervisor.nell.plist"
+
+    monkeypatch.setattr("brain.service.launchd.install_service", fake_install)
+
+    rc = cli.main(
+        [
+            "service",
+            "install",
+            "--persona",
+            "nell",
+            "--nell-path",
+            str(nell),
+            "--env-path",
+            "/tmp/bin",
+        ]
+    )
+
+    assert rc == 0
+    assert installed == {
+        "persona": "nell",
+        "nell_path": nell.resolve(),
+        "env_path": "/tmp/bin",
+        "nellbrain_home": None,
+    }
+    assert "service installed" in capsys.readouterr().out
+
+
+def test_service_uninstall_calls_launchd_uninstall(monkeypatch, tmp_path: Path, capsys) -> None:
+    seen = {}
+
+    def fake_uninstall(*, persona, keep_plist):
+        seen["persona"] = persona
+        seen["keep_plist"] = keep_plist
+        return tmp_path / "service.plist"
+
+    monkeypatch.setattr("brain.service.launchd.uninstall_service", fake_uninstall)
+
+    rc = cli.main(["service", "uninstall", "--persona", "nell", "--keep-plist"])
+
+    assert rc == 0
+    assert seen == {"persona": "nell", "keep_plist": True}
+    assert "plist kept" in capsys.readouterr().out
+
+
+def test_service_status_prints_launchd_state(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr(
+        "brain.service.launchd.service_status",
+        lambda *, persona: ServiceStatus(
+            label=f"com.companion-emergence.supervisor.{persona}",
+            plist_path=tmp_path / "service.plist",
+            installed=True,
+            loaded=False,
+            detail="not loaded",
+        ),
+    )
+
+    rc = cli.main(["service", "status", "--persona", "nell"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "installed: yes" in out
+    assert "loaded: no" in out
+    assert "not loaded" in out
