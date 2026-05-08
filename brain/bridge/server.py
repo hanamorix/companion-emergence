@@ -49,6 +49,27 @@ from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
 
+# Browser/WebView origins that are allowed to call the localhost bridge.
+# HTTP routes are still bearer-token protected; CORS is only the browser's
+# same-origin waiver. Keep this exact-origin list narrow so a random web page
+# cannot probe bridge responses even if it can hit 127.0.0.1.
+DEFAULT_ALLOWED_ORIGINS = (
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "null",
+)
+DEV_ALLOWED_ORIGINS = (
+    # Tauri devUrl / Vite config for this app.
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    # Vite's defaults and adjacent fallback ports used by browser-mode docs.
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+)
+
 # Audit 2026-05-07 P4-1: ChatReq.image_shas item-level validator. The
 # ingest path keys cache lookups on these values, so a renderer compromise
 # that posted "../../etc/passwd" would otherwise traverse the cache root.
@@ -393,7 +414,7 @@ def build_app(
     silence_minutes: float = 5.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
-    allowed_origins: tuple[str, ...] = ("tauri://localhost", "null"),
+    allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS,
 ) -> FastAPI:
     """Build a FastAPI app for the given persona. Public for tests + daemon.
 
@@ -524,24 +545,16 @@ def build_app(
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
 
     # CORS — narrowly scoped to the same allowed_origins used for WS auth,
-    # plus localhost dev origins (Vite default ports). Tauri prod calls
-    # don't need CORS (the webview origin is privileged); the localhost
-    # origins exist so `pnpm dev` browser mode can talk to the bridge
-    # without proxying. Bearer auth still gates every route — CORS is
-    # not a security boundary, just a same-origin policy waiver.
+    # plus localhost dev origins (Tauri devUrl + Vite default ports). Bearer
+    # auth still gates every route — CORS is not a security boundary, just a
+    # same-origin policy waiver for the trusted local app surface.
     from fastapi.middleware.cors import CORSMiddleware
 
-    _DEV_ORIGINS = (  # noqa: N806 — local frozen constant, deliberate uppercase
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    )
-    cors_origins = list(allowed_origins) + list(_DEV_ORIGINS)
+    cors_origins = list(allowed_origins) + list(DEV_ALLOWED_ORIGINS)
     # Extend the WS Origin allowlist with the same dev origins so
     # browser-mode WebSocket connections to /stream pass the Origin
     # check. Bearer subprotocol auth still gates every connection.
-    allowed_origins = tuple(list(allowed_origins) + list(_DEV_ORIGINS))
+    allowed_origins = tuple(list(allowed_origins) + list(DEV_ALLOWED_ORIGINS))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
