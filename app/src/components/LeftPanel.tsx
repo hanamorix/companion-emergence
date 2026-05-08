@@ -50,15 +50,20 @@ export function LeftPanel({
     <div
       style={{
         position: "relative",
-        // panel (220) + gap (8) + rail (≈38)
-        width: 270,
+        // panel (220) + gap (24) + rail (≈38) — gap 24 (was 12) so the
+        // panel's right edge is visibly clear of the rail icons.
+        width: 282,
         display: "flex",
         justifyContent: "flex-end",
         alignItems: "flex-start",
       }}
     >
       {tab !== null && (
-        <div style={{ position: "absolute", left: 0, top: 0 }}>
+        // The panel pops out to the left of the rail. zIndex < the rail's
+        // explicit zIndex so the rail icons always paint on top — without
+        // this the absolute-positioned panel was covering the rail in
+        // document order even though they didn't overlap horizontally.
+        <div style={{ position: "absolute", left: 0, top: 0, zIndex: 1 }}>
           {renderPanel(tab, state, {
             persona,
             stateError,
@@ -71,6 +76,8 @@ export function LeftPanel({
       )}
       <div
         style={{
+          position: "relative",
+          zIndex: 2,
           display: "flex",
           flexDirection: "column",
           gap: 6,
