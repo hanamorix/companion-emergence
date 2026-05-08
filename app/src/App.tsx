@@ -213,6 +213,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       />
       <NellAvatar
         state={state}
+        persona={persona}
         isSpeaking={isSpeaking}
         soulFlashing={soulFlashing}
         reducedMotion={config.reduced_motion}

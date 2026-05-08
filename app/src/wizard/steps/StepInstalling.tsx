@@ -19,7 +19,7 @@ export function StepInstalling({ step, totalSteps, result, onRetry, onBack, avat
       subtitle={
         result
           ? result.ok
-            ? "Your persona is ready. Opening NellFace…"
+            ? "Your persona is ready. Opening Companion Emergence…"
             : "The migrator returned a non-zero exit. Inspect the error and retry."
           : "Running uv run nell init — this may take a minute for migration runs."
       }
