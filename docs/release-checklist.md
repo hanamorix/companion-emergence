@@ -49,10 +49,11 @@ Run these commands locally — same shape as CI runs on every PR (`uv`
   When you push a `v*.*.*` tag, or manually dispatch the workflow with
   an existing tag, it checks out that tag, runs the validation job
   first (Python tests + lint + frontend tests + frontend build + cargo
-  check), and only then builds bundles. Successful builds publish to a
+  check), and only then builds bundles. Successful builds publish
+  package assets plus `SHA256SUMS-<platform>.txt` checksum assets to a
   GitHub Release via `softprops/action-gh-release`.
 
-## Phase 7 — NellFace.app cross-platform release
+## Phase 7 — Companion Emergence.app cross-platform release
 
 The Phase 7 bundled Python runtime ships inside the Tauri .app, so a
 release means producing platform-specific bundles for distribution.
@@ -80,10 +81,10 @@ release means producing platform-specific bundles for distribution.
 x86_64, and Windows x86_64. Triggered by pushing a `v*.*.*` tag, or
 manually dispatching with an existing tag for a retry. Bundles upload
 as workflow artifacts (`.app`, `.dmg`, `.deb`, `.AppImage`, `.msi`,
-`.exe`) and attach to the GitHub Release. Each platform also runs a
-bundled-CLI smoke (`nell --version`, `nell init`, `nell status`)
-against a temp `NELLBRAIN_HOME`, which is the automated substitute for
-manual Linux/Windows smoke until real host access exists.
+`.exe`, `SHA256SUMS-*.txt`) and attach to the GitHub Release. Each
+platform also runs a bundled-CLI smoke (`nell --version`, `nell init`,
+`nell status`) against a temp `NELLBRAIN_HOME`, which is the automated
+substitute for manual Linux/Windows smoke until real host access exists.
 Signing/notarization is NOT in CI — see below.
 
 macOS x86_64 is source-build-only for the alpha: GitHub's Intel macOS
@@ -111,8 +112,8 @@ default state is:
 Confirm before any tagged release:
 
 - Run `pnpm tauri build` locally on each target host
-- macOS: `codesign --verify --deep --strict NellFace.app` exits 0
-- macOS: `codesign -dv --verbose=2 NellFace.app | grep "Signature=adhoc"`
+- macOS: `codesign --verify --deep --strict "Companion Emergence.app"` exits 0
+- macOS: `codesign -dv --verbose=2 "Companion Emergence.app" | grep "Signature=adhoc"`
 - All three platforms: launch the bundle from a clean user
   directory and verify a chat turn round-trips with `claude` on PATH
 
@@ -128,15 +129,14 @@ If you decide to pay for signing later, the manual steps:
 3. Add notarization keys to your keychain (`xcrun notarytool
    store-credentials`).
 4. Build: `pnpm tauri build`. Tauri handles signing inline.
-5. Notarize the resulting .dmg: `xcrun notarytool submit
-   NellFace.dmg --keychain-profile <stored-name> --wait`.
-6. Staple: `xcrun stapler staple NellFace.dmg`.
+5. Notarize the resulting .dmg: `xcrun notarytool submit "Companion Emergence.dmg" --keychain-profile <stored-name> --wait`.
+6. Staple: `xcrun stapler staple "Companion Emergence.dmg"`.
 
 **Windows** (OV or EV code-signing cert):
 1. Get an OV or EV cert from a CA (DigiCert, Sectigo, etc.).
 2. Sign: `signtool sign /tr http://timestamp.digicert.com /td
-   sha256 /fd sha256 /a NellFace.msi`.
-3. Verify: `signtool verify /pa NellFace.msi`.
+   sha256 /fd sha256 /a "Companion Emergence.msi"`.
+3. Verify: `signtool verify /pa "Companion Emergence.msi"`.
 
 **Linux** (.deb / AppImage):
 1. .deb signing via dpkg-sig is optional but recommended for
