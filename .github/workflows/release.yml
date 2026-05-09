@@ -245,7 +245,7 @@ jobs:
   publish:
     name: publish GitHub Release
     needs: build
-    if: startsWith(env.RELEASE_TAG, 'v')
+    if: startsWith(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'v')
     runs-on: ubuntu-22.04
     steps:
       - name: Download bundle artifacts
