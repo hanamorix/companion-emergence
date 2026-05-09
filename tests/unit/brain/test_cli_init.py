@@ -152,3 +152,20 @@ def test_init_summary_includes_next_step_command(
     )
     out = capsys.readouterr().out
     assert "uv run nell chat --persona siren" in out
+
+
+def test_init_summary_is_encodable_on_windows_cp1252(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    rc = _run_init(
+        monkeypatch,
+        tmp_path,
+        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # Windows Git Bash / Actions may expose a cp1252 stdout. The summary
+    # must not contain glyphs such as "✓" that crash print() there.
+    out.encode("cp1252")
+    assert "OK persona 'siren' ready" in out

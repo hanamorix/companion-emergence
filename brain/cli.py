@@ -1586,7 +1586,10 @@ def _init_handler(args: argparse.Namespace) -> int:
     voice_path = install_voice_template(persona_dir, voice_template)
 
     print()
-    print(f"✓ persona '{persona}' ready at {persona_dir}")
+    # Keep CLI status text encodable on Windows' legacy cp1252 consoles.
+    # GitHub Actions Windows caught this: a leading "✓" raised
+    # UnicodeEncodeError during bundled `nell init` smoke.
+    print(f"OK persona '{persona}' ready at {persona_dir}")
     print(f"  - {config_path.name}: user_name={user_name!r}")
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
