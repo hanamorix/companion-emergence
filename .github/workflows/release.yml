@@ -1,6 +1,7 @@
 name: release
 
 permissions:
+  actions: read
   contents: write
 
 on:
@@ -26,9 +27,9 @@ on:
 # commit that fails normal validation.
 #
 # Audit 2026-05-07 P2-6: bundles get attached to a real GitHub
-# Release via softprops/action-gh-release. Previously the workflow
-# only used upload-artifact (14-day retention), which contradicted
-# README/INSTALL pointing users at "the Releases page".
+# Release via a single publish job after all platform builds finish.
+# Previously the workflow only used upload-artifact (14-day retention),
+# which contradicted README/INSTALL pointing users at "the Releases page".
 #
 # Manual dispatch builds the supplied existing tag rather than whatever
 # happens to be at the default branch tip, and publishes to that tag's
@@ -48,7 +49,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.RELEASE_REF }}
 
@@ -61,7 +62,7 @@ jobs:
           esac
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
 
@@ -78,12 +79,12 @@ jobs:
         run: uv run ruff check .
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Install Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -138,7 +139,7 @@ jobs:
     runs-on: ${{ matrix.platform.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.RELEASE_REF }}
 
@@ -146,7 +147,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
 
@@ -154,12 +155,12 @@ jobs:
         run: uv python install 3.13
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Install Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -228,7 +229,7 @@ jobs:
         shell: bash
 
       - name: Upload bundle artifacts (workflow retention)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nellface-${{ matrix.platform.label }}
           path: |
@@ -241,17 +242,31 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  publish:
+    name: publish GitHub Release
+    needs: build
+    if: startsWith(env.RELEASE_TAG, 'v')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: nellface-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: find release-artifacts -maxdepth 1 -type f -print | sort
+
       - name: Publish to GitHub Release
-        if: startsWith(env.RELEASE_TAG, 'v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          fail_on_unmatched_files: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          make_latest: ${{ contains(env.RELEASE_TAG, '-') && 'false' || 'legacy' }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
           files: |
-            app/src-tauri/target/release/bundle/macos/*.app
-            app/src-tauri/target/release/bundle/dmg/*.dmg
-            app/src-tauri/target/release/bundle/deb/*.deb
-            app/src-tauri/target/release/bundle/appimage/*.AppImage
-            app/src-tauri/target/release/bundle/msi/*.msi
-            app/src-tauri/target/release/bundle/nsis/*.exe
+            release-artifacts/*
           generate_release_notes: true
+          append_body: false
