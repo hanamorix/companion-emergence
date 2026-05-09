@@ -244,7 +244,15 @@ runtime_root = Path('$RUNTIME_DIR').resolve()
 print('  brain:', brain_file)
 assert str(brain_file).startswith(str(runtime_root)), brain_file
 "
-  "$NELL_BIN" --version
+  # Verify the launcher works. On Windows the launcher is a .bat
+  # file that Git Bash can't exec directly via a Unix-style path —
+  # invoke through ``cmd //c`` to dispatch through the OS launcher.
+  # On Unix, the launcher is a normal sh script we can exec directly.
+  if [ "$HOST_OS" = "windows" ]; then
+    cmd //c "$(cygpath -w "$NELL_BIN")" --version
+  else
+    "$NELL_BIN" --version
+  fi
   echo "[build] verify nell can resolve brain.voice_templates"
   "$PY_BIN" -c "
 from importlib.resources import files
