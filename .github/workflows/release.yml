@@ -1,7 +1,6 @@
 name: release
 
 permissions:
-  actions: read
   contents: write
 
 on:
@@ -14,7 +13,7 @@ on:
         description: 'Existing version tag to build and attach to the release (e.g. v0.1.0)'
         required: true
 
-# Cross-platform Phase 7 release pipeline. Builds NellFace.app /
+# Cross-platform Phase 7 release pipeline. Builds Companion Emergence.app /
 # .deb / .msi by running app/build_python_runtime.sh as part of
 # tauri-build's beforeBuildCommand on each runner. The alpha hosted
 # runner matrix intentionally omits macOS x86_64: GitHub's Intel macOS
@@ -27,9 +26,12 @@ on:
 # commit that fails normal validation.
 #
 # Audit 2026-05-07 P2-6: bundles get attached to a real GitHub
-# Release via a single publish job after all platform builds finish.
-# Previously the workflow only used upload-artifact (14-day retention),
-# which contradicted README/INSTALL pointing users at "the Releases page".
+# Release from each platform build job, avoiding an extra publish runner
+# that can be blocked by private-repo billing limits after heavy builds.
+# Release notes are generated only by macos-arm64 so parallel platform
+# uploads do not append duplicate generated notes. Previously the workflow
+# only used upload-artifact (14-day retention), which contradicted
+# README/INSTALL pointing users at "the Releases page".
 #
 # Manual dispatch builds the supplied existing tag rather than whatever
 # happens to be at the default branch tip, and publishes to that tag's
@@ -228,6 +230,50 @@ jobs:
           NELLBRAIN_HOME="$TMP_HOME" "$NELL" status --persona smoke_persona
         shell: bash
 
+      - name: Prepare release artifacts and checksums
+        working-directory: app/src-tauri
+        env:
+          PLATFORM_LABEL: ${{ matrix.platform.label }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY="python-runtime/python.exe"
+          else
+            PY="python-runtime/bin/python3"
+          fi
+          "$PY" - <<'PY'
+          import hashlib
+          import os
+          import shutil
+          from pathlib import Path
+
+          label = os.environ["PLATFORM_LABEL"]
+          root = Path("target/release/bundle")
+          out_dir = Path("target/release/release-assets")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          suffixes = {".dmg", ".deb", ".AppImage", ".msi", ".exe"}
+          packages = sorted(
+              path for path in root.rglob("*")
+              if path.is_file() and path.suffix in suffixes
+          )
+          if not packages:
+              raise SystemExit(f"no release package files found under {root}")
+          files = []
+          for path in packages:
+              # GitHub Release URLs are easier to document and copy/paste
+              # when the product-name space is replaced consistently.
+              target = out_dir / path.name.replace("Companion Emergence", "Companion.Emergence")
+              shutil.copy2(path, target)
+              files.append(target)
+          out = out_dir / f"SHA256SUMS-{label}.txt"
+          with out.open("w", encoding="utf-8", newline="\n") as handle:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  handle.write(f"{digest}  {path.name}\n")
+          print(out)
+          print(out.read_text(encoding="utf-8"))
+          PY
+        shell: bash
+
       - name: Upload bundle artifacts (workflow retention)
         uses: actions/upload-artifact@v7
         with:
@@ -239,34 +285,12 @@ jobs:
             app/src-tauri/target/release/bundle/appimage/*.AppImage
             app/src-tauri/target/release/bundle/msi/*.msi
             app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/release-assets/*
           if-no-files-found: ignore
           retention-days: 14
 
-  publish:
-    name: publish GitHub Release
-    needs: build
-    if: startsWith(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'v')
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Download bundle artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: nellface-*
-          path: release-artifacts
-          merge-multiple: true
-
-      - name: Validate release artifacts
-        run: |
-          find release-artifacts -type f \
-            \( -name '*.dmg' \
-            -o -name '*.deb' \
-            -o -name '*.AppImage' \
-            -o -name '*.msi' \
-            -o -name '*.exe' \) \
-            -print | sort | tee /tmp/release-assets.txt
-          test "$(wc -l < /tmp/release-assets.txt | tr -d ' ')" -eq 5
-
       - name: Publish to GitHub Release
+        if: startsWith(env.RELEASE_TAG, 'v')
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -275,10 +299,6 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
-            release-artifacts/**/*.dmg
-            release-artifacts/**/*.deb
-            release-artifacts/**/*.AppImage
-            release-artifacts/**/*.msi
-            release-artifacts/**/*.exe
-          generate_release_notes: true
+            app/src-tauri/target/release/release-assets/*
+          generate_release_notes: ${{ matrix.platform.label == 'macos-arm64' }}
           append_body: false
