@@ -255,8 +255,16 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
-      - name: List release artifacts
-        run: find release-artifacts -maxdepth 1 -type f -print | sort
+      - name: Validate release artifacts
+        run: |
+          find release-artifacts -type f \
+            \( -name '*.dmg' \
+            -o -name '*.deb' \
+            -o -name '*.AppImage' \
+            -o -name '*.msi' \
+            -o -name '*.exe' \) \
+            -print | sort | tee /tmp/release-assets.txt
+          test "$(wc -l < /tmp/release-assets.txt | tr -d ' ')" -eq 5
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v3
@@ -267,6 +275,10 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
-            release-artifacts/*
+            release-artifacts/**/*.dmg
+            release-artifacts/**/*.deb
+            release-artifacts/**/*.AppImage
+            release-artifacts/**/*.msi
+            release-artifacts/**/*.exe
           generate_release_notes: true
           append_body: false
