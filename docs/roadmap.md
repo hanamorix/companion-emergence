@@ -39,7 +39,7 @@ testing covers:
 - SQLite WAL + 5s busy_timeout on MemoryStore + HebbianMatrix +
   WorksStore
 - JSONL readers stream line-by-line (no full-file memory spike)
-- 1587 unit + integration tests; ruff clean
+- 1588 unit + integration tests; ruff clean
 
 **NellFace (Tauri 2 + React 18 + Vite):**
 
