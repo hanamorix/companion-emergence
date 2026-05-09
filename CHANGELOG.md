@@ -4,7 +4,17 @@ All notable changes to companion-emergence will be tracked here.
 
 The project is in active OSS development as of v0.0.1-alpha. Entries below describe pre-1.0 release readiness, not a public stable API promise.
 
-## 0.0.1 - Unreleased
+## 0.0.2-alpha — 2026-05-09
+
+First public alpha. Same framework runtime as 0.0.1; the bump
+marks the transition from private development to OSS distribution.
+Cleanups: dropped internal planning/audit doc trees from the
+public history, moved the `nell-example` voice template to a
+generic Nell archetype users edit themselves, scrubbed build-host
+absolute paths from kept docs, deleted stale internal milestone
+tags. No code changes.
+
+## 0.0.1 - Unreleased (private alpha)
 
 ### Added (2026-05-08 — second full repository audit + targeted hardening)
 
