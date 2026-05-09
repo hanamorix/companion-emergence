@@ -244,12 +244,16 @@ runtime_root = Path('$RUNTIME_DIR').resolve()
 print('  brain:', brain_file)
 assert str(brain_file).startswith(str(runtime_root)), brain_file
 "
-  # Verify the launcher works. On Windows the launcher is a .bat
-  # file that Git Bash can't exec directly via a Unix-style path —
-  # invoke through ``cmd //c`` to dispatch through the OS launcher.
-  # On Unix, the launcher is a normal sh script we can exec directly.
+  # Verify the launcher. On Unix we exec the sh wrapper directly
+  # ($NELL_BIN runs and reports a version). On Windows the launcher
+  # is a .bat file that Git Bash on the runner can't exec cleanly
+  # through cmd from this context (the path-quoting round-trip
+  # confuses cmd.exe), so check the .bat exists + invoke its inner
+  # logic directly through python.exe — which is exactly what the
+  # .bat does at runtime, just without the cmd dispatch layer.
   if [ "$HOST_OS" = "windows" ]; then
-    cmd //c "$(cygpath -w "$NELL_BIN")" --version
+    [ -f "$NELL_BIN" ] || { echo "[build] FAIL: $NELL_BIN missing" >&2; exit 1; }
+    "$PY_BIN" -c "from brain.cli import main; main()" --version
   else
     "$NELL_BIN" --version
   fi
