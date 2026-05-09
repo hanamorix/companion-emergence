@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "nellface"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "dirs 5.0.1",
  "reqwest 0.12.28",
