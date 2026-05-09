@@ -209,10 +209,15 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             PY="python-runtime/python.exe"
-            NELL="python-runtime/Scripts/nell.exe"
+            # Git Bash on Windows can't exec the bundled nell.bat
+            # through a Unix-style relative path. Mimic what the .bat
+            # does at runtime — invoke python.exe directly with the
+            # same -c incantation. Functionally equivalent for the
+            # smoke check.
+            NELL=("$PY" "-c" "from brain.cli import main; main()")
           else
             PY="python-runtime/bin/python3"
-            NELL="python-runtime/bin/nell"
+            NELL=("python-runtime/bin/nell")
           fi
           TMP_HOME="$("$PY" -c "import tempfile; print(tempfile.mkdtemp(prefix='nell-smoke-'))")"
           cleanup() {
@@ -220,14 +225,14 @@ jobs:
           }
           trap cleanup EXIT
 
-          "$NELL" --version
-          NELLBRAIN_HOME="$TMP_HOME" "$NELL" init \
+          "${NELL[@]}" --version
+          NELLBRAIN_HOME="$TMP_HOME" "${NELL[@]}" init \
             --persona smoke_persona \
             --user-name Smoke \
             --voice-template default \
             --fresh
           NELLBRAIN_HOME="$TMP_HOME" "$PY" -c "import os; from pathlib import Path; assert (Path(os.environ['NELLBRAIN_HOME']) / 'personas' / 'smoke_persona' / 'persona_config.json').is_file()"
-          NELLBRAIN_HOME="$TMP_HOME" "$NELL" status --persona smoke_persona
+          NELLBRAIN_HOME="$TMP_HOME" "${NELL[@]}" status --persona smoke_persona
         shell: bash
 
       - name: Prepare release artifacts and checksums
