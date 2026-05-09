@@ -43,9 +43,10 @@ Subsequent phases shipped:
   wash so the room temperature follows her mood — Phase 5D
 
 - Bundled portable Python runtime so the .app is zero-install for
-  Python — `pnpm tauri build` ships a self-contained NellFace.app
-  that doesn't need `uv` or system Python on PATH — Phase 7
-  (macOS arm64 / x86_64 / Linux x86_64 today; Windows next)
+  Python — `pnpm tauri build` ships a self-contained Companion
+  Emergence.app that doesn't need `uv` or system Python on PATH — Phase 7
+  (macOS arm64 / Linux x86_64 / Windows x86_64 alpha bundles today;
+  macOS Intel is source-build-only until a reliable runner exists)
 
 Not yet built:
 
@@ -87,7 +88,7 @@ which downloads `python-build-standalone` for the host arch, creates
 a portable Python tree under `app/src-tauri/python-runtime/`, builds
 the `companion-emergence` wheel, installs the brain into the bundled
 site-packages, and strips `__pycache__` + tests. Tauri then bundles
-that tree into `Resources/python-runtime/` inside `NellFace.app`.
+that tree into `Resources/python-runtime/` inside `Companion Emergence.app`.
 
 The resulting `.app` is ~190 MB on macOS arm64 (Python + httpx +
 fastapi + sqlite + ML deps; the full size is mostly third-party

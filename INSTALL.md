@@ -43,7 +43,7 @@ Grab `Companion.Emergence_<version>_aarch64.dmg` (Apple Silicon / M1+)
 from the Releases page. Intel macOS users should build from source
 until a reliable hosted Intel runner is available.
 
-### Open the .dmg and drag NellFace.app to Applications
+### Open the .dmg and drag Companion Emergence.app to Applications
 
 ### First launch
 
@@ -51,7 +51,7 @@ You'll see one of two warnings:
 
 **"NellFace can't be opened because it is from an unidentified developer"**
 
-1. Open Finder → Applications → right-click `NellFace.app` → **Open**
+1. Open Finder → Applications → right-click `Companion Emergence.app` → **Open**
 2. Click **Open** in the confirmation dialog
 3. macOS remembers the choice; subsequent launches use the dock /
    double-click as normal
@@ -70,7 +70,7 @@ This is the newer Sequoia/Tahoe wording. Slightly different bypass:
 If you'd rather skip the GUI dance:
 
 ```bash
-xattr -d com.apple.quarantine /Applications/NellFace.app
+xattr -d com.apple.quarantine "/Applications/Companion Emergence.app"
 ```
 
 That removes the Gatekeeper quarantine flag the .dmg added on download
@@ -202,20 +202,24 @@ launch without warnings.
 
 ## Verifying the binary
 
-If you want to confirm what you downloaded matches what we shipped:
+If you want to confirm what you downloaded matches what we shipped,
+download the matching `SHA256SUMS-*.txt` asset from the same Release:
 
 ```bash
 # macOS
-shasum -a 256 NellFace_*.dmg
+shasum -a 256 -c SHA256SUMS-macos-arm64.txt
 
 # Linux
-sha256sum NellFace_*.deb
+sha256sum -c SHA256SUMS-linux-x86_64.txt
 
 # Windows (PowerShell)
-Get-FileHash NellFace_*.msi -Algorithm SHA256
+Get-Content .\SHA256SUMS-windows-x86_64.txt
+Get-FileHash .\Companion.Emergence_0.0.1_x64_en-US.msi -Algorithm SHA256
+Get-FileHash .\Companion.Emergence_0.0.1_x64-setup.exe -Algorithm SHA256
 ```
 
-Compare against the hashes published on the Release page.
+Compare the PowerShell hashes against the `SHA256SUMS-windows-x86_64.txt`
+values. macOS/Linux `-c` does that comparison automatically.
 
 ---
 

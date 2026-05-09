@@ -29,7 +29,7 @@ Microsoft code-signing cert. See [`INSTALL.md`](INSTALL.md) for the
 per-platform bypass dance:
 
 - **macOS** — right-click → Open (one-time), or
-  `xattr -d com.apple.quarantine /Applications/NellFace.app`
+  `xattr -d com.apple.quarantine "/Applications/Companion Emergence.app"`
 - **Windows** — More info → Run anyway in the SmartScreen dialog
 - **Linux** — no signing dance; just `dpkg -i` or `chmod +x` the AppImage
 
