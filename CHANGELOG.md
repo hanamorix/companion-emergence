@@ -280,7 +280,7 @@ The project is in active OSS development as of v0.0.1-alpha. Entries below descr
 ### Added (2026-05-07 — Phase 7)
 
 - **Phase 7 — Python runtime bundling.** `pnpm tauri build` now
-  produces a self-contained `NellFace.app` that doesn't need `uv`,
+  produces a self-contained `Companion Emergence.app` that doesn't need `uv`,
   `python3`, or any system Python on PATH. Initial implementation
   shipped macOS arm64 / x86_64 / Linux x86_64; the cross-platform
   block above (2026-05-07) extended this to Linux arm64 + Windows
