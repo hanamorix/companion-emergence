@@ -217,7 +217,7 @@ fn build_service_install_args(persona: &str, bundled_nell: Option<&std::path::Pa
 /// inside Resources/. Path differs per OS because python-build-standalone
 /// uses different layouts:
 ///   * macOS / Linux: Resources/python-runtime/bin/nell
-///   * Windows:       Resources/python-runtime/Scripts/nell.exe
+///   * Windows:       Resources/python-runtime/Scripts/nell.bat
 ///
 /// Dev (`pnpm tauri dev`): the bundled runtime usually isn't built,
 /// so fall back to `uv run nell` against the source tree. Keeps the
@@ -232,7 +232,12 @@ fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> 
         .map_err(|e| format!("resolve resource_dir: {}", e))?;
     let runtime_dir = resource_dir.join("python-runtime");
     let bundled = if cfg!(windows) {
-        runtime_dir.join("Scripts").join("nell.exe")
+        // Was nell.exe (the uv trampoline) until v0.0.3-alpha; uv's
+        // trampoline bakes the build-host's python path and fails to
+        // canonicalize it on the user's machine
+        // ("uv trampoline failed to canonicalize script path"). Now
+        // a relocatable nell.bat written by build_python_runtime.sh.
+        runtime_dir.join("Scripts").join("nell.bat")
     } else {
         runtime_dir.join("bin").join("nell")
     };

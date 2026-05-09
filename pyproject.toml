@@ -1,6 +1,6 @@
 [project]
 name = "companion-emergence"
-version = "0.0.2"
+version = "0.0.3"
 description = "Framework for building persistent, emotionally aware AI companions"
 readme = "README.md"
 requires-python = ">=3.12"
