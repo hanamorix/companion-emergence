@@ -21,6 +21,7 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
+    delete_cursor,
     delete_session_buffer,
     list_active_sessions,
     read_cursor,
@@ -103,6 +104,7 @@ def close_session(
     # ── CLOSE guard: empty session ───────────────────────────────────────────
     if not turns:
         delete_session_buffer(persona_dir, session_id)
+        delete_cursor(persona_dir, session_id)
         return report
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
@@ -190,6 +192,7 @@ def close_session(
 
     # ── DELETE buffer ─────────────────────────────────────────────────────────
     delete_session_buffer(persona_dir, session_id)
+    delete_cursor(persona_dir, session_id)
 
     return report
 
@@ -346,6 +349,61 @@ def snapshot_stale_sessions(
                 config=config,
             )
             reports.append(report)
+    return reports
+
+
+def finalize_stale_sessions(
+    persona_dir: Path,
+    *,
+    finalize_after_hours: float = 24.0,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> list[IngestReport]:
+    """Iterate active sessions; finalize any whose last turn is past
+    ``finalize_after_hours``.
+
+    "Finalize" = run one last snapshot extraction, then delete the buffer
+    and the cursor sidecar. Caller (supervisor) follows up with
+    remove_session() for each returned report.session_id.
+
+    Per-session try/except so one bad session can't abort the loop. The
+    buffer + cursor are deleted whether the final snapshot succeeded or
+    not — sessions silent past the finalize threshold are dropped
+    unconditionally; memories already in MemoryStore from earlier
+    snapshots stay.
+    """
+    threshold_minutes = finalize_after_hours * 60.0
+    reports: list[IngestReport] = []
+    for sid in list_active_sessions(persona_dir):
+        turns = read_session(persona_dir, sid)
+        if not turns:
+            delete_session_buffer(persona_dir, sid)
+            delete_cursor(persona_dir, sid)
+            continue
+        age = session_silence_minutes(turns)
+        if age < threshold_minutes:
+            continue
+        try:
+            report = extract_session_snapshot(
+                persona_dir, sid,
+                store=store, hebbian=hebbian, provider=provider,
+                embeddings=embeddings, config=config,
+            )
+        except Exception:
+            logger.exception("finalize_stale_sessions: snapshot failed session=%s", sid)
+            report = IngestReport(session_id=sid)
+            report.errors += 1
+        delete_session_buffer(persona_dir, sid)
+        delete_cursor(persona_dir, sid)
+        reports.append(report)
+        logger.info(
+            "conversation_finalized session=%s silence_hours=%.2f",
+            sid,
+            age / 60.0,
+        )
     return reports
 
 
