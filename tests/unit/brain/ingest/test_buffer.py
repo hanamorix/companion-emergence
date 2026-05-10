@@ -216,3 +216,75 @@ def test_ingest_turn_image_shas_accepts_tuple(tmp_path):
     )
     rec = read_session(tmp_path, sid)[0]
     assert rec["image_shas"] == ["a" * 64, "b" * 64]
+
+
+# ---------------------------------------------------------------------------
+# cursor sidecar + read_session_after — full-session-context plan, Task 1
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from brain.ingest.buffer import (
+    delete_cursor,
+    read_cursor,
+    read_session_after,
+    write_cursor,
+)
+
+
+def test_write_and_read_cursor_roundtrip(tmp_path: Path) -> None:
+    ingest_turn(tmp_path, {"session_id": "sess_abc", "speaker": "user", "text": "hi"})
+    write_cursor(tmp_path, "sess_abc", "2026-05-10T20:00:00+00:00")
+    assert read_cursor(tmp_path, "sess_abc") == "2026-05-10T20:00:00+00:00"
+
+
+def test_read_cursor_missing_returns_none(tmp_path: Path) -> None:
+    assert read_cursor(tmp_path, "sess_abc") is None
+
+
+def test_read_cursor_malformed_returns_none(tmp_path: Path) -> None:
+    (tmp_path / "active_conversations").mkdir(parents=True)
+    (tmp_path / "active_conversations" / "sess_abc.cursor").write_text(
+        "not-a-timestamp", encoding="utf-8"
+    )
+    assert read_cursor(tmp_path, "sess_abc") is None
+
+
+def test_write_cursor_rejects_malformed_ts(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write_cursor(tmp_path, "sess_abc", "garbage")
+
+
+def test_delete_cursor_is_idempotent(tmp_path: Path) -> None:
+    delete_cursor(tmp_path, "sess_abc")
+    write_cursor(tmp_path, "sess_abc", "2026-05-10T20:00:00+00:00")
+    delete_cursor(tmp_path, "sess_abc")
+    assert read_cursor(tmp_path, "sess_abc") is None
+
+
+def test_read_session_after_returns_only_post_cursor_turns(tmp_path: Path) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "b",
+                           "ts": "2026-05-10T20:00:05+00:00"})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "c",
+                           "ts": "2026-05-10T20:01:00+00:00"})
+    out = read_session_after(tmp_path, sid, "2026-05-10T20:00:30+00:00")
+    assert [t["text"] for t in out] == ["c"]
+
+
+def test_read_session_after_none_cursor_returns_all(tmp_path: Path) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    out = read_session_after(tmp_path, sid, None)
+    assert len(out) == 1
+
+
+def test_read_session_after_malformed_cursor_returns_all(tmp_path: Path) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    out = read_session_after(tmp_path, sid, "not-a-ts")
+    assert len(out) == 1
