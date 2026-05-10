@@ -42,7 +42,10 @@ from pathlib import Path
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
-from brain.ingest.pipeline import close_stale_sessions
+from brain.ingest.pipeline import (
+    finalize_stale_sessions,
+    snapshot_stale_sessions,
+)
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -60,8 +63,10 @@ def run_folded(
     silence_minutes: float = 5.0,
     heartbeat_interval_s: float | None = 900.0,
     soul_review_interval_s: float | None = 6 * 3600.0,
+    finalize_after_hours: float = 24.0,
+    finalize_interval_s: float | None = 3600.0,
 ) -> None:
-    """Run supervisor + heartbeat + soul-review cadences until stop_event is set.
+    """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
     Stores are opened per-tick inside this thread; never crosses thread
     boundaries with the asyncio main loop.
@@ -77,19 +82,29 @@ def run_folded(
     bounded while ensuring candidates don't sit forever waiting for the
     user to discover ``nell soul review``. The user-surface principle
     says soul review is physiology, not a CLI knob.
+
+    ``finalize_interval_s=None`` disables the autonomous finalize
+    cadence. Default 3600s (1 hour) with a 24h silence threshold — the
+    sweep cadence is non-destructive (Task 3); finalize is the only path
+    that deletes buffers + cursors and evicts from _SESSIONS, so it
+    paces hourly because the threshold is days, not minutes.
     """
     logger.info(
-        "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s",
+        "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
         persona_dir.name,
         tick_interval_s,
         f"{heartbeat_interval_s:.0f}s" if heartbeat_interval_s is not None else "disabled",
         f"{soul_review_interval_s:.0f}s" if soul_review_interval_s is not None else "disabled",
+        f"{finalize_interval_s:.0f}s" if finalize_interval_s is not None else "disabled",
     )
     last_heartbeat_at = (
         time.monotonic() if heartbeat_interval_s is not None else None
     )
     last_soul_review_at = (
         time.monotonic() if soul_review_interval_s is not None else None
+    )
+    last_finalize_at = (
+        time.monotonic() if finalize_interval_s is not None else None
     )
     while not stop_event.is_set():
         try:
@@ -103,7 +118,7 @@ def run_folded(
                 )
                 stack.callback(embeddings.close)
 
-                reports = close_stale_sessions(
+                reports = snapshot_stale_sessions(
                     persona_dir,
                     silence_minutes=silence_minutes,
                     store=store,
@@ -111,9 +126,9 @@ def run_folded(
                     provider=provider,
                     embeddings=embeddings,
                 )
-                closed_session_ids = [r.session_id for r in reports if r.errors == 0]
-                for sid in closed_session_ids:
-                    remove_session(sid)
+                # Snapshot is NON-destructive — do NOT call remove_session
+                # here. Session lifecycle is owned by finalize_stale_sessions
+                # below and the explicit /sessions/close path.
                 pruned_empty_sessions = prune_empty_sessions(
                     older_than_seconds=silence_minutes * 60.0,
                     persona_name=persona_dir.name,
@@ -123,7 +138,7 @@ def run_folded(
             for r in reports:
                 event_bus.publish(
                     {
-                        "type": "session_closed",
+                        "type": "session_snapshot",
                         "session_id": r.session_id,
                         "committed": r.committed,
                         "deduped": r.deduped,
@@ -171,6 +186,26 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor soul-review tick raised")
             last_soul_review_at = time.monotonic()
+
+        # Finalize cadence — 24h silence (default) or explicit. Each pass
+        # runs at most one final snapshot per stale session, then deletes
+        # buffer + cursor + registry entry. Slow cadence (hourly default)
+        # because the threshold is days, not minutes.
+        if (
+            finalize_interval_s is not None
+            and last_finalize_at is not None
+            and time.monotonic() - last_finalize_at >= finalize_interval_s
+        ):
+            try:
+                _run_finalize_tick(
+                    persona_dir,
+                    provider,
+                    event_bus,
+                    finalize_after_hours=finalize_after_hours,
+                )
+            except Exception:
+                logger.exception("supervisor finalize tick raised")
+            last_finalize_at = time.monotonic()
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -326,6 +361,55 @@ def _run_soul_review_tick(
             "at": _now_iso(),
         }
     )
+
+
+def _run_finalize_tick(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus,
+    *,
+    finalize_after_hours: float,
+) -> None:
+    """Run one finalize pass — per-tick stores, then drop registry entries
+    for every session that was finalized.
+
+    Mirrors the per-tick store ownership pattern of `_run_heartbeat_tick`:
+    opens MemoryStore + HebbianMatrix + EmbeddingCache inside this thread,
+    closes them via ExitStack. The supervisor follows up by calling
+    remove_session() for each finalized session — finalize itself doesn't
+    touch the in-memory registry.
+    """
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+
+        reports = finalize_stale_sessions(
+            persona_dir,
+            finalize_after_hours=finalize_after_hours,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            embeddings=embeddings,
+        )
+
+    for r in reports:
+        remove_session(r.session_id)
+        event_bus.publish(
+            {
+                "type": "session_finalized",
+                "session_id": r.session_id,
+                "committed": r.committed,
+                "deduped": r.deduped,
+                "errors": r.errors,
+                "at": _now_iso(),
+            }
+        )
 
 
 def _now_iso() -> str:
