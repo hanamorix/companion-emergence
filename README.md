@@ -70,15 +70,21 @@ supervisor.** The app is a thin viewer that reads
 If you skipped the wizard auto-install (an existing persona, or a
 launchctl error during first run), open the **Connection** panel and
 click "install launchd supervisor" — that wires the same agent
-without touching your data. Or run `nell service install --persona <name>`
-from terminal.
+without touching your data.
+
+The wizard also installs a `nell` shortcut at `~/.local/bin/nell` so
+you can use the CLI from your terminal. If you skipped it, open the
+Connection panel and click "install nell to ~/.local/bin" too. (The
+DMG bundle ships the CLI inside `Companion Emergence.app/Contents/
+Resources/python-runtime/bin/nell` — the symlink just makes it
+reachable from your shell.)
 
 On Linux and Windows the equivalent service abstraction exists as a
 systemd user unit / Windows Task Scheduler task. Those code paths are
 unit-tested and bundled, but still need more live-host validation than
 macOS before we call them primary.
 
-Useful commands:
+Useful commands (after the `nell`-on-PATH step above):
 
 ```bash
 nell service status --persona nell      # is the LaunchAgent loaded?

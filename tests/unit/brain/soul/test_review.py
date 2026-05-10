@@ -382,6 +382,99 @@ def test_review_dry_run_skips_writes(tmp_path: Path) -> None:
     soul_store.close()
 
 
+# ── defer-cooldown tests (Phase 1.E) ──────────────────────────────────────────
+
+
+def test_review_skips_candidates_within_defer_cooldown(tmp_path: Path) -> None:
+    """A candidate deferred within cooldown_hours is not re-evaluated."""
+    from datetime import timedelta
+
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    provider = _AcceptProvider()
+
+    # Recently-deferred (1h ago) — should be skipped.
+    recent = _make_candidate("recently deferred")
+    recent["last_deferred_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+
+    # Long-deferred (48h ago) — past 24h cooldown, should be re-evaluated.
+    stale = _make_candidate("long ago deferred")
+    stale["last_deferred_at"] = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+
+    # Never deferred — should always be evaluated.
+    fresh = _make_candidate("never deferred")
+
+    _write_candidates(tmp_path, [recent, stale, fresh])
+
+    report = review_pending_candidates(
+        tmp_path,
+        store=store,
+        soul_store=soul_store,
+        provider=provider,
+        defer_cooldown_hours=24,
+    )
+
+    # Only stale + fresh examined; recent skipped.
+    assert report.examined == 2
+    # `recent` doesn't appear at the start of `pending_indices` either.
+    assert report.pending_at_start == 2
+
+    store.close()
+    soul_store.close()
+
+
+def test_review_defer_cooldown_disabled_when_zero(tmp_path: Path) -> None:
+    """defer_cooldown_hours=0 disables the cooldown — operator escape hatch."""
+    from datetime import timedelta
+
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    provider = _AcceptProvider()
+
+    recent = _make_candidate("recently deferred")
+    recent["last_deferred_at"] = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    _write_candidates(tmp_path, [recent])
+
+    report = review_pending_candidates(
+        tmp_path,
+        store=store,
+        soul_store=soul_store,
+        provider=provider,
+        defer_cooldown_hours=0,
+    )
+
+    assert report.examined == 1
+    assert report.accepted == 1
+
+    store.close()
+    soul_store.close()
+
+
+def test_review_handles_malformed_last_deferred_at(tmp_path: Path) -> None:
+    """A garbage last_deferred_at value is treated as 'never deferred'."""
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    provider = _AcceptProvider()
+
+    candidate = _make_candidate("malformed timestamp")
+    candidate["last_deferred_at"] = "not-a-timestamp"
+    _write_candidates(tmp_path, [candidate])
+
+    report = review_pending_candidates(
+        tmp_path,
+        store=store,
+        soul_store=soul_store,
+        provider=provider,
+        defer_cooldown_hours=24,
+    )
+
+    # Malformed timestamp falls through the cooldown gate — examined.
+    assert report.examined == 1
+
+    store.close()
+    soul_store.close()
+
+
 # ── parse_decision unit tests ─────────────────────────────────────────────────
 
 

@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DECISIONS = 5
 DEFAULT_CONFIDENCE_THRESHOLD = 7
+# Cooldown after a defer before the same candidate is re-evaluated.
+# 24h matches an emotional state's day-cycle; long enough that the model
+# isn't asked the same uncertain question every autonomous review pass
+# (which would burn LLM cost on candidates that are genuinely "not yet"),
+# short enough that a meaningful candidate doesn't sit unrevisited for
+# weeks. CLI invocations honor the same cooldown unless the operator
+# passes a smaller value via --defer-cooldown-hours.
+DEFAULT_DEFER_COOLDOWN_HOURS = 24
 
 # Valid decision values the model may return
 VALID_DECISIONS = {"accept", "reject", "defer"}
@@ -389,6 +397,30 @@ def _apply_defer(candidate: dict, dry_run: bool) -> None:
     candidate["last_deferred_at"] = datetime.now(UTC).isoformat()
 
 
+def _within_defer_cooldown(candidate: dict, cooldown_hours: float) -> bool:
+    """True if candidate was deferred within ``cooldown_hours`` of now.
+
+    Stops the autonomous-review treadmill: a candidate the model is
+    genuinely uncertain about gets re-evaluated (and re-billed) every
+    pass without this gate. ``cooldown_hours <= 0`` disables the gate
+    so operators can force a full sweep via ``nell soul review
+    --defer-cooldown-hours 0``.
+    """
+    if cooldown_hours <= 0:
+        return False
+    raw = candidate.get("last_deferred_at")
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    elapsed = datetime.now(UTC) - last
+    return elapsed.total_seconds() < cooldown_hours * 3600.0
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
@@ -400,6 +432,7 @@ def review_pending_candidates(
     provider: LLMProvider,
     max_decisions: int = DEFAULT_MAX_DECISIONS,
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
+    defer_cooldown_hours: float = DEFAULT_DEFER_COOLDOWN_HOURS,
     dry_run: bool = False,
 ) -> ReviewReport:
     """Read soul_candidates.jsonl, decide on each via the LLM, apply decisions.
@@ -421,6 +454,12 @@ def review_pending_candidates(
         Maximum candidates to evaluate per call.
     confidence_threshold:
         Minimum confidence required to accept or reject; below this → defer.
+    defer_cooldown_hours:
+        Skip any candidate whose ``last_deferred_at`` is within this many
+        hours. Default 24h — stops the autonomous-review treadmill where
+        an uncertain candidate gets re-evaluated (and re-billed) every
+        pass. Set to 0 to disable the cooldown (CLI / operator escape
+        hatch).
     dry_run:
         If True, evaluate + log but skip all writes.
     """
@@ -441,6 +480,7 @@ def review_pending_candidates(
             provider=provider,
             max_decisions=max_decisions,
             confidence_threshold=confidence_threshold,
+            defer_cooldown_hours=defer_cooldown_hours,
             dry_run=dry_run,
         )
 
@@ -453,6 +493,7 @@ def _review_pending_candidates_locked(
     provider: LLMProvider,
     max_decisions: int = DEFAULT_MAX_DECISIONS,
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
+    defer_cooldown_hours: float = DEFAULT_DEFER_COOLDOWN_HOURS,
     dry_run: bool = False,
 ) -> ReviewReport:
     """Read-modify-rewrite body of :func:`review_pending_candidates`.
@@ -464,7 +505,10 @@ def _review_pending_candidates_locked(
 
     records = _load_soul_candidates(persona_dir)
     pending_indices = [
-        i for i, r in enumerate(records) if r.get("status", "auto_pending") == "auto_pending"
+        i
+        for i, r in enumerate(records)
+        if r.get("status", "auto_pending") == "auto_pending"
+        and not _within_defer_cooldown(r, defer_cooldown_hours)
     ]
 
     report = ReviewReport(
