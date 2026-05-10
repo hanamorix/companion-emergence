@@ -537,16 +537,8 @@ async fn install_supervisor_service(
 /// no /Volumes-shaped DMGs) so we'll add Linux when there's a Linux
 /// `.app` shape to validate against.
 #[tauri::command]
+#[cfg(target_os = "macos")]
 async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
-    if !cfg!(target_os = "macos") {
-        return Ok(InitResult {
-            success: false,
-            stdout: String::new(),
-            stderr: "nell-CLI symlink install is currently macOS-only".to_string(),
-            exit_code: 78,
-        });
-    }
-
     let bundled = match bundled_nell_path(&app)? {
         Some(p) => p,
         None => {
@@ -585,6 +577,22 @@ async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, S
     install_symlink_to(&bundled, &target_dir, &target)
 }
 
+/// Non-macOS stub. The Linux + Windows builds compile this; macOS uses
+/// the real implementation above. Returns the unsupported result the
+/// frontend already renders inline. The Linux story (~/.local/bin/nell
+/// from the AppImage / .deb) is achievable but layout-specific
+/// validation differs from macOS — defer to a separate landing.
+#[cfg(not(target_os = "macos"))]
+#[allow(unused_variables)]
+async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
+    Ok(InitResult {
+        success: false,
+        stdout: String::new(),
+        stderr: "nell-CLI symlink install is currently macOS-only".to_string(),
+        exit_code: 78,
+    })
+}
+
 /// Pure file-system half of [`install_nell_cli_symlink`]. Extracted so
 /// the FS branches can be unit-tested against tempdirs without spinning
 /// up a Tauri runtime.
@@ -592,6 +600,11 @@ async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, S
 /// Returns the same [`InitResult`] shape the Tauri command surfaces.
 /// On `success=true`, `stdout` holds the user-facing summary; on
 /// `success=false`, `stderr` holds the error text the frontend renders.
+///
+/// Unix-only — uses [`std::os::unix::fs::symlink`]. The Windows build
+/// stops at the [`install_nell_cli_symlink`] non-macos stub; this
+/// helper isn't compiled there.
+#[cfg(unix)]
 fn install_symlink_to(
     bundled: &std::path::Path,
     target_dir: &std::path::Path,
@@ -683,6 +696,10 @@ fn install_symlink_to(
 /// Tauri is the launchd-inherited PATH (often missing user shell paths).
 /// So a "not on PATH" hint here is conservative — if it's absent here,
 /// the user might still need to add it to their shell rc.
+///
+/// Unix-only — paired with [`install_symlink_to`]; only ever called
+/// from a macOS runtime path.
+#[cfg(unix)]
 fn path_hint(target_dir: &std::path::Path) -> String {
     let on_path = std::env::var("PATH")
         .ok()
@@ -893,7 +910,12 @@ mod tests {
     }
 
     // ── install_symlink_to — Phase 1.A ────────────────────────────────────
+    // Unix-only: install_symlink_to is itself #[cfg(unix)] because it
+    // uses std::os::unix::fs::symlink. Windows builds compile only the
+    // non-macos stub of install_nell_cli_symlink and don't have these
+    // helpers at all.
 
+    #[cfg(unix)]
     #[test]
     fn install_symlink_to_writes_link_when_target_missing() {
         let dir = tempdir().unwrap();
@@ -911,6 +933,7 @@ mod tests {
         assert_eq!(std::fs::read_link(&target).unwrap(), bundled);
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_symlink_to_idempotent_when_link_already_correct() {
         let dir = tempdir().unwrap();
@@ -928,6 +951,7 @@ mod tests {
         assert!(r2.stdout.contains("already installed"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_symlink_to_replaces_stale_symlink_pointing_elsewhere() {
         let dir = tempdir().unwrap();
@@ -950,6 +974,7 @@ mod tests {
         assert_eq!(std::fs::read_link(&target).unwrap(), new_bundled);
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_symlink_to_refuses_to_clobber_regular_file() {
         let dir = tempdir().unwrap();
@@ -972,6 +997,7 @@ mod tests {
         assert!(body.starts_with("#!/usr/bin/env python"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_symlink_to_creates_parent_dir_if_missing() {
         let dir = tempdir().unwrap();
