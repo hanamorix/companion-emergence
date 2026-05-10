@@ -559,3 +559,84 @@ def test_snapshot_on_empty_buffer_returns_empty_report(
 
     assert report.extracted == 0
     assert tracking_provider.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# snapshot_stale_sessions tests
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_stale_sessions_keeps_buffer_alive(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import snapshot_stale_sessions
+
+    sid = "sess_abc"
+    old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "earlier", "ts": old_ts})
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert len(reports) == 1
+    assert reports[0].session_id == sid
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists(), "snapshot sweep must NOT delete the buffer"
+
+
+def test_snapshot_stale_sessions_skips_fresh_sessions(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import snapshot_stale_sessions
+
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "just now"})
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert reports == []
+
+
+def test_snapshot_stale_sessions_cleans_ghost_buffer(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    """A buffer file with no readable turns (corrupt / never-written) is
+    silently cleaned up without generating a report."""
+    from brain.ingest.pipeline import snapshot_stale_sessions
+
+    sid = "sess_ghost"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert reports == []
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert not buf.exists(), "ghost buffer should be cleaned up"
