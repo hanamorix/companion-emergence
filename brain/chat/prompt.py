@@ -35,6 +35,7 @@ def build_system_message(
     daemon_state: DaemonState,
     soul_store: SoulStore,
     store: MemoryStore,
+    user_input: str | None = None,
 ) -> str:
     """Compose the system message for one chat turn.
 
@@ -47,6 +48,11 @@ def build_system_message(
          - Daemon residue (from get_residue_context(daemon_state))
          - Soul highlights (top 5 most-recent crystallizations: love_type + 60-char snippet)
          - Pending soul-candidates count (informational)
+      4b. Recall block — memories matching the current user input (Phase 2.A).
+          Surfaces relevant memory ambiently so the model doesn't have to
+          consciously call `search_memories` for "remember when we talked
+          about X" cases. ``user_input=None`` (or empty / too short) skips
+          the block entirely.
       5. Body block (energy/temperature/exhaustion + body emotions — spec §4)
       6. Recent journal block (private — spec §4.3)
       7. Recent growth block (behavioral_log — spec §4.4)
@@ -93,6 +99,12 @@ def build_system_message(
 
     if len(brain_lines) > 1:  # more than just the header
         parts.append("\n".join(brain_lines))
+
+    # 4b. Recall block — memories matching the current user input.
+    if user_input is not None:
+        recall_block = _build_recall_block(store, user_input)
+        if recall_block.strip():
+            parts.append(recall_block)
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
     body_block = _build_body_block(store, persona_dir)
@@ -287,6 +299,125 @@ def _build_soul_highlights(soul_store: SoulStore) -> str:
         return "\n".join(lines)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _build_recall_block(
+    store: MemoryStore,
+    user_input: str,
+    *,
+    limit: int = 5,
+    max_chars: int = 140,
+) -> str:
+    """Surface up to ``limit`` memories matching the current user input.
+
+    Phase 2.A of the autonomous-memory work. Before this block existed
+    the chat prompt only surfaced memories that had been crystallized
+    into the soul (top-5 by recency); for "remember when we talked
+    about X" cases the model had to consciously invoke the
+    ``search_memories`` tool. Many local-LLM tool calls don't fire
+    when they should, so memories the user had every reason to expect
+    Nell to surface stayed silent.
+
+    Strategy: extract content tokens from ``user_input`` (drop short
+    stopword-shaped fragments), search via ``store.search_text`` for
+    each token, dedupe by memory id, sort the union by importance
+    descending then created_at descending, take the top ``limit``.
+
+    The same ``store.search_text`` primitive that powers the
+    ``search_memories`` tool — keyword recall, not semantic — so this
+    is best-effort. Phase 2.B (planned) swaps in embedding similarity
+    when keyword recall under-recovers.
+
+    Empty input or no matches → returns the empty string and the
+    block is omitted from the prompt.
+    """
+    tokens = _extract_recall_tokens(user_input)
+    if not tokens:
+        return ""
+
+    seen: set = set()
+    candidates: list = []
+    for token in tokens:
+        try:
+            hits = store.search_text(token, active_only=True, limit=limit * 2)
+        except Exception:  # noqa: BLE001
+            continue
+        for mem in hits:
+            if mem.id in seen:
+                continue
+            seen.add(mem.id)
+            candidates.append(mem)
+
+    if not candidates:
+        return ""
+
+    # Rank: highest importance first, then most-recent. Tie-break by
+    # importance avoids burying soul-shaped memories under freshly
+    # written tonight's-chat fluff.
+    def _sort_key(m):
+        importance = float(getattr(m, "importance", 0) or 0)
+        created_at = getattr(m, "created_at", None)
+        # created_at is a datetime; convert to comparable timestamp.
+        try:
+            ts = created_at.timestamp() if created_at is not None else 0.0
+        except Exception:  # noqa: BLE001
+            ts = 0.0
+        return (-importance, -ts)
+
+    candidates.sort(key=_sort_key)
+    top = candidates[:limit]
+
+    lines = ["── recall (memories matching this turn) ──"]
+    for mem in top:
+        snippet = (getattr(mem, "content", "") or "").strip()
+        if len(snippet) > max_chars:
+            snippet = snippet[: max_chars - 1].rstrip() + "…"
+        importance = int(round(float(getattr(mem, "importance", 0) or 0)))
+        domain = getattr(mem, "domain", "") or ""
+        prefix = f"[importance {importance}/10"
+        if domain:
+            prefix += f" · {domain}"
+        prefix += "]"
+        lines.append(f"- {prefix} {snippet}")
+
+    return "\n".join(lines)
+
+
+# Words shorter than this are dropped before search. Captures most
+# stopwords and pronouns ("the", "is", "I", "we") without an explicit
+# stopword list — keeps the helper lightweight and locale-flexible.
+_RECALL_TOKEN_MIN_LEN = 4
+_RECALL_TOKEN_LIMIT = 6  # cap unique tokens passed to search_text
+
+
+def _extract_recall_tokens(user_input: str) -> list[str]:
+    """Pull search tokens from a user message.
+
+    - Lowercases.
+    - Splits on non-alphanumerics.
+    - Drops tokens shorter than _RECALL_TOKEN_MIN_LEN (catches most
+      stopwords / pronouns / interjections without a stopword list).
+    - Dedupes preserving first-seen order.
+    - Caps at _RECALL_TOKEN_LIMIT unique tokens so a long message
+      doesn't fan out to dozens of LIKE queries.
+    """
+    if not user_input:
+        return []
+    import re
+
+    pieces = re.split(r"[^A-Za-z0-9]+", user_input.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    for piece in pieces:
+        if len(piece) < _RECALL_TOKEN_MIN_LEN:
+            continue
+        if piece in seen:
+            continue
+        seen.add(piece)
+        out.append(piece)
+        if len(out) >= _RECALL_TOKEN_LIMIT:
+            break
+    return out
 
 
 def _count_soul_candidates(persona_dir: Path) -> int:

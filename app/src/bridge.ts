@@ -114,6 +114,12 @@ export interface PersonaState {
     last_heartbeat_at: string | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
+  /** True iff orphan session buffers from a previous shutdown are still
+   *  being re-ingested. Drives the chat panel "reconnecting your previous
+   *  chat" banner. Optional in the type so older bridge builds (pre-Phase
+   *  3.A) without the field still parse — falls through to undefined and
+   *  the UI treats it as false. */
+  recovering?: boolean;
 }
 
 export interface BodyState {

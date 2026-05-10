@@ -77,6 +77,12 @@ interface Props {
   /** Notifier called when chat is in-flight; drives NellAvatar's
    * speaking animation. true = streaming reply, false = idle. */
   onSpeakingChange?: (speaking: boolean) => void;
+  /** True when orphan session buffers from a previous shutdown are
+   *  still being re-ingested. Drives the brief "reconnecting your
+   *  previous chat" banner so a user opening the app after a hard
+   *  quit sees that their last conversation is being saved, not
+   *  forgotten. Source: PersonaState.recovering from /persona/state. */
+  recovering?: boolean;
 }
 
 /**
@@ -87,7 +93,7 @@ interface Props {
  * message on the `done` frame. Avatar speaking animation runs from
  * stream-open until done, so the mouth animates while text appears.
  */
-export function ChatPanel({ persona, onSpeakingChange }: Props) {
+export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -490,6 +496,20 @@ export function ChatPanel({ persona, onSpeakingChange }: Props) {
         {memorySaveWarning && (
           <div style={{ fontSize: 11, color: "var(--lacquer)", padding: "6px 4px" }}>
             {memorySaveWarning}
+          </div>
+        )}
+        {recovering && (
+          <div
+            data-testid="recovery-banner"
+            role="status"
+            style={{
+              fontSize: 11,
+              color: "var(--text-mute)",
+              padding: "6px 4px",
+              fontStyle: "italic",
+            }}
+          >
+            Reconnecting your previous chat — give it a moment.
           </div>
         )}
       </div>

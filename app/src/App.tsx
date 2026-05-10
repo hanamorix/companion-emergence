@@ -317,7 +317,11 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           reducedMotion={config.reduced_motion}
         />
       </div>
-      <ChatPanel persona={persona} onSpeakingChange={setIsSpeaking} />
+      <ChatPanel
+        persona={persona}
+        onSpeakingChange={setIsSpeaking}
+        recovering={state?.recovering ?? false}
+      />
     </div>
   );
 }
