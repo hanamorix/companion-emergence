@@ -6,12 +6,18 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.ingest.buffer import (
+    delete_cursor,
     delete_session_buffer,
     ingest_turn,
     list_active_sessions,
+    read_cursor,
     read_session,
+    read_session_after,
     session_silence_minutes,
+    write_cursor,
 )
 
 
@@ -221,15 +227,6 @@ def test_ingest_turn_image_shas_accepts_tuple(tmp_path):
 # ---------------------------------------------------------------------------
 # cursor sidecar + read_session_after — full-session-context plan, Task 1
 # ---------------------------------------------------------------------------
-
-import pytest
-
-from brain.ingest.buffer import (
-    delete_cursor,
-    read_cursor,
-    read_session_after,
-    write_cursor,
-)
 
 
 def test_write_and_read_cursor_roundtrip(tmp_path: Path) -> None:
