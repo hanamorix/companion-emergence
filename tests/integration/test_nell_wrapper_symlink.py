@@ -15,14 +15,37 @@ Test shape: build a fake bundled layout in a tempdir (stub python3 +
 the wrapper template from app/build_python_runtime.sh), create a
 symlink elsewhere, invoke the symlink, assert it reaches the bundled
 python3.
+
+**Unix-only.** The wrapper is `#!/bin/sh` — Windows Python's
+``subprocess.run`` raises ``OSError [WinError 193]`` ("not a valid
+Win32 application") trying to exec it. The Windows entry point is a
+``.bat`` file written by a separate branch of build_python_runtime.sh
+and isn't symlink-shaped (Windows uses the launchd-supervisor and
+Tauri-resolved bundled path; no ~/.local/bin equivalent installed by
+the desktop app). Add a Windows-specific test file when the
+~/.local/bin Windows story lands; for now, skip cleanly on Windows
+so CI stays green.
 """
 from __future__ import annotations
 
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Wrapper is #!/bin/sh — Windows subprocess can't exec it. "
+        "Windows entry point is the .bat from build_python_runtime.sh; "
+        "see test_nell_wrapper_symlink_win32.py when the Windows ~/.local/bin "
+        "story lands."
+    ),
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
