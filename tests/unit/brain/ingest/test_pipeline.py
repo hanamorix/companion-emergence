@@ -16,7 +16,13 @@ from brain.ingest.buffer import (
     read_cursor,
     write_cursor,
 )
-from brain.ingest.pipeline import close_session, close_stale_sessions
+from brain.ingest.pipeline import (
+    close_session,
+    close_stale_sessions,
+    extract_session_snapshot,
+    finalize_stale_sessions,
+    snapshot_stale_sessions,
+)
 from brain.ingest.soul_queue import list_soul_candidates
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -455,8 +461,6 @@ def test_snapshot_preserves_buffer_and_writes_cursor(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import extract_session_snapshot
-
     sid = "sess_abc"
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "I love watercolour"})
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "noted"})
@@ -478,8 +482,6 @@ def test_snapshot_with_cursor_only_extracts_new_turns(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import extract_session_snapshot
-
     sid = "sess_abc"
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "old",
                            "ts": "2026-05-10T20:00:00+00:00"})
@@ -503,8 +505,6 @@ def test_snapshot_with_no_new_turns_skips_provider_call(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import extract_session_snapshot
-
     sid = "sess_abc"
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x",
                            "ts": "2026-05-10T20:00:00+00:00"})
@@ -525,8 +525,6 @@ def test_snapshot_malformed_cursor_falls_back_to_full(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import extract_session_snapshot
-
     sid = "sess_abc"
     (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
     (tmp_path / "active_conversations" / f"{sid}.cursor").write_text("garbage")
@@ -547,8 +545,6 @@ def test_snapshot_on_empty_buffer_returns_empty_report(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import extract_session_snapshot
-
     sid = "sess_abc"
     (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
     (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
@@ -573,8 +569,6 @@ def test_snapshot_stale_sessions_keeps_buffer_alive(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import snapshot_stale_sessions
-
     sid = "sess_abc"
     old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
@@ -600,8 +594,6 @@ def test_snapshot_stale_sessions_skips_fresh_sessions(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import snapshot_stale_sessions
-
     sid = "sess_abc"
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "just now"})
 
@@ -624,8 +616,6 @@ def test_snapshot_stale_sessions_cleans_ghost_buffer(
 ) -> None:
     """A buffer file with no readable turns (corrupt / never-written) is
     silently cleaned up without generating a report."""
-    from brain.ingest.pipeline import snapshot_stale_sessions
-
     sid = "sess_ghost"
     (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
     (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
@@ -654,8 +644,6 @@ def test_finalize_under_threshold_skips(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.pipeline import finalize_stale_sessions
-
     sid = "sess_abc"
     recent = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
@@ -678,9 +666,6 @@ def test_finalize_at_threshold_deletes_buffer_and_cursor(
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
-    from brain.ingest.buffer import write_cursor
-    from brain.ingest.pipeline import finalize_stale_sessions
-
     sid = "sess_abc"
     old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
@@ -708,8 +693,6 @@ def test_finalize_per_session_error_isolation(
 ) -> None:
     """A provider that raises on the first call shouldn't abort the whole sweep —
     both stale sessions must still be reported and cleaned up."""
-    from brain.bridge.chat import ChatResponse
-    from brain.ingest.pipeline import finalize_stale_sessions
 
     class _ExplodingOnceProvider(LLMProvider):
         def __init__(self) -> None:
@@ -758,8 +741,6 @@ def test_close_session_full_path_also_deletes_cursor(
     hebbian: HebbianMatrix,
 ) -> None:
     """Explicit close must clean up the cursor sidecar alongside the buffer."""
-    from brain.ingest.buffer import write_cursor
-
     sid = "sess_close_cur"
     for speaker, text in [("Hana", "hi"), ("Nell", "hello"), ("Hana", "bye")]:
         ingest_turn(tmp_path, {"session_id": sid, "speaker": speaker, "text": text})
@@ -783,8 +764,6 @@ def test_close_session_empty_path_also_deletes_cursor(
     canned_provider: _CannedProvider,
 ) -> None:
     """Empty-session early-return path must also clean up the cursor."""
-    from brain.ingest.buffer import write_cursor
-
     sid = "sess_empty_cur"
     # Empty buffer file + stale cursor.
     (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
