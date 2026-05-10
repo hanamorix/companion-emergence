@@ -100,6 +100,15 @@ starts it at login, and **closing or rebuilding the desktop app does
 not stop the brain**. The app reads `bridge.json` and reconnects to
 the supervisor that's already running.
 
+### CLI on PATH
+
+The `nell` CLI ships inside the .app bundle, but the wizard also
+installs a symlink at `~/.local/bin/nell` so you can run it from
+Terminal. If `nell --version` doesn't work, open the **Connection**
+panel and click **install nell to ~/.local/bin**, then open a new
+Terminal window. (The same dir is where Anthropic's `claude` installer
+puts its binary, so it's almost certainly already on your shell PATH.)
+
 To verify or manage the agent:
 
 ```bash
@@ -115,7 +124,8 @@ If the wizard install failed for any reason (an unusual `~/.local/bin`
 layout, a launchctl quirk, etc.), the wizard's success pane shows the
 stderr inline and the brain falls back to the legacy "spawned by the
 desktop app" lifecycle. You can retry from the Connection panel's
-**install launchd supervisor** button or from the terminal:
+**install launchd supervisor** button or from the terminal once the
+CLI symlink is in place:
 
 ```bash
 nell service install --persona nell

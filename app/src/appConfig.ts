@@ -146,3 +146,15 @@ export async function checkClaudeCli(): Promise<ClaudeCliCheck> {
 export async function installSupervisorService(persona: string): Promise<InitResult> {
   return await invoke<InitResult>("install_supervisor_service", { persona });
 }
+
+/**
+ * Install a symlink at ~/.local/bin/nell pointing at the bundled CLI so
+ * the user can run `nell ...` from their Terminal. Mirrors the
+ * supervisor-install shape: idempotent, AppTranslocation-guarded,
+ * surfaces structured success/error the panel renders inline.
+ *
+ * macOS-only for now (the Tauri command short-circuits on non-Darwin).
+ */
+export async function installNellCliSymlink(): Promise<InitResult> {
+  return await invoke<InitResult>("install_nell_cli_symlink");
+}
