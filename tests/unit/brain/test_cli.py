@@ -116,3 +116,31 @@ def test_nell_bridge_alias_removed(capsys: pytest.CaptureFixture[str]) -> None:
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "invalid choice" in captured.err.lower() or "argument command" in captured.err.lower()
+
+
+# ---------- dream handler — friendly NoSeedAvailable (audit 2026-05-10 P2) ----------
+
+
+def test_dream_handler_friendly_message_when_no_seed(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Fresh persona with no conversation memories: `nell dream --dry-run`
+    used to print a NoSeedAvailable traceback. Now it prints a friendly
+    "Dream skipped: ..." message and exits 0."""
+    persona_dir = _make_persona(tmp_path, "freshie")
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path / "home"))
+    PersonaConfig(provider="fake", searcher="noop", mcp_audit_log_level="metadata").save(
+        persona_dir / "persona_config.json"
+    )
+
+    result = cli.main(["dream", "--persona", "freshie", "--provider", "fake", "--dry-run"])
+
+    assert result == 0, "fresh-persona dream must exit cleanly"
+    captured = capsys.readouterr()
+    assert "Dream skipped" in captured.out
+    # The traceback would include `NoSeedAvailable` or `Traceback`.
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert "NoSeedAvailable" not in captured.out
