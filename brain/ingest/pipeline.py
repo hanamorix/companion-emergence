@@ -403,9 +403,13 @@ def finalize_stale_sessions(
         delete_cursor(persona_dir, sid)
         reports.append(report)
         logger.info(
-            "conversation_finalized session=%s silence_hours=%.2f",
+            "conversation_finalized session=%s silence_hours=%.2f "
+            "committed=%d deduped=%d errors=%d",
             sid,
             age / 60.0,
+            report.committed,
+            report.deduped,
+            report.errors,
         )
     return reports
 
