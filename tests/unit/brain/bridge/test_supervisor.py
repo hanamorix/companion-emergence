@@ -25,6 +25,21 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
+class _CapturingBus:
+    """In-process bus stand-in that records every published event.
+
+    The real EventBus.publish() requires a bound asyncio loop and is a
+    no-op otherwise; tests don't run a loop so we substitute a duck-typed
+    bus that records every dict the supervisor publishes.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+
+
 def test_run_folded_exits_when_stop_event_is_set(tmp_path: Path) -> None:
     """The supervisor loop honors stop_event and returns cleanly."""
     persona_dir = _persona_dir(tmp_path)
@@ -153,9 +168,7 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
 def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
     """_run_heartbeat_tick fires HeartbeatEngine.run_tick and publishes."""
     persona_dir = _persona_dir(tmp_path)
-    bus_events: list = []
-    bus = MagicMock()
-    bus.publish.side_effect = lambda payload: bus_events.append(payload)
+    bus = _CapturingBus()
 
     # Fake HeartbeatEngine returns a result we can predict
     fake_result = MagicMock(
@@ -176,28 +189,13 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
         _run_heartbeat_tick(persona_dir, FakeProvider(), bus)
 
     assert any(
-        e.get("type") == "heartbeat_tick" for e in bus_events
+        e.get("type") == "heartbeat_tick" for e in bus.events
     ), "heartbeat_tick event was not published"
 
 
 # ---------------------------------------------------------------------------
 # Snapshot sweep + finalize cadence tests (Phase B sticky sessions)
 # ---------------------------------------------------------------------------
-
-
-class _CapturingBus:
-    """In-process bus stand-in that records every published event.
-
-    The real EventBus.publish() requires a bound asyncio loop and is a
-    no-op otherwise; tests don't run a loop so we substitute a duck-typed
-    bus that records every dict the supervisor publishes.
-    """
-
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-
-    def publish(self, event: dict) -> None:
-        self.events.append(event)
 
 
 def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
