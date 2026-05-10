@@ -176,3 +176,116 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
     assert any(
         e.get("type") == "heartbeat_tick" for e in bus_events
     ), "heartbeat_tick event was not published"
+
+
+# ---------------------------------------------------------------------------
+# Snapshot sweep + finalize cadence tests (Phase B sticky sessions)
+# ---------------------------------------------------------------------------
+
+import time
+from datetime import UTC, datetime, timedelta
+
+
+class _CapturingBus:
+    """In-process bus stand-in that records every published event.
+
+    The real EventBus.publish() requires a bound asyncio loop and is a
+    no-op otherwise; tests don't run a loop so we substitute a duck-typed
+    bus that records every dict the supervisor publishes.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+
+
+def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
+    """After a snapshot sweep, the session must remain in _SESSIONS and its
+    buffer file on disk."""
+    from brain.chat.session import create_session, get_session, reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    reset_registry()
+    persona_dir = _persona_dir(tmp_path)
+    sess = create_session(persona_dir.name)
+    sid = sess.session_id
+    old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user",
+                              "text": "earlier", "ts": old_ts})
+
+    bus = _CapturingBus()
+
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "silence_minutes": 5.0,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    time.sleep(0.5)
+    stop.set()
+    t.join(timeout=2.0)
+
+    buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists(), "snapshot sweep must NOT delete the buffer"
+    assert get_session(sid) is not None, "snapshot sweep must NOT evict from _SESSIONS"
+    types = [e.get("type") for e in bus.events]
+    assert "session_snapshot" in types
+    assert "session_closed" not in types
+    reset_registry()
+
+
+def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
+    """The hourly finalize cadence at 24h silence runs, deletes the buffer
+    + cursor, evicts from _SESSIONS, and publishes session_finalized."""
+    from brain.chat.session import create_session, get_session, reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    reset_registry()
+    persona_dir = _persona_dir(tmp_path)
+    sess = create_session(persona_dir.name)
+    sid = sess.session_id
+    old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user",
+                              "text": "ancient", "ts": old_ts})
+
+    bus = _CapturingBus()
+
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "silence_minutes": 5.0,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_after_hours": 24.0,
+            "finalize_interval_s": 0.05,  # fire near-immediately
+        },
+    )
+    t.start()
+    time.sleep(0.5)
+    stop.set()
+    t.join(timeout=2.0)
+
+    buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
+    assert not buf.exists(), "finalize must delete the buffer"
+    assert get_session(sid) is None, "finalize must remove from _SESSIONS"
+    types = [e.get("type") for e in bus.events]
+    assert "session_finalized" in types
+    reset_registry()
