@@ -170,6 +170,240 @@ def test_build_system_message_includes_soul_highlights_when_crystallizations_exi
 # ── Emotion state ─────────────────────────────────────────────────────────────
 
 
+# ── Recall block (Phase 2.A) ──────────────────────────────────────────────────
+
+
+def test_recall_block_omitted_when_user_input_none(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """user_input=None (default) must not surface a recall block."""
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        # user_input deliberately omitted
+    )
+    assert "recall" not in msg.lower()
+
+
+def test_recall_block_omitted_when_user_input_too_short(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """A 'hi' / 'ok' message produces no extractable tokens → no recall block."""
+    mem = Memory.create_new(
+        content="A meaningful moment.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 7.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="hi!",
+    )
+    assert "── recall" not in msg
+
+
+def test_recall_block_surfaces_keyword_match(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """A user message naming an entity surfaces matching memories."""
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me what we said about Jordan last time.",
+    )
+    assert "── recall" in msg
+    assert "Jordan" in msg
+
+
+def test_recall_block_handles_no_match(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """When no memory matches the tokens, the block is omitted entirely."""
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="What's the weather like outside today?",
+    )
+    assert "── recall" not in msg
+
+
+def test_recall_block_caps_at_limit(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """A query that matches many memories surfaces at most ``limit`` (default 5)."""
+    for i in range(12):
+        store.create(
+            Memory.create_new(
+                content=f"A particular moment number {i} with Jordan.",
+                memory_type="event",
+                domain="relationship",
+                emotions={"love": 5.0},
+                tags=[],
+            )
+        )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Jordan.",
+    )
+    assert "── recall" in msg
+    # One header line + 5 bullet lines = 6 in the recall block.
+    recall_section = msg.split("── recall")[1]
+    bullet_count = recall_section.count("\n- ")
+    assert bullet_count == 5, f"expected 5 recall bullets, got {bullet_count}"
+
+
+def test_recall_block_truncates_long_content(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Memory content longer than max_chars (140) is truncated with ellipsis."""
+    long_content = (
+        "Jordan was someone "
+        + ("who mattered very much. " * 50)
+    )
+    store.create(
+        Memory.create_new(
+            content=long_content,
+            memory_type="event",
+            domain="relationship",
+            emotions={"love": 6.0},
+            tags=[],
+        )
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="What about Jordan?",
+    )
+    assert "── recall" in msg
+    assert "…" in msg.split("── recall")[1]
+
+
+def test_recall_block_dedupes_when_token_overlap_pulls_same_memory(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """A memory containing two query tokens must surface once, not twice."""
+    store.create(
+        Memory.create_new(
+            content="Hana told me Jordan was her brother.",
+            memory_type="event",
+            domain="relationship",
+            emotions={"love": 6.0},
+            tags=[],
+        )
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Hana's brother Jordan.",
+    )
+    recall_section = msg.split("── recall")[1]
+    # Both 'jordan' and 'brother' would match — but the same memory.
+    assert recall_section.count("Hana told me Jordan") == 1
+
+
+def test_recall_block_orders_by_importance_then_recency(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Highest-importance match comes first, even if it's older."""
+    # Older but more important.
+    store.create(
+        Memory.create_new(
+            content="Jordan: the soul-shaped memory.",
+            memory_type="event",
+            domain="relationship",
+            emotions={},
+            tags=[],
+            importance=9.0,
+        )
+    )
+    # Fresher but lower importance.
+    store.create(
+        Memory.create_new(
+            content="Jordan: a recent passing reference.",
+            memory_type="event",
+            domain="relationship",
+            emotions={},
+            tags=[],
+            importance=2.0,
+        )
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="What about Jordan?",
+    )
+    recall_section = msg.split("── recall")[1]
+    soul_idx = recall_section.find("soul-shaped")
+    recent_idx = recall_section.find("passing reference")
+    assert 0 <= soul_idx < recent_idx, (
+        f"soul-shaped (importance 9) should appear before passing reference (importance 2); "
+        f"got soul_idx={soul_idx}, recent_idx={recent_idx}"
+    )
+
+
+# ── Emotion state ─────────────────────────────────────────────────────────────
+
+
 def test_build_system_message_includes_emotion_state_when_memories_present(
     persona_dir: Path, soul_store: SoulStore
 ) -> None:

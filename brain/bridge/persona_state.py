@@ -57,7 +57,53 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "soul_highlight": _build_soul_highlight(persona_dir),
         "connection": _build_connection(persona_dir),
         "mode": "live",
+        "recovering": _is_recovering(persona_dir),
     }
+
+
+def _is_recovering(persona_dir: Path) -> bool:
+    """True iff orphan session buffers are present that aren't live
+    in-memory sessions.
+
+    Phase 3.A of the autonomous-memory work. Surfaces the dirty-shutdown
+    recovery path to the UI so the user can see "your previous chat is
+    still being saved" instead of "Nell forgot what we said." Without
+    this signal, a hard-quit ingest failure is invisible until the
+    next clean shutdown clears it.
+
+    Detection: walks ``active_conversations/`` and returns True if any
+    session-buffer dir's id is *not* in the live in-memory session
+    registry. Live chats are buffered in the same place but their ids
+    are tracked in ``brain.chat.session``; the difference is what tells
+    us "this buffer is from a previous run, not the current one."
+
+    Edges:
+      - Fresh persona dir (no ``active_conversations/``) → False.
+      - Bridge just started, recovery still in flight → True until
+        supervisor's first tick drains the orphans.
+      - User in the middle of a chat with no orphans → False
+        (the live session is in the registry).
+
+    Fail-soft: any exception (registry import error, disk read error)
+    returns False so a half-booted brain doesn't pin the banner on.
+    """
+    try:
+        from brain.chat.session import all_sessions
+
+        ac_dir = persona_dir / "active_conversations"
+        if not ac_dir.is_dir():
+            return False
+        live_sids = {s.session_id for s in all_sessions()}
+        for entry in ac_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            if not (entry / "turns.jsonl").exists():
+                continue
+            if entry.name not in live_sids:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _build_connection(persona_dir: Path) -> dict[str, Any]:
