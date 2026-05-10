@@ -1,4 +1,5 @@
-"""Tests for brain.ingest.pipeline — close_session + close_stale_sessions."""
+"""Tests for brain.ingest.pipeline — close_session, close_stale_sessions,
+extract_session_snapshot, snapshot_stale_sessions, finalize_stale_sessions."""
 
 from __future__ import annotations
 
