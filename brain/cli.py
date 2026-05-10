@@ -512,8 +512,12 @@ def _dream_handler(args: argparse.Namespace) -> int:
     # Nested try/finally so a HebbianMatrix open failure still closes the
     # already-open MemoryStore connection. Inline contextmanager would be
     # prettier but stores don't implement __enter__/__exit__ yet.
+    from brain.engines.dream import NoSeedAvailable
+
     provider_name, _ = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
+    result = None
+    skipped_reason: str | None = None
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
@@ -532,11 +536,21 @@ def _dream_handler(args: argparse.Namespace) -> int:
                     "starting with 'DREAM: '. Be honest and specific, not abstract."
                 ),
             )
-            result = engine.run_cycle(dry_run=args.dry_run)
+            try:
+                result = engine.run_cycle(dry_run=args.dry_run)
+            except NoSeedAvailable as exc:
+                # Fresh personas with no conversation memories yet hit this.
+                # Audit 2026-05-10 P2: a bare traceback was confusing on
+                # first-run smoke. Surface a friendly message instead.
+                skipped_reason = str(exc)
         finally:
             hebbian.close()
     finally:
         store.close()
+
+    if skipped_reason is not None:
+        print(f"Dream skipped: {skipped_reason}")
+        return 0
 
     if args.dry_run:
         print("Dry run — no writes.")
