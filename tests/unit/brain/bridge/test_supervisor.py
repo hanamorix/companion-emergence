@@ -4,6 +4,8 @@ thread that runs session-cleanup AND autonomous heartbeat cadences."""
 from __future__ import annotations
 
 import threading
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -181,9 +183,6 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Snapshot sweep + finalize cadence tests (Phase B sticky sessions)
 # ---------------------------------------------------------------------------
-
-import time
-from datetime import UTC, datetime, timedelta
 
 
 class _CapturingBus:
