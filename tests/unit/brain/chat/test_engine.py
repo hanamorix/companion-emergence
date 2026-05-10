@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from brain.bridge.chat import (
+    ChatMessage as _ChatMessage,
+)
+from brain.bridge.chat import (
+    ChatResponse as _ChatResponse,
+)
 from brain.bridge.provider import FakeProvider
+from brain.bridge.provider import LLMProvider as _LLMProvider
 from brain.chat.engine import ChatResult, respond
 from brain.chat.session import create_session, reset_registry
 from brain.memory.hebbian import HebbianMatrix
@@ -214,17 +223,6 @@ def test_respond_returns_empty_tool_invocations_with_fake_provider(
 # ---------------------------------------------------------------------------
 # Buffer-driven prompt construction (Phase B sticky sessions)
 # ---------------------------------------------------------------------------
-
-import hashlib
-from typing import Any
-
-from brain.bridge.chat import (
-    ChatMessage as _ChatMessage,
-)
-from brain.bridge.chat import (
-    ChatResponse as _ChatResponse,
-)
-from brain.bridge.provider import LLMProvider as _LLMProvider
 
 
 class _RecordingProvider(_LLMProvider):
