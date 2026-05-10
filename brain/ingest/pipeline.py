@@ -1,7 +1,10 @@
 """SP-4 pipeline driver — orchestrates all 8 ingest stages.
 
-close_session()       — run all 8 stages for one session, delete its buffer.
-close_stale_sessions()— iterate active sessions, close any past the silence window.
+close_session()             — run all 8 stages for one session, delete its buffer + cursor.
+extract_session_snapshot()  — non-destructive variant; uses cursor sidecar to extract only new turns.
+close_stale_sessions()      — destructive sweep (bridge shutdown drain); calls close_session per stale session.
+snapshot_stale_sessions()   — non-destructive periodic sweep (5-min silence); calls extract_session_snapshot.
+finalize_stale_sessions()   — real-close sweep (24h silence); final snapshot + buffer delete + cursor delete.
 
 Stage flow:
   BUFFER  → read turns from <persona_dir>/active_conversations/<session_id>.jsonl
@@ -418,6 +421,16 @@ def close_stale_sessions(
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
+
+    Destructive — runs the full close_session pipeline (extract + delete buffer +
+    delete cursor sidecar) for every match. Used by the bridge shutdown drain
+    path (brain.bridge.server lifespan teardown and brain.bridge.daemon) where
+    "the bridge is going away" is the signal to flush everything immediately,
+    typically called with ``silence_minutes=0`` to catch every active session.
+
+    For the periodic non-destructive 5-minute sweep, use
+    ``snapshot_stale_sessions`` instead (added 2026-05-10 — sticky sessions).
+    For the 24h real-close cadence, use ``finalize_stale_sessions``.
 
     Empty sessions (no turns) are cleaned up silently without running the
     full pipeline.
