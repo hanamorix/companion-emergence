@@ -237,7 +237,6 @@ def _build_user_message(
     if not image_shas:
         return ChatMessage(role="user", content=user_input)
 
-    from brain.bridge.chat import ContentBlock
     from brain.images import media_type_for_sha
 
     blocks: list[ContentBlock] = []
