@@ -10,7 +10,11 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
-from brain.ingest.buffer import ingest_turn
+from brain.ingest.buffer import (
+    ingest_turn,
+    read_cursor,
+    write_cursor,
+)
 from brain.ingest.pipeline import close_session, close_stale_sessions
 from brain.ingest.soul_queue import list_soul_candidates
 from brain.memory.hebbian import HebbianMatrix
@@ -48,6 +52,41 @@ class _GarbageProvider(LLMProvider):
 
     def chat(self, messages: list[ChatMessage], *, tools=None, options=None) -> ChatResponse:
         return ChatResponse(content="garbage", tool_calls=())
+
+
+class _TrackingProvider(LLMProvider):
+    """Canned provider that also records what was sent.
+
+    Used by snapshot tests that need to assert on which turns ended up in
+    the extraction prompt (cursor-driven filtering).
+    """
+
+    def __init__(self, items: list[dict] | None = None) -> None:
+        self._payload = json.dumps(items if items is not None else [])
+        self.call_count = 0
+        self.last_transcript: str | None = None
+
+    def reset_calls(self) -> None:
+        self.call_count = 0
+        self.last_transcript = None
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        self.call_count += 1
+        self.last_transcript = prompt
+        return self._payload
+
+    def name(self) -> str:
+        return "fake-tracking"
+
+    def chat(self, messages, *, tools=None, options=None):
+        from brain.bridge.chat import ChatResponse
+        self.call_count += 1
+        return ChatResponse(content=self._payload, tool_calls=())
+
+
+@pytest.fixture
+def tracking_provider() -> _TrackingProvider:
+    return _TrackingProvider()
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +442,121 @@ def test_close_session_falls_back_to_legacy_when_user_name_unset(
     assert "is the human user" not in p
     # Generic 'user:' label preserved
     assert "user: hi" in p
+
+
+# ---------------------------------------------------------------------------
+# extract_session_snapshot tests
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_preserves_buffer_and_writes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "I love watercolour"})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "noted"})
+
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists(), "snapshot must NOT delete the buffer"
+    assert report.session_id == sid
+    cursor = read_cursor(tmp_path, sid)
+    assert cursor is not None, "snapshot must write the cursor"
+
+
+def test_snapshot_with_cursor_only_extracts_new_turns(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "old",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "new",
+                           "ts": "2026-05-10T20:05:00+00:00"})
+
+    tracking_provider.reset_calls()
+    extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.last_transcript is not None
+    assert "new" in tracking_provider.last_transcript
+    assert "old" not in tracking_provider.last_transcript
+
+
+def test_snapshot_with_no_new_turns_skips_provider_call(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
+
+    tracking_provider.reset_calls()
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.call_count == 0
+    assert report.extracted == 0
+
+
+def test_snapshot_malformed_cursor_falls_back_to_full(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    sid = "sess_abc"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.cursor").write_text("garbage")
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "hello"})
+
+    tracking_provider.reset_calls()
+    extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.last_transcript is not None
+    assert "hello" in tracking_provider.last_transcript
+
+
+def test_snapshot_on_empty_buffer_returns_empty_report(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    sid = "sess_abc"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+
+    tracking_provider.reset_calls()
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert report.extracted == 0
+    assert tracking_provider.call_count == 0
