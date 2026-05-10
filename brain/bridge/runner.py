@@ -61,15 +61,34 @@ def _allocate_port(max_attempts: int = 3) -> int:
 
 
 def _write_clean_shutdown(persona_dir: Path) -> None:
-    """Mark bridge.json as cleanly stopped. Idempotent — safe to call multiple times."""
+    """Mark bridge.json as cleanly stopped. Idempotent — safe to call multiple times.
+
+    Honours ``drain_errors``: if the FastAPI lifespan recorded ingest
+    errors during the shutdown drain, leave shutdown_clean=False so the
+    next start runs ``run_recovery_if_needed`` and retries the orphan
+    buffers. Without this guard, a clean exit-flow that just-happened
+    to have a failed drain would mask itself as fully clean and the
+    buffers would sit forever.
+    """
     try:
         cur = state_file.read(persona_dir)
-        if cur is not None and cur.shutdown_clean is False:
-            cur.pid = None
-            cur.port = None
-            cur.stopped_at = datetime.now(UTC).isoformat()
-            cur.shutdown_clean = True
+        if cur is None or cur.shutdown_clean is True:
+            return
+        cur.pid = None
+        cur.port = None
+        cur.stopped_at = datetime.now(UTC).isoformat()
+        if cur.drain_errors > 0:
+            # Drain failed; do NOT flip clean=True. Recovery will retry
+            # the buffers on next start. Persist the (still-dirty) state
+            # so callers see the updated stopped_at + cleared pid/port.
             state_file.write(persona_dir, cur)
+            logger.warning(
+                "shutdown_clean kept False (drain_errors=%d); recovery will fire on next start",
+                cur.drain_errors,
+            )
+            return
+        cur.shutdown_clean = True
+        state_file.write(persona_dir, cur)
     except Exception:
         # best-effort only; don't re-raise at exit time, but leave a
         # forensic breadcrumb so silent dirty-shutdowns are debuggable.

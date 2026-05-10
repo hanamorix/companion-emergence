@@ -148,3 +148,146 @@ def test_clean_shutdown_skips_recovery(persona_dir: Path, monkeypatch):
 
     daemon.run_recovery_if_needed(persona_dir)
     assert called == []
+
+
+def test_clean_shutdown_with_drain_errors_triggers_recovery(persona_dir: Path, monkeypatch):
+    """Phase 1.F: a clean exit that nonetheless reported drain ingest errors
+    must NOT mask itself as fully clean. The next start should rerun
+    recovery on the orphan buffers."""
+    from brain.bridge import daemon, state_file
+    from brain.ingest.buffer import ingest_turn
+
+    s = state_file.BridgeState(
+        persona=persona_dir.name,
+        pid=999_999,
+        port=51234,
+        started_at="2026-04-28T10:00:00Z",
+        stopped_at="2026-04-28T10:30:00Z",
+        # The masked-as-clean shape from the bug we're fixing.
+        shutdown_clean=False,
+        client_origin="cli",
+        drain_errors=2,
+    )
+    state_file.write(persona_dir, s)
+
+    ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "user", "text": "hi"})
+
+    drained_sessions: list = []
+    monkeypatch.setattr(
+        "brain.bridge.daemon.close_stale_sessions",
+        lambda persona_dir, **kw: drained_sessions.append(kw.get("silence_minutes")) or [],
+    )
+
+    daemon.run_recovery_if_needed(persona_dir)
+    assert drained_sessions, "recovery must fire for drain_errors > 0"
+
+
+def test_recovery_needed_predicate_drain_errors_arm(tmp_path: Path):
+    """Phase 1.F: recovery_needed() returns True when drain_errors > 0
+    even if shutdown_clean was somehow True (defensive — if the runner
+    flipped clean=True before the lifespan had a chance to write
+    drain_errors, the saved drain_errors still wins)."""
+    from brain.bridge import state_file
+    persona_dir = tmp_path
+    persona_dir.mkdir(exist_ok=True)
+    s = state_file.BridgeState(
+        persona=persona_dir.name,
+        pid=999_999,
+        port=51234,
+        started_at="2026-04-28T10:00:00Z",
+        stopped_at="2026-04-28T10:30:00Z",
+        shutdown_clean=True,  # masked clean
+        client_origin="cli",
+        drain_errors=1,
+    )
+    state_file.write(persona_dir, s)
+    # PID 999_999 is dead → predicate should return True via the
+    # drain_errors arm.
+    assert state_file.recovery_needed(persona_dir) is True
+
+
+def test_write_clean_shutdown_keeps_dirty_when_drain_errors(tmp_path: Path):
+    """Phase 1.F: _write_clean_shutdown must NOT flip clean=True when
+    drain_errors > 0. The next bridge start re-runs recovery on the
+    orphan buffers."""
+    from brain.bridge import state_file
+    from brain.bridge.runner import _write_clean_shutdown
+
+    persona_dir = tmp_path
+    persona_dir.mkdir(exist_ok=True)
+    s = state_file.BridgeState(
+        persona=persona_dir.name,
+        pid=12345,
+        port=51234,
+        started_at="2026-04-28T10:00:00Z",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
+        drain_errors=3,
+    )
+    state_file.write(persona_dir, s)
+
+    _write_clean_shutdown(persona_dir)
+
+    after = state_file.read(persona_dir)
+    assert after is not None
+    assert after.shutdown_clean is False, "must remain dirty when drain_errors > 0"
+    assert after.drain_errors == 3
+    # pid + port still cleared so liveness checks see "not running".
+    assert after.pid is None
+    assert after.port is None
+    assert after.stopped_at is not None
+
+
+def test_write_clean_shutdown_flips_clean_when_drain_errors_zero(tmp_path: Path):
+    """Sanity-check: the no-error path still flips to clean=True."""
+    from brain.bridge import state_file
+    from brain.bridge.runner import _write_clean_shutdown
+
+    persona_dir = tmp_path
+    persona_dir.mkdir(exist_ok=True)
+    s = state_file.BridgeState(
+        persona=persona_dir.name,
+        pid=12345,
+        port=51234,
+        started_at="2026-04-28T10:00:00Z",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
+        drain_errors=0,
+    )
+    state_file.write(persona_dir, s)
+
+    _write_clean_shutdown(persona_dir)
+
+    after = state_file.read(persona_dir)
+    assert after is not None
+    assert after.shutdown_clean is True
+    assert after.pid is None
+
+
+def test_legacy_state_file_without_drain_errors_field_loads(tmp_path: Path):
+    """Backward-compat: a bridge.json written before drain_errors existed
+    must still deserialise cleanly. The field defaults to 0."""
+    import json
+
+    from brain.bridge import state_file
+
+    persona_dir = tmp_path
+    persona_dir.mkdir(exist_ok=True)
+    legacy = {
+        "persona": "test",
+        "pid": 12345,
+        "port": 51234,
+        "started_at": "2026-04-28T10:00:00Z",
+        "stopped_at": None,
+        "shutdown_clean": True,
+        "client_origin": "cli",
+        "auth_token": None,
+        # drain_errors deliberately missing.
+    }
+    (persona_dir / "bridge.json").write_text(json.dumps(legacy))
+
+    state = state_file.read(persona_dir)
+    assert state is not None
+    assert state.drain_errors == 0

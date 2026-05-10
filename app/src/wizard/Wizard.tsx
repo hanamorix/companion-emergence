@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  installNellCliSymlink,
   installSupervisorService,
   runInit,
   runMigrate,
@@ -180,9 +181,22 @@ export function Wizard({ onDone }: Props) {
           `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
           " — supervisor will fall back to the .app's lifecycle.";
       }
+      // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
+      // their Terminal without typing the .app's Resources path. Same
+      // best-effort posture as the launchd install: failure stitches into
+      // the success pane and is retryable from the connection panel.
+      let cliTrailer = "";
+      try {
+        const cli = await installNellCliSymlink();
+        cliTrailer = cli.success
+          ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
+          : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
+      } catch (e) {
+        cliTrailer = `\n\n[cli] could not install nell symlink: ${(e as Error).message}`;
+      }
       setInstallResult({
         ok: true,
-        output: result.stdout + serviceTrailer,
+        output: result.stdout + serviceTrailer + cliTrailer,
         error: "",
       });
       // Brief pause so the user reads the install summary, then move

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { installSupervisorService } from "../../appConfig";
+import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState } from "../../bridge";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 
@@ -38,6 +38,7 @@ export function ConnectionPanel({
   const conn = state?.connection;
   const mode = state?.mode ?? "live";
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
+  const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
 
   async function onInstallSupervisor() {
     setInstall({ kind: "running" });
@@ -56,6 +57,27 @@ export function ConnectionPanel({
       }
     } catch (e) {
       setInstall({ kind: "error", detail: (e as Error).message });
+    }
+  }
+
+  async function onInstallCli() {
+    setCliInstall({ kind: "running" });
+    try {
+      const result = await installNellCliSymlink();
+      if (result.success) {
+        setCliInstall({
+          kind: "ok",
+          // Show full stdout (link + PATH hint, ~2 lines).
+          detail: result.stdout.trim() || "nell installed",
+        });
+      } else {
+        setCliInstall({
+          kind: "error",
+          detail: result.stderr || `exit ${result.exit_code}`,
+        });
+      }
+    } catch (e) {
+      setCliInstall({ kind: "error", detail: (e as Error).message });
     }
   }
 
@@ -84,7 +106,37 @@ export function ConnectionPanel({
         Install the brain as a launchd LaunchAgent so it stays alive
         when you close the app. Idempotent — safe to click again.
       </div>
-      <InstallSupervisorButton state={install} onClick={onInstallSupervisor} />
+      <InstallActionButton
+        state={install}
+        onClick={onInstallSupervisor}
+        idleLabel="install launchd supervisor"
+        runningLabel="installing…"
+        successLabel="✓ supervisor installed"
+        errorLabel="retry install"
+      />
+
+      <Divider />
+      <SectionLabel>Terminal</SectionLabel>
+      <div
+        style={{
+          fontSize: 10.5,
+          color: "var(--text-mute)",
+          lineHeight: 1.55,
+          marginBottom: 8,
+          letterSpacing: "0.01em",
+        }}
+      >
+        Add a <code>nell</code> shortcut to ~/.local/bin so you can run
+        commands from Terminal. Idempotent — safe to click again.
+      </div>
+      <InstallActionButton
+        state={cliInstall}
+        onClick={onInstallCli}
+        idleLabel="install nell to ~/.local/bin"
+        runningLabel="installing…"
+        successLabel="✓ nell installed"
+        errorLabel="retry install"
+      />
 
       <Divider />
       <SectionLabel>Window</SectionLabel>
@@ -214,12 +266,20 @@ function formatHeartbeat(iso: string | null | undefined): string {
   }
 }
 
-function InstallSupervisorButton({
+function InstallActionButton({
   state,
   onClick,
+  idleLabel,
+  runningLabel,
+  successLabel,
+  errorLabel,
 }: {
   state: InstallState;
   onClick: () => void;
+  idleLabel: string;
+  runningLabel: string;
+  successLabel: string;
+  errorLabel: string;
 }) {
   const running = state.kind === "running";
   const success = state.kind === "ok";
@@ -257,13 +317,7 @@ function InstallSupervisorButton({
           transition: "background 0.15s, opacity 0.15s",
         }}
       >
-        {running
-          ? "installing…"
-          : success
-            ? "✓ supervisor installed"
-            : failed
-              ? "retry install"
-              : "install launchd supervisor"}
+        {running ? runningLabel : success ? successLabel : failed ? errorLabel : idleLabel}
       </button>
       {state.kind !== "idle" && state.kind !== "running" && (
         <div
@@ -274,6 +328,7 @@ function InstallSupervisorButton({
             lineHeight: 1.45,
             fontFamily: "var(--font-disp)",
             wordBreak: "break-word",
+            whiteSpace: "pre-wrap",
           }}
         >
           {state.detail}

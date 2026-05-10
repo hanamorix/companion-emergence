@@ -516,6 +516,28 @@ def build_app(
                 logger.exception("shutdown drain failed")
                 reports = []
 
+            # 3b. Record drain-error count to the state file. The runner's
+            # `_write_clean_shutdown` (atexit + finally) reads this and
+            # leaves shutdown_clean=False if any session failed to ingest,
+            # so the next bridge start re-runs `run_recovery_if_needed`
+            # against the orphan buffers instead of treating the dirty
+            # exit as clean. This closes the "clean shutdown that
+            # happened to have a failed drain" hole.
+            drain_errors = sum(getattr(r, "errors", 0) for r in reports)
+            if drain_errors > 0:
+                try:
+                    from brain.bridge import state_file as _state_file_mod
+                    cur = _state_file_mod.read(persona_dir)
+                    if cur is not None:
+                        cur.drain_errors = drain_errors
+                        _state_file_mod.write(persona_dir, cur)
+                    logger.warning(
+                        "shutdown drain produced %d ingest errors; marked dirty for next start",
+                        drain_errors,
+                    )
+                except Exception:
+                    logger.exception("failed to record drain_errors to state file")
+
             # 4. Stop supervisor thread
             stop_event.set()
             sup_thread.join(timeout=180.0)
