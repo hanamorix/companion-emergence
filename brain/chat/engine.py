@@ -141,13 +141,15 @@ def respond(
     soul_db = persona_dir / "crystallizations.db"
     soul_store = SoulStore(str(soul_db))
     try:
-        # 5. System message
+        # 5. System message — pass the user's current input so the recall
+        # block can surface memories matching this turn (Phase 2.A).
         system_msg = build_system_message(
             persona_dir,
             voice_md=voice_md,
             daemon_state=daemon_state,
             soul_store=soul_store,
             store=store,
+            user_input=user_input,
         )
     finally:
         soul_store.close()

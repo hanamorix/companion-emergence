@@ -232,3 +232,86 @@ def test_build_persona_state_connection_block_missing_files_safe(tmp_path: Path)
     assert conn["provider"] == "claude-cli"  # default
     assert conn["model"] == "sonnet"
     assert conn["last_heartbeat_at"] is None
+
+
+# ── recovering flag (Phase 3.A) ───────────────────────────────────────────────
+
+
+def test_recovering_false_on_fresh_persona_dir(tmp_path: Path) -> None:
+    """No active_conversations/ → recovering is False."""
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    state = build_persona_state(persona_dir)
+    assert state["recovering"] is False
+
+
+def test_recovering_true_when_orphan_buffer_exists(tmp_path: Path) -> None:
+    """A buffer with no matching live session means recovery is in flight."""
+    from brain.chat.session import reset_registry
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    # Orphan buffer — directory + turns.jsonl, no in-memory session.
+    sid_dir = persona_dir / "active_conversations" / "orphan-from-prev-run"
+    sid_dir.mkdir(parents=True)
+    (sid_dir / "turns.jsonl").write_text(
+        '{"speaker":"user","text":"hi"}\n', encoding="utf-8"
+    )
+
+    reset_registry()
+    try:
+        state = build_persona_state(persona_dir)
+        assert state["recovering"] is True
+    finally:
+        reset_registry()
+
+
+def test_recovering_false_when_only_live_session_buffer(tmp_path: Path) -> None:
+    """A buffer for an in-memory session (live chat) is NOT recovery."""
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+
+    reset_registry()
+    try:
+        sess = create_session(persona_name="nell")
+        sid_dir = persona_dir / "active_conversations" / sess.session_id
+        sid_dir.mkdir(parents=True)
+        (sid_dir / "turns.jsonl").write_text(
+            '{"speaker":"user","text":"hello"}\n', encoding="utf-8"
+        )
+        # Sanity: session is in the registry.
+        assert any(s.session_id == sess.session_id for s in all_sessions())
+
+        state = build_persona_state(persona_dir)
+        assert state["recovering"] is False
+    finally:
+        reset_registry()
+
+
+def test_recovering_true_when_orphan_alongside_live(tmp_path: Path) -> None:
+    """Mixed state: a live chat AND an orphan buffer → still recovering."""
+    from brain.chat.session import create_session, reset_registry
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+
+    reset_registry()
+    try:
+        sess = create_session(persona_name="nell")
+        live_dir = persona_dir / "active_conversations" / sess.session_id
+        live_dir.mkdir(parents=True)
+        (live_dir / "turns.jsonl").write_text(
+            '{"speaker":"user","text":"hi"}\n', encoding="utf-8"
+        )
+        orphan_dir = persona_dir / "active_conversations" / "orphan-id"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "turns.jsonl").write_text(
+            '{"speaker":"user","text":"old"}\n', encoding="utf-8"
+        )
+
+        state = build_persona_state(persona_dir)
+        assert state["recovering"] is True
+    finally:
+        reset_registry()
