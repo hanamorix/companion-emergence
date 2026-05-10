@@ -80,3 +80,27 @@ describe("ChatPanel — image-only + cancel + placeholder (P4-2)", () => {
     expect(screen.getByPlaceholderText(/^Write to X/)).toBeInTheDocument();
   });
 });
+
+describe("ChatPanel — recovery banner (Phase 3.B)", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders no banner when recovering is undefined (default)", () => {
+    render(<ChatPanel persona="nell" />);
+    expect(screen.queryByTestId("recovery-banner")).toBeNull();
+  });
+
+  it("renders no banner when recovering is false", () => {
+    render(<ChatPanel persona="nell" recovering={false} />);
+    expect(screen.queryByTestId("recovery-banner")).toBeNull();
+  });
+
+  it("renders the banner when recovering is true", () => {
+    render(<ChatPanel persona="nell" recovering={true} />);
+    const banner = screen.getByTestId("recovery-banner");
+    expect(banner).toBeInTheDocument();
+    expect(banner).toHaveAttribute("role", "status");
+    expect(banner.textContent).toMatch(/reconnecting your previous chat/i);
+  });
+});
