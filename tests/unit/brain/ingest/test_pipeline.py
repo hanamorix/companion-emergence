@@ -79,7 +79,6 @@ class _TrackingProvider(LLMProvider):
         return "fake-tracking"
 
     def chat(self, messages, *, tools=None, options=None):
-        from brain.bridge.chat import ChatResponse
         self.call_count += 1
         return ChatResponse(content=self._payload, tool_calls=())
 
