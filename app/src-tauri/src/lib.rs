@@ -582,6 +582,11 @@ async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, S
 /// frontend already renders inline. The Linux story (~/.local/bin/nell
 /// from the AppImage / .deb) is achievable but layout-specific
 /// validation differs from macOS — defer to a separate landing.
+///
+/// `#[tauri::command]` is on both halves so `generate_handler!` finds
+/// the companion macros (`__cmd__install_nell_cli_symlink`,
+/// `__tauri_command_name_install_nell_cli_symlink`) on every target.
+#[tauri::command]
 #[cfg(not(target_os = "macos"))]
 #[allow(unused_variables)]
 async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
