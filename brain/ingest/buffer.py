@@ -35,6 +35,21 @@ def _active_conversations_dir(persona_dir: Path) -> Path:
     return d
 
 
+def _validate_session_id(session_id: str) -> None:
+    """Raise ValueError unless session_id matches _SESSION_ID_RE.
+
+    Shared by _session_path and _cursor_path so the grammar can evolve in
+    one place. The isinstance check is kept for callers that ignore type
+    hints — _SESSION_ID_RE.fullmatch on a non-str raises TypeError, which
+    we'd rather surface as the same ValueError.
+    """
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(
+            f"invalid session_id {session_id!r} — must match "
+            f"[A-Za-z0-9_-]{{1,64}}"
+        )
+
+
 def _session_path(persona_dir: Path, session_id: str) -> Path:
     """Resolve <persona>/active_conversations/<session_id>.jsonl.
 
@@ -44,11 +59,7 @@ def _session_path(persona_dir: Path, session_id: str) -> Path:
     layer, but other callers (chat engine, future MCP, tests) inherit
     this validation defensively.
     """
-    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError(
-            f"invalid session_id {session_id!r} — must match "
-            f"[A-Za-z0-9_-]{{1,64}}"
-        )
+    _validate_session_id(session_id)
     return _active_conversations_dir(persona_dir) / f"{session_id}.jsonl"
 
 
@@ -129,11 +140,7 @@ def _cursor_path(persona_dir: Path, session_id: str) -> Path:
     Same session_id validation as _session_path so the cursor file lands
     inside the active_conversations dir, never traversed.
     """
-    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError(
-            f"invalid session_id {session_id!r} — must match "
-            f"[A-Za-z0-9_-]{{1,64}}"
-        )
+    _validate_session_id(session_id)
     return _active_conversations_dir(persona_dir) / f"{session_id}.cursor"
 
 
@@ -153,7 +160,7 @@ def read_cursor(persona_dir: Path, session_id: str) -> str | None:
             return None
         datetime.fromisoformat(text.replace("Z", "+00:00"))
         return text
-    except (OSError, ValueError):
+    except ValueError:
         return None
 
 
