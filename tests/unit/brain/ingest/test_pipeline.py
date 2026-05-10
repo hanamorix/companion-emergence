@@ -640,3 +640,157 @@ def test_snapshot_stale_sessions_cleans_ghost_buffer(
     assert reports == []
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
     assert not buf.exists(), "ghost buffer should be cleaned up"
+
+
+# ---------------------------------------------------------------------------
+# finalize_stale_sessions tests
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_under_threshold_skips(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.pipeline import finalize_stale_sessions
+
+    sid = "sess_abc"
+    recent = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "x", "ts": recent})
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert reports == []
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists()
+
+
+def test_finalize_at_threshold_deletes_buffer_and_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    from brain.ingest.buffer import write_cursor
+    from brain.ingest.pipeline import finalize_stale_sessions
+
+    sid = "sess_abc"
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "x", "ts": old})
+    write_cursor(tmp_path, sid, old)
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert len(reports) == 1
+    assert reports[0].session_id == sid
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not buf.exists(), "finalize must delete the buffer"
+    assert not cursor_file.exists(), "finalize must delete the cursor"
+
+
+def test_finalize_per_session_error_isolation(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """A provider that raises on the first call shouldn't abort the whole sweep —
+    both stale sessions must still be reported and cleaned up."""
+    from brain.bridge.chat import ChatResponse
+    from brain.ingest.pipeline import finalize_stale_sessions
+
+    class _ExplodingOnceProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("model down")
+            return "[]"
+
+        def name(self) -> str:
+            return "fake-exploding"
+
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="[]", tool_calls=())
+
+    sid_a = "sess_aaa"
+    sid_b = "sess_bbb"
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid_a, "speaker": "user", "text": "a", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_b, "speaker": "user", "text": "b", "ts": old})
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=_ExplodingOnceProvider(),
+    )
+
+    # Both stale sessions reach finalize regardless of the first one exploding.
+    assert len(reports) == 2
+    # Both buffers cleaned up after their finalize attempt.
+    for sid in (sid_a, sid_b):
+        buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+        assert not buf.exists()
+
+
+# ---------------------------------------------------------------------------
+# close_session cursor cleanup tests
+# ---------------------------------------------------------------------------
+
+
+def test_close_session_full_path_also_deletes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """Explicit close must clean up the cursor sidecar alongside the buffer."""
+    from brain.ingest.buffer import write_cursor
+
+    sid = "sess_close_cur"
+    for speaker, text in [("Hana", "hi"), ("Nell", "hello"), ("Hana", "bye")]:
+        ingest_turn(tmp_path, {"session_id": sid, "speaker": speaker, "text": text})
+    write_cursor(tmp_path, sid, datetime.now(UTC).isoformat())
+
+    provider = _CannedProvider([
+        {"text": "test memory", "label": "fact", "importance": 5},
+    ])
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=provider)
+
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not buf.exists()
+    assert not cursor_file.exists()
+
+
+def test_close_session_empty_path_also_deletes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+) -> None:
+    """Empty-session early-return path must also clean up the cursor."""
+    from brain.ingest.buffer import write_cursor
+
+    sid = "sess_empty_cur"
+    # Empty buffer file + stale cursor.
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+    write_cursor(tmp_path, sid, datetime.now(UTC).isoformat())
+
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=canned_provider)
+
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not cursor_file.exists()
