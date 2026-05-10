@@ -509,6 +509,195 @@ async fn install_supervisor_service(
     })
 }
 
+/// Install a symlink at ``~/.local/bin/nell`` pointing at the bundled CLI.
+///
+/// Lets the user run ``nell ...`` from their terminal without having to
+/// type the full ``/Applications/Companion Emergence.app/Contents/...``
+/// path. Mirrors the install-shape of ``install_supervisor_service``:
+/// idempotent, AppTranslocation-guarded, surfaces a structured result the
+/// frontend can format inline.
+///
+/// `~/.local/bin` is the right target because:
+/// 1. It's user-owned — no sudo prompt, no privileged helper.
+/// 2. Anthropic's ``claude`` installer drops binaries there too, so a
+///    user running this app already has the directory and (almost
+///    certainly) has it on PATH.
+/// 3. It matches the launchd flow's "no escalation" posture.
+///
+/// Behaviour at the target:
+/// * Doesn't exist  → write the symlink.
+/// * Existing symlink pointing at our bundled path → no-op success.
+/// * Existing symlink pointing elsewhere → overwrite (covers app moved /
+///   reinstalled at a different location).
+/// * Existing regular file → refuse with `exit_code=73`. We don't clobber
+///   a user-installed ``nell`` (e.g. ``pip install --user``).
+///
+/// macOS-only for now; Linux desktops have similar layout but the path
+/// validation needs different unstable-path checks (no AppTranslocation,
+/// no /Volumes-shaped DMGs) so we'll add Linux when there's a Linux
+/// `.app` shape to validate against.
+#[tauri::command]
+async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(InitResult {
+            success: false,
+            stdout: String::new(),
+            stderr: "nell-CLI symlink install is currently macOS-only".to_string(),
+            exit_code: 78,
+        });
+    }
+
+    let bundled = match bundled_nell_path(&app)? {
+        Some(p) => p,
+        None => {
+            return Ok(InitResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "Bundled nell CLI not found in this build. Install from a release DMG."
+                    .to_string(),
+                exit_code: 78,
+            })
+        }
+    };
+
+    if let Some(reason) = unstable_macos_app_path_reason(&bundled) {
+        return Ok(InitResult {
+            success: false,
+            stdout: String::new(),
+            stderr: reason,
+            exit_code: 78,
+        });
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => {
+            return Ok(InitResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "HOME env var not set; cannot resolve ~/.local/bin".to_string(),
+                exit_code: 78,
+            })
+        }
+    };
+    let target_dir = home.join(".local").join("bin");
+    let target = target_dir.join("nell");
+    install_symlink_to(&bundled, &target_dir, &target)
+}
+
+/// Pure file-system half of [`install_nell_cli_symlink`]. Extracted so
+/// the FS branches can be unit-tested against tempdirs without spinning
+/// up a Tauri runtime.
+///
+/// Returns the same [`InitResult`] shape the Tauri command surfaces.
+/// On `success=true`, `stdout` holds the user-facing summary; on
+/// `success=false`, `stderr` holds the error text the frontend renders.
+fn install_symlink_to(
+    bundled: &std::path::Path,
+    target_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<InitResult, String> {
+    if let Err(e) = std::fs::create_dir_all(target_dir) {
+        return Ok(InitResult {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("create {}: {}", target_dir.display(), e),
+            exit_code: 1,
+        });
+    }
+
+    // Inspect the target. symlink_metadata so we don't follow links and
+    // mistake a symlink for a regular file.
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Existing symlink — read its target.
+            match std::fs::read_link(target) {
+                Ok(existing) if existing == bundled => {
+                    return Ok(InitResult {
+                        success: true,
+                        stdout: format!(
+                            "{} → {} (already installed)\n{}",
+                            target.display(),
+                            bundled.display(),
+                            path_hint(target_dir)
+                        ),
+                        stderr: String::new(),
+                        exit_code: 0,
+                    });
+                }
+                _ => {
+                    // Old symlink pointing somewhere else — replace.
+                    if let Err(e) = std::fs::remove_file(target) {
+                        return Ok(InitResult {
+                            success: false,
+                            stdout: String::new(),
+                            stderr: format!("remove stale {}: {}", target.display(), e),
+                            exit_code: 1,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            // Regular file or directory at the target — don't clobber.
+            return Ok(InitResult {
+                success: false,
+                stdout: String::new(),
+                stderr: format!(
+                    "Refusing to overwrite {}: not a symlink. \
+                     Move or delete it (likely a pip/uv-installed nell) and try again.",
+                    target.display()
+                ),
+                exit_code: 73,
+            });
+        }
+        Err(_) => {
+            // ENOENT — fine; we'll create.
+        }
+    }
+
+    if let Err(e) = std::os::unix::fs::symlink(bundled, target) {
+        return Ok(InitResult {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("symlink {}: {}", target.display(), e),
+            exit_code: 1,
+        });
+    }
+
+    Ok(InitResult {
+        success: true,
+        stdout: format!(
+            "{} → {}\n{}",
+            target.display(),
+            bundled.display(),
+            path_hint(target_dir)
+        ),
+        stderr: String::new(),
+        exit_code: 0,
+    })
+}
+
+/// Returns a one-line hint about whether `target_dir` is on the user's
+/// `$PATH`. Best-effort: we check the *current* process env, which on
+/// Tauri is the launchd-inherited PATH (often missing user shell paths).
+/// So a "not on PATH" hint here is conservative — if it's absent here,
+/// the user might still need to add it to their shell rc.
+fn path_hint(target_dir: &std::path::Path) -> String {
+    let on_path = std::env::var("PATH")
+        .ok()
+        .map(|p| {
+            std::env::split_paths(&p).any(|entry| entry == target_dir)
+        })
+        .unwrap_or(false);
+    if on_path {
+        "Open a new Terminal window and run `nell --version`.".to_string()
+    } else {
+        "If `nell` isn't found in Terminal, add `export PATH=\"$HOME/.local/bin:$PATH\"` \
+         to your shell rc (~/.zshrc) and reload.".to_string()
+    }
+}
+
 /// Result of probing the host for Anthropic's ``claude`` CLI.
 ///
 /// Powers the wizard's prerequisites step: when ``found`` is false the
@@ -637,6 +826,7 @@ pub fn run() {
             run_init,
             run_migrate,
             install_supervisor_service,
+            install_nell_cli_symlink,
             check_claude_cli,
             set_always_on_top,
         ])
@@ -700,6 +890,104 @@ mod tests {
     fn port_parse_rejects_above_u16_max() {
         assert!(u16::try_from(65536u64).is_err());
         assert!(u16::try_from(100_000u64).is_err());
+    }
+
+    // ── install_symlink_to — Phase 1.A ────────────────────────────────────
+
+    #[test]
+    fn install_symlink_to_writes_link_when_target_missing() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("bundle/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "#!/bin/sh\necho test").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+
+        let r = install_symlink_to(&bundled, &target_dir, &target).unwrap();
+        assert!(r.success, "expected success: {:?}", r);
+        assert_eq!(r.exit_code, 0);
+        assert!(target.is_symlink());
+        assert_eq!(std::fs::read_link(&target).unwrap(), bundled);
+    }
+
+    #[test]
+    fn install_symlink_to_idempotent_when_link_already_correct() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("bundle/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "x").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+
+        let r1 = install_symlink_to(&bundled, &target_dir, &target).unwrap();
+        assert!(r1.success);
+        let r2 = install_symlink_to(&bundled, &target_dir, &target).unwrap();
+        assert!(r2.success, "second call must succeed: {:?}", r2);
+        assert!(r2.stdout.contains("already installed"));
+    }
+
+    #[test]
+    fn install_symlink_to_replaces_stale_symlink_pointing_elsewhere() {
+        let dir = tempdir().unwrap();
+        let old_bundled = dir.path().join("old-bundle/nell");
+        let new_bundled = dir.path().join("new-bundle/nell");
+        std::fs::create_dir_all(old_bundled.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(new_bundled.parent().unwrap()).unwrap();
+        std::fs::write(&old_bundled, "x").unwrap();
+        std::fs::write(&new_bundled, "x").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+
+        let r1 = install_symlink_to(&old_bundled, &target_dir, &target).unwrap();
+        assert!(r1.success);
+        assert_eq!(std::fs::read_link(&target).unwrap(), old_bundled);
+
+        let r2 = install_symlink_to(&new_bundled, &target_dir, &target).unwrap();
+        assert!(r2.success);
+        assert_eq!(std::fs::read_link(&target).unwrap(), new_bundled);
+    }
+
+    #[test]
+    fn install_symlink_to_refuses_to_clobber_regular_file() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("bundle/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "x").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("nell");
+        // Pretend the user has a pip-installed nell here.
+        std::fs::write(&target, "#!/usr/bin/env python\n").unwrap();
+
+        let r = install_symlink_to(&bundled, &target_dir, &target).unwrap();
+        assert!(!r.success);
+        assert_eq!(r.exit_code, 73);
+        assert!(r.stderr.contains("not a symlink"), "got: {}", r.stderr);
+        // Regular file untouched.
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.starts_with("#!/usr/bin/env python"));
+    }
+
+    #[test]
+    fn install_symlink_to_creates_parent_dir_if_missing() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("bundle/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "x").unwrap();
+
+        // Parent dirs deliberately don't exist.
+        let target_dir = dir.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+        assert!(!target_dir.exists());
+
+        let r = install_symlink_to(&bundled, &target_dir, &target).unwrap();
+        assert!(r.success);
+        assert!(target_dir.is_dir());
+        assert!(target.is_symlink());
     }
 
     #[test]

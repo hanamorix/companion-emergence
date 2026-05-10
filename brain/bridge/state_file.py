@@ -44,6 +44,13 @@ class BridgeState:
     # committed to git or logged. None for legacy state files (auth disabled
     # for backward compat — runner.py always generates one in real use).
     auth_token: str | None = None
+    # Number of session-ingest errors during the last shutdown drain.
+    # Set by the FastAPI lifespan finally block when reports[i].errors > 0.
+    # `_write_clean_shutdown` honours this: a process with drain_errors > 0
+    # is treated as dirty (shutdown_clean=False) so the next bridge start
+    # re-runs `run_recovery_if_needed` and retries the orphan buffers.
+    # Default 0 for legacy state files written before this field existed.
+    drain_errors: int = 0
 
 
 def _state_path(persona_dir: Path) -> Path:
@@ -67,6 +74,7 @@ def _default_factory() -> dict:
         "shutdown_clean": True,
         "client_origin": "cli",
         "auth_token": None,
+        "drain_errors": 0,
     }
 
 
@@ -115,6 +123,8 @@ def read(persona_dir: Path) -> BridgeState | None:
             anomaly.kind,
             anomaly.action,
         )
+    # Backward-compat: legacy files written before drain_errors existed.
+    data.setdefault("drain_errors", 0)
     return BridgeState(**data)
 
 
@@ -165,17 +175,24 @@ def pid_is_alive(pid: int) -> bool:
 def recovery_needed(persona_dir: Path) -> bool:
     """True iff the previous bridge process exited dirty.
 
-    Predicate: state file exists AND shutdown_clean is False AND
-    the recorded pid is dead.
+    Predicate: state file exists AND (``shutdown_clean=False`` OR the
+    last shutdown drain reported ingest errors) AND the recorded pid is
+    dead.
+
+    The drain_errors arm covers the "clean shutdown that happened to
+    have a failed drain" case — extraction blew up during shutdown and
+    the buffer was retained, but the lifespan still ran to completion
+    and so shutdown_clean=True. Without this arm, those buffers would
+    sit forever on disk.
     """
     state = read(persona_dir)
     if state is None:
         return False
-    if state.shutdown_clean:
-        return False
     if state.pid is None:
         return False
-    return not pid_is_alive(state.pid)
+    if not state.shutdown_clean or state.drain_errors > 0:
+        return not pid_is_alive(state.pid)
+    return False
 
 
 def is_running(persona_dir: Path) -> bool:
