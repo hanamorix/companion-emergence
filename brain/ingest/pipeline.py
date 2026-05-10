@@ -23,8 +23,11 @@ from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     delete_session_buffer,
     list_active_sessions,
+    read_cursor,
     read_session,
+    read_session_after,
     session_silence_minutes,
+    write_cursor,
 )
 from brain.ingest.commit import commit_item
 from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
@@ -188,6 +191,118 @@ def close_session(
     # ── DELETE buffer ─────────────────────────────────────────────────────────
     delete_session_buffer(persona_dir, session_id)
 
+    return report
+
+
+def extract_session_snapshot(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> IngestReport:
+    """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
+    deleting the buffer.
+
+    Uses a per-session cursor sidecar to extract only turns added since the
+    previous successful snapshot. On a successful pass, advances the cursor
+    to the ts of the last extracted turn. On extraction failure, the cursor
+    is unchanged so the next pass retries the same turns.
+
+    Returns an IngestReport with the same shape as close_session.
+    """
+    cfg = config or {}
+    report = IngestReport(session_id=session_id)
+
+    cursor = read_cursor(persona_dir, session_id)
+    turns = read_session_after(persona_dir, session_id, cursor)
+
+    if not turns:
+        logger.info(
+            "conversation_snapshot_empty session=%s cursor=%s",
+            session_id,
+            cursor,
+        )
+        return report
+
+    user_name = _load_user_name(persona_dir)
+    assistant_name = persona_dir.name
+    transcript = format_transcript(
+        turns,
+        max_tokens=int(cfg.get("max_transcript_tokens", 6000)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+    )
+    extraction = extract_items_with_status(
+        transcript,
+        provider=provider,
+        max_retries=int(cfg.get("extraction_max_retries", 1)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+    )
+    if extraction.failed:
+        report.errors += 1
+        logger.warning(
+            "conversation_snapshot_failed session=%s turns=%d error=%s; cursor unchanged",
+            session_id,
+            len(turns),
+            extraction.error or "unknown extraction failure",
+        )
+        return report
+
+    items = [it.normalize() for it in extraction.items if it.text]
+    report.extracted = len(items)
+
+    dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
+    crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
+
+    for item in items:
+        if is_duplicate(item.text, store=store, threshold=dedup_threshold, embeddings=embeddings):
+            report.deduped += 1
+            continue
+        mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
+        if mem_id is None:
+            report.errors += 1
+            continue
+        report.committed += 1
+        report.memory_ids.append(mem_id)
+        if item.importance >= crystallize_threshold:
+            queued = queue_soul_candidate(
+                persona_dir, memory_id=mem_id, item=item, session_id=session_id,
+            )
+            if queued:
+                report.soul_candidates += 1
+            else:
+                report.soul_queue_errors += 1
+
+    # Advance cursor to the ts of the last turn we included. If the last
+    # turn lacks a ts (defensive — ingest_turn always writes one), leave
+    # cursor unchanged so the next pass retries.
+    last_ts = turns[-1].get("ts")
+    if last_ts:
+        try:
+            write_cursor(persona_dir, session_id, str(last_ts))
+        except (OSError, ValueError):
+            logger.warning(
+                "conversation_snapshot_cursor_write_failed session=%s ts=%s",
+                session_id,
+                last_ts,
+            )
+
+    logger.info(
+        "conversation_snapshot session=%s turns=%d extracted=%d committed=%d "
+        "deduped=%d soul_candidates=%d cursor=%s",
+        session_id,
+        len(turns),
+        report.extracted,
+        report.committed,
+        report.deduped,
+        report.soul_candidates,
+        last_ts,
+    )
     return report
 
 
