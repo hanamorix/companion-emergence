@@ -306,6 +306,49 @@ def extract_session_snapshot(
     return report
 
 
+def snapshot_stale_sessions(
+    persona_dir: Path,
+    *,
+    silence_minutes: float = 5.0,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> list[IngestReport]:
+    """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
+
+    Non-destructive: buffer files and the in-memory _SESSIONS registry are
+    left intact. The caller (supervisor) should NOT call remove_session()
+    for sessions returned here — finalize_stale_sessions handles that on
+    its own 24h cadence.
+
+    Returns reports for sessions where extract_session_snapshot ran. Skips
+    fresh sessions; silently cleans up ghost buffers (files with no
+    readable turns).
+    """
+    reports: list[IngestReport] = []
+    for sid in list_active_sessions(persona_dir):
+        turns = read_session(persona_dir, sid)
+        if not turns:
+            # Ghost file — clean up without generating a report.
+            delete_session_buffer(persona_dir, sid)
+            continue
+        age = session_silence_minutes(turns)
+        if age >= silence_minutes:
+            report = extract_session_snapshot(
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                embeddings=embeddings,
+                config=config,
+            )
+            reports.append(report)
+    return reports
+
+
 def close_stale_sessions(
     persona_dir: Path,
     *,
