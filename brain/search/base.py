@@ -27,7 +27,7 @@ class WebSearcher(ABC):
 
     @abstractmethod
     def name(self) -> str:
-        """Short identifier: 'ddgs', 'noop', 'claude-tool'."""
+        """Short identifier: 'ddgs', 'noop'."""
 
 
 class NoopWebSearcher(WebSearcher):
