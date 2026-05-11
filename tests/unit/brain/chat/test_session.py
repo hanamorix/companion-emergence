@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -11,10 +12,12 @@ from brain.chat.session import (
     HISTORY_MAX_TURNS,
     all_sessions,
     create_session,
+    get_or_hydrate_session,
     get_session,
     prune_empty_sessions,
     reset_registry,
 )
+from brain.ingest.buffer import ingest_turn
 
 
 @pytest.fixture(autouse=True)
@@ -202,3 +205,120 @@ def test_registry_concurrent_create_remove_no_lost_sessions() -> None:
 
     assert errors == [], f"unexpected errors under concurrent load: {errors[:3]}"
     reset_registry()
+
+
+# ---- F-201 Phase B: get_or_hydrate_session ----
+
+
+def _persona_dir(tmp_path: Path) -> Path:
+    p = tmp_path / "nell"
+    p.mkdir()
+    (p / "active_conversations").mkdir()
+    return p
+
+
+def test_hydrate_already_in_registry_returns_existing(tmp_path: Path) -> None:
+    """If the session is in _SESSIONS, return it unchanged — no disk read."""
+    persona_dir = _persona_dir(tmp_path)
+    sess = create_session("nell")
+    same = get_or_hydrate_session(persona_dir, "nell", sess.session_id)
+    assert same is sess
+
+
+def test_hydrate_not_in_registry_no_buffer_returns_none(tmp_path: Path) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    result = get_or_hydrate_session(
+        persona_dir, "nell", "00000000-0000-0000-0000-000000000000"
+    )
+    assert result is None
+
+
+def test_hydrate_not_in_registry_buffer_present_returns_hydrated(tmp_path: Path) -> None:
+    """Empty registry + buffer with 3 pairs -> SessionState turns=3 + last ts."""
+    persona_dir = _persona_dir(tmp_path)
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    base = datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC)
+    for i in range(3):
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "user", "text": f"u{i}",
+            "ts": (base + timedelta(seconds=i * 2)).isoformat(),
+        })
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "assistant", "text": f"a{i}",
+            "ts": (base + timedelta(seconds=i * 2 + 1)).isoformat(),
+        })
+
+    result = get_or_hydrate_session(persona_dir, "nell", sid)
+    assert result is not None
+    assert result.session_id == sid
+    assert result.persona_name == "nell"
+    assert result.history == []
+    assert result.turns == 3
+    # last_turn_at matches the final ingest_turn (asst pair index 2 + 1 = 5s offset).
+    expected_last = base + timedelta(seconds=2 * 2 + 1)
+    assert result.last_turn_at == expected_last
+
+
+def test_hydrate_registers_in_registry(tmp_path: Path) -> None:
+    """After hydration the session is in _SESSIONS — next call returns same instance."""
+    persona_dir = _persona_dir(tmp_path)
+    sid = "22222222-2222-2222-2222-222222222222"
+    ingest_turn(persona_dir, {
+        "session_id": sid, "speaker": "user", "text": "hello",
+        "ts": datetime.now(UTC).isoformat(),
+    })
+    ingest_turn(persona_dir, {
+        "session_id": sid, "speaker": "assistant", "text": "hi",
+        "ts": datetime.now(UTC).isoformat(),
+    })
+
+    first = get_or_hydrate_session(persona_dir, "nell", sid)
+    assert first is not None
+    assert get_session(sid) is first
+
+    second = get_or_hydrate_session(persona_dir, "nell", sid)
+    assert second is first
+
+
+def test_hydrate_with_uneven_buffer_floors_turn_count(tmp_path: Path) -> None:
+    """3 user + 2 assistant -> turns=2 (pairs). Trailing user is incomplete."""
+    persona_dir = _persona_dir(tmp_path)
+    sid = "33333333-3333-3333-3333-333333333333"
+    base = datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC)
+    for i in range(2):
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "user", "text": f"u{i}",
+            "ts": (base + timedelta(seconds=i * 3)).isoformat(),
+        })
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "assistant", "text": f"a{i}",
+            "ts": (base + timedelta(seconds=i * 3 + 1)).isoformat(),
+        })
+    # Trailing unpaired user turn.
+    ingest_turn(persona_dir, {
+        "session_id": sid, "speaker": "user", "text": "u-trailing",
+        "ts": (base + timedelta(seconds=10)).isoformat(),
+    })
+
+    result = get_or_hydrate_session(persona_dir, "nell", sid)
+    assert result is not None
+    assert result.turns == 2
+    assert result.last_turn_at == base + timedelta(seconds=10)
+
+
+def test_hydrate_malformed_last_ts_leaves_last_turn_at_none(tmp_path: Path) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    sid = "44444444-4444-4444-4444-444444444444"
+    ingest_turn(persona_dir, {
+        "session_id": sid, "speaker": "user", "text": "u",
+        "ts": "not-a-timestamp",
+    })
+    ingest_turn(persona_dir, {
+        "session_id": sid, "speaker": "assistant", "text": "a",
+        "ts": "also-bad",
+    })
+    result = get_or_hydrate_session(persona_dir, "nell", sid)
+    assert result is not None
+    assert result.turns == 1
+    assert result.last_turn_at is None
