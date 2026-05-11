@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
     from brain.soul.review import Decision
 
 logger = logging.getLogger(__name__)
+
+_ARCHIVE_PATTERN = re.compile(r"^soul_audit\.(\d{4})\.jsonl\.gz$")
 
 
 def append_audit_entry(
@@ -87,3 +91,33 @@ def read_audit_log(persona_dir: Path, *, limit: int | None = None) -> list[dict]
         entries = entries[-limit:]
 
     return entries
+
+
+def iter_audit_full(persona_dir: Path) -> Iterator[dict]:
+    """Yield every audit entry across active + yearly archives, chronologically.
+
+    Walks ``soul_audit.YYYY.jsonl.gz`` archives oldest year → newest year,
+    then the active ``soul_audit.jsonl``. Per-line resilience matches
+    :func:`read_audit_log` — malformed lines are skipped with a warning.
+
+    Hana's spec requirement (2026-05-11): every decision ever made about
+    Nell's soul must remain reachable. This is the reader that honours
+    that — used by ``nell soul audit --full`` and any future caller that
+    needs the full history. Streaming, so memory stays bounded regardless
+    of how many years have accumulated.
+    """
+    from brain.health.jsonl_reader import iter_jsonl_streaming
+
+    # 1. Yearly archives, oldest first.
+    if persona_dir.exists():
+        archives: list[tuple[int, Path]] = []
+        for child in persona_dir.iterdir():
+            m = _ARCHIVE_PATTERN.match(child.name)
+            if m:
+                archives.append((int(m.group(1)), child))
+        archives.sort(key=lambda t: t[0])
+        for _year, archive_path in archives:
+            yield from iter_jsonl_streaming(archive_path)
+
+    # 2. Active log.
+    yield from iter_jsonl_streaming(persona_dir / "soul_audit.jsonl")
