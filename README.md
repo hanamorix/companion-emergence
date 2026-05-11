@@ -16,13 +16,6 @@ Known incomplete surfaces remain intentional and visible: see [`docs/roadmap.md`
 
 ## Installing the desktop app (NellFace)
 
-> **Status (2026-05-08):** `v0.0.1-alpha` exists as a private alpha
-> release with pre-built macOS arm64, Linux x86_64, and Windows x86_64
-> assets. macOS Intel users should build from source until a reliable
-> Intel runner is available. The release workflow also supports manual
-> retries for an existing `v*.*.*` tag and runs bundled-CLI smoke on
-> every produced platform.
-
 NellFace ships **unsigned** — binaries are integrity-sealed (ad-hoc
 code-signed on macOS) but we don't pay for an Apple Developer ID or a
 Microsoft code-signing cert. See [`INSTALL.md`](INSTALL.md) for the
