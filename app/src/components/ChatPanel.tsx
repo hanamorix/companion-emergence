@@ -203,6 +203,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
     }
     setError(null);
     const previewUrl = URL.createObjectURL(file);
+    // F-007 (v0.0.7 audit, polish): track the preview URL the moment it's
+    // created — not when the message is sent. If the user stages an image
+    // and then unmounts (persona switch, app quit, route change) without
+    // sending, the URL is held only in React state. The unmount sweep at
+    // lines 159-160 iterates trackedUrlsRef, so adding here ensures it's
+    // freed. Set semantics make subsequent track-on-send (line ~279)
+    // idempotent, and clearStagedImage's explicit revoke is unaffected
+    // since the URL stays in the set until unmount.
+    trackedUrlsRef.current.add(previewUrl);
     setStagedImage({
       previewUrl,
       fileName: file.name,
