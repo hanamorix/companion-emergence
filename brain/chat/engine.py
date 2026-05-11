@@ -23,14 +23,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from brain.bridge.chat import ChatMessage, ImageBlock, TextBlock
+from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
+from brain.chat.budget import apply_budget
 from brain.chat.prompt import build_system_message
 from brain.chat.session import SessionState, create_session
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
-from brain.ingest.buffer import ingest_turn
+from brain.images import media_type_for_sha
+from brain.ingest.buffer import ingest_turn, read_session
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -154,13 +156,32 @@ def respond(
     finally:
         soul_store.close()
 
-    # 6. Messages list: [system, ...history, user]
+    # 6. Messages list — buffer-driven, with budget guard.
     user_msg = _build_user_message(persona_dir, user_input, image_shas)
+    try:
+        prior_turns = read_session(persona_dir, session.session_id)
+        # Note: on call N+1, _persist_turn has already written turn N to
+        # the buffer (engine.py persists BEFORE session.append_turn), so
+        # prior_turns reflects the complete prior history with no torn turn.
+        history_msgs = _buffer_turns_to_messages(persona_dir, prior_turns)
+    except Exception:
+        logger.exception(
+            "engine.respond: buffer read failed session=%s; falling back to session.history",
+            session.session_id,
+        )
+        history_msgs = list(session.history)
+
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_msg),
-        *session.history,
+        *history_msgs,
         user_msg,
     ]
+    messages = apply_budget(
+        messages,
+        max_tokens=190_000,
+        preserve_tail_msgs=40,
+        provider=provider,
+    )
 
     # 7. Tool loop
     tools = build_tools_list()
@@ -216,7 +237,6 @@ def _build_user_message(
     if not image_shas:
         return ChatMessage(role="user", content=user_input)
 
-    from brain.bridge.chat import ContentBlock
     from brain.images import media_type_for_sha
 
     blocks: list[ContentBlock] = []
@@ -236,6 +256,52 @@ def _build_user_message(
         # Defensive: every block dropped (unlikely). Fall back to text.
         return ChatMessage(role="user", content=user_input or "")
     return ChatMessage(role="user", content=tuple(blocks))
+
+
+def _buffer_turns_to_messages(
+    persona_dir: Path, turns: list[dict]
+) -> list[ChatMessage]:
+    """Reconstruct ChatMessage list from buffer JSONL records.
+
+    Image-bearing user turns rebuild a (TextBlock, *ImageBlock) content
+    tuple identical to what _build_user_message produces for live turns.
+    Missing or unreadable images are skipped with a warning, matching
+    _build_user_message's defensive behaviour.
+    """
+    out: list[ChatMessage] = []
+    for t in turns:
+        speaker = t.get("speaker")
+        text = t.get("text", "")
+        if speaker == "user":
+            role = "user"
+        elif speaker == "assistant":
+            role = "assistant"
+        else:
+            continue  # skip unknown speakers defensively
+
+        image_shas = t.get("image_shas") or []
+        if role == "user" and image_shas:
+            blocks: list[ContentBlock] = []
+            if text:
+                blocks.append(TextBlock(text=text))
+            for sha in image_shas:
+                try:
+                    media_type = media_type_for_sha(persona_dir, sha)
+                    blocks.append(ImageBlock(image_sha=sha, media_type=media_type))
+                except (FileNotFoundError, ValueError) as exc:
+                    logger.warning(
+                        "buffer replay: skipping image_sha=%s: %s",
+                        sha[:8] if len(sha) >= 8 else sha,
+                        exc,
+                    )
+            if blocks:
+                out.append(ChatMessage(role=role, content=tuple(blocks)))
+            elif text:
+                out.append(ChatMessage(role=role, content=text))
+            continue
+
+        out.append(ChatMessage(role=role, content=text))
+    return out
 
 
 def _persist_turn(
