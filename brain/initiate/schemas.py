@@ -13,8 +13,7 @@ import json
 import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Literal, Optional
-
+from typing import Any, Literal
 
 CandidateKind = Literal["message", "voice_edit_proposal"]
 CandidateSource = Literal["dream", "crystallization", "emotion_spike", "voice_reflection"]
@@ -70,12 +69,6 @@ class SemanticContext:
 
 
 @dataclass
-class StateTransition:
-    to: StateName
-    at: str  # ISO 8601
-
-
-@dataclass
 class InitiateCandidate:
     candidate_id: str
     ts: str  # ISO 8601 with tz
@@ -84,9 +77,9 @@ class InitiateCandidate:
     source_id: str
     emotional_snapshot: EmotionalSnapshot
     semantic_context: SemanticContext
-    claimed_at: Optional[str] = None
+    claimed_at: str | None = None
     # Voice-edit-only payload (None for kind="message").
-    proposal: Optional[dict[str, Any]] = None
+    proposal: dict[str, Any] | None = None
 
     def to_jsonl(self) -> str:
         d = {
@@ -130,9 +123,9 @@ class AuditRow:
     decision: Decision
     decision_reasoning: str
     gate_check: dict[str, Any]
-    delivery: Optional[dict[str, Any]]
+    delivery: dict[str, Any] | None = None
     # Voice-edit-only payload (None for kind="message").
-    diff: Optional[str] = None
+    diff: str | None = None
     user_modified: bool = False
 
     def record_transition(self, to: StateName, at: str) -> None:

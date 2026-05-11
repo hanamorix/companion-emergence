@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from brain.initiate.schemas import (
     AuditRow,
     EmotionalSnapshot,
     InitiateCandidate,
     SemanticContext,
-    StateTransition,
 )
 
 
@@ -79,8 +77,8 @@ def test_initiate_candidate_id_generation():
     """candidate_id must be sortable and unique."""
     from brain.initiate.schemas import make_candidate_id
 
-    a = make_candidate_id(datetime(2026, 5, 11, 14, 32, 4, tzinfo=timezone.utc))
-    b = make_candidate_id(datetime(2026, 5, 11, 14, 32, 5, tzinfo=timezone.utc))
+    a = make_candidate_id(datetime(2026, 5, 11, 14, 32, 4, tzinfo=UTC))
+    b = make_candidate_id(datetime(2026, 5, 11, 14, 32, 5, tzinfo=UTC))
     assert a < b  # sortable
     assert a != b  # unique
     assert a.startswith("ic_")
