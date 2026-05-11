@@ -27,8 +27,9 @@ This module exposes:
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
+
+from brain.paths import validate_persona_name as validate_persona_name
 
 VOICE_TEMPLATE_DEFAULT = "default"
 VOICE_TEMPLATE_NELL_EXAMPLE = "nell-example"
@@ -48,22 +49,6 @@ VOICE_TEMPLATES = {
         "scripts that want to be explicit."
     ),
 }
-
-_PERSONA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-
-
-def validate_persona_name(name: str) -> None:
-    """Raise ValueError if `name` would land outside <home>/personas/.
-
-    Persona names become directory names. Reject anything that could
-    escape the personas/ root (slashes, dotdot, empty, oversize).
-    """
-    if not isinstance(name, str) or not _PERSONA_NAME_RE.fullmatch(name):
-        raise ValueError(
-            f"invalid persona name {name!r} — must match "
-            f"[A-Za-z0-9_-]{{1,40}} (no slashes, dots, or spaces)"
-        )
-
 
 def write_persona_config(
     persona_dir: Path,
