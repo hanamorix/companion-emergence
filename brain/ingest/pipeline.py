@@ -332,26 +332,37 @@ def snapshot_stale_sessions(
     Returns reports for sessions where extract_session_snapshot ran. Skips
     fresh sessions; silently cleans up ghost buffers (files with no
     readable turns).
+
+    Per-session try/except so a single bad session (corrupt buffer,
+    transient FS error) can't abort the whole sweep — mirrors the
+    isolation in finalize_stale_sessions.
     """
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
-        turns = read_session(persona_dir, sid)
-        if not turns:
-            # Ghost file — clean up without generating a report.
-            delete_session_buffer(persona_dir, sid)
-            continue
-        age = session_silence_minutes(turns)
-        if age >= silence_minutes:
-            report = extract_session_snapshot(
-                persona_dir,
+        try:
+            turns = read_session(persona_dir, sid)
+            if not turns:
+                # Ghost file — clean up without generating a report.
+                delete_session_buffer(persona_dir, sid)
+                continue
+            age = session_silence_minutes(turns)
+            if age >= silence_minutes:
+                report = extract_session_snapshot(
+                    persona_dir,
+                    sid,
+                    store=store,
+                    hebbian=hebbian,
+                    provider=provider,
+                    embeddings=embeddings,
+                    config=config,
+                )
+                reports.append(report)
+        except Exception:
+            logger.exception(
+                "snapshot_stale_sessions: per-session failure session=%s; "
+                "skipping and continuing sweep",
                 sid,
-                store=store,
-                hebbian=hebbian,
-                provider=provider,
-                embeddings=embeddings,
-                config=config,
             )
-            reports.append(report)
     return reports
 
 
