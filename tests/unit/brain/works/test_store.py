@@ -295,3 +295,30 @@ def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
     conn.close()
     assert n_works == 1, f"expected 1 works row, got {n_works}"
     assert n_fts == 1, f"expected 1 fts row, got {n_fts}"
+
+
+def test_works_store_connect_sets_busy_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WAL alone isn't enough — a writer lock without busy_timeout
+    fails immediately. _connect must explicitly set busy_timeout
+    rather than relying on Python's stdlib default (which is 5000ms
+    but can be overridden by sqlite3.connect's timeout kwarg)."""
+    import sqlite3 as _sqlite3
+
+    original_connect = _sqlite3.connect
+
+    def low_default_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # Force a tiny default so a missing PRAGMA leaves busy_timeout low.
+        kwargs.setdefault("timeout", 0.001)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(_sqlite3, "connect", low_default_connect)
+
+    store = WorksStore(tmp_path / "works.db")
+    conn = store._connect()
+    try:
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        conn.close()
+    assert busy_timeout >= 5000, f"expected busy_timeout >= 5000, got {busy_timeout}"
