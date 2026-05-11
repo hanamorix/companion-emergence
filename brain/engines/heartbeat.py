@@ -670,6 +670,7 @@ class HeartbeatEngine:
             embeddings=None,
             provider=self.provider,
             log_path=self.dream_log_path,
+            persona_dir=self.dream_log_path.parent,
             persona_name=self.persona_name,
             persona_system_prompt=(
                 f"You are {self.persona_name}. You just woke from a dream "

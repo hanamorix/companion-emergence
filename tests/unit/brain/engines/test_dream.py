@@ -435,6 +435,50 @@ def test_dream_system_prompt_uses_persona_name(tmp_path: Path) -> None:
     assert "Nell" not in captured["system"]
 
 
+def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
+    """After a dream is logged, an initiate candidate is emitted.
+
+    Phase 4.1 of the initiate physiology: the dream engine fires
+    `emit_initiate_candidate` with `source="dream"` immediately after
+    the log write. Wrapped in try/except inside the engine so an emit
+    failure can't break the dream itself.
+    """
+    from brain.engines.dream import DreamEngine
+    from brain.initiate.emit import read_candidates
+
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+
+    store = MemoryStore(db_path=":memory:")
+    hm = HebbianMatrix(db_path=":memory:")
+    try:
+        seed = _mem("seed for initiate emit", importance=8.0)
+        store.create(seed)
+
+        engine = DreamEngine(
+            store=store,
+            hebbian=hm,
+            embeddings=None,
+            provider=FakeProvider(),
+            log_path=persona_dir / "dreams.log.jsonl",
+            persona_dir=persona_dir,
+            persona_name="Nell",
+            persona_system_prompt=(
+                "You are Nell. Reflect in first person, 2-3 sentences, "
+                "starting with 'DREAM: '."
+            ),
+        )
+        engine.run_cycle()
+    finally:
+        store.close()
+        hm.close()
+
+    candidates = read_candidates(persona_dir)
+    assert len(candidates) == 1
+    assert candidates[0].source == "dream"
+    assert candidates[0].kind == "message"
+
+
 def test_dream_engine_empty_persona_raises() -> None:
     """DreamEngine must reject empty persona_name / persona_system_prompt
     to force callers to be explicit."""
