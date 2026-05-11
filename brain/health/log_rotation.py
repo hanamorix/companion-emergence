@@ -119,15 +119,19 @@ def _archive_path(log_path: Path, n: int) -> Path:
 def rotate_age_archive_yearly(
     log_path: Path,
     now: datetime | None = None,
+    timestamp_field: str = "at",
 ) -> list[Path]:
     """Split ``log_path`` by year; archive cold years to ``.YYYY.jsonl.gz``.
 
     Returns the list of newly-written archive paths. Empty if the log is
     missing or contains only current-year entries.
 
-    Each entry's year is the ``at`` field (ISO 8601 with optional tz).
+    ``timestamp_field`` is the entry key holding an ISO 8601 timestamp.
+    Defaults to ``"at"`` (the convention used by the supervisor's tick
+    events); soul_audit uses ``"ts"`` so callers must pass that.
+
     Malformed lines are skipped with a warning — the rotation must never
-    abort on one bad row. Lines without an ``at`` field are bucketed
+    abort on one bad row. Lines without the timestamp field are bucketed
     with the current year (treated as undated → kept in active).
 
     The active log is rewritten to contain only current-year entries.
@@ -165,7 +169,7 @@ def rotate_age_archive_yearly(
                 continue
             if not isinstance(entry, dict):
                 continue
-            year = _entry_year(entry, fallback=current_year)
+            year = _entry_year(entry, timestamp_field, fallback=current_year)
             by_year.setdefault(year, []).append(raw)
 
     cold_years = sorted(y for y in by_year if y < current_year)
@@ -211,12 +215,12 @@ def rotate_age_archive_yearly(
     return new_archives
 
 
-def _entry_year(entry: dict, fallback: int) -> int:
-    """Extract the year from an entry's ``at`` field; fall back if absent/bad."""
-    at = entry.get("at")
-    if not isinstance(at, str):
+def _entry_year(entry: dict, field: str, fallback: int) -> int:
+    """Extract the year from ``entry[field]``; fall back if absent/bad."""
+    ts = entry.get(field)
+    if not isinstance(ts, str):
         return fallback
     try:
-        return datetime.fromisoformat(at).year
+        return datetime.fromisoformat(ts).year
     except ValueError:
         return fallback
