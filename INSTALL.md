@@ -1,16 +1,5 @@
 # Installing NellFace
 
-> **Status (2026-05-08):** `v0.0.1-alpha` exists as a private alpha
-> release with pre-built macOS arm64, Linux x86_64, and Windows x86_64
-> assets. macOS Intel users should build from source until a reliable
-> Intel runner is available. New `v*.*.*` tags and manual retries of
-> existing tags publish bundles to the GitHub Releases page after a
-> bundled-CLI smoke test.
->
-> The bypass instructions below apply to downloaded release bundles.
-> Build-from-source artifacts launch without any of these warnings
-> because they inherit your local keychain.
-
 NellFace is open source and ships **unsigned** — we don't pay for an
 Apple Developer ID or a Microsoft code-signing certificate. Your
 operating system's first-launch security warnings will reflect that.
@@ -224,8 +213,8 @@ sha256sum -c SHA256SUMS-linux-x86_64.txt
 
 # Windows (PowerShell)
 Get-Content .\SHA256SUMS-windows-x86_64.txt
-Get-FileHash .\Companion.Emergence_0.0.1_x64_en-US.msi -Algorithm SHA256
-Get-FileHash .\Companion.Emergence_0.0.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\Companion.Emergence_<VERSION>_x64_en-US.msi -Algorithm SHA256
+Get-FileHash .\Companion.Emergence_<VERSION>_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the PowerShell hashes against the `SHA256SUMS-windows-x86_64.txt`
