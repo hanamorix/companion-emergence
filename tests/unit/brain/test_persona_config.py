@@ -81,6 +81,19 @@ def test_load_wrong_field_types_falls_back_per_field(tmp_path: Path) -> None:
     assert cfg.searcher == "noop"
 
 
+def test_load_claude_tool_searcher_heals_to_default(tmp_path: Path) -> None:
+    """Regression anchor: 'claude-tool' was a Phase-1 stub removed in the
+    2026-05-07 audit P2 round (F-004). PersonaConfig's allowlist must not
+    re-admit it without a corresponding implementation, otherwise the
+    factory would raise NotImplementedError on dispatch. If you intentionally
+    re-add 'claude-tool' as a real searcher, update KNOWN_SEARCHERS *and*
+    re-implement the factory branch — then delete this test."""
+    path = tmp_path / "persona_config.json"
+    path.write_text('{"provider": "ollama", "searcher": "claude-tool"}', encoding="utf-8")
+    cfg = PersonaConfig.load(path)
+    assert cfg.searcher == DEFAULT_SEARCHER
+
+
 def test_save_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "persona_config.json"
     PersonaConfig(provider="ollama", searcher="noop").save(path)
