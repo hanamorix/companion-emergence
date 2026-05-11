@@ -170,6 +170,30 @@ export async function newSession(persona: string): Promise<string> {
   return data.session_id;
 }
 
+/**
+ * Ask the bridge for the persona's currently-active session, if any.
+ *
+ * Returns a session id when the bridge has a recent open session
+ * (younger than the finalize threshold) we should reattach to, or
+ * ``null`` when there's nothing to attach to and the caller should
+ * fall back to ``newSession``. Throws on non-2xx so the caller can
+ * decide whether to swallow the failure or surface it; ChatPanel
+ * treats a throw the same as null (transient network flake).
+ *
+ * Part of the F-201 sticky-session reattach: combined with the
+ * server-side hydration path and the non-destructive shutdown drain,
+ * this lets Cmd-Q + reopen pick up mid-thread instead of starting a
+ * fresh session every cold start.
+ */
+export async function fetchActiveSession(persona: string): Promise<string | null> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/sessions/active`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/sessions/active ${r.status}`);
+  const data = (await r.json()) as { session_id: string | null };
+  return data.session_id;
+}
+
 export interface ChatResponse {
   session_id: string;
   reply: string;
