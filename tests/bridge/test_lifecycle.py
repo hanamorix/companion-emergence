@@ -46,29 +46,46 @@ def test_supervisor_prunes_old_empty_sessions(persona_dir: Path):
         reset_registry()
 
 
-def test_graceful_shutdown_closes_active_sessions(persona_dir: Path, monkeypatch):
-    """With one chat session, lifespan teardown drains via close_stale_sessions(silence_minutes=0)."""
+def test_graceful_shutdown_drains_via_snapshot_and_preserves_buffer(
+    persona_dir: Path, monkeypatch,
+):
+    """Lifespan teardown drains via snapshot_stale_sessions(silence_minutes=0)
+    — non-destructive: memories extract durably, but the buffer + cursor
+    survive on disk so the next bridge start can resume the sticky session.
+    """
     from tests.bridge.test_endpoints import _patch_fake_provider
 
     _patch_fake_provider(monkeypatch, reply="bye")
 
-    closed: list = []
+    drained: list = []
     from brain.ingest import pipeline as ingest_pipeline
 
-    real_close = ingest_pipeline.close_stale_sessions
+    real_snapshot = ingest_pipeline.snapshot_stale_sessions
 
     def spy(persona_dir, *, silence_minutes, **kw):
-        closed.append(silence_minutes)
-        return real_close(persona_dir, silence_minutes=silence_minutes, **kw)
+        drained.append(silence_minutes)
+        return real_snapshot(persona_dir, silence_minutes=silence_minutes, **kw)
 
-    monkeypatch.setattr(ingest_pipeline, "close_stale_sessions", spy)
+    monkeypatch.setattr(ingest_pipeline, "snapshot_stale_sessions", spy)
 
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
     with _client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         c.post("/chat", json={"session_id": sid, "message": "hi"})
-    # __exit__ has run — assert close_stale_sessions(silence_minutes=0) was called
-    assert 0 in closed or 0.0 in closed, f"silence_minutes=0 not seen; saw: {closed}"
+
+        # Sanity: the buffer file exists while the bridge is live.
+        buffer_path = persona_dir / "active_conversations" / f"{sid}.jsonl"
+        assert buffer_path.exists(), "buffer should exist after a /chat"
+
+    # __exit__ has run.
+    # 1. The drain ran with silence_minutes=0 (the shutdown signal).
+    assert 0 in drained or 0.0 in drained, f"silence_minutes=0 not seen; saw: {drained}"
+    # 2. The buffer SURVIVED — sticky-session contract. The 24h
+    #    finalize cadence handles genuinely-stale buffers on a later run.
+    assert buffer_path.exists(), (
+        "buffer must survive graceful shutdown (sticky-session contract); "
+        "snapshot_stale_sessions is non-destructive"
+    )
 
 
 def test_check_idle_predicate(persona_dir: Path):

@@ -299,14 +299,20 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
 def _drain_sessions_blocking(
     persona_dir: Path, provider: LLMProvider, silence_minutes: float = 0,
 ) -> Any:
-    """Wrap brain.ingest.pipeline.close_stale_sessions — used by shutdown.
+    """Wrap brain.ingest.pipeline.snapshot_stale_sessions — used by shutdown.
 
-    Same per-call store pattern. Silence_minutes=0 (default) closes EVERY
-    live session, which is what graceful shutdown wants.
+    Non-destructive — buffers + cursors survive across shutdown so the next
+    bridge start can resume sticky sessions. Memories still extract
+    durably here (the data-saving step on Cmd-Q). The 24h
+    finalize_stale_sessions cadence picks up genuinely-stale buffers on
+    the next bridge run.
+
+    Same per-call store pattern. Silence_minutes=0 (default) snapshots
+    EVERY live session, which is what graceful shutdown wants.
     """
     from contextlib import ExitStack
 
-    from brain.ingest.pipeline import close_stale_sessions
+    from brain.ingest.pipeline import snapshot_stale_sessions
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
@@ -317,7 +323,7 @@ def _drain_sessions_blocking(
             persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
         )
         stack.callback(embeddings.close)
-        return close_stale_sessions(
+        return snapshot_stale_sessions(
             persona_dir,
             silence_minutes=silence_minutes,
             store=store,
