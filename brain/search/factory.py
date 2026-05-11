@@ -9,10 +9,11 @@ from brain.search.ddgs_searcher import DdgsWebSearcher
 def get_searcher(name: str) -> WebSearcher:
     """Resolve a searcher identifier to an instance.
 
-    Raises ValueError on unknown name. The 'claude-tool' Phase-1 stub
-    has been removed from the public surface (audit 2026-05-07 P2);
-    PersonaConfig allowlists guard against legacy values surviving in
-    hand-edited or migrated config files.
+    Raises ValueError on unknown name. A 'claude-tool' Phase-1 stub
+    once lived here; it was removed from the public surface in the
+    2026-05-07 audit P2 round (F-004). PersonaConfig allowlists heal
+    legacy values in hand-edited or migrated config files to the
+    default before they ever reach this factory.
     """
     if name == "ddgs":
         return DdgsWebSearcher()
