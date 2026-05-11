@@ -135,5 +135,22 @@ def test_get_persona_dir_accepts_valid_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
-    result = paths.get_persona_dir("nell.sandbox")
-    assert result == tmp_path / "personas" / "nell.sandbox"
+    result = paths.get_persona_dir("nell_sandbox")
+    assert result == tmp_path / "personas" / "nell_sandbox"
+
+
+def test_get_persona_dir_rejects_names_with_spaces() -> None:
+    """get_persona_dir must enforce the same grammar as validate_persona_name —
+    no spaces, even though spaces aren't path-traversal chars."""
+    with pytest.raises(ValueError, match=r"\[A-Za-z0-9_-\]"):
+        paths.get_persona_dir("Nell Smith")
+
+
+def test_get_persona_dir_rejects_names_with_special_chars() -> None:
+    with pytest.raises(ValueError, match=r"\[A-Za-z0-9_-\]"):
+        paths.get_persona_dir("nell@home.com")
+
+
+def test_get_persona_dir_rejects_oversize_names() -> None:
+    with pytest.raises(ValueError):
+        paths.get_persona_dir("n" * 41)  # 41 chars; strict regex is {1,40}
