@@ -187,6 +187,18 @@ def test_rotate_age_archive_idempotent_same_year(tmp_path: Path) -> None:
     assert len(active) == 2
 
 
+def test_rotate_age_archive_honours_timestamp_field(tmp_path: Path) -> None:
+    """Soul audit uses ``ts`` not ``at``; the parameter must route correctly."""
+    log = tmp_path / "soul_audit.jsonl"
+    with log.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": _ts(2024), "seq": 0}) + "\n")
+        f.write(json.dumps({"ts": _ts(2026), "seq": 1}) + "\n")
+    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    archives = rotate_age_archive_yearly(log, now=now, timestamp_field="ts")
+    assert len(archives) == 1
+    assert archives[0].name == "soul_audit.2024.jsonl.gz"
+
+
 def test_rotate_age_archive_skips_corrupt_lines(tmp_path: Path) -> None:
     """A malformed line in the middle doesn't abort the split."""
     log = tmp_path / "soul_audit.jsonl"
