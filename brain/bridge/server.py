@@ -39,7 +39,11 @@ from pydantic import BaseModel, Field, field_validator
 from brain.bridge import events
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider, get_provider
-from brain.chat.session import all_sessions, create_session, get_session
+from brain.chat.session import (
+    all_sessions,
+    create_session,
+    get_or_hydrate_session,
+)
 from brain.health.alarm import compute_pending_alarms
 from brain.health.walker import walk_persona
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
@@ -706,10 +710,64 @@ def build_app(
             created_at=sess.created_at.isoformat(),
         )
 
+    @app.get("/sessions/active", dependencies=[Depends(require_http_auth)])
+    def sessions_active_endpoint() -> dict[str, str | None]:
+        """Return the most-recent-turn session_id that's still attach-eligible.
+
+        "Attach-eligible" = the session's last turn is younger than the
+        24h finalize threshold (matches the supervisor's
+        ``finalize_after_hours`` default in brain.bridge.supervisor —
+        deliberately hardcoded rather than wired through a config knob).
+        Older buffers will be cleaned up by the next supervisor finalize
+        tick; returning them would invite a race where the renderer
+        attaches and then immediately has the session deleted.
+
+        Response: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
+        """
+        from brain.ingest.buffer import list_active_sessions, read_session
+
+        s: BridgeAppState = app.state.bridge
+        now = datetime.now(UTC)
+        # 24 hours mirrors supervisor.finalize_after_hours default — sessions
+        # older than this are eligible for finalize and may disappear on
+        # the next sweep, so don't advertise them as attachable.
+        _ATTACH_MAX_AGE_HOURS = 24.0  # noqa: N806 — local frozen constant
+        best_sid: str | None = None
+        best_ts: datetime | None = None
+        for sid in list_active_sessions(s.persona_dir):
+            try:
+                turns = read_session(s.persona_dir, sid)
+            except (ValueError, OSError):
+                # Defensive: a malformed session_id on disk or unreadable
+                # file shouldn't take the endpoint down. Skip and move on.
+                continue
+            if not turns:
+                continue
+            raw_ts = turns[-1].get("ts")
+            if not raw_ts:
+                # Defensive — ingest_turn always writes a ts, so this
+                # should not happen in practice. Skip.
+                continue
+            try:
+                last = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+            except (ValueError, TypeError):
+                continue
+            age_hours = (now - last).total_seconds() / 3600.0
+            if age_hours >= _ATTACH_MAX_AGE_HOURS:
+                continue
+            if best_ts is None or last > best_ts:
+                best_ts = last
+                best_sid = sid
+        return {"session_id": best_sid}
+
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        sess = get_session(session_id)
+        # F-201 Phase B: hydrate from disk if the in-memory registry was
+        # cleared by a bridge restart but the buffer file still exists.
+        sess = get_or_hydrate_session(s.persona_dir, s.persona, session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         in_flight = (
@@ -827,7 +885,9 @@ def build_app(
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
     async def chat(req: ChatReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        sess = get_session(req.session_id)
+        # F-201 Phase B: hydrate from disk if the in-memory registry was
+        # cleared by a bridge restart but the buffer file still exists.
+        sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
@@ -880,7 +940,9 @@ def build_app(
             return
         await ws.accept(subprotocol=_ws_accept_subprotocol(ws))
         s: BridgeAppState = app.state.bridge
-        sess = get_session(session_id)
+        # F-201 Phase B: hydrate across bridge restart so the renderer
+        # can reattach to a session whose buffer still exists on disk.
+        sess = get_or_hydrate_session(s.persona_dir, s.persona, session_id)
         if sess is None:
             await ws.send_json({"type": "error", "code": "session_not_found", "done": True})
             await ws.close()
@@ -1058,12 +1120,18 @@ def build_app(
     @app.post("/sessions/close", dependencies=[Depends(require_http_auth)])
     async def sessions_close(req: CloseReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        from brain.chat.session import get_session, remove_session
+        from brain.chat.session import remove_session
 
         # H2/D2: differentiate cases.
-        # Unknown session id (never registered, or already removed) → 404.
+        # Unknown session id (never registered, or already removed AND no
+        # buffer on disk) → 404.
         # Known session → run ingest, remove from registry, drop in_flight lock.
-        sess = get_session(req.session_id)
+        #
+        # F-201 Phase B: a renderer may close a session whose in-memory
+        # entry was lost across a bridge restart but whose buffer file
+        # still exists. Hydrate from disk so close becomes the natural
+        # path to drain that buffer.
+        sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
 
