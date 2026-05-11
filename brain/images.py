@@ -113,6 +113,22 @@ def save_image_bytes(
             f"unsupported media_type {media_type!r}; "
             f"must be one of {sorted(_ALLOWED_MEDIA_TYPES)}"
         )
+    # Defense in depth: the bridge /upload endpoint already sniffs at the
+    # network boundary, but library callers (migration tools, internal
+    # workers, tests) shouldn't be trusted to honour the contract. If the
+    # bytes don't match a known signature — or don't match the declared
+    # media_type — refuse before writing anything to disk.
+    sniffed = sniff_media_type(data)
+    if sniffed is None:
+        raise ValueError(
+            "image bytes match no supported signature; "
+            "expected one of PNG, JPEG, WebP, GIF magic bytes"
+        )
+    if sniffed != media_type:
+        raise ValueError(
+            f"declared media_type {media_type!r} but bytes' signature "
+            f"is {sniffed!r}"
+        )
     sha = compute_sha(data)
     target = image_path(persona_dir, sha, media_type)
     target.parent.mkdir(parents=True, exist_ok=True)
