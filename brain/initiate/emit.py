@@ -92,6 +92,13 @@ def remove_candidate(persona_dir: Path, candidate_id: str) -> None:
 
     Rewrites the queue file without the target row. Used after a
     candidate has been processed (decision written to audit).
+
+    Side effect: corrupt rows already in the queue are dropped during
+    the rewrite. iter_jsonl_skipping_corrupt warns on each at read time;
+    no separate audit is written here. For a queue file this is the
+    correct behaviour (a corrupt candidate row is unrecoverable), but
+    callers should be aware that rewriting the queue is also a cleanup
+    operation.
     """
     queue = persona_dir / "initiate_candidates.jsonl"
     if not queue.exists():
