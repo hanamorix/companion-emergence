@@ -20,8 +20,13 @@ from datetime import UTC, datetime
 
 from brain.bridge.chat import ChatMessage
 
-# Truncate at 20 user+assistant pairs (40 messages total), matching OG.
-HISTORY_MAX_TURNS = 20
+# Sanity ceiling on the in-memory history list. As of 2026-05-10, the
+# engine builds its prompt from the buffer file (see brain.chat.engine.
+# _buffer_turns_to_messages), so session.history is informational only —
+# kept for telemetry, tests, and a fallback path when the buffer read
+# fails. A high ceiling is fine; it never hits the prompt unless the
+# buffer is unreadable.
+HISTORY_MAX_TURNS = 5000
 
 
 @dataclass
@@ -37,7 +42,10 @@ class SessionState:
     created_at:
         When the session was opened (UTC).
     history:
-        Rolling message window — last HISTORY_MAX_TURNS user+assistant pairs.
+        Informational rolling window — last HISTORY_MAX_TURNS user+assistant
+        pairs. NOT the prompt source: brain.chat.engine reads the buffer
+        file directly (see _buffer_turns_to_messages). Kept for telemetry,
+        debugging, and the buffer-read-failure fallback path.
     turns:
         Count of completed turn pairs (user + assistant).
     last_turn_at:
@@ -56,7 +64,8 @@ class SessionState:
 
         Truncates to the last HISTORY_MAX_TURNS pairs (2 * HISTORY_MAX_TURNS
         ChatMessage entries) after appending. Increments turns. Sets
-        last_turn_at to now (UTC).
+        last_turn_at to now (UTC). The truncation is a sanity ceiling only —
+        the engine reads the buffer file for prompt construction.
         """
         self.history.append(ChatMessage(role="user", content=user_msg))
         self.history.append(ChatMessage(role="assistant", content=assistant_msg))
