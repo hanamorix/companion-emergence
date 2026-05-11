@@ -7,8 +7,13 @@ Ported from OG NellBrain/nell_bridge_session.py (F36) with adaptations:
   - session_id UUID4 generated at create_session time
 
 Design note: persistence across process restarts is intentionally out of
-scope (matching OG). Sessions are in-memory only; on CLI exit the REPL
-flushes the buffer via close_session → ingest pipeline.
+scope for the registry (matching OG). Sessions are in-memory only; on CLI
+exit the REPL flushes the buffer via close_session → ingest pipeline.
+
+Phase B sticky sessions (F-201): although the registry itself is process-
+local, ``get_or_hydrate_session`` lets handlers rebuild a registry entry
+from the on-disk buffer file when the renderer reattaches to a prior
+session id across a clean bridge restart.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 from brain.bridge.chat import ChatMessage
 
@@ -118,6 +124,85 @@ def get_session(session_id: str) -> SessionState | None:
     """Return the session for the given id, or None if unknown."""
     with _LOCK:
         return _SESSIONS.get(session_id)
+
+
+def get_or_hydrate_session(
+    persona_dir: Path, persona_name: str, session_id: str
+) -> SessionState | None:
+    """Return the SessionState for ``session_id``, hydrating from disk if needed.
+
+    Phase B sticky sessions: a session's authoritative state lives in two
+    places — the in-memory ``_SESSIONS`` registry (recreated empty on each
+    bridge start) and the buffer file on disk at
+    ``<persona_dir>/active_conversations/<session_id>.jsonl``. Across a
+    clean bridge restart the in-memory entry is gone but the buffer
+    survives, so any request referencing the prior session_id would
+    otherwise return 404.
+
+    This helper bridges that gap: if the session is already in
+    ``_SESSIONS``, return it. Otherwise check the buffer; if turns are
+    present on disk, register a fresh ``SessionState`` (with
+    ``history=[]`` — the engine reads prior turns from the buffer file,
+    so the in-memory list is informational only) and return it. If the
+    buffer has no turns either, return None.
+
+    The hydrated ``last_turn_at`` is read from the buffer's last ts so the
+    silence-timer math (snapshot sweep, finalize cadence) keeps working
+    correctly across restarts. ``created_at`` is set to now — the field
+    documents "when the session was opened in this process," and the
+    Phase B sticky-session contract doesn't promise persistence of
+    ``created_at`` across restarts.
+
+    ``turns`` is recomputed from the buffer (count of user/assistant
+    speaker entries divided by 2, taking floor) so the ``ChatResult.turn``
+    surface stays consistent with disk truth across restart.
+
+    Returns None when neither the registry nor the buffer has the id.
+    """
+    # Import inside the function to avoid a circular import with
+    # brain.ingest, which depends on brain.chat for some types.
+    from brain.ingest.buffer import read_session
+
+    with _LOCK:
+        existing = _SESSIONS.get(session_id)
+        if existing is not None:
+            return existing
+
+        turns = read_session(persona_dir, session_id)
+        if not turns:
+            return None
+
+        # Count user+assistant pairs. The on-disk turn count is the
+        # canonical "how many exchanges has this session had" — match it
+        # so the renderer sees consistent turn numbers across restart.
+        user_count = sum(1 for t in turns if t.get("speaker") == "user")
+        assistant_count = sum(1 for t in turns if t.get("speaker") == "assistant")
+        pair_count = min(user_count, assistant_count)
+
+        last_turn_at: datetime | None = None
+        raw_ts = turns[-1].get("ts")
+        if raw_ts is not None:
+            try:
+                parsed = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                last_turn_at = parsed
+            except (ValueError, TypeError):
+                # Malformed ts — leave last_turn_at None. The silence
+                # sweep will treat that as "no recent activity" and the
+                # session will close on the next supervisor pass.
+                last_turn_at = None
+
+        state = SessionState(
+            session_id=session_id,
+            persona_name=persona_name,
+            created_at=datetime.now(UTC),
+            history=[],
+            turns=pair_count,
+            last_turn_at=last_turn_at,
+        )
+        _SESSIONS[session_id] = state
+        return state
 
 
 def all_sessions() -> list[SessionState]:

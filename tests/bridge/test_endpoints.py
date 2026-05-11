@@ -1,11 +1,13 @@
 """Bridge endpoints — sync TestClient against an in-memory FastAPI app."""
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
+from brain.ingest.buffer import ingest_turn
 
 
 def _make_client(persona_dir: Path) -> TestClient:
@@ -460,3 +462,112 @@ def test_stream_closes_cleanly_after_done(persona_dir: Path, monkeypatch):
                 raise AssertionError("server did not close after done")
             except WebSocketDisconnect as exc:
                 assert exc.code == 1000, f"expected clean close 1000, got {exc.code}"
+
+
+# ---------------------------------------------------------------------------
+# F-201 Phase B — /sessions/active + hydrate-on-miss
+# ---------------------------------------------------------------------------
+
+
+def _seed_buffer(persona_dir: Path, sid: str, *, last_age_hours: float, pairs: int = 1) -> None:
+    """Seed an active_conversations/<sid>.jsonl with ``pairs`` user+assistant
+    turns whose last ts is ``last_age_hours`` in the past."""
+    now = datetime.now(UTC)
+    last_ts = now - timedelta(hours=last_age_hours)
+    for i in range(pairs):
+        # Stamp earlier turns slightly before the last one — order matters
+        # because /sessions/active reads the *last* line.
+        u_ts = last_ts - timedelta(seconds=(pairs - i) * 2)
+        a_ts = last_ts - timedelta(seconds=(pairs - i) * 2 - 1)
+        if i == pairs - 1:
+            a_ts = last_ts  # final assistant turn anchors the age window
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "user", "text": f"u{i}",
+            "ts": u_ts.isoformat(),
+        })
+        ingest_turn(persona_dir, {
+            "session_id": sid, "speaker": "assistant", "text": f"a{i}",
+            "ts": a_ts.isoformat(),
+        })
+
+
+def test_sessions_active_returns_null_when_no_buffers(persona_dir: Path):
+    with _make_client(persona_dir) as c:
+        r = c.get("/sessions/active")
+        assert r.status_code == 200
+        assert r.json() == {"session_id": None}
+
+
+def test_sessions_active_returns_youngest_recent_session(persona_dir: Path):
+    """Two recent buffers — return the one with the most recent last turn."""
+    old_recent = "11111111-1111-1111-1111-111111111111"
+    young_recent = "22222222-2222-2222-2222-222222222222"
+    _seed_buffer(persona_dir, old_recent, last_age_hours=2.0)
+    _seed_buffer(persona_dir, young_recent, last_age_hours=0.5)
+    with _make_client(persona_dir) as c:
+        r = c.get("/sessions/active")
+        assert r.status_code == 200
+        assert r.json() == {"session_id": young_recent}
+
+
+def test_sessions_active_skips_stale_over_24h(persona_dir: Path):
+    """Buffer older than 24h is not attach-eligible."""
+    stale = "33333333-3333-3333-3333-333333333333"
+    _seed_buffer(persona_dir, stale, last_age_hours=25.0)
+    with _make_client(persona_dir) as c:
+        r = c.get("/sessions/active")
+        assert r.json() == {"session_id": None}
+
+
+def test_sessions_active_picks_recent_over_stale(persona_dir: Path):
+    stale = "44444444-4444-4444-4444-444444444444"
+    recent = "55555555-5555-5555-5555-555555555555"
+    _seed_buffer(persona_dir, stale, last_age_hours=48.0)
+    _seed_buffer(persona_dir, recent, last_age_hours=1.0)
+    with _make_client(persona_dir) as c:
+        r = c.get("/sessions/active")
+        assert r.json() == {"session_id": recent}
+
+
+def test_state_hydrates_from_buffer_on_unknown_session(persona_dir: Path):
+    """F-201 Phase B: /state/<sid> hydrates a session whose buffer exists
+    on disk but whose in-memory entry was lost (bridge restart simulation)."""
+    sid = "66666666-6666-6666-6666-666666666666"
+    _seed_buffer(persona_dir, sid, last_age_hours=0.1, pairs=2)
+    with _make_client(persona_dir) as c:
+        r = c.get(f"/state/{sid}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["session_id"] == sid
+        assert body["persona"] == persona_dir.name
+        # 2 user + 2 assistant turns -> 2 pairs.
+        assert body["turns"] == 2
+        # history_len is the in-memory history list, which is empty after
+        # hydration (engine reads the buffer for prompt context).
+        assert body["history_len"] == 0
+
+
+def test_chat_hydrates_from_buffer_on_unknown_session(persona_dir: Path, monkeypatch):
+    """F-201 Phase B: /chat hydrates instead of 404 when a buffer survives a restart."""
+    _patch_fake_provider(monkeypatch, reply="welcome back")
+    sid = "77777777-7777-7777-7777-777777777777"
+    _seed_buffer(persona_dir, sid, last_age_hours=0.1, pairs=1)
+    with _make_client(persona_dir) as c:
+        r = c.post("/chat", json={"session_id": sid, "message": "still here"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["session_id"] == sid
+        assert body["reply"] == "welcome back"
+
+
+def test_sessions_close_hydrates_from_buffer_on_unknown_session(
+    persona_dir: Path, monkeypatch
+):
+    """F-201 Phase B: /sessions/close drains a buffer left over from a restart."""
+    _patch_fake_provider(monkeypatch)
+    sid = "88888888-8888-8888-8888-888888888888"
+    _seed_buffer(persona_dir, sid, last_age_hours=0.1, pairs=1)
+    with _make_client(persona_dir) as c:
+        r = c.post("/sessions/close", json={"session_id": sid})
+        assert r.status_code == 200, r.text
+        assert r.json()["closed"] is True
