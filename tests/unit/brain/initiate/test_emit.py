@@ -54,7 +54,7 @@ def test_emit_is_idempotent_on_source_id(tmp_path: Path) -> None:
     assert len(candidates) == 1
 
 
-def test_emit_handles_missing_persona_dir(tmp_path: Path) -> None:
+def test_emit_creates_queue_when_absent(tmp_path: Path) -> None:
     """If the persona dir doesn't exist, emit creates the queue file under it."""
     persona = tmp_path / "fresh-persona"
     persona.mkdir()  # but no queue file yet
