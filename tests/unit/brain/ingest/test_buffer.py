@@ -9,14 +9,17 @@ from pathlib import Path
 import pytest
 
 from brain.ingest.buffer import (
+    delete_backoff,
     delete_cursor,
     delete_session_buffer,
     ingest_turn,
     list_active_sessions,
+    read_backoff,
     read_cursor,
     read_session,
     read_session_after,
     session_silence_minutes,
+    write_backoff,
     write_cursor,
 )
 
@@ -285,3 +288,62 @@ def test_read_session_after_malformed_cursor_returns_all(tmp_path: Path) -> None
                            "ts": "2026-05-10T20:00:00+00:00"})
     out = read_session_after(tmp_path, sid, "not-a-ts")
     assert len(out) == 1
+
+
+# ---------------------------------------------------------------------------
+# F-011 — backoff sidecar primitives
+# ---------------------------------------------------------------------------
+
+
+def test_read_backoff_missing_returns_none(tmp_path: Path) -> None:
+    assert read_backoff(tmp_path, "sess_abc") is None
+
+
+def test_read_backoff_malformed_returns_none(tmp_path: Path) -> None:
+    (tmp_path / "active_conversations").mkdir(parents=True)
+    backoff_file = tmp_path / "active_conversations" / "sess_abc.backoff"
+    # Not JSON.
+    backoff_file.write_text("not json at all", encoding="utf-8")
+    assert read_backoff(tmp_path, "sess_abc") is None
+    # JSON but wrong shape (list, not dict).
+    backoff_file.write_text("[1, 2, 3]", encoding="utf-8")
+    assert read_backoff(tmp_path, "sess_abc") is None
+    # JSON dict but missing required keys.
+    backoff_file.write_text('{"failures": 2}', encoding="utf-8")
+    assert read_backoff(tmp_path, "sess_abc") is None
+    # Bad ts inside an otherwise well-shaped dict.
+    backoff_file.write_text(
+        '{"failures": 2, "first_failure_at": "garbage"}', encoding="utf-8"
+    )
+    assert read_backoff(tmp_path, "sess_abc") is None
+    # Empty file.
+    backoff_file.write_text("", encoding="utf-8")
+    assert read_backoff(tmp_path, "sess_abc") is None
+
+
+def test_write_and_read_backoff_roundtrip(tmp_path: Path) -> None:
+    write_backoff(
+        tmp_path, "sess_abc", failures=2, first_failure_at="2026-05-10T20:00:00+00:00"
+    )
+    state = read_backoff(tmp_path, "sess_abc")
+    assert state == {
+        "failures": 2,
+        "first_failure_at": "2026-05-10T20:00:00+00:00",
+    }
+
+
+def test_delete_backoff_is_idempotent(tmp_path: Path) -> None:
+    # No file present — must not raise.
+    delete_backoff(tmp_path, "sess_abc")
+    write_backoff(
+        tmp_path, "sess_abc", failures=1, first_failure_at="2026-05-10T20:00:00+00:00"
+    )
+    delete_backoff(tmp_path, "sess_abc")
+    assert read_backoff(tmp_path, "sess_abc") is None
+    # Second delete on missing file — still no-op.
+    delete_backoff(tmp_path, "sess_abc")
+
+
+def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write_backoff(tmp_path, "sess_abc", failures=1, first_failure_at="garbage")

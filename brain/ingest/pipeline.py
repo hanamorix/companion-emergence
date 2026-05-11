@@ -20,17 +20,21 @@ Stage flow:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
+    delete_backoff,
     delete_cursor,
     delete_session_buffer,
     list_active_sessions,
+    read_backoff,
     read_cursor,
     read_session,
     read_session_after,
     session_silence_minutes,
+    write_backoff,
     write_cursor,
 )
 from brain.ingest.commit import commit_item
@@ -43,6 +47,13 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+# F-011 — extraction backoff knobs. After this many consecutive
+# `conversation_snapshot_failed` events for a given session, pause
+# extraction for `_BACKOFF_WINDOW_MINUTES` so we stop burning LLM calls
+# on a wedged buffer. Success clears the state.
+_BACKOFF_FAILURE_THRESHOLD = 3
+_BACKOFF_WINDOW_MINUTES = 10.0
 
 
 def _load_user_name(persona_dir: Path) -> str | None:
@@ -108,6 +119,7 @@ def close_session(
     if not turns:
         delete_session_buffer(persona_dir, session_id)
         delete_cursor(persona_dir, session_id)
+        delete_backoff(persona_dir, session_id)
         return report
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
@@ -196,6 +208,7 @@ def close_session(
     # ── DELETE buffer ─────────────────────────────────────────────────────────
     delete_session_buffer(persona_dir, session_id)
     delete_cursor(persona_dir, session_id)
+    delete_backoff(persona_dir, session_id)
 
     return report
 
@@ -222,6 +235,30 @@ def extract_session_snapshot(
     """
     cfg = config or {}
     report = IngestReport(session_id=session_id)
+
+    # F-011 — backoff guard: if we've failed N consecutive times within the
+    # window, skip extraction entirely until the window expires. Stops the
+    # 5-min snapshot sweep from burning LLM calls on a wedged buffer.
+    backoff_state = read_backoff(persona_dir, session_id)
+    if (
+        backoff_state is not None
+        and backoff_state["failures"] >= _BACKOFF_FAILURE_THRESHOLD
+    ):
+        first_failure_dt = datetime.fromisoformat(
+            backoff_state["first_failure_at"].replace("Z", "+00:00")
+        )
+        if first_failure_dt.tzinfo is None:
+            first_failure_dt = first_failure_dt.replace(tzinfo=UTC)
+        elapsed_min = (datetime.now(UTC) - first_failure_dt).total_seconds() / 60.0
+        if elapsed_min < _BACKOFF_WINDOW_MINUTES:
+            logger.info(
+                "conversation_snapshot_backoff session=%s failures=%d elapsed_min=%.2f",
+                session_id,
+                backoff_state["failures"],
+                elapsed_min,
+            )
+            report.errors += 1
+            return report
 
     cursor = read_cursor(persona_dir, session_id)
     turns = read_session_after(persona_dir, session_id, cursor)
@@ -257,6 +294,25 @@ def extract_session_snapshot(
             len(turns),
             extraction.error or "unknown extraction failure",
         )
+        # F-011 — record failure for backoff tracking. First failure in a
+        # new window anchors first_failure_at to now; subsequent failures
+        # increment the count without moving the anchor (so the window
+        # measures from the *first* failure, not the most recent).
+        existing = read_backoff(persona_dir, session_id)
+        if existing is None:
+            write_backoff(
+                persona_dir,
+                session_id,
+                failures=1,
+                first_failure_at=datetime.now(UTC).isoformat(),
+            )
+        else:
+            write_backoff(
+                persona_dir,
+                session_id,
+                failures=existing["failures"] + 1,
+                first_failure_at=existing["first_failure_at"],
+            )
         return report
 
     items = [it.normalize() for it in extraction.items if it.text]
@@ -283,6 +339,10 @@ def extract_session_snapshot(
                 report.soul_candidates += 1
             else:
                 report.soul_queue_errors += 1
+
+    # F-011 — success clears any prior backoff state so the next failure
+    # starts a fresh window. The wedge (if there was one) is past.
+    delete_backoff(persona_dir, session_id)
 
     # Advance cursor to the ts of the last turn we included. If the last
     # turn lacks a ts (defensive — ingest_turn always writes one), leave
@@ -396,6 +456,7 @@ def finalize_stale_sessions(
         if not turns:
             delete_session_buffer(persona_dir, sid)
             delete_cursor(persona_dir, sid)
+            delete_backoff(persona_dir, sid)
             continue
         age = session_silence_minutes(turns)
         if age < threshold_minutes:
@@ -412,6 +473,7 @@ def finalize_stale_sessions(
             report.errors += 1
         delete_session_buffer(persona_dir, sid)
         delete_cursor(persona_dir, sid)
+        delete_backoff(persona_dir, sid)
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "

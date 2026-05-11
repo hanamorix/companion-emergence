@@ -179,6 +179,60 @@ def delete_cursor(persona_dir: Path, session_id: str) -> None:
     path.unlink(missing_ok=True)
 
 
+def _backoff_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.backoff.
+
+    Sibling sidecar to the cursor file used by extract_session_snapshot
+    to record consecutive extraction failures and pause retries when a
+    buffer is wedged (F-011). Lives next to the cursor rather than
+    folded into it so the cursor stays a single-line atomic ISO ts.
+    """
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.backoff"
+
+
+def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
+    """Return the backoff state ({failures: int, first_failure_at: str}) or
+    None if the file is missing, empty, or malformed."""
+    path = _backoff_path(persona_dir, session_id)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return None
+        if "failures" not in data or "first_failure_at" not in data:
+            return None
+        # Validate ts parses
+        datetime.fromisoformat(str(data["first_failure_at"]).replace("Z", "+00:00"))
+        return data
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def write_backoff(
+    persona_dir: Path, session_id: str, failures: int, first_failure_at: str
+) -> None:
+    """Atomically write the backoff state. Raises ValueError on bad ts."""
+    datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
+    path = _backoff_path(persona_dir, session_id)
+    tmp = path.with_suffix(".backoff.tmp")
+    tmp.write_text(
+        json.dumps({"failures": failures, "first_failure_at": first_failure_at}),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def delete_backoff(persona_dir: Path, session_id: str) -> None:
+    """Idempotent unlink of the backoff sidecar."""
+    path = _backoff_path(persona_dir, session_id)
+    path.unlink(missing_ok=True)
+
+
 def read_session_after(
     persona_dir: Path, session_id: str, after_ts: str | None
 ) -> list[dict]:

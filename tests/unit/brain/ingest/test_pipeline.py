@@ -13,7 +13,9 @@ from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     ingest_turn,
+    read_backoff,
     read_cursor,
+    write_backoff,
     write_cursor,
 )
 from brain.ingest.pipeline import (
@@ -817,3 +819,204 @@ def test_close_session_empty_path_also_deletes_cursor(
 
     cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
     assert not cursor_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# F-011 — extraction backoff
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_records_backoff_on_extraction_failure(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """First failed extraction writes the backoff sidecar with failures=1."""
+    sid = "sess_backoff1"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+
+    provider = _GarbageProvider()
+    report = extract_session_snapshot(
+        tmp_path, sid,
+        store=store, hebbian=hebbian, provider=provider,
+        config={"extraction_max_retries": 0},
+    )
+
+    assert report.errors == 1
+    state = read_backoff(tmp_path, sid)
+    assert state is not None
+    assert state["failures"] == 1
+    # first_failure_at must be a parseable ISO ts.
+    datetime.fromisoformat(state["first_failure_at"].replace("Z", "+00:00"))
+
+
+def test_snapshot_backoff_increments_anchor_stays(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """A second failure increments failures but does NOT move first_failure_at."""
+    sid = "sess_backoff_inc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+    anchor = "2026-05-10T19:00:00+00:00"
+    write_backoff(tmp_path, sid, failures=1, first_failure_at=anchor)
+
+    provider = _GarbageProvider()
+    extract_session_snapshot(
+        tmp_path, sid,
+        store=store, hebbian=hebbian, provider=provider,
+        config={"extraction_max_retries": 0},
+    )
+
+    state = read_backoff(tmp_path, sid)
+    assert state == {"failures": 2, "first_failure_at": anchor}
+
+
+def test_snapshot_backoff_skips_after_threshold_within_window(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    """At failures=3 within the 10-min window, extraction is skipped entirely."""
+    sid = "sess_backoff_skip"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+    # Anchor inside the window.
+    now = datetime.now(UTC).isoformat()
+    write_backoff(tmp_path, sid, failures=3, first_failure_at=now)
+
+    report = extract_session_snapshot(
+        tmp_path, sid,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    # Provider must NOT be called.
+    assert tracking_provider.call_count == 0
+    assert report.errors == 1
+    assert report.extracted == 0
+    # Backoff state is preserved (only success clears it).
+    state = read_backoff(tmp_path, sid)
+    assert state is not None
+    assert state["failures"] == 3
+
+
+def test_snapshot_backoff_resumes_after_window_expires(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    """When the 10-min window has elapsed, extraction runs again."""
+    sid = "sess_backoff_resume"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+    # Anchor well outside the window.
+    stale = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    write_backoff(tmp_path, sid, failures=5, first_failure_at=stale)
+
+    extract_session_snapshot(
+        tmp_path, sid,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    # Provider WAS called this time.
+    assert tracking_provider.call_count == 1
+    # Success cleared the backoff state.
+    assert read_backoff(tmp_path, sid) is None
+
+
+def test_snapshot_backoff_clears_on_success(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """A successful extraction deletes any prior backoff state."""
+    sid = "sess_backoff_clear"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+    # Pre-existing backoff state under the threshold so guard doesn't fire.
+    write_backoff(
+        tmp_path, sid, failures=2,
+        first_failure_at=datetime.now(UTC).isoformat(),
+    )
+
+    provider = _CannedProvider(
+        [{"text": "Hana said hi", "label": "fact", "importance": 4}]
+    )
+    report = extract_session_snapshot(
+        tmp_path, sid,
+        store=store, hebbian=hebbian, provider=provider,
+    )
+
+    assert report.errors == 0
+    assert report.committed >= 1
+    assert read_backoff(tmp_path, sid) is None
+
+
+def test_close_session_deletes_backoff(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+) -> None:
+    """close_session cleans up the backoff sidecar along with buffer + cursor."""
+    sid = "sess_close_backoff"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
+    write_backoff(
+        tmp_path, sid, failures=2,
+        first_failure_at=datetime.now(UTC).isoformat(),
+    )
+
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=canned_provider)
+
+    assert read_backoff(tmp_path, sid) is None
+    backoff_file = tmp_path / "active_conversations" / f"{sid}.backoff"
+    assert not backoff_file.exists()
+
+
+def test_close_session_empty_path_deletes_backoff(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+) -> None:
+    """The empty-buffer early-return path also clears backoff state."""
+    sid = "sess_close_empty_backoff"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+    write_backoff(
+        tmp_path, sid, failures=3,
+        first_failure_at=datetime.now(UTC).isoformat(),
+    )
+
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=canned_provider)
+
+    assert read_backoff(tmp_path, sid) is None
+
+
+def test_finalize_stale_sessions_deletes_backoff(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+) -> None:
+    """finalize_stale_sessions must scrub the backoff sidecar too."""
+    sid = "sess_final_backoff"
+    # Ingest with a stale ts so silence threshold trips.
+    stale_ts = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "Hana", "text": "hi", "ts": stale_ts},
+    )
+    write_backoff(
+        tmp_path, sid, failures=2,
+        first_failure_at=datetime.now(UTC).isoformat(),
+    )
+
+    finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=canned_provider,
+    )
+
+    assert read_backoff(tmp_path, sid) is None
+    backoff_file = tmp_path / "active_conversations" / f"{sid}.backoff"
+    assert not backoff_file.exists()
