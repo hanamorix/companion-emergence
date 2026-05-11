@@ -1104,19 +1104,39 @@ def _soul_candidates_handler(args: argparse.Namespace) -> int:
 
 
 def _soul_audit_handler(args: argparse.Namespace) -> int:
-    """Dispatch `nell soul audit` — tail soul_audit.jsonl."""
+    """Dispatch `nell soul audit` — tail soul_audit.jsonl.
+
+    Default: shows the last ``--limit`` entries from the active log only.
+    With ``--full``: walks active + every yearly archive
+    (``soul_audit.YYYY.jsonl.gz``) in chronological order so every decision
+    Nell has ever made about her own soul is visible. Hana's call
+    2026-05-11: "soul memories need to be accessible at every point."
+    """
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(
             f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
         )
 
-    from brain.soul.audit import read_audit_log
+    full = getattr(args, "full", False)
+    if full:
+        from brain.soul.audit import iter_audit_full
 
-    limit = getattr(args, "limit", 20)
-    entries = read_audit_log(persona_dir, limit=limit)
+        entries = list(iter_audit_full(persona_dir))
+        header = (
+            f"Soul audit log for persona {args.persona!r} "
+            f"(full history — {len(entries)} entries across active + archives):"
+        )
+    else:
+        from brain.soul.audit import read_audit_log
 
-    print(f"Soul audit log for persona {args.persona!r} (last {len(entries)} entries):")
+        limit = getattr(args, "limit", 20)
+        entries = read_audit_log(persona_dir, limit=limit)
+        header = (
+            f"Soul audit log for persona {args.persona!r} (last {len(entries)} entries):"
+        )
+
+    print(header)
     if not entries:
         print("  (empty)")
         return 0
@@ -2224,6 +2244,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sl_audit.add_argument("--persona", required=True, help="Persona name (required).")
     sl_audit.add_argument(
         "--limit", type=int, default=20, help="Show only the last N entries (default 20)."
+    )
+    sl_audit.add_argument(
+        "--full",
+        action="store_true",
+        help="Walk active + every yearly archive (.YYYY.jsonl.gz) chronologically. "
+        "Use to see every decision Nell has ever made about her own soul.",
     )
     sl_audit.set_defaults(func=_soul_audit_handler)
 
