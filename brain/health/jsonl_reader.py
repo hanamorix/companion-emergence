@@ -13,6 +13,7 @@ raw text plus the list of split lines).
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from collections.abc import Iterator
@@ -83,3 +84,47 @@ def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:
     still avoids the previous memory spike.
     """
     return list(iter_jsonl_skipping_corrupt(path))
+
+
+def iter_jsonl_streaming(path: Path) -> Iterator[dict]:
+    """Stream JSONL entries from ``path``, transparently handling ``.gz``.
+
+    Same per-line resilience as :func:`iter_jsonl_skipping_corrupt`: a
+    malformed or non-dict line emits a warning and is skipped, not
+    aborted on. Whether the file is gzipped is detected by the
+    ``.gz`` suffix.
+
+    Returns immediately if the path doesn't exist (no error). Use this
+    when a caller needs to fan out across active + rotated archives.
+    """
+    if not path.exists():
+        return
+    is_gz = path.suffix == ".gz"
+    open_fn = gzip.open if is_gz else open
+    with open_fn(path, "rt", encoding="utf-8") as fh:
+        for line_index, raw in enumerate(fh, start=1):
+            stripped = raw.rstrip("\r\n")
+            if not stripped.strip():
+                continue
+            try:
+                data = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "skipping malformed jsonl line %d in %s: %s | content: %r",
+                    line_index,
+                    path,
+                    exc,
+                    stripped[:201],
+                )
+                continue
+            if isinstance(data, dict):
+                yield data
+            else:
+                logger.warning(
+                    "skipping non-dict jsonl line %d in %s "
+                    "(value type=%s) | content: %r",
+                    line_index,
+                    path,
+                    type(data).__name__,
+                    stripped[:201],
+                )

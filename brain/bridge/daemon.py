@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -442,10 +443,12 @@ def cmd_tail_log(args) -> int:
     n = max(0, int(args.lines))
     try:
         with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-            tail = lines[-n:] if n > 0 else []
-            for line in tail:
-                print(line, end="")
+            # deque(maxlen=n) keeps only the last n lines in memory as it
+            # iterates the file — bounded regardless of log size, unlike
+            # f.readlines() which materialised the whole file before slicing.
+            if n > 0:
+                for line in deque(f, maxlen=n):
+                    print(line, end="")
             if not getattr(args, "follow", False):
                 return 0
             # Follow mode: seek to end, poll for new content

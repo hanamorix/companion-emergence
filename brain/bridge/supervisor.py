@@ -42,6 +42,10 @@ from pathlib import Path
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
+from brain.health.log_rotation import (
+    rotate_age_archive_yearly,
+    rotate_rolling_size,
+)
 from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
@@ -65,6 +69,7 @@ def run_folded(
     soul_review_interval_s: float | None = 6 * 3600.0,
     finalize_after_hours: float = 24.0,
     finalize_interval_s: float | None = 3600.0,
+    log_rotation_interval_s: float | None = 3600.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -105,6 +110,9 @@ def run_folded(
     )
     last_finalize_at = (
         time.monotonic() if finalize_interval_s is not None else None
+    )
+    last_log_rotation_at = (
+        time.monotonic() if log_rotation_interval_s is not None else None
     )
     while not stop_event.is_set():
         try:
@@ -207,6 +215,21 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor finalize tick raised")
             last_finalize_at = time.monotonic()
+
+        # Log-rotation cadence — hourly default. Bounded JSONL archives so
+        # heartbeats/dreams/emotion_growth don't grow forever; yearly
+        # archive for soul_audit (every decision must remain reachable).
+        # Fault-isolated per-log inside the tick function.
+        if (
+            log_rotation_interval_s is not None
+            and last_log_rotation_at is not None
+            and time.monotonic() - last_log_rotation_at >= log_rotation_interval_s
+        ):
+            try:
+                _run_log_rotation_tick(persona_dir, event_bus)
+            except Exception:
+                logger.exception("supervisor log-rotation tick raised")
+            last_log_rotation_at = time.monotonic()
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -408,6 +431,101 @@ def _run_finalize_tick(
                 "committed": r.committed,
                 "deduped": r.deduped,
                 "errors": r.errors,
+                "at": _now_iso(),
+            }
+        )
+
+
+# Per-log retention policies. Bake the cadence-tick policies here so the
+# supervisor doesn't need a config file; defaults reflect Hana's 2026-05-11
+# decisions (5 MB rolling cap; 3 archives for heartbeats, 5 for dreams +
+# emotion_growth; yearly archive for soul_audit kept forever).
+_ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
+    ("heartbeats.log.jsonl", 3),
+    ("dreams.log.jsonl", 5),
+    ("emotion_growth.log.jsonl", 5),
+)
+_SOUL_AUDIT_LOG = "soul_audit.jsonl"
+_DEFAULT_ROLLING_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _run_log_rotation_tick(
+    persona_dir: Path,
+    event_bus: EventBus | object,
+    *,
+    rolling_size_bytes: int = _DEFAULT_ROLLING_BYTES,
+    now: datetime | None = None,
+) -> None:
+    """Rotate JSONL audit logs per the baked policy table.
+
+    Fault-isolated per-log: a failure in one rotation doesn't block the
+    others. Each successful rotation publishes a structured
+    ``log_rotation`` event.
+
+    Args:
+        persona_dir: persona root; logs live as immediate children.
+        event_bus: target for ``log_rotation`` events.
+        rolling_size_bytes: cap for rolling-size rotation (test override).
+        now: current datetime (test override for yearly archive).
+    """
+    # Rolling-size logs.
+    for log_name, keep in _ROLLING_LOG_POLICIES:
+        log_path = persona_dir / log_name
+        try:
+            archive = rotate_rolling_size(
+                log_path, max_bytes=rolling_size_bytes, archive_keep=keep
+            )
+        except Exception as exc:
+            logger.exception(
+                "log rotation failed for %s: %s", log_name, exc
+            )
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "failed",
+                    "error": str(exc),
+                    "at": _now_iso(),
+                }
+            )
+            continue
+        if archive is not None:
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "rotated",
+                    "archive": archive.name,
+                    "at": _now_iso(),
+                }
+            )
+
+    # Soul audit — yearly archive, archives kept forever. Reader (iter_audit_full)
+    # walks active + every archive so every decision stays reachable.
+    audit_path = persona_dir / _SOUL_AUDIT_LOG
+    try:
+        archives = rotate_age_archive_yearly(
+            audit_path, now=now, timestamp_field="ts"
+        )
+    except Exception as exc:
+        logger.exception("soul_audit yearly rotation failed: %s", exc)
+        event_bus.publish(
+            {
+                "type": "log_rotation",
+                "log": _SOUL_AUDIT_LOG,
+                "action": "failed",
+                "error": str(exc),
+                "at": _now_iso(),
+            }
+        )
+        return
+    for archive in archives:
+        event_bus.publish(
+            {
+                "type": "log_rotation",
+                "log": _SOUL_AUDIT_LOG,
+                "action": "archived",
+                "archive": archive.name,
                 "at": _now_iso(),
             }
         )
