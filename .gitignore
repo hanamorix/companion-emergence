@@ -103,3 +103,4 @@ bugs/
 mock-ups/
 .public-sync/
 tmp/
+.coverage
