@@ -172,6 +172,26 @@ natural extensions of the multimodal + bundled-runtime work:
 
 ## Recently shipped (reverse chronological)
 
+**2026-05-11 — JSONL log retention (autonomous physiology)**
+
+- New supervisor tick `_run_log_rotation_tick` on hourly cadence — same
+  fault-isolation + cadence-tracking shape as heartbeat / soul-review /
+  finalize.
+- Rolling-size archives for noisy logs at 5 MB cap: `heartbeats.log.jsonl`
+  keeps 3 archives; `dreams.log.jsonl` + `emotion_growth.log.jsonl`
+  keep 5 each.
+- Yearly archive for `soul_audit.jsonl` — archives kept forever per
+  the project's "every decision must remain reachable" principle. New
+  fan-out reader `iter_audit_full` walks active + every
+  `soul_audit.YYYY.jsonl.gz` chronologically; `nell soul audit --full`
+  surfaces it.
+- Defense-in-depth: `save_image_bytes` now sniffs magic bytes inside
+  the function (the bridge `/upload` endpoint already sniffed at the
+  network boundary; this closes the library-caller gap).
+- Hygiene: `cli.py` docstrings refreshed (no more "stub subcommand"
+  claims); `cmd_tail_log` switched to `deque(f, maxlen=n)` so bridge
+  log tail stays bounded regardless of file size.
+
 **2026-05-07 (end-of-day) — wizard validation + close-handshake fixes**
 
 - Wizard validation runbook + staging env at `~/wizard-validation/`
