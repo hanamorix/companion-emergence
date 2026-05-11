@@ -125,8 +125,12 @@ def test_save_image_bytes_dedupes_identical_content(tmp_path: Path) -> None:
 
 
 def test_save_image_bytes_distinct_content_distinct_files(tmp_path: Path) -> None:
-    save_image_bytes(tmp_path, _TINY_PNG, "image/png")
-    save_image_bytes(tmp_path, b"different bytes", "image/png")
+    # Use two valid-signature PNGs with different trailing bytes so the sha
+    # differs but the magic-byte sniff in save_image_bytes still passes.
+    png_a = _TINY_PNG
+    png_b = _TINY_PNG[:-4] + b"\x00\x00\x00\x00"
+    save_image_bytes(tmp_path, png_a, "image/png")
+    save_image_bytes(tmp_path, png_b, "image/png")
     files = list((tmp_path / "images").iterdir())
     assert len(files) == 2
 
@@ -134,6 +138,25 @@ def test_save_image_bytes_distinct_content_distinct_files(tmp_path: Path) -> Non
 def test_save_image_bytes_rejects_unsupported_media_type(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="media_type"):
         save_image_bytes(tmp_path, _TINY_PNG, "application/pdf")
+
+
+def test_save_image_bytes_rejects_mismatched_bytes(tmp_path: Path) -> None:
+    """Declared media_type must match the magic-byte signature.
+
+    Defense in depth — the bridge /upload endpoint already sniffs at the
+    boundary, but library callers (migration scripts, internal workers)
+    shouldn't be able to write bytes whose signature contradicts the
+    extension they'll be stored under.
+    """
+    gif_bytes = b"GIF89a" + b"\x00" * 20
+    with pytest.raises(ValueError, match="signature|magic|bytes"):
+        save_image_bytes(tmp_path, gif_bytes, "image/png")
+
+
+def test_save_image_bytes_rejects_unrecognized_bytes(tmp_path: Path) -> None:
+    """Bytes that match no known image signature are refused."""
+    with pytest.raises(ValueError, match="signature|magic|bytes"):
+        save_image_bytes(tmp_path, b"not an image at all", "image/png")
 
 
 def test_save_image_bytes_no_new_residue_on_success(tmp_path: Path) -> None:
