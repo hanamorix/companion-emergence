@@ -81,6 +81,15 @@ class EmbeddingCache:
 
     def __init__(self, db_path: str | Path, provider: EmbeddingProvider) -> None:
         self._conn = sqlite3.connect(str(db_path))
+        # WAL + 5s busy_timeout — supervisor opens this cache from a
+        # background thread; without WAL, any concurrent reader/writer
+        # surfaces as `database is locked`. In-memory dbs reject WAL;
+        # fallback keeps `:memory:` working in tests.
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(self._SCHEMA)
         self._conn.commit()
         self._provider = provider
