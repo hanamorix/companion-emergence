@@ -742,13 +742,19 @@ def test_acquire_lock_returns_none_on_garbage_pid(
 def test_release_lock_is_idempotent_after_external_unlink(
     tmp_path: Path,
 ) -> None:
-    """release_lock must not raise if the lockfile was already removed."""
+    """release_lock must not raise if the lockfile was already removed.
+
+    POSIX permits unlinking a file while its fd is still open, but Windows
+    raises WinError 32. Close the fd first so the test exercises the same
+    release_lock idempotence contract without relying on POSIX-only semantics.
+    """
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     fd = daemon.acquire_lock(persona_dir)
     assert fd is not None
+    os.close(fd)
     (persona_dir / daemon.LOCKFILE).unlink()  # simulate external removal
-    daemon.release_lock(persona_dir, fd)  # must not raise
+    daemon.release_lock(persona_dir, fd)  # must not raise on closed fd + missing path
 
 
 # ---------- spawn_detached (lines 117-148) ----------
