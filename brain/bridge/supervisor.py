@@ -445,7 +445,12 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("dreams.log.jsonl", 5),
     ("emotion_growth.log.jsonl", 5),
 )
-_SOUL_AUDIT_LOG = "soul_audit.jsonl"
+# Yearly-archive logs are kept forever — reader walks active + every archive
+# so every decision / initiation event stays reachable.
+_YEARLY_ARCHIVE_LOGS: tuple[tuple[str, str], ...] = (
+    ("soul_audit.jsonl", "ts"),
+    ("initiate_audit.jsonl", "ts"),
+)
 _DEFAULT_ROLLING_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
@@ -500,35 +505,35 @@ def _run_log_rotation_tick(
                 }
             )
 
-    # Soul audit — yearly archive, archives kept forever. Reader (iter_audit_full)
-    # walks active + every archive so every decision stays reachable.
-    audit_path = persona_dir / _SOUL_AUDIT_LOG
-    try:
-        archives = rotate_age_archive_yearly(
-            audit_path, now=now, timestamp_field="ts"
-        )
-    except Exception as exc:
-        logger.exception("soul_audit yearly rotation failed: %s", exc)
-        event_bus.publish(
-            {
-                "type": "log_rotation",
-                "log": _SOUL_AUDIT_LOG,
-                "action": "failed",
-                "error": str(exc),
-                "at": _now_iso(),
-            }
-        )
-        return
-    for archive in archives:
-        event_bus.publish(
-            {
-                "type": "log_rotation",
-                "log": _SOUL_AUDIT_LOG,
-                "action": "archived",
-                "archive": archive.name,
-                "at": _now_iso(),
-            }
-        )
+    # Yearly-archive logs (forever-keep): soul_audit + initiate_audit.
+    for log_name, ts_field in _YEARLY_ARCHIVE_LOGS:
+        audit_path = persona_dir / log_name
+        try:
+            archives = rotate_age_archive_yearly(
+                audit_path, now=now, timestamp_field=ts_field
+            )
+        except Exception as exc:
+            logger.exception("%s yearly rotation failed: %s", log_name, exc)
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "failed",
+                    "error": str(exc),
+                    "at": _now_iso(),
+                }
+            )
+            continue
+        for archive in archives:
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "archived",
+                    "archive": archive.name,
+                    "at": _now_iso(),
+                }
+            )
 
 
 def _now_iso() -> str:
