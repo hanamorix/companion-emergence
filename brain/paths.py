@@ -8,12 +8,33 @@ with NELLBRAIN_HOME env var for full override.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from platformdirs import PlatformDirs
 
 _APP_NAME = "companion-emergence"
 _APP_AUTHOR = "hanamorix"
+
+_PERSONA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def validate_persona_name(name: str) -> None:
+    """Raise ValueError if `name` would land outside <home>/personas/.
+
+    Persona names become directory names. Reject anything that could
+    escape the personas/ root (slashes, dotdot, empty, oversize) or
+    break str.format_map prompt rendering (literal '{' / '}'). The
+    grammar is ``[A-Za-z0-9_-]{1,40}`` — no slashes, dots, spaces, or
+    special characters. This is the single shared validator used by
+    both :func:`get_persona_dir` and ``brain.setup.validate_persona_name``
+    (which re-exports it).
+    """
+    if not isinstance(name, str) or not _PERSONA_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"invalid persona name {name!r} — must match "
+            f"[A-Za-z0-9_-]{{1,40}} (no slashes, dots, or spaces)"
+        )
 
 # PlatformDirs properties are evaluated lazily (env vars read at
 # property-access time, not at construction), so module-level
@@ -41,17 +62,12 @@ def get_home() -> Path:
 def get_persona_dir(name: str) -> Path:
     """Return the directory for a specific persona's private data.
 
-    Raises ValueError if `name` could escape the personas/ root via path
-    traversal ('/' or '\\') or break str.format_map prompt rendering
-    (literal '{' or '}'), or equals '.' / '..'.
+    Delegates name validation to :func:`validate_persona_name` — the
+    single source of truth for the persona-name grammar, shared with
+    ``brain.setup``. Raises ValueError on any input that doesn't match
+    ``[A-Za-z0-9_-]{1,40}``.
     """
-    if not name:
-        raise ValueError("Persona name cannot be empty.")
-    if "/" in name or "\\" in name or "{" in name or "}" in name or name in (".", ".."):
-        raise ValueError(
-            f"Invalid persona name: {name!r} "
-            "(must not contain '/', '\\\\', '{', '}', or be '.' / '..')."
-        )
+    validate_persona_name(name)
     return get_home() / "personas" / name
 
 
