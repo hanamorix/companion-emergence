@@ -4,8 +4,8 @@
 // P2-9 cancel control, and the persona-aware placeholder so future
 // hardcoded "Nell" doesn't sneak back in.
 
-import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -78,6 +78,60 @@ describe("ChatPanel — image-only + cancel + placeholder (P4-2)", () => {
     // here would crash the chat surface entirely.
     render(<ChatPanel persona="x" />);
     expect(screen.getByPlaceholderText(/^Write to X/)).toBeInTheDocument();
+  });
+});
+
+describe("ChatPanel — staged image URL lifetime (F-007)", () => {
+  let createSpy: ReturnType<typeof vi.spyOn>;
+  let revokeSpy: ReturnType<typeof vi.spyOn>;
+  let urlCounter = 0;
+
+  beforeEach(() => {
+    urlCounter = 0;
+    createSpy = vi
+      .spyOn(URL, "createObjectURL")
+      .mockImplementation(() => `blob:test-${++urlCounter}`);
+    revokeSpy = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+    createSpy.mockRestore();
+    revokeSpy.mockRestore();
+  });
+
+  it("revokes a staged-but-unsent preview URL on unmount", async () => {
+    const { container, unmount } = render(<ChatPanel persona="nell" />);
+
+    // The hidden <input type="file"> is the staging surface. Drive it
+    // directly — clicking the paperclip just forwards to fileInputRef.
+    const fileInput = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    expect(fileInput).not.toBeNull();
+
+    const file = new File(["fake-bytes"], "shot.png", { type: "image/png" });
+
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } });
+    });
+
+    // Wait for the staged thumbnail to appear so we know handleFile ran
+    // through createObjectURL.
+    await waitFor(() => {
+      expect(createSpy).toHaveBeenCalledTimes(1);
+    });
+    const stagedUrl = createSpy.mock.results[0]?.value as string;
+    expect(stagedUrl).toMatch(/^blob:test-/);
+
+    // Unmount WITHOUT sending — this is the leak path the fix closes.
+    unmount();
+
+    // The cleanup sweep at ChatPanel.tsx:159-160 should have revoked the
+    // staged URL because the fix tracks it at creation time, not send time.
+    expect(revokeSpy).toHaveBeenCalledWith(stagedUrl);
   });
 });
 
