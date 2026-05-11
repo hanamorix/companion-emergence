@@ -102,3 +102,4 @@ migrated-*/
 bugs/
 mock-ups/
 .public-sync/
+tmp/
