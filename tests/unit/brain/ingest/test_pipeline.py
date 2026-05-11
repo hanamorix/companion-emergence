@@ -1,4 +1,5 @@
-"""Tests for brain.ingest.pipeline — close_session + close_stale_sessions."""
+"""Tests for brain.ingest.pipeline — close_session, close_stale_sessions,
+extract_session_snapshot, snapshot_stale_sessions, finalize_stale_sessions."""
 
 from __future__ import annotations
 
@@ -10,8 +11,18 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
-from brain.ingest.buffer import ingest_turn
-from brain.ingest.pipeline import close_session, close_stale_sessions
+from brain.ingest.buffer import (
+    ingest_turn,
+    read_cursor,
+    write_cursor,
+)
+from brain.ingest.pipeline import (
+    close_session,
+    close_stale_sessions,
+    extract_session_snapshot,
+    finalize_stale_sessions,
+    snapshot_stale_sessions,
+)
 from brain.ingest.soul_queue import list_soul_candidates
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -48,6 +59,40 @@ class _GarbageProvider(LLMProvider):
 
     def chat(self, messages: list[ChatMessage], *, tools=None, options=None) -> ChatResponse:
         return ChatResponse(content="garbage", tool_calls=())
+
+
+class _TrackingProvider(LLMProvider):
+    """Canned provider that also records what was sent.
+
+    Used by snapshot tests that need to assert on which turns ended up in
+    the extraction prompt (cursor-driven filtering).
+    """
+
+    def __init__(self, items: list[dict] | None = None) -> None:
+        self._payload = json.dumps(items if items is not None else [])
+        self.call_count = 0
+        self.last_transcript: str | None = None
+
+    def reset_calls(self) -> None:
+        self.call_count = 0
+        self.last_transcript = None
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        self.call_count += 1
+        self.last_transcript = prompt
+        return self._payload
+
+    def name(self) -> str:
+        return "fake-tracking"
+
+    def chat(self, messages, *, tools=None, options=None):
+        self.call_count += 1
+        return ChatResponse(content=self._payload, tool_calls=())
+
+
+@pytest.fixture
+def tracking_provider() -> _TrackingProvider:
+    return _TrackingProvider()
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +448,372 @@ def test_close_session_falls_back_to_legacy_when_user_name_unset(
     assert "is the human user" not in p
     # Generic 'user:' label preserved
     assert "user: hi" in p
+
+
+# ---------------------------------------------------------------------------
+# extract_session_snapshot tests
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_preserves_buffer_and_writes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "I love watercolour"})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "noted"})
+
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists(), "snapshot must NOT delete the buffer"
+    assert report.session_id == sid
+    cursor = read_cursor(tmp_path, sid)
+    assert cursor is not None, "snapshot must write the cursor"
+
+
+def test_snapshot_with_cursor_only_extracts_new_turns(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "old",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "new",
+                           "ts": "2026-05-10T20:05:00+00:00"})
+
+    tracking_provider.reset_calls()
+    extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.last_transcript is not None
+    assert "new" in tracking_provider.last_transcript
+    assert "old" not in tracking_provider.last_transcript
+
+
+def test_snapshot_with_no_new_turns_skips_provider_call(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x",
+                           "ts": "2026-05-10T20:00:00+00:00"})
+    write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
+
+    tracking_provider.reset_calls()
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.call_count == 0
+    assert report.extracted == 0
+
+
+def test_snapshot_malformed_cursor_falls_back_to_full(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.cursor").write_text("garbage")
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "hello"})
+
+    tracking_provider.reset_calls()
+    extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert tracking_provider.last_transcript is not None
+    assert "hello" in tracking_provider.last_transcript
+
+
+def test_snapshot_on_empty_buffer_returns_empty_report(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+
+    tracking_provider.reset_calls()
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert report.extracted == 0
+    assert tracking_provider.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# snapshot_stale_sessions tests
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_stale_sessions_keeps_buffer_alive(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "earlier", "ts": old_ts})
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert len(reports) == 1
+    assert reports[0].session_id == sid
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists(), "snapshot sweep must NOT delete the buffer"
+
+
+def test_snapshot_stale_sessions_skips_fresh_sessions(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "just now"})
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert reports == []
+
+
+def test_snapshot_stale_sessions_cleans_ghost_buffer(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    """A buffer file with no readable turns (corrupt / never-written) is
+    silently cleaned up without generating a report."""
+    sid = "sess_ghost"
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert reports == []
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert not buf.exists(), "ghost buffer should be cleaned up"
+
+
+def test_snapshot_stale_sessions_per_session_error_isolation(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If reading one session's buffer raises (corrupt buffer / FS error),
+    the sweep must continue to the next session — not abort the whole loop."""
+    sid_bad = "sess_bad"
+    sid_good = "sess_good"
+    old = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid_bad, "speaker": "user",
+                           "text": "boom", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_good, "speaker": "user",
+                           "text": "ok", "ts": old})
+
+    import brain.ingest.pipeline as pipeline_mod
+
+    real_read = pipeline_mod.read_session
+
+    def selective_raise(persona_dir, session_id):
+        if session_id == sid_bad:
+            raise OSError("simulated disk error")
+        return real_read(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline_mod, "read_session", selective_raise)
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    # The good session still produced a report; the bad one was skipped
+    # via the per-session try/except and the loop continued.
+    sids_reported = {r.session_id for r in reports}
+    assert sid_good in sids_reported, "good session should still be snapshotted"
+    assert sid_bad not in sids_reported, "bad session should NOT produce a report"
+
+
+# ---------------------------------------------------------------------------
+# finalize_stale_sessions tests
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_under_threshold_skips(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    recent = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "x", "ts": recent})
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert reports == []
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    assert buf.exists()
+
+
+def test_finalize_at_threshold_deletes_buffer_and_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    sid = "sess_abc"
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "x", "ts": old})
+    write_cursor(tmp_path, sid, old)
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=tracking_provider,
+    )
+
+    assert len(reports) == 1
+    assert reports[0].session_id == sid
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not buf.exists(), "finalize must delete the buffer"
+    assert not cursor_file.exists(), "finalize must delete the cursor"
+
+
+def test_finalize_per_session_error_isolation(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """A provider that raises on the first call shouldn't abort the whole sweep —
+    both stale sessions must still be reported and cleaned up."""
+
+    class _ExplodingOnceProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("model down")
+            return "[]"
+
+        def name(self) -> str:
+            return "fake-exploding"
+
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="[]", tool_calls=())
+
+    sid_a = "sess_aaa"
+    sid_b = "sess_bbb"
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid_a, "speaker": "user", "text": "a", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_b, "speaker": "user", "text": "b", "ts": old})
+
+    reports = finalize_stale_sessions(
+        tmp_path,
+        finalize_after_hours=24.0,
+        store=store, hebbian=hebbian, provider=_ExplodingOnceProvider(),
+    )
+
+    # Both stale sessions reach finalize regardless of the first one exploding.
+    assert len(reports) == 2
+    # Both buffers cleaned up after their finalize attempt.
+    for sid in (sid_a, sid_b):
+        buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+        assert not buf.exists()
+
+
+# ---------------------------------------------------------------------------
+# close_session cursor cleanup tests
+# ---------------------------------------------------------------------------
+
+
+def test_close_session_full_path_also_deletes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+) -> None:
+    """Explicit close must clean up the cursor sidecar alongside the buffer."""
+    sid = "sess_close_cur"
+    for speaker, text in [("Hana", "hi"), ("Nell", "hello"), ("Hana", "bye")]:
+        ingest_turn(tmp_path, {"session_id": sid, "speaker": speaker, "text": text})
+    write_cursor(tmp_path, sid, datetime.now(UTC).isoformat())
+
+    provider = _CannedProvider([
+        {"text": "test memory", "label": "fact", "importance": 5},
+    ])
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=provider)
+
+    buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not buf.exists()
+    assert not cursor_file.exists()
+
+
+def test_close_session_empty_path_also_deletes_cursor(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+) -> None:
+    """Empty-session early-return path must also clean up the cursor."""
+    sid = "sess_empty_cur"
+    # Empty buffer file + stale cursor.
+    (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
+    write_cursor(tmp_path, sid, datetime.now(UTC).isoformat())
+
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=canned_provider)
+
+    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
+    assert not cursor_file.exists()
