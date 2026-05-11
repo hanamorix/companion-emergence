@@ -454,9 +454,7 @@ def close_stale_sessions(
     """
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
-        from brain.ingest.buffer import read_session as _read
-
-        turns = _read(persona_dir, sid)
+        turns = read_session(persona_dir, sid)
         if not turns:
             # Ghost file — clean it up without generating a report.
             delete_session_buffer(persona_dir, sid)
