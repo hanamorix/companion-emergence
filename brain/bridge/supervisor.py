@@ -50,9 +50,11 @@ from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
 )
+from brain.initiate.review import run_initiate_review_tick
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ def run_folded(
     finalize_after_hours: float = 24.0,
     finalize_interval_s: float | None = 3600.0,
     log_rotation_interval_s: float | None = 3600.0,
+    initiate_review_interval_s: float | None = 900.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -113,6 +116,9 @@ def run_folded(
     )
     last_log_rotation_at = (
         time.monotonic() if log_rotation_interval_s is not None else None
+    )
+    last_initiate_review_at = (
+        time.monotonic() if initiate_review_interval_s is not None else None
     )
     while not stop_event.is_set():
         try:
@@ -230,6 +236,20 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor log-rotation tick raised")
             last_log_rotation_at = time.monotonic()
+
+        # Initiate review cadence — mirrors soul_review. Per-pass cost cap
+        # (3 candidates max). Fault-isolated.
+        if (
+            initiate_review_interval_s is not None
+            and last_initiate_review_at is not None
+            and time.monotonic() - last_initiate_review_at
+            >= initiate_review_interval_s
+        ):
+            try:
+                _run_initiate_review_tick(persona_dir, provider, event_bus)
+            except Exception:
+                logger.exception("supervisor initiate-review tick raised")
+            last_initiate_review_at = time.monotonic()
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -434,6 +454,41 @@ def _run_finalize_tick(
                 "at": _now_iso(),
             }
         )
+
+
+def _run_initiate_review_tick(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus | object,
+) -> None:
+    """Build voice template + invoke run_initiate_review_tick.
+
+    Mirrors _run_soul_review_tick's per-tick store-ownership pattern.
+    Reads ``nell-voice.md`` from the persona dir (empty string if absent)
+    and ``initiate_review_cap_per_tick`` from PersonaConfig (default 3).
+    Publishes an ``initiate_review_tick`` event on success.
+    """
+    voice_path = persona_dir / "nell-voice.md"
+    voice_template = (
+        voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
+    )
+    try:
+        config = PersonaConfig.load(persona_dir / "persona_config.json")
+        cap_per_tick = getattr(config, "initiate_review_cap_per_tick", 3) or 3
+    except Exception:
+        cap_per_tick = 3
+    run_initiate_review_tick(
+        persona_dir,
+        provider=provider,
+        voice_template=voice_template,
+        cap_per_tick=cap_per_tick,
+    )
+    event_bus.publish(
+        {
+            "type": "initiate_review_tick",
+            "at": _now_iso(),
+        }
+    )
 
 
 # Per-log retention policies. Bake the cadence-tick policies here so the
