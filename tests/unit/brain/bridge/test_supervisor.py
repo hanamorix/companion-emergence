@@ -315,7 +315,7 @@ def _write_oversize_log(persona_dir: Path, name: str, size_bytes: int) -> Path:
 def test_run_log_rotation_tick_rotates_oversize_heartbeat(tmp_path: Path) -> None:
     """An oversize heartbeats.log.jsonl gets rotated to .1.gz."""
     persona_dir = _persona_dir(tmp_path)
-    log = _write_oversize_log(persona_dir, "heartbeats.log.jsonl", size_bytes=200_000)
+    _write_oversize_log(persona_dir, "heartbeats.log.jsonl", size_bytes=200_000)
     bus = _CapturingBus()
 
     # Force the cap small so the seeded log trips it.
@@ -355,6 +355,23 @@ def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
     ]
     assert len(remaining) == 1
     assert remaining[0]["seq"] == 1
+
+
+def test_run_log_rotation_tick_archives_old_year_in_initiate_audit(
+    tmp_path: Path,
+) -> None:
+    """initiate_audit.jsonl with 2024 entries → archived to .2024.jsonl.gz."""
+    persona_dir = _persona_dir(tmp_path)
+    audit = persona_dir / "initiate_audit.jsonl"
+    import json as _json
+    with audit.open("w", encoding="utf-8") as f:
+        f.write(_json.dumps({"ts": "2024-06-15T00:00:00+00:00", "seq": 0}) + "\n")
+        f.write(_json.dumps({"ts": "2026-06-15T00:00:00+00:00", "seq": 1}) + "\n")
+    bus = _CapturingBus()
+    _run_log_rotation_tick(
+        persona_dir, bus, now=datetime(2026, 5, 11, tzinfo=UTC)
+    )
+    assert (persona_dir / "initiate_audit.2024.jsonl.gz").exists()
 
 
 def test_run_log_rotation_tick_no_op_when_within_caps(tmp_path: Path) -> None:
