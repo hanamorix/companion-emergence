@@ -140,6 +140,7 @@ def run_folded(
                     {
                         "type": "session_snapshot",
                         "session_id": r.session_id,
+                        "extracted_since_cursor": r.extracted,
                         "committed": r.committed,
                         "deduped": r.deduped,
                         "soul_candidates": r.soul_candidates,
