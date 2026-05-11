@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -136,3 +137,18 @@ def test_cache_roundtrip_vector_values_match(
     cache.get_or_compute("roundtrip")  # store
     actual = cache.get_or_compute("roundtrip")  # read from cache
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_embedding_cache_sets_wal_and_busy_timeout(tmp_path: Path) -> None:
+    """Concurrent-write safety: EmbeddingCache must enable WAL and a
+    busy_timeout to match the rest of the brain's SQLite stores."""
+    from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+
+    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
+    try:
+        journal_mode = cache._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy_timeout = cache._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        cache.close()
+    assert journal_mode.lower() == "wal", f"expected WAL, got {journal_mode}"
+    assert busy_timeout >= 5000, f"expected busy_timeout >= 5000, got {busy_timeout}"
