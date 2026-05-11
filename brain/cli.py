@@ -1,8 +1,7 @@
 """Entry point CLI for companion-emergence.
 
-Invoked as `nell <subcommand> [options]`. Week 1 ships `--version`, help,
-and a set of stub subcommands that print "not implemented yet" so the CLI
-surface is stable while subsequent weeks fill in functionality.
+Invoked as `nell <subcommand> [options]`. All Week-1 framework stubs have
+since shipped — see the resolved-stubs note below `_build_args_from_config`.
 """
 
 from __future__ import annotations
@@ -1625,7 +1624,7 @@ def _init_handler(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Construct the top-level argparse parser with all stub subcommands."""
+    """Construct the top-level argparse parser with all subcommands."""
     parser = argparse.ArgumentParser(
         prog="nell",
         description=("companion-emergence — CLI for building emotionally aware AI companions"),
