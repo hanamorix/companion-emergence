@@ -633,6 +633,49 @@ def test_snapshot_stale_sessions_cleans_ghost_buffer(
     assert not buf.exists(), "ghost buffer should be cleaned up"
 
 
+def test_snapshot_stale_sessions_per_session_error_isolation(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If reading one session's buffer raises (corrupt buffer / FS error),
+    the sweep must continue to the next session — not abort the whole loop."""
+    sid_bad = "sess_bad"
+    sid_good = "sess_good"
+    old = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(tmp_path, {"session_id": sid_bad, "speaker": "user",
+                           "text": "boom", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_good, "speaker": "user",
+                           "text": "ok", "ts": old})
+
+    import brain.ingest.pipeline as pipeline_mod
+
+    real_read = pipeline_mod.read_session
+
+    def selective_raise(persona_dir, session_id):
+        if session_id == sid_bad:
+            raise OSError("simulated disk error")
+        return real_read(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline_mod, "read_session", selective_raise)
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=5.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    # The good session still produced a report; the bad one was skipped
+    # via the per-session try/except and the loop continued.
+    sids_reported = {r.session_id for r in reports}
+    assert sid_good in sids_reported, "good session should still be snapshotted"
+    assert sid_bad not in sids_reported, "bad session should NOT produce a report"
+
+
 # ---------------------------------------------------------------------------
 # finalize_stale_sessions tests
 # ---------------------------------------------------------------------------
