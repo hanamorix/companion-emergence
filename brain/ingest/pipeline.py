@@ -1,7 +1,10 @@
 """SP-4 pipeline driver — orchestrates all 8 ingest stages.
 
-close_session()       — run all 8 stages for one session, delete its buffer.
-close_stale_sessions()— iterate active sessions, close any past the silence window.
+close_session()             — run all 8 stages for one session, delete its buffer + cursor.
+extract_session_snapshot()  — non-destructive variant; uses cursor sidecar to extract only new turns.
+close_stale_sessions()      — destructive sweep (bridge shutdown drain); calls close_session per stale session.
+snapshot_stale_sessions()   — non-destructive periodic sweep (5-min silence); calls extract_session_snapshot.
+finalize_stale_sessions()   — real-close sweep (24h silence); final snapshot + buffer delete + cursor delete.
 
 Stage flow:
   BUFFER  → read turns from <persona_dir>/active_conversations/<session_id>.jsonl
@@ -21,10 +24,14 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
+    delete_cursor,
     delete_session_buffer,
     list_active_sessions,
+    read_cursor,
     read_session,
+    read_session_after,
     session_silence_minutes,
+    write_cursor,
 )
 from brain.ingest.commit import commit_item
 from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
@@ -100,6 +107,7 @@ def close_session(
     # ── CLOSE guard: empty session ───────────────────────────────────────────
     if not turns:
         delete_session_buffer(persona_dir, session_id)
+        delete_cursor(persona_dir, session_id)
         return report
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
@@ -187,8 +195,234 @@ def close_session(
 
     # ── DELETE buffer ─────────────────────────────────────────────────────────
     delete_session_buffer(persona_dir, session_id)
+    delete_cursor(persona_dir, session_id)
 
     return report
+
+
+def extract_session_snapshot(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> IngestReport:
+    """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
+    deleting the buffer.
+
+    Uses a per-session cursor sidecar to extract only turns added since the
+    previous successful snapshot. On a successful pass, advances the cursor
+    to the ts of the last extracted turn. On extraction failure, the cursor
+    is unchanged so the next pass retries the same turns.
+
+    Returns an IngestReport with the same shape as close_session.
+    """
+    cfg = config or {}
+    report = IngestReport(session_id=session_id)
+
+    cursor = read_cursor(persona_dir, session_id)
+    turns = read_session_after(persona_dir, session_id, cursor)
+
+    if not turns:
+        logger.info(
+            "conversation_snapshot_empty session=%s cursor=%s",
+            session_id,
+            cursor,
+        )
+        return report
+
+    user_name = _load_user_name(persona_dir)
+    assistant_name = persona_dir.name
+    transcript = format_transcript(
+        turns,
+        max_tokens=int(cfg.get("max_transcript_tokens", 6000)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+    )
+    extraction = extract_items_with_status(
+        transcript,
+        provider=provider,
+        max_retries=int(cfg.get("extraction_max_retries", 1)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+    )
+    if extraction.failed:
+        report.errors += 1
+        logger.warning(
+            "conversation_snapshot_failed session=%s turns=%d error=%s; cursor unchanged",
+            session_id,
+            len(turns),
+            extraction.error or "unknown extraction failure",
+        )
+        return report
+
+    items = [it.normalize() for it in extraction.items if it.text]
+    report.extracted = len(items)
+
+    dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
+    crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
+
+    for item in items:
+        if is_duplicate(item.text, store=store, threshold=dedup_threshold, embeddings=embeddings):
+            report.deduped += 1
+            continue
+        mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
+        if mem_id is None:
+            report.errors += 1
+            continue
+        report.committed += 1
+        report.memory_ids.append(mem_id)
+        if item.importance >= crystallize_threshold:
+            queued = queue_soul_candidate(
+                persona_dir, memory_id=mem_id, item=item, session_id=session_id,
+            )
+            if queued:
+                report.soul_candidates += 1
+            else:
+                report.soul_queue_errors += 1
+
+    # Advance cursor to the ts of the last turn we included. If the last
+    # turn lacks a ts (defensive — ingest_turn always writes one), leave
+    # cursor unchanged so the next pass retries.
+    last_ts = turns[-1].get("ts")
+    if last_ts:
+        try:
+            write_cursor(persona_dir, session_id, str(last_ts))
+        except (OSError, ValueError):
+            logger.warning(
+                "conversation_snapshot_cursor_write_failed session=%s ts=%s",
+                session_id,
+                last_ts,
+            )
+
+    logger.info(
+        "conversation_snapshot session=%s turns=%d extracted=%d committed=%d "
+        "deduped=%d soul_candidates=%d cursor=%s",
+        session_id,
+        len(turns),
+        report.extracted,
+        report.committed,
+        report.deduped,
+        report.soul_candidates,
+        last_ts,
+    )
+    return report
+
+
+def snapshot_stale_sessions(
+    persona_dir: Path,
+    *,
+    silence_minutes: float = 5.0,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> list[IngestReport]:
+    """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
+
+    Non-destructive: buffer files and the in-memory _SESSIONS registry are
+    left intact. The caller (supervisor) should NOT call remove_session()
+    for sessions returned here — finalize_stale_sessions handles that on
+    its own 24h cadence.
+
+    Returns reports for sessions where extract_session_snapshot ran. Skips
+    fresh sessions; silently cleans up ghost buffers (files with no
+    readable turns).
+
+    Per-session try/except so a single bad session (corrupt buffer,
+    transient FS error) can't abort the whole sweep — mirrors the
+    isolation in finalize_stale_sessions.
+    """
+    reports: list[IngestReport] = []
+    for sid in list_active_sessions(persona_dir):
+        try:
+            turns = read_session(persona_dir, sid)
+            if not turns:
+                # Ghost file — clean up without generating a report.
+                delete_session_buffer(persona_dir, sid)
+                continue
+            age = session_silence_minutes(turns)
+            if age >= silence_minutes:
+                report = extract_session_snapshot(
+                    persona_dir,
+                    sid,
+                    store=store,
+                    hebbian=hebbian,
+                    provider=provider,
+                    embeddings=embeddings,
+                    config=config,
+                )
+                reports.append(report)
+        except Exception:
+            logger.exception(
+                "snapshot_stale_sessions: per-session failure session=%s; "
+                "skipping and continuing sweep",
+                sid,
+            )
+    return reports
+
+
+def finalize_stale_sessions(
+    persona_dir: Path,
+    *,
+    finalize_after_hours: float = 24.0,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    embeddings: EmbeddingCache | None = None,
+    config: dict | None = None,
+) -> list[IngestReport]:
+    """Iterate active sessions; finalize any whose last turn is past
+    ``finalize_after_hours``.
+
+    "Finalize" = run one last snapshot extraction, then delete the buffer
+    and the cursor sidecar. Caller (supervisor) follows up with
+    remove_session() for each returned report.session_id.
+
+    Per-session try/except so one bad session can't abort the loop. The
+    buffer + cursor are deleted whether the final snapshot succeeded or
+    not — sessions silent past the finalize threshold are dropped
+    unconditionally; memories already in MemoryStore from earlier
+    snapshots stay.
+    """
+    threshold_minutes = finalize_after_hours * 60.0
+    reports: list[IngestReport] = []
+    for sid in list_active_sessions(persona_dir):
+        turns = read_session(persona_dir, sid)
+        if not turns:
+            delete_session_buffer(persona_dir, sid)
+            delete_cursor(persona_dir, sid)
+            continue
+        age = session_silence_minutes(turns)
+        if age < threshold_minutes:
+            continue
+        try:
+            report = extract_session_snapshot(
+                persona_dir, sid,
+                store=store, hebbian=hebbian, provider=provider,
+                embeddings=embeddings, config=config,
+            )
+        except Exception:
+            logger.exception("finalize_stale_sessions: snapshot failed session=%s", sid)
+            report = IngestReport(session_id=sid)
+            report.errors += 1
+        delete_session_buffer(persona_dir, sid)
+        delete_cursor(persona_dir, sid)
+        reports.append(report)
+        logger.info(
+            "conversation_finalized session=%s silence_hours=%.2f "
+            "committed=%d deduped=%d errors=%d",
+            sid,
+            age / 60.0,
+            report.committed,
+            report.deduped,
+            report.errors,
+        )
+    return reports
 
 
 def close_stale_sessions(
@@ -203,6 +437,16 @@ def close_stale_sessions(
 ) -> list[IngestReport]:
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
 
+    Destructive — runs the full close_session pipeline (extract + delete buffer +
+    delete cursor sidecar) for every match. Used by the bridge shutdown drain
+    path (brain.bridge.server lifespan teardown and brain.bridge.daemon) where
+    "the bridge is going away" is the signal to flush everything immediately,
+    typically called with ``silence_minutes=0`` to catch every active session.
+
+    For the periodic non-destructive 5-minute sweep, use
+    ``snapshot_stale_sessions`` instead (added 2026-05-10 — sticky sessions).
+    For the 24h real-close cadence, use ``finalize_stale_sessions``.
+
     Empty sessions (no turns) are cleaned up silently without running the
     full pipeline.
 
@@ -210,9 +454,7 @@ def close_stale_sessions(
     """
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
-        from brain.ingest.buffer import read_session as _read
-
-        turns = _read(persona_dir, sid)
+        turns = read_session(persona_dir, sid)
         if not turns:
             # Ghost file — clean it up without generating a report.
             delete_session_buffer(persona_dir, sid)

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from brain.bridge.chat import (
+    ChatMessage as _ChatMessage,
+)
+from brain.bridge.chat import (
+    ChatResponse as _ChatResponse,
+)
 from brain.bridge.provider import FakeProvider
+from brain.bridge.provider import LLMProvider as _LLMProvider
 from brain.chat.engine import ChatResult, respond
 from brain.chat.session import create_session, reset_registry
 from brain.memory.hebbian import HebbianMatrix
@@ -209,3 +218,183 @@ def test_respond_returns_empty_tool_invocations_with_fake_provider(
         voice_md_override="# Nell",
     )
     assert result.tool_invocations == []
+
+
+# ---------------------------------------------------------------------------
+# Buffer-driven prompt construction (Phase B sticky sessions)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingProvider(_LLMProvider):
+    """Like FakeProvider but records the messages list it was last sent."""
+
+    def __init__(self) -> None:
+        self.last_messages: list[_ChatMessage] = []
+
+    def name(self) -> str:
+        return "recording"
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        return "GEN: ok"
+
+    def chat(
+        self,
+        messages: list[_ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> _ChatResponse:
+        self.last_messages = list(messages)
+        h = hashlib.sha256(repr(messages).encode()).hexdigest()[:16]
+        return _ChatResponse(content=f"RECORDED: {h}", tool_calls=())
+
+
+@pytest.fixture()
+def recording_provider() -> _RecordingProvider:
+    return _RecordingProvider()
+
+
+def test_respond_reads_prior_turns_from_buffer_not_history(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """The prompt sent to the provider must contain prior turns read from
+    the buffer file — NOT from session.history."""
+    from brain.ingest.buffer import ingest_turn
+
+    sess = create_session(persona_dir.name)
+    # Pre-seed buffer with prior turns that are NOT in session.history.
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": sess.session_id,
+            "speaker": "user",
+            "text": "I love watercolour",
+        },
+    )
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": sess.session_id,
+            "speaker": "assistant",
+            "text": "tell me about the brushes",
+        },
+    )
+    # session.history is empty for this session — proves the buffer is the source.
+
+    respond(
+        persona_dir,
+        "the kolinsky sable",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        session=sess,
+        voice_md_override="# Nell",
+    )
+
+    sent = recording_provider.last_messages
+    user_texts = [
+        m.content for m in sent if m.role == "user" and isinstance(m.content, str)
+    ]
+    assistant_texts = [
+        m.content
+        for m in sent
+        if m.role == "assistant" and isinstance(m.content, str)
+    ]
+    assert "I love watercolour" in user_texts
+    assert "tell me about the brushes" in assistant_texts
+    assert "the kolinsky sable" in user_texts
+
+
+def test_respond_falls_back_to_history_when_buffer_read_fails(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+    monkeypatch,
+) -> None:
+    sess = create_session(persona_dir.name)
+    sess.append_turn("hi from history", "hi back")
+
+    def boom(*a, **kw):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr("brain.chat.engine.read_session", boom)
+
+    respond(
+        persona_dir,
+        "next turn",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        session=sess,
+        voice_md_override="# Nell",
+    )
+
+    sent = recording_provider.last_messages
+    contents = [m.content for m in sent if isinstance(m.content, str)]
+    assert "hi from history" in contents
+    assert "hi back" in contents
+
+
+def test_respond_replays_image_turn_from_buffer(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """A prior user turn with image_shas is reconstructed as a content tuple."""
+    from brain.bridge.chat import ImageBlock, TextBlock
+    from brain.images import save_image_bytes
+    from brain.ingest.buffer import ingest_turn
+
+    # Store a real 1x1 PNG so media_type_for_sha can resolve it.
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00"
+        b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    record = save_image_bytes(persona_dir, png_bytes, "image/png")
+    sha = record.sha
+
+    sess = create_session(persona_dir.name)
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": sess.session_id,
+            "speaker": "user",
+            "text": "look at this",
+            "image_shas": [sha],
+        },
+    )
+
+    respond(
+        persona_dir,
+        "what do you think?",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        session=sess,
+        voice_md_override="# Nell",
+    )
+
+    sent = recording_provider.last_messages
+    image_msgs = [
+        m for m in sent if m.role == "user" and not isinstance(m.content, str)
+    ]
+    assert image_msgs, "expected at least one user msg with tuple content"
+    # The replayed prior turn should be among them. The live turn ("what do you
+    # think?") is text-only so it stays a string-content message.
+    found = False
+    for msg in image_msgs:
+        blocks = list(msg.content)
+        text_blocks = [b for b in blocks if isinstance(b, TextBlock)]
+        image_blocks = [b for b in blocks if isinstance(b, ImageBlock)]
+        if any(b.text == "look at this" for b in text_blocks) and any(
+            b.image_sha == sha for b in image_blocks
+        ):
+            found = True
+            break
+    assert found, "image-bearing user turn was not replayed from buffer"
