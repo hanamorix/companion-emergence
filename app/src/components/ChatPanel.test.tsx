@@ -14,6 +14,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("../bridge", () => ({
   newSession: vi.fn(async () => "test-session-id"),
+  fetchActiveSession: vi.fn(async () => null),
   closeSession: vi.fn(async () => undefined),
   uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
 }));
@@ -23,6 +24,8 @@ vi.mock("../streamChat", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
+import { fetchActiveSession, newSession } from "../bridge";
+import { streamChat } from "../streamChat";
 
 // jsdom doesn't implement Element.scrollTo; stub it so ChatPanel's
 // auto-scroll effect doesn't throw during render.
@@ -132,6 +135,101 @@ describe("ChatPanel — staged image URL lifetime (F-007)", () => {
     // The cleanup sweep at ChatPanel.tsx:159-160 should have revoked the
     // staged URL because the fix tracks it at creation time, not send time.
     expect(revokeSpy).toHaveBeenCalledWith(stagedUrl);
+  });
+});
+
+describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    // Restore default streamChat behaviour (returns a no-op cancel).
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  async function typeAndSend(persona: string) {
+    render(<ChatPanel persona={persona} />);
+    const textarea = screen.getByPlaceholderText(
+      new RegExp(`^Write to`),
+    ) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "hello" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+    // Allow microtask queue (fetchActiveSession + downstream send) to flush.
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+  }
+
+  it("attaches to active session on first send when /sessions/active returns a sid", async () => {
+    mockedFetchActive.mockResolvedValue("existing-sess-xyz");
+    mockedNewSession.mockResolvedValue("should-not-be-used");
+
+    await typeAndSend("nell");
+
+    // attach was attempted
+    expect(mockedFetchActive).toHaveBeenCalledTimes(1);
+    expect(mockedFetchActive).toHaveBeenCalledWith("nell");
+    // newSession was NOT called — we attached to the existing session
+    expect(mockedNewSession).not.toHaveBeenCalled();
+    // streamChat was driven with the attached session_id
+    const [, sessionId] = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+    ];
+    expect(sessionId).toBe("existing-sess-xyz");
+  });
+
+  it("falls back to newSession when /sessions/active returns null", async () => {
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockResolvedValue("fresh-sess-abc");
+
+    await typeAndSend("nell");
+
+    expect(mockedFetchActive).toHaveBeenCalledTimes(1);
+    expect(mockedNewSession).toHaveBeenCalledTimes(1);
+    expect(mockedNewSession).toHaveBeenCalledWith("nell");
+    const [, sessionId] = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+    ];
+    expect(sessionId).toBe("fresh-sess-abc");
+  });
+
+  it("falls back to newSession when /sessions/active throws", async () => {
+    mockedFetchActive.mockRejectedValue(new Error("network flake"));
+    mockedNewSession.mockResolvedValue("fresh-sess-after-throw");
+
+    await typeAndSend("nell");
+
+    // fetchActiveSession was tried — the throw was swallowed by the
+    // try/catch in send(), not propagated to the user.
+    expect(mockedFetchActive).toHaveBeenCalledTimes(1);
+    // We still landed on a fresh session via newSession.
+    expect(mockedNewSession).toHaveBeenCalledTimes(1);
+    const [, sessionId] = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+    ];
+    expect(sessionId).toBe("fresh-sess-after-throw");
   });
 });
 

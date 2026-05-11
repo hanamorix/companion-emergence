@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { closeSession, newSession, uploadImage } from "../bridge";
+import { closeSession, fetchActiveSession, newSession, uploadImage } from "../bridge";
 import { streamChat } from "../streamChat";
 
 interface Message {
@@ -267,13 +267,26 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
 
     let sessionId = sessionRef.current;
     if (!sessionId) {
+      // Phase B sticky-session reattach (F-201): if the bridge has a
+      // recent session for this persona (younger than the finalize
+      // threshold), pick up where we left off instead of creating a
+      // fresh one. A transient /sessions/active failure (network flake,
+      // older bridge build without the endpoint) shouldn't block the
+      // send — we just fall through to newSession.
       try {
-        sessionId = await newSession(persona);
-        sessionRef.current = sessionId;
-      } catch (e) {
-        setError(`Bridge unreachable: ${(e as Error).message}`);
-        return;
+        sessionId = await fetchActiveSession(persona);
+      } catch {
+        sessionId = null;
       }
+      if (!sessionId) {
+        try {
+          sessionId = await newSession(persona);
+        } catch (e) {
+          setError(`Bridge unreachable: ${(e as Error).message}`);
+          return;
+        }
+      }
+      sessionRef.current = sessionId;
     }
 
     const userMsg: Message = {
