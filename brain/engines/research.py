@@ -239,6 +239,15 @@ class ResearchEngine:
         )
         log.appended(fire).save(self.research_log_path)
 
+        # D-reflection Task 18: emit research_completion initiate candidate (gated).
+        # Best-effort: gate/emit failure does NOT prevent the research fire.
+        _emit_research_candidate(
+            persona_dir=self.interests_path.parent,
+            interest=winner,
+            mem_id=mem.id,
+            now=now,
+        )
+
         return ResearchResult(
             fired=fire,
             would_fire=None,
@@ -349,6 +358,125 @@ def _create_research_memory(
             "searcher": searcher_name,
         },
     )
+
+
+def _emit_research_candidate(
+    *,
+    persona_dir: Path,
+    interest: Interest,
+    mem_id: str,
+    now: datetime,
+) -> None:
+    """Gate-check and emit a research_completion initiate candidate.
+
+    Builds a minimal Protocol-satisfying adapter from the research fire data.
+    Best-effort: any exception is logged at WARNING; the research fire
+    already succeeded before this is called.
+
+    Field mapping for ResearchThreadLike:
+    - thread_id                = mem_id (the output memory id — unique per fire)
+    - topic                    = interest.topic
+    - maturity_score           = interest.pull_score / 10.0 (pull 6-10 → 0.6-1.0)
+    - summary_excerpt          = "" (no LLM-generated summary at fire time)
+    - linked_memory_ids        = [mem_id] (the output memory just written)
+    - completed_at             = now
+    - previously_linked_to_audit  = checked against existing research_completion candidates
+
+    topic_overlap_score is hardcoded to 1.0 for v0.0.10 — ResearchEngine has no
+    embedding infrastructure. The gate is therefore effectively pass-through on
+    topic overlap until v0.0.11 wires real similarity.
+    """
+    try:
+        from brain.initiate.emit import read_candidates
+        from brain.initiate.new_sources import (
+            check_shared_meta_gates,
+            emit_research_completion_candidate,
+            gate_research_completion,
+            load_gate_thresholds,
+            write_gate_rejection,
+        )
+
+        # Determine previously_linked_to_audit: True if a research_completion
+        # candidate with the same source_id (mem_id) already exists in the queue.
+        existing = read_candidates(persona_dir)
+        prev_linked = any(
+            c.source == "research_completion" and c.source_id == mem_id
+            for c in existing
+        )
+
+        # Build a minimal Protocol-conformant adapter (inline dataclass).
+        @dataclass
+        class _ResearchThreadAdapter:
+            thread_id: str
+            topic: str
+            maturity_score: float
+            summary_excerpt: str
+            linked_memory_ids: list[str]
+            completed_at: datetime
+            previously_linked_to_audit: bool
+
+        thread = _ResearchThreadAdapter(
+            thread_id=mem_id,
+            topic=interest.topic,
+            maturity_score=min(interest.pull_score / 10.0, 1.0),
+            summary_excerpt="",
+            linked_memory_ids=[mem_id],
+            completed_at=now,
+            previously_linked_to_audit=prev_linked,
+        )
+
+        # topic_overlap_score is hardcoded 1.0 — see docstring.
+        topic_overlap_score = 1.0
+
+        thresholds = load_gate_thresholds(persona_dir)
+
+        gate_ok, gate_reason = gate_research_completion(
+            persona_dir,
+            thread=thread,
+            now=now,
+            topic_overlap_score=topic_overlap_score,
+            thresholds=thresholds,
+        )
+        if not gate_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=gate_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        meta_ok, meta_reason = check_shared_meta_gates(
+            persona_dir,
+            source="research_completion",
+            now=now,
+            is_rest_state=False,
+            thresholds=thresholds,
+        )
+        if not meta_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=meta_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        emit_research_completion_candidate(
+            persona_dir,
+            thread=thread,
+            topic_overlap_score=topic_overlap_score,
+            now=now,
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("research fire: initiate candidate emit failed: %s", exc)
 
 
 # ---------- Research log ----------
