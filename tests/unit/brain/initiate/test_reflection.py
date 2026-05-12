@@ -304,3 +304,107 @@ def test_reflection_run_filters_when_both_tiers_low_confidence(tmp_path):
     # Decision forced to filter despite Sonnet saying promote.
     assert result.decisions[0].decision == "filter"
     assert "ambivalent" in result.decisions[0].reason.lower()
+
+
+def test_reflection_run_records_timeout_failure(tmp_path):
+    """Timeout raised inside the LLM call is captured into DCallRow.failure_type."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import DTimeoutError, ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    def haiku_call(*, system, user):
+        raise DTimeoutError("haiku timed out at 30s")
+
+    def sonnet_call(*, system, user):
+        raise AssertionError("should not escalate on timeout — passthrough retry")
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    result, dcall = run(candidates, deps=deps)
+    assert dcall.failure_type == "timeout"
+    assert dcall.retry_count == 0
+    assert dcall.model_tier_used == "haiku"
+    # No decisions on passthrough (caller decides what to do — see Task 14).
+    assert result.decisions == []
+
+
+def test_reflection_run_records_rate_limit_failure(tmp_path):
+    """Rate-limit error captured as 'rate_limit' failure type."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import DRateLimitError, ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    def haiku_call(*, system, user):
+        raise DRateLimitError("429")
+
+    def sonnet_call(*, system, user):
+        raise AssertionError("should not escalate on rate_limit")
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    result, dcall = run(candidates, deps=deps)
+    assert dcall.failure_type == "rate_limit"
+    assert result.decisions == []
+
+
+def test_reflection_run_records_provider_error(tmp_path):
+    """Generic provider error captured as 'provider_error'."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import DProviderError, ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    def haiku_call(*, system, user):
+        raise DProviderError("500")
+
+    def sonnet_call(*, system, user):
+        raise AssertionError("should not escalate on provider_error")
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    _, dcall = run(candidates, deps=deps)
+    assert dcall.failure_type == "provider_error"
