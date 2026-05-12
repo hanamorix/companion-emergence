@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.initiate.audit import append_audit_row
@@ -13,7 +14,10 @@ from brain.initiate.tools import (
 )
 
 
-def _seed_audit(persona_dir: Path, audit_id: str, ts: str) -> None:
+def _seed_audit(persona_dir: Path, audit_id: str, ts: str | None = None) -> None:
+    from datetime import UTC, datetime
+    if ts is None:
+        ts = datetime.now(UTC).isoformat()
     row = AuditRow(
         audit_id=audit_id,
         candidate_id=f"ic_{audit_id}",
@@ -31,7 +35,7 @@ def _seed_audit(persona_dir: Path, audit_id: str, ts: str) -> None:
 
 
 def test_recall_initiate_audit_24h(tmp_path: Path) -> None:
-    _seed_audit(tmp_path, "ia_1", "2026-05-11T14:00:00+00:00")
+    _seed_audit(tmp_path, "ia_1")
     out = recall_initiate_audit(tmp_path, window="24h")
     assert "ia_1" in out or "the dream" in out
     assert isinstance(out, str)
@@ -42,7 +46,7 @@ def test_recall_initiate_audit_filter_by_state(tmp_path: Path) -> None:
     row1 = AuditRow(
         audit_id="ia_1",
         candidate_id="ic_1",
-        ts="2026-05-11T14:00:00+00:00",
+        ts=datetime.now(UTC).isoformat(),
         kind="message",
         subject="A",
         tone_rendered="",
@@ -57,7 +61,7 @@ def test_recall_initiate_audit_filter_by_state(tmp_path: Path) -> None:
     row2 = AuditRow(
         audit_id="ia_2",
         candidate_id="ic_2",
-        ts="2026-05-11T15:00:00+00:00",
+        ts=datetime.now(UTC).isoformat(),
         kind="message",
         subject="B",
         tone_rendered="",
