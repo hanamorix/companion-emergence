@@ -442,10 +442,67 @@ def crystallize_reflex(
             reasoning=str(prop_dict["reasoning"]).strip(),
         ))
 
-    return ReflexCrystallizationResult(
+    result = ReflexCrystallizationResult(
         emergences=accepted_emergences,
         prunings=accepted_prunings,
     )
+
+    # Phase 4.2 — emit one initiate candidate per accepted decision. Wrapped
+    # in try/except so a downstream emit failure can never crash the
+    # crystallizer: reflex emergence is physiology, initiate is signal.
+    for emergence in accepted_emergences:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"reflex_emergence:{emergence.name}",
+            label=emergence.name,
+            related_memory_ids=[],
+        )
+    for prune in accepted_prunings:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"reflex_pruning:{prune.name}",
+            label=prune.name,
+            related_memory_ids=[],
+        )
+
+    return result
+
+
+def _emit_initiate_candidate(
+    *,
+    persona_dir: Path,
+    source_id: str,
+    label: str,
+    related_memory_ids: list[str],
+) -> None:
+    """Emit one initiate candidate after a reflex crystallization commit.
+
+    Phase 4.2 of the initiate physiology pipeline. Wrapped in try/except —
+    an emit failure must not crash the crystallizer.
+    """
+    try:
+        from brain.initiate.emit import emit_initiate_candidate
+        from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+        emit_initiate_candidate(
+            persona_dir,
+            kind="message",
+            source="crystallization",
+            source_id=source_id,
+            emotional_snapshot=EmotionalSnapshot(
+                vector={},
+                rolling_baseline_mean=0.0,
+                rolling_baseline_stdev=0.0,
+                current_resonance=0.0,
+                delta_sigma=0.0,
+            ),
+            semantic_context=SemanticContext(
+                linked_memory_ids=related_memory_ids[:5],
+                topic_tags=[label] if label else [],
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reflex crystallization initiate emit failed: %s", exc)
 
 
 # ---------- Validation gates ----------

@@ -777,3 +777,45 @@ def test_adversarial_empty_proposals_is_valid_noop(
         persona_name="nell", persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
+
+
+# ---------- Phase 4.2: initiate-candidate emission ----------
+
+
+def test_reflex_crystallization_emits_initiate_candidate(
+    persona_dir: Path, store: MemoryStore,
+) -> None:
+    """After a reflex emergence accepts, an initiate candidate is queued.
+
+    source='crystallization', source_id encodes the arc name.
+    """
+    from brain.initiate.emit import read_candidates
+
+    _seed_vocab(persona_dir, ["creative_hunger", "love", "vulnerability"])
+    response = _json.dumps({
+        "emergences": [{
+            "name": "manuscript_obsession",
+            "description": "creative drive narrowed to one project",
+            "trigger": {"creative_hunger": 7.0, "love": 6.0},
+            "cooldown_hours": 24.0,
+            "output_memory_type": "reflex_pitch",
+            "prompt_template": "You are {persona_name}. {emotion_summary}",
+            "reasoning": "Fired creative_pitch four times this month.",
+        }],
+        "prunings": [],
+    })
+    result = crystallize_reflex(
+        store=store, persona_dir=persona_dir,
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
+        provider=_FakeProvider(response),
+        persona_name="nell", persona_pronouns="she/her",
+    )
+    assert len(result.emergences) == 1
+
+    candidates = read_candidates(persona_dir)
+    assert any(
+        c.source == "crystallization"
+        and c.source_id == "reflex_emergence:manuscript_obsession"
+        for c in candidates
+    )

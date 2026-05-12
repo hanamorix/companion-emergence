@@ -130,6 +130,10 @@ def run_growth_tick(
                 relational_context=proposal.relational_context,
             ),
         )
+        # Phase 4.2 — emit initiate candidate after vocabulary crystallization
+        # commits to disk. Wrapped in try/except so emit failures can't crash
+        # the scheduler.
+        _emit_vocabulary_initiate_candidate(persona_dir, proposal)
 
     # Creative DNA crystallization (spec §5)
     if not dry_run and (persona_dir / "persona_config.json").exists():
@@ -225,6 +229,39 @@ def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
     )
     treatment = compute_treatment(vocab_path.parent, vocab_path.name)
     save_with_backup(vocab_path, data, backup_count=treatment.backup_count)
+
+
+def _emit_vocabulary_initiate_candidate(
+    persona_dir: Path, proposal: EmotionProposal,
+) -> None:
+    """Emit one initiate candidate after vocabulary commit. Try/except wrapped.
+
+    Phase 4.2 of the initiate physiology pipeline. An emit failure must not
+    crash the growth tick.
+    """
+    try:
+        from brain.initiate.emit import emit_initiate_candidate
+        from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+        emit_initiate_candidate(
+            persona_dir,
+            kind="message",
+            source="crystallization",
+            source_id=f"vocabulary_emotion:{proposal.name}",
+            emotional_snapshot=EmotionalSnapshot(
+                vector={},
+                rolling_baseline_mean=0.0,
+                rolling_baseline_stdev=0.0,
+                current_resonance=0.0,
+                delta_sigma=0.0,
+            ),
+            semantic_context=SemanticContext(
+                linked_memory_ids=list(proposal.evidence_memory_ids)[:5],
+                topic_tags=[proposal.name],
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vocabulary crystallization initiate emit failed: %s", exc)
 
 
 def _default_reason_for(proposal: EmotionProposal) -> str:
