@@ -408,3 +408,131 @@ describe("ChatPanel — initiate banner integration (Task 26)", () => {
     });
   });
 });
+
+// ── Bundle A #4 — reply_to_audit_id threading via streamChat ─────────────
+// Closes the v0.0.9 review TODO: replied_explicit transitions used to be
+// renderer-only POSTs to /initiate/state, which left the chat engine blind
+// to which initiate the user was replying to. The fix moves the transition
+// server-side by passing reply_to_audit_id in the streamChat payload, so
+// the audit + memory + chat engine all see the link atomically.
+describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedFetchActive.mockReset();
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockReset();
+    mockedNewSession.mockResolvedValue("sess-bundle-a");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("threads replyToAuditId through streamChat options when an active reply target exists", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_replythread",
+        body: "the dream from this morning",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-12T09:00:00+00:00",
+      });
+    });
+    const replyBtn = await screen.findByRole("button", { name: /reply/i });
+    await act(async () => {
+      fireEvent.click(replyBtn);
+    });
+
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "yeah I felt it too" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+    // streamChat signature: (persona, sessionId, message, handlers, options?)
+    const args = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+      { replyToAuditId?: string } | undefined,
+    ];
+    expect(args[4]?.replyToAuditId).toBe("ia_replythread");
+  });
+
+  it("does not POST /initiate/state replied_explicit when sending — server handles it", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_noclientpost",
+        body: "small message",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-12T09:00:00+00:00",
+      });
+    });
+    const replyBtn = await screen.findByRole("button", { name: /reply/i });
+    await act(async () => {
+      fireEvent.click(replyBtn);
+    });
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "I see you" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+
+    // No renderer-side POST should fire for replied_explicit — the server
+    // performs that transition atomically with the chat turn now.
+    const repliedExplicitPost = fetchSpy.mock.calls.find(
+      ([url, init]: [RequestInfo | URL, RequestInit?]) => {
+        const u = typeof url === "string" ? url : (url as URL).toString();
+        const body = String(init?.body ?? "");
+        return (
+          u.includes("/initiate/state") &&
+          body.includes('"new_state":"replied_explicit"')
+        );
+      },
+    );
+    expect(repliedExplicitPost).toBeUndefined();
+  });
+});
