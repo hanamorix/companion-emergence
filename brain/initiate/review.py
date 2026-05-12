@@ -28,8 +28,8 @@ from brain.initiate.audit import (
     update_audit_state,
 )
 from brain.initiate.compose import (
-    DecisionResult,
     compose_decision,
+    compose_decision_voice_edit,
     compose_subject,
     compose_tone,
 )
@@ -63,27 +63,86 @@ def _process_one_candidate(
     voice_template: str,
     now: datetime,
 ) -> None:
-    """Run the three-prompt pipeline on a single candidate, write audit, remove."""
+    """Run the three-prompt pipeline on a single candidate, write audit, remove.
+
+    Two routes by ``candidate.kind``:
+
+    * ``message`` — full three-prompt path (subject -> tone -> decision)
+      plus cost-cap gate for ``send_*`` decisions.
+    * ``voice_edit_proposal`` — skip subject+tone (the proposal already
+      carries the diff); use ``compose_decision_voice_edit`` with the
+      current voice template + recent evolutions. Voice edits bypass the
+      cost-cap gate (the daily reflection tick is the rate limiter).
+    """
     audit_id = make_audit_id(now)
     try:
-        subject = compose_subject(
-            provider,
-            candidate,
-            semantic_memory_excerpts=candidate.semantic_context.linked_memory_ids,
-        )
-        tone_rendered = compose_tone(
-            provider,
-            subject=subject,
-            candidate=candidate,
-            voice_template=voice_template,
-        )
-        decision_result: DecisionResult = compose_decision(
-            provider,
-            rendered_message=tone_rendered,
-            recent_send_history=_build_send_history(persona_dir, now),
-            current_local_time=now,
-            voice_edit_acceptance_rate=None,
-        )
+        if candidate.kind == "voice_edit_proposal":
+            proposal = candidate.proposal or {}
+            subject = proposal.get("rationale", "voice edit proposal")
+            tone_rendered = (
+                f"Proposing to change my voice: "
+                f"{proposal.get('old_text', '')!r} -> "
+                f"{proposal.get('new_text', '')!r}. Rationale: "
+                f"{proposal.get('rationale', '')}"
+            )
+            # Pull recent accepted voice evolutions so the decision prompt
+            # can see Nell's evolution arc. Best-effort — a missing/locked
+            # SoulStore degrades to "(no recent voice edits)".
+            recent_evolutions: list[dict[str, Any]] = []
+            try:
+                from brain.soul.store import SoulStore
+
+                soul_store = SoulStore(
+                    str(persona_dir / "crystallizations.db")
+                )
+                try:
+                    recent_evolutions = [
+                        {
+                            "accepted_at": v.accepted_at,
+                            "old_text": v.old_text,
+                            "new_text": v.new_text,
+                        }
+                        for v in soul_store.list_voice_evolution()
+                    ]
+                finally:
+                    soul_store.close()
+            except Exception:
+                logger.exception(
+                    "voice-edit review: SoulStore read failed for %s",
+                    candidate.candidate_id,
+                )
+            voice_path = persona_dir / "nell-voice.md"
+            current_voice = (
+                voice_path.read_text(encoding="utf-8")
+                if voice_path.exists()
+                else ""
+            )
+            decision_result = compose_decision_voice_edit(
+                provider,
+                proposal=proposal,
+                current_voice_template=current_voice,
+                recent_voice_evolutions=recent_evolutions,
+                current_local_time=now,
+            )
+        else:
+            subject = compose_subject(
+                provider,
+                candidate,
+                semantic_memory_excerpts=candidate.semantic_context.linked_memory_ids,
+            )
+            tone_rendered = compose_tone(
+                provider,
+                subject=subject,
+                candidate=candidate,
+                voice_template=voice_template,
+            )
+            decision_result = compose_decision(
+                provider,
+                rendered_message=tone_rendered,
+                recent_send_history=_build_send_history(persona_dir, now),
+                current_local_time=now,
+                voice_edit_acceptance_rate=None,
+            )
     except Exception as exc:
         logger.exception(
             "initiate composition failed for candidate %s", candidate.candidate_id
@@ -106,9 +165,14 @@ def _process_one_candidate(
 
     final_decision = decision_result.decision
     final_reasoning = decision_result.reasoning
-    gate_check = {"allowed": True, "reason": None}
+    gate_check: dict[str, Any] = {"allowed": True, "reason": None}
 
-    if final_decision in ("send_notify", "send_quiet"):
+    # Voice-edit candidates are bucketed with `quiet` but bypass the cost-
+    # cap gate — the daily reflection tick is the rate limiter (Task 14).
+    if (
+        candidate.kind != "voice_edit_proposal"
+        and final_decision in ("send_notify", "send_quiet")
+    ):
         urgency = "notify" if final_decision == "send_notify" else "quiet"
         allowed, reason = check_send_allowed(
             persona_dir, urgency=urgency, now=now
@@ -117,6 +181,10 @@ def _process_one_candidate(
         if not allowed:
             final_decision = "hold"
             final_reasoning = f"blocked_by_gate: {reason}"
+
+    diff_payload: str | None = None
+    if candidate.kind == "voice_edit_proposal" and candidate.proposal:
+        diff_payload = candidate.proposal.get("diff", "") or None
 
     row = AuditRow(
         audit_id=audit_id,
@@ -129,6 +197,7 @@ def _process_one_candidate(
         decision_reasoning=final_reasoning,
         gate_check=gate_check,
         delivery=None,
+        diff=diff_payload,
     )
     append_audit_row(persona_dir, row)
 
