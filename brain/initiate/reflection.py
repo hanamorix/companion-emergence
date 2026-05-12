@@ -391,3 +391,40 @@ def run(
         tick_note=final_result.tick_note,
     )
     return final_result, d_call
+
+
+def demote_to_draft_space(
+    persona_dir: Path,
+    *,
+    candidate: InitiateCandidate,
+    decision: DDecision,
+    now: datetime,
+) -> None:
+    """Write a filtered candidate to draft_space.md with D-frontmatter.
+
+    Writes the fragment directly to draft_space.md without delegating to
+    the v0.0.9 draft writer (which doesn't accept arbitrary frontmatter).
+    Append-only — multiple demotions in one tick stack into the same file.
+    Never raises; logs warning on OSError.
+    """
+    frontmatter = (
+        "---\n"
+        f"demoted_by: d_reflection\n"
+        f"demoted_at: {now.isoformat()}\n"
+        f'd_reason: "{decision.reason}"\n'
+        f"source: {candidate.source}\n"
+        f"source_id: {candidate.source_id}\n"
+        f"candidate_id: {candidate.candidate_id}\n"
+        "---\n"
+    )
+    body_excerpt = (
+        f"(candidate {candidate.candidate_id} from {candidate.source}; "
+        f"subject-extraction skipped because D filtered)\n"
+    )
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = persona_dir / "draft_space.md"
+    try:
+        with draft_path.open("a", encoding="utf-8") as f:
+            f.write("\n" + frontmatter + body_excerpt + "\n")
+    except OSError as exc:
+        logger.warning("draft-space demote failed for %s: %s", draft_path, exc)
