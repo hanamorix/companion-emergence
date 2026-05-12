@@ -1150,30 +1150,57 @@ class HeartbeatEngine:
         always-elevated-emotions firehose.
         """
         mean, stdev, delta_sigma = self._update_rolling_baseline(current_resonance)
-        if delta_sigma < 1.5:
-            return
-        try:
-            # Local import to keep initiate deps out of engines that don't
-            # need them and to mirror the dream/crystallizer emit pattern.
-            from brain.initiate.emit import emit_initiate_candidate
-            from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+        if delta_sigma >= 1.5:
+            try:
+                # Local import to keep initiate deps out of engines that don't
+                # need them and to mirror the dream/crystallizer emit pattern.
+                from brain.initiate.emit import emit_initiate_candidate
+                from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
 
-            emit_initiate_candidate(
-                persona_dir,
-                kind="message",
-                source="emotion_spike",
-                source_id=f"emotion_{tick_count}",
-                emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(current_vector),
-                    rolling_baseline_mean=mean,
-                    rolling_baseline_stdev=stdev,
-                    current_resonance=current_resonance,
-                    delta_sigma=delta_sigma,
-                ),
-                semantic_context=SemanticContext(),
-            )
-        except Exception as exc:
-            logger.warning("emotion spike initiate emit failed: %s", exc)
+                emit_initiate_candidate(
+                    persona_dir,
+                    kind="message",
+                    source="emotion_spike",
+                    source_id=f"emotion_{tick_count}",
+                    emotional_snapshot=EmotionalSnapshot(
+                        vector=dict(current_vector),
+                        rolling_baseline_mean=mean,
+                        rolling_baseline_stdev=stdev,
+                        current_resonance=current_resonance,
+                        delta_sigma=delta_sigma,
+                    ),
+                    semantic_context=SemanticContext(),
+                )
+            except Exception as exc:
+                logger.warning("emotion spike initiate emit failed: %s", exc)
+            return
+
+        # Sub-initiate band: 0.5 <= delta_sigma < 1.5 lands in the draft space
+        # rather than escalating to an outbound initiate. Quiet enough to note,
+        # not loud enough to reach for Hana. (Phase 8.2.)
+        if delta_sigma >= 0.5:
+            try:
+                from datetime import UTC, datetime
+
+                from brain.initiate.draft import (
+                    append_draft_fragment,
+                    compose_draft_fragment,
+                )
+
+                body = compose_draft_fragment(
+                    self.provider,
+                    source="emotion_spike",
+                    source_id=f"emotion_{tick_count}",
+                    linked_memory_excerpts=[],
+                )
+                append_draft_fragment(
+                    persona_dir,
+                    timestamp=datetime.now(UTC).isoformat(),
+                    source="emotion_spike",
+                    body=body,
+                )
+            except Exception as exc:
+                logger.warning("emotion-spike draft fallback failed: %s", exc)
 
     def _append_log(self, entry: dict) -> None:
         """Append one JSON line to heartbeats.log.jsonl."""
