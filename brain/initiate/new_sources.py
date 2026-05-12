@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,3 +53,31 @@ def load_gate_thresholds(persona_dir: Path) -> GateThresholds:
     valid_names = {f.name for f in fields(GateThresholds)}
     overrides: dict[str, Any] = {k: v for k, v in raw.items() if k in valid_names}
     return GateThresholds(**overrides)
+
+
+def write_gate_rejection(
+    persona_dir: Path,
+    *,
+    ts: datetime,
+    source: str,
+    source_id: str,
+    gate_name: str,
+    threshold_value: float,
+    observed_value: float,
+) -> None:
+    """Append one rejection row to gate_rejections.jsonl. Never raises."""
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    path = persona_dir / "gate_rejections.jsonl"
+    row = {
+        "ts": ts.isoformat(),
+        "source": source,
+        "source_id": source_id,
+        "gate_name": gate_name,
+        "threshold_value": threshold_value,
+        "observed_value": observed_value,
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("gate_rejections append failed for %s: %s", path, exc)
