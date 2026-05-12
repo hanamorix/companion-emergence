@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from brain.initiate.new_sources import load_gate_thresholds
+from brain.initiate.new_sources import GateThresholds, load_gate_thresholds
 
 
 def test_load_gate_thresholds_returns_defaults_when_no_file(tmp_path: Path):
@@ -71,3 +71,99 @@ def test_write_gate_rejection_appends_jsonl(tmp_path: Path):
     assert rows[0]["gate_name"] == "confidence_min"
     assert rows[0]["observed_value"] == 0.5
     assert rows[1]["source"] == "research_completion"
+
+
+def test_check_shared_meta_gates_blocks_in_rest_state(tmp_path: Path):
+    from datetime import UTC, datetime
+
+    from brain.initiate.new_sources import check_shared_meta_gates
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    allowed, reason = check_shared_meta_gates(
+        persona,
+        source="reflex_firing",
+        now=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+        is_rest_state=True,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "rest_state"
+
+
+def test_check_shared_meta_gates_blocks_on_per_source_anti_flood(tmp_path: Path):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import emit_initiate_candidate
+    from brain.initiate.new_sources import check_shared_meta_gates
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    # Pre-seed a recent reflex_firing candidate.
+    emit_initiate_candidate(
+        persona,
+        kind="message",
+        source="reflex_firing",
+        source_id="r_prev",
+        semantic_context=SemanticContext(),
+        now=now - timedelta(minutes=10),
+    )
+    allowed, reason = check_shared_meta_gates(
+        persona,
+        source="reflex_firing",
+        now=now,
+        is_rest_state=False,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "per_source_anti_flood"
+
+
+def test_check_shared_meta_gates_blocks_on_queue_depth(tmp_path: Path):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import emit_initiate_candidate
+    from brain.initiate.new_sources import check_shared_meta_gates
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    # Pre-seed 6 candidates of mixed sources, all OUTSIDE the anti-flood window
+    # so per-source anti-flood doesn't fire first.
+    for i in range(6):
+        emit_initiate_candidate(
+            persona,
+            kind="message",
+            source="dream",
+            source_id=f"d{i}",
+            semantic_context=SemanticContext(),
+            now=now - timedelta(hours=1, minutes=i),
+        )
+    allowed, reason = check_shared_meta_gates(
+        persona,
+        source="reflex_firing",
+        now=now,
+        is_rest_state=False,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "queue_depth_max"
+
+
+def test_check_shared_meta_gates_passes(tmp_path: Path):
+    from datetime import UTC, datetime
+
+    from brain.initiate.new_sources import check_shared_meta_gates
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    allowed, reason = check_shared_meta_gates(
+        persona,
+        source="reflex_firing",
+        now=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+        is_rest_state=False,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is True
+    assert reason is None
