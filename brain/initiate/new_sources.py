@@ -46,6 +46,9 @@ def load_gate_thresholds(persona_dir: Path) -> GateThresholds:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("gate_thresholds.json read failed (%s); using defaults", exc)
         return GateThresholds()
+    if not isinstance(raw, dict):
+        logger.warning("gate_thresholds.json is not a JSON object; using defaults")
+        return GateThresholds()
     valid_names = {f.name for f in fields(GateThresholds)}
     overrides: dict[str, Any] = {k: v for k, v in raw.items() if k in valid_names}
     return GateThresholds(**overrides)
