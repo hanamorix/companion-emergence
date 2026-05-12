@@ -108,3 +108,69 @@ def test_build_user_message_renders_candidates_and_time():
     assert "[1] source: dream" in rendered
     assert "(no recent outbound)" in rendered
     assert "Promote at most 2" in rendered
+
+
+def test_reflection_run_happy_path_haiku(tmp_path):
+    """All high-confidence Haiku decisions parsed; no escalation."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=5)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+        InitiateCandidate(
+            candidate_id="ic_b",
+            ts=(now - timedelta(minutes=2)).isoformat(),
+            kind="message",
+            source="emotion_spike",
+            source_id="e1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    haiku_response = """
+    {"decisions":[
+      {"candidate_index":1,"decision":"promote","reason":"surprising return","confidence":"high"},
+      {"candidate_index":2,"decision":"filter","reason":"weather","confidence":"high"}
+    ],"tick_note":"one worth saying"}
+    """
+
+    calls: list[str] = []
+
+    def fake_haiku_call(*, system: str, user: str) -> tuple[str, int, int, int]:
+        calls.append("haiku")
+        return haiku_response, 200, 500, 180  # raw, latency_ms, tokens_in, tokens_out
+
+    def fake_sonnet_call(*, system: str, user: str) -> tuple[str, int, int, int]:
+        raise AssertionError("should not escalate on all-high-confidence")
+
+    deps = ReflectionDeps(
+        companion_name="Nell",
+        user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=fake_haiku_call,
+        sonnet_call=fake_sonnet_call,
+        now=now,
+        tick_id="tick_001",
+    )
+
+    result, dcall = run(candidates, deps=deps)
+    assert len(result.decisions) == 2
+    assert result.decisions[0].decision == "promote"
+    assert dcall.model_tier_used == "haiku"
+    assert dcall.candidates_in == 2
+    assert dcall.promoted_out == 1
+    assert dcall.filtered_out == 1
+    assert dcall.failure_type is None
+    assert dcall.retry_count == 0
+    assert calls == ["haiku"]  # Sonnet not called
