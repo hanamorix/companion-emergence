@@ -199,3 +199,74 @@ def emit_reflex_firing_candidate(
         semantic_context=sc,
         now=now,
     )
+
+
+class ResearchThreadLike(Protocol):
+    """Duck-typed shape gate_research_completion inspects on a research thread."""
+    thread_id: str
+    topic: str
+    maturity_score: float
+    summary_excerpt: str
+    linked_memory_ids: list[str]
+    completed_at: datetime
+    previously_linked_to_audit: bool
+
+
+def gate_research_completion(
+    persona_dir: Path,
+    *,
+    thread: ResearchThreadLike,
+    now: datetime,
+    topic_overlap_score: float,
+    thresholds: GateThresholds,
+) -> tuple[bool, str | None]:
+    """Per-source gate for the research_completion emitter.
+
+    Order: maturity -> previously-linked -> topic-overlap -> freshness.
+    `topic_overlap_score` is computed by the caller (the research engine
+    has access to recent conversation embeddings; we don't re-compute here).
+    """
+    if thread.maturity_score < thresholds.research_maturity_min:
+        return False, "maturity_min"
+    if thread.previously_linked_to_audit:
+        return False, "previously_linked"
+    if topic_overlap_score < thresholds.research_topic_overlap_min:
+        return False, "topic_overlap_min"
+
+    freshness_cutoff = now - timedelta(minutes=thresholds.research_freshness_minutes)
+    if thread.completed_at < freshness_cutoff:
+        return False, "freshness_window"
+
+    return True, None
+
+
+def emit_research_completion_candidate(
+    persona_dir: Path,
+    *,
+    thread: ResearchThreadLike,
+    topic_overlap_score: float,
+    now: datetime,
+) -> None:
+    """Write a research_completion candidate to the initiate queue.
+
+    Idempotent on (source, source_id). Callers must run
+    gate_research_completion + check_shared_meta_gates first.
+    """
+    sc = SemanticContext(
+        linked_memory_ids=list(thread.linked_memory_ids),
+        topic_tags=[thread.topic],
+        source_meta={
+            "thread_topic": thread.topic,
+            "maturity_score": thread.maturity_score,
+            "summary_excerpt": thread.summary_excerpt,
+            "topic_overlap_score": topic_overlap_score,
+        },
+    )
+    emit_initiate_candidate(
+        persona_dir,
+        kind="message",
+        source="research_completion",
+        source_id=thread.thread_id,
+        semantic_context=sc,
+        now=now,
+    )

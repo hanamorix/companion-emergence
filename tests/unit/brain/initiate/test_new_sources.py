@@ -315,3 +315,140 @@ def test_emit_reflex_firing_candidate_writes_queue_row(tmp_path: Path):
         "confidence": 0.85,
         "flinch_intensity": 0.70,
     }
+
+
+@dataclass(frozen=True)
+class _FakeResearchThread:
+    thread_id: str
+    topic: str
+    maturity_score: float
+    summary_excerpt: str
+    linked_memory_ids: list[str]
+    completed_at: datetime
+    previously_linked_to_audit: bool
+
+
+def test_gate_research_completion_passes(tmp_path: Path):
+    from brain.initiate.new_sources import gate_research_completion
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t1",
+        topic="quiet rivers",
+        maturity_score=0.80,
+        summary_excerpt="...",
+        linked_memory_ids=[],
+        completed_at=now - timedelta(minutes=15),
+        previously_linked_to_audit=False,
+    )
+    allowed, reason = gate_research_completion(
+        persona,
+        thread=thread,
+        now=now,
+        topic_overlap_score=0.40,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_gate_research_completion_blocks_on_low_maturity(tmp_path: Path):
+    from brain.initiate.new_sources import gate_research_completion
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t2", topic="x", maturity_score=0.50,
+        summary_excerpt="...", linked_memory_ids=[],
+        completed_at=now, previously_linked_to_audit=False,
+    )
+    allowed, reason = gate_research_completion(
+        persona, thread=thread, now=now,
+        topic_overlap_score=0.40, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "maturity_min"
+
+
+def test_gate_research_completion_blocks_on_previously_linked(tmp_path: Path):
+    from brain.initiate.new_sources import gate_research_completion
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t3", topic="x", maturity_score=0.90,
+        summary_excerpt="...", linked_memory_ids=[],
+        completed_at=now, previously_linked_to_audit=True,
+    )
+    allowed, reason = gate_research_completion(
+        persona, thread=thread, now=now,
+        topic_overlap_score=0.40, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "previously_linked"
+
+
+def test_gate_research_completion_blocks_on_low_topic_overlap(tmp_path: Path):
+    from brain.initiate.new_sources import gate_research_completion
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t4", topic="x", maturity_score=0.90,
+        summary_excerpt="...", linked_memory_ids=[],
+        completed_at=now, previously_linked_to_audit=False,
+    )
+    allowed, reason = gate_research_completion(
+        persona, thread=thread, now=now,
+        topic_overlap_score=0.10, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "topic_overlap_min"
+
+
+def test_gate_research_completion_blocks_on_stale(tmp_path: Path):
+    from brain.initiate.new_sources import gate_research_completion
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t5", topic="x", maturity_score=0.90,
+        summary_excerpt="...", linked_memory_ids=[],
+        completed_at=now - timedelta(hours=2),  # outside 30-min freshness
+        previously_linked_to_audit=False,
+    )
+    allowed, reason = gate_research_completion(
+        persona, thread=thread, now=now,
+        topic_overlap_score=0.40, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "freshness_window"
+
+
+def test_emit_research_completion_candidate_writes_queue_row(tmp_path: Path):
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.new_sources import emit_research_completion_candidate
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    thread = _FakeResearchThread(
+        thread_id="t_emit", topic="midnight gardens",
+        maturity_score=0.85, summary_excerpt="A study of...",
+        linked_memory_ids=["m_x"],
+        completed_at=now, previously_linked_to_audit=False,
+    )
+    emit_research_completion_candidate(
+        persona, thread=thread, topic_overlap_score=0.45, now=now,
+    )
+    out = read_candidates(persona)
+    assert len(out) == 1
+    c = out[0]
+    assert c.source == "research_completion"
+    assert c.source_id == "t_emit"
+    assert c.semantic_context.source_meta == {
+        "thread_topic": "midnight gardens",
+        "maturity_score": 0.85,
+        "summary_excerpt": "A study of...",
+        "topic_overlap_score": 0.45,
+    }
