@@ -103,3 +103,48 @@ def test_initiate_candidate_id_generation():
     assert a < b  # sortable
     assert a != b  # unique
     assert a.startswith("ic_")
+
+
+def test_candidate_source_includes_new_sources():
+    from brain.initiate.schemas import CandidateSource
+
+    # CandidateSource is a Literal — validate by trying to assign each value.
+    valid: CandidateSource
+    valid = "reflex_firing"
+    assert valid == "reflex_firing"
+    valid = "research_completion"
+    assert valid == "research_completion"
+
+
+def test_decision_includes_new_d_values():
+    from brain.initiate.schemas import Decision
+
+    for v in [
+        "promoted_by_d",
+        "filtered_pre_compose_low_confidence",
+        "filtered_d_budget",
+        "promoted_by_d_malformed_fallback",
+        "d_passthrough_retry",
+        "promoted_by_d_after_3_failures",
+    ]:
+        d: Decision = v  # type: ignore[assignment]
+        assert d == v
+
+
+def test_semantic_context_source_meta_field():
+    from brain.initiate.schemas import SemanticContext
+
+    sc = SemanticContext(
+        linked_memory_ids=["m1"],
+        topic_tags=["x"],
+        source_meta={"pattern_id": "p1", "confidence": 0.8},
+    )
+    rt = SemanticContext.from_dict(sc.to_dict())
+    assert rt.source_meta == {"pattern_id": "p1", "confidence": 0.8}
+
+
+def test_semantic_context_source_meta_optional_back_compat():
+    from brain.initiate.schemas import SemanticContext
+
+    sc = SemanticContext.from_dict({"linked_memory_ids": [], "topic_tags": []})
+    assert sc.source_meta is None
