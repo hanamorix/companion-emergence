@@ -1,6 +1,7 @@
 """Tests for the v0.0.10 new emitter gates and emitters."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from brain.initiate.new_sources import load_gate_thresholds
@@ -37,3 +38,36 @@ def test_load_gate_thresholds_non_dict_json_returns_defaults(tmp_path: Path):
     (persona / "gate_thresholds.json").write_text("[]")
     t = load_gate_thresholds(persona)
     assert t.reflex_confidence_min == 0.70  # default
+
+
+def test_write_gate_rejection_appends_jsonl(tmp_path: Path):
+    from datetime import UTC, datetime
+
+    from brain.initiate.new_sources import write_gate_rejection
+
+    persona = tmp_path / "p"
+    write_gate_rejection(
+        persona,
+        ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+        source="reflex_firing",
+        source_id="r1",
+        gate_name="confidence_min",
+        threshold_value=0.70,
+        observed_value=0.5,
+    )
+    write_gate_rejection(
+        persona,
+        ts=datetime(2026, 5, 12, 10, 1, 0, tzinfo=UTC),
+        source="research_completion",
+        source_id="t9",
+        gate_name="topic_overlap_min",
+        threshold_value=0.30,
+        observed_value=0.10,
+    )
+    path = persona / "gate_rejections.jsonl"
+    rows = [json.loads(line) for line in path.read_text().strip().split("\n")]
+    assert len(rows) == 2
+    assert rows[0]["source"] == "reflex_firing"
+    assert rows[0]["gate_name"] == "confidence_min"
+    assert rows[0]["observed_value"] == 0.5
+    assert rows[1]["source"] == "research_completion"
