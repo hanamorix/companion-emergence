@@ -344,3 +344,67 @@ def test_run_initiate_review_tick_demotes_filtered_to_draft(
     assert read_candidates(persona) == []
     assert (persona / "draft_space.md").exists()
     assert compose_called == []
+
+
+def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
+    """After 3 consecutive timeout/provider_error failures across the same
+    candidate cohort, fall through to 'promote all' so candidates aren't stranded."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.d_call_schema import DCallRow
+    from brain.initiate.emit import emit_initiate_candidate, read_candidates
+    from brain.initiate.reflection import DReflectionResult
+    from brain.initiate.review import run_initiate_review_tick
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    base_time = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+
+    emit_initiate_candidate(
+        persona, kind="message", source="dream", source_id="d_pf",
+        semantic_context=SemanticContext(), now=base_time,
+    )
+
+    invocation_count = {"n": 0}
+
+    def fake_reflection_run(candidates, *, deps):
+        invocation_count["n"] += 1
+        return (
+            DReflectionResult(decisions=[], tick_note=None),
+            DCallRow(
+                d_call_id=f"dc_{invocation_count['n']}",
+                ts=deps.now.isoformat(),
+                tick_id=f"t_{invocation_count['n']}",
+                model_tier_used="haiku",
+                candidates_in=1,
+                promoted_out=0,
+                filtered_out=0,
+                latency_ms=30000,
+                tokens_input=0,
+                tokens_output=0,
+                failure_type="timeout",
+            ),
+        )
+
+    compose_calls: list[str] = []
+
+    def fake_compose(persona_dir, candidate, *, provider, voice_template, now):
+        compose_calls.append(candidate.candidate_id)
+
+    monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
+    monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_compose)
+
+    # Tick 1 and 2: only 2 consecutive failures — candidates remain in queue.
+    tick1_time = base_time + timedelta(minutes=1)
+    tick2_time = base_time + timedelta(minutes=2)
+    tick3_time = base_time + timedelta(minutes=3)
+
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick1_time)
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick2_time)
+    assert len(read_candidates(persona)) == 1
+    assert compose_calls == []
+
+    # Tick 3: third consecutive failure — fall through to promote-all.
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick3_time)
+    assert len(compose_calls) == 1
+    assert "ic_" in compose_calls[0]  # candidate_id is always ic_<timestamp>_<rand>
