@@ -18,12 +18,15 @@ will rejoin the queue if the underlying event is still relevant.
 from __future__ import annotations
 
 import logging
+import secrets
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from brain.initiate.audit import (
     append_audit_row,
+    append_d_call_row,
     read_recent_audit,
     update_audit_state,
 )
@@ -36,6 +39,16 @@ from brain.initiate.compose import (
 from brain.initiate.emit import read_candidates, remove_candidate
 from brain.initiate.gates import check_send_allowed
 from brain.initiate.memory import write_initiate_memory
+from brain.initiate.reflection import (
+    DProviderError,
+    DRateLimitError,
+    DTimeoutError,
+    ReflectionDeps,
+    demote_to_draft_space,
+)
+from brain.initiate.reflection import (
+    run as reflection_run,
+)
 from brain.initiate.schemas import AuditRow, InitiateCandidate, make_audit_id
 from brain.memory.store import MemoryStore
 
@@ -293,12 +306,103 @@ def run_initiate_review_tick(
 ) -> None:
     """Process up to cap_per_tick queued candidates through the pipeline.
 
+    D-reflection runs between the candidate-fetch and the three-prompt
+    composition loop.  Empty queue → D is skipped entirely.  Each
+    candidate's D decision determines whether it reaches composition
+    (promote) or draft_space.md (filter).
+
     Fault-isolated per candidate: an exception in one candidate's
     processing does not block the others.
     """
     now = now or datetime.now(UTC)
     candidates = read_candidates(persona_dir)[:cap_per_tick]
+
+    if not candidates:
+        return
+
+    # --- D-reflection gate ---------------------------------------------------
+    from brain.initiate.ambient import build_outbound_recall_block
+    from brain.persona_config import PersonaConfig
+
+    companion_name = persona_dir.name
+    try:
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        user_name = cfg.user_name or "you"
+    except Exception:
+        user_name = "you"
+
+    outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
+    voice_template_path = persona_dir / "nell-voice.md"
+    tick_id = f"t_{now.strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(2)}"
+
+    deps = ReflectionDeps(
+        companion_name=companion_name,
+        user_name=user_name,
+        voice_template_path=voice_template_path,
+        outbound_recall_block=outbound_block,
+        haiku_call=_make_haiku_call(provider),
+        sonnet_call=_make_sonnet_call(provider),
+        now=now,
+        tick_id=tick_id,
+    )
+
+    result, dcall = reflection_run(candidates, deps=deps)
+    append_d_call_row(persona_dir, dcall)
+
+    if not result.decisions and dcall.failure_type is not None:
+        # Failure-mode dispatch per spec §E.
+        if dcall.failure_type in ("timeout", "provider_error"):
+            # Passthrough retry — leave candidates in queue.
+            return
+        if dcall.failure_type == "rate_limit":
+            # Demote all to draft_space, remove from queue.
+            from brain.initiate.reflection import DDecision
+            for c in candidates:
+                synthetic = DDecision(
+                    candidate_index=0,
+                    decision="filter",
+                    reason="rate_limit — D could not review this tick",
+                    confidence="high",
+                )
+                demote_to_draft_space(persona_dir, candidate=c, decision=synthetic, now=now)
+                remove_candidate(persona_dir, c.candidate_id)
+            return
+        if dcall.failure_type == "malformed_json":
+            # Promote all — fall through to composition loop below.
+            promote_ids = {c.candidate_id for c in candidates}
+        else:
+            # Unknown failure type — promote all as safe default.
+            promote_ids = {c.candidate_id for c in candidates}
+    else:
+        # Build the set of promoted candidate IDs from D's decisions.
+        # decisions are in candidate_index order (0-based); map back to
+        # the ordered candidates list.
+        promote_ids: set[str] = set()
+        for d in result.decisions:
+            idx = d.candidate_index
+            if 0 <= idx < len(candidates):
+                c = candidates[idx]
+                if d.decision == "filter":
+                    demote_to_draft_space(persona_dir, candidate=c, decision=d, now=now)
+                    remove_candidate(persona_dir, c.candidate_id)
+                else:
+                    promote_ids.add(c.candidate_id)
+            else:
+                logger.warning(
+                    "D returned out-of-range candidate_index=%d (queue len=%d); "
+                    "skipping decision",
+                    idx, len(candidates),
+                )
+        # Any candidate not covered by a D decision is promoted (safe default).
+        decided_indices = {d.candidate_index for d in result.decisions}
+        for i, c in enumerate(candidates):
+            if i not in decided_indices:
+                promote_ids.add(c.candidate_id)
+
+    # --- Three-prompt composition loop (promoted candidates only) -----------
     for candidate in candidates:
+        if candidate.candidate_id not in promote_ids:
+            continue
         try:
             _process_one_candidate(
                 persona_dir,
@@ -312,3 +416,47 @@ def run_initiate_review_tick(
                 "initiate review tick: unrecoverable error on candidate %s",
                 candidate.candidate_id,
             )
+
+
+def _make_haiku_call(provider: Any):
+    """Return an LLMCall wrapper around `provider` using the Haiku model tier.
+
+    Signature: (*, system, user) -> (text, latency_ms, tokens_in, tokens_out).
+
+    The v0.0.9 LLMProvider.generate(prompt, *, system) API returns only text.
+    Latency is measured client-side; tokens_in / tokens_out are 0 (not available
+    via the CLI surface — telemetry still works for latency + failure tracking).
+
+    Exception mapping per spec §E:
+      subprocess.TimeoutExpired / TimeoutError  → DTimeoutError
+      text contains "429" / "rate"              → DRateLimitError
+      any other exception                        → DProviderError
+    """
+    def _call(*, system: str, user: str) -> tuple[str, int, int, int]:
+        start = time.monotonic()
+        try:
+            text = provider.generate(user, system=system)
+        except (TimeoutError, TimeoutError.__class__) as exc:
+            # Catch both Python TimeoutError and subprocess.TimeoutExpired.
+            raise DTimeoutError(str(exc)) from exc
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "429" in msg or "rate" in msg:
+                raise DRateLimitError(str(exc)) from exc
+            raise DProviderError(str(exc)) from exc
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return text, latency_ms, 0, 0
+
+    return _call
+
+
+def _make_sonnet_call(provider: Any):
+    """Return an LLMCall wrapper identical to _make_haiku_call.
+
+    In v0.0.9 the provider is a single object (ClaudeCliProvider configured
+    with one model). The model-tier distinction matters for the DCallRow audit
+    trail but not for the actual call — the supervisor's provider handles
+    routing. Both wrappers call provider.generate() identically; future
+    versions may inject separate provider instances per tier.
+    """
+    return _make_haiku_call(provider)
