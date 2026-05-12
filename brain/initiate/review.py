@@ -28,6 +28,7 @@ from brain.initiate.audit import (
     append_audit_row,
     append_d_call_row,
     read_recent_audit,
+    read_recent_d_calls,
     update_audit_state,
 )
 from brain.initiate.compose import (
@@ -352,7 +353,29 @@ def run_initiate_review_tick(
     if not result.decisions and dcall.failure_type is not None:
         # Failure-mode dispatch per spec §E.
         if dcall.failure_type in ("timeout", "provider_error"):
-            # Passthrough retry — leave candidates in queue.
+            # Walk d_call history newest-first to count consecutive failures.
+            # append_d_call_row was already called above, so the current dcall
+            # is included in read_recent_d_calls.  If we see 3 in a row,
+            # fall through to promote-all so candidates aren't stranded.
+            recent = list(read_recent_d_calls(persona_dir, window_hours=1, now=now))
+            consecutive_failures = 0
+            for r in reversed(recent):
+                if r.failure_type in ("timeout", "provider_error"):
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        break
+                else:
+                    break
+            if consecutive_failures >= 3:
+                for c in candidates:
+                    _process_one_candidate(
+                        persona_dir, c,
+                        provider=provider,
+                        voice_template=voice_template,
+                        now=now,
+                    )
+                return
+            # Fewer than 3 consecutive failures — passthrough retry.
             return
         if dcall.failure_type == "rate_limit":
             # Demote all to draft_space, remove from queue.
