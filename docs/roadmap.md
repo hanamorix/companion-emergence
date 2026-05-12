@@ -172,6 +172,29 @@ natural extensions of the multimodal + bundled-runtime work:
 
 ## Recently shipped (reverse chronological)
 
+**2026-05-12 — Initiate physiology (v0.0.9-alpha)**
+
+- Autonomous outbound channel ("initiate"): events emit candidates →
+  supervisor cadence reviews with cost-cap + cooldown gates → three-prompt
+  composition (subject / tone / decision) → audit + memory.
+- Voice-edit proposals: daily reflection tick emits candidates with a
+  ≥3-evidence bar; accept writes to three places (audit + episodic
+  memory + SoulStore `voice_evolution`).
+- Draft space: failed-to-promote events (sub-1.5σ emotion spikes for
+  v0.0.9) become markdown fragments in `draft_space.md`.
+- Verify path: always-on outbound-recall slice in every chat prompt
+  + on-demand tools (`recall_initiate_audit`, `recall_soul_audit`,
+  `recall_voice_evolution`).
+- User-local timezone awareness via `datetime.now().astimezone()` —
+  no PersonaConfig knob.
+- Frontend: `InitiateBanner` with ↩ reply affordance + 2 s read
+  detection, `VoiceEditPanel` with diff-in-context review,
+  `DraftSpacePanel` for fragment viewing, Tauri OS notification
+  via `tauri-plugin-notification`.
+- CLI: `nell initiate audit [--full]`, `candidates`, `voice-evolution`.
+- D-reflection layer (Nell-side editorial filter) designed and
+  reserved for v0.0.10; v0.0.9 schemas carry the compatibility seam.
+
 **2026-05-11 — JSONL log retention (autonomous physiology)**
 
 - New supervisor tick `_run_log_rotation_tick` on hourly cadence — same
