@@ -479,6 +479,50 @@ def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
     assert candidates[0].kind == "message"
 
 
+def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path) -> None:
+    """v0.0.9: dream candidates carry the aggregated dream-memory emotions
+    in `emotional_snapshot.vector`, not a zero-filled dict.
+    """
+    from brain.engines.dream import DreamEngine
+    from brain.initiate.emit import read_candidates
+
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+
+    store = MemoryStore(db_path=":memory:")
+    hm = HebbianMatrix(db_path=":memory:")
+    try:
+        # Seed memory with a real emotion so the dream memory inherits it.
+        seed = _mem("seed", importance=8.0, emotions={"longing": 6.0})
+        store.create(seed)
+
+        engine = DreamEngine(
+            store=store,
+            hebbian=hm,
+            embeddings=None,
+            provider=FakeProvider(),
+            log_path=persona_dir / "dreams.log.jsonl",
+            persona_dir=persona_dir,
+            persona_name="Nell",
+            persona_system_prompt=(
+                "You are Nell. Reflect in first person, 2-3 sentences, "
+                "starting with 'DREAM: '."
+            ),
+        )
+        engine.run_cycle()
+    finally:
+        store.close()
+        hm.close()
+
+    candidates = read_candidates(persona_dir)
+    assert len(candidates) == 1
+    snap = candidates[0].emotional_snapshot
+    assert snap is not None
+    # The dream memory should have aggregated `longing` from the seed, so the
+    # candidate's vector must carry it — not an empty/zero dict.
+    assert snap.vector.get("longing", 0.0) > 0.0
+
+
 def test_dream_engine_empty_persona_raises() -> None:
     """DreamEngine must reject empty persona_name / persona_system_prompt
     to force callers to be explicit."""

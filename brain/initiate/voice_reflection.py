@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from brain.initiate.emit import emit_initiate_candidate
-from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+from brain.initiate.schemas import SemanticContext
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +99,9 @@ def run_voice_reflection_tick(
         kind="voice_edit_proposal",
         source="voice_reflection",
         source_id=source_id,
-        emotional_snapshot=EmotionalSnapshot(
-            vector={},
-            rolling_baseline_mean=0.0,
-            rolling_baseline_stdev=0.0,
-            current_resonance=0.0,
-            delta_sigma=0.0,
-        ),
+        # No emotional_snapshot: daily reflection looks back at the last
+        # week of activity — there is no moment-in-time emotion to
+        # capture, so None is more honest than zero-filled fields.
         semantic_context=SemanticContext(),
         proposal=proposal,
     )

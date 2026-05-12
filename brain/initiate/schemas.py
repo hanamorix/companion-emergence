@@ -70,13 +70,27 @@ class SemanticContext:
 
 @dataclass
 class InitiateCandidate:
+    """A queued initiate candidate.
+
+    `emotional_snapshot` is Optional because some emitters (notably
+    voice-reflection, which looks at the last week of activity) have no
+    moment-in-time emotion to capture. Carrying a zero-filled snapshot
+    there would be a structurally-valid lie; None is semantically honest.
+
+    Non-heartbeat emitters that DO have an emotional context at emit time
+    (dream cycle, crystallizers) populate the `vector` field from that
+    context. The rolling_baseline / current_resonance / delta_sigma fields
+    are heartbeat-specific — non-periodic emitters leave them at 0.0 with
+    a docstring note rather than fabricating values.
+    """
+
     candidate_id: str
     ts: str  # ISO 8601 with tz
     kind: CandidateKind
     source: CandidateSource
     source_id: str
-    emotional_snapshot: EmotionalSnapshot
     semantic_context: SemanticContext
+    emotional_snapshot: EmotionalSnapshot | None = None
     claimed_at: str | None = None
     # Voice-edit-only payload (None for kind="message").
     proposal: dict[str, Any] | None = None
@@ -88,7 +102,11 @@ class InitiateCandidate:
             "kind": self.kind,
             "source": self.source,
             "source_id": self.source_id,
-            "emotional_snapshot": self.emotional_snapshot.to_dict(),
+            "emotional_snapshot": (
+                self.emotional_snapshot.to_dict()
+                if self.emotional_snapshot is not None
+                else None
+            ),
             "semantic_context": self.semantic_context.to_dict(),
             "claimed_at": self.claimed_at,
         }
@@ -99,13 +117,15 @@ class InitiateCandidate:
     @classmethod
     def from_jsonl(cls, line: str) -> InitiateCandidate:
         d = json.loads(line)
+        snap_raw = d.get("emotional_snapshot")
+        snap = EmotionalSnapshot.from_dict(snap_raw) if snap_raw is not None else None
         return cls(
             candidate_id=d["candidate_id"],
             ts=d["ts"],
             kind=d["kind"],
             source=d["source"],
             source_id=d["source_id"],
-            emotional_snapshot=EmotionalSnapshot.from_dict(d["emotional_snapshot"]),
+            emotional_snapshot=snap,
             semantic_context=SemanticContext.from_dict(d["semantic_context"]),
             claimed_at=d.get("claimed_at"),
             proposal=d.get("proposal"),

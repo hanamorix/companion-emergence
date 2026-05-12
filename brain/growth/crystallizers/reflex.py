@@ -450,12 +450,14 @@ def crystallize_reflex(
     # Phase 4.2 — emit one initiate candidate per accepted decision. Wrapped
     # in try/except so a downstream emit failure can never crash the
     # crystallizer: reflex emergence is physiology, initiate is signal.
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
     for emergence in accepted_emergences:
         _emit_initiate_candidate(
             persona_dir=persona_dir,
             source_id=f"reflex_emergence:{emergence.name}",
             label=emergence.name,
             related_memory_ids=[],
+            emotion_vector=aggregated_vector,
         )
     for prune in accepted_prunings:
         _emit_initiate_candidate(
@@ -463,9 +465,39 @@ def crystallize_reflex(
             source_id=f"reflex_pruning:{prune.name}",
             label=prune.name,
             related_memory_ids=[],
+            emotion_vector=aggregated_vector,
         )
 
     return result
+
+
+def _aggregate_recent_emotion_vector(
+    store: MemoryStore, *, now: datetime, look_back_days: int = 7,
+) -> dict[str, float]:
+    """Return a max-pooled emotion vector across recent active memories.
+
+    Used by crystallizers to give their initiate candidates a real
+    emotional context — what's been alive in the persona over the
+    last week, not a moment-in-time felt state. Empty dict on any
+    failure (the emit candidate just carries no vector — better than
+    a zero-filled lie).
+    """
+    try:
+        from brain.emotion.aggregate import aggregate_state
+
+        cutoff = now - timedelta(days=look_back_days)
+        recent: list[Any] = []
+        for mtype in _CONVERSATION_TYPES:
+            for mem in store.list_by_type(mtype, active_only=True):
+                if mem.created_at >= cutoff and mem.emotions:
+                    recent.append(mem)
+        if not recent:
+            return {}
+        state = aggregate_state(recent)
+        return dict(state.emotions)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reflex: recent-emotion aggregation failed: %s", exc)
+        return {}
 
 
 def _emit_initiate_candidate(
@@ -474,11 +506,18 @@ def _emit_initiate_candidate(
     source_id: str,
     label: str,
     related_memory_ids: list[str],
+    emotion_vector: dict[str, float] | None = None,
 ) -> None:
     """Emit one initiate candidate after a reflex crystallization commit.
 
     Phase 4.2 of the initiate physiology pipeline. Wrapped in try/except —
     an emit failure must not crash the crystallizer.
+
+    `emotion_vector` carries a max-pooled aggregate over recent active
+    memories — what's been emotionally alive in the period that produced
+    this crystallization. rolling_baseline / current_resonance /
+    delta_sigma stay zero: those are heartbeat-specific signals; non-
+    periodic emitters don't compute them.
     """
     try:
         from brain.initiate.emit import emit_initiate_candidate
@@ -490,7 +529,7 @@ def _emit_initiate_candidate(
             source="crystallization",
             source_id=source_id,
             emotional_snapshot=EmotionalSnapshot(
-                vector={},
+                vector=dict(emotion_vector or {}),
                 rolling_baseline_mean=0.0,
                 rolling_baseline_stdev=0.0,
                 current_resonance=0.0,
