@@ -185,6 +185,18 @@ def _part_of_day(hour: int) -> str:
     return "night"
 
 
+class DTimeoutError(Exception):
+    """Raised by an LLMCall when the request exceeds its time budget."""
+
+
+class DProviderError(Exception):
+    """Raised by an LLMCall on generic provider error (5xx, connection, etc.)."""
+
+
+class DRateLimitError(Exception):
+    """Raised by an LLMCall on rate-limit / quota rejection (HTTP 429)."""
+
+
 # (raw_text, latency_ms, tokens_in, tokens_out)
 LLMCall = Callable[..., tuple[str, int, int, int]]
 
@@ -238,6 +250,9 @@ def run(
       - If Sonnet's response ALSO contains a low-confidence decision,
         force that candidate's decision to "filter" with an ambivalence
         reason (conservative default at the edge of D's judgment).
+      - On DTimeoutError / DProviderError / DRateLimitError raised by an
+        LLMCall, capture into DCallRow.failure_type with empty decisions;
+        caller (see Task 14/15) handles passthrough-retry / draft-space-demote.
     """
     system = build_system_message(
         companion_name=deps.companion_name,
@@ -253,18 +268,43 @@ def run(
         ],
     )
 
+    def _empty_call_row(*, failure_type: str, latency_ms: int = 0,
+                       model_tier: str = "haiku") -> DCallRow:
+        return DCallRow(
+            d_call_id=make_d_call_id(deps.now),
+            ts=deps.now.isoformat(),
+            tick_id=deps.tick_id,
+            model_tier_used=model_tier,  # type: ignore[arg-type]
+            candidates_in=len(candidates),
+            promoted_out=0,
+            filtered_out=0,
+            latency_ms=latency_ms,
+            tokens_input=0,
+            tokens_output=0,
+            failure_type=failure_type,  # type: ignore[arg-type]
+            retry_count=0,
+            tick_note=None,
+        )
+
     # First attempt on Haiku.
-    raw_h, latency_h, tin_h, tout_h = deps.haiku_call(system=system, user=user)
+    try:
+        raw_h, latency_h, tin_h, tout_h = deps.haiku_call(system=system, user=user)
+    except DTimeoutError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="timeout")
+    except DRateLimitError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="rate_limit")
+    except DProviderError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="provider_error")
+
     haiku_result: DReflectionResult | None
     try:
         haiku_result = parse_structured_response(raw_h)
         haiku_low = any(d.confidence == "low" for d in haiku_result.decisions)
     except ValueError:
         haiku_result = None
-        haiku_low = True  # treat parse-fail as low-confidence trigger
+        haiku_low = True
 
     if haiku_result is not None and not haiku_low:
-        # Haiku is final.
         promoted = sum(1 for d in haiku_result.decisions if d.decision == "promote")
         filtered = sum(1 for d in haiku_result.decisions if d.decision == "filter")
         d_call = DCallRow(
@@ -285,11 +325,38 @@ def run(
         return haiku_result, d_call
 
     # Escalate to Sonnet.
-    raw_s, latency_s, tin_s, tout_s = deps.sonnet_call(system=system, user=user)
-    sonnet_result = parse_structured_response(raw_s)
+    try:
+        raw_s, latency_s, tin_s, tout_s = deps.sonnet_call(system=system, user=user)
+    except DTimeoutError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="timeout", latency_ms=latency_h, model_tier="sonnet",
+        )
+    except DRateLimitError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="rate_limit", latency_ms=latency_h, model_tier="sonnet",
+        )
+    except DProviderError:
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="provider_error", latency_ms=latency_h, model_tier="sonnet",
+        )
 
-    # Both-low-confidence: force decisions where confidence is low to "filter"
-    # with an ambivalence reason.
+    try:
+        sonnet_result = parse_structured_response(raw_s)
+    except ValueError:
+        # Sonnet also malformed — caller treats this as "promote all" per spec §E.
+        return DReflectionResult(decisions=[], tick_note=None), DCallRow(
+            d_call_id=make_d_call_id(deps.now),
+            ts=deps.now.isoformat(),
+            tick_id=deps.tick_id,
+            model_tier_used="sonnet",
+            candidates_in=len(candidates),
+            promoted_out=0, filtered_out=0,
+            latency_ms=latency_h + latency_s,
+            tokens_input=tin_h + tin_s, tokens_output=tout_h + tout_s,
+            failure_type="malformed_json",
+            retry_count=1, tick_note=None,
+        )
+
     forced: list[DDecision] = []
     both_low = False
     for d in sonnet_result.decisions:
