@@ -408,3 +408,37 @@ def test_reflection_run_records_provider_error(tmp_path):
     )
     _, dcall = run(candidates, deps=deps)
     assert dcall.failure_type == "provider_error"
+
+
+def test_demote_to_draft_space_writes_fragment(tmp_path):
+    """A filtered candidate becomes a draft-space fragment with D-frontmatter."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import DDecision, demote_to_draft_space
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidate = InitiateCandidate(
+        candidate_id="ic_x",
+        ts=(now - timedelta(minutes=5)).isoformat(),
+        kind="message",
+        source="reflex_firing",
+        source_id="rfx_001",
+        semantic_context=SemanticContext(source_meta={"pattern_id": "p1"}),
+    )
+    decision = DDecision(
+        candidate_index=1,
+        decision="filter",
+        reason="private weather; passing through",
+        confidence="high",
+    )
+    demote_to_draft_space(persona, candidate=candidate, decision=decision, now=now)
+
+    draft_path = persona / "draft_space.md"
+    text = draft_path.read_text(encoding="utf-8")
+    assert "demoted_by: d_reflection" in text
+    assert 'd_reason: "private weather; passing through"' in text
+    assert "source: reflex_firing" in text
+    assert "source_id: rfx_001" in text
