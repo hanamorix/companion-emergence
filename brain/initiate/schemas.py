@@ -16,9 +16,28 @@ from datetime import datetime
 from typing import Any, Literal
 
 CandidateKind = Literal["message", "voice_edit_proposal"]
-CandidateSource = Literal["dream", "crystallization", "emotion_spike", "voice_reflection"]
+CandidateSource = Literal[
+    "dream",
+    "crystallization",
+    "emotion_spike",
+    "voice_reflection",
+    "reflex_firing",
+    "research_completion",
+]
 Decision = Literal[
-    "send_notify", "send_quiet", "hold", "drop", "error", "filtered_pre_compose"
+    "send_notify",
+    "send_quiet",
+    "hold",
+    "drop",
+    "error",
+    "filtered_pre_compose",
+    # D-reflection (v0.0.10) decision values:
+    "promoted_by_d",
+    "filtered_pre_compose_low_confidence",
+    "filtered_d_budget",
+    "promoted_by_d_malformed_fallback",
+    "d_passthrough_retry",
+    "promoted_by_d_after_3_failures",
 ]
 StateName = Literal[
     "pending", "delivered", "read",
@@ -59,13 +78,24 @@ class EmotionalSnapshot:
 class SemanticContext:
     linked_memory_ids: list[str] = field(default_factory=list)
     topic_tags: list[str] = field(default_factory=list)
+    source_meta: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = {
+            "linked_memory_ids": self.linked_memory_ids,
+            "topic_tags": self.topic_tags,
+        }
+        if self.source_meta is not None:
+            d["source_meta"] = self.source_meta
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SemanticContext:
-        return cls(**d)
+        return cls(
+            linked_memory_ids=d.get("linked_memory_ids", []),
+            topic_tags=d.get("topic_tags", []),
+            source_meta=d.get("source_meta"),
+        )
 
 
 @dataclass
