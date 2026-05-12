@@ -465,6 +465,17 @@ class ReflexEngine:
             except (OSError, ValueError) as exc:
                 logger.warning("reflex fire: behavioral_log append failed: %s", exc)
 
+        # D-reflection Task 17: emit reflex_firing initiate candidate (gated).
+        # Best-effort: gate/emit failure does NOT prevent the reflex fire.
+        if not dry_run:
+            _emit_reflex_candidate(
+                persona_dir=self.log_path.parent,
+                arc=arc,
+                trigger_state=trigger_state,
+                mem_id=mem.id,
+                now=now,
+            )
+
         return ArcFire(
             arc_name=arc.name,
             fired_at=now,
@@ -483,3 +494,98 @@ def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
 def _format_memory_summary(memories: list) -> str:
     top = list(memories)[:3]
     return "\n".join(f"- {m.content[:140]}" for m in top)
+
+
+def _emit_reflex_candidate(
+    *,
+    persona_dir: Path,
+    arc: ReflexArc,
+    trigger_state: dict[str, float],
+    mem_id: str,
+    now: datetime,
+) -> None:
+    """Gate-check and emit a reflex_firing initiate candidate.
+
+    Builds a minimal Protocol-satisfying adapter from the arc fire data.
+    Best-effort: any exception is logged at WARNING; the reflex fire
+    already succeeded before this is called.
+
+    Field mapping for ReflexFiringLike:
+    - pattern_id                  = arc.name
+    - confidence                  = 1.0 (threshold-based firing is deterministic)
+    - flinch_intensity            = max trigger_state value (highest emotional intensity)
+    - linked_memory_ids           = [mem_id] (the output memory just written)
+    - triggered_by_companion_outbound = False (reflex is autonomously triggered)
+    - ts                          = now
+    """
+    try:
+        from brain.initiate.new_sources import (
+            check_shared_meta_gates,
+            emit_reflex_firing_candidate,
+            gate_reflex_firing,
+            load_gate_thresholds,
+            write_gate_rejection,
+        )
+
+        # Build a minimal Protocol-conformant adapter.
+        @dataclass
+        class _ReflexFiringAdapter:
+            pattern_id: str
+            confidence: float
+            flinch_intensity: float
+            linked_memory_ids: list[str]
+            triggered_by_companion_outbound: bool
+            ts: datetime
+
+        flinch = max(trigger_state.values(), default=0.0)
+        firing = _ReflexFiringAdapter(
+            pattern_id=arc.name,
+            confidence=1.0,
+            flinch_intensity=flinch,
+            linked_memory_ids=[mem_id],
+            triggered_by_companion_outbound=False,
+            ts=now,
+        )
+
+        thresholds = load_gate_thresholds(persona_dir)
+
+        gate_ok, gate_reason = gate_reflex_firing(
+            persona_dir, firing=firing, thresholds=thresholds
+        )
+        if not gate_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="reflex_firing",
+                source_id=mem_id,
+                gate_name=gate_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        meta_ok, meta_reason = check_shared_meta_gates(
+            persona_dir,
+            source="reflex_firing",
+            now=now,
+            is_rest_state=False,
+            thresholds=thresholds,
+        )
+        if not meta_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="reflex_firing",
+                source_id=mem_id,
+                gate_name=meta_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        emit_reflex_firing_candidate(
+            persona_dir, firing=firing, firing_log_id=mem_id, now=now
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reflex fire: initiate candidate emit failed: %s", exc)
