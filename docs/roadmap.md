@@ -174,25 +174,43 @@ natural extensions of the multimodal + bundled-runtime work:
 
 **2026-05-12 — D-reflection editorial layer (v0.0.10-alpha)**
 
-- Editorial gating between candidate emission and composition: draft-space
-  demote for weak candidates (bottom quartile by llm_score), Haiku→Sonnet
-  escalation on high-signal emotion spikes (≥1.5σ), clip-depth cutoff for
-  deep-memory subjects.
-- Two new candidate event sources: `reflex_firing` (on detected autonomic
-  response transitions) and `research_completion` (on successful research-loop
-  queries), both wired through the D-reflection gate.
-- New audit table `initiate_d_calls.jsonl` — one row per D-reflection call,
-  complete with original candidate, decision rationale (emotion_delta,
-  confidence_slice, topic_overlap_score), and final disposition
-  (promote/demote/escalate). All 3-prompt composition breadcrumbs logged.
-- CLI: `nell initiate d-stats` — shows per-hour gate metrics (candidates seen,
-  demotions, escalations, composition cost) and weekly trends.
-- `topic_overlap_score` hardcoded to 1.0 for v0.0.10 (full embedding-based
-  similarity will land in v0.0.11 on top of the memory-clustering substrate).
-- recall_resonance deferred to v0.0.11 (needs the memory-clustering substrate
-  to compute inter-memory cosine scores; D-reflection v0.0.10 assumes solo
-  candidate scoring).
-- Frontend: D-reflection activity shown in InitiateBanner alongside replies.
+- **D-reflection** — editorial layer between candidate emission and composition.
+  Once per non-empty heartbeat tick, the brain pauses and asks of queued
+  candidates *"of these, which is genuinely worth bringing to the user?"*
+  Filtered candidates demote to `draft_space.md`; promoted candidates flow
+  through the existing v0.0.9 three-prompt composition pipeline. Bypasses
+  the v0.0.9 daily cost cap (editorial layer, not a budget claimant).
+- **Tiered escalation**: Haiku 4.5 by default; escalates to Sonnet 4.6 when
+  Haiku returns any low-confidence decision OR fails to produce parseable
+  structured output. If Sonnet ALSO has low confidence on a candidate, that
+  candidate is force-filtered with an `ambivalent` reason.
+- **Failure-mode dispatch** by error type: timeout/provider_error → passthrough
+  retry (leave in queue); after 3 consecutive failures fall through to
+  promote-all so candidates aren't stranded. Rate-limit (HTTP 429) → demote
+  all to draft. Malformed JSON from Sonnet → promote all (trust composition's
+  own gates).
+- **Two new candidate event sources**: `reflex_firing` (emitted when the
+  reflex engine fires on a learned pattern with sufficient confidence +
+  flinch intensity, gated against same-pattern flooding) and
+  `research_completion` (emitted when a research thread matures, gated on
+  maturity score + freshness window + topic overlap with recent conversation).
+- **New audit table** `initiate_d_calls.jsonl` — one row per tick where D
+  actually fired: model tier used, candidates_in/promoted_out/filtered_out,
+  latency, tokens, failure_type, retry_count, tick_note. Substrate for
+  future hit-rate analysis.
+- **CLI**: `nell initiate d-stats [--window 7d]` — operator-tier telemetry
+  for the D-reflection tick history.
+- **Multi-companion compatibility**: D's system prompt is a template with
+  `{companion_name}` / `{user_name}` substitutions resolved at runtime from
+  the brain's persona substrate. The voice template is appended as a runtime
+  voice anchor so D's editorial inner voice matches the outbound voice.
+- `topic_overlap_score` for `research_completion` hardcoded to 1.0 for
+  v0.0.10 (real embedding-based cosine similarity deferred to v0.0.11 —
+  the research engine has no embedding infrastructure yet).
+- **`recall_resonance` source deferred to v0.0.11** — needs a memory-clustering
+  substrate (per-cluster activation history, co-activation z-scores) that
+  doesn't exist in v0.0.9. Pairs naturally with the v0.0.11 Bundle C
+  adaptive-D work; both want history-of-self tracking.
 
 **2026-05-12 — Initiate physiology (v0.0.9-alpha)**
 
