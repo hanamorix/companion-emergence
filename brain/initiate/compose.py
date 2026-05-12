@@ -73,9 +73,22 @@ def compose_tone(
     input but must NOT change the content. Voice template + emotional
     vector live in this prompt's context.
     """
-    vector_str = ", ".join(
-        f"{k}={v}" for k, v in candidate.emotional_snapshot.vector.items()
-    )
+    if candidate.emotional_snapshot is None:
+        emotional_line = (
+            "Emotional state right now: (no moment-in-time emotional snapshot "
+            "for this candidate — it was emitted from a reflective/aggregate "
+            "source rather than a felt moment)"
+        )
+    else:
+        vector = candidate.emotional_snapshot.vector
+        if vector:
+            vector_str = ", ".join(f"{k}={v}" for k, v in vector.items())
+            emotional_line = f"Emotional state right now: {vector_str}"
+        else:
+            emotional_line = (
+                "Emotional state right now: (no specific emotional vector "
+                "available)"
+            )
     prompt = (
         "You are Nell. Render the following subject as a message to Hana, "
         "in your voice as defined below, coloured by your current "
@@ -83,7 +96,7 @@ def compose_tone(
         "it is said.\n\n"
         f"Subject: {subject}\n\n"
         f"Voice template:\n{voice_template}\n\n"
-        f"Emotional state right now: {vector_str}\n\n"
+        f"{emotional_line}\n\n"
         "Message (one paragraph):"
     )
     return provider.complete(prompt).strip()

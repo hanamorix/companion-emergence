@@ -45,6 +45,8 @@ def test_voice_reflection_emits_candidate_when_evidence_strong(
     assert candidates[0].kind == "voice_edit_proposal"
     assert candidates[0].proposal is not None
     assert candidates[0].proposal["old_text"] == "old line"
+    # v0.0.9: voice-reflection has no moment-in-time emotion — snapshot is None.
+    assert candidates[0].emotional_snapshot is None
 
 
 def test_voice_reflection_skips_when_evidence_thin(tmp_path: Path) -> None:

@@ -73,6 +73,27 @@ def test_audit_row_state_transitions_append():
     assert row.delivery["state_transitions"][0]["to"] == "delivered"
 
 
+def test_initiate_candidate_round_trips_with_none_snapshot():
+    """v0.0.9: emotional_snapshot is Optional (voice-reflection emits with None)."""
+    ts = "2026-05-11T14:32:04.123456+00:00"
+    cand = InitiateCandidate(
+        candidate_id="ic_2026-05-11T14-32-04_a3f1",
+        ts=ts,
+        kind="voice_edit_proposal",
+        source="voice_reflection",
+        source_id="vr_001",
+        emotional_snapshot=None,
+        semantic_context=SemanticContext(),
+        proposal={"old_text": "a", "new_text": "b", "evidence": ["1", "2", "3"]},
+    )
+    line = cand.to_jsonl()
+    # JSON should carry "emotional_snapshot": null (not omitted, not zeros).
+    assert '"emotional_snapshot": null' in line
+    reconstructed = InitiateCandidate.from_jsonl(line)
+    assert reconstructed == cand
+    assert reconstructed.emotional_snapshot is None
+
+
 def test_initiate_candidate_id_generation():
     """candidate_id must be sortable and unique."""
     from brain.initiate.schemas import make_candidate_id

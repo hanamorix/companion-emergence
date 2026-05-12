@@ -79,6 +79,32 @@ def test_compose_tone_receives_subject_immutable() -> None:
     assert result.startswith("the dream from this morning")
 
 
+def test_compose_tone_handles_none_snapshot_gracefully() -> None:
+    """v0.0.9: when emotional_snapshot is None (voice-reflection), tone prompt
+    must not crash and must signal absence honestly."""
+    provider = MagicMock(complete=MagicMock(return_value="rendered"))
+    cand = InitiateCandidate(
+        candidate_id="ic_002",
+        ts="2026-05-11T14:32:04+00:00",
+        kind="voice_edit_proposal",
+        source="voice_reflection",
+        source_id="vr_001",
+        emotional_snapshot=None,
+        semantic_context=SemanticContext(),
+        proposal={"old_text": "a", "new_text": "b"},
+    )
+    compose_tone(
+        provider,
+        subject="subject text",
+        candidate=cand,
+        voice_template="voice",
+    )
+    args, _ = provider.complete.call_args
+    prompt_text = args[0]
+    # Should not raise AttributeError; should make absence visible.
+    assert "no moment-in-time" in prompt_text or "no emotional" in prompt_text.lower()
+
+
 def test_compose_decision_excludes_candidate_metadata() -> None:
     """Decision prompt sees the rendered message but NOT the candidate metadata."""
     provider = MagicMock()
