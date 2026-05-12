@@ -967,7 +967,10 @@ def build_app(
         user_modified = isinstance(with_edits, str) and with_edits != ""
         new_text = with_edits if user_modified else proposed_new_text
 
-        # Place 1: voice template file (atomic via temp+rename).
+        # Pre-flight the voice template: existence + old_text presence are
+        # validated BEFORE the audit transition so we don't record a
+        # transition we can't honour. The actual file write happens after
+        # the audit update — see comment below.
         voice_path = s.persona_dir / "nell-voice.md"
         if not voice_path.exists():
             raise HTTPException(
@@ -982,11 +985,17 @@ def build_app(
                 ),
             )
         new_content = current.replace(old_text, new_text, 1)
-        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
-        tmp.write_text(new_content, encoding="utf-8")
-        tmp.replace(voice_path)
 
-        # Place 2: audit row — record replied_explicit transition.
+        # Place 1: audit row FIRST — record replied_explicit transition.
+        #
+        # Order rationale: audit transitions are reversible by appending
+        # further transitions; voice-template mutations are not (the file
+        # is the source of truth once written). If the file write below
+        # fails, the audit overstates by one transition — recoverable by
+        # appending a `dismissed` transition with a `voice_write_failed`
+        # reason. The previous ordering (file → audit) had the inverse
+        # failure mode: a successful file write with no audit record,
+        # which is silently unrecoverable.
         now_iso = datetime.now(UTC).isoformat()
         update_audit_state(
             s.persona_dir,
@@ -994,6 +1003,15 @@ def build_app(
             new_state="replied_explicit",
             at=now_iso,
         )
+
+        # Place 2: voice template file (atomic via temp+rename).
+        # If this raises after the audit update, the 500 propagates and
+        # leaves the persona in a recoverable state: audit says
+        # "replied_explicit", file unchanged. Hana can re-issue accept
+        # after fixing the underlying disk error.
+        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
+        tmp.write_text(new_content, encoding="utf-8")
+        tmp.replace(voice_path)
 
         # Place 3: SoulStore voice_evolution.
         try:

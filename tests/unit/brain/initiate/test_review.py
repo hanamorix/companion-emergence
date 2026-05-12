@@ -155,3 +155,74 @@ def test_review_tick_no_op_when_queue_empty(tmp_path: Path) -> None:
     )
     assert not (tmp_path / "initiate_audit.jsonl").exists()
     provider.complete.assert_not_called()
+
+
+def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path) -> None:
+    """When the decision is to send, the review tick MUST publish an
+    ``initiate_delivered`` event so the frontend banner pipeline wakes up.
+
+    The frontend ChatPanel subscribes to this event on the bridge /events
+    stream; without the publish, the brain's outreach is invisible to the
+    user even though the audit row says "delivered".
+    """
+    from brain.bridge import events
+
+    emit_initiate_candidate(
+        tmp_path,
+        kind="message",
+        source="dream",
+        source_id="dream_abc",
+        emotional_snapshot=_snap(),
+        semantic_context=_ctx(),
+    )
+
+    captured: list[dict] = []
+    events.set_publisher(captured.append)
+    try:
+        run_initiate_review_tick(
+            tmp_path,
+            provider=_fake_provider("send_notify"),
+            voice_template="be warm",
+            cap_per_tick=3,
+        )
+    finally:
+        events.set_publisher(None)
+
+    delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
+    assert len(delivered) == 1, f"expected 1 initiate_delivered event, got: {captured}"
+    event = delivered[0]
+    assert event["urgency"] == "notify"
+    assert event["state"] == "delivered"
+    assert event["audit_id"].startswith("ia_")
+    assert isinstance(event["body"], str) and event["body"]
+    assert isinstance(event["timestamp"], str) and event["timestamp"]
+
+
+def test_review_tick_does_not_publish_on_hold(tmp_path: Path) -> None:
+    """Hold decisions must NOT publish initiate_delivered — the user
+    should only see banners for outreach the brain actually committed to."""
+    from brain.bridge import events
+
+    emit_initiate_candidate(
+        tmp_path,
+        kind="message",
+        source="dream",
+        source_id="dream_abc",
+        emotional_snapshot=_snap(),
+        semantic_context=_ctx(),
+    )
+
+    captured: list[dict] = []
+    events.set_publisher(captured.append)
+    try:
+        run_initiate_review_tick(
+            tmp_path,
+            provider=_fake_provider("hold"),
+            voice_template="be warm",
+            cap_per_tick=3,
+        )
+    finally:
+        events.set_publisher(None)
+
+    delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
+    assert delivered == []

@@ -85,6 +85,16 @@ class LLMProvider(ABC):
         research, growth) call this — do not touch it.
         """
 
+    def complete(self, prompt: str) -> str:
+        """Compatibility shim — the initiate pipeline calls ``.complete()``.
+
+        Delegates to :meth:`generate` with no system prompt. Concrete
+        providers do not need to override this; the default implementation
+        works for every provider that satisfies the ``generate`` contract.
+        Engines that need a system prompt should call ``generate`` directly.
+        """
+        return self.generate(prompt, system=None)
+
     @abstractmethod
     def name(self) -> str:
         """Return a short provider name (e.g. 'fake', 'claude-cli:sonnet')."""
