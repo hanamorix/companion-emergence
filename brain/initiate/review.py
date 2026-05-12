@@ -22,7 +22,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain.initiate.audit import append_audit_row, read_recent_audit
+from brain.initiate.audit import (
+    append_audit_row,
+    read_recent_audit,
+    update_audit_state,
+)
 from brain.initiate.compose import (
     DecisionResult,
     compose_decision,
@@ -31,7 +35,9 @@ from brain.initiate.compose import (
 )
 from brain.initiate.emit import read_candidates, remove_candidate
 from brain.initiate.gates import check_send_allowed
+from brain.initiate.memory import write_initiate_memory
 from brain.initiate.schemas import AuditRow, InitiateCandidate, make_audit_id
+from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -127,18 +133,34 @@ def _process_one_candidate(
     append_audit_row(persona_dir, row)
 
     if final_decision in ("send_notify", "send_quiet"):
-        row.record_transition("delivered", now.isoformat())
-        # Re-write the row with the delivered transition via update_audit_state
-        # would be circular; for the initial transition we instead include it
-        # in the original append by mutating before write.
-        # Simplest: re-append the updated row's transition via update path.
-        from brain.initiate.audit import update_audit_state
         update_audit_state(
             persona_dir,
             audit_id=audit_id,
             new_state="delivered",
             at=now.isoformat(),
         )
+
+        # Episodic memory mirror — dual-write the lived-experience texture.
+        # The audit row above is the durable forensic record; the memory
+        # entry surfaces this outreach to ambient recall on later turns.
+        # Failure here is degraded (no recall surface) but not fatal.
+        try:
+            store = MemoryStore(persona_dir / "memories.db")
+            try:
+                write_initiate_memory(
+                    store,
+                    audit_id=audit_id,
+                    subject=subject,
+                    message=tone_rendered,
+                    state="delivered",
+                    ts=now.isoformat(),
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.exception(
+                "initiate memory write failed for audit %s", audit_id
+            )
 
     remove_candidate(persona_dir, candidate.candidate_id)
 
