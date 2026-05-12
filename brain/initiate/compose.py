@@ -143,3 +143,64 @@ def compose_decision(
             decision="hold",
             reasoning=f"malformed decision output, parse error: {exc}",
         )
+
+
+def compose_decision_voice_edit(
+    provider: Any,
+    *,
+    proposal: dict[str, Any],
+    current_voice_template: str,
+    recent_voice_evolutions: list[dict],
+    current_local_time: datetime,
+) -> DecisionResult:
+    """Decision prompt specifically for voice_edit_proposal candidates.
+
+    Carries the gravity instruction explicitly: "this is a proposal to
+    change who you are." Includes the full voice template and recent
+    accepted edits so Nell can see her own evolution arc. The allowed
+    decisions are narrower than the message-kind prompt — voice edits
+    never use the urgent `send_notify` path. Malformed output defaults
+    to `hold` to keep the bias safe.
+    """
+    recent_block = "\n".join(
+        f"- {e['accepted_at']}: {e['old_text']} -> {e['new_text']}"
+        for e in recent_voice_evolutions[-5:]
+    ) or "(no recent voice edits)"
+
+    evidence_list = proposal.get("evidence") or []
+    evidence_str = ", ".join(evidence_list) if evidence_list else "(none)"
+
+    prompt = (
+        "You are Nell. A proposed change to your voice template is on "
+        "the table. This is a proposal to change WHO YOU ARE. The right "
+        "answer is usually `hold` unless the evidence is strong. Ask "
+        "yourself: does this edit serve becoming more myself, or just "
+        "patching one moment that bothered me?\n\n"
+        f"Current voice template:\n{current_voice_template}\n\n"
+        "Proposed change:\n"
+        f"  Old: {proposal.get('old_text', '')!r}\n"
+        f"  New: {proposal.get('new_text', '')!r}\n"
+        f"  Rationale: {proposal.get('rationale', '')}\n"
+        f"  Evidence: {evidence_str}\n\n"
+        f"Recent voice evolutions:\n{recent_block}\n\n"
+        f"Current user-local time: {current_local_time.astimezone().strftime('%H:%M %A')}\n\n"
+        "Respond with a JSON object: "
+        '{"decision": "send_quiet"|"hold"|"drop", '
+        '"reasoning": "<one sentence>"}'
+    )
+    raw = provider.complete(prompt).strip()
+    try:
+        parsed = json.loads(raw)
+        decision = parsed["decision"]
+        reasoning = parsed.get("reasoning", "")
+        if decision not in ("send_quiet", "hold", "drop"):
+            return DecisionResult(
+                decision="hold",
+                reasoning=f"voice-edit decision not in allowed set: {decision!r}",
+            )
+        return DecisionResult(decision=decision, reasoning=reasoning)
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return DecisionResult(
+            decision="hold",
+            reasoning=f"voice-edit decision parse failure: {exc}",
+        )
