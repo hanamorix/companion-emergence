@@ -37,7 +37,39 @@ def _fake_provider(decision: str = "send_quiet") -> MagicMock:
     return provider
 
 
-def test_review_tick_processes_queued_candidate_writes_audit(tmp_path: Path) -> None:
+def _promote_all_reflection_run(candidates, *, deps):
+    """Stub for reflection_run that promotes every candidate unconditionally.
+
+    Used by existing tests that pre-date D-reflection wiring so they
+    continue to exercise composition behaviour without hitting real LLMs.
+    """
+    from brain.initiate.d_call_schema import DCallRow, make_d_call_id
+    from brain.initiate.reflection import DDecision, DReflectionResult
+
+    decisions = [
+        DDecision(i, "promote", "test stub", "high")
+        for i in range(len(candidates))
+    ]
+    result = DReflectionResult(decisions=decisions, tick_note=None)
+    dcall = DCallRow(
+        d_call_id=make_d_call_id(deps.now),
+        ts=deps.now.isoformat(),
+        tick_id=deps.tick_id,
+        model_tier_used="haiku",
+        candidates_in=len(candidates),
+        promoted_out=len(candidates),
+        filtered_out=0,
+        latency_ms=0,
+        tokens_input=0,
+        tokens_output=0,
+    )
+    return result, dcall
+
+
+def test_review_tick_processes_queued_candidate_writes_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -59,7 +91,10 @@ def test_review_tick_processes_queued_candidate_writes_audit(tmp_path: Path) -> 
     assert '"decision": "send_quiet"' in lines[0]
 
 
-def test_review_tick_removes_processed_candidate_from_queue(tmp_path: Path) -> None:
+def test_review_tick_removes_processed_candidate_from_queue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -74,8 +109,9 @@ def test_review_tick_removes_processed_candidate_from_queue(tmp_path: Path) -> N
     assert read_candidates(tmp_path) == []
 
 
-def test_review_tick_respects_cap_per_tick(tmp_path: Path) -> None:
+def test_review_tick_respects_cap_per_tick(tmp_path: Path, monkeypatch) -> None:
     """Only `cap_per_tick` candidates are processed in one call."""
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     for i in range(5):
         emit_initiate_candidate(
             tmp_path,
@@ -97,8 +133,9 @@ def test_review_tick_respects_cap_per_tick(tmp_path: Path) -> None:
     assert len(audit_lines) == 3
 
 
-def test_review_tick_gate_blocks_send_records_hold(tmp_path: Path) -> None:
+def test_review_tick_gate_blocks_send_records_hold(tmp_path: Path, monkeypatch) -> None:
     """When decision = send_notify but gate denies (blackout), audit shows hold."""
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -125,9 +162,10 @@ def test_review_tick_gate_blocks_send_records_hold(tmp_path: Path) -> None:
 
 
 def test_review_tick_handles_compose_exception_as_error_decision(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A composition failure produces decision=error, candidate not requeued."""
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -137,6 +175,11 @@ def test_review_tick_handles_compose_exception_as_error_decision(
         semantic_context=_ctx(),
     )
     provider = MagicMock(complete=MagicMock(side_effect=RuntimeError("boom")))
+    # generate() is called by D's LLMCall wrapper; complete() by composition.
+    # We want generate to succeed (so D promotes) but complete to fail (so
+    # composition errors). Provide generate as a pass-through that returns
+    # canned JSON so D doesn't escalate, then composition errors via complete.
+    provider.generate = MagicMock(return_value='{"decisions":[]}')
     run_initiate_review_tick(
         tmp_path, provider=provider, voice_template="x", cap_per_tick=3,
     )
@@ -157,7 +200,9 @@ def test_review_tick_no_op_when_queue_empty(tmp_path: Path) -> None:
     provider.complete.assert_not_called()
 
 
-def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path) -> None:
+def test_review_tick_publishes_initiate_delivered_on_send(
+    tmp_path: Path, monkeypatch
+) -> None:
     """When the decision is to send, the review tick MUST publish an
     ``initiate_delivered`` event so the frontend banner pipeline wakes up.
 
@@ -167,6 +212,7 @@ def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path) -> Non
     """
     from brain.bridge import events
 
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -198,11 +244,12 @@ def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path) -> Non
     assert isinstance(event["timestamp"], str) and event["timestamp"]
 
 
-def test_review_tick_does_not_publish_on_hold(tmp_path: Path) -> None:
+def test_review_tick_does_not_publish_on_hold(tmp_path: Path, monkeypatch) -> None:
     """Hold decisions must NOT publish initiate_delivered — the user
     should only see banners for outreach the brain actually committed to."""
     from brain.bridge import events
 
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
         kind="message",
@@ -226,3 +273,74 @@ def test_review_tick_does_not_publish_on_hold(tmp_path: Path) -> None:
 
     delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
     assert delivered == []
+
+
+def test_run_initiate_review_tick_skips_d_when_queue_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No candidates → no D call, no composition."""
+    called = {"d": 0}
+
+    def fake_run(candidates, *, deps):
+        called["d"] += 1
+        raise AssertionError("D should not be called on empty queue")
+
+    monkeypatch.setattr("brain.initiate.review.reflection_run", fake_run)
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = MagicMock()
+    run_initiate_review_tick(persona, provider=provider, voice_template="x", cap_per_tick=3)
+    assert called["d"] == 0
+
+
+def test_run_initiate_review_tick_demotes_filtered_to_draft(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D-filter decision → candidate goes to draft_space.md, NOT composition."""
+    from brain.initiate.d_call_schema import DCallRow, make_d_call_id
+    from brain.initiate.reflection import DDecision, DReflectionResult
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    emit_initiate_candidate(
+        persona,
+        kind="message",
+        source="dream",
+        source_id="d_x",
+        semantic_context=SemanticContext(),
+        now=now,
+    )
+
+    def fake_reflection_run(candidates, *, deps):
+        result = DReflectionResult(
+            decisions=[DDecision(0, "filter", "private weather", "high")],
+            tick_note=None,
+        )
+        dcall = DCallRow(
+            d_call_id=make_d_call_id(now),
+            ts=now.isoformat(),
+            tick_id=deps.tick_id,
+            model_tier_used="haiku",
+            candidates_in=1,
+            promoted_out=0,
+            filtered_out=1,
+            latency_ms=10,
+            tokens_input=10,
+            tokens_output=10,
+        )
+        return result, dcall
+
+    compose_called: list = []
+
+    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now):
+        compose_called.append(candidate.candidate_id)
+
+    monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
+    monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process_one)
+
+    provider = MagicMock()
+    run_initiate_review_tick(persona, provider=provider, voice_template="x", cap_per_tick=3, now=now)
+
+    assert read_candidates(persona) == []
+    assert (persona / "draft_space.md").exists()
+    assert compose_called == []
