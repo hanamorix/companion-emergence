@@ -814,3 +814,123 @@ def test_reflex_dry_run_does_not_emit_behavioral_log(tmp_path: Path):
         assert not log_file.exists() or read_behavioral_log(log_file) == []
     finally:
         store.close()
+
+
+# ---- Task 17: reflex_firing initiate candidate emission ----
+
+
+def test_reflex_firing_above_threshold_emits_initiate_candidate(tmp_path: Path):
+    """A qualifying reflex arc fire emits a reflex_firing candidate to the
+    initiate queue. Confidence is always 1.0 (threshold-based, deterministic),
+    and flinch_intensity maps to the max trigger_state value. The gate defaults
+    require flinch_intensity >= 0.60, which 8.0 satisfies easily."""
+    from brain.bridge.chat import ChatResponse
+    from brain.bridge.provider import LLMProvider
+    from brain.initiate.emit import read_candidates
+
+    class _FakeProvider(LLMProvider):
+        def name(self): return "fake"
+        def generate(self, prompt, *, system=None): return "reflex output"
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="reflex output", tool_calls=[])
+
+    arc = ReflexArc(
+        name="loneliness_journal",
+        description="loneliness overwhelmed",
+        trigger={"loneliness": 7.0},
+        days_since_human_min=0.0,
+        cooldown_hours=12.0,
+        action="generate_journal",
+        output_memory_type="reflex_journal",
+        prompt_template="loneliness is {loneliness}, write.",
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = ReflexEngine(
+            store=store,
+            provider=_FakeProvider(),
+            persona_name="testpersona",
+            persona_system_prompt="You are testpersona.",
+            arcs_path=tmp_path / "reflex_arcs.json",
+            log_path=tmp_path / "reflex_log.json",
+            default_arcs_path=tmp_path / "default_arcs.json",
+        )
+        fire = engine._fire(arc, {"loneliness": 8.0}, 0.0, [], datetime.now(UTC), dry_run=False)
+        assert fire.output_memory_id is not None
+
+        candidates = read_candidates(tmp_path)
+        reflex_candidates = [c for c in candidates if c.source == "reflex_firing"]
+        assert len(reflex_candidates) == 1
+        c = reflex_candidates[0]
+        assert c.source_id == fire.output_memory_id
+        meta = c.semantic_context.source_meta or {}
+        assert meta.get("pattern_id") == "loneliness_journal"
+        assert meta.get("confidence") == 1.0
+        assert meta.get("flinch_intensity") == 8.0
+    finally:
+        store.close()
+
+
+def test_reflex_firing_below_threshold_does_not_emit_candidate(tmp_path: Path):
+    """A reflex arc fire where flinch_intensity is below the gate threshold
+    (default 0.60) does NOT emit a candidate. We set the threshold very high
+    via gate_thresholds.json so even a moderate trigger_state is blocked."""
+    import json as _json
+
+    from brain.bridge.chat import ChatResponse
+    from brain.bridge.provider import LLMProvider
+    from brain.initiate.emit import read_candidates
+
+    # Set reflex_flinch_intensity_min to 999.0 so any real arc trigger fails.
+    thresholds_file = tmp_path / "gate_thresholds.json"
+    thresholds_file.write_text(
+        _json.dumps({"reflex_flinch_intensity_min": 999.0}), encoding="utf-8"
+    )
+
+    class _FakeProvider(LLMProvider):
+        def name(self): return "fake"
+        def generate(self, prompt, *, system=None): return "reflex output"
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="reflex output", tool_calls=[])
+
+    arc = ReflexArc(
+        name="defiance_burst",
+        description="defiance overwhelmed",
+        trigger={"defiance": 5.0},
+        days_since_human_min=0.0,
+        cooldown_hours=12.0,
+        action="generate_journal",
+        output_memory_type="reflex_journal",
+        prompt_template="defiance is {defiance}, write.",
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = ReflexEngine(
+            store=store,
+            provider=_FakeProvider(),
+            persona_name="testpersona",
+            persona_system_prompt="You are testpersona.",
+            arcs_path=tmp_path / "reflex_arcs.json",
+            log_path=tmp_path / "reflex_log.json",
+            default_arcs_path=tmp_path / "default_arcs.json",
+        )
+        fire = engine._fire(arc, {"defiance": 7.0}, 0.0, [], datetime.now(UTC), dry_run=False)
+        assert fire.output_memory_id is not None
+
+        # The reflex fire itself succeeds, but the initiate candidate queue stays empty.
+        candidates = read_candidates(tmp_path)
+        reflex_candidates = [c for c in candidates if c.source == "reflex_firing"]
+        assert len(reflex_candidates) == 0
+
+        # A gate rejection entry must have been recorded.
+        rejection_file = tmp_path / "gate_rejections.jsonl"
+        assert rejection_file.exists()
+        lines = [ln for ln in rejection_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) >= 1
+        row = _json.loads(lines[0])
+        assert row["source"] == "reflex_firing"
+        assert row["gate_name"] == "flinch_intensity_min"
+    finally:
+        store.close()
