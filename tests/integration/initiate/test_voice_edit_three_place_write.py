@@ -9,6 +9,7 @@ through the live `/initiate/voice-edit/accept` endpoint.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -93,6 +94,71 @@ def test_voice_edit_accept_writes_voice_audit_and_soul(tmp_path: Path) -> None:
     matched = next(
         row for row in iter_initiate_audit_full(persona_dir)
         if row.audit_id == "ia_ve_001"
+    )
+    assert matched.delivery is not None
+    assert matched.delivery["current_state"] == "replied_explicit"
+
+
+def test_voice_edit_accept_records_audit_when_file_write_fails(
+    tmp_path: Path,
+) -> None:
+    """If the voice-template file write fails after the audit transition,
+    the audit row MUST still reflect ``replied_explicit`` and the voice
+    file MUST be unchanged.
+
+    Order contract: audit transition first, file write second. The
+    failure mode this test pins down — audit recorded, file untouched —
+    is RECOVERABLE: Hana can re-issue accept once the disk error is
+    fixed. The inverse mode (file written, no audit) is silently
+    unrecoverable and the reorder explicitly avoids it.
+    """
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+    original_voice = "line A\nold line\nline C\n"
+    (persona_dir / "nell-voice.md").write_text(original_voice)
+    _seed_voice_edit_audit(
+        persona_dir,
+        audit_id="ia_ve_002",
+        old_text="old line",
+        new_text="new line",
+    )
+
+    # Patch Path.replace so the atomic rename step fails AFTER the audit
+    # transition has already been written. write_text on the tmp file is
+    # allowed so we exercise the final rename failure realistically.
+    original_replace = Path.replace
+
+    def boom_replace(self: Path, target: Path | str) -> Path:  # type: ignore[override]
+        if str(self).endswith("nell-voice.md.tmp"):
+            raise OSError("simulated disk failure during atomic rename")
+        return original_replace(self, target)
+
+    # raise_server_exceptions=False — TestClient otherwise re-raises the
+    # OSError instead of letting Starlette surface it as a 500. We want
+    # to assert on the post-failure persona state, not the exception
+    # bubble.
+    app = build_app(persona_dir=persona_dir, client_origin="tests")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        with patch.object(Path, "replace", boom_replace):
+            r = client.post(
+                "/initiate/voice-edit/accept",
+                json={"audit_id": "ia_ve_002", "with_edits": None},
+            )
+
+    # The endpoint should fail (500) because the file write blew up.
+    assert r.status_code >= 500, r.text
+
+    # Voice file is unchanged — the rename failure left the original in place.
+    assert (persona_dir / "nell-voice.md").read_text() == original_voice
+
+    # Audit row IS transitioned to replied_explicit — the reorder put the
+    # audit write before the file write so this transition survives the
+    # disk failure. Recovery from here is appending a `dismissed`
+    # transition with reason `voice_write_failed`, or retrying once the
+    # disk is healthy.
+    matched = next(
+        row for row in iter_initiate_audit_full(persona_dir)
+        if row.audit_id == "ia_ve_002"
     )
     assert matched.delivery is not None
     assert matched.delivery["current_state"] == "replied_explicit"

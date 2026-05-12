@@ -125,10 +125,36 @@ def _process_one_candidate(
                 current_local_time=now,
             )
         else:
+            # Hydrate semantic memory IDs into content excerpts. The compose
+            # prompt needs the lived texture, not opaque "m_xyz" handles, or
+            # the LLM has no signal to thread the message back to anything.
+            # Best-effort: any failure falls back to the IDs so the pipeline
+            # still produces *some* output rather than crashing the tick.
+            excerpts: list[str]
+            try:
+                mem_store = MemoryStore(
+                    persona_dir / "memories.db", integrity_check=False,
+                )
+                try:
+                    excerpts = []
+                    for mem_id in candidate.semantic_context.linked_memory_ids[:5]:
+                        mem = mem_store.get(mem_id)
+                        if mem is not None:
+                            excerpts.append(mem.content[:240])
+                finally:
+                    mem_store.close()
+            except Exception:
+                logger.exception(
+                    "memory hydration for compose_subject failed; "
+                    "using IDs as fallback for candidate %s",
+                    candidate.candidate_id,
+                )
+                excerpts = list(candidate.semantic_context.linked_memory_ids[:5])
+
             subject = compose_subject(
                 provider,
                 candidate,
-                semantic_memory_excerpts=candidate.semantic_context.linked_memory_ids,
+                semantic_memory_excerpts=excerpts,
             )
             tone_rendered = compose_tone(
                 provider,
@@ -208,6 +234,29 @@ def _process_one_candidate(
             new_state="delivered",
             at=now.isoformat(),
         )
+
+        # Bridge event-bus publish — wakes the renderer's banner pipeline.
+        # The ChatPanel listens for `initiate_delivered` and surfaces the
+        # outreach inline; without this, the user never sees the message
+        # the brain just decided to send. Best-effort: a publish failure
+        # leaves the audit + memory rows intact so the next ambient recall
+        # still has a record to surface.
+        try:
+            from brain.bridge import events
+
+            events.publish(
+                "initiate_delivered",
+                audit_id=audit_id,
+                body=tone_rendered,
+                urgency="notify" if final_decision == "send_notify" else "quiet",
+                state="delivered",
+                timestamp=now.isoformat(),
+            )
+        except Exception:
+            logger.exception(
+                "publish initiate_delivered failed for audit %s "
+                "(audit row still written)", audit_id,
+            )
 
         # Episodic memory mirror — dual-write the lived-experience texture.
         # The audit row above is the durable forensic record; the memory
