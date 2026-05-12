@@ -32,7 +32,7 @@ import gzip
 import json
 import logging
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -144,7 +144,7 @@ def rotate_age_archive_yearly(
     if not log_path.exists():
         return []
 
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     current_year = now.year
 
     # Bucket entries by year. We read the whole file once into year buckets;
