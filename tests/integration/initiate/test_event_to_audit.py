@@ -12,8 +12,39 @@ from brain.initiate.review import run_initiate_review_tick
 from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
 
 
-def test_full_pipeline_dream_to_audit(tmp_path: Path) -> None:
-    """Simulate: dream emits candidate; review tick composes + writes audit."""
+def test_full_pipeline_dream_to_audit(tmp_path: Path, monkeypatch) -> None:
+    """Simulate: dream emits candidate; review tick composes + writes audit.
+
+    D-reflection is stubbed to promote the candidate unconditionally so the
+    test remains focused on the composition + audit pipeline rather than the
+    D editorial gate (which has its own dedicated unit tests).
+    """
+    from brain.initiate.d_call_schema import DCallRow, make_d_call_id
+    from brain.initiate.reflection import DDecision, DReflectionResult
+    from datetime import UTC, datetime
+
+    def _promote_all(candidates, *, deps):
+        decisions = [
+            DDecision(i, "promote", "test stub", "high")
+            for i in range(len(candidates))
+        ]
+        result = DReflectionResult(decisions=decisions, tick_note=None)
+        dcall = DCallRow(
+            d_call_id=make_d_call_id(deps.now),
+            ts=deps.now.isoformat(),
+            tick_id=deps.tick_id,
+            model_tier_used="haiku",
+            candidates_in=len(candidates),
+            promoted_out=len(candidates),
+            filtered_out=0,
+            latency_ms=0,
+            tokens_input=0,
+            tokens_output=0,
+        )
+        return result, dcall
+
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all)
+
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
     (persona_dir / "nell-voice.md").write_text("be warm and direct.\n")
