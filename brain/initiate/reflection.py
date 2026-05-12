@@ -17,10 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+
+from brain.initiate.d_call_schema import DCallRow, make_d_call_id
+from brain.initiate.schemas import InitiateCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -179,3 +183,96 @@ def _part_of_day(hour: int) -> str:
     if 17 <= hour < 21:
         return "evening"
     return "night"
+
+
+# (raw_text, latency_ms, tokens_in, tokens_out)
+LLMCall = Callable[..., tuple[str, int, int, int]]
+
+
+@dataclass(frozen=True)
+class ReflectionDeps:
+    """Injected dependencies — keeps reflection.run testable without real LLMs."""
+
+    companion_name: str
+    user_name: str
+    voice_template_path: Path
+    outbound_recall_block: str
+    haiku_call: LLMCall
+    sonnet_call: LLMCall
+    now: datetime
+    tick_id: str
+
+
+def _render_candidate_summary(c: InitiateCandidate, *, now: datetime) -> str:
+    """Render a single candidate for D's user message."""
+    try:
+        c_ts = datetime.fromisoformat(c.ts)
+        age_min = int((now - c_ts).total_seconds() / 60)
+        age_str = f"{age_min} min ago"
+    except ValueError:
+        age_str = "unknown"
+    delta_sigma = (
+        c.emotional_snapshot.delta_sigma if c.emotional_snapshot is not None else 0.0
+    )
+    meta = c.semantic_context.source_meta or {}
+    meta_summary = ", ".join(f"{k}={v}" for k, v in meta.items()) or "—"
+    linked = ", ".join(c.semantic_context.linked_memory_ids) or "—"
+    return (
+        f"source: {c.source}  ·  ts: {age_str}  ·  Δσ: {delta_sigma:.2f}\n"
+        f"  semantic_context: linked_memory_ids={linked}; {meta_summary}\n"
+        f"  fragment-of-self: (subject-extracted at composition time)"
+    )
+
+
+def run(
+    candidates: list[InitiateCandidate],
+    *,
+    deps: ReflectionDeps,
+) -> tuple[DReflectionResult, DCallRow]:
+    """Execute one D-reflection tick over the given candidates.
+
+    Returns (result, d_call_row). Caller is responsible for writing the
+    d_call_row to audit and for dispatching the per-candidate decisions
+    (promote → composition handoff, filter → draft-space demote).
+
+    Failure-mode handling: see Tasks 12-13 (escalation, retries, fallbacks).
+    This task implements only the happy path on Haiku.
+    """
+    system = build_system_message(
+        companion_name=deps.companion_name,
+        user_name=deps.user_name,
+        voice_template_path=deps.voice_template_path,
+    )
+    user = build_user_message(
+        user_name=deps.user_name,
+        now=deps.now,
+        outbound_recall_block=deps.outbound_recall_block,
+        candidate_summaries=[
+            _render_candidate_summary(c, now=deps.now) for c in candidates
+        ],
+    )
+
+    raw, latency_ms, tokens_in, tokens_out = deps.haiku_call(
+        system=system, user=user
+    )
+    result = parse_structured_response(raw)
+
+    promoted = sum(1 for d in result.decisions if d.decision == "promote")
+    filtered = sum(1 for d in result.decisions if d.decision == "filter")
+
+    d_call = DCallRow(
+        d_call_id=make_d_call_id(deps.now),
+        ts=deps.now.isoformat(),
+        tick_id=deps.tick_id,
+        model_tier_used="haiku",
+        candidates_in=len(candidates),
+        promoted_out=promoted,
+        filtered_out=filtered,
+        latency_ms=latency_ms,
+        tokens_input=tokens_in,
+        tokens_output=tokens_out,
+        failure_type=None,
+        retry_count=0,
+        tick_note=result.tick_note,
+    )
+    return result, d_call
