@@ -51,4 +51,57 @@ describe("InitiateBanner", () => {
     render(<InitiateBanner message={{ ...baseMessage, state: "acknowledged_unclear" }} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     expect(screen.getByText(/unclear/i)).toBeInTheDocument();
   });
+
+  it("does not call onMounted when document is hidden at mount time", () => {
+    vi.useFakeTimers();
+    const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const onMounted = vi.fn();
+    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    vi.advanceTimersByTime(5000);
+    expect(onMounted).not.toHaveBeenCalled();
+    hiddenSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("pauses timer when document becomes hidden mid-countdown and resumes when visible again", () => {
+    vi.useFakeTimers();
+    const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    const onMounted = vi.fn();
+    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    // 1 second elapses (not enough to fire).
+    vi.advanceTimersByTime(1000);
+    expect(onMounted).not.toHaveBeenCalled();
+    // Document becomes hidden — timer should be cleared.
+    hiddenSpy.mockReturnValue(true);
+    document.dispatchEvent(new Event("visibilitychange"));
+    // Plenty of time passes while hidden; should not fire.
+    vi.advanceTimersByTime(10_000);
+    expect(onMounted).not.toHaveBeenCalled();
+    // Document becomes visible — fresh 2-second timer schedules.
+    hiddenSpy.mockReturnValue(false);
+    document.dispatchEvent(new Event("visibilitychange"));
+    vi.advanceTimersByTime(2100);
+    expect(onMounted).toHaveBeenCalledTimes(1);
+    expect(onMounted).toHaveBeenCalledWith("ia_001");
+    hiddenSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("does not fire onMounted twice across multiple visibility cycles", () => {
+    vi.useFakeTimers();
+    const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    const onMounted = vi.fn();
+    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    vi.advanceTimersByTime(2100);
+    expect(onMounted).toHaveBeenCalledTimes(1);
+    // Hide + show again — should not re-fire.
+    hiddenSpy.mockReturnValue(true);
+    document.dispatchEvent(new Event("visibilitychange"));
+    hiddenSpy.mockReturnValue(false);
+    document.dispatchEvent(new Event("visibilitychange"));
+    vi.advanceTimersByTime(5000);
+    expect(onMounted).toHaveBeenCalledTimes(1);
+    hiddenSpy.mockRestore();
+    vi.useRealTimers();
+  });
 });

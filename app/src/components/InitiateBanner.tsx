@@ -35,13 +35,46 @@ const STATE_LABEL: Record<InitiateMessage["state"], string> = {
 export function InitiateBanner({ message, onReply, onDismiss, onMounted }: Props) {
   const firedRef = useRef(false);
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (!firedRef.current) {
+    // 2-second on-screen timer that respects document visibility:
+    // if the user minimizes / switches tabs, pause; resume when visible.
+    // Otherwise a backgrounded app would silently mark messages "read"
+    // without Hana ever having looked at them.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    function fire() {
+      if (!firedRef.current && !document.hidden) {
         firedRef.current = true;
         onMounted(message.auditId);
       }
-    }, 2000);
-    return () => clearTimeout(timer);
+    }
+
+    function scheduleTimer() {
+      if (firedRef.current) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      timer = setTimeout(fire, 2000);
+    }
+
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      } else {
+        scheduleTimer();
+      }
+    }
+
+    scheduleTimer();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+    }
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      }
+    };
   }, [message.auditId, onMounted]);
 
   return (
