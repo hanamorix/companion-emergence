@@ -488,6 +488,30 @@ def _apply_changes(
     # Persist atomically
     save_creative_dna(persona_dir, dna)
 
+    # Phase 4.2 — emit initiate candidates for each accepted change.
+    # Wrapped in try/except so emit failures can't crash the crystallizer.
+    for a in additions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_addition:{a['name']}",
+            label=a["name"],
+            related_memory_ids=list(a.get("evidence_memory_ids", [])),
+        )
+    for p in promotions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_promotion:{p['name']}",
+            label=p["name"],
+            related_memory_ids=[],
+        )
+    for d in demotions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_demotion:{d['name']}",
+            label=d["name"],
+            related_memory_ids=[],
+        )
+
     # Behavioral log entries (best-effort, never let logging break the tick)
     for a in additions:
         try:
@@ -521,3 +545,40 @@ def _apply_changes(
             )
         except (OSError, ValueError) as exc:
             logger.warning("creative_dna: behavioral_log append failed: %s", exc)
+
+
+def _emit_initiate_candidate(
+    *,
+    persona_dir: Path,
+    source_id: str,
+    label: str,
+    related_memory_ids: list[str],
+) -> None:
+    """Emit one initiate candidate after a creative_dna crystallization commit.
+
+    Phase 4.2 of the initiate physiology pipeline. Wrapped in try/except —
+    an emit failure must not crash the crystallizer.
+    """
+    try:
+        from brain.initiate.emit import emit_initiate_candidate
+        from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+        emit_initiate_candidate(
+            persona_dir,
+            kind="message",
+            source="crystallization",
+            source_id=source_id,
+            emotional_snapshot=EmotionalSnapshot(
+                vector={},
+                rolling_baseline_mean=0.0,
+                rolling_baseline_stdev=0.0,
+                current_resonance=0.0,
+                delta_sigma=0.0,
+            ),
+            semantic_context=SemanticContext(
+                linked_memory_ids=related_memory_ids[:5],
+                topic_tags=[label] if label else [],
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("creative_dna crystallization initiate emit failed: %s", exc)
