@@ -390,7 +390,13 @@ class HeartbeatEngine:
                 "explicitly, don't rely on a default."
             )
 
-    def run_tick(self, *, trigger: str = "manual", dry_run: bool = False) -> HeartbeatResult:
+    def run_tick(
+        self,
+        *,
+        trigger: str = "manual",
+        dry_run: bool = False,
+        forced_resonance: float | None = None,
+    ) -> HeartbeatResult:
         """Run one heartbeat tick.
 
         First-ever invocation (state file missing) initializes state and
@@ -592,6 +598,19 @@ class HeartbeatEngine:
                     "anomalies": [a.to_dict() for a in tick_anomalies],
                     "pending_alarms_count": pending_alarms_count,
                 }
+            )
+
+            # Emotion-spike initiate emitter (Phase 4.3). Runs after the
+            # heartbeat log append so a spike emit can never roll back the
+            # tick's audit trail. Fully fault-isolated inside the helper.
+            current_resonance, current_vector = self._compute_current_resonance(
+                forced_resonance
+            )
+            self._maybe_emit_emotion_spike(
+                persona_dir=persona_dir,
+                current_resonance=current_resonance,
+                current_vector=current_vector,
+                tick_count=state.tick_count,
             )
 
         return HeartbeatResult(
@@ -1064,6 +1083,97 @@ class HeartbeatEngine:
             return default
         name, val = max(emotions.items(), key=lambda kv: kv[1])
         return name, max(0, min(10, round(val)))
+
+    # --- emotion-spike initiate emitter (Phase 4.3) ---
+
+    def _compute_current_resonance(
+        self, forced_resonance: float | None
+    ) -> tuple[float, dict[str, float]]:
+        """Return (resonance, aggregate_emotion_vector) for the current tick.
+
+        Resonance is the peak intensity across all active memories' emotion
+        dicts — same scalar used elsewhere as "dominant emotion intensity".
+        When `forced_resonance` is given (test-only injection), the vector is
+        a single-key dict so the snapshot still carries structured data.
+        """
+        if forced_resonance is not None:
+            return float(forced_resonance), {"forced": float(forced_resonance)}
+
+        combined: dict[str, float] = {}
+        for mem in self.store.list_active():
+            for name, val in mem.emotions.items():
+                combined[name] = combined.get(name, 0.0) + float(val)
+        if not combined:
+            return 0.0, {}
+        # Peak intensity — clamped to [0, 10] to match the project's
+        # canonical 0..10 emotion scale (see _peak_emotion).
+        peak = max(combined.values())
+        peak = max(0.0, min(10.0, peak))
+        return peak, combined
+
+    def _update_rolling_baseline(
+        self, current_resonance: float
+    ) -> tuple[float, float, float]:
+        """Update the in-memory rolling-baseline window. Returns (mean, stdev, delta_sigma).
+
+        Window: last 24 ticks (~6h at default cadence). Below 5 ticks we
+        return zeros — no emission during warm-up. State is held in
+        `self._resonance_window`, initialized lazily on first call so the
+        dataclass definition stays unchanged.
+        """
+        import statistics
+
+        if not hasattr(self, "_resonance_window"):
+            self._resonance_window: list[float] = []
+        self._resonance_window.append(current_resonance)
+        self._resonance_window = self._resonance_window[-24:]
+        if len(self._resonance_window) < 5:
+            return 0.0, 0.0, 0.0
+        mean = statistics.mean(self._resonance_window)
+        stdev = statistics.pstdev(self._resonance_window) or 1.0
+        delta_sigma = (current_resonance - mean) / stdev
+        return mean, stdev, delta_sigma
+
+    def _maybe_emit_emotion_spike(
+        self,
+        *,
+        persona_dir: Path,
+        current_resonance: float,
+        current_vector: dict[str, float],
+        tick_count: int,
+    ) -> None:
+        """If delta_sigma >= 1.5, emit an initiate candidate sourced from this spike.
+
+        Fault-isolated: any failure (disk error, schema mismatch) is logged
+        and swallowed so the heartbeat tick still completes normally.
+        Delta-from-baseline is the architectural guard against the
+        always-elevated-emotions firehose.
+        """
+        mean, stdev, delta_sigma = self._update_rolling_baseline(current_resonance)
+        if delta_sigma < 1.5:
+            return
+        try:
+            # Local import to keep initiate deps out of engines that don't
+            # need them and to mirror the dream/crystallizer emit pattern.
+            from brain.initiate.emit import emit_initiate_candidate
+            from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+            emit_initiate_candidate(
+                persona_dir,
+                kind="message",
+                source="emotion_spike",
+                source_id=f"emotion_{tick_count}",
+                emotional_snapshot=EmotionalSnapshot(
+                    vector=dict(current_vector),
+                    rolling_baseline_mean=mean,
+                    rolling_baseline_stdev=stdev,
+                    current_resonance=current_resonance,
+                    delta_sigma=delta_sigma,
+                ),
+                semantic_context=SemanticContext(),
+            )
+        except Exception as exc:
+            logger.warning("emotion spike initiate emit failed: %s", exc)
 
     def _append_log(self, entry: dict) -> None:
         """Append one JSON line to heartbeats.log.jsonl."""
