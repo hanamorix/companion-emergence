@@ -27,3 +27,13 @@ def test_load_gate_thresholds_overrides_from_persona_file(tmp_path: Path):
     assert t.reflex_confidence_min == 0.5
     # Unset fields use defaults.
     assert t.reflex_flinch_intensity_min == 0.60
+
+
+def test_load_gate_thresholds_non_dict_json_returns_defaults(tmp_path: Path):
+    """A gate_thresholds.json file that contains valid JSON but isn't a dict
+    falls back to defaults rather than crashing."""
+    persona = tmp_path / "p"
+    persona.mkdir()
+    (persona / "gate_thresholds.json").write_text("[]")
+    t = load_gate_thresholds(persona)
+    assert t.reflex_confidence_min == 0.70  # default
