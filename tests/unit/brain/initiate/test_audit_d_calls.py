@@ -54,3 +54,63 @@ def test_make_d_call_id_sortable():
     ident = make_d_call_id(now)
     assert ident.startswith("dc_2026-05-12T10-00-00_")
     assert len(ident) == len("dc_2026-05-12T10-00-00_") + 4  # 2 hex bytes = 4 chars
+
+
+def test_append_d_call_row_and_read(tmp_path):
+    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
+    from datetime import UTC, datetime, timedelta
+
+    persona = tmp_path / "persona"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    row = DCallRow(
+        d_call_id="dc_a",
+        ts=now.isoformat(),
+        tick_id="t1",
+        model_tier_used="haiku",
+        candidates_in=2,
+        promoted_out=1,
+        filtered_out=1,
+        latency_ms=300,
+        tokens_input=400,
+        tokens_output=150,
+    )
+    append_d_call_row(persona, row)
+    out = list(read_recent_d_calls(persona, window_hours=1, now=now + timedelta(minutes=10)))
+    assert len(out) == 1
+    assert out[0].d_call_id == "dc_a"
+
+
+def test_read_recent_d_calls_window_filter(tmp_path):
+    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
+    from datetime import UTC, datetime, timedelta
+
+    persona = tmp_path / "persona"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    old = DCallRow(
+        d_call_id="dc_old",
+        ts=(now - timedelta(hours=5)).isoformat(),
+        tick_id="t1",
+        model_tier_used="haiku",
+        candidates_in=1, promoted_out=0, filtered_out=1,
+        latency_ms=200, tokens_input=300, tokens_output=100,
+    )
+    recent = DCallRow(
+        d_call_id="dc_new",
+        ts=now.isoformat(),
+        tick_id="t2",
+        model_tier_used="sonnet",
+        candidates_in=2, promoted_out=2, filtered_out=0,
+        latency_ms=800, tokens_input=400, tokens_output=200,
+    )
+    append_d_call_row(persona, old)
+    append_d_call_row(persona, recent)
+    out = list(read_recent_d_calls(persona, window_hours=1, now=now + timedelta(minutes=10)))
+    assert [r.d_call_id for r in out] == ["dc_new"]
+
+
+def test_read_recent_d_calls_no_file_returns_empty(tmp_path):
+    from brain.initiate.audit import read_recent_d_calls
+    from datetime import UTC, datetime
+    persona = tmp_path / "fresh"
+    out = list(read_recent_d_calls(persona, window_hours=1, now=datetime(2026, 5, 12, tzinfo=UTC)))
+    assert out == []
