@@ -94,6 +94,22 @@ def test_read_candidates_returns_empty_when_missing(tmp_path: Path) -> None:
     assert read_candidates(tmp_path) == []
 
 
+def test_emit_with_none_emotional_snapshot_round_trips(tmp_path: Path) -> None:
+    """v0.0.9: emotional_snapshot is Optional — None must round-trip cleanly."""
+    emit_initiate_candidate(
+        tmp_path,
+        kind="voice_edit_proposal",
+        source="voice_reflection",
+        source_id="vr_none_snap",
+        semantic_context=_ctx(),
+        proposal={"old_text": "a", "new_text": "b", "evidence": ["e1", "e2", "e3"]},
+    )
+    candidates = read_candidates(tmp_path)
+    assert len(candidates) == 1
+    assert candidates[0].emotional_snapshot is None
+    assert candidates[0].kind == "voice_edit_proposal"
+
+
 def test_remove_candidate_drops_specific_id(tmp_path: Path) -> None:
     from brain.initiate.emit import remove_candidate
 

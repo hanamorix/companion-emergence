@@ -34,8 +34,8 @@ def emit_initiate_candidate(
     kind: CandidateKind,
     source: CandidateSource,
     source_id: str,
-    emotional_snapshot: EmotionalSnapshot,
     semantic_context: SemanticContext,
+    emotional_snapshot: EmotionalSnapshot | None = None,
     proposal: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> None:
