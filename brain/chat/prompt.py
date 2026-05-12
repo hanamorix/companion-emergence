@@ -36,6 +36,7 @@ def build_system_message(
     soul_store: SoulStore,
     store: MemoryStore,
     user_input: str | None = None,
+    reply_to_audit_id: str | None = None,
 ) -> str:
     """Compose the system message for one chat turn.
 
@@ -122,6 +123,18 @@ def build_system_message(
         recall_block = _build_recall_block(store, user_input)
         if recall_block.strip():
             parts.append(recall_block)
+
+    # 4c. Reply-to-outbound block (Bundle A #4 / v0.0.9 review TODO).
+    # When the user's turn carries ``reply_to_audit_id`` (renderer-set via
+    # the "↩ reply" affordance on an initiate banner), surface the linked
+    # subject so the system prompt reads "you are replying to your earlier
+    # outbound about X." Without this the engine never sees the link — the
+    # state transition lived only in the audit/memory layer and the prompt
+    # had no idea which initiate the user was answering.
+    if reply_to_audit_id:
+        reply_block = _build_reply_to_outbound_block(persona_dir, reply_to_audit_id)
+        if reply_block.strip():
+            parts.append(reply_block)
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
     body_block = _build_body_block(store, persona_dir)
@@ -398,6 +411,49 @@ def _build_recall_block(
         lines.append(f"- {prefix} {snippet}")
 
     return "\n".join(lines)
+
+
+def _build_reply_to_outbound_block(
+    persona_dir: Path, audit_id: str,
+) -> str:
+    """Render the "you are replying to your earlier outbound" block.
+
+    Hydrates the audit row's ``subject`` (one-line headline; falls back to
+    a trimmed ``tone_rendered`` if subject is empty) so the prompt carries
+    conversational context for the engine. Bundle A #4 / v0.0.9 review TODO.
+
+    Failure-safe per the project-wide contract: chat composition must NEVER
+    break because a self-narrative block failed. Missing audit row, missing
+    file, malformed JSONL → return empty string and the block is omitted.
+    """
+    try:
+        from brain.initiate.audit import iter_initiate_audit_full
+
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(persona_dir)
+                if r.audit_id == audit_id
+            ),
+            None,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    if matched is None:
+        return ""
+
+    subject = (matched.subject or "").strip()
+    if not subject:
+        subject = (matched.tone_rendered or "").strip()
+        if len(subject) > 80:
+            subject = subject[:79].rstrip() + "…"
+    if not subject:
+        return ""
+
+    return (
+        "── replying to your earlier outbound ──\n"
+        f"this user message is an explicit reply to your initiate: {subject}\n"
+        "you reached out to them about this; they're answering you now."
+    )
 
 
 # Words shorter than this are dropped before search. Captures most

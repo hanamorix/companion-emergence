@@ -139,6 +139,92 @@ def test_build_system_message_no_residue_section_when_empty_state(
     assert "Emotional residue" not in msg
 
 
+# ── Reply-to-outbound block (Bundle A #4) ─────────────────────────────────────
+
+
+def _seed_initiate_audit(
+    persona_dir: Path,
+    *,
+    audit_id: str,
+    subject: str = "the dream from this morning",
+    tone_rendered: str = "the dream landed somewhere",
+) -> None:
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    row = AuditRow(
+        audit_id=audit_id,
+        candidate_id=f"ic_{audit_id}",
+        ts="2026-05-12T09:00:00+00:00",
+        kind="message",
+        subject=subject,
+        tone_rendered=tone_rendered,
+        decision="send_quiet",
+        decision_reasoning="resonance",
+        gate_check={"allowed": True, "reason": None},
+        delivery={
+            "delivered_at": "2026-05-12T09:00:00+00:00",
+            "state_transitions": [
+                {"to": "delivered", "at": "2026-05-12T09:00:00+00:00"},
+            ],
+            "current_state": "delivered",
+        },
+    )
+    append_audit_row(persona_dir, row)
+
+
+def test_build_system_message_includes_reply_block_when_audit_id_present(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+) -> None:
+    """When ``reply_to_audit_id`` resolves to an audit row, the system message
+    surfaces "you are replying to your earlier outbound" with the subject so
+    Nell sees the conversational link in her context."""
+    _seed_initiate_audit(
+        persona_dir,
+        audit_id="ia_replyblock",
+        subject="the silk-and-iron line",
+    )
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        reply_to_audit_id="ia_replyblock",
+    )
+    assert "replying to" in msg.lower()
+    assert "silk-and-iron line" in msg
+
+
+def test_build_system_message_omits_reply_block_when_no_audit_id(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+) -> None:
+    """No ``reply_to_audit_id`` -> no reply block."""
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "replying to" not in msg.lower()
+
+
+def test_build_system_message_omits_reply_block_when_audit_id_not_found(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+) -> None:
+    """Unknown audit_id -> block omitted, chat composition continues silently."""
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        reply_to_audit_id="ia_does_not_exist",
+    )
+    assert "replying to" not in msg.lower()
+
+
 # ── Soul highlights ───────────────────────────────────────────────────────────
 
 

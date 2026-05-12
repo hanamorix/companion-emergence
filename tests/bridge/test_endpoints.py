@@ -428,6 +428,70 @@ def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch)
             assert f.get("code") == "invalid_image_shas"
 
 
+def test_stream_with_reply_to_audit_id_transitions_audit_to_replied_explicit(
+    persona_dir: Path, monkeypatch,
+):
+    """Bundle A #4: WS /stream payload with ``reply_to_audit_id`` triggers a
+    server-side audit transition + memory re-render atomically with the chat
+    turn — no renderer-side POST /initiate/state needed.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ack")
+    _seed_audit_row(persona_dir, audit_id="ia_streamreply", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json(
+                {"message": "yes, I felt it too", "reply_to_audit_id": "ia_streamreply"},
+            )
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    break
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_streamreply")
+    assert target["delivery"]["current_state"] == "replied_explicit"
+
+
+def test_stream_without_reply_to_audit_id_leaves_audit_untouched(
+    persona_dir: Path, monkeypatch,
+):
+    """Sanity: a chat turn without ``reply_to_audit_id`` doesn't mutate any
+    audit row. Prevents the server-side transition from over-firing.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ok")
+    _seed_audit_row(persona_dir, audit_id="ia_untouched", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "regular message"})
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    break
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_untouched")
+    assert target["delivery"]["current_state"] == "delivered"
+
+
+def test_stream_rejects_non_string_reply_to_audit_id(persona_dir: Path, monkeypatch):
+    """Invalid ``reply_to_audit_id`` (non-string) closes with a typed error."""
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "x", "reply_to_audit_id": 42})
+            f = ws.receive_json()
+            assert f.get("type") == "error"
+            assert f.get("code") == "invalid_reply_to_audit_id"
+
+
 def test_stream_closes_cleanly_after_done(persona_dir: Path, monkeypatch):
     """The WS Close frame after `done` carries code 1000 (not 1006).
 
