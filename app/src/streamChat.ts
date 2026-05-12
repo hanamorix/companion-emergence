@@ -2,7 +2,8 @@
  * WS streaming chat client, talks to /stream/{session_id}.
  *
  * Wire protocol (from brain/bridge/server.py):
- *   client -> server: {message: string, image_shas?: string[]} after WS open
+ *   client -> server: {message: string, image_shas?: string[],
+ *                      reply_to_audit_id?: string} after WS open
  *   server -> client:
  *     {type: "started", session_id, at}
  *     {type: "tool_call", tool, session_id, at}
@@ -35,6 +36,13 @@ export interface StreamChatHandlers {
 export interface StreamChatOptions {
   /** Sha-strings for any /upload-staged images attached to this turn. */
   imageShas?: string[];
+  /** If this turn is an explicit reply to an outbound initiate, the
+   *  audit row id (e.g. ``"ia_001"``). The bridge ingests it, records
+   *  the ``replied_explicit`` state transition + memory re-render
+   *  atomically with the chat turn, and surfaces the linked subject
+   *  to the chat engine's system prompt. Foundation for v0.0.10's
+   *  acknowledged_unclear detection. */
+  replyToAuditId?: string;
   /** Time to establish the socket before surfacing an error. */
   openTimeoutMs?: number;
   /** Time after open to receive the first bridge frame. */
@@ -116,8 +124,13 @@ export async function streamChat(
         () => fail("stream timed out waiting for first frame"),
         firstFrameTimeoutMs,
       );
-      const frame: { message: string; image_shas?: string[] } = { message };
+      const frame: {
+        message: string;
+        image_shas?: string[];
+        reply_to_audit_id?: string;
+      } = { message };
       if (options.imageShas && options.imageShas.length > 0) frame.image_shas = options.imageShas;
+      if (options.replyToAuditId) frame.reply_to_audit_id = options.replyToAuditId;
       ws.send(JSON.stringify(frame));
     });
 

@@ -410,12 +410,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, event
 
     setMessages((m) => [...m, userMsg, replyStub]);
     setInput("");
-    // If the user invoked "↩ reply" on an initiate banner, the next outbound
-    // message is the explicit reply. Mark that initiate as replied_explicit
-    // so the audit row + ambient memory reflect it, then clear the target.
-    // (Threading the reply payload through streamChat is a later wire-up.)
+    // If the user invoked "↩ reply" on an initiate banner, capture the
+    // audit_id for this turn so streamChat can pass it on the WS frame.
+    // The server records the ``replied_explicit`` transition + memory
+    // re-render atomically with ingesting the chat turn — no renderer-side
+    // POST /initiate/state is needed. Surfacing the audit_id to the chat
+    // engine is what gives the system prompt "you're replying to your
+    // earlier outbound about X" (Bundle A item #4, v0.0.9 review TODO).
+    const replyToAuditId = activeReplyTarget;
     if (activeReplyTarget) {
-      void postInitiateState(activeReplyTarget, "replied_explicit");
       setActiveBanners((prev) => prev.filter((b) => b.auditId !== activeReplyTarget));
       setActiveReplyTarget(null);
     }
@@ -510,7 +513,12 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, event
             );
           },
         },
-        readySha ? { imageShas: [readySha] } : undefined,
+        (() => {
+          const opts: { imageShas?: string[]; replyToAuditId?: string } = {};
+          if (readySha) opts.imageShas = [readySha];
+          if (replyToAuditId) opts.replyToAuditId = replyToAuditId;
+          return Object.keys(opts).length > 0 ? opts : undefined;
+        })(),
       );
     };
 
