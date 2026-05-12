@@ -166,6 +166,7 @@ def _respond_blocking(
     message: str,
     provider: LLMProvider,
     image_shas: list[str] | None = None,
+    reply_to_audit_id: str | None = None,
 ) -> Any:
     """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
 
@@ -190,7 +191,52 @@ def _respond_blocking(
             provider=provider,
             session=sess,
             image_shas=image_shas,
+            reply_to_audit_id=reply_to_audit_id,
         )
+
+
+def _apply_replied_explicit_transition(
+    persona_dir: Path, audit_id: str,
+) -> None:
+    """Record a ``replied_explicit`` audit transition + re-render its memory.
+
+    Bundle A #4 — pulls the rendezvous logic out of the renderer's POST
+    /initiate/state path so the WS /stream handler can fire it atomically
+    with ingesting the chat turn. Mirrors the body of the /initiate/state
+    endpoint (transition + iter_initiate_audit_full lookup + memory update),
+    but scoped to ``replied_explicit`` only.
+
+    Per the fail-soft contract: any exception is propagated so the caller
+    can log it; the WS handler catches and logs without breaking the chat.
+    """
+    from brain.initiate.audit import (
+        iter_initiate_audit_full,
+        update_audit_state,
+    )
+    from brain.initiate.memory import update_initiate_memory_for_state
+
+    now = datetime.now(UTC).isoformat()
+    update_audit_state(
+        persona_dir, audit_id=audit_id, new_state="replied_explicit", at=now,
+    )
+    matched = next(
+        (r for r in iter_initiate_audit_full(persona_dir) if r.audit_id == audit_id),
+        None,
+    )
+    if matched is None:
+        return
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        update_initiate_memory_for_state(
+            store,
+            audit_id=audit_id,
+            subject=matched.subject,
+            message=matched.tone_rendered,
+            new_state="replied_explicit",
+            ts=now,
+        )
+    finally:
+        store.close()
 
 
 def _close_session_blocking(
@@ -1322,12 +1368,46 @@ def build_app(
                 return
             image_shas = list(raw_shas)
 
+        # Bundle A #4: optional ``reply_to_audit_id`` threads the link from a
+        # banner-driven "↩ reply" through to the chat engine. If present, the
+        # server transitions the audit row + re-renders the linked memory
+        # atomically with the chat turn — replacing the renderer's previous
+        # POST /initiate/state replied_explicit. Must be a string when given.
+        raw_reply_id = req.get("reply_to_audit_id")
+        reply_to_audit_id: str | None = None
+        if raw_reply_id is not None:
+            if not isinstance(raw_reply_id, str) or not raw_reply_id:
+                await ws.send_json(
+                    {"type": "error", "code": "invalid_reply_to_audit_id", "done": True}
+                )
+                await ws.close()
+                return
+            reply_to_audit_id = raw_reply_id
+
         chunk_delay_ms = int(os.environ.get("NELL_STREAM_CHUNK_DELAY_MS", "30"))
 
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
             events.publish("chat_started", session_id=session_id, client=s.client_origin)
+
+            # Bundle A #4: server-side replied_explicit transition. Fires BEFORE
+            # the engine runs so the audit/memory write is atomic with this
+            # chat turn — the renderer no longer posts /initiate/state for
+            # explicit replies. Failure is best-effort: the chat must still
+            # complete even if the audit/memory write fails.
+            if reply_to_audit_id is not None:
+                try:
+                    await asyncio.to_thread(
+                        _apply_replied_explicit_transition,
+                        s.persona_dir,
+                        reply_to_audit_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "replied_explicit transition failed audit_id=%s",
+                        reply_to_audit_id,
+                    )
 
             try:
                 result = await asyncio.to_thread(
@@ -1337,6 +1417,7 @@ def build_app(
                     message,
                     s.provider,
                     image_shas,
+                    reply_to_audit_id,
                 )
             except Exception:
                 logger.exception("stream failed session=%s", session_id)
