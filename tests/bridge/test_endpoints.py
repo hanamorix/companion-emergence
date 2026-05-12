@@ -653,3 +653,132 @@ def test_post_initiate_state_rejects_unknown_state(persona_dir: Path) -> None:
             json={"audit_id": "ia_001", "new_state": "garbage"},
         )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /initiate/voice-edit/accept and /reject
+# ---------------------------------------------------------------------------
+
+
+def _seed_voice_edit_audit(
+    persona_dir: Path,
+    *,
+    audit_id: str,
+    old_text: str,
+    new_text: str,
+) -> None:
+    """Append a voice_edit_proposal audit row with a one-line unified diff."""
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    diff = f"- {old_text}\n+ {new_text}\n"
+    row = AuditRow(
+        audit_id=audit_id,
+        candidate_id=f"ic_{audit_id}",
+        ts="2026-05-11T14:47:09+00:00",
+        kind="voice_edit_proposal",
+        subject="a small edit to my voice",
+        tone_rendered=(
+            f"Proposing to change my voice: {old_text!r} -> {new_text!r}."
+        ),
+        decision="send_quiet",
+        decision_reasoning="the pattern showed up three times",
+        gate_check={"allowed": True, "reason": None},
+        delivery={
+            "delivered_at": "2026-05-11T14:47:09+00:00",
+            "state_transitions": [
+                {"to": "delivered", "at": "2026-05-11T14:47:09+00:00"},
+            ],
+            "current_state": "delivered",
+        },
+        diff=diff,
+    )
+    append_audit_row(persona_dir, row)
+
+
+def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
+    persona_dir: Path,
+) -> None:
+    """Accept writes audit + memory + voice_evolution AND modifies nell-voice.md."""
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/accept",
+            json={"audit_id": "ia_ve_001", "with_edits": None},
+        )
+    assert r.status_code == 200, r.text
+    body = voice_path.read_text()
+    assert "new line" in body
+    assert "old line" not in body
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        evolutions = store.list_voice_evolution()
+    finally:
+        store.close()
+    assert len(evolutions) == 1
+    assert evolutions[0].audit_id == "ia_ve_001"
+    assert evolutions[0].new_text == "new line"
+    assert evolutions[0].user_modified is False
+
+
+def test_post_voice_edit_accept_with_edits_records_user_modified(
+    persona_dir: Path,
+) -> None:
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line proposed",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/accept",
+            json={
+                "audit_id": "ia_ve_001",
+                "with_edits": "hana's tweaked line",
+            },
+        )
+    assert r.status_code == 200, r.text
+    assert "hana's tweaked line" in voice_path.read_text()
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        ev = store.list_voice_evolution()[0]
+    finally:
+        store.close()
+    assert ev.user_modified is True
+    assert ev.new_text == "hana's tweaked line"
+
+
+def test_post_voice_edit_reject_records_dismissed_no_voice_write(
+    persona_dir: Path,
+) -> None:
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/reject",
+            json={"audit_id": "ia_ve_001"},
+        )
+    assert r.status_code == 200, r.text
+    assert "old line" in voice_path.read_text()  # unchanged
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        evolutions = store.list_voice_evolution()
+    finally:
+        store.close()
+    assert evolutions == []

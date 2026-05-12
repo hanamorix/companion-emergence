@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 from brain.initiate.compose import (
     compose_decision,
+    compose_decision_voice_edit,
     compose_subject,
     compose_tone,
 )
@@ -130,3 +131,28 @@ def test_compose_decision_handles_malformed_json_as_hold() -> None:
     )
     assert result.decision == "hold"
     assert "malformed" in result.reasoning.lower() or "parse" in result.reasoning.lower()
+
+
+def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
+    """Voice-edit decision prompt must include the gravity instruction."""
+    provider = MagicMock(complete=MagicMock(
+        return_value='{"decision": "send_quiet", "reasoning": "evidence is strong"}'
+    ))
+    result = compose_decision_voice_edit(
+        provider,
+        proposal={
+            "old_text": "a",
+            "new_text": "b",
+            "rationale": "x",
+            "evidence": ["e1", "e2", "e3"],
+        },
+        current_voice_template="full voice template content",
+        recent_voice_evolutions=[],
+        current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+    )
+    args, _ = provider.complete.call_args
+    prompt_text = args[0]
+    assert "change who you are" in prompt_text.lower()
+    assert "usually `hold`" in prompt_text or "usually 'hold'" in prompt_text
+    assert "full voice template content" in prompt_text
+    assert result.decision == "send_quiet"

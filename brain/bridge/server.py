@@ -90,6 +90,28 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _extract_old_text_from_diff(diff: str) -> str:
+    """Pull the first removed line out of a simple unified diff.
+
+    Handles the one-line diffs produced by the voice-reflection prompt
+    (a single `- old\n+ new` pair). Skips the `---` file header. Multi-
+    line diff support can come later when reflection learns to propose
+    bigger edits.
+    """
+    for line in diff.splitlines():
+        if line.startswith("- ") and not line.startswith("---"):
+            return line[2:]
+    return ""
+
+
+def _extract_new_text_from_diff(diff: str) -> str:
+    """Pull the first added line out of a simple unified diff. See `_extract_old_text_from_diff`."""
+    for line in diff.splitlines():
+        if line.startswith("+ ") and not line.startswith("+++"):
+            return line[2:]
+    return ""
+
+
 def _word_chunks(text: str) -> list[str]:
     """Split text into word-or-whitespace tokens preserving spacing.
 
@@ -885,6 +907,203 @@ def build_app(
             except Exception:
                 logger.exception("memory update failed for state transition")
         return {"ok": True, "new_state": new_state}
+
+    # ── POST /initiate/voice-edit/{accept,reject} ────────────────────────
+    @app.post(
+        "/initiate/voice-edit/accept",
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def voice_edit_accept(req: dict[str, Any]) -> dict[str, Any]:
+        """Apply an accepted voice-edit proposal — three-place write.
+
+        Three writes on accept (all best-effort isolated):
+          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          2. initiate_audit.jsonl — record `replied_explicit` transition.
+          3. crystallizations.db.voice_evolution — durable record of the edit.
+
+        Plus the parallel episodic-memory re-render so ambient recall reflects
+        that the proposal was accepted.
+
+        `with_edits` (optional string) overrides the proposed new_text — Hana
+        re-wrote the edit before accepting. `user_modified=True` in that case.
+        """
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+        from brain.soul.store import SoulStore, VoiceEvolution
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        with_edits = req.get("with_edits")
+        if not isinstance(audit_id, str):
+            raise HTTPException(
+                status_code=422, detail="audit_id required (string)"
+            )
+
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+                and r.kind == "voice_edit_proposal"
+            ),
+            None,
+        )
+        if matched is None or not matched.diff:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no voice-edit audit row for {audit_id}",
+            )
+
+        old_text = _extract_old_text_from_diff(matched.diff)
+        proposed_new_text = _extract_new_text_from_diff(matched.diff)
+        if not old_text:
+            raise HTTPException(
+                status_code=409,
+                detail="cannot apply voice edit: diff has no removed line",
+            )
+
+        user_modified = isinstance(with_edits, str) and with_edits != ""
+        new_text = with_edits if user_modified else proposed_new_text
+
+        # Place 1: voice template file (atomic via temp+rename).
+        voice_path = s.persona_dir / "nell-voice.md"
+        if not voice_path.exists():
+            raise HTTPException(
+                status_code=409, detail="nell-voice.md not found"
+            )
+        current = voice_path.read_text(encoding="utf-8")
+        if old_text not in current:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "cannot apply voice edit: old text not present in template"
+                ),
+            )
+        new_content = current.replace(old_text, new_text, 1)
+        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
+        tmp.write_text(new_content, encoding="utf-8")
+        tmp.replace(voice_path)
+
+        # Place 2: audit row — record replied_explicit transition.
+        now_iso = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir,
+            audit_id=audit_id,
+            new_state="replied_explicit",
+            at=now_iso,
+        )
+
+        # Place 3: SoulStore voice_evolution.
+        try:
+            soul_store = SoulStore(
+                str(s.persona_dir / "crystallizations.db")
+            )
+            try:
+                soul_store.save_voice_evolution(
+                    VoiceEvolution(
+                        id=f"ve_{audit_id}",
+                        accepted_at=now_iso,
+                        diff=matched.diff,
+                        old_text=old_text,
+                        new_text=new_text,
+                        rationale=matched.decision_reasoning,
+                        evidence=[],
+                        audit_id=audit_id,
+                        user_modified=user_modified,
+                    )
+                )
+            finally:
+                soul_store.close()
+        except Exception:
+            logger.exception(
+                "voice-edit: voice_evolution write failed for %s", audit_id
+            )
+
+        # Parallel episodic memory re-render (degrades gracefully).
+        try:
+            store = MemoryStore(
+                s.persona_dir / "memories.db", integrity_check=False,
+            )
+            try:
+                update_initiate_memory_for_state(
+                    store,
+                    audit_id=audit_id,
+                    subject=matched.subject,
+                    message=matched.tone_rendered,
+                    new_state="replied_explicit",
+                    ts=now_iso,
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.exception(
+                "voice-edit: memory update failed for %s", audit_id
+            )
+
+        return {
+            "ok": True,
+            "applied": new_text,
+            "user_modified": user_modified,
+        }
+
+    @app.post(
+        "/initiate/voice-edit/reject",
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def voice_edit_reject(req: dict[str, Any]) -> dict[str, Any]:
+        """Reject a voice-edit proposal — audit + memory only, no voice write."""
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        if not isinstance(audit_id, str):
+            raise HTTPException(
+                status_code=422, detail="audit_id required (string)"
+            )
+        now_iso = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir,
+            audit_id=audit_id,
+            new_state="dismissed",
+            at=now_iso,
+        )
+        # Parallel episodic memory re-render so ambient recall sees the
+        # dismissal. Best-effort.
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+            ),
+            None,
+        )
+        if matched is not None:
+            try:
+                store = MemoryStore(
+                    s.persona_dir / "memories.db", integrity_check=False,
+                )
+                try:
+                    update_initiate_memory_for_state(
+                        store,
+                        audit_id=audit_id,
+                        subject=matched.subject,
+                        message=matched.tone_rendered,
+                        new_state="dismissed",
+                        ts=now_iso,
+                    )
+                finally:
+                    store.close()
+            except Exception:
+                logger.exception(
+                    "voice-edit reject: memory update failed for %s",
+                    audit_id,
+                )
+        return {"ok": True}
 
     # ── POST /upload — multimodal image upload ────────────────────────────
     # Image upload limit (matches the spec D2 default; per-persona override
