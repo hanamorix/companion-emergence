@@ -836,9 +836,35 @@ fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
         .map_err(|e| format!("set_always_on_top: {}", e))
 }
 
+/// Show a native OS notification for a notify-urgency initiate.
+///
+/// Phase 9.5 — when a notify-urgency `initiate_delivered` event arrives at
+/// the renderer, ChatPanel invokes this command via `tryInvoke` so the
+/// user gets a system-level nudge even when the Companion window isn't
+/// focused. On macOS the first call triggers the OS permission prompt;
+/// subsequent calls succeed silently if the user granted, or fail
+/// quietly (returning Err) if denied. The renderer's try/catch swallows
+/// errors so a denied permission doesn't cascade into a UI failure —
+/// the in-app banner is the primary surface, notifications are a bonus.
+#[tauri::command]
+fn show_initiate_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| format!("show notification: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_bridge_credentials,
             read_app_config,
@@ -851,6 +877,7 @@ pub fn run() {
             install_nell_cli_symlink,
             check_claude_cli,
             set_always_on_top,
+            show_initiate_notification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
