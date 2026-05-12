@@ -15,6 +15,7 @@ from brain.bridge.supervisor import (
     _run_heartbeat_tick,
     _run_initiate_review_tick,  # noqa: F401 — imported to assert symbol exists
     _run_log_rotation_tick,
+    _run_voice_reflection_tick,  # noqa: F401 — imported to assert symbol exists
     run_folded,
 )
 
@@ -559,6 +560,80 @@ def test_run_folded_skips_initiate_review_when_disabled(tmp_path: Path) -> None:
                 finalize_interval_s=None,
                 log_rotation_interval_s=None,
                 initiate_review_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert fired == []
+
+
+def test_run_folded_fires_voice_reflection_after_interval(tmp_path: Path) -> None:
+    """run_folded wires voice reflection into the cadence loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+
+    def fake_voice(*args, **kwargs):
+        fired.set()
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_voice_reflection_tick",
+            side_effect=fake_voice,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=0.0,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "voice reflection never fired"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired: list[int] = []
+
+    def fake_voice(*args, **kwargs):
+        fired.append(1)
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_voice_reflection_tick",
+            side_effect=fake_voice,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
             )
 
     t = threading.Thread(target=runner, daemon=True)
