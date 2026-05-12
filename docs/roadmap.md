@@ -172,6 +172,28 @@ natural extensions of the multimodal + bundled-runtime work:
 
 ## Recently shipped (reverse chronological)
 
+**2026-05-12 — D-reflection editorial layer (v0.0.10-alpha)**
+
+- Editorial gating between candidate emission and composition: draft-space
+  demote for weak candidates (bottom quartile by llm_score), Haiku→Sonnet
+  escalation on high-signal emotion spikes (≥1.5σ), clip-depth cutoff for
+  deep-memory subjects.
+- Two new candidate event sources: `reflex_firing` (on detected autonomic
+  response transitions) and `research_completion` (on successful research-loop
+  queries), both wired through the D-reflection gate.
+- New audit table `initiate_d_calls.jsonl` — one row per D-reflection call,
+  complete with original candidate, decision rationale (emotion_delta,
+  confidence_slice, topic_overlap_score), and final disposition
+  (promote/demote/escalate). All 3-prompt composition breadcrumbs logged.
+- CLI: `nell initiate d-stats` — shows per-hour gate metrics (candidates seen,
+  demotions, escalations, composition cost) and weekly trends.
+- `topic_overlap_score` hardcoded to 1.0 for v0.0.10 (full embedding-based
+  similarity will land in v0.0.11 on top of the memory-clustering substrate).
+- recall_resonance deferred to v0.0.11 (needs the memory-clustering substrate
+  to compute inter-memory cosine scores; D-reflection v0.0.10 assumes solo
+  candidate scoring).
+- Frontend: D-reflection activity shown in InitiateBanner alongside replies.
+
 **2026-05-12 — Initiate physiology (v0.0.9-alpha)**
 
 - Autonomous outbound channel ("initiate"): events emit candidates →
