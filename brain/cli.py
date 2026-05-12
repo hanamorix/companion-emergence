@@ -1247,6 +1247,44 @@ def _initiate_voice_evolution_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _initiate_d_stats_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell initiate d-stats` — render D-reflection telemetry."""
+    import re
+    from datetime import UTC, datetime
+
+    from brain.initiate.audit import read_recent_d_calls
+
+    persona_dir = get_persona_dir(args.persona)
+
+    m = re.fullmatch(r"(\d+)([dh])", args.window)
+    if not m:
+        print(f"invalid --window: {args.window!r} (expected e.g. 24h or 7d)")
+        return 2
+    n, unit = int(m.group(1)), m.group(2)
+    hours = n * 24 if unit == "d" else n
+    now = datetime.now(UTC)
+    rows = list(read_recent_d_calls(persona_dir, window_hours=hours, now=now))
+
+    if not rows:
+        print(f"no D calls in last {args.window}")
+        return 0
+
+    total_in = sum(r.candidates_in for r in rows)
+    total_promoted = sum(r.promoted_out for r in rows)
+    total_filtered = sum(r.filtered_out for r in rows)
+    failures = sum(1 for r in rows if r.failure_type)
+    avg_latency = sum(r.latency_ms for r in rows) // max(1, len(rows))
+
+    print(f"D-reflection stats (last {args.window}):")
+    print(f"  ticks={len(rows)}")
+    print(f"  candidates_in={total_in}")
+    print(f"  promoted_out={total_promoted}")
+    print(f"  filtered_out={total_filtered}")
+    print(f"  failures={failures}")
+    print(f"  avg_latency_ms={avg_latency}")
+    return 0
+
+
 def _soul_review_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell soul review` — run autonomous soul review pass."""
     persona_dir = get_persona_dir(args.persona)
@@ -2374,6 +2412,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     il_ve.add_argument("--persona", required=True)
     il_ve.set_defaults(func=_initiate_voice_evolution_handler)
+
+    # nell initiate d-stats
+    il_ds = initiate_actions.add_parser(
+        "d-stats", help="D-reflection telemetry over a time window."
+    )
+    il_ds.add_argument(
+        "--window",
+        default="7d",
+        help="Window like '7d' or '24h' (default: 7d)",
+    )
+    il_ds.add_argument("--persona", required=True)
+    il_ds.set_defaults(func=_initiate_d_stats_handler)
 
     # nell chat — keystone chat engine (SP-6)
     chat_sub = subparsers.add_parser(
