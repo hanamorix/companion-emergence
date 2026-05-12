@@ -57,8 +57,9 @@ def test_make_d_call_id_sortable():
 
 
 def test_append_d_call_row_and_read(tmp_path):
-    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
     from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
 
     persona = tmp_path / "persona"
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
@@ -81,8 +82,9 @@ def test_append_d_call_row_and_read(tmp_path):
 
 
 def test_read_recent_d_calls_window_filter(tmp_path):
-    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
     from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.audit import append_d_call_row, read_recent_d_calls
 
     persona = tmp_path / "persona"
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
@@ -109,8 +111,9 @@ def test_read_recent_d_calls_window_filter(tmp_path):
 
 
 def test_read_recent_d_calls_no_file_returns_empty(tmp_path):
-    from brain.initiate.audit import read_recent_d_calls
     from datetime import UTC, datetime
+
+    from brain.initiate.audit import read_recent_d_calls
     persona = tmp_path / "fresh"
     out = list(read_recent_d_calls(persona, window_hours=1, now=datetime(2026, 5, 12, tzinfo=UTC)))
     assert out == []
