@@ -2,9 +2,22 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.initiate.new_sources import GateThresholds, load_gate_thresholds
+
+
+@dataclass(frozen=True)
+class _FakeReflexFiring:
+    """Test double for the fields gate_reflex_firing inspects."""
+    pattern_id: str
+    confidence: float
+    flinch_intensity: float
+    linked_memory_ids: list[str]
+    triggered_by_companion_outbound: bool
+    ts: datetime
 
 
 def test_load_gate_thresholds_returns_defaults_when_no_file(tmp_path: Path):
@@ -167,3 +180,138 @@ def test_check_shared_meta_gates_passes(tmp_path: Path):
     )
     assert allowed is True
     assert reason is None
+
+
+def test_gate_reflex_firing_passes_when_above_thresholds(tmp_path: Path):
+    from brain.initiate.new_sources import gate_reflex_firing
+    persona = tmp_path / "p"
+    persona.mkdir()
+    firing = _FakeReflexFiring(
+        pattern_id="p1",
+        confidence=0.80,
+        flinch_intensity=0.70,
+        linked_memory_ids=["m1"],
+        triggered_by_companion_outbound=False,
+        ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+    )
+    allowed, reason = gate_reflex_firing(
+        persona, firing=firing, thresholds=GateThresholds(),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_gate_reflex_firing_blocks_on_low_confidence(tmp_path: Path):
+    from brain.initiate.new_sources import gate_reflex_firing
+    persona = tmp_path / "p"
+    persona.mkdir()
+    firing = _FakeReflexFiring(
+        pattern_id="p2",
+        confidence=0.50,  # below 0.70
+        flinch_intensity=0.80,
+        linked_memory_ids=[],
+        triggered_by_companion_outbound=False,
+        ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+    )
+    allowed, reason = gate_reflex_firing(
+        persona, firing=firing, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "confidence_min"
+
+
+def test_gate_reflex_firing_blocks_on_low_flinch(tmp_path: Path):
+    from brain.initiate.new_sources import gate_reflex_firing
+    persona = tmp_path / "p"
+    persona.mkdir()
+    firing = _FakeReflexFiring(
+        pattern_id="p3",
+        confidence=0.90,
+        flinch_intensity=0.30,
+        linked_memory_ids=[],
+        triggered_by_companion_outbound=False,
+        ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+    )
+    allowed, reason = gate_reflex_firing(
+        persona, firing=firing, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "flinch_intensity_min"
+
+
+def test_gate_reflex_firing_blocks_on_anti_feedback(tmp_path: Path):
+    from brain.initiate.new_sources import gate_reflex_firing
+    persona = tmp_path / "p"
+    persona.mkdir()
+    firing = _FakeReflexFiring(
+        pattern_id="p4",
+        confidence=0.80,
+        flinch_intensity=0.70,
+        linked_memory_ids=[],
+        triggered_by_companion_outbound=True,  # anti-feedback guard
+        ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
+    )
+    allowed, reason = gate_reflex_firing(
+        persona, firing=firing, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "anti_feedback"
+
+
+def test_gate_reflex_firing_blocks_on_pattern_anti_flood(tmp_path: Path):
+    from brain.initiate.emit import emit_initiate_candidate
+    from brain.initiate.new_sources import gate_reflex_firing
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    # Pre-seed a candidate for the same pattern within the 4h window.
+    emit_initiate_candidate(
+        persona,
+        kind="message",
+        source="reflex_firing",
+        source_id="r_old",
+        semantic_context=SemanticContext(source_meta={"pattern_id": "shared_pattern"}),
+        now=now - timedelta(hours=2),
+    )
+    firing = _FakeReflexFiring(
+        pattern_id="shared_pattern",
+        confidence=0.85,
+        flinch_intensity=0.65,
+        linked_memory_ids=[],
+        triggered_by_companion_outbound=False,
+        ts=now,
+    )
+    allowed, reason = gate_reflex_firing(
+        persona, firing=firing, thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "pattern_anti_flood"
+
+
+def test_emit_reflex_firing_candidate_writes_queue_row(tmp_path: Path):
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.new_sources import emit_reflex_firing_candidate
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    firing = _FakeReflexFiring(
+        pattern_id="p_emit",
+        confidence=0.85,
+        flinch_intensity=0.70,
+        linked_memory_ids=["m_a", "m_b"],
+        triggered_by_companion_outbound=False,
+        ts=now,
+    )
+    emit_reflex_firing_candidate(persona, firing=firing, firing_log_id="rfx_001", now=now)
+    out = read_candidates(persona)
+    assert len(out) == 1
+    c = out[0]
+    assert c.source == "reflex_firing"
+    assert c.source_id == "rfx_001"
+    assert c.semantic_context.linked_memory_ids == ["m_a", "m_b"]
+    assert c.semantic_context.source_meta == {
+        "pattern_id": "p_emit",
+        "confidence": 0.85,
+        "flinch_intensity": 0.70,
+    }
