@@ -2032,3 +2032,46 @@ def test_daemon_state_writer_error_is_fault_isolated(tmp_path: Path, caplog) -> 
     finally:
         engine.store.close()
         engine.hebbian.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 11 — Emotion-spike initiate emitter with rolling baseline
+# ---------------------------------------------------------------------------
+
+
+def test_emotion_spike_above_baseline_emits_initiate_candidate(tmp_path: Path) -> None:
+    """When current_resonance is >=1.5 sigma above the 24-tick rolling mean, emit."""
+    from brain.initiate.emit import read_candidates
+
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        # Seed 24 historical heartbeats with resonance ~5.0 (first is init/defer).
+        for i in range(24):
+            engine.run_tick(trigger="close", forced_resonance=5.0 + 0.2 * (i % 3))
+
+        # One more tick with a spike to 8.5 (well above mean ~5.2).
+        engine.run_tick(trigger="close", forced_resonance=8.5)
+
+        candidates = read_candidates(persona_dir)
+        assert any(c.source == "emotion_spike" for c in candidates)
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+
+def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
+    """A normal-range tick produces no initiate candidate."""
+    from brain.initiate.emit import read_candidates
+
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        for i in range(24):
+            engine.run_tick(trigger="close", forced_resonance=5.0 + 0.1 * (i % 3))
+        engine.run_tick(trigger="close", forced_resonance=5.1)
+
+        assert not any(
+            c.source == "emotion_spike" for c in read_candidates(persona_dir)
+        )
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
