@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from brain.initiate.d_call_schema import DCallRow, make_d_call_id
 
 
