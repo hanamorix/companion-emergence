@@ -1,6 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { closeSession, fetchActiveSession, newSession, uploadImage } from "../bridge";
+import { closeSession, fetchActiveSession, getBridgeCredentials, newSession, uploadImage } from "../bridge";
+import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
+import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { streamChat } from "../streamChat";
+
+// Loaded lazily so the test environment (jsdom) doesn't trip on Tauri's
+// invoke when ChatPanel is rendered without it being mocked. Real builds
+// resolve the dynamic import; tests can mock @tauri-apps/api/core.
+async function tryInvoke(cmd: string, args: Record<string, unknown>): Promise<void> {
+  try {
+    const mod = await import("@tauri-apps/api/core");
+    await mod.invoke(cmd, args);
+  } catch {
+    // Tauri not present (browser dev) or command unregistered (Task 27
+    // hasn't shipped yet) — silent no-op is the right behaviour.
+  }
+}
 
 interface Message {
   id: number;
@@ -83,6 +98,12 @@ interface Props {
    *  quit sees that their last conversation is being saved, not
    *  forgotten. Source: PersonaState.recovering from /persona/state. */
   recovering?: boolean;
+  /** Optional event-stream override — used in tests to inject a mock
+   *  bridge /events subscription without opening a real WebSocket. When
+   *  omitted, ChatPanel opens its own /events socket scoped to the
+   *  persona. The stream is responsible for ``initiate_delivered``
+   *  events that drive InitiateBanner rendering. */
+  eventStream?: EventStream;
 }
 
 /**
@@ -93,7 +114,7 @@ interface Props {
  * message on the `done` frame. Avatar speaking animation runs from
  * stream-open until done, so the mouth animates while text appears.
  */
-export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Props) {
+export function ChatPanel({ persona, onSpeakingChange, recovering = false, eventStream }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -101,6 +122,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
   const [memorySaveWarning, setMemorySaveWarning] = useState<string | null>(null);
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
+  const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
+  const [activeReplyTarget, setActiveReplyTarget] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -165,6 +188,81 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, streaming]);
+
+  // ── Bridge /events subscription — initiate_delivered banners ───────────
+  // When an injected stream is provided (tests), use it as-is. Otherwise
+  // open a real /events WebSocket scoped to this persona. The subscription
+  // adds an active banner per initiate_delivered event; the banner itself
+  // calls onMounted after 2s on-screen (read receipt), and onDismiss /
+  // onReply on user action.
+  useEffect(() => {
+    let owned: { close: () => void } | null = null;
+    let stream: EventStream;
+    if (eventStream) {
+      stream = eventStream;
+    } else {
+      const opened = subscribeToBridgeEvents(persona);
+      owned = opened;
+      stream = opened;
+    }
+    const unsubscribe = stream.subscribe((event) => {
+      if (event.type !== "initiate_delivered") return;
+      const auditId = event.audit_id;
+      const body = event.body;
+      if (typeof auditId !== "string" || typeof body !== "string") return;
+      const urgency = event.urgency === "notify" ? "notify" : "quiet";
+      const state =
+        typeof event.state === "string"
+          ? (event.state as InitiateMessage["state"])
+          : "delivered";
+      const timestamp =
+        typeof event.timestamp === "string" ? event.timestamp : new Date().toISOString();
+      setActiveBanners((prev) =>
+        prev.some((b) => b.auditId === auditId)
+          ? prev
+          : [...prev, { auditId, body, urgency, state, timestamp }],
+      );
+      // Task 27 will register show_initiate_notification; until then this
+      // is a graceful no-op via tryInvoke's silent catch.
+      if (urgency === "notify") {
+        void tryInvoke("show_initiate_notification", { title: "Nell", body });
+      }
+    });
+    return () => {
+      unsubscribe();
+      owned?.close();
+    };
+  }, [persona, eventStream]);
+
+  async function postInitiateState(auditId: string, newState: string): Promise<void> {
+    // Best-effort: a network failure here just means the audit row stays
+    // in its previous state until the next user action. We don't want to
+    // surface an error to the user for an ambient receipt.
+    try {
+      const creds = await getBridgeCredentials(persona);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (creds.authToken) headers.Authorization = `Bearer ${creds.authToken}`;
+      await fetch(`${creds.url}/initiate/state`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ audit_id: auditId, new_state: newState }),
+      });
+    } catch {
+      // Silent — see comment above.
+    }
+  }
+
+  const onBannerMounted = (auditId: string) => {
+    void postInitiateState(auditId, "read");
+  };
+  const onBannerDismiss = (auditId: string) => {
+    void postInitiateState(auditId, "dismissed");
+    setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
+  };
+  const onBannerReply = (auditId: string) => {
+    setActiveReplyTarget(auditId);
+    textareaRef.current?.focus();
+  };
 
   // Paste-from-clipboard: when an image is on the clipboard and the
   // user pastes inside the textarea, stage it instead of dumping the
@@ -312,6 +410,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
 
     setMessages((m) => [...m, userMsg, replyStub]);
     setInput("");
+    // If the user invoked "↩ reply" on an initiate banner, the next outbound
+    // message is the explicit reply. Mark that initiate as replied_explicit
+    // so the audit row + ambient memory reflect it, then clear the target.
+    // (Threading the reply payload through streamChat is a later wire-up.)
+    if (activeReplyTarget) {
+      void postInitiateState(activeReplyTarget, "replied_explicit");
+      setActiveBanners((prev) => prev.filter((b) => b.auditId !== activeReplyTarget));
+      setActiveReplyTarget(null);
+    }
     setStreaming(true);
     setError(null);
     setMemorySaveWarning(null);
@@ -535,6 +642,49 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false }: Pro
           </div>
         )}
       </div>
+      {activeBanners.length > 0 && (
+        <div
+          data-testid="initiate-banner-list"
+          style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}
+        >
+          {activeBanners.map((b) => (
+            <InitiateBanner
+              key={b.auditId}
+              message={b}
+              onReply={onBannerReply}
+              onDismiss={onBannerDismiss}
+              onMounted={onBannerMounted}
+            />
+          ))}
+        </div>
+      )}
+      {activeReplyTarget && (
+        <div
+          data-testid="reply-target-indicator"
+          style={{
+            fontSize: 10,
+            color: "var(--mauve)",
+            padding: "4px 6px",
+            fontStyle: "italic",
+          }}
+        >
+          replying to {activeReplyTarget}{" "}
+          <button
+            type="button"
+            onClick={() => setActiveReplyTarget(null)}
+            aria-label="cancel reply"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--mauve)",
+              cursor: "pointer",
+              padding: "0 4px",
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       {stagedImage && (
         <StagedImageRow staged={stagedImage} onRemove={clearStagedImage} />
       )}
