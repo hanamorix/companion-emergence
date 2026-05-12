@@ -16,10 +16,10 @@ import logging
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from brain.initiate.emit import read_candidates
-from brain.initiate.schemas import CandidateSource
+from brain.initiate.emit import emit_initiate_candidate, read_candidates
+from brain.initiate.schemas import CandidateSource, SemanticContext
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +122,80 @@ def check_shared_meta_gates(
         return False, "queue_depth_max"
 
     return True, None
+
+
+class ReflexFiringLike(Protocol):
+    """Duck-typed shape gate_reflex_firing inspects on a reflex firing."""
+    pattern_id: str
+    confidence: float
+    flinch_intensity: float
+    linked_memory_ids: list[str]
+    triggered_by_companion_outbound: bool
+    ts: datetime
+
+
+def gate_reflex_firing(
+    persona_dir: Path,
+    *,
+    firing: ReflexFiringLike,
+    thresholds: GateThresholds,
+) -> tuple[bool, str | None]:
+    """Per-source gate for the reflex_firing emitter.
+
+    Order of checks: confidence -> flinch -> anti-feedback -> pattern anti-flood.
+    """
+    if firing.confidence < thresholds.reflex_confidence_min:
+        return False, "confidence_min"
+    if firing.flinch_intensity < thresholds.reflex_flinch_intensity_min:
+        return False, "flinch_intensity_min"
+    if firing.triggered_by_companion_outbound:
+        return False, "anti_feedback"
+
+    # Anti-flood: same pattern_id must not have emitted in the last N hours.
+    cutoff = firing.ts - timedelta(hours=thresholds.reflex_anti_flood_hours)
+    for c in read_candidates(persona_dir):
+        if c.source != "reflex_firing":
+            continue
+        meta = c.semantic_context.source_meta or {}
+        if meta.get("pattern_id") != firing.pattern_id:
+            continue
+        try:
+            c_ts = datetime.fromisoformat(c.ts)
+        except ValueError:
+            continue
+        if c_ts >= cutoff:
+            return False, "pattern_anti_flood"
+
+    return True, None
+
+
+def emit_reflex_firing_candidate(
+    persona_dir: Path,
+    *,
+    firing: ReflexFiringLike,
+    firing_log_id: str,
+    now: datetime,
+) -> None:
+    """Write a reflex_firing candidate to the initiate queue.
+
+    Idempotent on (source, source_id) per emit_initiate_candidate's contract.
+    Callers must run gate_reflex_firing + check_shared_meta_gates first;
+    this function does NOT re-check gates.
+    """
+    sc = SemanticContext(
+        linked_memory_ids=list(firing.linked_memory_ids),
+        topic_tags=[],
+        source_meta={
+            "pattern_id": firing.pattern_id,
+            "confidence": firing.confidence,
+            "flinch_intensity": firing.flinch_intensity,
+        },
+    )
+    emit_initiate_candidate(
+        persona_dir,
+        kind="message",
+        source="reflex_firing",
+        source_id=firing_log_id,
+        semantic_context=sc,
+        now=now,
+    )
