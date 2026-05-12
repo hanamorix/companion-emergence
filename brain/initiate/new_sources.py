@@ -14,9 +14,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, fields
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from brain.initiate.emit import read_candidates
+from brain.initiate.schemas import CandidateSource
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +84,41 @@ def write_gate_rejection(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:
         logger.warning("gate_rejections append failed for %s: %s", path, exc)
+
+
+def check_shared_meta_gates(
+    persona_dir: Path,
+    *,
+    source: CandidateSource,
+    now: datetime,
+    is_rest_state: bool,
+    thresholds: GateThresholds,
+) -> tuple[bool, str | None]:
+    """Apply the meta-gates that hold for every new v0.0.10 emitter.
+
+    Returns (allowed, reason). When allowed is False, `reason` is a
+    structured tag suitable for gate_rejections.jsonl.
+    """
+    if is_rest_state:
+        return False, "rest_state"
+
+    # Read current queue once for the two remaining checks.
+    candidates = read_candidates(persona_dir)
+
+    # Per-source anti-flood: at most 1 candidate of this source in last N min.
+    anti_flood_cutoff = now - timedelta(minutes=thresholds.meta_anti_flood_minutes)
+    for c in candidates:
+        if c.source != source:
+            continue
+        try:
+            c_ts = datetime.fromisoformat(c.ts)
+        except ValueError:
+            continue
+        if c_ts >= anti_flood_cutoff:
+            return False, "per_source_anti_flood"
+
+    # Queue depth ceiling.
+    if len(candidates) >= thresholds.meta_max_queue_depth:
+        return False, "queue_depth_max"
+
+    return True, None
