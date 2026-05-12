@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.jsonl_reader import iter_jsonl_streaming
+from brain.initiate.d_call_schema import DCallRow
 from brain.initiate.schemas import AuditRow, StateName
 
 logger = logging.getLogger(__name__)
@@ -143,3 +144,43 @@ def iter_initiate_audit_full(persona_dir: Path) -> Iterator[AuditRow]:
             yield AuditRow.from_jsonl(json.dumps(raw))
         except (KeyError, TypeError):
             continue
+
+
+def append_d_call_row(persona_dir: Path, row: DCallRow) -> None:
+    """Append one row to initiate_d_calls.jsonl (creates file lazily)."""
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    path = persona_dir / "initiate_d_calls.jsonl"
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(row.to_jsonl() + "\n")
+    except OSError as exc:
+        logger.warning("initiate_d_calls append failed for %s: %s", path, exc)
+
+
+def read_recent_d_calls(
+    persona_dir: Path,
+    *,
+    window_hours: float,
+    now: datetime | None = None,
+) -> Iterator[DCallRow]:
+    """Yield D-call rows within `window_hours` of `now` (defaults to datetime.now(UTC))."""
+    path = persona_dir / "initiate_d_calls.jsonl"
+    if not path.exists():
+        return
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(hours=window_hours)
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.rstrip("\r\n")
+            if not stripped.strip():
+                continue
+            try:
+                row = DCallRow.from_jsonl(stripped)
+            except (json.JSONDecodeError, KeyError):
+                continue
+            try:
+                row_ts = datetime.fromisoformat(row.ts)
+            except ValueError:
+                continue
+            if row_ts >= cutoff:
+                yield row
