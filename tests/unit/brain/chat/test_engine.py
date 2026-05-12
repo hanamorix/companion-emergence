@@ -339,6 +339,59 @@ def test_respond_falls_back_to_history_when_buffer_read_fails(
     assert "hi back" in contents
 
 
+def test_respond_system_message_includes_outbound_recall_block(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """Phase 7.2 — the always-on verify slice is injected into the system message.
+
+    Seeds an audit row dated within the 24h ambient window, then drives a
+    full chat turn through a recording provider and asserts the system
+    message contains "Recent outbound" plus the seeded subject.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    # Use a recent ts so read_recent_audit's 24h window (anchored at
+    # datetime.now(UTC)) includes it. One hour ago is comfortably inside.
+    recent_ts = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    row = AuditRow(
+        audit_id="ia_engine_001",
+        candidate_id="ic_engine_001",
+        ts=recent_ts,
+        kind="message",
+        subject="the kolinsky sable brushes",
+        tone_rendered="the kolinsky sable brushes landed",
+        decision="send_quiet",
+        decision_reasoning="x",
+        gate_check={"allowed": True, "reason": None},
+        delivery=None,
+    )
+    row.record_transition("delivered", recent_ts)
+    append_audit_row(persona_dir, row)
+
+    respond(
+        persona_dir,
+        "hello",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        voice_md_override="# Nell",
+    )
+
+    sent = recording_provider.last_messages
+    system_msgs = [m.content for m in sent if m.role == "system"]
+    assert system_msgs, "expected a system message"
+    system_text = system_msgs[0]
+    assert isinstance(system_text, str)
+    assert "Recent outbound" in system_text
+    assert "the kolinsky sable brushes" in system_text
+
+
 def test_respond_replays_image_turn_from_buffer(
     persona_dir: Path,
     store: MemoryStore,

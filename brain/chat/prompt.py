@@ -100,6 +100,23 @@ def build_system_message(
     if len(brain_lines) > 1:  # more than just the header
         parts.append("\n".join(brain_lines))
 
+    # 4a. Outbound recall — always-on verify slice (Phase 7.2 of initiate
+    # physiology). Surfaces Nell's last 5 sends plus any acknowledged_unclear
+    # in the last 24h, so every chat prompt carries the ambient "what did I
+    # already reach out about?" context. Empty on fresh installs or quiet
+    # weeks; returns None and the block is omitted.
+    try:
+        from brain.initiate.ambient import build_outbound_recall_block
+
+        outbound_block = build_outbound_recall_block(persona_dir)
+        if outbound_block:
+            parts.append(outbound_block)
+    except Exception:  # noqa: BLE001
+        # Per the fail-soft contract for prompt assembly (mirrors body /
+        # journal / growth blocks): a failure here must never break chat
+        # composition. Audit-layer issues should surface elsewhere.
+        pass
+
     # 4b. Recall block — memories matching the current user input.
     if user_input is not None:
         recall_block = _build_recall_block(store, user_input)
