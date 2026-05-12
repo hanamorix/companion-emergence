@@ -368,3 +368,61 @@ def test_research_log_load_heals_from_bak(tmp_path: Path) -> None:
     log = ResearchLog.load(path)
     assert len(log.fires) == 1
     assert log.fires[0].topic == "marine bioluminescence"
+
+
+# ---- D-reflection Task 18: research_completion initiate candidate emission ----
+
+
+def test_research_fire_emits_initiate_candidate_when_maturity_passes(tmp_path: Path) -> None:
+    """A matured research fire (pull_score >= 7.5) emits a research_completion candidate.
+
+    pull_score=8.0 → maturity_score=0.8 ≥ default threshold 0.75, so the gate passes.
+    topic_overlap_score is hardcoded 1.0 (≥ threshold 0.30), so that gate also passes.
+    """
+    from brain.initiate.emit import read_candidates
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        assert result.fired is not None, "Expected research to fire"
+
+        candidates = read_candidates(tmp_path)
+        research_candidates = [c for c in candidates if c.source == "research_completion"]
+        assert len(research_candidates) == 1
+        rc = research_candidates[0]
+        assert rc.source_id == result.fired.output_memory_id
+        assert rc.semantic_context.source_meta is not None
+        assert rc.semantic_context.source_meta["thread_topic"] == "marine bioluminescence"
+        assert rc.semantic_context.source_meta["topic_overlap_score"] == 1.0
+    finally:
+        store.close()
+
+
+def test_research_fire_does_not_emit_candidate_when_maturity_fails(tmp_path: Path) -> None:
+    """A low-pull-score fire (pull_score=6.0 → maturity=0.60 < 0.75 threshold) does not emit.
+
+    The maturity_min gate should reject and write a gate rejection row instead.
+    """
+    from brain.initiate.emit import read_candidates
+
+    # pull_score=6.0 → maturity_score=0.60, which is below the default 0.75 threshold
+    _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        assert result.fired is not None, "Expected research to fire (engine gate passed)"
+
+        candidates = read_candidates(tmp_path)
+        research_candidates = [c for c in candidates if c.source == "research_completion"]
+        assert len(research_candidates) == 0, "Low-maturity fire must NOT emit a research_completion candidate"
+
+        # Confirm gate rejection was recorded
+        rejection_path = tmp_path / "gate_rejections.jsonl"
+        assert rejection_path.exists(), "gate_rejections.jsonl should exist after maturity gate rejection"
+        rows = [json.loads(line) for line in rejection_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert any(r["gate_name"] == "maturity_min" and r["source"] == "research_completion" for r in rows)
+    finally:
+        store.close()
