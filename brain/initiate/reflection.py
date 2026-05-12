@@ -231,12 +231,13 @@ def run(
 ) -> tuple[DReflectionResult, DCallRow]:
     """Execute one D-reflection tick over the given candidates.
 
-    Returns (result, d_call_row). Caller is responsible for writing the
-    d_call_row to audit and for dispatching the per-candidate decisions
-    (promote → composition handoff, filter → draft-space demote).
-
-    Failure-mode handling: see Tasks 12-13 (escalation, retries, fallbacks).
-    This task implements only the happy path on Haiku.
+    Escalation rules:
+      - If Haiku's response fails to parse OR contains ANY decision with
+        confidence "low", re-call on Sonnet. Sonnet's result is the one
+        written; Haiku's attempt is recorded in retry_count.
+      - If Sonnet's response ALSO contains a low-confidence decision,
+        force that candidate's decision to "filter" with an ambivalence
+        reason (conservative default at the edge of D's judgment).
     """
     system = build_system_message(
         companion_name=deps.companion_name,
@@ -252,27 +253,74 @@ def run(
         ],
     )
 
-    raw, latency_ms, tokens_in, tokens_out = deps.haiku_call(
-        system=system, user=user
-    )
-    result = parse_structured_response(raw)
+    # First attempt on Haiku.
+    raw_h, latency_h, tin_h, tout_h = deps.haiku_call(system=system, user=user)
+    haiku_result: DReflectionResult | None
+    try:
+        haiku_result = parse_structured_response(raw_h)
+        haiku_low = any(d.confidence == "low" for d in haiku_result.decisions)
+    except ValueError:
+        haiku_result = None
+        haiku_low = True  # treat parse-fail as low-confidence trigger
 
-    promoted = sum(1 for d in result.decisions if d.decision == "promote")
-    filtered = sum(1 for d in result.decisions if d.decision == "filter")
+    if haiku_result is not None and not haiku_low:
+        # Haiku is final.
+        promoted = sum(1 for d in haiku_result.decisions if d.decision == "promote")
+        filtered = sum(1 for d in haiku_result.decisions if d.decision == "filter")
+        d_call = DCallRow(
+            d_call_id=make_d_call_id(deps.now),
+            ts=deps.now.isoformat(),
+            tick_id=deps.tick_id,
+            model_tier_used="haiku",
+            candidates_in=len(candidates),
+            promoted_out=promoted,
+            filtered_out=filtered,
+            latency_ms=latency_h,
+            tokens_input=tin_h,
+            tokens_output=tout_h,
+            failure_type=None,
+            retry_count=0,
+            tick_note=haiku_result.tick_note,
+        )
+        return haiku_result, d_call
 
+    # Escalate to Sonnet.
+    raw_s, latency_s, tin_s, tout_s = deps.sonnet_call(system=system, user=user)
+    sonnet_result = parse_structured_response(raw_s)
+
+    # Both-low-confidence: force decisions where confidence is low to "filter"
+    # with an ambivalence reason.
+    forced: list[DDecision] = []
+    both_low = False
+    for d in sonnet_result.decisions:
+        if d.confidence == "low":
+            both_low = True
+            forced.append(
+                DDecision(
+                    candidate_index=d.candidate_index,
+                    decision="filter",
+                    reason="ambivalent — both my fast and slow voice were uncertain",
+                    confidence="low",
+                )
+            )
+        else:
+            forced.append(d)
+    final_result = DReflectionResult(decisions=forced, tick_note=sonnet_result.tick_note)
+    promoted = sum(1 for d in final_result.decisions if d.decision == "promote")
+    filtered = sum(1 for d in final_result.decisions if d.decision == "filter")
     d_call = DCallRow(
         d_call_id=make_d_call_id(deps.now),
         ts=deps.now.isoformat(),
         tick_id=deps.tick_id,
-        model_tier_used="haiku",
+        model_tier_used="sonnet",
         candidates_in=len(candidates),
         promoted_out=promoted,
         filtered_out=filtered,
-        latency_ms=latency_ms,
-        tokens_input=tokens_in,
-        tokens_output=tokens_out,
-        failure_type=None,
-        retry_count=0,
-        tick_note=result.tick_note,
+        latency_ms=latency_h + latency_s,
+        tokens_input=tin_h + tin_s,
+        tokens_output=tout_h + tout_s,
+        failure_type="both_low_confidence" if both_low else None,
+        retry_count=1,
+        tick_note=final_result.tick_note,
     )
-    return result, d_call
+    return final_result, d_call

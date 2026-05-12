@@ -174,3 +174,133 @@ def test_reflection_run_happy_path_haiku(tmp_path):
     assert dcall.failure_type is None
     assert dcall.retry_count == 0
     assert calls == ["haiku"]  # Sonnet not called
+
+
+def test_reflection_run_escalates_on_low_confidence(tmp_path):
+    """Any 'low' confidence in Haiku response triggers Sonnet re-call."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    haiku_response = (
+        '{"decisions":[{"candidate_index":1,"decision":"filter",'
+        '"reason":"unsure","confidence":"low"}],"tick_note":null}'
+    )
+    sonnet_response = (
+        '{"decisions":[{"candidate_index":1,"decision":"promote",'
+        '"reason":"resonant","confidence":"high"}],"tick_note":"yes"}'
+    )
+
+    def haiku_call(*, system, user):
+        return haiku_response, 200, 400, 100
+
+    def sonnet_call(*, system, user):
+        return sonnet_response, 700, 400, 100
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    result, dcall = run(candidates, deps=deps)
+    assert dcall.model_tier_used == "sonnet"
+    assert dcall.retry_count == 1
+    assert result.decisions[0].decision == "promote"
+    assert result.tick_note == "yes"
+
+
+def test_reflection_run_escalates_on_malformed_haiku(tmp_path):
+    """Malformed JSON from Haiku triggers Sonnet re-call."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    def haiku_call(*, system, user):
+        return "I cannot comply with this request.", 200, 400, 50
+
+    def sonnet_call(*, system, user):
+        return (
+            '{"decisions":[{"candidate_index":1,"decision":"filter",'
+            '"reason":"ok","confidence":"high"}],"tick_note":null}',
+            700, 400, 100,
+        )
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    result, dcall = run(candidates, deps=deps)
+    assert dcall.model_tier_used == "sonnet"
+    assert dcall.retry_count == 1
+    assert result.decisions[0].decision == "filter"
+
+
+def test_reflection_run_filters_when_both_tiers_low_confidence(tmp_path):
+    """If Sonnet's confidence is also low, decision is forced to filter."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.reflection import ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    candidates = [
+        InitiateCandidate(
+            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message", source="dream", source_id="d1",
+            semantic_context=SemanticContext(),
+        ),
+    ]
+
+    haiku_response = (
+        '{"decisions":[{"candidate_index":1,"decision":"promote",'
+        '"reason":"maybe","confidence":"low"}],"tick_note":null}'
+    )
+    sonnet_response = (
+        '{"decisions":[{"candidate_index":1,"decision":"promote",'
+        '"reason":"still maybe","confidence":"low"}],"tick_note":null}'
+    )
+
+    def haiku_call(*, system, user):
+        return haiku_response, 200, 400, 100
+
+    def sonnet_call(*, system, user):
+        return sonnet_response, 700, 400, 100
+
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=haiku_call, sonnet_call=sonnet_call,
+        now=now, tick_id="t1",
+    )
+    result, dcall = run(candidates, deps=deps)
+    assert dcall.model_tier_used == "sonnet"
+    assert dcall.failure_type == "both_low_confidence"
+    # Decision forced to filter despite Sonnet saying promote.
+    assert result.decisions[0].decision == "filter"
+    assert "ambivalent" in result.decisions[0].reason.lower()
