@@ -19,9 +19,9 @@ def test_full_pipeline_dream_to_audit(tmp_path: Path, monkeypatch) -> None:
     test remains focused on the composition + audit pipeline rather than the
     D editorial gate (which has its own dedicated unit tests).
     """
+
     from brain.initiate.d_call_schema import DCallRow, make_d_call_id
     from brain.initiate.reflection import DDecision, DReflectionResult
-    from datetime import UTC, datetime
 
     def _promote_all(candidates, *, deps):
         decisions = [
