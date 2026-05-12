@@ -571,3 +571,85 @@ def test_sessions_close_hydrates_from_buffer_on_unknown_session(
         r = c.post("/sessions/close", json={"session_id": sid})
         assert r.status_code == 200, r.text
         assert r.json()["closed"] is True
+
+
+# ── /initiate/state — renderer-driven state transitions ─────────────────────
+
+
+def _seed_audit_row(
+    persona_dir: Path,
+    *,
+    audit_id: str,
+    state: str,
+    subject: str = "the dream",
+    tone_rendered: str = "the dream landed somewhere this morning",
+) -> None:
+    """Append one AuditRow with delivery.current_state preset."""
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    row = AuditRow(
+        audit_id=audit_id,
+        candidate_id=f"ic_{audit_id}",
+        ts="2026-05-11T14:47:09+00:00",
+        kind="message",
+        subject=subject,
+        tone_rendered=tone_rendered,
+        decision="send_quiet",
+        decision_reasoning="resonance is real",
+        gate_check={"allowed": True, "reason": None},
+        delivery={
+            "delivered_at": "2026-05-11T14:47:09+00:00",
+            "state_transitions": [
+                {"to": "delivered", "at": "2026-05-11T14:47:09+00:00"},
+            ],
+            "current_state": state,
+        },
+    )
+    append_audit_row(persona_dir, row)
+
+
+def _read_audit_rows(persona_dir: Path) -> list[dict]:
+    """Read initiate_audit.jsonl as raw dicts (for asserting current_state)."""
+    import json
+
+    path = persona_dir / "initiate_audit.jsonl"
+    out: list[dict] = []
+    if not path.exists():
+        return out
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            out.append(json.loads(stripped))
+    return out
+
+
+def test_post_initiate_state_transition_records_audit_and_memory(
+    persona_dir: Path,
+) -> None:
+    """POST /initiate/state — renderer reports a state event (read/dismissed)."""
+    _seed_audit_row(persona_dir, audit_id="ia_001", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/state",
+            json={"audit_id": "ia_001", "new_state": "read"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "new_state": "read"}
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_001")
+    assert target["delivery"]["current_state"] == "read"
+
+
+def test_post_initiate_state_rejects_unknown_state(persona_dir: Path) -> None:
+    _seed_audit_row(persona_dir, audit_id="ia_001", state="delivered")
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/state",
+            json={"audit_id": "ia_001", "new_state": "garbage"},
+        )
+    assert r.status_code == 422

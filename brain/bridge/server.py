@@ -817,6 +817,75 @@ def build_app(
             raise HTTPException(status_code=404, detail=result["error"])
         return result
 
+    # ── POST /initiate/state — renderer-driven state transitions ─────────
+    _VALID_INITIATE_STATES = frozenset(  # noqa: N806 — local constant
+        {
+            "pending", "delivered", "read",
+            "replied_explicit", "acknowledged_unclear", "unanswered",
+            "dismissed",
+        }
+    )
+
+    @app.post("/initiate/state", dependencies=[Depends(require_http_auth)])
+    async def initiate_state(req: dict[str, Any]) -> dict[str, Any]:
+        """Record a state transition for an initiate audit row.
+
+        Renderer posts ``{audit_id, new_state}`` when a user-visible event
+        happens (mounted, read, dismissed, replied). The endpoint validates
+        new_state, mutates the audit row's delivery block, and re-renders
+        the linked first-person memory so ambient recall reflects current
+        truth.
+        """
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        new_state = req.get("new_state")
+        if (
+            not isinstance(audit_id, str)
+            or not isinstance(new_state, str)
+            or new_state not in _VALID_INITIATE_STATES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid state transition request: {req!r}",
+            )
+        now = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir, audit_id=audit_id, new_state=new_state, at=now,
+        )
+        # Re-render memory if we can locate the audit row's subject + body.
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+            ),
+            None,
+        )
+        if matched is not None:
+            try:
+                store = MemoryStore(
+                    s.persona_dir / "memories.db", integrity_check=False,
+                )
+                try:
+                    update_initiate_memory_for_state(
+                        store,
+                        audit_id=audit_id,
+                        subject=matched.subject,
+                        message=matched.tone_rendered,
+                        new_state=new_state,
+                        ts=now,
+                    )
+                finally:
+                    store.close()
+            except Exception:
+                logger.exception("memory update failed for state transition")
+        return {"ok": True, "new_state": new_state}
+
     # ── POST /upload — multimodal image upload ────────────────────────────
     # Image upload limit (matches the spec D2 default; per-persona override
     # via PersonaConfig.image_max_bytes can come later if needed).
