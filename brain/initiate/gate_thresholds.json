@@ -1,0 +1,10 @@
+{
+  "reflex_confidence_min": 0.70,
+  "reflex_flinch_intensity_min": 0.60,
+  "reflex_anti_flood_hours": 4.0,
+  "research_maturity_min": 0.75,
+  "research_topic_overlap_min": 0.30,
+  "research_freshness_minutes": 30,
+  "meta_anti_flood_minutes": 30,
+  "meta_max_queue_depth": 6
+}
