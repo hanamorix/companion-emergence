@@ -535,3 +535,21 @@ def test_truncate_at_role_leak_does_not_match_persona_names() -> None:
     )
     out = _truncate_at_role_leak(text)
     assert out == text  # persona names inside narrative prose stay intact
+
+
+def test_llm_provider_complete_delegates_to_generate() -> None:
+    """The .complete() shim on the ABC must forward to .generate() with
+    system=None. The initiate pipeline calls .complete(); every engine
+    historically called .generate(). One surface, two call shapes — the
+    shim keeps both contracts honoured.
+
+    FakeProvider exercises the real subclass path: the ABC's default
+    .complete implementation should be inherited and produce the same
+    result a .generate(prompt, system=None) call would.
+    """
+    p = FakeProvider()
+    via_complete = p.complete("hello world")
+    via_generate = p.generate("hello world", system=None)
+    assert via_complete == via_generate
+    # Sanity: shim isn't a stub returning empty/None.
+    assert via_complete.startswith("DREAM: ")
