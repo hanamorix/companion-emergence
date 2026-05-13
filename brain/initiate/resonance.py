@@ -12,8 +12,14 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from brain.initiate.emit import emit_initiate_candidate, read_candidates
+from brain.initiate.new_sources import GateThresholds
+from brain.initiate.schemas import SemanticContext
+from brain.memory.hebbian import HebbianMatrix
+from brain.memory.store import Memory
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +119,6 @@ class MemoryActivationBaseline:
         self._conn.commit()
 
 
-from brain.memory.hebbian import HebbianMatrix  # noqa: E402
-
-
 def compute_current_activation(hebbian: HebbianMatrix, memory_id: str) -> float:
     """Sum of weights of all Hebbian neighbors of memory_id.
 
@@ -150,3 +153,77 @@ def top_n_most_active_memories(
         activation[b] = activation.get(b, 0.0) + w
     sorted_pairs = sorted(activation.items(), key=lambda p: p[1], reverse=True)
     return sorted_pairs[:n]
+
+
+def gate_recall_resonance(
+    persona_dir: Path,
+    *,
+    memory_id: str,
+    z_score: float,
+    staleness_days: float,
+    thresholds: GateThresholds,
+    now: datetime | None = None,
+) -> tuple[bool, str | None]:
+    """Per-source gate for recall_resonance.
+
+    Checks, in order: z-threshold, memory staleness, then anti-flood for
+    the same memory ID.
+    """
+    if z_score < thresholds.recall_resonance_z_threshold:
+        return False, "z_threshold"
+    if staleness_days < thresholds.recall_resonance_staleness_min_days:
+        return False, "staleness_min"
+
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(hours=thresholds.recall_resonance_anti_flood_hours)
+    for candidate in read_candidates(persona_dir):
+        if candidate.source != "recall_resonance" or candidate.source_id != memory_id:
+            continue
+        try:
+            candidate_ts = datetime.fromisoformat(candidate.ts)
+        except ValueError:
+            continue
+        if candidate_ts.tzinfo is None and cutoff.tzinfo is not None:
+            candidate_ts = candidate_ts.replace(tzinfo=UTC)
+        if candidate_ts >= cutoff:
+            return False, "anti_flood"
+
+    return True, None
+
+
+def emit_recall_resonance_candidate(
+    persona_dir: Path,
+    *,
+    memory: Memory,
+    z_score: float,
+    ema_mean: float,
+    current_activation: float,
+    staleness_days: float,
+    top_neighbors: list[tuple[str, float]],
+    now: datetime,
+) -> None:
+    """Write a recall_resonance candidate into the initiate queue."""
+    neighbor_ids = [neighbor_id for neighbor_id, _ in top_neighbors]
+    semantic_context = SemanticContext(
+        linked_memory_ids=[memory.id, *neighbor_ids],
+        topic_tags=list(memory.tags),
+        source_meta={
+            "memory_id": memory.id,
+            "z_score": round(z_score, 3),
+            "ema_mean_at_evaluation": round(ema_mean, 3),
+            "current_activation": round(current_activation, 3),
+            "staleness_days": int(staleness_days),
+            "top_neighbors": [
+                {"id": neighbor_id, "weight": round(weight, 3)}
+                for neighbor_id, weight in top_neighbors
+            ],
+        },
+    )
+    emit_initiate_candidate(
+        persona_dir,
+        kind="message",
+        source="recall_resonance",
+        source_id=memory.id,
+        semantic_context=semantic_context,
+        now=now,
+    )
