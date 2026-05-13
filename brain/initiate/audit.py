@@ -270,6 +270,74 @@ def run_calibration_closer_tick(
         append_calibration_row(persona_dir, cal)
         seen_ids.add(audit_row.candidate_id)
 
+    # Pass 2 — filtered-by-D rows that have aged past 48h.
+    forty_eight_hours = timedelta(hours=48)
+    # Window padded to 72h to catch some closer-was-down-yesterday cases.
+    for audit_row in read_recent_audit(persona_dir, window_hours=72, now=now):
+        if audit_row.decision not in _D_FILTERED_DECISIONS:
+            continue
+        if audit_row.candidate_id in seen_ids:
+            continue
+        try:
+            decision_ts = datetime.fromisoformat(audit_row.ts)
+        except ValueError:
+            continue
+        if (now - decision_ts) < forty_eight_hours:
+            continue  # not yet terminal
+
+        # Determine filtered_recurred: did the same (source, source_id)
+        # re-emit as a candidate within 48h of the original decision?
+        source_id_of_filter = audit_row.gate_check.get("source_id")
+        filtered_recurred = False
+        if source_id_of_filter:
+            filtered_recurred = _source_id_recurred_within(
+                persona_dir,
+                source_id=source_id_of_filter,
+                source=audit_row.gate_check.get("source", ""),
+                start_ts=decision_ts,
+                window=forty_eight_hours,
+            )
+
+        cal = CalibrationRow(
+            ts_decision=audit_row.ts,
+            ts_closed=(decision_ts + forty_eight_hours).isoformat(),
+            candidate_id=audit_row.candidate_id,
+            source=_extract_source_from_decision(audit_row),
+            decision="filter",
+            confidence=_extract_confidence(audit_row),
+            model_tier=_extract_model_tier(audit_row),
+            promoted_to_state=None,
+            filtered_recurred=filtered_recurred,
+            reason_short=audit_row.decision_reasoning[:80],
+        )
+        append_calibration_row(persona_dir, cal)
+        seen_ids.add(audit_row.candidate_id)
+
+
+def _source_id_recurred_within(
+    persona_dir: Path,
+    *,
+    source_id: str,
+    source: str,
+    start_ts: datetime,
+    window: timedelta,
+) -> bool:
+    """Check whether a candidate with (source, source_id) was emitted into
+    the queue within `window` after `start_ts`."""
+    from brain.initiate.emit import read_candidates
+
+    end_ts = start_ts + window
+    for c in read_candidates(persona_dir):
+        if c.source != source or c.source_id != source_id:
+            continue
+        try:
+            c_ts = datetime.fromisoformat(c.ts)
+        except ValueError:
+            continue
+        if start_ts < c_ts <= end_ts:
+            return True
+    return False
+
 
 def _extract_source_from_decision(audit_row: AuditRow) -> str:
     """Best-effort extract candidate source from gate_check; 'unknown' fallback.
