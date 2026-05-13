@@ -287,10 +287,22 @@ class ResearchEngine:
 
         # D-reflection Task 18: emit research_completion initiate candidate (gated).
         # Best-effort: gate/emit failure does NOT prevent the research fire.
+        user_name = "you"
+        try:
+            from brain.persona_config import PersonaConfig
+
+            cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
+            user_name = cfg.user_name or user_name
+        except Exception:
+            user_name = "you"
+
         _emit_research_candidate(
             persona_dir=self.interests_path.parent,
             interest=winner,
             mem_id=mem.id,
+            summary_excerpt=raw[:1000],
+            provider=self.provider,
+            user_name=user_name,
             now=now,
         )
 
@@ -411,6 +423,9 @@ def _emit_research_candidate(
     persona_dir: Path,
     interest: Interest,
     mem_id: str,
+    summary_excerpt: str,
+    provider: LLMProvider,
+    user_name: str,
     now: datetime,
 ) -> None:
     """Gate-check and emit a research_completion initiate candidate.
@@ -423,16 +438,16 @@ def _emit_research_candidate(
     - thread_id                = mem_id (the output memory id — unique per fire)
     - topic                    = interest.topic
     - maturity_score           = interest.pull_score / 10.0 (pull 6-10 → 0.6-1.0)
-    - summary_excerpt          = "" (no LLM-generated summary at fire time)
+    - summary_excerpt          = first 1000 chars of generated research memory
     - linked_memory_ids        = [mem_id] (the output memory just written)
     - completed_at             = now
     - previously_linked_to_audit  = checked against existing research_completion candidates
 
-    topic_overlap_score is hardcoded to 1.0 for v0.0.10 — ResearchEngine has no
-    embedding infrastructure. The gate is therefore effectively pass-through on
-    topic overlap until v0.0.11 wires real similarity.
+    topic_overlap_score is computed via Haiku against the recent conversation
+    excerpt before the research-completion gates run.
     """
     try:
+        from brain.initiate.ambient import build_recent_conversation_excerpt
         from brain.initiate.emit import read_candidates
         from brain.initiate.new_sources import (
             check_shared_meta_gates,
@@ -465,16 +480,45 @@ def _emit_research_candidate(
             thread_id=mem_id,
             topic=interest.topic,
             maturity_score=min(interest.pull_score / 10.0, 1.0),
-            summary_excerpt="",
+            summary_excerpt=summary_excerpt,
             linked_memory_ids=[mem_id],
             completed_at=now,
             previously_linked_to_audit=prev_linked,
         )
 
-        # topic_overlap_score is hardcoded 1.0 — see docstring.
-        topic_overlap_score = 1.0
-
         thresholds = load_gate_thresholds(persona_dir)
+
+        preflight_ok, preflight_reason = gate_research_completion(
+            persona_dir,
+            thread=thread,
+            now=now,
+            topic_overlap_score=thresholds.research_topic_overlap_min,
+            thresholds=thresholds,
+        )
+        if not preflight_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=preflight_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        recent_excerpt = build_recent_conversation_excerpt(
+            persona_dir,
+            hours=48,
+            max_chars=2000,
+        )
+        topic_overlap_score = _compute_topic_overlap_via_haiku(
+            thread_topic=thread.topic,
+            thread_summary=thread.summary_excerpt,
+            recent_conversation_excerpt=recent_excerpt,
+            provider=provider,
+            user_name=user_name,
+        )
 
         gate_ok, gate_reason = gate_research_completion(
             persona_dir,
