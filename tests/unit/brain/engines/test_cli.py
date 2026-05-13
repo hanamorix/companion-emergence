@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 pytest.importorskip("brain.initiate")
 
 from brain.memory.store import Memory, MemoryStore
