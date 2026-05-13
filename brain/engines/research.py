@@ -6,6 +6,7 @@ This module ships the types + engine scaffold. run_tick body lands in Task 3.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,10 +17,55 @@ from brain.engines._interests import Interest, InterestSet
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
+from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
+
+_TOPIC_OVERLAP_SYSTEM = """\
+You are a relevance scorer for an autonomous companion's research engine.
+You will be given (1) a research thread that just matured, and (2) recent
+conversation excerpts. Return a JSON object with a single field: score,
+a float in [0.0, 1.0] indicating how relevant the research thread is
+to the recent conversation.
+
+  0.0 = entirely unrelated to anything {user_name} has been near
+  0.5 = thematic adjacency, no direct overlap
+  1.0 = directly addresses something {user_name} mentioned
+
+Be conservative — default toward the low end unless the connection
+is clearly present. Return ONLY the JSON object, no other text."""
+
+
+def _compute_topic_overlap_via_haiku(
+    *,
+    thread_topic: str,
+    thread_summary: str,
+    recent_conversation_excerpt: str,
+    provider,
+    user_name: str,
+) -> float:
+    """Score how relevant a matured research thread is to recent conversation."""
+    system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
+    prompt = (
+        "=== Research thread ===\n"
+        f"Topic: {thread_topic}\n"
+        f"Summary: {thread_summary}\n\n"
+        "=== Recent conversation (last 48 hours, oldest first) ===\n"
+        f"{recent_conversation_excerpt}\n\n"
+        "=== Your task ===\n"
+        'Return: {"score": <float in [0.0, 1.0]>}'
+    )
+
+    try:
+        raw = provider.generate(prompt, system=system)
+        data = json.loads(extract_json_object(raw))
+        score = float(data["score"])
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+        logger.warning("topic_overlap haiku call failed (%s); returning 0.0", exc)
+        return 0.0
+    return max(0.0, min(1.0, score))
 
 
 # ---------- Types ----------
