@@ -17,6 +17,7 @@ will rejoin the queue if the underlying event is still relevant.
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import time
@@ -24,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.initiate.adaptive import detect_drift
 from brain.initiate.audit import (
     append_audit_row,
     append_d_call_row,
@@ -439,6 +441,38 @@ def run_initiate_review_tick(
                 "initiate review tick: unrecoverable error on candidate %s",
                 candidate.candidate_id,
             )
+
+    # --- Drift check — emit operator-tier alert if D's promote-rate drifts ---
+    # Runs after the composition loop so we only call detect_drift on ticks
+    # where D actually processed candidates (early-return paths above skip
+    # this naturally).
+    alert = detect_drift(persona_dir)
+    if alert is not None:
+        _emit_supervisor_event({
+            "type": "d_reflection_drift_detected",
+            "ts": datetime.now(UTC).isoformat(),
+            "current_rate": alert.current_rate,
+            "historical_median": alert.historical_median,
+            "delta_sigma": alert.delta_sigma,
+        })
+
+
+def _emit_supervisor_event(event: dict) -> None:
+    """Emit a structured event to the supervisor telemetry channel.
+
+    Routes through brain.bridge.events.publish when the event-bus is
+    wired (supervisor runtime); falls back to a structured logger.warning
+    so the event is never silently swallowed in test or offline contexts.
+    The event is operator-tier (no user-facing surface).
+    """
+    try:
+        from brain.bridge import events
+
+        events.publish(event["type"], **{k: v for k, v in event.items() if k != "type"})
+    except Exception:
+        logger.warning(
+            "supervisor_event %s", json.dumps(event, ensure_ascii=False)
+        )
 
 
 def _make_haiku_call(provider: Any):
