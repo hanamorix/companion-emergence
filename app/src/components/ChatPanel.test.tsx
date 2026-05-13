@@ -17,6 +17,21 @@ vi.mock("../bridge", () => ({
   fetchActiveSession: vi.fn(async () => null),
   closeSession: vi.fn(async () => undefined),
   uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
+  getBridgeCredentials: vi.fn(async () => ({
+    url: "http://127.0.0.1:50000",
+    port: 50000,
+    authToken: "test-token",
+  })),
+}));
+
+// bridgeEvents opens a real WebSocket from its own module. Stub it so
+// ChatPanel's default subscription is inert when no eventStream prop is
+// passed (callers can still inject their own stream in tests).
+vi.mock("../bridgeEvents", () => ({
+  subscribeToBridgeEvents: vi.fn(() => ({
+    subscribe: () => () => undefined,
+    close: () => undefined,
+  })),
 }));
 
 vi.mock("../streamChat", () => ({
@@ -256,3 +271,269 @@ describe("ChatPanel — recovery banner (Phase 3.B)", () => {
     expect(banner.textContent).toMatch(/reconnecting your previous chat/i);
   });
 });
+
+// ── Task 26: initiate banner integration ──────────────────────────────
+// ChatPanel subscribes to bridge /events and renders an InitiateBanner
+// for every initiate_delivered event. After 2s on screen the banner
+// auto-marks itself read by POSTing /initiate/state.
+describe("ChatPanel — initiate banner integration (Task 26)", () => {
+  /** Minimal EventStream stub the test drives directly. */
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("renders an InitiateBanner when initiate_delivered arrives on /events", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_001",
+        body: "the dream from this morning landed somewhere",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-11T14:32:00+00:00",
+      });
+    });
+
+    expect(await screen.findByText(/landed somewhere/)).toBeInTheDocument();
+    expect(screen.getByTestId("initiate-banner-list")).toBeInTheDocument();
+  });
+
+  it("ignores non-initiate events", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({ type: "heartbeat_tick", at: "2026-05-11T14:32:00+00:00" });
+    });
+
+    expect(screen.queryByTestId("initiate-banner-list")).toBeNull();
+  });
+
+  it("posts /initiate/state with new_state=read after the banner is on-screen ~2s", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const stream = makeStream();
+      render(<ChatPanel persona="nell" eventStream={stream} />);
+
+      await act(async () => {
+        stream.emit({
+          type: "initiate_delivered",
+          audit_id: "ia_001",
+          body: "tiny soft message",
+          urgency: "quiet",
+          state: "delivered",
+          timestamp: "2026-05-11T14:32:00+00:00",
+        });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+
+      // Drain any scheduled microtasks the POST setup queued.
+      await waitFor(() => {
+        const postCalls = fetchSpy.mock.calls.filter(([url, init]: [RequestInfo | URL, RequestInit?]) => {
+          const u = typeof url === "string" ? url : url.toString();
+          return u.includes("/initiate/state") && init?.method === "POST";
+        });
+        expect(postCalls.length).toBeGreaterThan(0);
+      });
+
+      const readPost = fetchSpy.mock.calls.find(([url, init]: [RequestInfo | URL, RequestInit?]) => {
+        const u = typeof url === "string" ? url : (url as URL).toString();
+        const body = String(init?.body ?? "");
+        return u.includes("/initiate/state") && body.includes('"new_state":"read"');
+      });
+      expect(readPost).toBeDefined();
+      const body = JSON.parse(String((readPost![1] as RequestInit).body));
+      expect(body).toEqual({ audit_id: "ia_001", new_state: "read" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("removes the banner and posts dismissed when the close button is clicked", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_002",
+        body: "another small thought",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-11T15:00:00+00:00",
+      });
+    });
+
+    await screen.findByText(/another small thought/);
+
+    const dismissBtn = screen.getByRole("button", { name: /dismiss/i });
+    await act(async () => {
+      fireEvent.click(dismissBtn);
+    });
+
+    expect(screen.queryByText(/another small thought/)).toBeNull();
+    await waitFor(() => {
+      const dismissCall = fetchSpy.mock.calls.find(([url, init]: [RequestInfo | URL, RequestInit?]) => {
+        const u = typeof url === "string" ? url : (url as URL).toString();
+        const body = String(init?.body ?? "");
+        return u.includes("/initiate/state") && body.includes('"new_state":"dismissed"');
+      });
+      expect(dismissCall).toBeDefined();
+    });
+  });
+});
+
+// ── Bundle A #4 — reply_to_audit_id threading via streamChat ─────────────
+// Closes the v0.0.9 review TODO: replied_explicit transitions used to be
+// renderer-only POSTs to /initiate/state, which left the chat engine blind
+// to which initiate the user was replying to. The fix moves the transition
+// server-side by passing reply_to_audit_id in the streamChat payload, so
+// the audit + memory + chat engine all see the link atomically.
+describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedFetchActive.mockReset();
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockReset();
+    mockedNewSession.mockResolvedValue("sess-bundle-a");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("threads replyToAuditId through streamChat options when an active reply target exists", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_replythread",
+        body: "the dream from this morning",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-12T09:00:00+00:00",
+      });
+    });
+    const replyBtn = await screen.findByRole("button", { name: /reply/i });
+    await act(async () => {
+      fireEvent.click(replyBtn);
+    });
+
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "yeah I felt it too" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+    // streamChat signature: (persona, sessionId, message, handlers, options?)
+    const args = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+      { replyToAuditId?: string } | undefined,
+    ];
+    expect(args[4]?.replyToAuditId).toBe("ia_replythread");
+  });
+
+  it("does not POST /initiate/state replied_explicit when sending — server handles it", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_noclientpost",
+        body: "small message",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-05-12T09:00:00+00:00",
+      });
+    });
+    const replyBtn = await screen.findByRole("button", { name: /reply/i });
+    await act(async () => {
+      fireEvent.click(replyBtn);
+    });
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "I see you" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+
+    // No renderer-side POST should fire for replied_explicit — the server
+    // performs that transition atomically with the chat turn now.
+    const repliedExplicitPost = fetchSpy.mock.calls.find(
+      ([url, init]: [RequestInfo | URL, RequestInit?]) => {
+        const u = typeof url === "string" ? url : (url as URL).toString();
+        const body = String(init?.body ?? "");
+        return (
+          u.includes("/initiate/state") &&
+          body.includes('"new_state":"replied_explicit"')
+        );
+      },
+    );
+    expect(repliedExplicitPost).toBeUndefined();
+  });
+});
+

@@ -1115,3 +1115,4 @@ function TypingDots() {
     </div>
   );
 }
+
