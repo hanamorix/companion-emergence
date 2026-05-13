@@ -53,6 +53,7 @@ from brain.initiate.reflection import (
 from brain.initiate.reflection import (
     run as reflection_run,
 )
+from brain.initiate.resonance import run_resonance_tick
 from brain.initiate.schemas import AuditRow, InitiateCandidate, make_audit_id
 from brain.memory.store import MemoryStore
 
@@ -320,6 +321,7 @@ def run_initiate_review_tick(
     """
     now = now or datetime.now(UTC)
     run_calibration_closer_tick(persona_dir, now=now)
+    run_resonance_tick(persona_dir, now=now)
     candidates = read_candidates(persona_dir)[:cap_per_tick]
 
     if not candidates:
