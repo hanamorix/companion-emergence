@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +24,7 @@ from typing import Literal
 
 from brain.initiate.d_call_schema import DCallRow, make_d_call_id
 from brain.initiate.schemas import InitiateCandidate
+from brain.utils.llm_output import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +47,6 @@ class DReflectionResult:
     tick_note: str | None
 
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-_JSON_LOOSE = re.compile(r"(\{.*\})", re.DOTALL)
-
-
 def parse_structured_response(raw: str) -> DReflectionResult:
     """Parse a structured-output JSON blob into a DReflectionResult.
 
@@ -58,13 +54,10 @@ def parse_structured_response(raw: str) -> DReflectionResult:
     ValueError if no parseable JSON object is found OR if the structure
     doesn't match the expected schema.
     """
-    fenced = _JSON_FENCE.search(raw)
-    candidate = fenced.group(1) if fenced else None
-    if candidate is None:
-        loose = _JSON_LOOSE.search(raw)
-        if loose is None:
-            raise ValueError("no JSON object found in D response")
-        candidate = loose.group(1)
+    try:
+        candidate = extract_json_object(raw)
+    except ValueError as exc:
+        raise ValueError(f"no JSON object found in D response: {exc}") from exc
     try:
         data = json.loads(candidate)
     except json.JSONDecodeError as exc:
