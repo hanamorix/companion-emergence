@@ -18,7 +18,8 @@
         "minWidth": 720,
         "minHeight": 460,
         "decorations": true,
-        "alwaysOnTop": false
+        "alwaysOnTop": false,
+        "useHttpsScheme": false
       }
     ],
     "macOSPrivateApi": true,
