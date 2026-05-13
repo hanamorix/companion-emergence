@@ -485,3 +485,24 @@ def test_run_initiate_review_tick_calls_calibration_closer(tmp_path, monkeypatch
     run_initiate_review_tick(persona, provider=MagicMock(), voice_template="test")
     assert len(closer_calls) == 1
     assert closer_calls[0] == persona
+
+
+def test_run_initiate_review_tick_calls_resonance_tick(tmp_path, monkeypatch):
+    """run_initiate_review_tick should call run_resonance_tick on every pass."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    resonance_calls: list = []
+
+    def fake_resonance(persona_dir, *, now=None, is_rest_state=False):
+        resonance_calls.append(persona_dir)
+
+    monkeypatch.setattr("brain.initiate.review.run_resonance_tick", fake_resonance)
+    monkeypatch.setattr(
+        "brain.initiate.review.run_calibration_closer_tick",
+        lambda *args, **kwargs: None,
+    )
+    persona = tmp_path / "p"
+    persona.mkdir()
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="test")
+    assert len(resonance_calls) == 1
+    assert resonance_calls[0] == persona
