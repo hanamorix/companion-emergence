@@ -34,6 +34,13 @@ class GateThresholds:
     research_freshness_minutes: float = 30
     meta_anti_flood_minutes: float = 30
     meta_max_queue_depth: int = 6
+    # v0.0.11 resonance fields:
+    recall_resonance_z_threshold: float = 2.5
+    recall_resonance_staleness_min_days: int = 7
+    recall_resonance_top_n: int = 50
+    recall_resonance_ema_alpha: float = 0.08
+    recall_resonance_bootstrap_min_count: int = 10
+    recall_resonance_anti_flood_hours: float = 24.0
 
 
 def load_gate_thresholds(persona_dir: Path) -> GateThresholds:
