@@ -10,16 +10,22 @@ Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md (Section D)
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
-from brain.initiate.new_sources import GateThresholds
+from brain.initiate.new_sources import (
+    GateThresholds,
+    check_shared_meta_gates,
+    load_gate_thresholds,
+    write_gate_rejection,
+)
 from brain.initiate.schemas import SemanticContext
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import Memory
+from brain.memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -227,3 +233,122 @@ def emit_recall_resonance_candidate(
         semantic_context=semantic_context,
         now=now,
     )
+
+
+def run_resonance_tick(
+    persona_dir: Path,
+    *,
+    now: datetime | None = None,
+    is_rest_state: bool = False,
+) -> None:
+    """Per-heartbeat batch evaluator for recall_resonance.
+
+    Evaluates top-N active Hebbian memories, updates their EMA baselines,
+    and emits candidates when current activation spikes above history.
+    """
+    now = now or datetime.now(UTC)
+    thresholds = load_gate_thresholds(persona_dir)
+
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    try:
+        top = top_n_most_active_memories(
+            hebbian,
+            n=thresholds.recall_resonance_top_n,
+        )
+    finally:
+        hebbian.close()
+
+    if not top:
+        return
+
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    store_path = persona_dir / "memories.db"
+    store = MemoryStore(store_path) if store_path.exists() else None
+    baseline = MemoryActivationBaseline(persona_dir / "memory_activation_baseline.db")
+
+    try:
+        for memory_id, current_activation in top:
+            row = baseline.get(memory_id)
+            baseline.update(
+                memory_id,
+                current_activation,
+                alpha=thresholds.recall_resonance_ema_alpha,
+            )
+
+            if (
+                row is None
+                or row.update_count < thresholds.recall_resonance_bootstrap_min_count
+            ):
+                continue
+
+            memory = store.get(memory_id) if store is not None else None
+            if memory is None:
+                continue
+
+            last_accessed = memory.last_accessed_at or memory.created_at
+            if last_accessed.tzinfo is None and now.tzinfo is not None:
+                last_accessed = last_accessed.replace(tzinfo=UTC)
+            staleness_days = (now - last_accessed).total_seconds() / 86_400.0
+
+            stdev = math.sqrt(max(row.ema_var, 1e-6))
+            z_score = (current_activation - row.ema_mean) / stdev
+
+            allowed, reason = gate_recall_resonance(
+                persona_dir,
+                memory_id=memory_id,
+                z_score=z_score,
+                staleness_days=staleness_days,
+                thresholds=thresholds,
+                now=now,
+            )
+            if not allowed:
+                write_gate_rejection(
+                    persona_dir,
+                    ts=now,
+                    source="recall_resonance",
+                    source_id=memory_id,
+                    gate_name=reason or "unknown",
+                    threshold_value=thresholds.recall_resonance_z_threshold,
+                    observed_value=z_score,
+                )
+                continue
+
+            meta_ok, meta_reason = check_shared_meta_gates(
+                persona_dir,
+                source="recall_resonance",
+                now=now,
+                is_rest_state=is_rest_state,
+                thresholds=thresholds,
+            )
+            if not meta_ok:
+                write_gate_rejection(
+                    persona_dir,
+                    ts=now,
+                    source="recall_resonance",
+                    source_id=memory_id,
+                    gate_name=meta_reason or "meta",
+                    threshold_value=0.0,
+                    observed_value=0.0,
+                )
+                continue
+
+            top_neighbors = sorted(
+                hebbian.neighbors(memory_id),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )[:3]
+            emit_recall_resonance_candidate(
+                persona_dir,
+                memory=memory,
+                z_score=z_score,
+                ema_mean=row.ema_mean,
+                current_activation=current_activation,
+                staleness_days=staleness_days,
+                top_neighbors=top_neighbors,
+                now=now,
+            )
+    finally:
+        baseline.close()
+        if store is not None:
+            store.close()
+        hebbian.close()
