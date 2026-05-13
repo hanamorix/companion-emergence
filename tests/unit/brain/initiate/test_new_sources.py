@@ -452,3 +452,26 @@ def test_emit_research_completion_candidate_writes_queue_row(tmp_path: Path):
         "summary_excerpt": "A study of...",
         "topic_overlap_score": 0.45,
     }
+
+
+def test_load_gate_thresholds_includes_resonance_defaults(tmp_path):
+    persona = tmp_path / "fresh"
+    persona.mkdir()
+    t = load_gate_thresholds(persona)
+    assert t.recall_resonance_z_threshold == 2.5
+    assert t.recall_resonance_staleness_min_days == 7
+    assert t.recall_resonance_top_n == 50
+    assert t.recall_resonance_ema_alpha == 0.08
+    assert t.recall_resonance_bootstrap_min_count == 10
+    assert t.recall_resonance_anti_flood_hours == 24.0
+
+
+def test_load_gate_thresholds_resonance_override(tmp_path):
+    persona = tmp_path / "p"
+    persona.mkdir()
+    (persona / "gate_thresholds.json").write_text(
+        '{"recall_resonance_z_threshold": 3.0}'
+    )
+    t = load_gate_thresholds(persona)
+    assert t.recall_resonance_z_threshold == 3.0
+    assert t.recall_resonance_top_n == 50  # default preserved

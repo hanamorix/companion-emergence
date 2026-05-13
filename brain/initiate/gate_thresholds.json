@@ -6,5 +6,11 @@
   "research_topic_overlap_min": 0.30,
   "research_freshness_minutes": 30,
   "meta_anti_flood_minutes": 30,
-  "meta_max_queue_depth": 6
+  "meta_max_queue_depth": 6,
+  "recall_resonance_z_threshold": 2.5,
+  "recall_resonance_staleness_min_days": 7,
+  "recall_resonance_top_n": 50,
+  "recall_resonance_ema_alpha": 0.08,
+  "recall_resonance_bootstrap_min_count": 10,
+  "recall_resonance_anti_flood_hours": 24.0
 }
