@@ -9,14 +9,14 @@ from __future__ import annotations
 import gzip
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.soul.audit import iter_audit_full
 
 
 def _ts(year: int) -> str:
-    return datetime(year, 6, 15, tzinfo=timezone.utc).isoformat()
+    return datetime(year, 6, 15, tzinfo=UTC).isoformat()
 
 
 def _write_active(persona_dir: Path, entries: list[dict]) -> None:
