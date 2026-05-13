@@ -755,8 +755,12 @@ def _seed_voice_edit_audit(
     new_text: str,
 ) -> None:
     """Append a voice_edit_proposal audit row with a one-line unified diff."""
-    from brain.initiate.audit import append_audit_row
-    from brain.initiate.schemas import AuditRow
+    try:
+        from brain.initiate.audit import append_audit_row
+        from brain.initiate.schemas import AuditRow
+    except ModuleNotFoundError:
+        import pytest
+        pytest.skip("brain.initiate not available in public build")
 
     diff = f"- {old_text}\n+ {new_text}\n"
     row = AuditRow(

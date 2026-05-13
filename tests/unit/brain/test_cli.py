@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+pytest.importorskip("brain.initiate")
 
 from brain import cli
 from brain.bridge.state_file import BridgeState
