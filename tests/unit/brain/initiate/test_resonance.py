@@ -243,3 +243,81 @@ def test_emit_recall_resonance_candidate_writes_queue_row(tmp_path):
     assert c.semantic_context.source_meta["z_score"] == 3.2
     assert c.semantic_context.linked_memory_ids[0] == "mem_e"
     assert "n1" in c.semantic_context.linked_memory_ids
+
+
+def test_run_resonance_tick_bootstrap_no_emission(tmp_path):
+    """First few ticks shouldn't emit because update_count < 10."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.resonance import run_resonance_tick
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    h.strengthen("mem_x", "n1", delta=1.0)
+    h.close()
+
+    store = MemoryStore(persona / "memories.db")
+    store.create(
+        Memory(
+            id="mem_x",
+            content="x",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(days=30),
+        )
+    )
+    store.close()
+
+    run_resonance_tick(persona, now=now)
+    assert read_candidates(persona) == []
+
+
+def test_run_resonance_tick_emits_on_spike(tmp_path):
+    """After bootstrap (10 stable samples) + a spike sample, emission fires."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.resonance import MemoryActivationBaseline, run_resonance_tick
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    h.strengthen("mem_y", "n1", delta=0.1)
+    h.close()
+
+    store = MemoryStore(persona / "memories.db")
+    store.create(
+        Memory(
+            id="mem_y",
+            content="y",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(days=30),
+        )
+    )
+    store.close()
+
+    with MemoryActivationBaseline(persona / "memory_activation_baseline.db") as b:
+        for _ in range(12):
+            b.update("mem_y", 0.1, alpha=0.08)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    for i in range(20):
+        h.strengthen("mem_y", f"new_n{i}", delta=0.4)
+    h.close()
+
+    run_resonance_tick(persona, now=now)
+    candidates = read_candidates(persona)
+    assert len(candidates) == 1
+    assert candidates[0].source == "recall_resonance"
+    assert candidates[0].source_id == "mem_y"
