@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=1.0.0,<2.0.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
