@@ -88,6 +88,42 @@ def test_graceful_shutdown_drains_via_snapshot_and_preserves_buffer(
     )
 
 
+def test_graceful_shutdown_records_dirty_when_snapshot_drain_raises(
+    persona_dir: Path, monkeypatch,
+):
+    """A catastrophic shutdown drain exception must still arm dirty recovery."""
+    from brain.bridge import state_file
+    from tests.bridge.test_endpoints import _patch_fake_provider
+
+    _patch_fake_provider(monkeypatch, reply="bye")
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona=persona_dir.name,
+            pid=12345,
+            port=51234,
+            started_at="2026-05-13T00:00:00Z",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="tests",
+        ),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("snapshot exploded")
+
+    monkeypatch.setattr("brain.bridge.server._drain_sessions_blocking", boom)
+
+    with _client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        c.post("/chat", json={"session_id": sid, "message": "hi"})
+
+    after = state_file.read(persona_dir)
+    assert after is not None
+    assert after.drain_errors >= 1
+    assert after.shutdown_clean is False
+
+
 def test_check_idle_predicate(persona_dir: Path):
     """_check_idle is a pure predicate; no side effects."""
     from brain.bridge.server import _check_idle

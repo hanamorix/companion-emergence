@@ -78,6 +78,17 @@ DEV_ALLOWED_ORIGINS = (
 # ingest path keys cache lookups on these values, so a renderer compromise
 # that posted "../../etc/passwd" would otherwise traverse the cache root.
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _validate_path_session_id(session_id: str) -> str:
+    """Validate session IDs supplied in URL path segments."""
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise HTTPException(status_code=422, detail="invalid session_id")
+    return session_id
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +597,7 @@ def build_app(
             # 3. Close all live sessions (silence_minutes=0) via per-call stores.
             #    This is the data-saving step — every conversation that was open
             #    becomes memory before the lights go out.
+            drain_errors = 0
             try:
                 reports = await asyncio.to_thread(
                     _drain_sessions_blocking, persona_dir, provider, 0,
@@ -593,6 +605,7 @@ def build_app(
             except Exception:
                 logger.exception("shutdown drain failed")
                 reports = []
+                drain_errors = 1
 
             # 3b. Record drain-error count to the state file. The runner's
             # `_write_clean_shutdown` (atexit + finally) reads this and
@@ -601,13 +614,14 @@ def build_app(
             # against the orphan buffers instead of treating the dirty
             # exit as clean. This closes the "clean shutdown that
             # happened to have a failed drain" hole.
-            drain_errors = sum(getattr(r, "errors", 0) for r in reports)
+            drain_errors += sum(getattr(r, "errors", 0) for r in reports)
             if drain_errors > 0:
                 try:
                     from brain.bridge import state_file as _state_file_mod
                     cur = _state_file_mod.read(persona_dir)
                     if cur is not None:
                         cur.drain_errors = drain_errors
+                        cur.shutdown_clean = False
                         _state_file_mod.write(persona_dir, cur)
                     logger.warning(
                         "shutdown drain produced %d ingest errors; marked dirty for next start",
@@ -633,7 +647,7 @@ def build_app(
             # 6. Publish shutdown event
             try:
                 bus.publish(
-                    {"type": "shutdown", "clean": True, "drained": len(reports), "at": _now()}
+                    {"type": "shutdown", "clean": drain_errors == 0, "drained": len(reports), "drain_errors": drain_errors, "at": _now()}
                 )
             except Exception:
                 logger.exception("shutdown event publish failed")
@@ -837,6 +851,7 @@ def build_app(
 
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
+        session_id = _validate_path_session_id(session_id)
         s: BridgeAppState = app.state.bridge
         # F-201 Phase B: hydrate from disk if the in-memory registry was
         # cleared by a bridge restart but the buffer file still exists.
@@ -1284,6 +1299,8 @@ def build_app(
                 "turn": result.turn,
                 "tool_invocations": result.tool_invocations,
                 "duration_ms": duration_ms,
+                "persistence_ok": result.metadata.get("persistence_ok"),
+                "persistence_error": result.metadata.get("persistence_error"),
                 "metadata": result.metadata,
             }
 
@@ -1296,6 +1313,10 @@ def build_app(
             await ws.close(code=4001, reason=reason)
             return
         await ws.accept(subprotocol=_ws_accept_subprotocol(ws))
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            await ws.send_json({"type": "error", "code": "invalid_session_id", "done": True})
+            await ws.close()
+            return
         s: BridgeAppState = app.state.bridge
         # F-201 Phase B: hydrate across bridge restart so the renderer
         # can reattach to a session whose buffer still exists on disk.
@@ -1467,6 +1488,8 @@ def build_app(
                     "session_id": session_id,
                     "turn": result.turn,
                     "duration_ms": duration_ms,
+                    "persistence_ok": result.metadata.get("persistence_ok"),
+                    "persistence_error": result.metadata.get("persistence_error"),
                     "metadata": result.metadata,
                     "at": _now(),
                 }

@@ -21,8 +21,8 @@
   --bubble-nell: rgba(234, 222, 218, 0.97);
   --bubble-user: rgba(130, 51, 41, 0.88);
   --panel-bg: rgba(234, 222, 218, 0.97);
-  --font-ui: "DM Sans", system-ui, sans-serif;
-  --font-disp: "Noto Serif JP", Georgia, serif;
+  --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-disp: ui-serif, Georgia, "Times New Roman", serif;
 }
 
 *,

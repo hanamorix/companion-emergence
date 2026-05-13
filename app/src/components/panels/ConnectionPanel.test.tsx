@@ -19,8 +19,15 @@ vi.mock("@tauri-apps/api/core", () => ({
   })),
 }));
 
+vi.mock("../../platform", () => ({
+  getClientPlatform: vi.fn(() => "macos"),
+  platformLabel: (platform: string) => platform === "macos" ? "macOS" : platform === "windows" ? "Windows" : platform === "linux" ? "Linux" : "this platform",
+  supportsMacOnlyInstallActions: (platform: string) => platform === "macos",
+}));
+
 import { ConnectionPanel } from "./ConnectionPanel";
 import type { PersonaState } from "../../bridge";
+import { getClientPlatform } from "../../platform";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
   return {
@@ -42,6 +49,7 @@ function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
 describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
   });
   afterEach(() => {
     cleanup();
@@ -93,11 +101,29 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(banner.textContent).toMatch(/ECONNREFUSED/);
   });
 
-  it("renders the install supervisor button regardless of state", () => {
+  it("renders the install supervisor button on macOS", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(
       screen.getByRole("button", { name: /install launchd supervisor/i }),
     ).toBeInTheDocument();
+  });
+
+  it("shows calm unsupported notes instead of macOS install buttons on Windows", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("windows");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+
+    expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
+    expect(screen.getAllByText(/macOS-only right now/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/nothing is broken/i)).toBeInTheDocument();
+  });
+
+  it("shows calm unsupported notes instead of macOS install buttons on Linux", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+
+    expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/on Linux, Companion will use the app-managed supervisor lifecycle/i)).toBeInTheDocument();
   });
 
   it("renders the privacy row marked accent (local-only)", () => {

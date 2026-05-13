@@ -30,11 +30,16 @@ export function resetBridgeCredentialCache(persona?: string): void {
   else cache.clear();
 }
 
+function hasTauriRuntime(): boolean {
+  const w = typeof window === "undefined" ? undefined : window as unknown as Record<string, unknown>;
+  return Boolean(w && ("__TAURI_INTERNALS__" in w || "__TAURI__" in w));
+}
+
 export async function getBridgeCredentials(persona: string): Promise<BridgeCredentials> {
   const hit = cache.get(persona);
   if (hit) return hit;
 
-  // Try Tauri command first (production build path)
+  // Try Tauri command first (production build path).
   try {
     const creds = await invoke<{ port: number; auth_token: string | null }>(
       "get_bridge_credentials",
@@ -47,10 +52,12 @@ export async function getBridgeCredentials(persona: string): Promise<BridgeCrede
     };
     cache.set(persona, result);
     return result;
-  } catch {
-    // Browser dev fallback — read from import.meta.env. The dev
-    // surface points at whichever bridge the developer started; the
-    // persona name is informational only.
+  } catch (e) {
+    // Browser dev fallback only. In packaged Tauri production, silently
+    // guessing 50000 can connect to the wrong persona or another local
+    // service; surface the real credential failure instead.
+    if (hasTauriRuntime()) throw e;
+
     const url = (import.meta.env.VITE_BRIDGE_URL as string) ?? "http://127.0.0.1:50000";
     const token = (import.meta.env.VITE_BRIDGE_TOKEN as string) ?? null;
     const portMatch = url.match(/:(\d+)/);
