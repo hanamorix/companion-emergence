@@ -161,3 +161,85 @@ def test_build_calibration_block_empty_history(tmp_path):
     block = build_calibration_block(persona, user_name="Hana")
     assert "0 reached replied_explicit" in block
     assert "0 stayed silent in draft" in block
+
+
+def test_detect_drift_below_bootstrap_returns_none(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.adaptive import detect_drift
+    from brain.initiate.audit import append_d_call_row
+    from brain.initiate.d_call_schema import DCallRow
+
+    persona = tmp_path / "p"
+    now = datetime.now(UTC)
+    # 50 d_call rows — below the 100 bootstrap floor.
+    for i in range(50):
+        append_d_call_row(persona, DCallRow(
+            d_call_id=f"dc_{i}", ts=(now - timedelta(hours=i)).isoformat(),
+            tick_id=f"t_{i}", model_tier_used="haiku",
+            candidates_in=2, promoted_out=1, filtered_out=1,
+            latency_ms=300, tokens_input=400, tokens_output=150,
+        ))
+    assert detect_drift(persona) is None
+
+
+def test_detect_drift_stable_history_returns_none(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.adaptive import detect_drift
+    from brain.initiate.audit import append_d_call_row
+    from brain.initiate.d_call_schema import DCallRow
+
+    persona = tmp_path / "p"
+    now = datetime.now(UTC)
+    # 150 rows, all the same promote rate (flat → stdev ~ 0).
+    for i in range(150):
+        ts = (now - timedelta(hours=i)).isoformat()
+        append_d_call_row(persona, DCallRow(
+            d_call_id=f"dc_{i}", ts=ts,
+            tick_id=f"t_{i}", model_tier_used="haiku",
+            candidates_in=2, promoted_out=1, filtered_out=1,
+            latency_ms=300, tokens_input=400, tokens_output=150,
+        ))
+    assert detect_drift(persona) is None
+
+
+def test_detect_drift_clear_promote_rate_increase(tmp_path):
+    """120 historical rows ~0.3 promote rate; 30 recent rows ~1.0 promote rate.
+    Should emit a DriftAlert with delta_sigma > 2."""
+    import random
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.adaptive import detect_drift
+    from brain.initiate.audit import append_d_call_row
+    from brain.initiate.d_call_schema import DCallRow
+
+    persona = tmp_path / "p"
+    now = datetime.now(UTC)
+    rng = random.Random(42)
+
+    # 120 older rows with ~0.3 promote rate, mild noise.
+    for i in range(120):
+        ts = (now - timedelta(days=60 + i // 4)).isoformat()
+        promoted = 1 if rng.random() < 0.3 else 0
+        append_d_call_row(persona, DCallRow(
+            d_call_id=f"dc_h_{i}", ts=ts,
+            tick_id=f"t_h_{i}", model_tier_used="haiku",
+            candidates_in=2, promoted_out=promoted, filtered_out=2 - promoted,
+            latency_ms=300, tokens_input=400, tokens_output=150,
+        ))
+
+    # 30 recent rows with 1.0 promote rate (clear drift).
+    for i in range(30):
+        ts = (now - timedelta(hours=i)).isoformat()
+        append_d_call_row(persona, DCallRow(
+            d_call_id=f"dc_r_{i}", ts=ts,
+            tick_id=f"t_r_{i}", model_tier_used="haiku",
+            candidates_in=2, promoted_out=2, filtered_out=0,
+            latency_ms=300, tokens_input=400, tokens_output=150,
+        ))
+
+    alert = detect_drift(persona)
+    assert alert is not None
+    assert alert.delta_sigma > 2.0
+    assert alert.current_rate > alert.historical_median
