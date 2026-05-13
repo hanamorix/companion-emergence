@@ -36,7 +36,7 @@ Run these commands locally — same shape as CI runs on every PR (`uv`
 ## Packaging/versioning
 
 - Set the intended version in `pyproject.toml`.
-- Add or update `CHANGELOG.md` before tagging or sharing a build.
+- Add or update `.public-sync/changelog-public.md` before tagging or sharing a build; local `CHANGELOG.md` is substituted at public sync time.
 - Review `docs/roadmap.md` and confirm known stubs/incomplete surfaces are documented.
 - Build the wheel/sdist only after tests and lint pass.
 - **Run `bash scripts/smoke_test_wheel.sh`** — builds the wheel + sdist,
@@ -149,6 +149,24 @@ Tauri ships `tauri-plugin-updater` for in-app updates. Not yet
 wired — needs an update server (S3 + signed manifest, or a managed
 service like updately.app). Defer until the first public release
 gets feedback on actual demand.
+
+## v0.0.11-alpha local verification findings — 2026-05-13
+
+Local macOS arm64 package check passed before public sync/tagging:
+
+- `uv run ruff check .` — passed
+- `uv run pytest -q` — 1972 passed
+- `cd app && pnpm test` — 56 passed across 8 files
+- `cd app/src-tauri && cargo test` — 28 passed
+- `cd app && pnpm tauri build` — produced `.app` + `.dmg`
+- `hdiutil verify "Companion Emergence_0.0.11_aarch64.dmg"` — valid checksum
+- `codesign --verify --deep --strict "Companion Emergence.app"` — valid ad-hoc signature
+- Bundled runtime smoke: `python3 --version` and bundled `nell --help` both pass
+
+Expected/non-blocking findings:
+
+- Gatekeeper rejects the local `.app` because this alpha is ad-hoc signed and not notarized.
+- Tauri warns that bundle identifier `com.companion-emergence.app` ends in `.app`; fix before a notarized/stable public release.
 
 ## Known incomplete surfaces
 
