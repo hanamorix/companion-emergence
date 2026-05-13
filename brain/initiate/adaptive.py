@@ -132,3 +132,67 @@ def read_recent_calibration_rows(
                 continue
     rows.reverse()
     yield from rows[:limit]
+
+
+_CALIBRATION_BLOCK_TEMPLATE = """\
+=== Your recent editorial track record ===
+Last 20 closed decisions:
+
+  PROMOTED:
+    • {n_replied} reached replied_explicit  ← {user_name} engaged
+    • {n_acknowledged} reached acknowledged_unclear
+    • {n_dismissed} reached dismissed       ← {user_name} ↩'d
+    • {n_pending} still pending
+
+  FILTERED:
+    • {n_stayed_silent} stayed silent in draft (not re-emitted)
+    • {n_recurred} re-emitted within 48h (you may have been too cautious)
+
+Use this only as light context. It is who you've been, not who you must be.
+"""
+
+
+def build_calibration_block(persona_dir: Path, *, user_name: str) -> str:
+    """Render the calibration block for D's adaptive system message.
+
+    Reads the last 20 closed rows from d_calibration.jsonl. Counts buckets
+    by outcome. Returns a formatted block ready to prepend to D's system
+    message. With no history, all bucket counts are 0.
+    """
+    rows = list(read_recent_calibration_rows(persona_dir, limit=20))
+
+    n_replied = sum(
+        1 for r in rows
+        if r.decision == "promote" and r.promoted_to_state == "replied_explicit"
+    )
+    n_acknowledged = sum(
+        1 for r in rows
+        if r.decision == "promote" and r.promoted_to_state == "acknowledged_unclear"
+    )
+    n_dismissed = sum(
+        1 for r in rows
+        if r.decision == "promote" and r.promoted_to_state == "dismissed"
+    )
+    # "Pending" = promoted rows not yet closed. read_recent_calibration_rows
+    # only returns closed rows, so this is 0 from the calibration view.
+    # The block still shows the bucket for completeness.
+    n_pending = 0
+
+    n_stayed_silent = sum(
+        1 for r in rows
+        if r.decision == "filter" and r.filtered_recurred is False
+    )
+    n_recurred = sum(
+        1 for r in rows
+        if r.decision == "filter" and r.filtered_recurred is True
+    )
+
+    return _CALIBRATION_BLOCK_TEMPLATE.format(
+        n_replied=n_replied,
+        n_acknowledged=n_acknowledged,
+        n_dismissed=n_dismissed,
+        n_pending=n_pending,
+        n_stayed_silent=n_stayed_silent,
+        n_recurred=n_recurred,
+        user_name=user_name,
+    )
