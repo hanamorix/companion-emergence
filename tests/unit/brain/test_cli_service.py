@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import plistlib
+import pytest
 from pathlib import Path
+
+pytest.importorskip("brain.initiate")
 
 from brain import cli
 from brain.service.launchd import DoctorCheck, ServiceStatus
