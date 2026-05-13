@@ -668,8 +668,11 @@ def _seed_audit_row(
     tone_rendered: str = "the dream landed somewhere this morning",
 ) -> None:
     """Append one AuditRow with delivery.current_state preset."""
-    from brain.initiate.audit import append_audit_row
-    from brain.initiate.schemas import AuditRow
+    try:
+        from brain.initiate.audit import append_audit_row
+        from brain.initiate.schemas import AuditRow
+    except ModuleNotFoundError:
+        pytest.skip("brain.initiate not available in public build")
 
     row = AuditRow(
         audit_id=audit_id,
