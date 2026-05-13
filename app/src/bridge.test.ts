@@ -49,6 +49,20 @@ describe("getBridgeCredentials", () => {
     });
   });
 
+  it("does not fall back to the default dev bridge when a Tauri runtime is present", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    await expect(getBridgeCredentials("unknown")).rejects.toThrow("unknown persona unknown");
+  });
+
+  it("does use the default bridge fallback in plain browser dev mode", async () => {
+    const creds = await getBridgeCredentials("unknown");
+    expect(creds).toMatchObject({
+      url: "http://127.0.0.1:50000",
+      port: 50000,
+      authToken: null,
+    });
+  });
+
   it("caches per-persona — second call same persona doesn't re-invoke", async () => {
     await getBridgeCredentials("alice");
     await getBridgeCredentials("alice");

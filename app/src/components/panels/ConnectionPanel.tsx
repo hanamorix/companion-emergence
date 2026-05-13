@@ -1,6 +1,8 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState } from "../../bridge";
+import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 
 interface Props {
@@ -37,6 +39,9 @@ export function ConnectionPanel({
 }: Props) {
   const conn = state?.connection;
   const mode = state?.mode ?? "live";
+  const platform = getClientPlatform();
+  const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
+  const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
 
@@ -103,17 +108,24 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        Install the brain as a launchd LaunchAgent so it stays alive
-        when you close the app. Idempotent — safe to click again.
+        {macInstallActionsSupported
+          ? "Install the brain as a launchd LaunchAgent so it stays alive when you close the app. Idempotent — safe to click again."
+          : `Persistent supervisor installation from the app is macOS-only right now. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
       </div>
-      <InstallActionButton
-        state={install}
-        onClick={onInstallSupervisor}
-        idleLabel="install launchd supervisor"
-        runningLabel="installing…"
-        successLabel="✓ supervisor installed"
-        errorLabel="retry install"
-      />
+      {macInstallActionsSupported ? (
+        <InstallActionButton
+          state={install}
+          onClick={onInstallSupervisor}
+          idleLabel="install launchd supervisor"
+          runningLabel="installing…"
+          successLabel="✓ supervisor installed"
+          errorLabel="retry install"
+        />
+      ) : (
+        <UnsupportedActionNote>
+          Nothing is broken — this install action is just not available on {currentPlatformLabel} yet.
+        </UnsupportedActionNote>
+      )}
 
       <Divider />
       <SectionLabel>Terminal</SectionLabel>
@@ -126,17 +138,24 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        Add a <code>nell</code> shortcut to ~/.local/bin so you can run
-        commands from Terminal. Idempotent — safe to click again.
+        {macInstallActionsSupported
+          ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
+          : `The bundled Terminal shortcut installer is macOS-only right now. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
-      <InstallActionButton
-        state={cliInstall}
-        onClick={onInstallCli}
-        idleLabel="install nell to ~/.local/bin"
-        runningLabel="installing…"
-        successLabel="✓ nell installed"
-        errorLabel="retry install"
-      />
+      {macInstallActionsSupported ? (
+        <InstallActionButton
+          state={cliInstall}
+          onClick={onInstallCli}
+          idleLabel="install nell to ~/.local/bin"
+          runningLabel="installing…"
+          successLabel="✓ nell installed"
+          errorLabel="retry install"
+        />
+      ) : (
+        <UnsupportedActionNote>
+          No action needed for normal app use on {currentPlatformLabel}.
+        </UnsupportedActionNote>
+      )}
 
       <Divider />
       <SectionLabel>Window</SectionLabel>
@@ -334,6 +353,24 @@ function InstallActionButton({
           {state.detail}
         </div>
       )}
+    </div>
+  );
+}
+
+function UnsupportedActionNote({ children }: { children: ReactNode }) {
+  return (
+    <div
+      style={{
+        padding: "7px 10px",
+        fontSize: 10.5,
+        color: "var(--text-mid)",
+        background: "rgba(130, 51, 41, 0.06)",
+        border: "1px solid rgba(130, 51, 41, 0.16)",
+        borderRadius: 6,
+        lineHeight: 1.45,
+      }}
+    >
+      {children}
     </div>
   );
 }

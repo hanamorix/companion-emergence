@@ -98,6 +98,12 @@ def test_state_returns_404_for_unknown_session(persona_dir: Path):
         assert r.status_code == 404
 
 
+def test_state_rejects_malformed_path_session_id(persona_dir: Path):
+    with _make_client(persona_dir) as c:
+        assert c.get("/state/not-a-uuid").status_code == 422
+        assert c.get("/state/../../etc/passwd").status_code == 404
+
+
 def test_health_sessions_active_increments_after_new(persona_dir: Path):
     with _make_client(persona_dir) as c:
         c.post("/session/new", json={"client": "tests"})
@@ -137,6 +143,8 @@ def test_chat_round_trip_with_fake_provider(persona_dir: Path, monkeypatch):
         assert body["reply"] == "hello, hana"
         assert body["turn"] == 1
         assert "duration_ms" in body
+        assert body["persistence_ok"] is True
+        assert body["persistence_error"] is None
         assert body["metadata"]["persistence_ok"] is True
 
         s = c.get(f"/state/{sid}").json()
@@ -231,6 +239,15 @@ def test_sessions_close_exception_stays_retryable(persona_dir: Path, monkeypatch
         assert second.json()["closed"] is True
 
 
+def test_stream_rejects_malformed_path_session_id(persona_dir: Path, monkeypatch):
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="hello")
+    with _make_client(persona_dir) as c:
+        with c.websocket_connect("/stream/not-a-uuid") as ws:
+            frame = ws.receive_json()
+            assert frame == {"type": "error", "code": "invalid_session_id", "done": True}
+
+
 def test_stream_round_trip(persona_dir: Path, monkeypatch):
     """WS /stream/{sid} sends started, reply_chunks, done."""
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")  # no artificial delay in tests
@@ -251,6 +268,8 @@ def test_stream_round_trip(persona_dir: Path, monkeypatch):
     assert types[-1] == "done"
     assert "reply_chunk" in types
     assert frames[-1]["metadata"]["persistence_ok"] is True
+    assert frames[-1]["persistence_ok"] is True
+    assert frames[-1]["persistence_error"] is None
     chunked = "".join(f["text"] for f in frames if f.get("type") == "reply_chunk")
     assert chunked == "hello world from nell"
 
@@ -428,6 +447,70 @@ def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch)
             assert f.get("code") == "invalid_image_shas"
 
 
+def test_stream_with_reply_to_audit_id_transitions_audit_to_replied_explicit(
+    persona_dir: Path, monkeypatch,
+):
+    """Bundle A #4: WS /stream payload with ``reply_to_audit_id`` triggers a
+    server-side audit transition + memory re-render atomically with the chat
+    turn — no renderer-side POST /initiate/state needed.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ack")
+    _seed_audit_row(persona_dir, audit_id="ia_streamreply", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json(
+                {"message": "yes, I felt it too", "reply_to_audit_id": "ia_streamreply"},
+            )
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    break
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_streamreply")
+    assert target["delivery"]["current_state"] == "replied_explicit"
+
+
+def test_stream_without_reply_to_audit_id_leaves_audit_untouched(
+    persona_dir: Path, monkeypatch,
+):
+    """Sanity: a chat turn without ``reply_to_audit_id`` doesn't mutate any
+    audit row. Prevents the server-side transition from over-firing.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ok")
+    _seed_audit_row(persona_dir, audit_id="ia_untouched", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "regular message"})
+            while True:
+                f = ws.receive_json()
+                if f.get("type") == "done":
+                    break
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_untouched")
+    assert target["delivery"]["current_state"] == "delivered"
+
+
+def test_stream_rejects_non_string_reply_to_audit_id(persona_dir: Path, monkeypatch):
+    """Invalid ``reply_to_audit_id`` (non-string) closes with a typed error."""
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="ok")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "x", "reply_to_audit_id": 42})
+            f = ws.receive_json()
+            assert f.get("type") == "error"
+            assert f.get("code") == "invalid_reply_to_audit_id"
+
+
 def test_stream_closes_cleanly_after_done(persona_dir: Path, monkeypatch):
     """The WS Close frame after `done` carries code 1000 (not 1006).
 
@@ -571,3 +654,214 @@ def test_sessions_close_hydrates_from_buffer_on_unknown_session(
         r = c.post("/sessions/close", json={"session_id": sid})
         assert r.status_code == 200, r.text
         assert r.json()["closed"] is True
+
+
+# ── /initiate/state — renderer-driven state transitions ─────────────────────
+
+
+def _seed_audit_row(
+    persona_dir: Path,
+    *,
+    audit_id: str,
+    state: str,
+    subject: str = "the dream",
+    tone_rendered: str = "the dream landed somewhere this morning",
+) -> None:
+    """Append one AuditRow with delivery.current_state preset."""
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    row = AuditRow(
+        audit_id=audit_id,
+        candidate_id=f"ic_{audit_id}",
+        ts="2026-05-11T14:47:09+00:00",
+        kind="message",
+        subject=subject,
+        tone_rendered=tone_rendered,
+        decision="send_quiet",
+        decision_reasoning="resonance is real",
+        gate_check={"allowed": True, "reason": None},
+        delivery={
+            "delivered_at": "2026-05-11T14:47:09+00:00",
+            "state_transitions": [
+                {"to": "delivered", "at": "2026-05-11T14:47:09+00:00"},
+            ],
+            "current_state": state,
+        },
+    )
+    append_audit_row(persona_dir, row)
+
+
+def _read_audit_rows(persona_dir: Path) -> list[dict]:
+    """Read initiate_audit.jsonl as raw dicts (for asserting current_state)."""
+    import json
+
+    path = persona_dir / "initiate_audit.jsonl"
+    out: list[dict] = []
+    if not path.exists():
+        return out
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            out.append(json.loads(stripped))
+    return out
+
+
+def test_post_initiate_state_transition_records_audit_and_memory(
+    persona_dir: Path,
+) -> None:
+    """POST /initiate/state — renderer reports a state event (read/dismissed)."""
+    _seed_audit_row(persona_dir, audit_id="ia_001", state="delivered")
+
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/state",
+            json={"audit_id": "ia_001", "new_state": "read"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "new_state": "read"}
+
+    rows = _read_audit_rows(persona_dir)
+    target = next(r for r in rows if r["audit_id"] == "ia_001")
+    assert target["delivery"]["current_state"] == "read"
+
+
+def test_post_initiate_state_rejects_unknown_state(persona_dir: Path) -> None:
+    _seed_audit_row(persona_dir, audit_id="ia_001", state="delivered")
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/state",
+            json={"audit_id": "ia_001", "new_state": "garbage"},
+        )
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /initiate/voice-edit/accept and /reject
+# ---------------------------------------------------------------------------
+
+
+def _seed_voice_edit_audit(
+    persona_dir: Path,
+    *,
+    audit_id: str,
+    old_text: str,
+    new_text: str,
+) -> None:
+    """Append a voice_edit_proposal audit row with a one-line unified diff."""
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
+
+    diff = f"- {old_text}\n+ {new_text}\n"
+    row = AuditRow(
+        audit_id=audit_id,
+        candidate_id=f"ic_{audit_id}",
+        ts="2026-05-11T14:47:09+00:00",
+        kind="voice_edit_proposal",
+        subject="a small edit to my voice",
+        tone_rendered=(
+            f"Proposing to change my voice: {old_text!r} -> {new_text!r}."
+        ),
+        decision="send_quiet",
+        decision_reasoning="the pattern showed up three times",
+        gate_check={"allowed": True, "reason": None},
+        delivery={
+            "delivered_at": "2026-05-11T14:47:09+00:00",
+            "state_transitions": [
+                {"to": "delivered", "at": "2026-05-11T14:47:09+00:00"},
+            ],
+            "current_state": "delivered",
+        },
+        diff=diff,
+    )
+    append_audit_row(persona_dir, row)
+
+
+def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
+    persona_dir: Path,
+) -> None:
+    """Accept writes audit + memory + voice_evolution AND modifies nell-voice.md."""
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/accept",
+            json={"audit_id": "ia_ve_001", "with_edits": None},
+        )
+    assert r.status_code == 200, r.text
+    body = voice_path.read_text()
+    assert "new line" in body
+    assert "old line" not in body
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        evolutions = store.list_voice_evolution()
+    finally:
+        store.close()
+    assert len(evolutions) == 1
+    assert evolutions[0].audit_id == "ia_ve_001"
+    assert evolutions[0].new_text == "new line"
+    assert evolutions[0].user_modified is False
+
+
+def test_post_voice_edit_accept_with_edits_records_user_modified(
+    persona_dir: Path,
+) -> None:
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line proposed",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/accept",
+            json={
+                "audit_id": "ia_ve_001",
+                "with_edits": "hana's tweaked line",
+            },
+        )
+    assert r.status_code == 200, r.text
+    assert "hana's tweaked line" in voice_path.read_text()
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        ev = store.list_voice_evolution()[0]
+    finally:
+        store.close()
+    assert ev.user_modified is True
+    assert ev.new_text == "hana's tweaked line"
+
+
+def test_post_voice_edit_reject_records_dismissed_no_voice_write(
+    persona_dir: Path,
+) -> None:
+    voice_path = persona_dir / "nell-voice.md"
+    voice_path.write_text("line A\nold line\nline C\n")
+    _seed_voice_edit_audit(
+        persona_dir, audit_id="ia_ve_001",
+        old_text="old line", new_text="new line",
+    )
+    with _make_client(persona_dir) as c:
+        r = c.post(
+            "/initiate/voice-edit/reject",
+            json={"audit_id": "ia_ve_001"},
+        )
+    assert r.status_code == 200, r.text
+    assert "old line" in voice_path.read_text()  # unchanged
+
+    from brain.soul.store import SoulStore
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        evolutions = store.list_voice_evolution()
+    finally:
+        store.close()
+    assert evolutions == []

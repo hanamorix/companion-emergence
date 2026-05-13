@@ -7,6 +7,7 @@ import {
   writeAppConfig,
   type InitArgs,
 } from "../appConfig";
+import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../platform";
 import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
 import { StepPrerequisites } from "./steps/StepPrerequisites";
@@ -165,34 +166,43 @@ export function Wizard({ onDone }: Props) {
         always_on_top: false,
         reduced_motion: false,
       });
+      const platform = getClientPlatform();
+      const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
+      const currentPlatformLabel = platformLabel(platform);
       // Plan C — install the launchd LaunchAgent so the supervisor
-      // outlives the .app from the very first run. Best-effort: a
-      // failure here doesn't block the wizard (the legacy Tauri-spawn
-      // path still works), but we surface the stderr in the success
-      // pane so the user can fix it from the connection panel later.
+      // outlives the .app from the very first run. macOS-only; on
+      // Windows/Linux we skip quietly so the ready pane doesn't make
+      // unsupported platform work look like a failure.
       let serviceTrailer = "";
-      try {
-        const svc = await installSupervisorService(state.personaName);
-        serviceTrailer = svc.success
-          ? `\n\n[service] launchd agent installed`
-          : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
-      } catch (e) {
-        serviceTrailer =
-          `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
-          " — supervisor will fall back to the .app's lifecycle.";
+      if (macInstallActionsSupported) {
+        try {
+          const svc = await installSupervisorService(state.personaName);
+          serviceTrailer = svc.success
+            ? `\n\n[service] launchd agent installed`
+            : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
+        } catch (e) {
+          serviceTrailer =
+            `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
+            " — supervisor will fall back to the .app's lifecycle.";
+        }
+      } else {
+        serviceTrailer = `\n\n[service] persistent service install is macOS-only; on ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle.`;
       }
       // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
-      // their Terminal without typing the .app's Resources path. Same
-      // best-effort posture as the launchd install: failure stitches into
-      // the success pane and is retryable from the connection panel.
+      // their Terminal without typing the .app's Resources path. Also
+      // macOS-only for now; skip on Windows/Linux with a reassuring note.
       let cliTrailer = "";
-      try {
-        const cli = await installNellCliSymlink();
-        cliTrailer = cli.success
-          ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
-          : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
-      } catch (e) {
-        cliTrailer = `\n\n[cli] could not install nell symlink: ${(e as Error).message}`;
+      if (macInstallActionsSupported) {
+        try {
+          const cli = await installNellCliSymlink();
+          cliTrailer = cli.success
+            ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
+            : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
+        } catch (e) {
+          cliTrailer = `\n\n[cli] could not install nell symlink: ${(e as Error).message}`;
+        }
+      } else {
+        cliTrailer = `\n\n[cli] bundled CLI shortcut install is macOS-only; no action is needed for normal app use on ${currentPlatformLabel}.`;
       }
       setInstallResult({
         ok: true,

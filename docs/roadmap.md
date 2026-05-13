@@ -139,18 +139,23 @@ release blocker on the macOS side. What remains:
   the project gets added to a third-party APT source or wants
   delta-update support.
 
-## Public release blockers (open)
+## Public release follow-ups (open)
 
-These keep a public/tagged release honest. None of them block private
-development:
+The first tagged public release matrix has completed: v0.0.11-alpha.4
+release run `25806949385` passed `validate`, `macos-arm64`,
+`linux-x86_64`, and `windows-x86_64`, with downloadable assets attached.
+Remaining follow-ups:
 
-- First CI matrix run from a tagged commit + manual smoke on the
-  three not-yet-verified hosts (macOS x86_64, Linux x86_64, Windows
-  x86_64).
+- Human click-through on Linux x86_64 / Windows x86_64 bundles. CI now
+  builds those bundles on native hosted runners and runs bundled Python
+  + `nell` CLI smoke; real-machine UX feedback is still useful.
+- macOS x86_64 DMG asset. GitHub's Intel macOS runner stayed queued
+  indefinitely, so Intel Mac users build from source until a reliable
+  hosted or self-hosted Intel runner exists.
 - Public contributor / onboarding docs.
 - Public API / CLI compatibility policy.
 - Auto-update story — `tauri-plugin-updater` infra exists but isn't
-  wired. Defer until a first public release shows actual demand;
+  wired. Defer until public release feedback shows actual demand;
   needs an update-server hosting decision (S3 + signed manifest, or
   managed service like updately.app).
 

@@ -400,6 +400,10 @@ async fn run_migrate(
     })
 }
 
+const INIT_TIMEOUT_SECS: u64 = 30;
+const MIGRATING_INIT_TIMEOUT_SECS: u64 = 300;
+const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
+
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
@@ -423,11 +427,20 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Audit 2026-05-07 P2-9: 30s timeout — nell init creates a
-    // persona dir, writes config + voice.md. Typical run is <2s.
-    // First-run deadlocks would leave the wizard's installing step
-    // forever-spinning; the timeout surfaces `init_timeout`.
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await
+    // Audit 2026-05-07 P2-9: fresh init uses a 30s timeout — creates a
+    // persona dir, writes config + voice.md. Migrating init gets the
+    // same 5-minute budget as explicit migrate because legacy NellBrain
+    // imports can rebuild larger stores.
+    let init_timeout_secs = if args.migrate_from.is_some() {
+        MIGRATING_INIT_TIMEOUT_SECS
+    } else {
+        INIT_TIMEOUT_SECS
+    };
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(init_timeout_secs),
+        cmd.output(),
+    )
+    .await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("spawn nell init: {}", e)),
@@ -773,12 +786,15 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
     // app was launched from terminal), this can succeed even when
     // the path probe missed.
     if resolved.is_none() {
-        if let Ok(out) = tokio::process::Command::new("claude")
-            .arg("--version")
-            .output()
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CLAUDE_VERSION_TIMEOUT_SECS),
+            tokio::process::Command::new("claude")
+                .arg("--version")
+                .output(),
+        )
+        .await
         {
-            if out.status.success() {
+            Ok(Ok(out)) if out.status.success() => {
                 let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 return Ok(ClaudeCliCheck {
                     found: true,
@@ -790,6 +806,7 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
                     },
                 });
             }
+            _ => {}
         }
         return Ok(ClaudeCliCheck {
             found: false,
@@ -798,12 +815,15 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
         });
     }
     let path = resolved.unwrap();
-    let version = match tokio::process::Command::new(&path)
-        .arg("--version")
-        .output()
-        .await
+    let version = match tokio::time::timeout(
+        std::time::Duration::from_secs(CLAUDE_VERSION_TIMEOUT_SECS),
+        tokio::process::Command::new(&path)
+            .arg("--version")
+            .output(),
+    )
+    .await
     {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if v.is_empty() {
                 None
@@ -836,9 +856,35 @@ fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
         .map_err(|e| format!("set_always_on_top: {}", e))
 }
 
+/// Show a native OS notification for a notify-urgency initiate.
+///
+/// Phase 9.5 — when a notify-urgency `initiate_delivered` event arrives at
+/// the renderer, ChatPanel invokes this command via `tryInvoke` so the
+/// user gets a system-level nudge even when the Companion window isn't
+/// focused. On macOS the first call triggers the OS permission prompt;
+/// subsequent calls succeed silently if the user granted, or fail
+/// quietly (returning Err) if denied. The renderer's try/catch swallows
+/// errors so a denied permission doesn't cascade into a UI failure —
+/// the in-app banner is the primary surface, notifications are a bonus.
+#[tauri::command]
+fn show_initiate_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| format!("show notification: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_bridge_credentials,
             read_app_config,
@@ -851,6 +897,7 @@ pub fn run() {
             install_nell_cli_symlink,
             check_claude_cli,
             set_always_on_top,
+            show_initiate_notification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -896,6 +943,18 @@ mod tests {
         assert!(validate_persona_name("nell;semi").is_err());
         assert!(validate_persona_name("nell$dollar").is_err());
         assert!(validate_persona_name("nell!bang").is_err());
+    }
+
+    #[test]
+    fn init_timeout_is_longer_when_migrating() {
+        assert_eq!(INIT_TIMEOUT_SECS, 30);
+        assert_eq!(MIGRATING_INIT_TIMEOUT_SECS, 300);
+        assert!(MIGRATING_INIT_TIMEOUT_SECS > INIT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn claude_version_probe_timeout_is_bounded() {
+        assert_eq!(CLAUDE_VERSION_TIMEOUT_SECS, 2);
     }
 
     // Audit P2-8: port parsing must reject out-of-range and zero.

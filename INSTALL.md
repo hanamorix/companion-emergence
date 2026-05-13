@@ -7,15 +7,20 @@ Below are the steps to launch the app despite the warnings, per
 platform. The app itself is the same regardless of which path you
 take.
 
-> **Platform support today:** macOS (arm64 + x86_64) is the primary
-> distribution target. The window chrome (transparent background +
-> overlay title bar) and supervisor-as-LaunchAgent lifecycle are tuned
-> for macOS. Linux + Windows bundles compile from the same source and
-> the brain itself runs everywhere, but the transparent chrome and
-> persistent OS-service supervisor have less live-host validation on
-> those platforms than macOS. `nell service install` is implemented via
-> `systemd --user` on Linux and Task Scheduler on Windows, but treat
-> those as alpha surfaces until they have more real-machine smoke.
+> **Downloadable platforms today:** the public release ships a macOS
+> Apple Silicon DMG (`Companion.Emergence_<version>_aarch64.dmg`),
+> Windows x64 installers (`.exe` and `.msi`), and Linux x86_64
+> packages (`.AppImage` and `.deb`). There is no downloadable Intel
+> macOS DMG yet; Intel Mac users should build from source until a
+> reliable Intel runner is available.
+>
+> macOS remains the most live-tested desktop path. Linux + Windows
+> bundles compile from the same source and now ship as downloadable
+> alpha assets, but transparent chrome and persistent OS-service
+> supervisor flows have less real-machine validation than macOS.
+> `nell service install` is implemented via `systemd --user` on Linux
+> and Task Scheduler on Windows; treat those as alpha surfaces until
+> they have more host smoke.
 
 > **One external prerequisite on every platform:** you need
 > [`claude`](https://docs.claude.com/en/docs/claude-code/setup) (the

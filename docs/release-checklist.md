@@ -150,7 +150,14 @@ wired — needs an update server (S3 + signed manifest, or a managed
 service like updately.app). Defer until the first public release
 gets feedback on actual demand.
 
-## v0.0.11-alpha local verification findings — 2026-05-13
+## v0.0.11-alpha.4 public release validation — 2026-05-13
+
+Final public release state:
+
+- Tag: `v0.0.11-alpha.4`
+- Commit: `7115525bf84be5bc4637c8499cddcf3caf7a7421`
+- Release run: `25806949385` — success
+- Jobs passed: `validate`, `windows-x86_64`, `macos-arm64`, `linux-x86_64`
 
 Local macOS arm64 package check passed before public sync/tagging:
 
@@ -162,6 +169,20 @@ Local macOS arm64 package check passed before public sync/tagging:
 - `hdiutil verify "Companion Emergence_0.0.11_aarch64.dmg"` — valid checksum
 - `codesign --verify --deep --strict "Companion Emergence.app"` — valid ad-hoc signature
 - Bundled runtime smoke: `python3 --version` and bundled `nell --help` both pass
+
+Public release assets verified present:
+
+- `Companion.Emergence_0.0.11_aarch64.dmg`
+- `Companion.Emergence_0.0.11_amd64.AppImage`
+- `Companion.Emergence_0.0.11_amd64.deb`
+- `Companion.Emergence_0.0.11_x64-setup.exe`
+- `Companion.Emergence_0.0.11_x64_en-US.msi`
+- `SHA256SUMS-linux-x86_64.txt`
+- `SHA256SUMS-macos-arm64.txt`
+- `SHA256SUMS-windows-x86_64.txt`
+
+Privacy verification: public marker scan passed with all checked private markers
+reporting `0` matches in the public release state.
 
 Expected/non-blocking findings:
 
