@@ -114,26 +114,43 @@ def build_system_message(
     companion_name: str,
     user_name: str,
     voice_template_path: Path,
+    persona_dir: Path | None = None,
 ) -> str:
-    """Assemble D's full system message: static task frame + voice anchor.
+    """Assemble D's full system message.
 
-    The static frame is parameterized with companion_name / user_name.
-    The voice anchor is the contents of voice_template_path, appended
-    under a `=== Your voice ===` header. If the file is missing or
-    unreadable, the anchor is omitted (the task frame still works).
+    Layers:
+    1. Optional calibration block (adaptive-D, v0.0.11) — prepended when
+       persona_dir is provided AND d_mode.json says "adaptive".
+    2. Static task frame (universal template, parameterized).
+    3. Voice anchor (the brain's voice template, appended).
+
+    persona_dir defaults to None for back-compat with older callers / tests
+    that don't have a persona_dir in scope. Without it, the calibration
+    block is skipped (equivalent to stateless mode).
     """
+    # Import inside the function to avoid potential circular imports —
+    # adaptive.py doesn't import reflection.py, but the test load order
+    # can confuse things if this import is at module top.
+    from brain.initiate.adaptive import build_calibration_block, load_d_mode
+
+    calibration_prefix = ""
+    if persona_dir is not None and load_d_mode(persona_dir) == "adaptive":
+        calibration_prefix = build_calibration_block(
+            persona_dir, user_name=user_name
+        ) + "\n"
+
     frame = _TASK_FRAME_TEMPLATE.format(
         companion_name=companion_name,
         user_name=user_name,
     )
     if not voice_template_path.exists():
-        return frame
+        return calibration_prefix + frame
     try:
         voice = voice_template_path.read_text(encoding="utf-8").rstrip()
     except OSError as exc:
         logger.warning("voice template read failed (%s); omitting anchor", exc)
-        return frame
-    return f"{frame}\n\n=== Your voice ===\n{voice}\n"
+        return calibration_prefix + frame
+    return f"{calibration_prefix}{frame}\n\n=== Your voice ===\n{voice}\n"
 
 
 def build_user_message(
