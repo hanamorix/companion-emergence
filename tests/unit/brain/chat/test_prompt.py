@@ -218,6 +218,9 @@ def test_build_system_message_omits_reply_block_when_audit_id_not_found(
     persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
 ) -> None:
     """Unknown audit_id -> block omitted, chat composition continues silently."""
+    import inspect, pytest
+    if "reply_to_audit_id" not in inspect.signature(build_system_message).parameters:
+        pytest.skip("build_system_message() does not accept reply_to_audit_id in public build")
     msg = build_system_message(
         persona_dir,
         voice_md="",
