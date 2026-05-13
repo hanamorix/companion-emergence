@@ -14,10 +14,11 @@ returns a formatted text block ready to splice into the system message.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.initiate.audit import read_recent_audit
+from brain.memory.store import MemoryStore
 
 
 def build_outbound_recall_block(
@@ -69,3 +70,44 @@ def build_outbound_recall_block(
             )
 
     return "\n".join(lines)
+
+
+def build_recent_conversation_excerpt(
+    persona_dir: Path,
+    *,
+    hours: int = 48,
+    max_chars: int = 2000,
+) -> str:
+    """Return recent conversation memories as a capped oldest-first excerpt.
+
+    Empty string is returned for fresh personas with no memory database or no
+    conversation memories in the requested window.
+    """
+    store_path = persona_dir / "memories.db"
+    if not store_path.exists():
+        return ""
+
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
+    store = MemoryStore(store_path)
+    try:
+        recent = [
+            memory
+            for memory in store.list_by_type("conversation")
+            if memory.created_at >= cutoff
+        ]
+    finally:
+        store.close()
+
+    recent.sort(key=lambda memory: memory.created_at)
+    excerpt = "\n".join(
+        f"[{memory.created_at.isoformat()}] {memory.content}" for memory in recent
+    )
+
+    if len(excerpt) <= max_chars:
+        return excerpt
+
+    excerpt = excerpt[-max_chars:]
+    newline_index = excerpt.find("\n")
+    if newline_index > 0:
+        excerpt = excerpt[newline_index + 1 :]
+    return excerpt

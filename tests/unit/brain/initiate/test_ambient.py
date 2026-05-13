@@ -80,3 +80,74 @@ def test_build_outbound_recall_block_excludes_holds_and_drops(tmp_path: Path) ->
     if block is not None:
         assert "ia_hold" not in block
         assert "ia_drop" not in block
+
+
+def test_build_recent_conversation_excerpt_respects_char_cap(tmp_path: Path) -> None:
+    from brain.initiate.ambient import build_recent_conversation_excerpt
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    store = MemoryStore(persona / "memories.db")
+    now = datetime.now(UTC)
+    for i in range(30):
+        store.create(
+            Memory(
+                id=f"m_{i}",
+                content=f"This is conversation turn {i} with content lorem ipsum " * 5,
+                memory_type="conversation",
+                domain="us",
+                created_at=now - timedelta(hours=i),
+            )
+        )
+    store.close()
+
+    excerpt = build_recent_conversation_excerpt(persona, hours=48, max_chars=2000)
+
+    assert len(excerpt) <= 2000
+
+
+def test_build_recent_conversation_excerpt_filters_by_window(tmp_path: Path) -> None:
+    from brain.initiate.ambient import build_recent_conversation_excerpt
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    store = MemoryStore(persona / "memories.db")
+    now = datetime.now(UTC)
+    store.create(
+        Memory(
+            id="inside",
+            content="inside the window",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(hours=24),
+        )
+    )
+    store.create(
+        Memory(
+            id="outside",
+            content="too old",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(hours=72),
+        )
+    )
+    store.close()
+
+    excerpt = build_recent_conversation_excerpt(persona, hours=48, max_chars=2000)
+
+    assert "inside the window" in excerpt
+    assert "too old" not in excerpt
+
+
+def test_build_recent_conversation_excerpt_no_persona_db(tmp_path: Path) -> None:
+    """Fresh persona (no memories.db) returns empty excerpt without crashing."""
+    from brain.initiate.ambient import build_recent_conversation_excerpt
+
+    persona = tmp_path / "fresh"
+    persona.mkdir()
+
+    excerpt = build_recent_conversation_excerpt(persona, hours=48, max_chars=2000)
+
+    assert excerpt == ""
