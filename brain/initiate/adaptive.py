@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,3 +197,81 @@ def build_calibration_block(persona_dir: Path, *, user_name: str) -> str:
         n_recurred=n_recurred,
         user_name=user_name,
     )
+
+
+@dataclass(frozen=True)
+class DriftAlert:
+    """Signal that D-reflection's promote-rate has drifted from its
+    historical median. Emitted by detect_drift; consumed by the
+    supervisor for operator-tier telemetry."""
+
+    current_rate: float
+    historical_median: float
+    delta_sigma: float
+
+
+def _read_all_d_calls(persona_dir: Path) -> list:
+    """Read every row from initiate_d_calls.jsonl without a time filter."""
+    import json as _json
+
+    from brain.initiate.d_call_schema import DCallRow
+
+    path = persona_dir / "initiate_d_calls.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.rstrip("\r\n")
+            if not stripped.strip():
+                continue
+            try:
+                rows.append(DCallRow.from_jsonl(stripped))
+            except (_json.JSONDecodeError, KeyError):
+                continue
+    return rows
+
+
+def detect_drift(persona_dir: Path) -> DriftAlert | None:
+    """Compare recent D promote-rate against historical median.
+
+    Returns a DriftAlert when |delta| > 2 * historical_stdev_via_MAD.
+    Returns None when history is insufficient or flat.
+    """
+    rows = _read_all_d_calls(persona_dir)
+    if len(rows) < 100:
+        return None  # bootstrap floor
+
+    rows.sort(key=lambda r: r.ts)
+    current = rows[-30:]
+    historical = rows[:-30]
+    if len(historical) < 50:
+        return None  # still bootstrapping
+
+    def promote_rate(rs: list) -> float:
+        total_in = sum(r.candidates_in for r in rs)
+        total_promoted = sum(r.promoted_out for r in rs)
+        return total_promoted / max(1, total_in)
+
+    current_rate = promote_rate(current)
+    historical_rates = [
+        promote_rate([r]) for r in historical if r.candidates_in > 0
+    ]
+    if len(historical_rates) < 2:
+        return None
+    historical_median = statistics.median(historical_rates)
+    # Use sample stdev; MAD collapses to 0 when > 50 % of per-row rates
+    # are identical (common with small candidates_in values).
+    historical_stdev = statistics.stdev(historical_rates)
+
+    if historical_stdev < 1e-6:
+        return None  # flat history; can't detect drift meaningfully
+
+    delta_sigma = abs(current_rate - historical_median) / historical_stdev
+    if delta_sigma > 2.0:
+        return DriftAlert(
+            current_rate=current_rate,
+            historical_median=historical_median,
+            delta_sigma=delta_sigma,
+        )
+    return None
