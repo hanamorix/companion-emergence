@@ -123,3 +123,123 @@ def test_top_n_empty_hebbian_returns_empty(tmp_path):
         assert top_n_most_active_memories(h, n=10) == []
     finally:
         h.close()
+
+
+def test_gate_recall_resonance_passes(tmp_path):
+    from brain.initiate.new_sources import GateThresholds
+    from brain.initiate.resonance import gate_recall_resonance
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    allowed, reason = gate_recall_resonance(
+        persona,
+        memory_id="m_pass",
+        z_score=3.0,
+        staleness_days=14,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_gate_recall_resonance_blocks_below_z_threshold(tmp_path):
+    from brain.initiate.new_sources import GateThresholds
+    from brain.initiate.resonance import gate_recall_resonance
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    allowed, reason = gate_recall_resonance(
+        persona,
+        memory_id="m",
+        z_score=1.5,
+        staleness_days=14,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "z_threshold"
+
+
+def test_gate_recall_resonance_blocks_below_staleness_min(tmp_path):
+    from brain.initiate.new_sources import GateThresholds
+    from brain.initiate.resonance import gate_recall_resonance
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    allowed, reason = gate_recall_resonance(
+        persona,
+        memory_id="m",
+        z_score=3.0,
+        staleness_days=3,
+        thresholds=GateThresholds(),
+    )
+    assert allowed is False
+    assert reason == "staleness_min"
+
+
+def test_gate_recall_resonance_blocks_on_cooldown(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import emit_initiate_candidate
+    from brain.initiate.new_sources import GateThresholds
+    from brain.initiate.resonance import gate_recall_resonance
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    now = datetime.now(UTC)
+    emit_initiate_candidate(
+        persona,
+        kind="message",
+        source="recall_resonance",
+        source_id="m_cool",
+        semantic_context=SemanticContext(),
+        now=now - timedelta(hours=10),
+    )
+    allowed, reason = gate_recall_resonance(
+        persona,
+        memory_id="m_cool",
+        z_score=3.0,
+        staleness_days=14,
+        thresholds=GateThresholds(),
+        now=now,
+    )
+    assert allowed is False
+    assert reason == "anti_flood"
+
+
+def test_emit_recall_resonance_candidate_writes_queue_row(tmp_path):
+    from datetime import UTC, datetime
+
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.resonance import emit_recall_resonance_candidate
+    from brain.memory.store import Memory
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+    mem = Memory(
+        id="mem_e",
+        content="A quiet returning",
+        memory_type="conversation",
+        domain="us",
+        created_at=now,
+    )
+
+    emit_recall_resonance_candidate(
+        persona,
+        memory=mem,
+        z_score=3.2,
+        ema_mean=0.4,
+        current_activation=1.1,
+        staleness_days=14,
+        top_neighbors=[("n1", 0.5), ("n2", 0.3), ("n3", 0.2)],
+        now=now,
+    )
+    out = read_candidates(persona)
+    assert len(out) == 1
+    c = out[0]
+    assert c.source == "recall_resonance"
+    assert c.source_id == "mem_e"
+    assert c.semantic_context.source_meta["memory_id"] == "mem_e"
+    assert c.semantic_context.source_meta["z_score"] == 3.2
+    assert c.semantic_context.linked_memory_ids[0] == "mem_e"
+    assert "n1" in c.semantic_context.linked_memory_ids
