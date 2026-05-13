@@ -148,3 +148,10 @@ def test_semantic_context_source_meta_optional_back_compat():
 
     sc = SemanticContext.from_dict({"linked_memory_ids": [], "topic_tags": []})
     assert sc.source_meta is None
+
+
+def test_candidate_source_includes_recall_resonance():
+    from brain.initiate.schemas import CandidateSource
+
+    valid: CandidateSource = "recall_resonance"  # type: ignore[assignment]
+    assert valid == "recall_resonance"
