@@ -1,13 +1,13 @@
 # Roadmap
 
 This roadmap keeps the project's remaining work honest after the
-2026-05-07 audit cycle + Phase 7 cross-platform open-source bundling.
+2026-05-13 v0.0.11-alpha release-readiness pass.
 It is not a public release promise. companion-emergence stays
 private/local-first during development, but as of this refresh it has
 private alpha bundles for macOS arm64, Linux x86_64, and Windows
 x86_64. macOS x86_64 remains source-build-only until GitHub provides a
 reliable hosted Intel runner for this private repo.
-Last refreshed 2026-05-08 after the release-readiness audit.
+Last refreshed 2026-05-13 after the v0.0.11-alpha local packaging pass.
 
 ## Current posture
 
@@ -34,12 +34,15 @@ testing covers:
   metadata
 - safe memory inspection (`nell memory list/search/show`)
 - body/emotion context, soul candidate review, growth crystallizers
+- initiate physiology: autonomous outbound candidates, voice-edit proposals,
+  draft-space demotion, D-reflection editorial filtering, adaptive-D
+  calibration, drift telemetry, and recall-resonance memory activation
 - MCP tool server with privacy-aware audit logging
 - health checks and data-file self-healing
 - SQLite WAL + 5s busy_timeout on MemoryStore + HebbianMatrix +
   WorksStore
 - JSONL readers stream line-by-line (no full-file memory spike)
-- 1588 unit + integration tests; ruff clean
+- 1972 unit + integration tests; ruff clean
 
 **NellFace (Tauri 2 + React 18 + Vite):**
 
@@ -57,8 +60,8 @@ testing covers:
 - 5 left-column panels (inner weather, body, recent interior, soul,
   connection)
 - always-on-top toggle wired to the actual Tauri window API
-- 29 frontend Vitest tests pinning chat, connection-panel,
-  persona-cache, wizard InitArgs, and StepReady behavior
+- 56 frontend Vitest tests pinning chat, initiate banners, draft-space,
+  voice-edit panels, connection-panel, bridge, wizard, and StepReady behavior
 
 **Phase 7 — bundled portable Python runtime:**
 
@@ -171,6 +174,95 @@ natural extensions of the multimodal + bundled-runtime work:
   workflow, version policy, and the auto-update story.
 
 ## Recently shipped (reverse chronological)
+
+**2026-05-13 — Adaptive-D + recall resonance packaged locally (v0.0.11-alpha)**
+
+- **Adaptive-D calibration** — D-reflection now records promoted/filtered
+  decisions into `d_calibration.jsonl`, tracks D-mode in `d_mode.json`, and
+  can prepend a calibration block to the initiate system message so the
+  editorial layer learns from its own recent decisions.
+- **Calibration closer** — the initiate review tick can close old calibration
+  rows by either promotion outcome or 48h timeout, keeping the history useful
+  without turning it into a user-managed knob.
+- **Drift telemetry** — `DriftAlert` + `detect_drift` surface sustained changes
+  in D's behaviour before they become silent personality drift.
+- **Recall resonance** — memory activation baseline + current activation scoring
+  can emit `recall_resonance` candidates when a memory cluster becomes unusually
+  alive against the recent conversation.
+- **Real research topic overlap** — the v0.0.10 hardcoded
+  `topic_overlap_score = 1.0` has been replaced with a Haiku-backed overlap
+  helper using recent conversation excerpts.
+- **Packaging findings** — local macOS arm64 package smoke passed on 2026-05-13:
+  `uv run ruff check .`, `uv run pytest -q` (1972 passed), `pnpm test`
+  (56 passed), `cargo test` (28 passed), `pnpm tauri build`, `hdiutil verify`,
+  `codesign --verify --deep --strict`, and bundled `nell --help`. Gatekeeper
+  rejection is expected because the alpha is ad-hoc signed and not notarized.
+- **Known release warning** — Tauri warns that
+  `com.companion-emergence.app` ends in `.app`; fix before a notarized/public
+  stable release, but it does not block this unsigned alpha.
+
+**2026-05-12 — D-reflection editorial layer (v0.0.10-alpha)**
+
+- **D-reflection** — editorial layer between candidate emission and composition.
+  Once per non-empty heartbeat tick, the brain pauses and asks of queued
+  candidates *"of these, which is genuinely worth bringing to the user?"*
+  Filtered candidates demote to `draft_space.md`; promoted candidates flow
+  through the existing v0.0.9 three-prompt composition pipeline. Bypasses
+  the v0.0.9 daily cost cap (editorial layer, not a budget claimant).
+- **Tiered escalation**: Haiku 4.5 by default; escalates to Sonnet 4.6 when
+  Haiku returns any low-confidence decision OR fails to produce parseable
+  structured output. If Sonnet ALSO has low confidence on a candidate, that
+  candidate is force-filtered with an `ambivalent` reason.
+- **Failure-mode dispatch** by error type: timeout/provider_error → passthrough
+  retry (leave in queue); after 3 consecutive failures fall through to
+  promote-all so candidates aren't stranded. Rate-limit (HTTP 429) → demote
+  all to draft. Malformed JSON from Sonnet → promote all (trust composition's
+  own gates).
+- **Two new candidate event sources**: `reflex_firing` (emitted when the
+  reflex engine fires on a learned pattern with sufficient confidence +
+  flinch intensity, gated against same-pattern flooding) and
+  `research_completion` (emitted when a research thread matures, gated on
+  maturity score + freshness window + topic overlap with recent conversation).
+- **New audit table** `initiate_d_calls.jsonl` — one row per tick where D
+  actually fired: model tier used, candidates_in/promoted_out/filtered_out,
+  latency, tokens, failure_type, retry_count, tick_note. Substrate for
+  future hit-rate analysis.
+- **CLI**: `nell initiate d-stats [--window 7d]` — operator-tier telemetry
+  for the D-reflection tick history.
+- **Multi-companion compatibility**: D's system prompt is a template with
+  `{companion_name}` / `{user_name}` substitutions resolved at runtime from
+  the brain's persona substrate. The voice template is appended as a runtime
+  voice anchor so D's editorial inner voice matches the outbound voice.
+- `topic_overlap_score` for `research_completion` hardcoded to 1.0 for
+  v0.0.10 (real embedding-based cosine similarity deferred to v0.0.11 —
+  the research engine has no embedding infrastructure yet).
+- **`recall_resonance` source deferred to v0.0.11** — needs a memory-clustering
+  substrate (per-cluster activation history, co-activation z-scores) that
+  doesn't exist in v0.0.9. Pairs naturally with the v0.0.11 Bundle C
+  adaptive-D work; both want history-of-self tracking.
+
+**2026-05-12 — Initiate physiology (v0.0.9-alpha)**
+
+- Autonomous outbound channel ("initiate"): events emit candidates →
+  supervisor cadence reviews with cost-cap + cooldown gates → three-prompt
+  composition (subject / tone / decision) → audit + memory.
+- Voice-edit proposals: daily reflection tick emits candidates with a
+  ≥3-evidence bar; accept writes to three places (audit + episodic
+  memory + SoulStore `voice_evolution`).
+- Draft space: failed-to-promote events (sub-1.5σ emotion spikes for
+  v0.0.9) become markdown fragments in `draft_space.md`.
+- Verify path: always-on outbound-recall slice in every chat prompt
+  + on-demand tools (`recall_initiate_audit`, `recall_soul_audit`,
+  `recall_voice_evolution`).
+- User-local timezone awareness via `datetime.now().astimezone()` —
+  no PersonaConfig knob.
+- Frontend: `InitiateBanner` with ↩ reply affordance + 2 s read
+  detection, `VoiceEditPanel` with diff-in-context review,
+  `DraftSpacePanel` for fragment viewing, Tauri OS notification
+  via `tauri-plugin-notification`.
+- CLI: `nell initiate audit [--full]`, `candidates`, `voice-evolution`.
+- D-reflection layer (Nell-side editorial filter) designed and
+  reserved for v0.0.10; v0.0.9 schemas carry the compatibility seam.
 
 **2026-05-11 — JSONL log retention (autonomous physiology)**
 
