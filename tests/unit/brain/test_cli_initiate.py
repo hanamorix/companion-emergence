@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+
 import pytest
+
 pytest.importorskip("brain.initiate")
 
 from pathlib import Path
