@@ -422,7 +422,91 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(tmp_path: Pat
         # Confirm gate rejection was recorded
         rejection_path = tmp_path / "gate_rejections.jsonl"
         assert rejection_path.exists(), "gate_rejections.jsonl should exist after maturity gate rejection"
-        rows = [json.loads(line) for line in rejection_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert any(r["gate_name"] == "maturity_min" and r["source"] == "research_completion" for r in rows)
+        rows = [
+            json.loads(line)
+            for line in rejection_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any(
+            r["gate_name"] == "maturity_min" and r["source"] == "research_completion"
+            for r in rows
+        )
     finally:
         store.close()
+
+
+# ---- v0.0.11 topic overlap scoring ----
+
+
+def test_compute_topic_overlap_via_haiku_happy_path() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            assert "quiet rivers" in prompt
+            assert "Hana" in system
+            return '{"score": 0.7}'
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="quiet rivers",
+        thread_summary="A study of slow water and patience.",
+        recent_conversation_excerpt="[2026-05-13T10:00] We talked about flow",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.7
+
+
+def test_compute_topic_overlap_clamps_out_of_range() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            return '{"score": 1.5}'
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 1.0
+
+
+def test_compute_topic_overlap_returns_zero_on_malformed() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            return "not even close to JSON"
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.0
+
+
+def test_compute_topic_overlap_returns_zero_on_provider_error() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            raise OSError("boom")
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.0
