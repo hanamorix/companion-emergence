@@ -45,3 +45,72 @@ def test_load_d_mode_non_dict_json_falls_back_to_stateless(tmp_path: Path):
     persona.mkdir()
     (persona / "d_mode.json").write_text('"adaptive"')
     assert load_d_mode(persona) == "stateless"
+
+
+def test_calibration_row_roundtrip():
+    from brain.initiate.adaptive import CalibrationRow
+
+    row = CalibrationRow(
+        ts_decision="2026-05-13T10:00:00+00:00",
+        ts_closed="2026-05-13T11:30:00+00:00",
+        candidate_id="ic_abc",
+        source="dream",
+        decision="promote",
+        confidence="high",
+        model_tier="haiku",
+        promoted_to_state="replied_explicit",
+        filtered_recurred=None,
+        reason_short="resonant memory return",
+    )
+    line = row.to_jsonl()
+    parsed = CalibrationRow.from_jsonl(line)
+    assert parsed == row
+
+
+def test_calibration_row_filtered():
+    from brain.initiate.adaptive import CalibrationRow
+
+    row = CalibrationRow(
+        ts_decision="2026-05-13T10:00:00+00:00",
+        ts_closed="2026-05-15T10:00:00+00:00",
+        candidate_id="ic_def",
+        source="reflex_firing",
+        decision="filter",
+        confidence="high",
+        model_tier="haiku",
+        promoted_to_state=None,
+        filtered_recurred=True,
+        reason_short="reflex echo",
+    )
+    line = row.to_jsonl()
+    parsed = CalibrationRow.from_jsonl(line)
+    assert parsed.filtered_recurred is True
+    assert parsed.promoted_to_state is None
+
+
+def test_append_and_read_calibration_rows(tmp_path: Path):
+    from brain.initiate.adaptive import (
+        CalibrationRow,
+        append_calibration_row,
+        read_recent_calibration_rows,
+    )
+
+    persona = tmp_path / "p"
+    for i in range(5):
+        append_calibration_row(persona, CalibrationRow(
+            ts_decision=f"2026-05-13T10:0{i}:00+00:00",
+            ts_closed=f"2026-05-13T11:0{i}:00+00:00",
+            candidate_id=f"ic_{i}",
+            source="dream",
+            decision="promote",
+            confidence="high",
+            model_tier="haiku",
+            promoted_to_state="replied_explicit",
+            filtered_recurred=None,
+            reason_short=f"reason {i}",
+        ))
+    rows = list(read_recent_calibration_rows(persona, limit=3))
+    assert len(rows) == 3
+    # Newest first.
+    assert rows[0].candidate_id == "ic_4"
+    assert rows[2].candidate_id == "ic_2"
