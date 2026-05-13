@@ -90,6 +90,28 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _extract_old_text_from_diff(diff: str) -> str:
+    """Pull the first removed line out of a simple unified diff.
+
+    Handles the one-line diffs produced by the voice-reflection prompt
+    (a single `- old\n+ new` pair). Skips the `---` file header. Multi-
+    line diff support can come later when reflection learns to propose
+    bigger edits.
+    """
+    for line in diff.splitlines():
+        if line.startswith("- ") and not line.startswith("---"):
+            return line[2:]
+    return ""
+
+
+def _extract_new_text_from_diff(diff: str) -> str:
+    """Pull the first added line out of a simple unified diff. See `_extract_old_text_from_diff`."""
+    for line in diff.splitlines():
+        if line.startswith("+ ") and not line.startswith("+++"):
+            return line[2:]
+    return ""
+
+
 def _word_chunks(text: str) -> list[str]:
     """Split text into word-or-whitespace tokens preserving spacing.
 
@@ -144,6 +166,7 @@ def _respond_blocking(
     message: str,
     provider: LLMProvider,
     image_shas: list[str] | None = None,
+    reply_to_audit_id: str | None = None,
 ) -> Any:
     """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
 
@@ -168,7 +191,52 @@ def _respond_blocking(
             provider=provider,
             session=sess,
             image_shas=image_shas,
+            reply_to_audit_id=reply_to_audit_id,
         )
+
+
+def _apply_replied_explicit_transition(
+    persona_dir: Path, audit_id: str,
+) -> None:
+    """Record a ``replied_explicit`` audit transition + re-render its memory.
+
+    Bundle A #4 — pulls the rendezvous logic out of the renderer's POST
+    /initiate/state path so the WS /stream handler can fire it atomically
+    with ingesting the chat turn. Mirrors the body of the /initiate/state
+    endpoint (transition + iter_initiate_audit_full lookup + memory update),
+    but scoped to ``replied_explicit`` only.
+
+    Per the fail-soft contract: any exception is propagated so the caller
+    can log it; the WS handler catches and logs without breaking the chat.
+    """
+    from brain.initiate.audit import (
+        iter_initiate_audit_full,
+        update_audit_state,
+    )
+    from brain.initiate.memory import update_initiate_memory_for_state
+
+    now = datetime.now(UTC).isoformat()
+    update_audit_state(
+        persona_dir, audit_id=audit_id, new_state="replied_explicit", at=now,
+    )
+    matched = next(
+        (r for r in iter_initiate_audit_full(persona_dir) if r.audit_id == audit_id),
+        None,
+    )
+    if matched is None:
+        return
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        update_initiate_memory_for_state(
+            store,
+            audit_id=audit_id,
+            subject=matched.subject,
+            message=matched.tone_rendered,
+            new_state="replied_explicit",
+            ts=now,
+        )
+    finally:
+        store.close()
 
 
 def _close_session_blocking(
@@ -593,6 +661,11 @@ def build_app(
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
+        # Windows WebView2/Chromium can preflight loopback calls from the
+        # Tauri renderer with Access-Control-Request-Private-Network. Without
+        # this, the browser turns an otherwise healthy local bridge into a
+        # generic `Failed to fetch` / "Bridge unreachable" UI error.
+        allow_private_network=True,
     )
 
     # ── H-C: auth + Origin check helpers ──────────────────────────────────
@@ -817,6 +890,290 @@ def build_app(
             raise HTTPException(status_code=404, detail=result["error"])
         return result
 
+    # ── POST /initiate/state — renderer-driven state transitions ─────────
+    _VALID_INITIATE_STATES = frozenset(  # noqa: N806 — local constant
+        {
+            "pending", "delivered", "read",
+            "replied_explicit", "acknowledged_unclear", "unanswered",
+            "dismissed",
+        }
+    )
+
+    @app.post("/initiate/state", dependencies=[Depends(require_http_auth)])
+    async def initiate_state(req: dict[str, Any]) -> dict[str, Any]:
+        """Record a state transition for an initiate audit row.
+
+        Renderer posts ``{audit_id, new_state}`` when a user-visible event
+        happens (mounted, read, dismissed, replied). The endpoint validates
+        new_state, mutates the audit row's delivery block, and re-renders
+        the linked first-person memory so ambient recall reflects current
+        truth.
+        """
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        new_state = req.get("new_state")
+        if (
+            not isinstance(audit_id, str)
+            or not isinstance(new_state, str)
+            or new_state not in _VALID_INITIATE_STATES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid state transition request: {req!r}",
+            )
+        now = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir, audit_id=audit_id, new_state=new_state, at=now,
+        )
+        # Re-render memory if we can locate the audit row's subject + body.
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+            ),
+            None,
+        )
+        if matched is not None:
+            try:
+                store = MemoryStore(
+                    s.persona_dir / "memories.db", integrity_check=False,
+                )
+                try:
+                    update_initiate_memory_for_state(
+                        store,
+                        audit_id=audit_id,
+                        subject=matched.subject,
+                        message=matched.tone_rendered,
+                        new_state=new_state,
+                        ts=now,
+                    )
+                finally:
+                    store.close()
+            except Exception:
+                logger.exception("memory update failed for state transition")
+        return {"ok": True, "new_state": new_state}
+
+    # ── POST /initiate/voice-edit/{accept,reject} ────────────────────────
+    @app.post(
+        "/initiate/voice-edit/accept",
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def voice_edit_accept(req: dict[str, Any]) -> dict[str, Any]:
+        """Apply an accepted voice-edit proposal — three-place write.
+
+        Three writes on accept (all best-effort isolated):
+          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          2. initiate_audit.jsonl — record `replied_explicit` transition.
+          3. crystallizations.db.voice_evolution — durable record of the edit.
+
+        Plus the parallel episodic-memory re-render so ambient recall reflects
+        that the proposal was accepted.
+
+        `with_edits` (optional string) overrides the proposed new_text — Hana
+        re-wrote the edit before accepting. `user_modified=True` in that case.
+        """
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+        from brain.soul.store import SoulStore, VoiceEvolution
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        with_edits = req.get("with_edits")
+        if not isinstance(audit_id, str):
+            raise HTTPException(
+                status_code=422, detail="audit_id required (string)"
+            )
+
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+                and r.kind == "voice_edit_proposal"
+            ),
+            None,
+        )
+        if matched is None or not matched.diff:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no voice-edit audit row for {audit_id}",
+            )
+
+        old_text = _extract_old_text_from_diff(matched.diff)
+        proposed_new_text = _extract_new_text_from_diff(matched.diff)
+        if not old_text:
+            raise HTTPException(
+                status_code=409,
+                detail="cannot apply voice edit: diff has no removed line",
+            )
+
+        user_modified = isinstance(with_edits, str) and with_edits != ""
+        new_text = with_edits if user_modified else proposed_new_text
+
+        # Pre-flight the voice template: existence + old_text presence are
+        # validated BEFORE the audit transition so we don't record a
+        # transition we can't honour. The actual file write happens after
+        # the audit update — see comment below.
+        voice_path = s.persona_dir / "nell-voice.md"
+        if not voice_path.exists():
+            raise HTTPException(
+                status_code=409, detail="nell-voice.md not found"
+            )
+        current = voice_path.read_text(encoding="utf-8")
+        if old_text not in current:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "cannot apply voice edit: old text not present in template"
+                ),
+            )
+        new_content = current.replace(old_text, new_text, 1)
+
+        # Place 1: audit row FIRST — record replied_explicit transition.
+        #
+        # Order rationale: audit transitions are reversible by appending
+        # further transitions; voice-template mutations are not (the file
+        # is the source of truth once written). If the file write below
+        # fails, the audit overstates by one transition — recoverable by
+        # appending a `dismissed` transition with a `voice_write_failed`
+        # reason. The previous ordering (file → audit) had the inverse
+        # failure mode: a successful file write with no audit record,
+        # which is silently unrecoverable.
+        now_iso = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir,
+            audit_id=audit_id,
+            new_state="replied_explicit",
+            at=now_iso,
+        )
+
+        # Place 2: voice template file (atomic via temp+rename).
+        # If this raises after the audit update, the 500 propagates and
+        # leaves the persona in a recoverable state: audit says
+        # "replied_explicit", file unchanged. Hana can re-issue accept
+        # after fixing the underlying disk error.
+        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
+        tmp.write_text(new_content, encoding="utf-8")
+        tmp.replace(voice_path)
+
+        # Place 3: SoulStore voice_evolution.
+        try:
+            soul_store = SoulStore(
+                str(s.persona_dir / "crystallizations.db")
+            )
+            try:
+                soul_store.save_voice_evolution(
+                    VoiceEvolution(
+                        id=f"ve_{audit_id}",
+                        accepted_at=now_iso,
+                        diff=matched.diff,
+                        old_text=old_text,
+                        new_text=new_text,
+                        rationale=matched.decision_reasoning,
+                        evidence=[],
+                        audit_id=audit_id,
+                        user_modified=user_modified,
+                    )
+                )
+            finally:
+                soul_store.close()
+        except Exception:
+            logger.exception(
+                "voice-edit: voice_evolution write failed for %s", audit_id
+            )
+
+        # Parallel episodic memory re-render (degrades gracefully).
+        try:
+            store = MemoryStore(
+                s.persona_dir / "memories.db", integrity_check=False,
+            )
+            try:
+                update_initiate_memory_for_state(
+                    store,
+                    audit_id=audit_id,
+                    subject=matched.subject,
+                    message=matched.tone_rendered,
+                    new_state="replied_explicit",
+                    ts=now_iso,
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.exception(
+                "voice-edit: memory update failed for %s", audit_id
+            )
+
+        return {
+            "ok": True,
+            "applied": new_text,
+            "user_modified": user_modified,
+        }
+
+    @app.post(
+        "/initiate/voice-edit/reject",
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def voice_edit_reject(req: dict[str, Any]) -> dict[str, Any]:
+        """Reject a voice-edit proposal — audit + memory only, no voice write."""
+        from brain.initiate.audit import (
+            iter_initiate_audit_full,
+            update_audit_state,
+        )
+        from brain.initiate.memory import update_initiate_memory_for_state
+
+        s: BridgeAppState = app.state.bridge
+        audit_id = req.get("audit_id")
+        if not isinstance(audit_id, str):
+            raise HTTPException(
+                status_code=422, detail="audit_id required (string)"
+            )
+        now_iso = datetime.now(UTC).isoformat()
+        update_audit_state(
+            s.persona_dir,
+            audit_id=audit_id,
+            new_state="dismissed",
+            at=now_iso,
+        )
+        # Parallel episodic memory re-render so ambient recall sees the
+        # dismissal. Best-effort.
+        matched = next(
+            (
+                r for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id
+            ),
+            None,
+        )
+        if matched is not None:
+            try:
+                store = MemoryStore(
+                    s.persona_dir / "memories.db", integrity_check=False,
+                )
+                try:
+                    update_initiate_memory_for_state(
+                        store,
+                        audit_id=audit_id,
+                        subject=matched.subject,
+                        message=matched.tone_rendered,
+                        new_state="dismissed",
+                        ts=now_iso,
+                    )
+                finally:
+                    store.close()
+            except Exception:
+                logger.exception(
+                    "voice-edit reject: memory update failed for %s",
+                    audit_id,
+                )
+        return {"ok": True}
+
     # ── POST /upload — multimodal image upload ────────────────────────────
     # Image upload limit (matches the spec D2 default; per-persona override
     # via PersonaConfig.image_max_bytes can come later if needed).
@@ -1016,12 +1373,46 @@ def build_app(
                 return
             image_shas = list(raw_shas)
 
+        # Bundle A #4: optional ``reply_to_audit_id`` threads the link from a
+        # banner-driven "↩ reply" through to the chat engine. If present, the
+        # server transitions the audit row + re-renders the linked memory
+        # atomically with the chat turn — replacing the renderer's previous
+        # POST /initiate/state replied_explicit. Must be a string when given.
+        raw_reply_id = req.get("reply_to_audit_id")
+        reply_to_audit_id: str | None = None
+        if raw_reply_id is not None:
+            if not isinstance(raw_reply_id, str) or not raw_reply_id:
+                await ws.send_json(
+                    {"type": "error", "code": "invalid_reply_to_audit_id", "done": True}
+                )
+                await ws.close()
+                return
+            reply_to_audit_id = raw_reply_id
+
         chunk_delay_ms = int(os.environ.get("NELL_STREAM_CHUNK_DELAY_MS", "30"))
 
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
             events.publish("chat_started", session_id=session_id, client=s.client_origin)
+
+            # Bundle A #4: server-side replied_explicit transition. Fires BEFORE
+            # the engine runs so the audit/memory write is atomic with this
+            # chat turn — the renderer no longer posts /initiate/state for
+            # explicit replies. Failure is best-effort: the chat must still
+            # complete even if the audit/memory write fails.
+            if reply_to_audit_id is not None:
+                try:
+                    await asyncio.to_thread(
+                        _apply_replied_explicit_transition,
+                        s.persona_dir,
+                        reply_to_audit_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "replied_explicit transition failed audit_id=%s",
+                        reply_to_audit_id,
+                    )
 
             try:
                 result = await asyncio.to_thread(
@@ -1031,6 +1422,7 @@ def build_app(
                     message,
                     s.provider,
                     image_shas,
+                    reply_to_audit_id,
                 )
             except Exception:
                 logger.exception("stream failed session=%s", session_id)

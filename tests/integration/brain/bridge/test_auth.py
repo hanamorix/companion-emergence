@@ -142,6 +142,32 @@ def test_http_cors_allows_tauri_dev_origin(persona_dir_for_auth: Path, monkeypat
         assert "Authorization" in r.headers["access-control-allow-headers"]
 
 
+def test_http_cors_allows_private_network_preflight_for_tauri_origin(
+    persona_dir_for_auth: Path, monkeypatch,
+):
+    """Windows WebView2 can send Chromium Private Network Access preflights.
+
+    Without Access-Control-Allow-Private-Network: true, Chromium reports the
+    bridge request as a generic `Failed to fetch` even though the daemon is up
+    and CLI health checks work.
+    """
+    _patch_provider(monkeypatch, _FakeProvider())
+    app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
+    with TestClient(app) as c:
+        r = c.options(
+            "/persona/state",
+            headers={
+                "Origin": "http://tauri.localhost",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,content-type",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "http://tauri.localhost"
+        assert r.headers["access-control-allow-private-network"] == "true"
+
+
 def test_http_cors_still_rejects_untrusted_origin(persona_dir_for_auth: Path, monkeypatch):
     _patch_provider(monkeypatch, _FakeProvider())
     app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
