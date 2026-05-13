@@ -31,6 +31,7 @@ from brain.initiate.audit import (
     append_d_call_row,
     read_recent_audit,
     read_recent_d_calls,
+    run_calibration_closer_tick,
     update_audit_state,
 )
 from brain.initiate.compose import (
@@ -318,6 +319,7 @@ def run_initiate_review_tick(
     processing does not block the others.
     """
     now = now or datetime.now(UTC)
+    run_calibration_closer_tick(persona_dir, now=now)
     candidates = read_candidates(persona_dir)[:cap_per_tick]
 
     if not candidates:

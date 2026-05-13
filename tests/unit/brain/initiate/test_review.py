@@ -467,3 +467,21 @@ def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
     assert event["type"] == "d_reflection_drift_detected"
     assert event["current_rate"] == 0.9
     assert event["delta_sigma"] == 3.0
+
+
+def test_run_initiate_review_tick_calls_calibration_closer(tmp_path, monkeypatch):
+    """run_initiate_review_tick should call run_calibration_closer_tick
+    at the start of every pass."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    closer_calls: list = []
+
+    def fake_closer(persona_dir, *, now=None):
+        closer_calls.append(persona_dir)
+
+    monkeypatch.setattr("brain.initiate.review.run_calibration_closer_tick", fake_closer)
+    persona = tmp_path / "p"
+    persona.mkdir()
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="test")
+    assert len(closer_calls) == 1
+    assert closer_calls[0] == persona
