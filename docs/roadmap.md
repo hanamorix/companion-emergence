@@ -1,17 +1,17 @@
 # Roadmap
 
 This roadmap keeps the project's remaining work honest after the
-2026-05-13 v0.0.11-alpha release-readiness pass.
-It is not a public release promise. companion-emergence stays
-private/local-first during development, but as of this refresh it has
-private alpha bundles for macOS arm64, Linux x86_64, and Windows
-x86_64. macOS x86_64 remains source-build-only until GitHub provides a
-reliable hosted Intel runner for this private repo.
-Last refreshed 2026-05-13 after the v0.0.11-alpha local packaging pass.
+2026-05-13 v0.0.11-alpha.4 release and the follow-up desktop hardening pass.
+It is not a release promise. companion-emergence is local-first and now has
+public alpha bundles for macOS arm64, Linux x86_64, and Windows x86_64.
+macOS x86_64 remains source-build-only until a reliable hosted or self-hosted
+Intel runner is available.
+Last refreshed 2026-05-13 after the v0.0.11-alpha.4 public release and desktop
+hardening pass.
 
 ## Current posture
 
-The framework is a private prototype with a working desktop client,
+The framework is a public alpha with a working desktop client,
 a fully multimodal chat path, and a relocatable bundle. Local smoke
 testing covers:
 
@@ -42,7 +42,7 @@ testing covers:
 - SQLite WAL + 5s busy_timeout on MemoryStore + HebbianMatrix +
   WorksStore
 - JSONL readers stream line-by-line (no full-file memory spike)
-- 1972 unit + integration tests; ruff clean
+- 1979 unit + integration tests; ruff clean
 
 **NellFace (Tauri 2 + React 18 + Vite):**
 
@@ -60,8 +60,9 @@ testing covers:
 - 5 left-column panels (inner weather, body, recent interior, soul,
   connection)
 - always-on-top toggle wired to the actual Tauri window API
-- 56 frontend Vitest tests pinning chat, initiate banners, draft-space,
-  voice-edit panels, connection-panel, bridge, wizard, and StepReady behavior
+- 67 frontend Vitest tests pinning chat, initiate banners, draft-space,
+  voice-edit panels, connection-panel, bridge, bridge event reconnect,
+  platform helpers, wizard, and StepReady behavior
 
 **Phase 7 — bundled portable Python runtime:**
 
@@ -94,12 +95,13 @@ testing covers:
 The 2026-05-07 audit cycle (19 issues) is **closed** — all P1/P2
 shipped, both P4 cleanups landed, the JSONL streaming P3 shipped,
 and the cross-platform Phase 7 follow-up wrapped up the public-
-release blocker on the macOS side. What remains:
+release blocker across the current macOS arm64, Linux x86_64, and Windows
+x86_64 bundle matrix. What remains:
 
-**Validation gaps (non-blocking for private alpha):**
+**Validation gaps (non-blocking for public alpha):**
 
 - macOS x86_64 DMG asset — GitHub's Intel macOS runner stayed queued
-  indefinitely for this private repo, so the alpha matrix intentionally
+  indefinitely for this repo, so the alpha matrix intentionally
   excludes it. Intel Mac users build from source for now.
 - Human click-through on Linux x86_64 / Windows x86_64 bundles — not
   available before this alpha. In its place, CI builds the bundles on
@@ -110,8 +112,8 @@ release blocker on the macOS side. What remains:
   `python-runtime` imports `brain` from inside the mounted app, and
   passes `codesign --verify --deep --strict` (`Signature=adhoc`).
 - First-time outside-user testing — the wizard works end-to-end and the
-  bundle smokes pass, but live feedback from someone other than Hana is
-  still the next product signal, not a private-alpha blocker.
+  bundle smokes pass, but broader live feedback is still the next product
+  signal, not a public-alpha blocker.
 
 **Intentionally deferred (design call needed, not urgent):**
 
@@ -180,7 +182,7 @@ natural extensions of the multimodal + bundled-runtime work:
 
 ## Recently shipped (reverse chronological)
 
-**2026-05-13 — Adaptive-D + recall resonance packaged locally (v0.0.11-alpha)**
+**2026-05-13 — Adaptive-D + recall resonance packaged for public alpha (v0.0.11-alpha.1)**
 
 - **Adaptive-D calibration** — D-reflection now records promoted/filtered
   decisions into `d_calibration.jsonl`, tracks D-mode in `d_mode.json`, and

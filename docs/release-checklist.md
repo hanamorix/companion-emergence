@@ -1,6 +1,6 @@
 # Release checklist
 
-This project is private/local-first during development. Before sharing a public build or tagged release, do this checklist instead of relying on ad-hoc local state.
+This project is local-first and privacy-sensitive. Before sharing a public build or tagged release, do this checklist instead of relying on ad-hoc local state.
 
 ## Pre-release verification
 
