@@ -528,6 +528,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
                 embeddings=None,
                 provider=provider,
                 log_path=persona_dir / "dreams.log.jsonl",
+                persona_dir=persona_dir,
                 persona_name=args.persona,
                 persona_system_prompt=(
                     f"You are {args.persona}. You just woke from a dream about "
@@ -1158,6 +1159,129 @@ def _soul_audit_handler(args: argparse.Namespace) -> int:
             print(f"    parse_error: {e['parse_error']}")
         if e.get("forced_defer_reason"):
             print(f"    forced_defer: {e['forced_defer_reason']}")
+    return 0
+
+
+def _initiate_audit_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell initiate audit` — tail or full walk."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+
+    if getattr(args, "full", False):
+        from brain.initiate.audit import iter_initiate_audit_full
+
+        rows = list(iter_initiate_audit_full(persona_dir))
+        header = (
+            f"Initiate audit (full history — {len(rows)} entries across "
+            "active + archives):"
+        )
+    else:
+        from brain.initiate.audit import read_recent_audit
+
+        rows = list(read_recent_audit(persona_dir, window_hours=24 * 7))
+        limit = getattr(args, "limit", 20)
+        rows = rows[-limit:]
+        header = f"Initiate audit (last {len(rows)} entries):"
+
+    print(header)
+    if not rows:
+        print("  (empty)")
+        return 0
+    for r in rows:
+        ts = str(r.ts)[:19].replace("T", " ")
+        state = (r.delivery.get("current_state") if r.delivery else "n/a") or "n/a"
+        print(
+            f"\n  {ts}  {r.decision:<14}  audit_id={r.audit_id}  state={state}"
+        )
+        if r.subject:
+            print(f"    subject: {r.subject[:100]}")
+        if r.decision_reasoning:
+            print(f"    reason:  {r.decision_reasoning[:100]}")
+    return 0
+
+
+def _initiate_candidates_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell initiate candidates` — read the pending queue."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    from brain.initiate.emit import read_candidates
+
+    candidates = read_candidates(persona_dir)
+    print(f"Initiate candidates queue ({len(candidates)} pending):")
+    if not candidates:
+        print("  (empty)")
+        return 0
+    for c in candidates:
+        print(
+            f"\n  {c.ts}  source={c.source}  kind={c.kind}  source_id={c.source_id}"
+        )
+    return 0
+
+
+def _initiate_voice_evolution_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell initiate voice-evolution` — list accepted voice changes."""
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        raise FileNotFoundError(f"No persona directory at {persona_dir}")
+    from brain.soul.store import SoulStore
+
+    store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        evolutions = store.list_voice_evolution()
+    finally:
+        store.close()
+    print(f"Voice evolution ({len(evolutions)} accepted changes):")
+    if not evolutions:
+        print("  (empty)")
+        return 0
+    for v in evolutions:
+        ts = v.accepted_at[:19].replace("T", " ")
+        marker = " (with your edits)" if v.user_modified else ""
+        print(f"\n  {ts}{marker}")
+        print(f"    {v.old_text!r}")
+        print(f"    -> {v.new_text!r}")
+        if v.rationale:
+            print(f"    {v.rationale}")
+    return 0
+
+
+def _initiate_d_stats_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell initiate d-stats` — render D-reflection telemetry."""
+    import re
+    from datetime import UTC, datetime
+
+    from brain.initiate.audit import read_recent_d_calls
+
+    persona_dir = get_persona_dir(args.persona)
+
+    m = re.fullmatch(r"(\d+)([dh])", args.window)
+    if not m:
+        print(f"invalid --window: {args.window!r} (expected e.g. 24h or 7d)")
+        return 2
+    n, unit = int(m.group(1)), m.group(2)
+    hours = n * 24 if unit == "d" else n
+    now = datetime.now(UTC)
+    rows = list(read_recent_d_calls(persona_dir, window_hours=hours, now=now))
+
+    if not rows:
+        print(f"no D calls in last {args.window}")
+        return 0
+
+    total_in = sum(r.candidates_in for r in rows)
+    total_promoted = sum(r.promoted_out for r in rows)
+    total_filtered = sum(r.filtered_out for r in rows)
+    failures = sum(1 for r in rows if r.failure_type)
+    avg_latency = sum(r.latency_ms for r in rows) // max(1, len(rows))
+
+    print(f"D-reflection stats (last {args.window}):")
+    print(f"  ticks={len(rows)}")
+    print(f"  candidates_in={total_in}")
+    print(f"  promoted_out={total_promoted}")
+    print(f"  filtered_out={total_filtered}")
+    print(f"  failures={failures}")
+    print(f"  avg_latency_ms={avg_latency}")
     return 0
 
 
@@ -2252,6 +2376,54 @@ def _build_parser() -> argparse.ArgumentParser:
         "Use to see every decision Nell has ever made about her own soul.",
     )
     sl_audit.set_defaults(func=_soul_audit_handler)
+
+    # nell initiate ...
+    initiate_sub = subparsers.add_parser(
+        "initiate", help="Inspect Nell's autonomous-outbound state."
+    )
+    initiate_actions = initiate_sub.add_subparsers(
+        dest="initiate_action", required=True
+    )
+
+    # nell initiate audit
+    il_audit = initiate_actions.add_parser(
+        "audit", help="Tail initiate_audit.jsonl entries."
+    )
+    il_audit.add_argument("--persona", required=True)
+    il_audit.add_argument("--limit", type=int, default=20)
+    il_audit.add_argument(
+        "--full",
+        action="store_true",
+        help="Walk active + every yearly archive chronologically.",
+    )
+    il_audit.set_defaults(func=_initiate_audit_handler)
+
+    # nell initiate candidates
+    il_cands = initiate_actions.add_parser(
+        "candidates", help="List pending initiate_candidates.jsonl entries."
+    )
+    il_cands.add_argument("--persona", required=True)
+    il_cands.set_defaults(func=_initiate_candidates_handler)
+
+    # nell initiate voice-evolution
+    il_ve = initiate_actions.add_parser(
+        "voice-evolution",
+        help="List voice-template changes Nell has accepted.",
+    )
+    il_ve.add_argument("--persona", required=True)
+    il_ve.set_defaults(func=_initiate_voice_evolution_handler)
+
+    # nell initiate d-stats
+    il_ds = initiate_actions.add_parser(
+        "d-stats", help="D-reflection telemetry over a time window."
+    )
+    il_ds.add_argument(
+        "--window",
+        default="7d",
+        help="Window like '7d' or '24h' (default: 7d)",
+    )
+    il_ds.add_argument("--persona", required=True)
+    il_ds.set_defaults(func=_initiate_d_stats_handler)
 
     # nell chat — keystone chat engine (SP-6)
     chat_sub = subparsers.add_parser(

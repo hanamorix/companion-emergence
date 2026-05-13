@@ -407,3 +407,37 @@ def test_throttle_boundary_at_exactly_threshold() -> None:
     last = datetime(2026, 4, 21, tzinfo=UTC)
     now = last + timedelta(days=7)  # exactly 7 days
     assert _should_run_growth_tick(last_tick=last, now=now, throttle_days=7.0) is True
+
+
+def test_vocabulary_crystallization_emits_initiate_candidate(
+    persona_dir: Path, store: MemoryStore,
+) -> None:
+    """After vocabulary crystallization commits, emit a candidate.
+
+    Phase 4.2 — the emit fires inside scheduler.run_growth_tick immediately
+    after _append_to_vocabulary + append_growth_event, so it lives at the
+    actual SoulStore-commit point for vocabulary changes.
+    """
+    from brain.initiate.emit import read_candidates
+
+    _seed_vocab(persona_dir)
+    proposal = EmotionProposal(
+        name="lingering",
+        description="the slow trail of warmth after a loved person leaves the room",
+        decay_half_life_days=7.0,
+        evidence_memory_ids=("mem_a", "mem_b"),
+        score=0.78,
+        relational_context="recurred during Hana's tender messages",
+    )
+    with patch(
+        "brain.growth.scheduler.crystallize_vocabulary",
+        return_value=[proposal],
+    ):
+        run_growth_tick(persona_dir, store, datetime.now(UTC))
+
+    candidates = read_candidates(persona_dir)
+    assert any(
+        c.source == "crystallization"
+        and c.source_id == "vocabulary_emotion:lingering"
+        for c in candidates
+    )

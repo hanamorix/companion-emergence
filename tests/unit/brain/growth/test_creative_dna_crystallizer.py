@@ -240,3 +240,32 @@ def test_behavioral_log_entry_written_on_acceptance(persona_dir, store, hebbian)
     assert len(log) == 1
     assert log[0]["kind"] == "creative_dna_emerging_added"
     assert log[0]["name"] == "valid emerging name"
+
+
+def test_creative_dna_crystallization_emits_initiate_candidate(
+    persona_dir, store, hebbian,
+):
+    """After an accepted creative_dna change commits, emit a candidate."""
+    from brain.initiate.emit import read_candidates
+
+    response = json.dumps({
+        "emerging_additions": [{
+            "name": "intentional sentence fragments",
+            "reasoning": "appeared in 3 recent fiction sessions distinct from previous patterns",
+            "evidence_memory_ids": ["mem_a", "mem_b", "mem_c"],
+        }],
+        "emerging_promotions": [],
+        "active_demotions": [],
+    })
+    crystallize_creative_dna(
+        store=store, persona_dir=persona_dir,
+        provider=_FakeProvider(response), persona_name="t",
+        now=datetime.now(UTC),
+    )
+
+    candidates = read_candidates(persona_dir)
+    assert any(
+        c.source == "crystallization"
+        and c.source_id == "creative_dna_addition:intentional sentence fragments"
+        for c in candidates
+    )

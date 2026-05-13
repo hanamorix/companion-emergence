@@ -7,11 +7,35 @@ which sets revoked_at + revoked_reason but keeps the row in the DB (soft delete)
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.soul.crystallization import Crystallization
+
+
+@dataclass
+class VoiceEvolution:
+    """An accepted voice-template edit, recorded for posterity.
+
+    `accepted_at` is an ISO-8601 timestamp string (UTC). `evidence` is a list
+    of opaque source identifiers (dream ids, crystallization ids, tone-shift
+    ids) that motivated the edit. `audit_id` links back to the initiate
+    audit row. `user_modified` distinguishes edits the user re-wrote before
+    accepting from edits accepted verbatim.
+    """
+
+    id: str
+    accepted_at: str
+    diff: str
+    old_text: str
+    new_text: str
+    rationale: str
+    evidence: list[str]
+    audit_id: str
+    user_modified: bool
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS crystallizations (
@@ -150,6 +174,75 @@ class SoulStore:
                 "SELECT COUNT(*) FROM crystallizations WHERE revoked_at IS NULL"
             ).fetchone()[0]
         )
+
+    def _ensure_voice_evolution_table(self) -> None:
+        """Create the voice_evolution table lazily on first use."""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_evolution (
+                id              TEXT PRIMARY KEY,
+                accepted_at     TEXT NOT NULL,
+                diff            TEXT NOT NULL,
+                old_text        TEXT NOT NULL,
+                new_text        TEXT NOT NULL,
+                rationale       TEXT NOT NULL,
+                evidence_json   TEXT NOT NULL,
+                audit_id        TEXT NOT NULL,
+                user_modified   INTEGER NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+
+    def save_voice_evolution(self, ev: VoiceEvolution) -> None:
+        """Persist a voice_evolution record. Idempotent on id (INSERT OR REPLACE)."""
+        self._ensure_voice_evolution_table()
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO voice_evolution
+                (id, accepted_at, diff, old_text, new_text, rationale,
+                 evidence_json, audit_id, user_modified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ev.id,
+                ev.accepted_at,
+                ev.diff,
+                ev.old_text,
+                ev.new_text,
+                ev.rationale,
+                json.dumps(ev.evidence),
+                ev.audit_id,
+                1 if ev.user_modified else 0,
+            ),
+        )
+        self._conn.commit()
+
+    def list_voice_evolution(self) -> list[VoiceEvolution]:
+        """Return all voice_evolution records, oldest accepted_at first."""
+        self._ensure_voice_evolution_table()
+        rows = self._conn.execute(
+            """
+            SELECT id, accepted_at, diff, old_text, new_text,
+                   rationale, evidence_json, audit_id, user_modified
+            FROM voice_evolution
+            ORDER BY accepted_at ASC
+            """
+        ).fetchall()
+        return [
+            VoiceEvolution(
+                id=r[0],
+                accepted_at=r[1],
+                diff=r[2],
+                old_text=r[3],
+                new_text=r[4],
+                rationale=r[5],
+                evidence=json.loads(r[6]) if r[6] else [],
+                audit_id=r[7],
+                user_modified=bool(r[8]),
+            )
+            for r in rows
+        ]
 
     def __enter__(self) -> SoulStore:
         return self

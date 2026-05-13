@@ -50,9 +50,11 @@ from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
 )
+from brain.initiate.review import run_initiate_review_tick
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,8 @@ def run_folded(
     finalize_after_hours: float = 24.0,
     finalize_interval_s: float | None = 3600.0,
     log_rotation_interval_s: float | None = 3600.0,
+    initiate_review_interval_s: float | None = 900.0,
+    voice_reflection_interval_s: float | None = 86400.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -113,6 +117,12 @@ def run_folded(
     )
     last_log_rotation_at = (
         time.monotonic() if log_rotation_interval_s is not None else None
+    )
+    last_initiate_review_at = (
+        time.monotonic() if initiate_review_interval_s is not None else None
+    )
+    last_voice_reflection_at = (
+        time.monotonic() if voice_reflection_interval_s is not None else None
     )
     while not stop_event.is_set():
         try:
@@ -230,6 +240,36 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor log-rotation tick raised")
             last_log_rotation_at = time.monotonic()
+
+        # Initiate review cadence — mirrors soul_review. Per-pass cost cap
+        # (3 candidates max). Fault-isolated.
+        if (
+            initiate_review_interval_s is not None
+            and last_initiate_review_at is not None
+            and time.monotonic() - last_initiate_review_at
+            >= initiate_review_interval_s
+        ):
+            try:
+                _run_initiate_review_tick(persona_dir, provider, event_bus)
+            except Exception:
+                logger.exception("supervisor initiate-review tick raised")
+            last_initiate_review_at = time.monotonic()
+
+        # Voice-reflection cadence — daily by default. Gathers last 7 days
+        # of crystallizations + dreams + message tones and may emit a
+        # voice-edit candidate (gated by >=3 evidence items inside the
+        # reflection tick itself). Fault-isolated.
+        if (
+            voice_reflection_interval_s is not None
+            and last_voice_reflection_at is not None
+            and time.monotonic() - last_voice_reflection_at
+            >= voice_reflection_interval_s
+        ):
+            try:
+                _run_voice_reflection_tick(persona_dir, provider, event_bus)
+            except Exception:
+                logger.exception("supervisor voice-reflection tick raised")
+            last_voice_reflection_at = time.monotonic()
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -436,6 +476,129 @@ def _run_finalize_tick(
         )
 
 
+def _run_initiate_review_tick(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus | object,
+) -> None:
+    """Build voice template + invoke run_initiate_review_tick.
+
+    Mirrors _run_soul_review_tick's per-tick store-ownership pattern.
+    Reads ``nell-voice.md`` from the persona dir (empty string if absent)
+    and ``initiate_review_cap_per_tick`` from PersonaConfig (default 3).
+    Publishes an ``initiate_review_tick`` event on success.
+    """
+    voice_path = persona_dir / "nell-voice.md"
+    voice_template = (
+        voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
+    )
+    try:
+        config = PersonaConfig.load(persona_dir / "persona_config.json")
+        cap_per_tick = getattr(config, "initiate_review_cap_per_tick", 3) or 3
+    except Exception:
+        cap_per_tick = 3
+    run_initiate_review_tick(
+        persona_dir,
+        provider=provider,
+        voice_template=voice_template,
+        cap_per_tick=cap_per_tick,
+    )
+    event_bus.publish(
+        {
+            "type": "initiate_review_tick",
+            "at": _now_iso(),
+        }
+    )
+
+
+def _run_voice_reflection_tick(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus | object,
+) -> None:
+    """Gather inputs and invoke run_voice_reflection_tick.
+
+    Reads the last 7 days of crystallizations (from SoulStore), dreams
+    (from ``dreams.log.jsonl``), and recent message tones (placeholder
+    for v0.0.9 — empty list until the chat-turn tone schema lands).
+    Publishes a ``voice_reflection_tick`` event on success.
+    """
+    from brain.initiate.voice_reflection import run_voice_reflection_tick
+
+    crystallizations = _read_recent_crystallizations(persona_dir, days=7)
+    dreams = _read_recent_dreams(persona_dir, days=7)
+    recent_tones = _read_recent_message_tones(persona_dir, days=7)
+    run_voice_reflection_tick(
+        persona_dir,
+        provider=provider,
+        crystallizations=crystallizations,
+        dreams=dreams,
+        recent_tones=recent_tones,
+    )
+    event_bus.publish(
+        {
+            "type": "voice_reflection_tick",
+            "at": _now_iso(),
+        }
+    )
+
+
+def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
+    """Read recent crystallization summaries from SoulStore.
+
+    Returns a list of ``{"id": ..., "ts": iso8601}`` dicts for
+    crystallizations created within the last ``days`` days. Failures
+    swallowed — reflection still fires with whatever evidence exists.
+    """
+    from datetime import timedelta
+
+    from brain.soul.store import SoulStore
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    try:
+        store = SoulStore(str(persona_dir / "crystallizations.db"))
+        try:
+            out: list[dict] = []
+            for c in store.list_active():
+                ts = c.crystallized_at.isoformat()
+                if ts >= cutoff:
+                    out.append({"id": c.id, "ts": ts})
+            return out
+        finally:
+            store.close()
+    except Exception:
+        return []
+
+
+def _read_recent_dreams(persona_dir: Path, days: int) -> list[dict]:
+    """Read recent dream entries from ``dreams.log.jsonl``."""
+    from datetime import timedelta
+
+    from brain.health.jsonl_reader import iter_jsonl_streaming
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    out: list[dict] = []
+    try:
+        for raw in iter_jsonl_streaming(persona_dir / "dreams.log.jsonl"):
+            ts = raw.get("at") or raw.get("ts")
+            if ts and ts >= cutoff:
+                out.append({"id": raw.get("dream_id") or raw.get("id"), "ts": ts})
+    except Exception:
+        return []
+    return out
+
+
+def _read_recent_message_tones(persona_dir: Path, days: int) -> list[dict]:
+    """Read recent Nell-authored chat turn tones — placeholder for v0.0.9.
+
+    Real implementation requires schema on the chat-turn log we don't
+    currently have. For v0.0.9, return an empty list; voice reflection
+    still fires but with less material. Revisit when chat-turn tone
+    tracking is added.
+    """
+    return []
+
+
 # Per-log retention policies. Bake the cadence-tick policies here so the
 # supervisor doesn't need a config file; defaults reflect Hana's 2026-05-11
 # decisions (5 MB rolling cap; 3 archives for heartbeats, 5 for dreams +
@@ -445,7 +608,12 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("dreams.log.jsonl", 5),
     ("emotion_growth.log.jsonl", 5),
 )
-_SOUL_AUDIT_LOG = "soul_audit.jsonl"
+# Yearly-archive logs are kept forever — reader walks active + every archive
+# so every decision / initiation event stays reachable.
+_YEARLY_ARCHIVE_LOGS: tuple[tuple[str, str], ...] = (
+    ("soul_audit.jsonl", "ts"),
+    ("initiate_audit.jsonl", "ts"),
+)
 _DEFAULT_ROLLING_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
@@ -500,35 +668,35 @@ def _run_log_rotation_tick(
                 }
             )
 
-    # Soul audit — yearly archive, archives kept forever. Reader (iter_audit_full)
-    # walks active + every archive so every decision stays reachable.
-    audit_path = persona_dir / _SOUL_AUDIT_LOG
-    try:
-        archives = rotate_age_archive_yearly(
-            audit_path, now=now, timestamp_field="ts"
-        )
-    except Exception as exc:
-        logger.exception("soul_audit yearly rotation failed: %s", exc)
-        event_bus.publish(
-            {
-                "type": "log_rotation",
-                "log": _SOUL_AUDIT_LOG,
-                "action": "failed",
-                "error": str(exc),
-                "at": _now_iso(),
-            }
-        )
-        return
-    for archive in archives:
-        event_bus.publish(
-            {
-                "type": "log_rotation",
-                "log": _SOUL_AUDIT_LOG,
-                "action": "archived",
-                "archive": archive.name,
-                "at": _now_iso(),
-            }
-        )
+    # Yearly-archive logs (forever-keep): soul_audit + initiate_audit.
+    for log_name, ts_field in _YEARLY_ARCHIVE_LOGS:
+        audit_path = persona_dir / log_name
+        try:
+            archives = rotate_age_archive_yearly(
+                audit_path, now=now, timestamp_field=ts_field
+            )
+        except Exception as exc:
+            logger.exception("%s yearly rotation failed: %s", log_name, exc)
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "failed",
+                    "error": str(exc),
+                    "at": _now_iso(),
+                }
+            )
+            continue
+        for archive in archives:
+            event_bus.publish(
+                {
+                    "type": "log_rotation",
+                    "log": log_name,
+                    "action": "archived",
+                    "archive": archive.name,
+                    "at": _now_iso(),
+                }
+            )
 
 
 def _now_iso() -> str:
