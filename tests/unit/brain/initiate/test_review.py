@@ -408,3 +408,62 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
     run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick3_time)
     assert len(compose_calls) == 1
     assert "ic_" in compose_calls[0]  # candidate_id is always ic_<timestamp>_<rand>
+
+
+def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
+    """When detect_drift returns a DriftAlert, the review tick should
+    emit a structured supervisor event."""
+    from datetime import UTC, datetime
+
+    from brain.initiate.adaptive import DriftAlert
+    from brain.initiate.d_call_schema import DCallRow
+    from brain.initiate.emit import emit_initiate_candidate
+    from brain.initiate.reflection import DDecision, DReflectionResult
+    from brain.initiate.review import run_initiate_review_tick
+    from brain.initiate.schemas import SemanticContext
+
+    persona = tmp_path / "p"
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+    emit_initiate_candidate(
+        persona, kind="message", source="dream", source_id="d1",
+        semantic_context=SemanticContext(), now=now,
+    )
+
+    def fake_reflection_run(candidates, *, deps):
+        return (
+            DReflectionResult(
+                decisions=[DDecision(1, "promote", "x", "high")],
+                tick_note=None,
+            ),
+            DCallRow(
+                d_call_id="dc", ts=now.isoformat(), tick_id="t",
+                model_tier_used="haiku", candidates_in=1,
+                promoted_out=1, filtered_out=0,
+                latency_ms=10, tokens_input=10, tokens_output=10,
+            ),
+        )
+
+    def fake_detect_drift(persona_dir):
+        return DriftAlert(
+            current_rate=0.9,
+            historical_median=0.3,
+            delta_sigma=3.0,
+        )
+
+    captured_events: list[dict] = []
+
+    def fake_emit_supervisor_event(event: dict) -> None:
+        captured_events.append(event)
+
+    monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
+    monkeypatch.setattr("brain.initiate.review.detect_drift", fake_detect_drift)
+    monkeypatch.setattr("brain.initiate.review._emit_supervisor_event", fake_emit_supervisor_event)
+    monkeypatch.setattr("brain.initiate.review._process_one_candidate", lambda *a, **k: None)
+
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=now)
+
+    assert len(captured_events) == 1
+    event = captured_events[0]
+    assert event["type"] == "d_reflection_drift_detected"
+    assert event["current_rate"] == 0.9
+    assert event["delta_sigma"] == 3.0
