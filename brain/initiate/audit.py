@@ -184,3 +184,106 @@ def read_recent_d_calls(
                 continue
             if row_ts >= cutoff:
                 yield row
+
+
+# Decision values that mark D-promoted rows.
+_D_PROMOTED_DECISIONS: frozenset[str] = frozenset({
+    "promoted_by_d",
+    "promoted_by_d_malformed_fallback",
+    "promoted_by_d_after_3_failures",
+})
+
+# Decision values that mark D-filtered rows (used by Pass 2 in T11).
+_D_FILTERED_DECISIONS: frozenset[str] = frozenset({
+    "filtered_pre_compose",
+    "filtered_pre_compose_low_confidence",
+    "filtered_d_budget",
+})
+
+# Delivery states that count as "terminal" for promoted candidates.
+_TERMINAL_STATES: frozenset[str] = frozenset({
+    "replied_explicit",
+    "acknowledged_unclear",
+    "unanswered",
+    "dismissed",
+})
+
+
+def run_calibration_closer_tick(
+    persona_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Walk recent audit rows, write d_calibration.jsonl rows for D
+    decisions that have reached terminal state.
+
+    Pass 1: promoted-by-D rows where delivery.current_state is in
+    _TERMINAL_STATES.
+
+    Pass 2 (T11): filtered-by-D rows where 48h has elapsed since the
+    decision timestamp.
+
+    Idempotent: dedupes against existing calibration rows via candidate_id.
+    """
+    from brain.initiate.adaptive import (
+        CalibrationRow,
+        append_calibration_row,
+        read_recent_calibration_rows,
+    )
+
+    now = now or datetime.now(UTC)
+
+    # Build dedupe set from existing calibration rows.
+    seen_ids = {
+        r.candidate_id
+        for r in read_recent_calibration_rows(persona_dir, limit=500)
+    }
+
+    # Pass 1 — promoted-by-D rows that have reached terminal.
+    for audit_row in read_recent_audit(persona_dir, window_hours=24 * 90, now=now):
+        if audit_row.decision not in _D_PROMOTED_DECISIONS:
+            continue
+        if audit_row.candidate_id in seen_ids:
+            continue
+        delivery = audit_row.delivery or {}
+        current_state = delivery.get("current_state")
+        if current_state not in _TERMINAL_STATES:
+            continue
+        # Closure timestamp: the state_transitions entry for current_state.
+        ts_closed = now.isoformat()
+        for transition in delivery.get("state_transitions", []):
+            if transition.get("to") == current_state:
+                ts_closed = transition.get("at", ts_closed)
+
+        cal = CalibrationRow(
+            ts_decision=audit_row.ts,
+            ts_closed=ts_closed,
+            candidate_id=audit_row.candidate_id,
+            source=_extract_source_from_decision(audit_row),
+            decision="promote",
+            confidence=_extract_confidence(audit_row),
+            model_tier=_extract_model_tier(audit_row),
+            promoted_to_state=current_state,
+            filtered_recurred=None,
+            reason_short=audit_row.decision_reasoning[:80],
+        )
+        append_calibration_row(persona_dir, cal)
+        seen_ids.add(audit_row.candidate_id)
+
+
+def _extract_source_from_decision(audit_row: AuditRow) -> str:
+    """Best-effort extract candidate source from gate_check; 'unknown' fallback.
+
+    v0.0.10 audit rows don't currently carry source directly.
+    """
+    return audit_row.gate_check.get("source", "unknown")
+
+
+def _extract_confidence(audit_row: AuditRow) -> str:
+    """Best-effort extract D's confidence from gate_check; 'high' fallback."""
+    return audit_row.gate_check.get("d_confidence", "high")
+
+
+def _extract_model_tier(audit_row: AuditRow) -> str:
+    """Best-effort extract D's model tier from gate_check; 'haiku' fallback."""
+    return audit_row.gate_check.get("d_model_tier", "haiku")
