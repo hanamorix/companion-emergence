@@ -442,3 +442,64 @@ def test_demote_to_draft_space_writes_fragment(tmp_path):
     assert 'd_reason: "private weather; passing through"' in text
     assert "source: reflex_firing" in text
     assert "source_id: rfx_001" in text
+
+
+def test_build_system_message_stateless_omits_calibration_block(tmp_path):
+    from brain.initiate.reflection import build_system_message
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    # No d_mode.json => stateless.
+    msg = build_system_message(
+        companion_name="Nell",
+        user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        persona_dir=persona,
+    )
+    assert "=== Your recent editorial track record ===" not in msg
+    assert "Nell's own physiology" in msg
+
+
+def test_build_system_message_adaptive_includes_calibration_block(tmp_path):
+    from brain.initiate.adaptive import (
+        CalibrationRow,
+        append_calibration_row,
+    )
+    from brain.initiate.reflection import build_system_message
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    # Seed one calibration row + flip the mode.
+    append_calibration_row(persona, CalibrationRow(
+        ts_decision="2026-05-13T10:00:00+00:00",
+        ts_closed="2026-05-13T11:00:00+00:00",
+        candidate_id="ic_x", source="dream",
+        decision="promote", confidence="high", model_tier="haiku",
+        promoted_to_state="replied_explicit", filtered_recurred=None,
+        reason_short="x",
+    ))
+    (persona / "d_mode.json").write_text('{"mode": "adaptive"}')
+
+    msg = build_system_message(
+        companion_name="Nell",
+        user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        persona_dir=persona,
+    )
+    assert "=== Your recent editorial track record ===" in msg
+    assert "1 reached replied_explicit  ← Hana engaged" in msg
+    # Static frame still present.
+    assert "Nell's own physiology" in msg
+
+
+def test_build_system_message_persona_dir_none_omits_calibration_block(tmp_path):
+    """Back-compat: calling without persona_dir works for older callers."""
+    from brain.initiate.reflection import build_system_message
+
+    msg = build_system_message(
+        companion_name="Nell",
+        user_name="Hana",
+        voice_template_path=tmp_path / "voice.md",
+        persona_dir=None,
+    )
+    assert "=== Your recent editorial track record ===" not in msg
