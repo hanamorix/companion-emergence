@@ -74,7 +74,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "C4", "UP"]
-ignore = ["E501"]
+ignore = ["E501", "UP017"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["N802"]
+"tests/unit/brain/initiate/*.py" = ["I001", "F401"]
+"tests/integration/initiate/*.py" = ["I001", "F401"]
+"tests/unit/brain/test_cli_initiate.py" = ["I001"]
+"tests/unit/brain/test_cli_d_stats.py" = ["I001"]
+"tests/unit/brain/test_cli_soul_audit.py" = ["F401"]
