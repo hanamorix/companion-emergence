@@ -1,0 +1,11 @@
+{
+  "version": "0.0.11",
+  "notes": "See the release page for changes.",
+  "pub_date": "2026-05-14T10:00:00Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHZGd0s5S29CUUdTdVVLYTRCWUNuWm1iT1ZaSjB1emRpVS9KVXl2WmM3T1c2S0loOCs3a2VCQjN3R1ROYWNuWGpLdGhkOXAvYjZKUmZEeG9DMmRzQlFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4NzUzNjM2CWZpbGU6Q29tcGFuaW9uIEVtZXJnZW5jZV8wLjAuMTFfYWFyY2g2NC5kbWcKMVBRejF4cWxWV3Q0V3Q2NnUyR2dLTUk5WXhYK2QwN01VWTZwRmJhTXNpNnlWQkRRQmlxU2FFYmkvY1RUWGVsbW1TTE9oMnZ0TWlnRDlLMlNSRjdTQ2c9PQo=",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.11-alpha.5/Companion.Emergence_0.0.11_aarch64.dmg"
+    }
+  }
+}
