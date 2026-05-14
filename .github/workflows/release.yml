@@ -12,6 +12,10 @@ on:
       tag:
         description: 'Existing version tag to build and attach to the release (e.g. v0.1.0)'
         required: true
+      debug:
+        description: 'Build with devtools enabled (for Windows testers to see console errors)'
+        type: boolean
+        default: false
 
 # Cross-platform Phase 7 release pipeline. Builds Companion Emergence.app /
 # .deb / .msi by running app/build_python_runtime.sh as part of
@@ -185,6 +189,21 @@ jobs:
 
       - name: Build Python wheel + sync uv env
         run: uv sync --all-extras --locked
+
+      - name: Enable devtools (debug build)
+        if: ${{ inputs.debug }}
+        working-directory: app/src-tauri
+        run: |
+          # Add devtools to tauri features so release builds show a
+          # console on Windows.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            sed -i '' 's/features = \["macos-private-api"\]/features = ["macos-private-api", "devtools"]/' Cargo.toml
+          else
+            sed -i 's/features = \["macos-private-api"\]/features = ["macos-private-api", "devtools"]/' Cargo.toml
+          fi
+          echo "=== Cargo.toml tauri line ==="
+          grep '^tauri =' Cargo.toml || true
+        shell: bash
 
       - name: Build Tauri bundle (runs build_python_runtime.sh
               via beforeBuildCommand)
