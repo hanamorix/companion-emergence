@@ -361,8 +361,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG || inputs.tag }}
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export VERSION="${RELEASE_TAG#v}"
+          export PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           python3 -c "
           import json, glob, os, sys
           version = os.environ.get('VERSION', '0.0.0')
