@@ -1287,4 +1287,3 @@ mod tests {
         assert!(args.contains(&"my_companion".to_string()));
     }
 }
-

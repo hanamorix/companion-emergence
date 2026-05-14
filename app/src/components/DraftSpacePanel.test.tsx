@@ -19,4 +19,3 @@ describe("DraftSpacePanel", () => {
     expect(screen.getByText(/no drafts yet/i)).toBeInTheDocument();
   });
 });
-

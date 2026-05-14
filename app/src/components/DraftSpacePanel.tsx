@@ -20,4 +20,3 @@ export function DraftSpacePanel({ markdown }: Props) {
     </aside>
   );
 }
-

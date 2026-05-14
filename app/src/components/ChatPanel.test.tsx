@@ -536,4 +536,3 @@ describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
     expect(repliedExplicitPost).toBeUndefined();
   });
 });
-

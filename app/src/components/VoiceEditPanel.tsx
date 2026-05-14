@@ -68,4 +68,3 @@ export function VoiceEditPanel({ proposal, onAccept, onReject }: Props) {
     </aside>
   );
 }
-

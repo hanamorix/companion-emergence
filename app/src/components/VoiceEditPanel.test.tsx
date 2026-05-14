@@ -49,4 +49,3 @@ describe("VoiceEditPanel", () => {
     expect(onReject).toHaveBeenCalledWith("ia_ve_001");
   });
 });
-
