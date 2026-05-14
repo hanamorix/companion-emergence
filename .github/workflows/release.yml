@@ -406,6 +406,8 @@ jobs:
 
       - name: Update latest-release branch
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           cp "$RUNNER_TEMP/latest.json" latest.json
           git add latest.json
           git diff --staged --quiet || git commit -m "latest.json for ${RELEASE_TAG}"
