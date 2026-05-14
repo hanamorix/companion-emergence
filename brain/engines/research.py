@@ -6,6 +6,7 @@ This module ships the types + engine scaffold. run_tick body lands in Task 3.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,10 +17,55 @@ from brain.engines._interests import Interest, InterestSet
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
+from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
+
+_TOPIC_OVERLAP_SYSTEM = """\
+You are a relevance scorer for an autonomous companion's research engine.
+You will be given (1) a research thread that just matured, and (2) recent
+conversation excerpts. Return a JSON object with a single field: score,
+a float in [0.0, 1.0] indicating how relevant the research thread is
+to the recent conversation.
+
+  0.0 = entirely unrelated to anything {user_name} has been near
+  0.5 = thematic adjacency, no direct overlap
+  1.0 = directly addresses something {user_name} mentioned
+
+Be conservative — default toward the low end unless the connection
+is clearly present. Return ONLY the JSON object, no other text."""
+
+
+def _compute_topic_overlap_via_haiku(
+    *,
+    thread_topic: str,
+    thread_summary: str,
+    recent_conversation_excerpt: str,
+    provider,
+    user_name: str,
+) -> float:
+    """Score how relevant a matured research thread is to recent conversation."""
+    system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
+    prompt = (
+        "=== Research thread ===\n"
+        f"Topic: {thread_topic}\n"
+        f"Summary: {thread_summary}\n\n"
+        "=== Recent conversation (last 48 hours, oldest first) ===\n"
+        f"{recent_conversation_excerpt}\n\n"
+        "=== Your task ===\n"
+        'Return: {"score": <float in [0.0, 1.0]>}'
+    )
+
+    try:
+        raw = provider.generate(prompt, system=system)
+        data = json.loads(extract_json_object(raw))
+        score = float(data["score"])
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+        logger.warning("topic_overlap haiku call failed (%s); returning 0.0", exc)
+        return 0.0
+    return max(0.0, min(1.0, score))
 
 
 # ---------- Types ----------
@@ -239,6 +285,27 @@ class ResearchEngine:
         )
         log.appended(fire).save(self.research_log_path)
 
+        # D-reflection Task 18: emit research_completion initiate candidate (gated).
+        # Best-effort: gate/emit failure does NOT prevent the research fire.
+        user_name = "you"
+        try:
+            from brain.persona_config import PersonaConfig
+
+            cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
+            user_name = cfg.user_name or user_name
+        except Exception:
+            user_name = "you"
+
+        _emit_research_candidate(
+            persona_dir=self.interests_path.parent,
+            interest=winner,
+            mem_id=mem.id,
+            summary_excerpt=raw[:1000],
+            provider=self.provider,
+            user_name=user_name,
+            now=now,
+        )
+
         return ResearchResult(
             fired=fire,
             would_fire=None,
@@ -349,6 +416,157 @@ def _create_research_memory(
             "searcher": searcher_name,
         },
     )
+
+
+def _emit_research_candidate(
+    *,
+    persona_dir: Path,
+    interest: Interest,
+    mem_id: str,
+    summary_excerpt: str,
+    provider: LLMProvider,
+    user_name: str,
+    now: datetime,
+) -> None:
+    """Gate-check and emit a research_completion initiate candidate.
+
+    Builds a minimal Protocol-satisfying adapter from the research fire data.
+    Best-effort: any exception is logged at WARNING; the research fire
+    already succeeded before this is called.
+
+    Field mapping for ResearchThreadLike:
+    - thread_id                = mem_id (the output memory id — unique per fire)
+    - topic                    = interest.topic
+    - maturity_score           = interest.pull_score / 10.0 (pull 6-10 → 0.6-1.0)
+    - summary_excerpt          = first 1000 chars of generated research memory
+    - linked_memory_ids        = [mem_id] (the output memory just written)
+    - completed_at             = now
+    - previously_linked_to_audit  = checked against existing research_completion candidates
+
+    topic_overlap_score is computed via Haiku against the recent conversation
+    excerpt before the research-completion gates run.
+    """
+    try:
+        from brain.initiate.ambient import build_recent_conversation_excerpt
+        from brain.initiate.emit import read_candidates
+        from brain.initiate.new_sources import (
+            check_shared_meta_gates,
+            emit_research_completion_candidate,
+            gate_research_completion,
+            load_gate_thresholds,
+            write_gate_rejection,
+        )
+
+        # Determine previously_linked_to_audit: True if a research_completion
+        # candidate with the same source_id (mem_id) already exists in the queue.
+        existing = read_candidates(persona_dir)
+        prev_linked = any(
+            c.source == "research_completion" and c.source_id == mem_id
+            for c in existing
+        )
+
+        # Build a minimal Protocol-conformant adapter (inline dataclass).
+        @dataclass
+        class _ResearchThreadAdapter:
+            thread_id: str
+            topic: str
+            maturity_score: float
+            summary_excerpt: str
+            linked_memory_ids: list[str]
+            completed_at: datetime
+            previously_linked_to_audit: bool
+
+        thread = _ResearchThreadAdapter(
+            thread_id=mem_id,
+            topic=interest.topic,
+            maturity_score=min(interest.pull_score / 10.0, 1.0),
+            summary_excerpt=summary_excerpt,
+            linked_memory_ids=[mem_id],
+            completed_at=now,
+            previously_linked_to_audit=prev_linked,
+        )
+
+        thresholds = load_gate_thresholds(persona_dir)
+
+        preflight_ok, preflight_reason = gate_research_completion(
+            persona_dir,
+            thread=thread,
+            now=now,
+            topic_overlap_score=thresholds.research_topic_overlap_min,
+            thresholds=thresholds,
+        )
+        if not preflight_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=preflight_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        recent_excerpt = build_recent_conversation_excerpt(
+            persona_dir,
+            hours=48,
+            max_chars=2000,
+        )
+        topic_overlap_score = _compute_topic_overlap_via_haiku(
+            thread_topic=thread.topic,
+            thread_summary=thread.summary_excerpt,
+            recent_conversation_excerpt=recent_excerpt,
+            provider=provider,
+            user_name=user_name,
+        )
+
+        gate_ok, gate_reason = gate_research_completion(
+            persona_dir,
+            thread=thread,
+            now=now,
+            topic_overlap_score=topic_overlap_score,
+            thresholds=thresholds,
+        )
+        if not gate_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=gate_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        meta_ok, meta_reason = check_shared_meta_gates(
+            persona_dir,
+            source="research_completion",
+            now=now,
+            is_rest_state=False,
+            thresholds=thresholds,
+        )
+        if not meta_ok:
+            write_gate_rejection(
+                persona_dir,
+                ts=now,
+                source="research_completion",
+                source_id=mem_id,
+                gate_name=meta_reason or "unknown",
+                threshold_value=0.0,
+                observed_value=0.0,
+            )
+            return
+
+        emit_research_completion_candidate(
+            persona_dir,
+            thread=thread,
+            topic_overlap_score=topic_overlap_score,
+            now=now,
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("research fire: initiate candidate emit failed: %s", exc)
 
 
 # ---------- Research log ----------

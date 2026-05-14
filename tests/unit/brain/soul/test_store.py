@@ -120,3 +120,61 @@ def test_integrity_check_raises_on_corrupt_db(tmp_path: Path) -> None:
 
     with pytest.raises(BrainIntegrityError):
         SoulStore(str(corrupt_path))
+
+
+def test_save_and_list_voice_evolution(tmp_path: Path) -> None:
+    """save_voice_evolution persists a record; list_voice_evolution returns it."""
+    from brain.soul.store import VoiceEvolution
+
+    store = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        evolution = VoiceEvolution(
+            id="ve_001",
+            accepted_at="2026-05-11T14:32:04+00:00",
+            diff="- old\n+ new",
+            old_text="old",
+            new_text="new",
+            rationale="feels truer",
+            evidence=["dream_a", "cryst_b"],
+            audit_id="ia_001",
+            user_modified=False,
+        )
+        store.save_voice_evolution(evolution)
+        retrieved = store.list_voice_evolution()
+        assert len(retrieved) == 1
+        assert retrieved[0].id == "ve_001"
+        assert retrieved[0].evidence == ["dream_a", "cryst_b"]
+    finally:
+        store.close()
+
+
+def test_list_voice_evolution_chronological_order(tmp_path: Path) -> None:
+    """list_voice_evolution returns records ordered by accepted_at ascending."""
+    from brain.soul.store import VoiceEvolution
+
+    store = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        for i, ts in enumerate(
+            [
+                "2026-01-01T00:00:00+00:00",
+                "2026-03-15T00:00:00+00:00",
+                "2026-05-11T00:00:00+00:00",
+            ]
+        ):
+            store.save_voice_evolution(
+                VoiceEvolution(
+                    id=f"ve_{i}",
+                    accepted_at=ts,
+                    diff="",
+                    old_text="",
+                    new_text="",
+                    rationale="",
+                    evidence=[],
+                    audit_id=f"ia_{i}",
+                    user_modified=False,
+                )
+            )
+        retrieved = store.list_voice_evolution()
+        assert [v.id for v in retrieved] == ["ve_0", "ve_1", "ve_2"]
+    finally:
+        store.close()

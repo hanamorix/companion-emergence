@@ -78,6 +78,7 @@ def respond(
     session: SessionState | None = None,
     voice_md_override: str | None = None,
     image_shas: list[str] | None = None,
+    reply_to_audit_id: str | None = None,
 ) -> ChatResult:
     """One chat turn end-to-end.
 
@@ -110,6 +111,11 @@ def respond(
     voice_md_override:
         If set, use this string instead of loading voice.md from disk.
         Useful for tests that don't want to write files.
+    reply_to_audit_id:
+        If this turn is an explicit reply to an outbound initiate, the
+        audit row id. Surfaced to build_system_message so the system
+        prompt carries "you are replying to your earlier outbound about
+        X" context. Bundle A #4 / v0.0.9 review TODO.
 
     Returns
     -------
@@ -152,6 +158,7 @@ def respond(
             soul_store=soul_store,
             store=store,
             user_input=user_input,
+            reply_to_audit_id=reply_to_audit_id,
         )
     finally:
         soul_store.close()
