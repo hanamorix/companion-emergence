@@ -8,15 +8,14 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
 from brain.cli import _soul_audit_handler
 
 
 def _ts(year: int) -> str:
-    return datetime(year, 6, 15, tzinfo=timezone.utc).isoformat()
+    return datetime(year, 6, 15, tzinfo=UTC).isoformat()
 
 
 def _make_persona(tmp_path: Path, *, active: list[dict] | None = None,

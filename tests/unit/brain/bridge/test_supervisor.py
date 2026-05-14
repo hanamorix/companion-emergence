@@ -13,7 +13,9 @@ from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
     _run_heartbeat_tick,
+    _run_initiate_review_tick,  # noqa: F401 — imported to assert symbol exists
     _run_log_rotation_tick,
+    _run_voice_reflection_tick,  # noqa: F401 — imported to assert symbol exists
     run_folded,
 )
 
@@ -315,7 +317,7 @@ def _write_oversize_log(persona_dir: Path, name: str, size_bytes: int) -> Path:
 def test_run_log_rotation_tick_rotates_oversize_heartbeat(tmp_path: Path) -> None:
     """An oversize heartbeats.log.jsonl gets rotated to .1.gz."""
     persona_dir = _persona_dir(tmp_path)
-    log = _write_oversize_log(persona_dir, "heartbeats.log.jsonl", size_bytes=200_000)
+    _write_oversize_log(persona_dir, "heartbeats.log.jsonl", size_bytes=200_000)
     bus = _CapturingBus()
 
     # Force the cap small so the seeded log trips it.
@@ -355,6 +357,23 @@ def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
     ]
     assert len(remaining) == 1
     assert remaining[0]["seq"] == 1
+
+
+def test_run_log_rotation_tick_archives_old_year_in_initiate_audit(
+    tmp_path: Path,
+) -> None:
+    """initiate_audit.jsonl with 2024 entries → archived to .2024.jsonl.gz."""
+    persona_dir = _persona_dir(tmp_path)
+    audit = persona_dir / "initiate_audit.jsonl"
+    import json as _json
+    with audit.open("w", encoding="utf-8") as f:
+        f.write(_json.dumps({"ts": "2024-06-15T00:00:00+00:00", "seq": 0}) + "\n")
+        f.write(_json.dumps({"ts": "2026-06-15T00:00:00+00:00", "seq": 1}) + "\n")
+    bus = _CapturingBus()
+    _run_log_rotation_tick(
+        persona_dir, bus, now=datetime(2026, 5, 11, tzinfo=UTC)
+    )
+    assert (persona_dir / "initiate_audit.2024.jsonl.gz").exists()
 
 
 def test_run_log_rotation_tick_no_op_when_within_caps(tmp_path: Path) -> None:
@@ -478,3 +497,149 @@ def test_run_folded_skips_log_rotation_when_disabled(tmp_path: Path) -> None:
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert fired == [], "log rotation fired even though disabled"
+
+
+def test_run_folded_fires_initiate_review_after_interval(tmp_path: Path) -> None:
+    """run_folded wires initiate review into the cadence loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+
+    def fake_initiate(*args, **kwargs):
+        fired.set()
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_initiate_review_tick",
+            side_effect=fake_initiate,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=0.0,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "initiate review never fired"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_run_folded_skips_initiate_review_when_disabled(tmp_path: Path) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired: list[int] = []
+
+    def fake_initiate(*args, **kwargs):
+        fired.append(1)
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_initiate_review_tick",
+            side_effect=fake_initiate,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert fired == []
+
+
+def test_run_folded_fires_voice_reflection_after_interval(tmp_path: Path) -> None:
+    """run_folded wires voice reflection into the cadence loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+
+    def fake_voice(*args, **kwargs):
+        fired.set()
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_voice_reflection_tick",
+            side_effect=fake_voice,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=0.0,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "voice reflection never fired"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired: list[int] = []
+
+    def fake_voice(*args, **kwargs):
+        fired.append(1)
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_voice_reflection_tick",
+            side_effect=fake_voice,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert fired == []

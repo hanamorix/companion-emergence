@@ -172,6 +172,10 @@ def crystallize_creative_dna(
     if not (accepted_additions or accepted_promotions or accepted_demotions):
         return CreativeDnaCrystallizationResult()
 
+    # Aggregate a real emotion vector over recent active memories so emitted
+    # initiate candidates carry honest context instead of a zero-filled lie.
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
+
     # Apply atomically — single save_creative_dna after mutating dna in place
     try:
         _apply_changes(
@@ -179,6 +183,7 @@ def crystallize_creative_dna(
             additions=accepted_additions,
             promotions=accepted_promotions,
             demotions=accepted_demotions,
+            emotion_vector=aggregated_vector,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("crystallize_creative_dna: apply failed: %s", exc)
@@ -436,6 +441,34 @@ def _validate_active_demotion(
 # ── apply ─────────────────────────────────────────────────────────────────
 
 
+def _aggregate_recent_emotion_vector(
+    store: MemoryStore, *, now: datetime, look_back_days: int = 30,
+) -> dict[str, float]:
+    """Return a max-pooled emotion vector across recent active memories.
+
+    Used by the creative_dna crystallizer so emitted initiate candidates
+    carry a real signal of what's been emotionally alive in the window
+    that produced the crystallization, rather than zero-filled fields.
+    Empty dict on any failure.
+    """
+    try:
+        from brain.emotion.aggregate import aggregate_state
+        from brain.utils.memory import list_conversation_memories
+
+        cutoff = now - timedelta(days=look_back_days)
+        recent = [
+            m for m in list_conversation_memories(store, active_only=True)
+            if m.created_at >= cutoff and m.emotions
+        ]
+        if not recent:
+            return {}
+        state = aggregate_state(recent)
+        return dict(state.emotions)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("creative_dna: recent-emotion aggregation failed: %s", exc)
+        return {}
+
+
 def _apply_changes(
     persona_dir: Path,
     dna: dict[str, Any],
@@ -444,6 +477,7 @@ def _apply_changes(
     additions: list[dict[str, Any]],
     promotions: list[dict[str, Any]],
     demotions: list[dict[str, Any]],
+    emotion_vector: dict[str, float] | None = None,
 ) -> None:
     """Mutate dna in place, save atomically, append behavioral_log entries."""
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -488,6 +522,33 @@ def _apply_changes(
     # Persist atomically
     save_creative_dna(persona_dir, dna)
 
+    # Phase 4.2 — emit initiate candidates for each accepted change.
+    # Wrapped in try/except so emit failures can't crash the crystallizer.
+    for a in additions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_addition:{a['name']}",
+            label=a["name"],
+            related_memory_ids=list(a.get("evidence_memory_ids", [])),
+            emotion_vector=emotion_vector,
+        )
+    for p in promotions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_promotion:{p['name']}",
+            label=p["name"],
+            related_memory_ids=[],
+            emotion_vector=emotion_vector,
+        )
+    for d in demotions:
+        _emit_initiate_candidate(
+            persona_dir=persona_dir,
+            source_id=f"creative_dna_demotion:{d['name']}",
+            label=d["name"],
+            related_memory_ids=[],
+            emotion_vector=emotion_vector,
+        )
+
     # Behavioral log entries (best-effort, never let logging break the tick)
     for a in additions:
         try:
@@ -521,3 +582,47 @@ def _apply_changes(
             )
         except (OSError, ValueError) as exc:
             logger.warning("creative_dna: behavioral_log append failed: %s", exc)
+
+
+def _emit_initiate_candidate(
+    *,
+    persona_dir: Path,
+    source_id: str,
+    label: str,
+    related_memory_ids: list[str],
+    emotion_vector: dict[str, float] | None = None,
+) -> None:
+    """Emit one initiate candidate after a creative_dna crystallization commit.
+
+    Phase 4.2 of the initiate physiology pipeline. Wrapped in try/except —
+    an emit failure must not crash the crystallizer.
+
+    `emotion_vector` carries a max-pooled aggregate over recent active
+    memories — what's been emotionally alive in the period that produced
+    this crystallization. rolling_baseline / current_resonance /
+    delta_sigma stay zero: those are heartbeat-specific signals; non-
+    periodic emitters don't compute them.
+    """
+    try:
+        from brain.initiate.emit import emit_initiate_candidate
+        from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+        emit_initiate_candidate(
+            persona_dir,
+            kind="message",
+            source="crystallization",
+            source_id=source_id,
+            emotional_snapshot=EmotionalSnapshot(
+                vector=dict(emotion_vector or {}),
+                rolling_baseline_mean=0.0,
+                rolling_baseline_stdev=0.0,
+                current_resonance=0.0,
+                delta_sigma=0.0,
+            ),
+            semantic_context=SemanticContext(
+                linked_memory_ids=related_memory_ids[:5],
+                topic_tags=[label] if label else [],
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("creative_dna crystallization initiate emit failed: %s", exc)
