@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import plistlib
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 pytest.importorskip("brain.initiate")
 
