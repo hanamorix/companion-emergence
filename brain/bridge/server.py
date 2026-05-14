@@ -202,6 +202,7 @@ def _respond_blocking(
             provider=provider,
             session=sess,
             image_shas=image_shas,
+            reply_to_audit_id=reply_to_audit_id,
         )
 
 
