@@ -279,6 +279,41 @@ jobs:
           PY
         shell: bash
 
+      - name: Sign update artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+          UPDATER_PLATFORM_KEY: ${{ matrix.platform.label == 'macos-arm64' && 'darwin-aarch64' || matrix.platform.label == 'linux-x86_64' && 'linux-x86_64' || 'windows-x86_64' }}
+        working-directory: app/src-tauri
+        run: |
+          # Find the main update asset for this platform
+          case "$RUNNER_OS" in
+            macOS)   asset_glob="target/release/release-assets/*.dmg" ;;
+            Linux)   asset_glob="target/release/release-assets/*.AppImage" ;;
+            Windows) asset_glob="target/release/release-assets/*.msi" ;;
+          esac
+          asset="$(ls $asset_glob 2>/dev/null | head -1)"
+          if [ -z "$asset" ]; then
+            echo "ERROR: no update asset found for $RUNNER_OS" >&2
+            exit 1
+          fi
+          asset_name="$(basename "$asset")"
+          asset_url="https://github.com/hanamorix/companion-emergence/releases/download/${RELEASE_TAG}/${asset_name}"
+          sig="$(pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$asset" | tail -1)"
+          mkdir -p target/release/updater-fragments
+          cat > "target/release/updater-fragments/${UPDATER_PLATFORM_KEY}.json" <<JSON
+          {"platform":"${UPDATER_PLATFORM_KEY}","url":"${asset_url}","signature":"${sig}"}
+          JSON
+          echo "Signed $asset_name → ${UPDATER_PLATFORM_KEY}"
+        shell: bash
+
+      - name: Upload updater fragment
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-fragment-${{ matrix.platform.label }}
+          path: app/src-tauri/target/release/updater-fragments/*.json
+          retention-days: 1
+
       - name: Upload bundle artifacts (workflow retention)
         uses: actions/upload-artifact@v7
         with:
@@ -307,3 +342,52 @@ jobs:
             app/src-tauri/target/release/release-assets/*
           generate_release_notes: ${{ matrix.platform.label == 'macos-arm64' }}
           append_body: false
+
+  publish-update-manifest:
+    name: publish update manifest (latest.json)
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(env.RELEASE_TAG, 'v')
+    steps:
+      - name: Download all updater fragments
+        uses: actions/download-artifact@v7
+        with:
+          pattern: updater-fragment-*
+          merge-multiple: true
+          path: fragments
+
+      - name: Assemble latest.json
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo '{' > latest.json
+          echo "  \"version\": \"${VERSION}\"," >> latest.json
+          echo '  \"notes\": \"See the release page for changes.\",' >> latest.json
+          echo "  \"pub_date\": \"${PUB_DATE}\"," >> latest.json
+          echo '  \"platforms\": {' >> latest.json
+
+          first=true
+          for frag in fragments/*.json; do
+            platform="$(jq -r .platform "$frag")"
+            sig="$(jq -r .signature "$frag")"
+            url="$(jq -r .url "$frag")"
+            if [ "$first" != true ]; then echo ',' >> latest.json; fi
+            first=false
+            echo -n "    \"${platform}\": {\"signature\": \"${sig}\", \"url\": \"${url}\"}" >> latest.json
+          done
+
+          echo '' >> latest.json
+          echo '  }' >> latest.json
+          echo '}' >> latest.json
+
+          echo "=== latest.json ==="
+          cat latest.json
+
+      - name: Publish latest.json to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          files: latest.json
+          fail_on_unmatched_files: true
+          overwrite_files: true
