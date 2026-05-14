@@ -101,7 +101,8 @@ def test_service_print_plist_outputs_launchagent_xml(
     assert parsed["EnvironmentVariables"]["NELLBRAIN_HOME"] == str(data_home.resolve())
 
 
-def test_service_print_plist_invalid_nell_path_returns_1(capsys) -> None:
+def test_service_print_plist_invalid_nell_path_returns_1(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
     rc = cli.main(
         [
             "service",
@@ -193,16 +194,15 @@ def test_service_install_dry_run_prints_plist_without_bootstrap(
     monkeypatch,
     capsys,
 ) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NELLBRAIN_HOME", str(home / "data"))
     nell = _make_executable(tmp_path / "nell")
 
-    def fail_install(*args, **kwargs):
-        raise AssertionError("dry-run must not call install_service")
-
-    monkeypatch.setattr("brain.service.launchd.install_service", fail_install)
+    backend = _FakeBackend(tmp_path)
+    monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
     rc = cli.main(
         [
@@ -217,24 +217,15 @@ def test_service_install_dry_run_prints_plist_without_bootstrap(
     )
 
     assert rc == 0
-    parsed = plistlib.loads(capsys.readouterr().out.encode("utf-8"))
-    assert parsed["ProgramArguments"][:3] == [str(nell.resolve()), "supervisor", "run"]
+    assert "fake dry-run config" in capsys.readouterr().out
 
 
 def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
     nell = _make_executable(tmp_path / "nell")
-    installed = {}
 
-    def fake_install(*, persona, nell_path, env_path, nellbrain_home):
-        installed.update(
-            persona=persona,
-            nell_path=nell_path,
-            env_path=env_path,
-            nellbrain_home=nellbrain_home,
-        )
-        return tmp_path / "com.companion-emergence.supervisor.nell.plist"
-
-    monkeypatch.setattr("brain.service.launchd.install_service", fake_install)
+    backend = _FakeBackend(tmp_path)
+    monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
     rc = cli.main(
         [
@@ -250,48 +241,39 @@ def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, caps
     )
 
     assert rc == 0
-    assert installed == {
+    install_call = ("install_service", {
         "persona": "nell",
         "nell_path": nell.resolve(),
         "env_path": "/tmp/bin",
         "nellbrain_home": None,
-    }
+    })
+    assert install_call in backend.calls
     assert "service installed" in capsys.readouterr().out
 
 
 def test_service_uninstall_calls_launchd_uninstall(monkeypatch, tmp_path: Path, capsys) -> None:
-    seen = {}
+    monkeypatch.setattr("sys.platform", "darwin")
 
-    def fake_uninstall(*, persona, keep_plist):
-        seen["persona"] = persona
-        seen["keep_plist"] = keep_plist
-        return tmp_path / "service.plist"
-
-    monkeypatch.setattr("brain.service.launchd.uninstall_service", fake_uninstall)
+    backend = _FakeBackend(tmp_path)
+    monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
     rc = cli.main(["service", "uninstall", "--persona", "nell", "--keep-plist"])
 
     assert rc == 0
-    assert seen == {"persona": "nell", "keep_plist": True}
+    assert ("uninstall_service", {"persona": "nell", "keep_plist": True}) in backend.calls
     assert "config kept" in capsys.readouterr().out
 
 
 def test_service_status_prints_launchd_state(monkeypatch, tmp_path: Path, capsys) -> None:
-    monkeypatch.setattr(
-        "brain.service.launchd.service_status",
-        lambda *, persona: ServiceStatus(
-            label=f"com.companion-emergence.supervisor.{persona}",
-            plist_path=tmp_path / "service.plist",
-            installed=True,
-            loaded=False,
-            detail="not loaded",
-        ),
-    )
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    backend = _FakeBackend(tmp_path)
+    monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
     rc = cli.main(["service", "status", "--persona", "nell"])
 
     assert rc == 0
     out = capsys.readouterr().out
     assert "installed: yes" in out
-    assert "loaded: no" in out
-    assert "not loaded" in out
+    assert "loaded: yes" in out
+    assert "fake running" in out
