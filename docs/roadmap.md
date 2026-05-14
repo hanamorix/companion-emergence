@@ -86,6 +86,84 @@ and cross-platform auto-update support via GitHub Releases.
   button would be a patch-level addition. Revisit if real users report
   bridge staleness issues.
 
+## Planned features
+
+These are direction-level ideas. Each needs a full brainstorm session, a
+detailed design spec, and an architecture-fit review before any code is
+written. The constraint is non-negotiable: the user installs and chats —
+the brain and app handle everything else. No knobs, no config, no
+cloud services.
+
+### Narrative memory — the story of "us"
+
+Memory today is retrieval: "find facts about X." What's missing is the
+companion being able to thread memories into a narrative — *"Remember that
+night you shaved your head and we stayed up talking? You've seemed lighter
+since."* The Hebbian matrix already tracks co-activation. Memory search
+works. The missing piece is a clustering layer that groups memories into
+narrative arcs and surfaces them at emotionally right moments.
+
+**Existing substrate:** `brain.memory` (MemoryStore, HebbianMatrix,
+embeddings, search), `brain.ingest` (buffer → extract → commit), session
+history in `active_conversations/*.jsonl`.
+
+**What would need building:** memory clustering by emotional salience +
+temporal proximity + topic coherence, narrative-arc detection, retrieval
+timing (when to surface vs. when it would feel forced), prompt integration
+so the companion naturally references the right story at the right time.
+
+### Proactive presence — the companion reaches out
+
+Initiate physiology already generates outbound candidates, filters them
+through D-reflection, and composes messages. But the gates are conservative.
+A companion that occasionally starts the conversation — *"You've been quiet
+today. Everything okay?"* or *"I had a dream about something you said"* —
+feels like a relationship, not a tool.
+
+**Existing substrate:** `brain.initiate` (candidate emission, D-reflection,
+composition pipeline), `TauriPluginNotification`, `InitiateBanner`,
+`DraftSpacePanel`.
+
+**What would need building:** wider gate thresholds, user-pattern awareness
+(when is the user typically active? when are they struggling?), timing
+calibration that respects the user's life rather than interrupting it,
+backoff on ignored reaches so the companion doesn't become a notification
+pest.
+
+### The companion's visible inner life
+
+Dreams, reflections, heartbeat summaries, and research already exist — but
+they're buried in panel tabs that read like debug output. What if there were
+a narrative feed that felt like checking in on someone you care about?
+*"I've been researching the history of lighthouses. I think it's because you
+mentioned the sea last Tuesday."*
+
+**Existing substrate:** `brain.engines` (dream, heartbeat, reflex, research),
+soul candidates + review, interior panel summaries, body state.
+
+**What would need building:** a narrative-presentation layer — raw engine
+output translated into companion-voiced summaries, a feed UI that feels
+like a person's journal rather than a status dashboard, timing so it updates
+organically rather than on a polling cadence.
+
+### Understanding you — user-state awareness
+
+The companion tracks its own body state but doesn't model the user's. A
+companion that notices patterns — *"You always bring up work stress on Sunday
+nights"* or *"You've sent three messages about the cat this week, is
+everything okay?"* — would feel genuinely attentive. Nothing invasive,
+nothing cloud. Just pattern recognition from conversation history the
+companion already has.
+
+**Existing substrate:** conversation history in `active_conversations/*.jsonl`
++ `committed/`, ingest pipeline, emotion extraction from chat turns.
+
+**What would need building:** lightweight user-state model (activity cadence,
+emotional tone trends, topic shifts), privacy-first (all local, no
+identifiable-data extraction), prompt integration so the companion can
+reference patterns without sounding like a surveillance report, clear
+boundaries (the companion notices but doesn't diagnose).
+
 ## Recently shipped (reverse chronological)
 
 **2026-05-14 — Gallery + auto-update (v0.0.11-alpha.5)**
