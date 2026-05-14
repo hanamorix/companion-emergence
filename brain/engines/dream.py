@@ -7,6 +7,7 @@ experiences together. See spec Section 5 for the cycle step-by-step.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.memory import list_conversation_memories
+
+logger = logging.getLogger(__name__)
 
 
 class NoSeedAvailable(Exception):  # noqa: N818
@@ -52,6 +55,7 @@ class DreamEngine:
     embeddings: EmbeddingCache | None
     provider: LLMProvider
     log_path: Path | None = None
+    persona_dir: Path | None = None
     persona_name: str = ""
     persona_system_prompt: str = ""
     lookback_hours: int = 24
@@ -103,6 +107,7 @@ class DreamEngine:
         dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
         edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
         self._log(seed, neighbours, dream_memory)
+        self._emit_initiate_candidate(seed, neighbours, dream_memory)
 
         return DreamResult(
             seed=seed,
@@ -225,3 +230,48 @@ class DreamEngine:
         }
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+
+    def _emit_initiate_candidate(
+        self,
+        seed: Memory,
+        neighbours: list[tuple[Memory, float]],
+        dream_memory: Memory,
+    ) -> None:
+        """Emit an initiate candidate sourced from this dream.
+
+        Phase 4.1 of the initiate physiology pipeline. Wrapped in
+        try/except so a failure on the initiate side can never break
+        the dream cycle itself — dreams are physiology, initiate is
+        downstream signal.
+        """
+        if self.persona_dir is None:
+            return
+        try:
+            # Local import to avoid pulling initiate deps into engines that
+            # don't need them and to keep the dream module focused.
+            from brain.initiate.emit import emit_initiate_candidate
+            from brain.initiate.schemas import (
+                EmotionalSnapshot,
+                SemanticContext,
+            )
+
+            linked_ids = [seed.id, *[m.id for m, _ in neighbours]][:5]
+            emit_initiate_candidate(
+                self.persona_dir,
+                kind="message",
+                source="dream",
+                source_id=dream_memory.id,
+                emotional_snapshot=EmotionalSnapshot(
+                    vector=dict(dream_memory.emotions),
+                    rolling_baseline_mean=0.0,
+                    rolling_baseline_stdev=0.0,
+                    current_resonance=0.0,
+                    delta_sigma=0.0,
+                ),
+                semantic_context=SemanticContext(
+                    linked_memory_ids=linked_ids,
+                    topic_tags=[],
+                ),
+            )
+        except Exception as exc:
+            logger.warning("dream initiate emit failed: %s", exc)

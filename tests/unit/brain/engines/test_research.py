@@ -288,7 +288,11 @@ def test_run_tick_llm_failure_does_not_touch_files(tmp_path: Path):
         store.close()
 
 
-def test_run_tick_renders_prompt_with_context(tmp_path: Path):
+def test_run_tick_renders_prompt_with_context(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "brain.engines.research._compute_topic_overlap_via_haiku",
+        lambda **kwargs: 1.0,
+    )
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
     _seed_conversation_memory(store, "I love how deep-sea creatures make their own light.")
@@ -368,3 +372,176 @@ def test_research_log_load_heals_from_bak(tmp_path: Path) -> None:
     log = ResearchLog.load(path)
     assert len(log.fires) == 1
     assert log.fires[0].topic == "marine bioluminescence"
+
+
+# ---- D-reflection Task 18: research_completion initiate candidate emission ----
+
+
+def test_research_fire_emits_initiate_candidate_when_maturity_passes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A matured research fire emits a research_completion candidate using real overlap plumbing.
+
+    pull_score=8.0 → maturity_score=0.8 ≥ default threshold 0.75, so the gate passes.
+    The overlap helper is stubbed to isolate the engine path and prove the hardcode is gone.
+    """
+    from brain.initiate.emit import read_candidates
+
+    overlap_calls: list[dict] = []
+
+    def fake_overlap(**kwargs):
+        overlap_calls.append(kwargs)
+        return 0.5
+
+    monkeypatch.setattr(
+        "brain.engines.research._compute_topic_overlap_via_haiku",
+        fake_overlap,
+    )
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        assert result.fired is not None, "Expected research to fire"
+
+        candidates = read_candidates(tmp_path)
+        research_candidates = [c for c in candidates if c.source == "research_completion"]
+        assert len(research_candidates) == 1
+        rc = research_candidates[0]
+        assert rc.source_id == result.fired.output_memory_id
+        assert rc.semantic_context.source_meta is not None
+        assert rc.semantic_context.source_meta["thread_topic"] == "marine bioluminescence"
+        assert rc.semantic_context.source_meta["topic_overlap_score"] == 0.5
+        assert len(overlap_calls) == 1
+        assert overlap_calls[0]["thread_topic"] == "marine bioluminescence"
+        assert overlap_calls[0]["recent_conversation_excerpt"] == ""
+    finally:
+        store.close()
+
+
+def test_research_fire_does_not_emit_candidate_when_maturity_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A low-pull-score fire (pull_score=6.0 → maturity=0.60 < 0.75 threshold) does not emit.
+
+    The maturity_min gate should reject and write a gate rejection row instead,
+    without spending a topic-overlap LLM call on an already-failed thread.
+    """
+    from brain.initiate.emit import read_candidates
+
+    overlap_calls: list[dict] = []
+
+    def fake_overlap(**kwargs):
+        overlap_calls.append(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(
+        "brain.engines.research._compute_topic_overlap_via_haiku",
+        fake_overlap,
+    )
+
+    # pull_score=6.0 → maturity_score=0.60, which is below the default 0.75 threshold
+    _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        assert result.fired is not None, "Expected research to fire (engine gate passed)"
+
+        candidates = read_candidates(tmp_path)
+        research_candidates = [c for c in candidates if c.source == "research_completion"]
+        assert len(research_candidates) == 0, "Low-maturity fire must NOT emit a research_completion candidate"
+
+        # Confirm gate rejection was recorded
+        rejection_path = tmp_path / "gate_rejections.jsonl"
+        assert rejection_path.exists(), "gate_rejections.jsonl should exist after maturity gate rejection"
+        rows = [
+            json.loads(line)
+            for line in rejection_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any(
+            r["gate_name"] == "maturity_min" and r["source"] == "research_completion"
+            for r in rows
+        )
+        assert overlap_calls == []
+    finally:
+        store.close()
+
+
+# ---- v0.0.11 topic overlap scoring ----
+
+
+def test_compute_topic_overlap_via_haiku_happy_path() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            assert "quiet rivers" in prompt
+            assert "Hana" in system
+            return '{"score": 0.7}'
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="quiet rivers",
+        thread_summary="A study of slow water and patience.",
+        recent_conversation_excerpt="[2026-05-13T10:00] We talked about flow",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.7
+
+
+def test_compute_topic_overlap_clamps_out_of_range() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            return '{"score": 1.5}'
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 1.0
+
+
+def test_compute_topic_overlap_returns_zero_on_malformed() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            return "not even close to JSON"
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.0
+
+
+def test_compute_topic_overlap_returns_zero_on_provider_error() -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class FakeTopicProvider:
+        def generate(self, prompt, *, system=None):
+            raise OSError("boom")
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x",
+        thread_summary="",
+        recent_conversation_excerpt="",
+        provider=FakeTopicProvider(),
+        user_name="Hana",
+    )
+
+    assert score == 0.0

@@ -130,6 +130,10 @@ def run_growth_tick(
                 relational_context=proposal.relational_context,
             ),
         )
+        # Phase 4.2 — emit initiate candidate after vocabulary crystallization
+        # commits to disk. Wrapped in try/except so emit failures can't crash
+        # the scheduler.
+        _emit_vocabulary_initiate_candidate(persona_dir, proposal, store=store, now=now)
 
     # Creative DNA crystallization (spec §5)
     if not dry_run and (persona_dir / "persona_config.json").exists():
@@ -225,6 +229,76 @@ def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
     )
     treatment = compute_treatment(vocab_path.parent, vocab_path.name)
     save_with_backup(vocab_path, data, backup_count=treatment.backup_count)
+
+
+def _emit_vocabulary_initiate_candidate(
+    persona_dir: Path,
+    proposal: EmotionProposal,
+    *,
+    store: MemoryStore,
+    now: datetime,
+) -> None:
+    """Emit one initiate candidate after vocabulary commit. Try/except wrapped.
+
+    Phase 4.2 of the initiate physiology pipeline. An emit failure must not
+    crash the growth tick.
+
+    Pulls a max-pooled emotion vector across recent active memories so the
+    candidate carries a real signal of what's been emotionally alive in
+    the window that produced this emotion. rolling_baseline /
+    current_resonance / delta_sigma stay zero — heartbeat-specific signals
+    that non-periodic emitters don't compute.
+    """
+    try:
+        from brain.initiate.emit import emit_initiate_candidate
+        from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+
+        emotion_vector = _aggregate_recent_emotion_vector(store, now=now)
+
+        emit_initiate_candidate(
+            persona_dir,
+            kind="message",
+            source="crystallization",
+            source_id=f"vocabulary_emotion:{proposal.name}",
+            emotional_snapshot=EmotionalSnapshot(
+                vector=emotion_vector,
+                rolling_baseline_mean=0.0,
+                rolling_baseline_stdev=0.0,
+                current_resonance=0.0,
+                delta_sigma=0.0,
+            ),
+            semantic_context=SemanticContext(
+                linked_memory_ids=list(proposal.evidence_memory_ids)[:5],
+                topic_tags=[proposal.name],
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vocabulary crystallization initiate emit failed: %s", exc)
+
+
+def _aggregate_recent_emotion_vector(
+    store: MemoryStore, *, now: datetime, look_back_days: int = 30,
+) -> dict[str, float]:
+    """Return a max-pooled emotion vector across recent active memories.
+
+    Empty dict on any failure.
+    """
+    try:
+        from brain.emotion.aggregate import aggregate_state
+        from brain.utils.memory import list_conversation_memories
+
+        cutoff = now - timedelta(days=look_back_days)
+        recent = [
+            m for m in list_conversation_memories(store, active_only=True)
+            if m.created_at >= cutoff and m.emotions
+        ]
+        if not recent:
+            return {}
+        state = aggregate_state(recent)
+        return dict(state.emotions)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vocabulary: recent-emotion aggregation failed: %s", exc)
+        return {}
 
 
 def _default_reason_for(proposal: EmotionProposal) -> str:
