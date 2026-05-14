@@ -284,13 +284,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
           UPDATER_PLATFORM_KEY: ${{ matrix.platform.label == 'macos-arm64' && 'darwin-aarch64' || matrix.platform.label == 'linux-x86_64' && 'linux-x86_64' || 'windows-x86_64' }}
-        working-directory: app/src-tauri
+        working-directory: app
         run: |
-          # Find the main update asset for this platform
+          # Find the main update asset for this platform.
+          # pnpm runs from app/ (where package.json is), so all paths
+          # are relative to app/.
           case "$RUNNER_OS" in
-            macOS)   asset_glob="target/release/release-assets/*.dmg" ;;
-            Linux)   asset_glob="target/release/release-assets/*.AppImage" ;;
-            Windows) asset_glob="target/release/release-assets/*.msi" ;;
+            macOS)   asset_glob="src-tauri/target/release/release-assets/*.dmg" ;;
+            Linux)   asset_glob="src-tauri/target/release/release-assets/*.AppImage" ;;
+            Windows) asset_glob="src-tauri/target/release/release-assets/*.msi" ;;
           esac
           asset="$(ls $asset_glob 2>/dev/null | head -1)"
           if [ -z "$asset" ]; then
@@ -300,8 +302,8 @@ jobs:
           asset_name="$(basename "$asset")"
           asset_url="https://github.com/hanamorix/companion-emergence/releases/download/${RELEASE_TAG}/${asset_name}"
           sig="$(pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$asset" | tail -1)"
-          mkdir -p target/release/updater-fragments
-          cat > "target/release/updater-fragments/${UPDATER_PLATFORM_KEY}.json" <<JSON
+          mkdir -p src-tauri/target/release/updater-fragments
+          cat > "src-tauri/target/release/updater-fragments/${UPDATER_PLATFORM_KEY}.json" <<JSON
           {"platform":"${UPDATER_PLATFORM_KEY}","url":"${asset_url}","signature":"${sig}"}
           JSON
           echo "Signed $asset_name → ${UPDATER_PLATFORM_KEY}"
