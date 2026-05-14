@@ -301,7 +301,7 @@ jobs:
           fi
           asset_name="$(basename "$asset")"
           asset_url="https://github.com/hanamorix/companion-emergence/releases/download/${RELEASE_TAG}/${asset_name}"
-          sig="$(pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$asset" | tail -1)"
+          sig="$(pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$asset" | sed -n '/^dW50/p')"
           mkdir -p src-tauri/target/release/updater-fragments
           cat > "src-tauri/target/release/updater-fragments/${UPDATER_PLATFORM_KEY}.json" <<JSON
           {"platform":"${UPDATER_PLATFORM_KEY}","url":"${asset_url}","signature":"${sig}"}
@@ -349,7 +349,6 @@ jobs:
     name: publish update manifest (latest.json)
     needs: build
     runs-on: ubuntu-22.04
-    if: ${{ startsWith(github.ref_name, 'v') }}
     steps:
       - name: Download all updater fragments
         uses: actions/download-artifact@v7
@@ -359,28 +358,33 @@ jobs:
           path: fragments
 
       - name: Assemble latest.json
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG || inputs.tag }}
         run: |
           VERSION="${RELEASE_TAG#v}"
           PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo '{' > latest.json
-          echo "  \"version\": \"${VERSION}\"," >> latest.json
-          echo '  \"notes\": \"See the release page for changes.\",' >> latest.json
-          echo "  \"pub_date\": \"${PUB_DATE}\"," >> latest.json
-          echo '  \"platforms\": {' >> latest.json
-
-          first=true
-          for frag in fragments/*.json; do
-            platform="$(jq -r .platform "$frag")"
-            sig="$(jq -r .signature "$frag")"
-            url="$(jq -r .url "$frag")"
-            if [ "$first" != true ]; then echo ',' >> latest.json; fi
-            first=false
-            echo -n "    \"${platform}\": {\"signature\": \"${sig}\", \"url\": \"${url}\"}" >> latest.json
-          done
-
-          echo '' >> latest.json
-          echo '  }' >> latest.json
-          echo '}' >> latest.json
+          python3 -c "
+          import json, glob, os, sys
+          version = os.environ.get('VERSION', '0.0.0')
+          pub_date = os.environ.get('PUB_DATE', '')
+          platforms = {}
+          for frag_path in sorted(glob.glob('fragments/*.json')):
+              with open(frag_path) as fh:
+                  frag = json.load(fh)
+              platforms[frag['platform']] = {
+                  'signature': frag['signature'],
+                  'url': frag['url'],
+              }
+          manifest = {
+              'version': version,
+              'notes': 'See the release page for changes.',
+              'pub_date': pub_date,
+              'platforms': platforms,
+          }
+          with open('latest.json', 'w') as fh:
+              json.dump(manifest, fh, indent=2)
+          print(json.dumps(manifest, indent=2))
+          "
 
           echo "=== latest.json ==="
           cat latest.json
