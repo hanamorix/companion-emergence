@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -110,7 +110,7 @@ def test_rotate_rolling_size_evicts_oldest_when_keep_reached(tmp_path: Path) -> 
 
 
 def _ts(year: int, month: int = 1, day: int = 1) -> str:
-    return datetime(year, month, day, tzinfo=timezone.utc).isoformat()
+    return datetime(year, month, day, tzinfo=UTC).isoformat()
 
 
 def _write_yearly_lines(path: Path, entries_per_year: dict[int, int]) -> None:
@@ -124,7 +124,7 @@ def _write_yearly_lines(path: Path, entries_per_year: dict[int, int]) -> None:
 def test_rotate_age_archive_no_op_when_current_year_only(tmp_path: Path) -> None:
     log = tmp_path / "soul_audit.jsonl"
     _write_yearly_lines(log, {2026: 5})
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
     result = rotate_age_archive_yearly(log, now=now)
     assert result == []
     # Active file unchanged.
@@ -139,7 +139,7 @@ def test_rotate_age_archive_missing_log_returns_empty(tmp_path: Path) -> None:
 def test_rotate_age_archive_splits_by_year(tmp_path: Path) -> None:
     log = tmp_path / "soul_audit.jsonl"
     _write_yearly_lines(log, {2024: 3, 2025: 4, 2026: 2})
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
     archives = rotate_age_archive_yearly(log, now=now)
 
     # Two archives for the two cold years.
@@ -162,7 +162,7 @@ def test_rotate_age_archive_splits_by_year(tmp_path: Path) -> None:
 def test_rotate_age_archive_preserves_within_year_order(tmp_path: Path) -> None:
     log = tmp_path / "soul_audit.jsonl"
     _write_yearly_lines(log, {2024: 5})
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
     rotate_age_archive_yearly(log, now=now)
 
     with gzip.open(tmp_path / "soul_audit.2024.jsonl.gz", "rt") as gz:
@@ -174,7 +174,7 @@ def test_rotate_age_archive_idempotent_same_year(tmp_path: Path) -> None:
     """Calling twice within the same year shouldn't re-archive 2026 entries."""
     log = tmp_path / "soul_audit.jsonl"
     _write_yearly_lines(log, {2025: 3, 2026: 2})
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
 
     first = rotate_age_archive_yearly(log, now=now)
     second = rotate_age_archive_yearly(log, now=now)
@@ -193,7 +193,7 @@ def test_rotate_age_archive_honours_timestamp_field(tmp_path: Path) -> None:
     with log.open("w", encoding="utf-8") as f:
         f.write(json.dumps({"ts": _ts(2024), "seq": 0}) + "\n")
         f.write(json.dumps({"ts": _ts(2026), "seq": 1}) + "\n")
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
     archives = rotate_age_archive_yearly(log, now=now, timestamp_field="ts")
     assert len(archives) == 1
     assert archives[0].name == "soul_audit.2024.jsonl.gz"
@@ -209,7 +209,7 @@ def test_rotate_age_archive_skips_corrupt_lines(tmp_path: Path) -> None:
         + json.dumps({"at": _ts(2026), "seq": 2}) + "\n",
         encoding="utf-8",
     )
-    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 11, tzinfo=UTC)
     archives = rotate_age_archive_yearly(log, now=now)
     assert len(archives) == 1
 
