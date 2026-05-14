@@ -391,3 +391,16 @@ jobs:
           files: latest.json
           fail_on_unmatched_files: true
           overwrite_files: true
+
+      - name: Checkout repo for latest-release push
+        uses: actions/checkout@v6
+        with:
+          ref: latest-release
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update latest-release branch
+        run: |
+          cp "$GITHUB_WORKSPACE/../latest.json" latest.json 2>/dev/null || cp ../latest.json latest.json
+          git add latest.json
+          git diff --staged --quiet || git commit -m "latest.json for ${RELEASE_TAG}"
+          git push origin latest-release
