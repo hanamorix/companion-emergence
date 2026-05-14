@@ -1,11 +1,19 @@
 {
-  "version": "0.0.11",
+  "version": "0.0.0",
   "notes": "See the release page for changes.",
-  "pub_date": "2026-05-14T10:00:00Z",
+  "pub_date": "",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHZGd0s5S29CUUdTdVVLYTRCWUNuWm1iT1ZaSjB1emRpVS9KVXl2WmM3T1c2S0loOCs3a2VCQjN3R1ROYWNuWGpLdGhkOXAvYjZKUmZEeG9DMmRzQlFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4NzUzNjM2CWZpbGU6Q29tcGFuaW9uIEVtZXJnZW5jZV8wLjAuMTFfYWFyY2g2NC5kbWcKMVBRejF4cWxWV3Q0V3Q2NnUyR2dLTUk5WXhYK2QwN01VWTZwRmJhTXNpNnlWQkRRQmlxU2FFYmkvY1RUWGVsbW1TTE9oMnZ0TWlnRDlLMlNSRjdTQ2c9PQo=",
-      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.11-alpha.5/Companion.Emergence_0.0.11_aarch64.dmg"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbGtGUHg4YzZwb3N2eUtJMFlNRW1pSEt5Rm40d0FKeGVSeUNVTUZHeTVrN213R0s5d0RXK2lHbzdQNFhUbDRsSFlqRHRqMzB2VGVBalNJcW1xbDRQYnc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4NzgzMDAzCWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYWFyY2g2NC5kbWcKUUdOTnFTdHFGRVdEUnN2RktzZW4xMjh2UjNxdmZYcDdCbThWOFJsc3ROdUhHRkVKM0FNNk1pQmRlZkxHOG9kR3liNlV1R3dBSGY3cW1YZFZ1dUdVQUE9PQo=",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.1/Companion.Emergence_0.0.12_aarch64.dmg"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbGt1d2h2VndhUC85S0o5N1d1NHlFZUp5aG1HREZUZnNBVTgwc0tDY3JqRFJXRU9LSHNGdGRoaXQzU2NrVkFSUFJZQzB2Q0hEODB4ZDZzNDI2L2p3NXdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4NzgzMTAwCWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYW1kNjQuQXBwSW1hZ2UKdkdiY21sMGtmcVZBU2NxMmxxbHQrUjh0NDl4aEp6K2Q0NHQxSGExSHBNYitZd3ZLejBJZ0xXdkNueEUyTWZndUFIY1MxTEw3Vkh5U1FiNVV5WDJRQWc9PQo=",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.1/Companion.Emergence_0.0.12_amd64.AppImage"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHJEclJNUzVaaWt0R1ZTY05WdjNieDdSMFZRR1NKMC84cENvY2JvWkRvZ3RSdkhBTDU2Z2k0K2Q0MVJRbUlQSmlTUTc5Um9ja3FSV1ZhcE5XSkVOcXdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4NzgzMjc2CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfeDY0X2VuLVVTLm1zaQpWZEkwY1U3ZXBhc3B6VmFtTUZiL2NmWGhxczhJUUtsZHhzR3JnRWN2SWoxNjF3WXQ2L1Ryd0JqNjhWZnFYNTB0ODlBbXI0S2g3ay9mQVNueXp5Z2VEUT09Cg==",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.1/Companion.Emergence_0.0.12_x64_en-US.msi"
     }
   }
 }
