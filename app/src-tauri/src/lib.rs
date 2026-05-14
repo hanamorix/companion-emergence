@@ -48,13 +48,25 @@ pub struct InitResult {
 }
 
 /// Resolve <NELLBRAIN_HOME>, honoring the env var first, then
-/// platformdirs (matches brain.paths).
+/// platformdirs (matches brain.paths).  On Windows, platformdirs
+/// uses LOCALAPPDATA\\hanamorix\\companion-emergence, not the
+/// Roaming profile that dirs::data_dir() returns.
 fn nellbrain_home() -> Result<PathBuf, String> {
     if let Ok(home) = std::env::var("NELLBRAIN_HOME") {
         return Ok(PathBuf::from(home));
     }
-    let base = dirs::data_dir().ok_or_else(|| "could not resolve user data dir".to_string())?;
-    Ok(base.join("companion-emergence"))
+    #[cfg(target_os = "windows")]
+    {
+        let local = std::env::var("LOCALAPPDATA")
+            .map_err(|_| "LOCALAPPDATA not set".to_string())?;
+        return Ok(PathBuf::from(local).join("hanamorix").join("companion-emergence"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let base = dirs::data_dir()
+            .ok_or_else(|| "could not resolve user data dir".to_string())?;
+        Ok(base.join("companion-emergence"))
+    }
 }
 
 /// Mirror of brain.setup's persona-name validation. Anything outside
