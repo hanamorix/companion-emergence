@@ -149,11 +149,8 @@ def _seed_initiate_audit(
     subject: str = "the dream from this morning",
     tone_rendered: str = "the dream landed somewhere",
 ) -> None:
-    try:
-        from brain.initiate.audit import append_audit_row
-        from brain.initiate.schemas import AuditRow
-    except ModuleNotFoundError:
-        pytest.skip("brain.initiate not available in public build")
+    from brain.initiate.audit import append_audit_row
+    from brain.initiate.schemas import AuditRow
 
     row = AuditRow(
         audit_id=audit_id,
