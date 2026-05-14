@@ -33,7 +33,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field, field_validator
 
 from brain.bridge import events
@@ -169,6 +177,32 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
         if lock.locked():
             return False
     return True
+
+
+def _read_jsonl_lines(path: Path):
+    """Yield parsed JSON objects from a JSONL file, skipping corrupt lines."""
+    if not path.is_file():
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
+    """Look up the on-disk extension for an image sha.
+
+    Returns the extension (without dot) or None if no file found.
+    """
+    for ext in ("png", "jpg", "webp", "gif"):
+        if (images_dir / f"{sha}.{ext}").exists():
+            return ext
+    return None
 
 
 def _respond_blocking(
@@ -1252,6 +1286,93 @@ def build_app(
             "media_type": record.media_type,
             "size_bytes": record.size_bytes,
         }
+
+    # ── GET /images — past-image gallery listing ─────────────────────────
+    @app.get("/images", dependencies=[Depends(require_http_auth)])
+    async def list_images(
+        limit: int = 50,
+        before_ts: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return deduped list of images shared across all sessions.
+
+        Scans ``<persona_dir>/active_conversations/*.jsonl`` buffer files,
+        collects image_shas with their first-seen timestamps, dedupes by
+        sha, sorts reverse-chronological, and resolves on-disk extensions.
+
+        Query params:
+          limit     — max results (default 50)
+          before_ts — ISO-8601 timestamp; only include images first seen
+                      before this time (cursor for future pagination)
+
+        Returns ``[{sha, ext, first_seen_ts, first_8_chars}]``.
+        """
+        s: BridgeAppState = app.state.bridge
+        persona_dir = s.persona_dir
+        buffers_dir = persona_dir / "active_conversations"
+        images_dir = persona_dir / "images"
+
+        # Collect (sha, first_ts) pairs from buffer files
+        seen: dict[str, str] = {}  # sha → first_seen_ts
+        if buffers_dir.is_dir():
+            for buf_path in sorted(buffers_dir.glob("*.jsonl")):
+                try:
+                    for line in _read_jsonl_lines(buf_path):
+                        turn_ts = line.get("ts") or line.get("at", "")
+                        shas = line.get("image_shas")
+                        if not shas or not isinstance(shas, list):
+                            continue
+                        for sha in shas:
+                            if not isinstance(sha, str) or len(sha) != 64:
+                                continue
+                            # Dedupe: keep earliest timestamp per sha
+                            if sha not in seen or turn_ts < seen[sha]:
+                                seen[sha] = turn_ts
+                except Exception:
+                    logger.warning(
+                        "list_images: skip unreadable buffer %s", buf_path,
+                        exc_info=True,
+                    )
+
+        # Filter by before_ts
+        if before_ts is not None:
+            seen = {s: t for s, t in seen.items() if t < before_ts}
+
+        # Sort by first_seen_ts descending, take top N
+        sorted_shas = sorted(seen.items(), key=lambda x: x[1], reverse=True)
+        sorted_shas = sorted_shas[:limit]
+
+        # Resolve extensions from disk
+        results: list[dict[str, Any]] = []
+        for sha, ts in sorted_shas:
+            ext = _resolve_image_ext(images_dir, sha)
+            if ext is None:
+                continue  # file missing on disk — skip gracefully
+            results.append({
+                "sha": sha,
+                "ext": ext,
+                "first_seen_ts": ts,
+                "first_8_chars": sha[:8],
+            })
+
+        return results
+
+    # ── GET /images/{sha} — serve individual image bytes ────────────────
+    @app.get("/images/{sha}")
+    async def serve_image(sha: str) -> Response:
+        """Serve an image file by its content-addressable sha.
+
+        Resolves the on-disk file from ``<persona_dir>/images/<sha>.<ext>``.
+        Returns the raw image bytes with the correct Content-Type header.
+        404 if the sha is unknown or the file is missing.
+        """
+        s: BridgeAppState = app.state.bridge
+        try:
+            from brain.images import media_type_for_sha, read_image_bytes
+            media_type = media_type_for_sha(s.persona_dir, sha)
+            data = read_image_bytes(s.persona_dir, sha, media_type)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="image not found") from None
+        return Response(content=data, media_type=media_type)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
