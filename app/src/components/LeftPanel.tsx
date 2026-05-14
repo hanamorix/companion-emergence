@@ -5,8 +5,9 @@ import { BodyPanel } from "./panels/BodyPanel";
 import { InteriorPanel } from "./panels/InteriorPanel";
 import { SoulPanel } from "./panels/SoulPanel";
 import { ConnectionPanel } from "./panels/ConnectionPanel";
+import { GalleryPanel } from "./panels/GalleryPanel";
 
-type Tab = "weather" | "body" | "interior" | "soul" | "connection";
+type Tab = "weather" | "body" | "interior" | "soul" | "connection" | "gallery";
 
 interface Props {
   state: PersonaState | null;
@@ -24,6 +25,7 @@ const TABS: Array<{ id: Tab; label: string; icon: string }> = [
   { id: "interior", label: "Recent Interior", icon: "✦" },
   { id: "soul", label: "Soul", icon: "❀" },
   { id: "connection", label: "Connection", icon: "≡" },
+  { id: "gallery", label: "Gallery", icon: "◫" },
 ];
 
 export function LeftPanel({
@@ -154,5 +156,7 @@ function renderPanel(tab: Tab, state: PersonaState | null, opts: PanelOpts) {
           onReducedMotionChange={opts.onReducedMotionChange}
         />
       );
+    case "gallery":
+      return <GalleryPanel persona={opts.persona} />;
   }
 }
