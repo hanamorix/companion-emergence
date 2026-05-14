@@ -381,20 +381,20 @@ jobs:
               'pub_date': pub_date,
               'platforms': platforms,
           }
-          with open('latest.json', 'w') as fh:
+          with open(os.environ.get('RUNNER_TEMP', '/tmp') + '/latest.json', 'w') as fh:
               json.dump(manifest, fh, indent=2)
           print(json.dumps(manifest, indent=2))
           "
 
           echo "=== latest.json ==="
-          cat latest.json
+          cat "$RUNNER_TEMP/latest.json"
 
       - name: Publish latest.json to release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          files: latest.json
+          files: ${{ runner.temp }}/latest.json
           fail_on_unmatched_files: true
           overwrite_files: true
 
@@ -406,7 +406,7 @@ jobs:
 
       - name: Update latest-release branch
         run: |
-          cp "$GITHUB_WORKSPACE/../latest.json" latest.json 2>/dev/null || cp ../latest.json latest.json
+          cp "$RUNNER_TEMP/latest.json" latest.json
           git add latest.json
           git diff --staged --quiet || git commit -m "latest.json for ${RELEASE_TAG}"
           git push origin latest-release
