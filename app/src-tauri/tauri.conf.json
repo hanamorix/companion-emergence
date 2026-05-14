@@ -30,7 +30,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/hanamorix/companion-emergence/releases/latest/download/latest.json"
+        "https://raw.githubusercontent.com/hanamorix/companion-emergence/latest-release/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2QUEyMjMzMEY3MTRENDkKUldSSlRYRVBNeUtxbHZBaGpZRHd5WW9KOUtzM3N5Y2xiRFRKTzRtRWt4SW5RU1BIQnVYd2srVm4K",
       "windows": {
