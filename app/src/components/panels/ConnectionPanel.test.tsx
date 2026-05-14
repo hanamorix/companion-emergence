@@ -2,14 +2,16 @@
 // (frontend test coverage beyond smoke). Verifies that the status
 // banner surfaces real degraded modes and state-poll errors so the
 // audit's "user can't tell something's broken" scenario can't regress.
+//
+// Also covers the auto-update UI (Phase 4): idle, checking, up-to-date,
+// update available, error, download, and ready states.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-// Tauri's invoke is referenced indirectly via installSupervisorService.
-// Stub it so the install button can render without trying to talk to
-// the real Tauri runtime.
+// ── mocks ──────────────────────────────────────────────────────────
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => ({
     success: true,
@@ -25,9 +27,20 @@ vi.mock("../../platform", () => ({
   supportsMacOnlyInstallActions: (platform: string) => platform === "macos",
 }));
 
+const { check } = vi.hoisted(() => ({
+  check: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-updater", () => ({
+  check,
+  // Update class for the "available" state
+  Update: class {},
+}));
+
 import { ConnectionPanel } from "./ConnectionPanel";
 import type { PersonaState } from "../../bridge";
 import { getClientPlatform } from "../../platform";
+import type { Update } from "@tauri-apps/plugin-updater";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
   return {
@@ -45,6 +58,17 @@ function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
     ...overrides,
   };
 }
+
+function fakeUpdate(version = "0.0.12"): Update {
+  return {
+    version,
+    body: "release notes",
+    date: "2026-05-14T00:00:00Z",
+    downloadAndInstall: vi.fn(),
+  } as unknown as Update;
+}
+
+// ── StatusBanner tests ─────────────────────────────────────────────
 
 describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
   beforeEach(() => {
@@ -129,5 +153,81 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
   it("renders the privacy row marked accent (local-only)", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(screen.getByText(/local-only/i)).toBeInTheDocument();
+  });
+});
+
+// ── Update UI tests (Phase 4) ──────────────────────────────────────
+
+describe("ConnectionPanel — UpdateSection (Phase 4)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+    vi.mocked(check).mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows Check for updates button when idle", () => {
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.getByRole("button", { name: /check for updates/i })).toBeInTheDocument();
+  });
+
+  it("shows checking state after clicking check", async () => {
+    // check() hangs → stays in checking state
+    vi.mocked(check).mockImplementation(() => new Promise(() => {}));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/checking for updates/i)).toBeInTheDocument();
+    });
+  });
+
+  it("shows up-to-date when check returns null", async () => {
+    vi.mocked(check).mockResolvedValue(null);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/up to date/i)).toBeInTheDocument();
+    });
+  });
+
+  it("shows update available when check returns an update", async () => {
+    vi.mocked(check).mockResolvedValue(fakeUpdate("0.0.12"));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/0.0.12 available/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /download/i })).toBeInTheDocument();
+  });
+
+  it("shows error state on check failure", async () => {
+    vi.mocked(check).mockRejectedValue(new Error("network error"));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/could not check for updates/i)).toBeInTheDocument();
+    });
+    // Retry button
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("shows downloading state after clicking Download & Install", async () => {
+    const update = fakeUpdate("0.0.12");
+    vi.mocked(check).mockResolvedValue(update);
+    // downloadAndInstall hangs → stays in downloading
+    vi.mocked(update.downloadAndInstall).mockImplementation(() => new Promise(() => {}));
+
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/0.0.12 available/i)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /download/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/downloading update/i)).toBeInTheDocument();
+    });
   });
 });

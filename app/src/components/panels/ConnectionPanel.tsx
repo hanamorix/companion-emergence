@@ -4,6 +4,8 @@ import { installNellCliSymlink, installSupervisorService } from "../../appConfig
 import type { PersonaState } from "../../bridge";
 import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
+import { check } from "@tauri-apps/plugin-updater";
+import type { Update } from "@tauri-apps/plugin-updater";
 
 interface Props {
   state: PersonaState | null;
@@ -24,9 +26,18 @@ type InstallState =
   | { kind: "ok"; detail: string }
   | { kind: "error"; detail: string };
 
+type UpdateStatus =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "up-to-date" }
+  | { kind: "available"; update: Update }
+  | { kind: "downloading" }
+  | { kind: "ready" }
+  | { kind: "error"; detail: string };
+
 /**
  * Connection — bridge mode, provider, model, last-heartbeat, status
- * warnings, supervisor install, and window settings.
+ * warnings, supervisor install, update check, and window settings.
  */
 export function ConnectionPanel({
   state,
@@ -44,6 +55,31 @@ export function ConnectionPanel({
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
+  const [upd, setUpd] = useState<UpdateStatus>({ kind: "idle" });
+
+  async function checkForUpdates() {
+    setUpd({ kind: "checking" });
+    try {
+      const update = await check();
+      if (update) {
+        setUpd({ kind: "available", update });
+      } else {
+        setUpd({ kind: "up-to-date" });
+      }
+    } catch (e) {
+      setUpd({ kind: "error", detail: (e as Error).message || "unknown error" });
+    }
+  }
+
+  async function onDownloadUpdate(update: Update) {
+    setUpd({ kind: "downloading" });
+    try {
+      await update.downloadAndInstall(() => {});
+      setUpd({ kind: "ready" });
+    } catch (e) {
+      setUpd({ kind: "error", detail: (e as Error).message || "download failed" });
+    }
+  }
 
   async function onInstallSupervisor() {
     setInstall({ kind: "running" });
@@ -169,7 +205,152 @@ export function ConnectionPanel({
         label="Reduced motion"
         onChange={onReducedMotionChange}
       />
+
+      <Divider />
+      <SectionLabel>Updates</SectionLabel>
+      <UpdateSection upd={upd} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
     </PanelShell>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  UpdateSection                                                     */
+/* ------------------------------------------------------------------ */
+
+function UpdateSection({
+  upd,
+  onCheck,
+  onDownload,
+}: {
+  upd: UpdateStatus;
+  onCheck: () => void;
+  onDownload: (update: Update) => void;
+}) {
+  if (upd.kind === "idle") {
+    return (
+      <button
+        onClick={onCheck}
+        style={{
+          width: "100%",
+          padding: "7px 10px",
+          fontSize: 11,
+          fontFamily: "var(--font-ui)",
+          background: "var(--accent-dim)",
+          color: "var(--text)",
+          border: "1px solid rgba(130, 51, 41, 0.30)",
+          borderRadius: 6,
+          cursor: "pointer",
+        }}
+      >
+        Check for updates
+      </button>
+    );
+  }
+
+  if (upd.kind === "checking") {
+    return (
+      <div style={{ fontSize: 11, color: "var(--text-mute)", padding: "8px 0", textAlign: "center" }}>
+        Checking for updates…
+      </div>
+    );
+  }
+
+  if (upd.kind === "up-to-date") {
+    return (
+      <div style={{ fontSize: 11, color: "var(--text-mute)", padding: "8px 0", textAlign: "center" }}>
+        Companion Emergence is up to date ✓
+      </div>
+    );
+  }
+
+  if (upd.kind === "error") {
+    return (
+      <div>
+        <div
+          style={{
+            fontSize: 10.5,
+            color: "var(--crimson)",
+            padding: "6px 0",
+            lineHeight: 1.45,
+            wordBreak: "break-word",
+          }}
+        >
+          Could not check for updates: {upd.detail}
+        </div>
+        <button
+          onClick={onCheck}
+          style={{
+            width: "100%",
+            padding: "5px 10px",
+            fontSize: 10.5,
+            fontFamily: "var(--font-ui)",
+            background: "rgba(178, 42, 42, 0.10)",
+            color: "var(--crimson)",
+            border: "1px solid rgba(178, 42, 42, 0.35)",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (upd.kind === "available") {
+    return (
+      <div>
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--text)",
+            marginBottom: 6,
+            lineHeight: 1.45,
+          }}
+        >
+          v{upd.update.version} available. Current: v0.0.11.
+        </div>
+        <button
+          onClick={() => onDownload(upd.update)}
+          style={{
+            width: "100%",
+            padding: "7px 10px",
+            fontSize: 11,
+            fontFamily: "var(--font-ui)",
+            background: "rgba(60, 130, 90, 0.15)",
+            color: "var(--text)",
+            border: "1px solid rgba(60, 130, 90, 0.45)",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          Download &amp; Install
+        </button>
+      </div>
+    );
+  }
+
+  if (upd.kind === "downloading") {
+    return (
+      <div style={{ fontSize: 11, color: "var(--text-mute)", padding: "8px 0", textAlign: "center" }}>
+        Downloading update…
+      </div>
+    );
+  }
+
+  // ready
+  return (
+    <div
+      style={{
+        fontSize: 11,
+        color: "var(--text)",
+        padding: "8px 0",
+        textAlign: "center",
+        lineHeight: 1.45,
+      }}
+    >
+      Update downloaded. Restart Companion Emergence to apply.
+    </div>
   );
 }
 
