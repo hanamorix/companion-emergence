@@ -672,7 +672,6 @@ def _seed_audit_row(
         from brain.initiate.audit import append_audit_row
         from brain.initiate.schemas import AuditRow
     except ModuleNotFoundError:
-        import pytest
         pytest.skip("brain.initiate not available in public build")
 
     row = AuditRow(
