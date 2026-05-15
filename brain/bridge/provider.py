@@ -261,6 +261,8 @@ class ClaudeCliProvider(LLMProvider):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._timeout,
                 check=False,
             )
@@ -375,6 +377,8 @@ class ClaudeCliProvider(LLMProvider):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._timeout,
                 check=False,
             )
@@ -534,6 +538,8 @@ class ClaudeCliProvider(LLMProvider):
                     input=stdin_payload,
                     capture_output=True,
                     text=True,
+                encoding="utf-8",
+                errors="replace",
                     timeout=self._timeout,
                     env=env_overrides,
                     check=False,
@@ -661,6 +667,8 @@ class ClaudeCliProvider(LLMProvider):
                     cmd,
                     capture_output=True,
                     text=True,
+                encoding="utf-8",
+                errors="replace",
                     timeout=self._timeout,
                     check=False,
                 )
