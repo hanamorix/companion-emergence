@@ -1,19 +1,19 @@
 {
-  "version": "0.0.12-alpha.3",
+  "version": "0.0.12-alpha.4",
   "notes": "See the release page for changes.",
-  "pub_date": "2026-05-15T09:34:34Z",
+  "pub_date": "2026-05-15T13:54:19Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHNiV0d0bmo5NzJhTGFDSnp6QTZhcWdGK1hRMEViUEhNakt4MjJFZHNaekxIb04wMEs3ajZGMFhUcWV3ZGVWZ1R6MnE2U1hUcEJ1aVVBRWVUaWVRbndjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODM3MDY5CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYWFyY2g2NC5kbWcKNmRtVVg2YWxhc1FGYnlrNkJURjk3MW4xTU0wUm5sTkNEWUpYa0tHOFJvTXdWQVhmZ0dZTmNpT1RtN3I5eHlWbGdzOFBoNmtITEZId29PakpGNGx5QVE9PQo=",
-      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.3/Companion.Emergence_0.0.12_aarch64.dmg"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbGh1TmUreWtqalArbjIrYXR6QzM2MFRnT3lLQmRtZUswVlhSMTE0SGVISStNM0hnSUw2VEQ0blRVUkpmSE5uSmJYb0FVaFo0bGg3VFJqa0FWRDZFTVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODUyODU2CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYWFyY2g2NC5kbWcKaS9ieVhQVWxmc2d5L2llN1J2bWd1Uy80dU1meVZScHYzM3lMcVM3aUdFWUI1eHgyMXdYdUhvdHZTUFJxZzN1NFNPeXRFMFErQXZMRXNmODdHS2R1QVE9PQo=",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.4/Companion.Emergence_0.0.12_aarch64.dmg"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbGlGUUJMcFdObWU0SExoZ2hFb1AyWGVMWXhBTXp6WjFTaGNRQm5MbG5mK1pHRWFCVklHNlMrcGgzZWdYdjJJSjB5d1FCT0NTN05TWXpVRjdtY296L0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODM3NjI1CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYW1kNjQuQXBwSW1hZ2UKUkQ2YTFrOVo2a3ZyelJXWWJFbUZPQ3IvQlhZeGtHbCtWYVFWSWc2TG9Wc29kelRxdjRmbXJPTjMxWFduUXhmUjRSVThxY29xZlY1OHpWUUNkT3R1QWc9PQo=",
-      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.3/Companion.Emergence_0.0.12_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHYyVGhIQXVsS1JXTmJxaHlEU3hKcEVoRUVLN2p6bEpXOFFQRzk1QjZhY1hqcmg0REFjTE8reVcvTmhVY2dIRDRLclhLaTBZdXRnb1pVckdscTJGUEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODUzMTA5CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfYW1kNjQuQXBwSW1hZ2UKTVU5aDcwd21Sdm5YZW05a2lENDNFNUg0dUQrd3lDZ1ZDNzlyVXdBRDk2ak5Fd1JVdHdQdklXRS9KckM2bHgwTGc5bER5bUpLczRZRk1XQVhld1ZGQmc9PQo=",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.4/Companion.Emergence_0.0.12_amd64.AppImage"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbG5LQjEvVVhxM0psUGJ3TXRrQnBFb015NzdXM2wvRTJlVVppNmt0eXRMN3ZYMW5wemRpMUZ4Q24vRzRPZFk4c3VOQlZQVXdsYXNKV25tOGp4alBORmdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODM3MzQ5CWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfeDY0X2VuLVVTLm1zaQpDTmNvamRmUWI1Zmh1YVlicmJxT1ZxWGEvYjAyTXp5VDU2QVpubmsvU1Y3aGhickljV25odGZVc09xWHpsSmZadHp2RStqaVNGUTFmYzNQWk9Ub1pEQT09Cg==",
-      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.3/Companion.Emergence_0.0.12_x64_en-US.msi"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSlRYRVBNeUtxbHZWZlFHZFlEZWNJRTdXZUFGTS80Y1lCbi9jSGdZTUZpSUpGS3hqMGoycnNXK2dHMjRLbG5uWkQvajBCVjR3b0JwZFRVb0ZZMytsK3BuMHBoZHhWblFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc4ODUzMjIzCWZpbGU6Q29tcGFuaW9uLkVtZXJnZW5jZV8wLjAuMTJfeDY0X2VuLVVTLm1zaQpUb2NPZkg5YWJiQ2ZGdzdRSGFzVSttMC9sbkovRE40RjRlMHJDdDFwN25sb2dGVjVoUmxmeVV3STZQQVcvVTAzQ1NWendxZjA5WTlFaFhJRjdKaEFCQT09Cg==",
+      "url": "https://github.com/hanamorix/companion-emergence/releases/download/v0.0.12-alpha.4/Companion.Emergence_0.0.12_x64_en-US.msi"
     }
   }
 }
