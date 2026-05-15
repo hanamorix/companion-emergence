@@ -43,7 +43,7 @@ describe("getBridgeCredentials", () => {
     const creds = await getBridgeCredentials("alice");
     expect(creds.port).toBe(41001);
     expect(creds.authToken).toBe("alice-tok");
-    expect(creds.url).toBe("http://tauri.localhost:41001");
+    expect(creds.url).toBe("http://127.0.0.1:41001");
     expect(invoke).toHaveBeenCalledWith("get_bridge_credentials", {
       persona: "alice",
     });
@@ -131,7 +131,7 @@ describe("getBridgeCredentials", () => {
     await expect(closeSession("alice", "session-1", { keepalive: true })).resolves.toMatchObject({ closed: true });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://tauri.localhost:41001/sessions/close",
+      "http://127.0.0.1:41001/sessions/close",
       expect.objectContaining({
         method: "POST",
         keepalive: true,

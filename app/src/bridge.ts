@@ -46,7 +46,7 @@ export async function getBridgeCredentials(persona: string): Promise<BridgeCrede
       { persona },
     );
     const result: BridgeCredentials = {
-      url: `http://tauri.localhost:${creds.port}`,
+      url: `http://127.0.0.1:${creds.port}`,
       port: creds.port,
       authToken: creds.auth_token,
     };
