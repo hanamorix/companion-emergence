@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,7 +74,11 @@ def test_ollama_provider_name_includes_model() -> None:
 
 
 def test_claude_cli_provider_builds_expected_command() -> None:
-    """ClaudeCliProvider spawns `claude -p <prompt> --output-format json`."""
+    """ClaudeCliProvider spawns `claude -p ...`; prompt piped via stdin (off argv).
+
+    Heavy payloads on argv cross Windows' 32,767-char CreateProcess limit.
+    The fix: pipe prompt via stdin, write system prompt to a tempfile.
+    """
     mock_result = MagicMock()
     mock_result.returncode = 0
     mock_result.stdout = json.dumps({"result": "DREAM: test output"})
@@ -87,25 +92,62 @@ def test_claude_cli_provider_builds_expected_command() -> None:
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "claude"
     assert "-p" in cmd
-    assert "test prompt" in cmd
+    # Prompt MUST NOT appear on argv — piped via stdin instead.
+    assert "test prompt" not in cmd
+    assert mock_run.call_args.kwargs["input"] == "test prompt"
     assert "--output-format" in cmd
     assert "json" in cmd
     assert "--model" in cmd
     assert "sonnet" in cmd
 
 
-def test_claude_cli_provider_forwards_system_prompt() -> None:
-    """ClaudeCliProvider passes the system prompt via --system-prompt."""
+def test_claude_cli_provider_forwards_system_prompt_via_file(tmp_path) -> None:
+    """System prompt is passed via --system-prompt-file (off argv) and the
+    tempfile is cleaned up after the call.
+    """
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps({"result": "ok"})
+
+    captured: dict = {"path": None, "text": None}
+
+    def _recording(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        if "--system-prompt-file" in cmd:
+            captured["path"] = cmd[cmd.index("--system-prompt-file") + 1]
+            captured["text"] = Path(captured["path"]).read_text(encoding="utf-8")
+        return mock_result
+
+    with patch("subprocess.run", side_effect=_recording):
+        ClaudeCliProvider().generate("p", system="you are nell")
+
+    cmd = captured["cmd"]
+    assert "--system-prompt" not in cmd  # the bug
+    assert "--system-prompt-file" in cmd
+    assert "you are nell" not in cmd  # MUST NOT appear on argv
+    assert captured["text"] == "you are nell"
+    # And the tempfile is unlinked after the call.
+    assert not Path(captured["path"]).exists(), f"tempfile leaked: {captured['path']}"
+
+
+def test_claude_cli_provider_generate_long_prompt_keeps_argv_bounded() -> None:
+    """Regression: 50 KB prompt + 20 KB system must NOT push argv over Windows limit."""
+    big_prompt = "P" * 50_000
+    big_system = "S" * 20_000
     mock_result = MagicMock()
     mock_result.returncode = 0
     mock_result.stdout = json.dumps({"result": "ok"})
 
     with patch("subprocess.run", return_value=mock_result) as mock_run:
-        ClaudeCliProvider().generate("p", system="you are nell")
+        ClaudeCliProvider().generate(big_prompt, system=big_system)
 
     cmd = mock_run.call_args[0][0]
-    assert "--system-prompt" in cmd
-    assert "you are nell" in cmd
+    joined_len = sum(len(part) + 1 for part in cmd)
+    assert joined_len < 8192, (
+        f"argv length {joined_len} is unsafe for Windows CreateProcess "
+        f"(limit 32,767). Heavy payloads must not ride on argv."
+    )
+    assert mock_run.call_args.kwargs["input"] == big_prompt
 
 
 def test_claude_cli_provider_raises_on_nonzero_exit() -> None:
@@ -125,11 +167,13 @@ def test_claude_cli_provider_nonzero_exit_includes_json_stdout_error() -> None:
     """Claude quota errors can arrive as JSON stdout with empty stderr."""
     mock_result = MagicMock()
     mock_result.returncode = 1
-    mock_result.stdout = json.dumps({
-        "is_error": True,
-        "api_error_status": 429,
-        "result": "You're out of extra usage · resets 1:50pm",
-    })
+    mock_result.stdout = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "You're out of extra usage · resets 1:50pm",
+        }
+    )
     mock_result.stderr = ""
 
     with patch("subprocess.run", return_value=mock_result):
@@ -305,7 +349,7 @@ def test_chat_mcp_path_skips_malformed_audit_lines(tmp_path):
     def fake_run(cmd, *a, **kw):
         # 1 malformed + 1 good line
         with audit.open("a") as fh:
-            fh.write('not json at all\n')
+            fh.write("not json at all\n")
             fh.write(
                 '{"timestamp": "2026-05-05T20:00:00Z", "name": "get_soul", '
                 '"audit_level": "redacted", "arguments": {}, '
@@ -345,9 +389,7 @@ def _make_streaming_response(lines, status_code=200):
 
     def _raise():
         if status_code >= 400:
-            raise _httpx.HTTPStatusError(
-                "boom", request=MagicMock(), response=response
-            )
+            raise _httpx.HTTPStatusError("boom", request=MagicMock(), response=response)
 
     response.raise_for_status = MagicMock(side_effect=_raise)
 
