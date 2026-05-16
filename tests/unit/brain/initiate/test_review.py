@@ -46,10 +46,7 @@ def _promote_all_reflection_run(candidates, *, deps):
     from brain.initiate.d_call_schema import DCallRow, make_d_call_id
     from brain.initiate.reflection import DDecision, DReflectionResult
 
-    decisions = [
-        DDecision(i, "promote", "test stub", "high")
-        for i in range(len(candidates))
-    ]
+    decisions = [DDecision(i, "promote", "test stub", "high") for i in range(len(candidates))]
     result = DReflectionResult(decisions=decisions, tick_note=None)
     dcall = DCallRow(
         d_call_id=make_d_call_id(deps.now),
@@ -66,9 +63,7 @@ def _promote_all_reflection_run(candidates, *, deps):
     return result, dcall
 
 
-def test_review_tick_processes_queued_candidate_writes_audit(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_review_tick_processes_queued_candidate_writes_audit(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
@@ -91,9 +86,7 @@ def test_review_tick_processes_queued_candidate_writes_audit(
     assert '"decision": "send_quiet"' in lines[0]
 
 
-def test_review_tick_removes_processed_candidate_from_queue(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_review_tick_removes_processed_candidate_from_queue(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
@@ -104,7 +97,10 @@ def test_review_tick_removes_processed_candidate_from_queue(
         semantic_context=_ctx(),
     )
     run_initiate_review_tick(
-        tmp_path, provider=_fake_provider(), voice_template="x", cap_per_tick=3,
+        tmp_path,
+        provider=_fake_provider(),
+        voice_template="x",
+        cap_per_tick=3,
     )
     assert read_candidates(tmp_path) == []
 
@@ -125,7 +121,10 @@ def test_review_tick_respects_cap_per_tick(tmp_path: Path, monkeypatch) -> None:
     canned = ["subject", "tone", '{"decision": "send_quiet", "reasoning": "x"}'] * 3
     provider.complete = MagicMock(side_effect=canned)
     run_initiate_review_tick(
-        tmp_path, provider=provider, voice_template="x", cap_per_tick=3,
+        tmp_path,
+        provider=provider,
+        voice_template="x",
+        cap_per_tick=3,
     )
     # 5 emitted, 3 processed, 2 remaining
     assert len(read_candidates(tmp_path)) == 2
@@ -181,7 +180,10 @@ def test_review_tick_handles_compose_exception_as_error_decision(
     # canned JSON so D doesn't escalate, then composition errors via complete.
     provider.generate = MagicMock(return_value='{"decisions":[]}')
     run_initiate_review_tick(
-        tmp_path, provider=provider, voice_template="x", cap_per_tick=3,
+        tmp_path,
+        provider=provider,
+        voice_template="x",
+        cap_per_tick=3,
     )
     audit_line = (tmp_path / "initiate_audit.jsonl").read_text().strip()
     assert '"decision": "error"' in audit_line
@@ -194,24 +196,32 @@ def test_review_tick_no_op_when_queue_empty(tmp_path: Path) -> None:
     """Empty queue → no audit writes, no errors, no LLM calls."""
     provider = MagicMock(complete=MagicMock())
     run_initiate_review_tick(
-        tmp_path, provider=provider, voice_template="x", cap_per_tick=3,
+        tmp_path,
+        provider=provider,
+        voice_template="x",
+        cap_per_tick=3,
     )
     assert not (tmp_path / "initiate_audit.jsonl").exists()
     provider.complete.assert_not_called()
 
 
-def test_review_tick_publishes_initiate_delivered_on_send(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path, monkeypatch) -> None:
     """When the decision is to send, the review tick MUST publish an
     ``initiate_delivered`` event so the frontend banner pipeline wakes up.
 
     The frontend ChatPanel subscribes to this event on the bridge /events
     stream; without the publish, the brain's outreach is invisible to the
     user even though the audit row says "delivered".
+
+    Time is pinned to a known non-blackout hour because send_notify gates
+    through the 23:00–07:00 user-local blackout window. Without this pin,
+    the test silently flipped to ``decision="hold"`` whenever the suite
+    ran past 11 PM local — see ``test_review_tick_gate_blocks_send_records_hold``
+    for the inverse case that proves the gate.
     """
     from brain.bridge import events
 
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)  # 14:00 UTC — well outside blackout
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
@@ -230,6 +240,7 @@ def test_review_tick_publishes_initiate_delivered_on_send(
             provider=_fake_provider("send_notify"),
             voice_template="be warm",
             cap_per_tick=3,
+            now=daytime,
         )
     finally:
         events.set_publisher(None)
@@ -275,9 +286,7 @@ def test_review_tick_does_not_publish_on_hold(tmp_path: Path, monkeypatch) -> No
     assert delivered == []
 
 
-def test_run_initiate_review_tick_skips_d_when_queue_empty(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_run_initiate_review_tick_skips_d_when_queue_empty(tmp_path: Path, monkeypatch) -> None:
     """No candidates → no D call, no composition."""
     called = {"d": 0}
 
@@ -293,9 +302,7 @@ def test_run_initiate_review_tick_skips_d_when_queue_empty(
     assert called["d"] == 0
 
 
-def test_run_initiate_review_tick_demotes_filtered_to_draft(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_run_initiate_review_tick_demotes_filtered_to_draft(tmp_path: Path, monkeypatch) -> None:
     """D-filter decision → candidate goes to draft_space.md, NOT composition."""
     from brain.initiate.d_call_schema import DCallRow, make_d_call_id
     from brain.initiate.reflection import DDecision, DReflectionResult
@@ -339,7 +346,9 @@ def test_run_initiate_review_tick_demotes_filtered_to_draft(
     monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process_one)
 
     provider = MagicMock()
-    run_initiate_review_tick(persona, provider=provider, voice_template="x", cap_per_tick=3, now=now)
+    run_initiate_review_tick(
+        persona, provider=provider, voice_template="x", cap_per_tick=3, now=now
+    )
 
     assert read_candidates(persona) == []
     assert (persona / "draft_space.md").exists()
@@ -361,8 +370,12 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
     base_time = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
 
     emit_initiate_candidate(
-        persona, kind="message", source="dream", source_id="d_pf",
-        semantic_context=SemanticContext(), now=base_time,
+        persona,
+        kind="message",
+        source="dream",
+        source_id="d_pf",
+        semantic_context=SemanticContext(),
+        now=base_time,
     )
 
     invocation_count = {"n": 0}
@@ -399,13 +412,19 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
     tick2_time = base_time + timedelta(minutes=2)
     tick3_time = base_time + timedelta(minutes=3)
 
-    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick1_time)
-    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick2_time)
+    run_initiate_review_tick(
+        persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick1_time
+    )
+    run_initiate_review_tick(
+        persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick2_time
+    )
     assert len(read_candidates(persona)) == 1
     assert compose_calls == []
 
     # Tick 3: third consecutive failure — fall through to promote-all.
-    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick3_time)
+    run_initiate_review_tick(
+        persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=tick3_time
+    )
     assert len(compose_calls) == 1
     assert "ic_" in compose_calls[0]  # candidate_id is always ic_<timestamp>_<rand>
 
@@ -425,8 +444,12 @@ def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
     persona = tmp_path / "p"
     now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
     emit_initiate_candidate(
-        persona, kind="message", source="dream", source_id="d1",
-        semantic_context=SemanticContext(), now=now,
+        persona,
+        kind="message",
+        source="dream",
+        source_id="d1",
+        semantic_context=SemanticContext(),
+        now=now,
     )
 
     def fake_reflection_run(candidates, *, deps):
@@ -436,10 +459,16 @@ def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
                 tick_note=None,
             ),
             DCallRow(
-                d_call_id="dc", ts=now.isoformat(), tick_id="t",
-                model_tier_used="haiku", candidates_in=1,
-                promoted_out=1, filtered_out=0,
-                latency_ms=10, tokens_input=10, tokens_output=10,
+                d_call_id="dc",
+                ts=now.isoformat(),
+                tick_id="t",
+                model_tier_used="haiku",
+                candidates_in=1,
+                promoted_out=1,
+                filtered_out=0,
+                latency_ms=10,
+                tokens_input=10,
+                tokens_output=10,
             ),
         )
 
@@ -460,7 +489,9 @@ def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
     monkeypatch.setattr("brain.initiate.review._emit_supervisor_event", fake_emit_supervisor_event)
     monkeypatch.setattr("brain.initiate.review._process_one_candidate", lambda *a, **k: None)
 
-    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=now)
+    run_initiate_review_tick(
+        persona, provider=MagicMock(), voice_template="x", cap_per_tick=3, now=now
+    )
 
     assert len(captured_events) == 1
     event = captured_events[0]
