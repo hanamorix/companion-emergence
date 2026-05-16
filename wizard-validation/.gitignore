@@ -1,0 +1,11 @@
+# Build artifacts — rebuilt fresh per test run, do not commit
+NellFace.app/
+*.dmg
+
+# Runtime logs from launch.sh / launch_real.sh
+launch_real.log
+launch.log
+
+# Test state — wiped by cleanup.sh between runs
+nellbrain_home/*
+!nellbrain_home/.gitkeep
