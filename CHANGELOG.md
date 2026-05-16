@@ -7,23 +7,99 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
-## 0.0.11-alpha.5 — (pending)
+## 0.0.12-alpha.5 — 2026-05-17
 
-Windows WebView2 fetch fix — root cause identified.
+- **Windows `WinError 206` fix on long chat sessions.** Fresh sessions
+  worked but every message returned `provider_failed` after a few dozen
+  turns; closing and reopening the chat resolved it until the new
+  session grew again. Root cause: the Claude CLI provider was passing
+  the system prompt (voice template, ~15 KB) and the full session
+  buffer on the command line. Windows `CreateProcess` caps the entire
+  command line at 32,767 chars — voice template + a moderate session
+  buffer was already enough to cross it. The provider now writes the
+  system prompt to a tempfile (`--system-prompt-file`) and pipes the
+  conversation via stdin instead, keeping argv bounded regardless of
+  session length. macOS and Linux are unaffected today (their argv
+  limits are 256 KB–2 MB), but the same fix preempts the same trap
+  there on extremely long sessions.
+
+## 0.0.12-alpha.4 — 2026-05-15
+
+- **UTF-8 encoding fix for Windows.** Added `encoding="utf-8", errors="replace"`
+  to all four `subprocess.run` calls in the Claude CLI provider. Windows defaults
+  to cp1252 for `text=True` subprocess output, but Claude CLI emits UTF-8. Without
+  this, accented characters in chat replies render as mojibake. Non-Windows
+  platforms are unaffected (default encoding is already UTF-8).
+
+## 0.0.12-alpha.3 — 2026-05-15
+
+- **Revert tauri.localhost bridge URL.** The alpha.1 tauri.localhost change
+  was a red herring. The real wizard hang was the Windows path mismatch
+  (fixed in alpha.2). With the path fix in place, 127.0.0.1 works correctly.
+  tauri.localhost introduced a new problem: Tauri's internal proxy intercepts
+  CORS preflight requests carrying an Authorization header and strips the
+  server's Access-Control-Allow-Headers, breaking all authenticated fetches
+  on Windows.
+
+## 0.0.12-alpha.2 — 2026-05-14
+
+- **Windows path fix.** The Rust `nellbrain_home()` function was resolving
+  to `%APPDATA%` (Roaming) while Python's `platformdirs` resolves to
+  `%LOCALAPPDATA%\hanamorix\companion-emergence`. This caused the Tauri app
+  to read bridge.json from the wrong directory on Windows — the file was
+  written by Python under LocalAppData but Rust looked under Roaming.
+  Root-caused by a Windows user who added devtools to surface the error.
+  macOS and Linux are unaffected (both crates agree on the path there).
+
+## 0.0.12-alpha.1 — 2026-05-14
+
+- **Past-image gallery.** New Gallery tab in the left panel shows every
+  image shared across all past conversations as a thumbnail grid. Click any
+  thumbnail for a full-size lightbox (Escape or click backdrop to close).
+  Thumbnails lazy-load and the grid shows up to 50 recent images.
+
+- **Auto-update support.** The app can now check for, download, and install
+  updates from GitHub Releases. Find it in the Connection panel under the
+  new "Updates" section. On macOS it downloads a DMG, on Windows an MSI,
+  and on Linux an AppImage. Updates are cryptographically signed.
+
+- **Windows WebView2 fetch fix (tauri.localhost).** The bridge fetch URL now
+  uses `http://tauri.localhost` instead of `http://127.0.0.1`, matching the
+  WebView page origin. On Chromium 148+ (WebView2 Runtime), the hostname
+  mismatch could cause `fetch()` to hang even after CORS preflight passed.
+  CSP updated to include `tauri.localhost:*` for both HTTP and WebSocket.
+
+## 0.0.11-alpha.5 — 2026-05-14
+
+Windows WebView2 bridge fetch fix (root-cause fix for the alpha.4 symptom).
 
 - **WebView2 origin mismatch fix.** The alpha.4 PNA fix correctly added
-  server-side `Access-Control-Allow-Private-Network` headers, but on Windows
-  the Tauri WebView2 was still blocking *all* bridge fetches before any bytes
-  left the browser. Root cause: Tauri 2 serves Windows frontends from
-  `https://tauri.localhost` (HTTPS → public address space) while the bridge
-  listens on `http://127.0.0.1` (HTTP → private address space). Chromium's
-  Private Network Access enforcement blocks the fetch at the address-space
-  gate — the preflight never reaches the server, so server-side headers
-  don't help. Fix: `useHttpsScheme: false` in Tauri window config tells the
-  WebView2 to serve the frontend from `http://tauri.localhost` instead. Now
-  both page and bridge share the same address space → no PNA preflight
-  needed. CORS origins (`http://tauri.localhost`) and CSP (`'self'`) already
-  supported HTTP scheme. No change to macOS (custom protocol) or dev mode.
+  server-side `Access-Control-Allow-Private-Network` headers, but Windows
+  users reported the app still showed `Failed to fetch` / `Bridge unreachable`
+  and `bridge-*.log` stayed at 0 bytes — no request from the WebView ever
+  reached the server, not even a preflight. Server-side CSP and CORS headers
+  were verified correct from PowerShell; the fetch was blocked inside the
+  WebView2 before any bytes left. Root cause: Tauri 2 serves Windows/Linux
+  frontends from `https://tauri.localhost` (HTTPS, public address space) while
+  the bridge listens on `http://127.0.0.1` (HTTP, private address space).
+  Chromium's Private Network Access enforcement blocks the fetch at the
+  address-space gate. Fix: `useHttpsScheme: false` in the Tauri window config
+  switches to `http://tauri.localhost`. Page and bridge now share the same
+  address space → no PNA preflight needed. CORS origins and CSP already
+  supported the HTTP scheme. No change to macOS (custom `tauri://` protocol)
+  or dev mode (Vite). Reported and root-caused with help from a Windows user.
+
+- **Public sync filter-repo recovery.** The public sync's `git filter-repo`
+  step was dropping the v0.0.11 initiate merge, removing `brain/initiate/`,
+  `InitiateBanner.tsx`, `reply_to_audit_id`, and related files from the public
+  build. Added a post-filter-repo recovery step to `.public-sync/sync-to-public.sh`
+  that restores any files the merge simplification drops, with personal-marker
+  filtering applied.
+
+- **Packaging.** CI run `25849769893` passed all four jobs: validate (Python
+  tests, lint, frontend tests, frontend build, cargo check, cargo test, wheel
+  smoke), windows-x86_64, macos-arm64, linux-x86_64. All 8 release assets
+  published with SHA256SUMS. Privacy marker scan passes.
 
 ## 0.0.11-alpha.4 — 2026-05-13
 
