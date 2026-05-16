@@ -16,6 +16,7 @@ which shape they need.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -172,6 +173,48 @@ class FakeProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
+    """Yield a tempfile path containing ``text``, cleaned up on exit.
+
+    Yields ``None`` when ``text`` is ``None`` so callers can write::
+
+        with _system_prompt_tempfile(system_prompt) as sp_path:
+            if sp_path is not None:
+                cmd.extend(["--system-prompt-file", sp_path])
+            subprocess.run(cmd, ...)
+
+    Why a file: Windows ``CreateProcess`` caps the entire command line at
+    32,767 chars (``WinError 206``). voice.md alone runs ~15 KB; pushing it
+    through ``--system-prompt`` on argv crosses the limit on long sessions.
+    ``--system-prompt-file`` keeps the prompt off argv. macOS/Linux
+    ``ARG_MAX`` is 256 KB–2 MB so the same problem looms there too, just
+    with a larger margin.
+
+    The file is created with ``NamedTemporaryFile(delete=False)`` (mode
+    0600 on POSIX, user-only ACL on Windows) and unlinked in ``finally``
+    so it survives a subprocess failure path the same as a success.
+    """
+    if text is None:
+        yield None
+        return
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        delete=False,
+        encoding="utf-8",
+    )
+    try:
+        tmp.write(text)
+        tmp.close()
+        yield tmp.name
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     """Return a useful error detail for failed Claude CLI subprocesses.
 
@@ -252,24 +295,29 @@ class ClaudeCliProvider(LLMProvider):
         self._timeout = timeout_seconds
 
     def generate(self, prompt: str, *, system: str | None = None) -> str:
-        cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", self._model]
-        if system is not None:
-            cmd.extend(["--system-prompt", system])
+        # Prompt piped via stdin; system prompt via --system-prompt-file.
+        # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
+        # limit — WinError 206). See _system_prompt_tempfile for context.
+        cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
+        with _system_prompt_tempfile(system) as sp_path:
+            if sp_path is not None:
+                cmd.extend(["--system-prompt-file", sp_path])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self._timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(
-                f"ClaudeCliProvider: subprocess timed out after {self._timeout}s"
-            ) from exc
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self._timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(
+                    f"ClaudeCliProvider: subprocess timed out after {self._timeout}s"
+                ) from exc
 
         if result.returncode != 0:
             raise RuntimeError(
@@ -368,25 +416,29 @@ class ClaudeCliProvider(LLMProvider):
         # Text path for turns without image blocks. Multi-turn history is
         # formatted as JSONL context data instead of a script with canonical
         # User:/Assistant: labels, because those labels can leak into replies.
-        cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
-        if system_prompt is not None:
-            cmd.extend(["--system-prompt", system_prompt])
+        # Prompt → stdin, system_prompt → tempfile + --system-prompt-file
+        # keeps both off argv (Windows CreateProcess 32,767-char limit).
+        cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
+        with _system_prompt_tempfile(system_prompt) as sp_path:
+            if sp_path is not None:
+                cmd.extend(["--system-prompt-file", sp_path])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self._timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ProviderError(
-                "claude_cli_timeout",
-                f"subprocess timed out after {self._timeout}s",
-            ) from exc
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=flat_prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self._timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError(
+                    "claude_cli_timeout",
+                    f"subprocess timed out after {self._timeout}s",
+                ) from exc
 
         if result.returncode != 0:
             raise ProviderError(
@@ -472,13 +524,19 @@ class ClaudeCliProvider(LLMProvider):
         cmd = [
             "claude",
             "--print",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
             "--verbose",
-            "--model", self._model,
+            "--model",
+            self._model,
         ]
-        if full_system is not None:
-            cmd.extend(["--system-prompt", full_system])
+        # System prompt (which on this path includes flattened history) goes
+        # to a tempfile + --system-prompt-file. Stdin is reserved for the
+        # stream-json user frame so we can't pipe it the way the text path
+        # does. Off-argv keeps long histories under Windows' 32,767-char
+        # CreateProcess limit.
 
         # Set up MCP if tools are enabled — same shape as the
         # legacy-text tool path so the brain's tools remain available
@@ -512,7 +570,10 @@ class ClaudeCliProvider(LLMProvider):
             }
             try:
                 with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".json", delete=False, encoding="utf-8",
+                    mode="w",
+                    suffix=".json",
+                    delete=False,
+                    encoding="utf-8",
                 ) as tmp:
                     json.dump(mcp_config, tmp)
                     tmp_mcp_path = tmp.name
@@ -532,23 +593,26 @@ class ClaudeCliProvider(LLMProvider):
                 audit_offset_before = 0
 
         try:
-            try:
-                result = subprocess.run(
-                    cmd,
-                    input=stdin_payload,
-                    capture_output=True,
-                    text=True,
-                encoding="utf-8",
-                errors="replace",
-                    timeout=self._timeout,
-                    env=env_overrides,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise ProviderError(
-                    "claude_cli_timeout",
-                    f"image-passthrough subprocess timed out after {self._timeout}s",
-                ) from exc
+            with _system_prompt_tempfile(full_system) as sp_path:
+                if sp_path is not None:
+                    cmd.extend(["--system-prompt-file", sp_path])
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        input=stdin_payload,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=self._timeout,
+                        env=env_overrides,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise ProviderError(
+                        "claude_cli_timeout",
+                        f"image-passthrough subprocess timed out after {self._timeout}s",
+                    ) from exc
 
             if result.returncode != 0:
                 raise ProviderError(
@@ -656,27 +720,34 @@ class ClaudeCliProvider(LLMProvider):
             from brain.tools import NELL_TOOL_NAMES  # local import — avoids circular
 
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
-            cmd = ["claude", "-p", flat_prompt, "--output-format", "json", "--model", self._model]
-            if system_prompt is not None:
-                cmd.extend(["--system-prompt", system_prompt])
+            # flat_prompt → stdin, system_prompt → tempfile + --system-prompt-file.
+            # Off-argv on both keeps the cmd under Windows' 32,767-char limit
+            # even after a long session has grown voice.md + buffer into the
+            # tens of KB. This is the exact code path that surfaced WinError
+            # 206 in the field.
+            cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
 
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                encoding="utf-8",
-                errors="replace",
-                    timeout=self._timeout,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise ProviderError(
-                    "claude_cli_timeout",
-                    f"subprocess timed out after {self._timeout}s",
-                ) from exc
+            with _system_prompt_tempfile(system_prompt) as sp_path:
+                if sp_path is not None:
+                    cmd.extend(["--system-prompt-file", sp_path])
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        input=flat_prompt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=self._timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise ProviderError(
+                        "claude_cli_timeout",
+                        f"subprocess timed out after {self._timeout}s",
+                    ) from exc
 
             if result.returncode != 0:
                 raise ProviderError(
@@ -1149,9 +1220,7 @@ class OllamaProvider(LLMProvider):
 
         url = f"{self._host}/api/chat"
         try:
-            with httpx.stream(
-                "POST", url, json=payload, timeout=self._timeout
-            ) as resp:
+            with httpx.stream("POST", url, json=payload, timeout=self._timeout) as resp:
                 try:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as exc:
@@ -1161,7 +1230,11 @@ class OllamaProvider(LLMProvider):
                         f"{exc.response.status_code}: {body[:200]}",
                     ) from exc
                 for raw_line in resp.iter_lines():
-                    line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="replace").strip()
+                    line = (
+                        raw_line.strip()
+                        if isinstance(raw_line, str)
+                        else raw_line.decode("utf-8", errors="replace").strip()
+                    )
                     if not line:
                         continue
                     try:
