@@ -102,16 +102,84 @@ def _make_claude_result(content: str = "hello", rc: int = 0) -> MagicMock:
     return m
 
 
+def _make_recording_run(result: MagicMock | None = None):
+    """Build a subprocess.run side_effect that captures --system-prompt-file
+    contents BEFORE the implementation unlinks the tempfile.
+
+    Use via:
+        recorder = _make_recording_run(_make_claude_result("..."))
+        with patch("brain.bridge.provider.subprocess.run", side_effect=recorder):
+            ...
+        recorder.captured["system_prompt_text"]   # the file contents
+        recorder.captured["system_prompt_path"]   # the path used
+        recorder.captured["mcp_config_text"]      # mcp-config tempfile contents
+        recorder.captured["cmd"]                  # argv recorded
+        recorder.captured["stdin"]                # value of `input=` kwarg
+    """
+    if result is None:
+        result = _make_claude_result()
+    captured: dict = {
+        "system_prompt_text": None,
+        "system_prompt_path": None,
+        "mcp_config_text": None,
+        "cmd": None,
+        "stdin": None,
+    }
+
+    def _side_effect(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["stdin"] = kwargs.get("input")
+        if "--system-prompt-file" in cmd:
+            path = cmd[cmd.index("--system-prompt-file") + 1]
+            captured["system_prompt_path"] = path
+            captured["system_prompt_text"] = Path(path).read_text(encoding="utf-8")
+        if "--mcp-config" in cmd:
+            path = cmd[cmd.index("--mcp-config") + 1]
+            captured["mcp_config_text"] = Path(path).read_text(encoding="utf-8")
+        return result
+
+    _side_effect.captured = captured  # type: ignore[attr-defined]
+    return _side_effect
+
+
+def _captured_system_file_text(mock_run) -> str:
+    """Pull captured system-prompt-file contents from a recording mock_run.
+
+    Works when mock_run was patched with `side_effect=_make_recording_run(...)`.
+    """
+    side_effect = mock_run.side_effect
+    if side_effect is None or not hasattr(side_effect, "captured"):
+        raise AssertionError(
+            "mock_run was not configured with _make_recording_run — "
+            "cannot read system-prompt-file contents post-cleanup."
+        )
+    return side_effect.captured["system_prompt_text"] or ""
+
+
 def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
-    """ClaudeCliProvider.chat uses -p for the flattened conversation."""
-    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+    """ClaudeCliProvider.chat uses -p with the prompt piped via stdin (off argv).
+
+    The conversation prompt grows with session length. Passing it on the
+    command line crosses Windows' CreateProcess 32,767-char limit (WinError
+    206) after a few dozen turns. We pipe it on stdin instead — claude -p
+    reads from stdin when no positional prompt is given.
+    """
+    with patch(
+        "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
+    ) as mock_run:
         p = ClaudeCliProvider(model="sonnet")
         p.chat([ChatMessage(role="user", content="hello")])
 
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "claude"
     assert "-p" in cmd
-    assert "hello" in cmd
+    # Prompt must NOT appear on argv — it goes via stdin.
+    assert "hello" not in cmd
+    # No positional prompt after -p (next element is either a flag or end).
+    p_idx = cmd.index("-p")
+    if p_idx + 1 < len(cmd):
+        assert cmd[p_idx + 1].startswith("--")
+    assert mock_run.call_args.kwargs["input"] == "hello"
 
 
 def _make_stream_json_result(text: str = "I see it.") -> MagicMock:
@@ -196,9 +264,10 @@ def test_claude_cli_chat_image_history_uses_jsonl_context_not_role_labels(tmp_pa
         ImageBlock(image_sha=sha, media_type="image/png"),
     )
 
+    recorder = _make_recording_run(_make_stream_json_result("a tiny png"))
     with patch(
         "brain.bridge.provider.subprocess.run",
-        return_value=_make_stream_json_result("a tiny png"),
+        side_effect=recorder,
     ) as mock_run:
         p = ClaudeCliProvider(model="sonnet")
         p.chat(
@@ -212,7 +281,13 @@ def test_claude_cli_chat_image_history_uses_jsonl_context_not_role_labels(tmp_pa
         )
 
     cmd = mock_run.call_args[0][0]
-    system_prompt = cmd[cmd.index("--system-prompt") + 1]
+    # System prompt is now passed via --system-prompt-file (off argv).
+    assert "--system-prompt" not in cmd
+    assert "--system-prompt-file" in cmd
+    system_prompt_path = cmd[cmd.index("--system-prompt-file") + 1]
+    # Tempfile is unlinked AFTER subprocess returns, but the recorder
+    # captured its contents during the subprocess call.
+    system_prompt = _captured_system_file_text(mock_run)
     assert system_prompt.startswith("you are nell")
     assert "User:" not in system_prompt
     assert "Assistant:" not in system_prompt
@@ -226,6 +301,8 @@ def test_claude_cli_chat_image_history_uses_jsonl_context_not_role_labels(tmp_pa
 
     stdin_bytes = mock_run.call_args.kwargs["input"]
     assert "describe this new image" in stdin_bytes
+    # And the tempfile path was a real path (string, not None).
+    assert isinstance(system_prompt_path, str) and system_prompt_path
 
 
 def test_claude_cli_chat_image_without_persona_dir_raises() -> None:
@@ -252,8 +329,13 @@ def test_claude_cli_chat_text_only_still_uses_p_flag() -> None:
 
 
 def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None:
-    """Multi-turn -p prompts must not prime Claude with User:/Assistant: labels."""
-    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+    """Multi-turn -p prompts must not prime Claude with User:/Assistant: labels.
+
+    Prompt is piped via stdin (off argv) — read it from `input=` kwarg.
+    """
+    with patch(
+        "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
+    ) as mock_run:
         p = ClaudeCliProvider(model="sonnet")
         p.chat(
             [
@@ -263,8 +345,7 @@ def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None
             ]
         )
 
-    cmd = mock_run.call_args[0][0]
-    prompt = cmd[cmd.index("-p") + 1]
+    prompt = mock_run.call_args.kwargs["input"]
     assert "User:" not in prompt
     assert "Assistant:" not in prompt
     assert "Conversation context is encoded below as JSONL data" in prompt
@@ -278,9 +359,15 @@ def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None
     ]
 
 
-def test_claude_cli_chat_passes_system_prompt_flag() -> None:
-    """System message in the list → --system-prompt flag."""
-    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result()) as mock_run:
+def test_claude_cli_chat_passes_system_prompt_via_file_not_argv() -> None:
+    """System message in the list → --system-prompt-file <tempfile>, contents on disk.
+
+    Replaces the earlier --system-prompt-on-argv contract. voice.md is ~15 KB
+    and the session prompt grows with each turn; together they cross Windows'
+    32,767-char CreateProcess limit. Off-argv via tempfile keeps argv bounded.
+    """
+    recorder = _make_recording_run()
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder) as mock_run:
         p = ClaudeCliProvider()
         p.chat(
             [
@@ -290,13 +377,189 @@ def test_claude_cli_chat_passes_system_prompt_flag() -> None:
         )
 
     cmd = mock_run.call_args[0][0]
-    assert "--system-prompt" in cmd
-    assert "you are nell" in cmd
+    assert "--system-prompt" not in cmd  # the bug
+    assert "--system-prompt-file" in cmd
+    assert "you are nell" not in cmd  # MUST NOT appear on argv
+    assert _captured_system_file_text(mock_run) == "you are nell"
+
+
+def test_claude_cli_chat_system_prompt_tempfile_cleaned_up_on_success() -> None:
+    """The system-prompt tempfile is unlinked after a successful subprocess.run."""
+    recorder = _make_recording_run()
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder):
+        p = ClaudeCliProvider()
+        p.chat(
+            [
+                ChatMessage(role="system", content="you are nell"),
+                ChatMessage(role="user", content="hi"),
+            ]
+        )
+
+    path = recorder.captured["system_prompt_path"]
+    assert path is not None
+    assert not Path(path).exists(), f"tempfile leaked: {path}"
+
+
+def test_claude_cli_chat_system_prompt_tempfile_cleaned_up_on_error() -> None:
+    """The system-prompt tempfile is unlinked even when subprocess.run fails."""
+    failed = MagicMock()
+    failed.returncode = 1
+    failed.stdout = ""
+    failed.stderr = "auth failure"
+    recorder = _make_recording_run(failed)
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder):
+        p = ClaudeCliProvider()
+        with pytest.raises(ProviderError):
+            p.chat(
+                [
+                    ChatMessage(role="system", content="you are nell"),
+                    ChatMessage(role="user", content="hi"),
+                ]
+            )
+
+    path = recorder.captured["system_prompt_path"]
+    assert path is not None
+    assert not Path(path).exists(), f"tempfile leaked on error path: {path}"
+
+
+def test_claude_cli_chat_long_session_keeps_argv_bounded() -> None:
+    """Regression: 40 KB system + 30 KB prompt must NOT push argv over Windows limit.
+
+    Windows CreateProcess caps the joined command line at 32,767 chars (WinError
+    206). Before this fix, voice.md (~15 KB) + a long session buffer (~18 KB+)
+    pushed every chat call over the cap and the provider raised
+    FileNotFoundError on every message. We give plenty of margin by asserting
+    the joined argv stays under 8 KB — the heavy payloads now travel via
+    stdin and tempfile.
+    """
+    big_system = "S" * 40_000
+    big_prompt = "P" * 30_000
+    recorder = _make_recording_run()
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder) as mock_run:
+        p = ClaudeCliProvider()
+        p.chat(
+            [
+                ChatMessage(role="system", content=big_system),
+                ChatMessage(role="user", content=big_prompt),
+            ]
+        )
+
+    cmd = mock_run.call_args[0][0]
+    joined_len = sum(len(part) + 1 for part in cmd)  # +1 per arg separator
+    assert joined_len < 8192, (
+        f"argv length {joined_len} is unsafe for Windows CreateProcess "
+        f"(limit 32,767). Heavy payloads must not ride on argv."
+    )
+    # Sanity: the heavy payloads went where they should.
+    assert mock_run.call_args.kwargs["input"] == big_prompt
+    assert _captured_system_file_text(mock_run) == big_system
+
+
+def test_claude_cli_chat_mcp_tools_pipes_prompt_via_stdin(tmp_path) -> None:
+    """The MCP-tools path also pipes flat_prompt via stdin and uses --system-prompt-file.
+
+    This is the exact code path that surfaced WinError 206 in the field
+    (provider.py:_chat_with_mcp_tools). Both heavy payloads must be off argv.
+    """
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    recorder = _make_recording_run()
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat(
+            [
+                ChatMessage(role="system", content="voice persona"),
+                ChatMessage(role="user", content="hi nell"),
+            ],
+            tools=[{"name": "search_memories"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    cmd = mock_run.call_args[0][0]
+    # MCP tool path is identifiable by --mcp-config + --allowedTools.
+    assert "--mcp-config" in cmd
+    assert "--allowedTools" in cmd
+    # Same off-argv contract as the text-only path.
+    assert "--system-prompt" not in cmd
+    assert "--system-prompt-file" in cmd
+    assert "voice persona" not in cmd
+    assert "hi nell" not in cmd
+    assert mock_run.call_args.kwargs["input"] == "hi nell"
+    assert _captured_system_file_text(mock_run) == "voice persona"
+
+
+def test_claude_cli_chat_mcp_tools_tempfile_cleaned_up_on_error(tmp_path) -> None:
+    """MCP path also cleans the system-prompt tempfile on subprocess failure."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    failed = MagicMock()
+    failed.returncode = 1
+    failed.stdout = ""
+    failed.stderr = "boom"
+    recorder = _make_recording_run(failed)
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder):
+        p = ClaudeCliProvider(model="sonnet")
+        with pytest.raises(ProviderError):
+            p.chat(
+                [
+                    ChatMessage(role="system", content="voice"),
+                    ChatMessage(role="user", content="hi"),
+                ],
+                tools=[{"name": "search_memories"}],
+                options={"persona_dir": str(persona_dir)},
+            )
+
+    path = recorder.captured["system_prompt_path"]
+    assert path is not None
+    assert not Path(path).exists(), f"system tempfile leaked on MCP error path: {path}"
+
+
+def test_claude_cli_chat_image_system_prompt_via_file(tmp_path) -> None:
+    """Image path also passes the full_system prompt via --system-prompt-file.
+
+    Image-bearing turns flatten history into `full_system`, which can be even
+    larger than the text path's system_prompt. Stdin is already used for the
+    stream-json user frame, so only system_prompt moves off argv here.
+    """
+    import hashlib
+
+    from brain.images import save_image_bytes
+
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c63606060600000000400015e36b8c80000000049454e44ae426082"
+    )
+    save_image_bytes(tmp_path, tiny_png, "image/png")
+    sha = hashlib.sha256(tiny_png).hexdigest()
+    blocks = (
+        TextBlock(text="describe"),
+        ImageBlock(image_sha=sha, media_type="image/png"),
+    )
+    recorder = _make_recording_run(_make_stream_json_result("ok"))
+    with patch("brain.bridge.provider.subprocess.run", side_effect=recorder) as mock_run:
+        p = ClaudeCliProvider(model="sonnet")
+        p.chat(
+            [
+                ChatMessage(role="system", content="you are nell"),
+                ChatMessage(role="user", content=blocks),
+            ],
+            options={"persona_dir": str(tmp_path)},
+        )
+
+    cmd = mock_run.call_args[0][0]
+    assert "--system-prompt" not in cmd
+    assert "--system-prompt-file" in cmd
+    assert "you are nell" not in cmd
+    assert "you are nell" in _captured_system_file_text(mock_run)
 
 
 def test_claude_cli_chat_parses_success() -> None:
     """Successful call returns ChatResponse with correct content."""
-    with patch("brain.bridge.provider.subprocess.run", return_value=_make_claude_result("dream response")):
+    with patch(
+        "brain.bridge.provider.subprocess.run", return_value=_make_claude_result("dream response")
+    ):
         p = ClaudeCliProvider()
         resp = p.chat([ChatMessage(role="user", content="dream")])
 
@@ -572,9 +835,7 @@ def persona_dir(tmp_path: Path) -> Path:
 
 
 def _fake_proc(stdout: str, returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=stderr
-    )
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 def test_chat_with_tools_passes_mcp_config_flag(persona_dir: Path) -> None:
@@ -644,8 +905,17 @@ def test_read_audit_lines_since_filters_other_request_ids(tmp_path: Path) -> Non
     audit_path.write_text(
         "\n".join(
             [
-                json.dumps({"name": "mine", "arguments": {}, "result_summary": "ok", "request_id": "req-1"}),
-                json.dumps({"name": "other", "arguments": {}, "result_summary": "ok", "request_id": "req-2"}),
+                json.dumps(
+                    {"name": "mine", "arguments": {}, "result_summary": "ok", "request_id": "req-1"}
+                ),
+                json.dumps(
+                    {
+                        "name": "other",
+                        "arguments": {},
+                        "result_summary": "ok",
+                        "request_id": "req-2",
+                    }
+                ),
                 json.dumps({"name": "legacy", "arguments": {}, "result_summary": "ok"}),
             ]
         )
@@ -665,9 +935,7 @@ def test_read_audit_lines_since_logs_malformed_lines(tmp_path: Path, caplog) -> 
 
     audit_path = tmp_path / "tool_invocations.log.jsonl"
     audit_path.write_text(
-        "not json\n"
-        + json.dumps({"name": "ok", "arguments": {}, "result_summary": "done"})
-        + "\n",
+        "not json\n" + json.dumps({"name": "ok", "arguments": {}, "result_summary": "done"}) + "\n",
         encoding="utf-8",
     )
     caplog.set_level(logging.WARNING)
@@ -679,13 +947,19 @@ def test_read_audit_lines_since_logs_malformed_lines(tmp_path: Path, caplog) -> 
 
 
 def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
-    """The other flags (-p, --output-format, --model, --system-prompt)
-    must remain — only --json-schema is replaced."""
+    """The other flags (-p, --output-format, --model, --system-prompt-file)
+    must remain — only --json-schema is replaced. system_prompt now travels
+    via tempfile (--system-prompt-file) after the Windows argv-overflow fix.
+    """
     provider = ClaudeCliProvider()
     captured: dict = {}
 
     def _capture(cmd, **kwargs):
-        captured["cmd"] = cmd
+        captured["cmd"] = list(cmd)
+        if "--system-prompt-file" in cmd:
+            captured["sp_text"] = Path(cmd[cmd.index("--system-prompt-file") + 1]).read_text(
+                encoding="utf-8"
+            )
         return _fake_proc(json.dumps({"result": "ok"}))
 
     with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
@@ -704,8 +978,9 @@ def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
     assert "--output-format" in cmd
     assert "json" in cmd
     assert "--model" in cmd
-    assert "--system-prompt" in cmd
-    assert "sys-prompt" in cmd
+    assert "--system-prompt-file" in cmd
+    assert "--system-prompt" not in cmd  # on-argv form is the bug
+    assert captured["sp_text"] == "sys-prompt"
     # The replaced flag must NOT appear
     assert "--json-schema" not in cmd
 
@@ -738,9 +1013,7 @@ def test_chat_with_tools_passes_allowed_tools_for_each_brain_tool(persona_dir: P
     assert "--allowedTools" in cmd
     # Every NELL_TOOL_NAME must appear under the mcp__brain-tools__ namespace.
     for name in NELL_TOOL_NAMES:
-        assert f"mcp__brain-tools__{name}" in cmd, (
-            f"missing --allowedTools entry for {name}"
-        )
+        assert f"mcp__brain-tools__{name}" in cmd, f"missing --allowedTools entry for {name}"
 
 
 def test_chat_with_tools_parses_payload_result(persona_dir: Path) -> None:
@@ -917,6 +1190,7 @@ def test_chat_with_tools_cleans_up_temp_file_on_subprocess_error(persona_dir: Pa
 def test_chat_with_tools_missing_mcp_sdk_raises_mcp_unavailable(persona_dir: Path) -> None:
     """If the mcp SDK is not installed, raise ProviderError('mcp_unavailable')."""
     import builtins
+
     real_import = builtins.__import__
 
     def _fake_import(name, *args, **kwargs):
@@ -939,7 +1213,9 @@ def test_chat_with_tools_missing_mcp_sdk_raises_mcp_unavailable(persona_dir: Pat
 def test_chat_with_tools_temp_file_write_failure_raises_setup(persona_dir: Path) -> None:
     """OSError on the temp file write must surface as ProviderError('claude_cli_setup')."""
     provider = ClaudeCliProvider()
-    with patch("brain.bridge.provider.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
+    with patch(
+        "brain.bridge.provider.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")
+    ):
         with pytest.raises(ProviderError) as ei:
             provider.chat(
                 [ChatMessage(role="user", content="hi")],
