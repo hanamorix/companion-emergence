@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { PersonaState } from "../bridge";
 import { InnerWeatherPanel } from "./panels/InnerWeatherPanel";
 import { BodyPanel } from "./panels/BodyPanel";
-import { InteriorPanel } from "./panels/InteriorPanel";
+import { FeedPanel } from "./panels/FeedPanel";
 import { SoulPanel } from "./panels/SoulPanel";
 import { ConnectionPanel } from "./panels/ConnectionPanel";
 import { GalleryPanel } from "./panels/GalleryPanel";
@@ -22,7 +22,7 @@ interface Props {
 const TABS: Array<{ id: Tab; label: string; icon: string }> = [
   { id: "weather", label: "Inner Weather", icon: "◐" },
   { id: "body", label: "Body", icon: "○" },
-  { id: "interior", label: "Recent Interior", icon: "✦" },
+  { id: "interior", label: "Inner Life", icon: "✦" },
   { id: "soul", label: "Soul", icon: "❀" },
   { id: "connection", label: "Connection", icon: "≡" },
   { id: "gallery", label: "Gallery", icon: "◫" },
@@ -141,7 +141,7 @@ function renderPanel(tab: Tab, state: PersonaState | null, opts: PanelOpts) {
     case "body":
       return <BodyPanel state={state} />;
     case "interior":
-      return <InteriorPanel state={state} />;
+      return <FeedPanel state={state} />;
     case "soul":
       return <SoulPanel state={state} />;
     case "connection":
