@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct BridgeCredentials {
     pub port: u16,
     pub auth_token: Option<String>,
+    pub pid: Option<i32>,  // None for older bridges that didn't write pid
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -143,7 +144,12 @@ fn parse_bridge_credentials_at(
         .get("auth_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    Ok(BridgeCredentials { port, auth_token })
+    let pid = parsed
+        .get("pid")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i32::try_from(v).ok())
+        .filter(|p| *p > 0);
+    Ok(BridgeCredentials { port, auth_token, pid })
 }
 
 #[tauri::command]
@@ -364,6 +370,54 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
         ));
     }
     Ok(())
+}
+
+/// User-facing error string when bridge.json lacks pid. Frontend matches
+/// against this exact text to show the "restart Companion" recovery hint.
+const ERR_MISSING_PID: &str =
+    "bridge.json missing pid — restart Companion to re-spawn bridge with pid field";
+
+#[cfg(unix)]
+#[tauri::command]
+async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
+    let creds = get_bridge_credentials(persona.clone())?;
+    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
+    // SIGKILL by PID. Best-effort — process may have already exited.
+    // ESRCH (process gone) is fine; other errors surface to the user.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if rc != 0 {
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { *libc::__error() };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let errno = unsafe { *libc::__errno_location() };
+        if errno != libc::ESRCH {
+            return Err(format!("SIGKILL pid={} failed: errno {}", pid, errno));
+        }
+    }
+    // 500ms grace period for OS-level reap.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    ensure_bridge_running(app, persona).await
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+    };
+
+    let creds = get_bridge_credentials(persona.clone())?;
+    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, false, pid as u32)
+            .map_err(|e| format!("OpenProcess pid={} failed: {}", pid, e))?;
+        let result = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+        result.map_err(|e| format!("TerminateProcess pid={} failed: {}", pid, e))?;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    ensure_bridge_running(app, persona).await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -918,6 +972,7 @@ pub fn run() {
             write_app_config,
             list_personas,
             ensure_bridge_running,
+            force_restart_bridge,
             run_init,
             run_migrate,
             install_supervisor_service,
@@ -1157,6 +1212,46 @@ mod tests {
         let creds = parse_bridge_credentials_at(&path).unwrap();
         assert_eq!(creds.port, 55703);
         assert_eq!(creds.auth_token.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn err_missing_pid_message_matches_frontend_contract() {
+        assert_eq!(
+            ERR_MISSING_PID,
+            "bridge.json missing pid — restart Companion to re-spawn bridge with pid field"
+        );
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_with_pid_returns_pid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bridge.json");
+        std::fs::write(
+            &path,
+            r#"{"port": 8080, "auth_token": "t", "pid": 4242}"#,
+        )
+        .unwrap();
+        let creds = parse_bridge_credentials_at(&path).unwrap();
+        assert_eq!(creds.pid, Some(4242));
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_missing_pid_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bridge.json");
+        std::fs::write(&path, r#"{"port": 8080, "auth_token": "t"}"#).unwrap();
+        let creds = parse_bridge_credentials_at(&path).unwrap();
+        assert_eq!(creds.pid, None);
+    }
+
+    #[test]
+    fn parse_bridge_credentials_at_pid_zero_returns_none() {
+        // pid=0 is invalid; the parser must filter it out the same way port>0 is checked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bridge.json");
+        std::fs::write(&path, r#"{"port": 8080, "auth_token": "t", "pid": 0}"#).unwrap();
+        let creds = parse_bridge_credentials_at(&path).unwrap();
+        assert_eq!(creds.pid, None);
     }
 
     #[test]
