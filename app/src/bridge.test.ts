@@ -22,6 +22,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { invoke } from "@tauri-apps/api/core";
 import {
   closeSession,
+  fetchPersonaFeed,
   fetchPersonaState,
   getBridgeCredentials,
   newSession,
@@ -177,5 +178,56 @@ describe("getBridgeCredentials", () => {
     await expect(uploadImage("alice", file)).resolves.toMatchObject({ media_type: "image/png" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("fetchPersonaFeed", () => {
+  beforeEach(() => {
+    resetBridgeCredentialCache();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("returns the entries array on a 200 response", async () => {
+    const fakeResponse = {
+      entries: [
+        {
+          type: "dream",
+          ts: "2026-05-17T01:00:00+00:00",
+          opener: "I dreamed",
+          body: "a hallway",
+          audit_id: null,
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify(fakeResponse), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const entries = await fetchPersonaFeed("alice");
+    expect(entries).toEqual(fakeResponse.entries);
+  });
+
+  it("returns an empty array when entries are empty", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ entries: [] }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const entries = await fetchPersonaFeed("alice");
+    expect(entries).toEqual([]);
+  });
+
+  it("throws on a 401 response (auth failure)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("unauthorized", { status: 401 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchPersonaFeed("alice")).rejects.toThrow();
   });
 });

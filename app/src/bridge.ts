@@ -148,6 +148,16 @@ export interface SoulHighlight {
   why_it_matters: string | null;
 }
 
+export type FeedEntryType = "dream" | "research" | "soul" | "outreach" | "voice_edit";
+
+export interface FeedEntry {
+  type: FeedEntryType;
+  ts: string;
+  opener: string;
+  body: string;
+  audit_id: string | null;
+}
+
 async function fetchPersonaStateOnce(persona: string): Promise<PersonaState> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) }),
@@ -158,6 +168,15 @@ async function fetchPersonaStateOnce(persona: string): Promise<PersonaState> {
 
 export async function fetchPersonaState(persona: string): Promise<PersonaState> {
   return await fetchPersonaStateOnce(persona);
+}
+
+export async function fetchPersonaFeed(persona: string): Promise<FeedEntry[]> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/feed`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/persona/feed ${r.status}`);
+  const data = (await r.json()) as { entries: FeedEntry[] };
+  return data.entries;
 }
 
 export interface NewSessionResponse {
