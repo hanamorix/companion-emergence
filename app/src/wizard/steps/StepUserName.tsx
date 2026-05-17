@@ -17,7 +17,7 @@ export function StepUserName({ step, totalSteps, value, onChange, onNext, onBack
       step={step}
       totalSteps={totalSteps}
       title="Your name"
-      subtitle="Helps the brain tell you apart from people mentioned in memories and soul context."
+      subtitle="Helps the Kindled tell you apart from people mentioned in memories and soul context."
       avatar={avatar}
       footer={
         <>
@@ -58,7 +58,7 @@ export function StepUserName({ step, totalSteps, value, onChange, onNext, onBack
       >
         <div style={{ fontSize: 11.5, color: "var(--text)", lineHeight: 1.6 }}>
           <strong>Why this matters:</strong> the ingest extractor uses your name to distinguish
-          you from historical figures the brain may reference in crystallisations. Without it,
+          you from historical figures the Kindled may reference in crystallisations. Without it,
           memories from your conversations may be mis-attributed.
         </div>
       </div>
