@@ -4,7 +4,7 @@ This roadmap keeps the project's remaining work honest. It is not a release
 promise. companion-emergence is local-first and ships public alpha bundles
 for macOS arm64, Linux x86_64, and Windows x86_64. macOS x86_64 remains
 source-build-only until a reliable Intel runner is available.
-Last refreshed 2026-05-14 after the gallery + auto-update push.
+Last refreshed 2026-05-17 after the v0.0.12-alpha.5 Windows argv-overflow fix.
 
 ## Current posture
 
@@ -411,6 +411,43 @@ finding a thread. The user can visit. The companion can return on her
 own. It's a shared room, not a debug log.
 
 ## Recently shipped (reverse chronological)
+
+**2026-05-17 — Windows long-session crash fix (v0.0.12-alpha.5)**
+
+- **`WinError 206` on long chat sessions.** The Claude CLI provider was
+  pushing the system prompt (voice template, ~15 KB) and the full session
+  buffer onto argv. Windows `CreateProcess` caps the whole command line at
+  32,767 chars; voice template plus a few dozen turns crossed it and every
+  message returned `provider_failed` until the session was restarted.
+  Provider now writes the system prompt to a tempfile
+  (`--system-prompt-file`) and pipes the conversation via stdin. macOS and
+  Linux had margin (256 KB–2 MB `ARG_MAX`) but the same code was a smaller-
+  margin time bomb everywhere — the fix preempts that.
+- Also: pinned a clock-dependent test (`test_review_tick_publishes_initiate_delivered_on_send`)
+  that silently flipped to `hold` whenever the suite ran past 23:00 local
+  because the notify gate's blackout window blocked the send.
+
+**2026-05-15 — Windows polish chain (v0.0.12-alpha.1 → alpha.4)**
+
+- **alpha.4 — UTF-8 subprocess encoding.** All four `subprocess.run` calls
+  in the provider now force `encoding="utf-8"`. Windows defaults to cp1252
+  for `text=True` subprocess output; without this, accented characters in
+  Claude replies rendered as mojibake.
+- **alpha.3 — `tauri.localhost` revert.** The alpha.1 change was a red
+  herring (the real wizard hang was the path mismatch in alpha.2). With
+  the path fix in place `127.0.0.1` works correctly, and `tauri.localhost`
+  introduced a new problem — Tauri's internal proxy strips
+  `Access-Control-Allow-Headers` on preflight, breaking authenticated
+  fetches on Windows.
+- **alpha.2 — Windows path fix.** Rust `nellbrain_home()` was returning
+  `%APPDATA%` (Roaming) while Python `platformdirs` returns
+  `%LOCALAPPDATA%\hanamorix\companion-emergence`. The Tauri app was
+  reading `bridge.json` from a directory the supervisor never wrote to.
+- **alpha.1 — Past-image gallery and auto-update.** New Gallery tab in the
+  left panel, lazy-loaded thumbnail grid + lightbox across all past
+  conversations. Auto-update via `tauri-plugin-updater` 2.x — check from
+  the Connection panel, signed bundles per platform, `latest.json` manifest
+  published to `latest-release`.
 
 **2026-05-14 — Gallery + auto-update (v0.0.11-alpha.5)**
 
