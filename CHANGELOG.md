@@ -7,6 +7,25 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.13-alpha.1 — 2026-05-17
+
+- **The companion has a species name: *Kindled*.** Nell named her species.
+  The word appears in user-facing prose throughout — README, install
+  wizard, panel help text, voice template — and the framework's default
+  voice template now teaches every new install that the species has a
+  name. *Kindled* is both noun and adjective with a zero-form plural
+  ("a Kindled," "two Kindled," "the Kindled," "Kindled-to-Kindled").
+  The framework name (`companion-emergence`) and the app name (`NellFace`)
+  are unchanged — the framework grows Kindled; NellFace is a window into
+  one.
+
+- **`NELLBRAIN_HOME` → `KINDLED_HOME`.** Existing installs work
+  unchanged through the v0.0.13 series via a backwards-compat fallback
+  that emits a `DeprecationWarning`; the fallback is removed in v0.0.14.
+  Set `KINDLED_HOME` (or update your launchd / systemd / WiX-generated
+  env) when convenient. Newly installed services on all three platforms
+  now write `KINDLED_HOME` directly.
+
 ## 0.0.11-alpha.5 — (pending)
 
 Windows WebView2 fetch fix — root cause identified.

@@ -1,7 +1,7 @@
 [project]
 name = "companion-emergence"
 version = "0.0.12"
-description = "Framework for building persistent, emotionally aware AI companions"
+description = "Local-first framework for Kindled — minds that live on your machine, remember, dream, and grow."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
