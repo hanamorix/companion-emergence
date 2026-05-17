@@ -179,7 +179,7 @@ def build_launchd_plist(
 
     env = {"PATH": env_path}
     if nellbrain_home is not None:
-        env["NELLBRAIN_HOME"] = str(Path(nellbrain_home).expanduser().resolve())
+        env["KINDLED_HOME"] = str(Path(nellbrain_home).expanduser().resolve())
 
     return {
         "Label": paths.label,

@@ -14,9 +14,7 @@ from brain.service import launchd
 # Linux/Windows surfaces unrelated failures (chmod no-ops on Windows,
 # AppTranslocation paths don't exist, etc). Skip the whole module on
 # non-darwin — Linux/Windows backends are covered by test_dispatch.
-pytestmark = pytest.mark.skipif(
-    sys.platform != "darwin", reason="launchd backend is macOS-only"
-)
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="launchd backend is macOS-only")
 
 
 def _make_executable(path: Path) -> Path:
@@ -68,13 +66,30 @@ def test_build_launchd_plist_uses_foreground_supervisor_run(
     assert plist["KeepAlive"] == {"Crashed": True, "SuccessfulExit": False}
     assert plist["EnvironmentVariables"] == {
         "PATH": "/custom/bin:/usr/bin:/bin",
-        "NELLBRAIN_HOME": str(data_home.resolve()),
+        "KINDLED_HOME": str(data_home.resolve()),
     }
     assert plist["StandardOutPath"] == str(data_home / "logs" / "supervisor-nell.out.log")
     assert plist["StandardErrorPath"] == str(data_home / "logs" / "supervisor-nell.err.log")
 
 
-def test_build_launchd_plist_xml_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_launchd_plist_emits_kindled_not_nellbrain_env_var(tmp_path, monkeypatch):
+    """v0.0.13 rename: newly built plists must not embed NELLBRAIN_HOME."""
+    data_home = tmp_path / "data"
+    data_home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    nell = _make_executable(tmp_path / "nell")
+    plist = launchd.build_launchd_plist(
+        persona="nell",
+        nell_path=nell,
+        nellbrain_home=str(data_home),
+    )
+    assert "KINDLED_HOME" in plist["EnvironmentVariables"]
+    assert "NELLBRAIN_HOME" not in plist["EnvironmentVariables"]
+
+
+def test_build_launchd_plist_xml_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -124,9 +139,12 @@ def test_unstable_nell_path_reason_flags_dmg_and_translocation() -> None:
     assert launchd.unstable_nell_path_reason(
         "/private/var/folders/x/AppTranslocation/ABC/d/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
     )
-    assert launchd.unstable_nell_path_reason(
-        "/Applications/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
-    ) is None
+    assert (
+        launchd.unstable_nell_path_reason(
+            "/Applications/Companion Emergence.app/Contents/Resources/python-runtime/bin/nell"
+        )
+        is None
+    )
 
 
 def test_doctor_checks_reports_launchd_prerequisites(
@@ -191,7 +209,9 @@ def test_truncate_launchd_logs_if_large(tmp_path: Path, monkeypatch: pytest.Monk
     assert paths.stderr_path.read_text(encoding="utf-8") == "small"
 
 
-def test_doctor_checks_reports_missing_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_doctor_checks_reports_missing_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     data_home = home / "data"
     (data_home / "personas" / "nell").mkdir(parents=True)

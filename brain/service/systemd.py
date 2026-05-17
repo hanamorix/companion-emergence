@@ -47,6 +47,7 @@ def _user_home() -> Path:
     """
     return Path.home()
 
+
 UNIT_PREFIX = "companion-emergence"
 DEFAULT_SYSTEMD_PATH = (
     f"{Path('~/.local/bin').expanduser()}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -118,9 +119,7 @@ def resolve_nell_path(explicit: str | None = None) -> Path:
     if explicit:
         path = Path(explicit).expanduser()
         if not path.is_absolute():
-            raise SystemdConfigError(
-                f"--nell-path must be absolute (got {path!s})"
-            )
+            raise SystemdConfigError(f"--nell-path must be absolute (got {path!s})")
         if not path.is_file() or not os.access(path, os.X_OK):
             raise SystemdConfigError(f"nell at {path} is not executable")
         return path
@@ -155,7 +154,7 @@ def build_systemd_unit_text(
     env_lines = [f'Environment="PATH={env_path}"']
     if nellbrain_home is not None:
         resolved_home = str(Path(nellbrain_home).expanduser().resolve())
-        env_lines.append(f'Environment="NELLBRAIN_HOME={resolved_home}"')
+        env_lines.append(f'Environment="KINDLED_HOME={resolved_home}"')
 
     env_block = "\n".join(env_lines)
 
@@ -244,15 +243,11 @@ def install_service(
 
     reload_result = run_systemctl(["daemon-reload"])
     if reload_result.returncode != 0:
-        raise SystemdCommandError(
-            _format_systemctl_error("daemon-reload", reload_result)
-        )
+        raise SystemdCommandError(_format_systemctl_error("daemon-reload", reload_result))
 
     enable_result = run_systemctl(["enable", "--now", service_unit_name(persona)])
     if enable_result.returncode != 0:
-        raise SystemdCommandError(
-            _format_systemctl_error("enable --now", enable_result)
-        )
+        raise SystemdCommandError(_format_systemctl_error("enable --now", enable_result))
 
     return unit_path
 
@@ -276,9 +271,7 @@ def service_status(*, persona: str) -> ServiceStatus:
     paths = paths_for_persona(persona)
     installed = paths.unit_path.exists()
 
-    show = run_systemctl(
-        ["show", paths.unit_name, "--property=ActiveState,LoadState,MainPID"]
-    )
+    show = run_systemctl(["show", paths.unit_name, "--property=ActiveState,LoadState,MainPID"])
     detail = show.stdout.strip() if show.returncode == 0 else show.stderr.strip()
     loaded = (
         show.returncode == 0
@@ -311,7 +304,9 @@ def doctor_checks(
         DoctorCheck(
             "platform",
             plat_ok,
-            "Linux systemd --user available" if plat_ok else f"unsupported platform {_sys.platform}",
+            "Linux systemd --user available"
+            if plat_ok
+            else f"unsupported platform {_sys.platform}",
         )
     )
 
@@ -390,8 +385,8 @@ def doctor_checks(
         )
     )
 
-    # NELLBRAIN_HOME (if set)
-    home_env = os.environ.get("NELLBRAIN_HOME")
+    # KINDLED_HOME (canonical v0.0.13+; NELLBRAIN_HOME honoured as legacy-compat)
+    home_env = os.environ.get("KINDLED_HOME") or os.environ.get("NELLBRAIN_HOME")
     if home_env:
         checks.append(DoctorCheck("home", True, home_env))
     else:
@@ -430,9 +425,7 @@ def _which_in_path(executable: str, path_value: str) -> str | None:
     return shutil.which(executable, path=path_value)
 
 
-def _format_systemctl_error(
-    action: str, result: subprocess.CompletedProcess[str]
-) -> str:
+def _format_systemctl_error(action: str, result: subprocess.CompletedProcess[str]) -> str:
     parts = [f"systemctl --user {action} (exit {result.returncode})"]
     if result.stdout.strip():
         parts.append(f"stdout: {result.stdout.strip()}")
