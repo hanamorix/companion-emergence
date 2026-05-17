@@ -41,8 +41,12 @@ Decision = Literal[
     "promoted_by_d_after_3_failures",
 ]
 StateName = Literal[
-    "pending", "delivered", "read",
-    "replied_explicit", "acknowledged_unclear", "unanswered",
+    "pending",
+    "delivered",
+    "read",
+    "replied_explicit",
+    "acknowledged_unclear",
+    "unanswered",
     "dismissed",
 ]
 
@@ -134,9 +138,7 @@ class InitiateCandidate:
             "source": self.source,
             "source_id": self.source_id,
             "emotional_snapshot": (
-                self.emotional_snapshot.to_dict()
-                if self.emotional_snapshot is not None
-                else None
+                self.emotional_snapshot.to_dict() if self.emotional_snapshot is not None else None
             ),
             "semantic_context": self.semantic_context.to_dict(),
             "claimed_at": self.claimed_at,

@@ -1,4 +1,5 @@
 """save_work tool implementation."""
+
 from __future__ import annotations
 
 import logging
@@ -36,10 +37,7 @@ def save_work(
         return {"error": f"title exceeds {_TITLE_MAX} chars"}
     if type not in WORK_TYPES:
         return {
-            "error": (
-                f"invalid type {type!r} — must be one of: "
-                f"{', '.join(sorted(WORK_TYPES))}"
-            )
+            "error": (f"invalid type {type!r} — must be one of: {', '.join(sorted(WORK_TYPES))}")
         }
     if not content or not content.strip():
         return {"error": "content cannot be empty"}

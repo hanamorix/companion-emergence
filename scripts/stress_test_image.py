@@ -34,10 +34,22 @@ def _make_red_x_png() -> bytes:
     red = (255, 0, 0, 255)
     white = (255, 255, 255, 255)
     pixels = [
-        red, white, white, red,
-        white, red, red, white,
-        white, red, red, white,
-        red, white, white, red,
+        red,
+        white,
+        white,
+        red,
+        white,
+        red,
+        red,
+        white,
+        white,
+        red,
+        red,
+        white,
+        red,
+        white,
+        white,
+        red,
     ]
 
     def chunk(t: bytes, d: bytes) -> bytes:
@@ -108,8 +120,7 @@ def main() -> int:
                 except ValueError:
                     payload = {"raw": r.text}
                 print(
-                    "[stress] FAIL: chat failed "
-                    f"status={r.status_code} detail={payload!r}",
+                    f"[stress] FAIL: chat failed status={r.status_code} detail={payload!r}",
                     file=sys.stderr,
                 )
                 return 1
@@ -121,7 +132,17 @@ def main() -> int:
         # said "[image: ...]" or generic "I saw an image" without colour or
         # form, the passthrough isn't actually working.
         lowered = reply.lower()
-        visible_words = ("red", "crimson", "scarlet", "square", "pixel", "x", "cross", "corner", "white")
+        visible_words = (
+            "red",
+            "crimson",
+            "scarlet",
+            "square",
+            "pixel",
+            "x",
+            "cross",
+            "corner",
+            "white",
+        )
         if any(w in lowered for w in visible_words):
             print("[stress] PASS - reply references visible content")
             return 0

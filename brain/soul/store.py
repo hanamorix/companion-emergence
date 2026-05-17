@@ -37,6 +37,7 @@ class VoiceEvolution:
     audit_id: str
     user_modified: bool
 
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS crystallizations (
     id              TEXT PRIMARY KEY,

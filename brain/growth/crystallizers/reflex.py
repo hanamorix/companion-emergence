@@ -86,15 +86,17 @@ def _build_corpus(
     for arc in current_arcs:
         arc_fires = fires_by_arc.get(arc.name, [])
         last_fired = max((f.fired_at for f in arc_fires), default=None)
-        current_arc_entries.append({
-            "name": arc.name,
-            "description": arc.description,
-            "trigger": dict(arc.trigger),
-            "cooldown_hours": arc.cooldown_hours,
-            "created_by": arc.created_by,
-            "fired_count_30d": len(arc_fires),
-            "last_fired_at": last_fired.isoformat() if last_fired else None,
-        })
+        current_arc_entries.append(
+            {
+                "name": arc.name,
+                "description": arc.description,
+                "trigger": dict(arc.trigger),
+                "cooldown_hours": arc.cooldown_hours,
+                "created_by": arc.created_by,
+                "fired_count_30d": len(arc_fires),
+                "last_fired_at": last_fired.isoformat() if last_fired else None,
+            }
+        )
 
     # 3. recently-removed arcs with days remaining
     removed_entries = []
@@ -110,12 +112,14 @@ def _build_corpus(
         except ValueError:
             continue
         days_remaining = max(0, 15 - int((now - removed_at).total_seconds() / 86400))
-        removed_entries.append({
-            "name": name,
-            "removed_at": ts_raw,
-            "removed_by": entry.get("removed_by", "user_edit"),
-            "days_remaining_in_graveyard": days_remaining,
-        })
+        removed_entries.append(
+            {
+                "name": name,
+                "removed_at": ts_raw,
+                "removed_by": entry.get("removed_by", "user_edit"),
+                "days_remaining_in_graveyard": days_remaining,
+            }
+        )
 
     # 4. fire_log_30d (full)
     fire_log_entries = []
@@ -128,12 +132,14 @@ def _build_corpus(
                     excerpt = (mem.content or "")[:200]
             except Exception:
                 pass
-        fire_log_entries.append({
-            "arc": f.arc_name,
-            "fired_at": f.fired_at.isoformat(),
-            "trigger_state": dict(f.trigger_state),
-            "output_excerpt": excerpt,
-        })
+        fire_log_entries.append(
+            {
+                "arc": f.arc_name,
+                "fired_at": f.fired_at.isoformat(),
+                "trigger_state": dict(f.trigger_state),
+                "output_excerpt": excerpt,
+            }
+        )
 
     # 5. memories_30d (top-40 by importance) — gather across conversation types
     memory_entries: list[dict[str, Any]] = []
@@ -145,13 +151,15 @@ def _build_corpus(
                     memories_in_window.append(m)
         memories_in_window.sort(key=lambda m: m.importance, reverse=True)
         for m in memories_in_window[:_TOP_MEMORIES_CAP]:
-            memory_entries.append({
-                "id": m.id,
-                "created_at": m.created_at.isoformat(),
-                "type": m.memory_type,
-                "importance": m.importance,
-                "excerpt": (m.content or "")[:240],
-            })
+            memory_entries.append(
+                {
+                    "id": m.id,
+                    "created_at": m.created_at.isoformat(),
+                    "type": m.memory_type,
+                    "importance": m.importance,
+                    "excerpt": (m.content or "")[:240],
+                }
+            )
     except Exception as exc:
         logger.warning("memories load failed (non-fatal): %s", exc)
 
@@ -165,11 +173,13 @@ def _build_corpus(
                     reflections_in_window.append(m)
         reflections_in_window.sort(key=lambda m: m.created_at, reverse=True)
         for m in reflections_in_window[:_TOP_REFLECTIONS_CAP]:
-            reflection_entries.append({
-                "id": m.id,
-                "type": m.memory_type,
-                "excerpt": (m.content or "")[:240],
-            })
+            reflection_entries.append(
+                {
+                    "id": m.id,
+                    "type": m.memory_type,
+                    "excerpt": (m.content or "")[:240],
+                }
+            )
     except Exception as exc:
         logger.warning("reflections load failed (non-fatal): %s", exc)
 
@@ -179,12 +189,14 @@ def _build_corpus(
     try:
         for ev in read_growth_log(growth_path):
             if ev.timestamp >= growth_cutoff:
-                growth_in_window.append({
-                    "timestamp": ev.timestamp.isoformat(),
-                    "type": ev.type,
-                    "name": ev.name,
-                    "reasoning": ev.reason,
-                })
+                growth_in_window.append(
+                    {
+                        "timestamp": ev.timestamp.isoformat(),
+                        "type": ev.type,
+                        "name": ev.name,
+                        "reasoning": ev.reason,
+                    }
+                )
     except Exception as exc:
         logger.warning("growth log load failed (non-fatal): %s", exc)
 
@@ -212,9 +224,7 @@ def _render_prompt(
 ) -> str:
     """Render the first-person prompt the brain reads when judging."""
 
-    pronouns_clause = (
-        f"Your pronouns are {persona_pronouns}." if persona_pronouns else ""
-    )
+    pronouns_clause = f"Your pronouns are {persona_pronouns}." if persona_pronouns else ""
 
     if max_emergences == 0:
         emergence_clause = (
@@ -408,7 +418,8 @@ def crystallize_reflex(
         if not accepted:
             logger.info(
                 "emergence proposal rejected name=%r reason=%s",
-                prop_dict.get("name", "?"), reason,
+                prop_dict.get("name", "?"),
+                reason,
             )
             continue
         try:
@@ -434,13 +445,16 @@ def crystallize_reflex(
         if not accepted:
             logger.info(
                 "pruning proposal rejected name=%r reason=%s",
-                prop_dict.get("name", "?"), reason,
+                prop_dict.get("name", "?"),
+                reason,
             )
             continue
-        accepted_prunings.append(ReflexPruneProposal(
-            name=str(prop_dict["name"]),
-            reasoning=str(prop_dict["reasoning"]).strip(),
-        ))
+        accepted_prunings.append(
+            ReflexPruneProposal(
+                name=str(prop_dict["name"]),
+                reasoning=str(prop_dict["reasoning"]).strip(),
+            )
+        )
 
     result = ReflexCrystallizationResult(
         emergences=accepted_emergences,
@@ -472,7 +486,10 @@ def crystallize_reflex(
 
 
 def _aggregate_recent_emotion_vector(
-    store: MemoryStore, *, now: datetime, look_back_days: int = 7,
+    store: MemoryStore,
+    *,
+    now: datetime,
+    look_back_days: int = 7,
 ) -> dict[str, float]:
     """Return a max-pooled emotion vector across recent active memories.
 
@@ -588,16 +605,13 @@ def _validate_emergence_proposal(
     unknown = set(trigger_typed.keys()) - emotion_vocabulary
     if unknown:
         return False, (
-            f"gate 4: trigger references unknown emotions {sorted(unknown)} "
-            "not in vocabulary"
+            f"gate 4: trigger references unknown emotions {sorted(unknown)} not in vocabulary"
         )
 
     # Gate 6: threshold floor 5.0
     for emo, thresh in trigger_typed.items():
         if thresh < _THRESHOLD_FLOOR:
-            return False, (
-                f"gate 6: threshold {thresh} for {emo!r} below floor {_THRESHOLD_FLOOR}"
-            )
+            return False, (f"gate 6: threshold {thresh} for {emo!r} below floor {_THRESHOLD_FLOOR}")
 
     # Gate 7: cooldown floor 12h
     cooldown = proposal_dict.get("cooldown_hours")
@@ -606,9 +620,7 @@ def _validate_emergence_proposal(
     except (TypeError, ValueError):
         return False, "gate 7: cooldown_hours must be numeric"
     if cooldown_f < _COOLDOWN_FLOOR_HOURS:
-        return False, (
-            f"gate 7: cooldown {cooldown_f}h below floor {_COOLDOWN_FLOOR_HOURS}h"
-        )
+        return False, (f"gate 7: cooldown {cooldown_f}h below floor {_COOLDOWN_FLOOR_HOURS}h")
 
     # Gate 5: prompt_template renderable (after numeric checks so we surface
     # the more-actionable threshold/cooldown errors first)
@@ -626,19 +638,13 @@ def _validate_emergence_proposal(
             # different name with same keys, treat as non-overlap (partial allowed)
             continue
         if proposed_keyset < existing_keyset:
-            return False, (
-                "gate 8: trigger keys are strict subset of existing arc's"
-            )
+            return False, ("gate 8: trigger keys are strict subset of existing arc's")
         if proposed_keyset > existing_keyset:
-            return False, (
-                "gate 8: trigger keys are strict superset of existing arc's"
-            )
+            return False, ("gate 8: trigger keys are strict superset of existing arc's")
 
     # Gate 9: total cap
     if active_arc_count >= total_cap:
-        return False, (
-            f"gate 9: arc set is full ({active_arc_count} >= cap {total_cap})"
-        )
+        return False, (f"gate 9: arc set is full ({active_arc_count} >= cap {total_cap})")
 
     # Required string fields (description, output_memory_type, reasoning)
     for required in ("description", "output_memory_type", "reasoning"):
@@ -676,9 +682,7 @@ def _validate_pruning_proposal(
 
     # Gate P3: active floor 4
     if len(current_arcs) - 1 < _ACTIVE_FLOOR:
-        return False, (
-            f"gate P3: pruning would drop active count below floor {_ACTIVE_FLOOR}"
-        )
+        return False, (f"gate P3: pruning would drop active count below floor {_ACTIVE_FLOOR}")
 
     # Gate P4: max prunes per tick (configurable; default 1)
     if prunes_accepted_so_far >= max_prunings_per_tick:
@@ -756,9 +760,7 @@ def _load_emotion_vocabulary(persona_dir: Path) -> set[str]:
         data = json.loads(path.read_text(encoding="utf-8"))
         emotions = data.get("emotions", [])
         return {
-            e["name"]
-            for e in emotions
-            if isinstance(e, dict) and isinstance(e.get("name"), str)
+            e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)
         }
     except (json.JSONDecodeError, OSError, KeyError) as exc:
         logger.warning("could not read emotion_vocabulary.json: %s", exc)

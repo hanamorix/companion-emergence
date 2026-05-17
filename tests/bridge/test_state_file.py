@@ -1,4 +1,5 @@
 """Bridge state file — bridge.json schema, atomic writes, recovery predicates."""
+
 from __future__ import annotations
 
 import os

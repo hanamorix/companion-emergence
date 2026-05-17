@@ -1,4 +1,5 @@
 """Tests for `nell initiate d-stats` CLI subcommand."""
+
 from __future__ import annotations
 
 import argparse
@@ -19,9 +20,7 @@ def _args(persona_dir: Path, **kw) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def test_d_stats_empty_persona_returns_zero_counts(
-    tmp_path: Path, capsys, monkeypatch
-) -> None:
+def test_d_stats_empty_persona_returns_zero_counts(tmp_path: Path, capsys, monkeypatch) -> None:
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
     monkeypatch.setattr("brain.cli.get_persona_dir", lambda _name: persona_dir)
@@ -31,9 +30,7 @@ def test_d_stats_empty_persona_returns_zero_counts(
     assert "candidates_in=0" in out or "no d calls" in out.lower()
 
 
-def test_d_stats_aggregates_recent_calls(
-    tmp_path: Path, capsys, monkeypatch
-) -> None:
+def test_d_stats_aggregates_recent_calls(tmp_path: Path, capsys, monkeypatch) -> None:
     persona_dir = tmp_path / "p"
     now = datetime.now(UTC)
     for i in range(3):

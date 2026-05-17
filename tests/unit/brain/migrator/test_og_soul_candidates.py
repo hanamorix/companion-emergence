@@ -1,4 +1,5 @@
 """Tests for brain.migrator.og_soul_candidates — schema migration for OG soul_candidates.jsonl."""
+
 from __future__ import annotations
 
 import json
@@ -20,7 +21,9 @@ def _load_migrated(persona_dir: Path) -> list[dict]:
     path = persona_dir / "soul_candidates.jsonl"
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
 
 
 def test_migrates_full_record_with_all_fields(tmp_path: Path) -> None:
@@ -29,22 +32,25 @@ def test_migrates_full_record_with_all_fields(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_candidates(og_data, [{
-        "memory_id": "mem-abc",
-        "text": "the lighthouse keeper's daughter",
-        "label": "high_emotion_peak",
-        "importance": 95,
-        "source": "growth_loop",
-        "queued_at": "2026-04-06T17:14:28+00:00",
-        "status": "accepted",
-        "decided_at": "2026-04-07T18:39:29.989825+00:00",
-        "session_id": "sess-1",
-        "crystallization_id": "cryst-xyz",
-    }])
-
-    migrated, skipped = migrate_soul_candidates(
-        og_data_dir=og_data, persona_dir=persona_dir
+    _write_og_candidates(
+        og_data,
+        [
+            {
+                "memory_id": "mem-abc",
+                "text": "the lighthouse keeper's daughter",
+                "label": "high_emotion_peak",
+                "importance": 95,
+                "source": "growth_loop",
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "accepted",
+                "decided_at": "2026-04-07T18:39:29.989825+00:00",
+                "session_id": "sess-1",
+                "crystallization_id": "cryst-xyz",
+            }
+        ],
     )
+
+    migrated, skipped = migrate_soul_candidates(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 1
     assert skipped == 0
 
@@ -72,28 +78,29 @@ def test_skips_record_missing_memory_id(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_candidates(og_data, [
-        {
-            "text": "no memory id",
-            "label": "high_emotion_peak",
-            "queued_at": "2026-04-06T17:14:28+00:00",
-            "status": "rejected",
-        },
-        {
-            "memory_id": "mem-abc",
-            "text": "has memory id",
-            "label": "high_emotion_peak",
-            "importance": 88,
-            "queued_at": "2026-04-06T17:14:28+00:00",
-            "status": "rejected",
-            "decided_at": "2026-04-07T18:39:29.989836+00:00",
-            "rejection_reason": "duplicate",
-        },
-    ])
-
-    migrated, skipped = migrate_soul_candidates(
-        og_data_dir=og_data, persona_dir=persona_dir
+    _write_og_candidates(
+        og_data,
+        [
+            {
+                "text": "no memory id",
+                "label": "high_emotion_peak",
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "rejected",
+            },
+            {
+                "memory_id": "mem-abc",
+                "text": "has memory id",
+                "label": "high_emotion_peak",
+                "importance": 88,
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "rejected",
+                "decided_at": "2026-04-07T18:39:29.989836+00:00",
+                "rejection_reason": "duplicate",
+            },
+        ],
     )
+
+    migrated, skipped = migrate_soul_candidates(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 1
     assert skipped == 1
     records = _load_migrated(persona_dir)
@@ -106,17 +113,20 @@ def test_defaults_missing_importance_to_8(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_candidates(og_data, [{
-        "memory_id": "mem-abc",
-        "text": "no importance",
-        "label": "high_emotion_peak",
-        "queued_at": "2026-04-06T17:14:28+00:00",
-        "status": "pending",
-    }])
-
-    migrated, _ = migrate_soul_candidates(
-        og_data_dir=og_data, persona_dir=persona_dir
+    _write_og_candidates(
+        og_data,
+        [
+            {
+                "memory_id": "mem-abc",
+                "text": "no importance",
+                "label": "high_emotion_peak",
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "pending",
+            }
+        ],
     )
+
+    migrated, _ = migrate_soul_candidates(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 1
     records = _load_migrated(persona_dir)
     assert records[0]["importance"] == 8
@@ -128,20 +138,23 @@ def test_rejected_status_uses_rejected_at_and_reason(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_candidates(og_data, [{
-        "memory_id": "mem-abc",
-        "text": "rejected one",
-        "label": "high_emotion_peak",
-        "importance": 50,
-        "queued_at": "2026-04-06T17:14:28+00:00",
-        "status": "rejected",
-        "decided_at": "2026-04-07T18:39:29.989836+00:00",
-        "rejection_reason": "duplicate of existing soul crystallization",
-    }])
-
-    migrated, _ = migrate_soul_candidates(
-        og_data_dir=og_data, persona_dir=persona_dir
+    _write_og_candidates(
+        og_data,
+        [
+            {
+                "memory_id": "mem-abc",
+                "text": "rejected one",
+                "label": "high_emotion_peak",
+                "importance": 50,
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "rejected",
+                "decided_at": "2026-04-07T18:39:29.989836+00:00",
+                "rejection_reason": "duplicate of existing soul crystallization",
+            }
+        ],
     )
+
+    migrated, _ = migrate_soul_candidates(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 1
     records = _load_migrated(persona_dir)
     rec = records[0]
@@ -161,9 +174,7 @@ def test_returns_zero_zero_when_og_file_missing(tmp_path: Path) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
 
-    migrated, skipped = migrate_soul_candidates(
-        og_data_dir=og_data, persona_dir=persona_dir
-    )
+    migrated, skipped = migrate_soul_candidates(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 0
     assert skipped == 0
     assert not (persona_dir / "soul_candidates.jsonl").exists()

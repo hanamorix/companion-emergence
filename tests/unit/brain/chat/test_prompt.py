@@ -174,7 +174,9 @@ def _seed_initiate_audit(
 
 
 def test_build_system_message_includes_reply_block_when_audit_id_present(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
 ) -> None:
     """When ``reply_to_audit_id`` resolves to an audit row, the system message
     surfaces "you are replying to your earlier outbound" with the subject so
@@ -197,7 +199,9 @@ def test_build_system_message_includes_reply_block_when_audit_id_present(
 
 
 def test_build_system_message_omits_reply_block_when_no_audit_id(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
 ) -> None:
     """No ``reply_to_audit_id`` -> no reply block."""
     msg = build_system_message(
@@ -211,7 +215,9 @@ def test_build_system_message_omits_reply_block_when_no_audit_id(
 
 
 def test_build_system_message_omits_reply_block_when_audit_id_not_found(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
 ) -> None:
     """Unknown audit_id -> block omitted, chat composition continues silently."""
     msg = build_system_message(
@@ -390,10 +396,7 @@ def test_recall_block_truncates_long_content(
     persona_dir: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
     """Memory content longer than max_chars (140) is truncated with ellipsis."""
-    long_content = (
-        "Jordan was someone "
-        + ("who mattered very much. " * 50)
-    )
+    long_content = "Jordan was someone " + ("who mattered very much. " * 50)
     store.create(
         Memory.create_new(
             content=long_content,

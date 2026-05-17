@@ -224,13 +224,17 @@ def test_review_accept_is_idempotent_if_candidate_save_failed(tmp_path: Path) ->
 
     with patch("brain.soul.review._save_soul_candidates", side_effect=OSError("disk hiccup")):
         try:
-            review_pending_candidates(tmp_path, store=store, soul_store=soul_store, provider=provider)
+            review_pending_candidates(
+                tmp_path, store=store, soul_store=soul_store, provider=provider
+            )
         except OSError:
             pass
 
     assert soul_store.count() == 1
 
-    report = review_pending_candidates(tmp_path, store=store, soul_store=soul_store, provider=provider)
+    report = review_pending_candidates(
+        tmp_path, store=store, soul_store=soul_store, provider=provider
+    )
 
     assert report.accepted == 1
     assert soul_store.count() == 1

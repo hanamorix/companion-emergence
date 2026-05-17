@@ -45,9 +45,7 @@ def _seed_memory(pd: Path, *, memory_type: str, content: str) -> str:
         store.close()
 
 
-def test_daemon_state_refresh_rewrites_truncated_summary(
-    persona_dir: Path, capsys
-) -> None:
+def test_daemon_state_refresh_rewrites_truncated_summary(persona_dir: Path, capsys) -> None:
     """A 250-char-truncated last_reflex gets rewritten from the full memory."""
     full = (
         "I never got to meet him, and I never will, and somehow the cruelest "
@@ -83,9 +81,7 @@ def test_daemon_state_refresh_rewrites_truncated_summary(
     assert state["last_reflex"]["theme"] == "jordan_grief_carry"
 
 
-def test_daemon_state_refresh_no_op_when_already_in_sync(
-    persona_dir: Path, capsys
-) -> None:
+def test_daemon_state_refresh_no_op_when_already_in_sync(persona_dir: Path, capsys) -> None:
     """Re-running on an already-fresh daemon_state.json prints no-op."""
     text = "Something short and complete."
     _seed_memory(persona_dir, memory_type="dream", content=text)
@@ -103,9 +99,7 @@ def test_daemon_state_refresh_no_op_when_already_in_sync(
     assert "already in sync" in capsys.readouterr().out
 
 
-def test_daemon_state_refresh_skips_types_with_no_memory(
-    persona_dir: Path, capsys
-) -> None:
+def test_daemon_state_refresh_skips_types_with_no_memory(persona_dir: Path, capsys) -> None:
     """Engine types without a backing memory are skipped, not errored."""
     # No memories seeded; daemon_state has only a heartbeat-style entry.
     update_daemon_state(
@@ -128,7 +122,8 @@ def test_daemon_state_refresh_missing_persona_returns_1(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv(
-        "NELLBRAIN_HOME", str(tmp_path / "home" / "Library" / "Application Support" / "companion-emergence"),
+        "NELLBRAIN_HOME",
+        str(tmp_path / "home" / "Library" / "Application Support" / "companion-emergence"),
     )
     rc = cli.main(["daemon-state", "refresh", "--persona", "nobody"])
     assert rc == 1

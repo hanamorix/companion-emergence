@@ -12,6 +12,7 @@ Atomic writes via save_with_backup; reads via attempt_heal so corruption
 falls back to .bak rotation; if all backups corrupt, framework default
 applies (per spec §3.2).
 """
+
 from __future__ import annotations
 
 import json
@@ -72,7 +73,9 @@ def load_creative_dna(persona_dir: Path) -> dict[str, Any]:
     if anomaly is not None:
         logger.warning(
             "creative_dna at %s anomaly %s (action=%s); using recovered/default",
-            path, anomaly.kind, anomaly.action,
+            path,
+            anomaly.kind,
+            anomaly.action,
         )
     return data
 

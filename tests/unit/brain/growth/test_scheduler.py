@@ -379,11 +379,14 @@ def test_run_growth_tick_clean_vocabulary_collector_unchanged(
 
 def test_throttle_runs_when_never_ticked() -> None:
     """last_tick=None → always run (first ever growth tick)."""
-    assert _should_run_growth_tick(
-        last_tick=None,
-        now=datetime(2026, 4, 28, tzinfo=UTC),
-        throttle_days=7.0,
-    ) is True
+    assert (
+        _should_run_growth_tick(
+            last_tick=None,
+            now=datetime(2026, 4, 28, tzinfo=UTC),
+            throttle_days=7.0,
+        )
+        is True
+    )
 
 
 def test_throttle_runs_when_window_elapsed() -> None:
@@ -410,7 +413,8 @@ def test_throttle_boundary_at_exactly_threshold() -> None:
 
 
 def test_vocabulary_crystallization_emits_initiate_candidate(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ) -> None:
     """After vocabulary crystallization commits, emit a candidate.
 
@@ -437,7 +441,6 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
 
     candidates = read_candidates(persona_dir)
     assert any(
-        c.source == "crystallization"
-        and c.source_id == "vocabulary_emotion:lingering"
+        c.source == "crystallization" and c.source_id == "vocabulary_emotion:lingering"
         for c in candidates
     )

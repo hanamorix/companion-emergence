@@ -121,8 +121,10 @@ def test_days_since_human_handles_corrupt_buffer_lines_gracefully(tmp_path: Path
     fresh_ts = (datetime.now(UTC) - timedelta(hours=3)).isoformat(timespec="seconds")
     (active / "messy.jsonl").write_text(
         "not json at all\n"
-        + json.dumps({"speaker": "user"}) + "\n"  # no ts
-        + json.dumps({"speaker": "user", "text": "hi", "ts": fresh_ts}) + "\n"
+        + json.dumps({"speaker": "user"})
+        + "\n"  # no ts
+        + json.dumps({"speaker": "user", "text": "hi", "ts": fresh_ts})
+        + "\n"
     )
 
     store = MemoryStore(":memory:")

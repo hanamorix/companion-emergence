@@ -7,6 +7,7 @@ memories whose activation has spiked vs. their own history.
 
 Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md (Section D)
 """
+
 from __future__ import annotations
 
 import logging
@@ -275,10 +276,7 @@ def run_resonance_tick(
                 alpha=thresholds.recall_resonance_ema_alpha,
             )
 
-            if (
-                row is None
-                or row.update_count < thresholds.recall_resonance_bootstrap_min_count
-            ):
+            if row is None or row.update_count < thresholds.recall_resonance_bootstrap_min_count:
                 continue
 
             memory = store.get(memory_id) if store is not None else None

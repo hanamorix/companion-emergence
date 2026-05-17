@@ -1,4 +1,5 @@
 """Tests for brain.initiate.resonance — per-memory recall resonance."""
+
 from __future__ import annotations
 
 import math
@@ -34,6 +35,7 @@ def test_baseline_ema_converges_to_constant_input(tmp_path: Path):
 def test_baseline_ema_variance_grows_with_noise(tmp_path: Path):
     db_path = tmp_path / "baseline.db"
     import random
+
     rng = random.Random(7)
     with MemoryActivationBaseline(db_path) as b:
         for _ in range(50):

@@ -110,9 +110,7 @@ def _process_one_candidate(
             try:
                 from brain.soul.store import SoulStore
 
-                soul_store = SoulStore(
-                    str(persona_dir / "crystallizations.db")
-                )
+                soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
                 try:
                     recent_evolutions = [
                         {
@@ -130,11 +128,7 @@ def _process_one_candidate(
                     candidate.candidate_id,
                 )
             voice_path = persona_dir / "nell-voice.md"
-            current_voice = (
-                voice_path.read_text(encoding="utf-8")
-                if voice_path.exists()
-                else ""
-            )
+            current_voice = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
             decision_result = compose_decision_voice_edit(
                 provider,
                 proposal=proposal,
@@ -151,7 +145,8 @@ def _process_one_candidate(
             excerpts: list[str]
             try:
                 mem_store = MemoryStore(
-                    persona_dir / "memories.db", integrity_check=False,
+                    persona_dir / "memories.db",
+                    integrity_check=False,
                 )
                 try:
                     excerpts = []
@@ -188,9 +183,7 @@ def _process_one_candidate(
                 voice_edit_acceptance_rate=None,
             )
     except Exception as exc:
-        logger.exception(
-            "initiate composition failed for candidate %s", candidate.candidate_id
-        )
+        logger.exception("initiate composition failed for candidate %s", candidate.candidate_id)
         row = AuditRow(
             audit_id=audit_id,
             candidate_id=candidate.candidate_id,
@@ -213,14 +206,9 @@ def _process_one_candidate(
 
     # Voice-edit candidates are bucketed with `quiet` but bypass the cost-
     # cap gate — the daily reflection tick is the rate limiter (Task 14).
-    if (
-        candidate.kind != "voice_edit_proposal"
-        and final_decision in ("send_notify", "send_quiet")
-    ):
+    if candidate.kind != "voice_edit_proposal" and final_decision in ("send_notify", "send_quiet"):
         urgency = "notify" if final_decision == "send_notify" else "quiet"
-        allowed, reason = check_send_allowed(
-            persona_dir, urgency=urgency, now=now
-        )
+        allowed, reason = check_send_allowed(persona_dir, urgency=urgency, now=now)
         gate_check = {"allowed": allowed, "reason": reason}
         if not allowed:
             final_decision = "hold"
@@ -272,8 +260,8 @@ def _process_one_candidate(
             )
         except Exception:
             logger.exception(
-                "publish initiate_delivered failed for audit %s "
-                "(audit row still written)", audit_id,
+                "publish initiate_delivered failed for audit %s (audit row still written)",
+                audit_id,
             )
 
         # Episodic memory mirror — dual-write the lived-experience texture.
@@ -294,9 +282,7 @@ def _process_one_candidate(
             finally:
                 store.close()
         except Exception:
-            logger.exception(
-                "initiate memory write failed for audit %s", audit_id
-            )
+            logger.exception("initiate memory write failed for audit %s", audit_id)
 
     remove_candidate(persona_dir, candidate.candidate_id)
 
@@ -375,7 +361,8 @@ def run_initiate_review_tick(
             if consecutive_failures >= 3:
                 for c in candidates:
                     _process_one_candidate(
-                        persona_dir, c,
+                        persona_dir,
+                        c,
                         provider=provider,
                         voice_template=voice_template,
                         now=now,
@@ -386,6 +373,7 @@ def run_initiate_review_tick(
         if dcall.failure_type == "rate_limit":
             # Demote all to draft_space, remove from queue.
             from brain.initiate.reflection import DDecision
+
             for c in candidates:
                 synthetic = DDecision(
                     candidate_index=0,
@@ -418,9 +406,9 @@ def run_initiate_review_tick(
                     promote_ids.add(c.candidate_id)
             else:
                 logger.warning(
-                    "D returned out-of-range candidate_index=%d (queue len=%d); "
-                    "skipping decision",
-                    idx, len(candidates),
+                    "D returned out-of-range candidate_index=%d (queue len=%d); skipping decision",
+                    idx,
+                    len(candidates),
                 )
         # Any candidate not covered by a D decision is promoted (safe default).
         decided_indices = {d.candidate_index for d in result.decisions}
@@ -452,13 +440,15 @@ def run_initiate_review_tick(
     # this naturally).
     alert = detect_drift(persona_dir)
     if alert is not None:
-        _emit_supervisor_event({
-            "type": "d_reflection_drift_detected",
-            "ts": datetime.now(UTC).isoformat(),
-            "current_rate": alert.current_rate,
-            "historical_median": alert.historical_median,
-            "delta_sigma": alert.delta_sigma,
-        })
+        _emit_supervisor_event(
+            {
+                "type": "d_reflection_drift_detected",
+                "ts": datetime.now(UTC).isoformat(),
+                "current_rate": alert.current_rate,
+                "historical_median": alert.historical_median,
+                "delta_sigma": alert.delta_sigma,
+            }
+        )
 
 
 def _emit_supervisor_event(event: dict) -> None:
@@ -474,9 +464,7 @@ def _emit_supervisor_event(event: dict) -> None:
 
         events.publish(event["type"], **{k: v for k, v in event.items() if k != "type"})
     except Exception:
-        logger.warning(
-            "supervisor_event %s", json.dumps(event, ensure_ascii=False)
-        )
+        logger.warning("supervisor_event %s", json.dumps(event, ensure_ascii=False))
 
 
 def _make_haiku_call(provider: Any):
@@ -493,6 +481,7 @@ def _make_haiku_call(provider: Any):
       text contains "429" / "rate"              → DRateLimitError
       any other exception                        → DProviderError
     """
+
     def _call(*, system: str, user: str) -> tuple[str, int, int, int]:
         start = time.monotonic()
         try:

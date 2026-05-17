@@ -9,6 +9,7 @@ main audit log — rejection volume would otherwise drown signal).
 Thresholds are loaded from gate_thresholds.json in the persona dir,
 with defaults baked in. Operator can tune without code change.
 """
+
 from __future__ import annotations
 
 import json
@@ -133,6 +134,7 @@ def check_shared_meta_gates(
 
 class ReflexFiringLike(Protocol):
     """Duck-typed shape gate_reflex_firing inspects on a reflex firing."""
+
     pattern_id: str
     confidence: float
     flinch_intensity: float
@@ -210,6 +212,7 @@ def emit_reflex_firing_candidate(
 
 class ResearchThreadLike(Protocol):
     """Duck-typed shape gate_research_completion inspects on a research thread."""
+
     thread_id: str
     topic: str
     maturity_score: float

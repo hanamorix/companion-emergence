@@ -1,6 +1,7 @@
 """Argparse wiring tests for `nell supervisor` — verifies dispatch + flags
 without invoking the real daemon. Behaviour of cmd_restart and cmd_tail_log
 is covered by tests/unit/brain/bridge/test_daemon_extras.py."""
+
 from __future__ import annotations
 
 import pytest
@@ -41,7 +42,9 @@ def test_supervisor_action_parses_with_required_persona(action: str) -> None:
     "action",
     ["start", "run", "stop", "status", "restart", "tail-events", "tail-log"],
 )
-def test_supervisor_action_requires_persona(action: str, capsys: pytest.CaptureFixture[str]) -> None:
+def test_supervisor_action_requires_persona(
+    action: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Missing --persona is an argparse error (SystemExit code 2)."""
     with pytest.raises(SystemExit) as exc:
         cli.main(["supervisor", action])
@@ -51,7 +54,18 @@ def test_supervisor_action_requires_persona(action: str, capsys: pytest.CaptureF
 
 
 def test_supervisor_start_accepts_idle_shutdown_and_client_origin() -> None:
-    rc = cli.main(["supervisor", "start", "--persona", "nell", "--idle-shutdown", "5", "--client-origin", "tauri"])
+    rc = cli.main(
+        [
+            "supervisor",
+            "start",
+            "--persona",
+            "nell",
+            "--idle-shutdown",
+            "5",
+            "--client-origin",
+            "tauri",
+        ]
+    )
     assert rc == 0
 
 

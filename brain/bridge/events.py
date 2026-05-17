@@ -107,9 +107,7 @@ class EventBus:
                 q.put_nowait(event)
                 self._dropped_total += 1
                 if self._dropped_total % 10 == 1:
-                    logger.warning(
-                        "event queue overflow, dropped=%d", self._dropped_total
-                    )
+                    logger.warning("event queue overflow, dropped=%d", self._dropped_total)
             except asyncio.QueueEmpty:
                 pass
 

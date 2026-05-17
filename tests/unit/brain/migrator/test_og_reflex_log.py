@@ -1,4 +1,5 @@
 """Tests for brain.migrator.og_reflex_log — schema migration for OG nell_reflex_log.json."""
+
 from __future__ import annotations
 
 import json
@@ -27,20 +28,23 @@ def test_migrates_fires_with_version_wrapper(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_log(og_data, {
-        "fires": [
-            {
-                "arc": "creative_pitch",
-                "fired_at": "2026-03-31T11:30:52.498666+00:00",
-                "trigger_state": {"creative_hunger": 9},
-            },
-            {
-                "arc": "gift_creation",
-                "fired_at": "2026-03-31T11:31:02.122702+00:00",
-                "trigger_state": {"love": 9, "creative_hunger": 9},
-            },
-        ],
-    })
+    _write_og_log(
+        og_data,
+        {
+            "fires": [
+                {
+                    "arc": "creative_pitch",
+                    "fired_at": "2026-03-31T11:30:52.498666+00:00",
+                    "trigger_state": {"creative_hunger": 9},
+                },
+                {
+                    "arc": "gift_creation",
+                    "fired_at": "2026-03-31T11:31:02.122702+00:00",
+                    "trigger_state": {"love": 9, "creative_hunger": 9},
+                },
+            ],
+        },
+    )
 
     migrated = migrate_reflex_log(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 2
@@ -61,17 +65,22 @@ def test_drops_og_only_fields(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_log(og_data, {
-        "fires": [{
-            "arc": "creative_pitch",
-            "fired_at": "2026-03-31T11:30:52.498666+00:00",
-            "trigger_state": {"creative_hunger": 9},
-            "days_since_human": 0.0,
-            "output_type": "gifts",
-            "output_preview": "Listen to this, babe...",
-            "description": "creative hunger overwhelmed",
-        }],
-    })
+    _write_og_log(
+        og_data,
+        {
+            "fires": [
+                {
+                    "arc": "creative_pitch",
+                    "fired_at": "2026-03-31T11:30:52.498666+00:00",
+                    "trigger_state": {"creative_hunger": 9},
+                    "days_since_human": 0.0,
+                    "output_type": "gifts",
+                    "output_preview": "Listen to this, babe...",
+                    "description": "creative hunger overwhelmed",
+                }
+            ],
+        },
+    )
 
     migrate_reflex_log(og_data_dir=og_data, persona_dir=persona_dir)
 
@@ -95,25 +104,28 @@ def test_skips_malformed_fire_entries(tmp_path: Path) -> None:
     og_data = tmp_path / "og_data"
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    _write_og_log(og_data, {
-        "fires": [
-            {
-                "arc": "creative_pitch",
-                "fired_at": "2026-03-31T11:30:52.498666+00:00",
-                "trigger_state": {"creative_hunger": 9},
-            },
-            {
-                # missing 'arc'
-                "fired_at": "2026-03-31T11:31:00+00:00",
-                "trigger_state": {"love": 9},
-            },
-            {
-                "arc": "gift_creation",
-                # missing 'fired_at'
-                "trigger_state": {"love": 9},
-            },
-        ],
-    })
+    _write_og_log(
+        og_data,
+        {
+            "fires": [
+                {
+                    "arc": "creative_pitch",
+                    "fired_at": "2026-03-31T11:30:52.498666+00:00",
+                    "trigger_state": {"creative_hunger": 9},
+                },
+                {
+                    # missing 'arc'
+                    "fired_at": "2026-03-31T11:31:00+00:00",
+                    "trigger_state": {"love": 9},
+                },
+                {
+                    "arc": "gift_creation",
+                    # missing 'fired_at'
+                    "trigger_state": {"love": 9},
+                },
+            ],
+        },
+    )
 
     migrated = migrate_reflex_log(og_data_dir=og_data, persona_dir=persona_dir)
     assert migrated == 1

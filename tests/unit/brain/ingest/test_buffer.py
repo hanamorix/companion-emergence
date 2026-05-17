@@ -131,14 +131,15 @@ def test_ingest_turn_rejects_path_traversal_session_id(tmp_path: Path) -> None:
     contract advertises 'Optional: session_id' and previously accepted any
     string straight into a filename interpolation."""
     import pytest as _pytest
+
     for evil in [
         "../../etc/passwd",
         "../escape",
         "a/b",
         "..",
-        "x" * 65,            # too long
-        "no spaces here",    # space disallowed
-        "weird:char",        # colon disallowed (also Windows-illegal)
+        "x" * 65,  # too long
+        "no spaces here",  # space disallowed
+        "weird:char",  # colon disallowed (also Windows-illegal)
     ]:
         with _pytest.raises(ValueError, match="invalid session_id"):
             ingest_turn(tmp_path, {"session_id": evil, "speaker": "u", "text": "x"})
@@ -154,6 +155,7 @@ def test_ingest_turn_rejects_path_traversal_session_id(tmp_path: Path) -> None:
 def test_ingest_turn_accepts_uuid_and_sess_prefix_session_ids(tmp_path: Path) -> None:
     """Both UUID4 (with hyphens) and the sess_<8hex> fallback must be accepted."""
     import uuid as _uuid
+
     sid_uuid = str(_uuid.uuid4())
     sid_sess = "sess_abcd1234"
     ingest_turn(tmp_path, {"session_id": sid_uuid, "speaker": "u", "text": "a"})
@@ -264,28 +266,38 @@ def test_delete_cursor_is_idempotent(tmp_path: Path) -> None:
 
 def test_read_session_after_returns_only_post_cursor_turns(tmp_path: Path) -> None:
     sid = "sess_abc"
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
-                           "ts": "2026-05-10T20:00:00+00:00"})
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "b",
-                           "ts": "2026-05-10T20:00:05+00:00"})
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "c",
-                           "ts": "2026-05-10T20:01:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "a", "ts": "2026-05-10T20:00:00+00:00"},
+    )
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "assistant", "text": "b", "ts": "2026-05-10T20:00:05+00:00"},
+    )
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "c", "ts": "2026-05-10T20:01:00+00:00"},
+    )
     out = read_session_after(tmp_path, sid, "2026-05-10T20:00:30+00:00")
     assert [t["text"] for t in out] == ["c"]
 
 
 def test_read_session_after_none_cursor_returns_all(tmp_path: Path) -> None:
     sid = "sess_abc"
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
-                           "ts": "2026-05-10T20:00:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "a", "ts": "2026-05-10T20:00:00+00:00"},
+    )
     out = read_session_after(tmp_path, sid, None)
     assert len(out) == 1
 
 
 def test_read_session_after_malformed_cursor_returns_all(tmp_path: Path) -> None:
     sid = "sess_abc"
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "a",
-                           "ts": "2026-05-10T20:00:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "a", "ts": "2026-05-10T20:00:00+00:00"},
+    )
     out = read_session_after(tmp_path, sid, "not-a-ts")
     assert len(out) == 1
 
@@ -312,9 +324,7 @@ def test_read_backoff_malformed_returns_none(tmp_path: Path) -> None:
     backoff_file.write_text('{"failures": 2}', encoding="utf-8")
     assert read_backoff(tmp_path, "sess_abc") is None
     # Bad ts inside an otherwise well-shaped dict.
-    backoff_file.write_text(
-        '{"failures": 2, "first_failure_at": "garbage"}', encoding="utf-8"
-    )
+    backoff_file.write_text('{"failures": 2, "first_failure_at": "garbage"}', encoding="utf-8")
     assert read_backoff(tmp_path, "sess_abc") is None
     # Empty file.
     backoff_file.write_text("", encoding="utf-8")
@@ -322,9 +332,7 @@ def test_read_backoff_malformed_returns_none(tmp_path: Path) -> None:
 
 
 def test_write_and_read_backoff_roundtrip(tmp_path: Path) -> None:
-    write_backoff(
-        tmp_path, "sess_abc", failures=2, first_failure_at="2026-05-10T20:00:00+00:00"
-    )
+    write_backoff(tmp_path, "sess_abc", failures=2, first_failure_at="2026-05-10T20:00:00+00:00")
     state = read_backoff(tmp_path, "sess_abc")
     assert state == {
         "failures": 2,
@@ -335,9 +343,7 @@ def test_write_and_read_backoff_roundtrip(tmp_path: Path) -> None:
 def test_delete_backoff_is_idempotent(tmp_path: Path) -> None:
     # No file present — must not raise.
     delete_backoff(tmp_path, "sess_abc")
-    write_backoff(
-        tmp_path, "sess_abc", failures=1, first_failure_at="2026-05-10T20:00:00+00:00"
-    )
+    write_backoff(tmp_path, "sess_abc", failures=1, first_failure_at="2026-05-10T20:00:00+00:00")
     delete_backoff(tmp_path, "sess_abc")
     assert read_backoff(tmp_path, "sess_abc") is None
     # Second delete on missing file — still no-op.

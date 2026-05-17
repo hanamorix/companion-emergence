@@ -13,6 +13,7 @@ explicit isolated persona directory, or --live to target the user's installed
 companion-emergence persona directory. Reports print to stdout unless --output
 or --legacy-output is supplied.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -294,7 +295,9 @@ def main(argv: list[str] | None = None) -> int:
                 tool_invs = resp.get("tool_invocations") or []
                 tools = [inv.get("name", "?") for inv in tool_invs]
                 metrics = compute_metrics(reply)
-                results.append(Result(pid, mode, expected_tool, prompt, reply, elapsed_ms, tools, metrics))
+                results.append(
+                    Result(pid, mode, expected_tool, prompt, reply, elapsed_ms, tools, metrics)
+                )
                 print(f"{elapsed_ms}ms, {metrics.words}w, tools={tools}")
             except HTTPError as e:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)

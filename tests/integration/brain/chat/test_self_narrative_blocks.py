@@ -6,6 +6,7 @@ sections, and degrade gracefully when files are missing.
 This file is added to incrementally — Task 4 lands the journal block tests,
 Task 5 adds growth block tests, Task 7 adds creative_dna block tests.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -79,13 +80,21 @@ def _seed_journal_entry(
 
 
 def test_recent_journal_block_renders_metadata_and_contract(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
-    _seed_journal_entry(store, days_ago=2, source="brain_authored",
-                        emotions={"love": 8.0, "vulnerability": 6.0})
-    _seed_journal_entry(store, days_ago=4, source="reflex_arc",
-                        arc_name="loneliness_journal",
-                        emotions={"loneliness": 8.0})
+    _seed_journal_entry(
+        store, days_ago=2, source="brain_authored", emotions={"love": 8.0, "vulnerability": 6.0}
+    )
+    _seed_journal_entry(
+        store,
+        days_ago=4,
+        source="reflex_arc",
+        arc_name="loneliness_journal",
+        emotions={"loneliness": 8.0},
+    )
 
     msg = build_system_message(
         persona_dir,
@@ -109,16 +118,24 @@ def test_recent_journal_block_renders_metadata_and_contract(
 
 
 def test_recent_journal_block_omits_entries_older_than_7_days(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
-    _seed_journal_entry(store, days_ago=10, source="brain_authored",
-                        content="OLD entry content unique marker zzz")
-    _seed_journal_entry(store, days_ago=2, source="brain_authored",
-                        content="RECENT entry content unique marker yyy")
+    _seed_journal_entry(
+        store, days_ago=10, source="brain_authored", content="OLD entry content unique marker zzz"
+    )
+    _seed_journal_entry(
+        store, days_ago=2, source="brain_authored", content="RECENT entry content unique marker yyy"
+    )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     # Both contents are filtered out (privacy), but only the recent
@@ -133,32 +150,38 @@ def test_recent_journal_block_omits_entries_older_than_7_days(
     next_block = msg.find("\n\n──", header_end)
     block = msg[header_end:next_block] if next_block > 0 else msg[header_end:]
     # Count entry rows — lines that have both "brain_authored" and an em-dash
-    entry_lines = [
-        line for line in block.split("\n")
-        if "brain_authored" in line and "—" in line
-    ]
+    entry_lines = [line for line in block.split("\n") if "brain_authored" in line and "—" in line]
     assert len(entry_lines) == 1
 
 
 def test_recent_journal_block_empty_state_renders_silence_marker(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """No journal entries → block still renders contract + 'no entries' marker."""
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
     assert "── recent journal" in msg
     assert "no journal entries" in msg.lower() or "(no entries" in msg.lower()
 
 
 def test_recent_journal_block_handles_store_query_failure_gracefully(
-    persona_dir: Path, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """If store.list_by_type raises (e.g. corrupt SQLite), the block falls
     back to the empty-state contract — chat must NEVER break because
     journal failed.
     """
+
     class _BrokenStore:
         def list_by_type(self, *args, **kwargs):
             raise RuntimeError("simulated store failure")
@@ -182,8 +205,11 @@ def test_recent_journal_block_handles_store_query_failure_gracefully(
         s.list_by_type = broken_list_by_type  # type: ignore[method-assign]
 
         msg = build_system_message(
-            persona_dir, voice_md="", daemon_state=daemon_state,
-            soul_store=soul_store, store=s,
+            persona_dir,
+            voice_md="",
+            daemon_state=daemon_state,
+            soul_store=soul_store,
+            store=s,
         )
         # Falls back to empty-state contract; doesn't crash
         assert "── recent journal" in msg
@@ -193,7 +219,10 @@ def test_recent_journal_block_handles_store_query_failure_gracefully(
 
 
 def test_recent_growth_block_renders_behavioral_log_entries(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """Last 7 days of behavioral_log entries appear in chat as raw metadata."""
     from brain.behavioral.log import append_behavioral_event
@@ -201,14 +230,16 @@ def test_recent_growth_block_renders_behavioral_log_entries(
     log_path = persona_dir / "behavioral_log.jsonl"
     base = datetime.now(UTC)
     append_behavioral_event(
-        log_path, kind="creative_dna_emerging_added",
+        log_path,
+        kind="creative_dna_emerging_added",
         name="sentence fragments as rhythmic percussion",
         timestamp=base - timedelta(days=2),
         reasoning="appeared in 3 recent sessions",
         evidence_memory_ids=("mem_a",),
     )
     append_behavioral_event(
-        log_path, kind="journal_entry_added",
+        log_path,
+        kind="journal_entry_added",
         name="mem_journal_xyz",
         timestamp=base - timedelta(days=1),
         source="brain_authored",
@@ -217,8 +248,11 @@ def test_recent_growth_block_renders_behavioral_log_entries(
     )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     assert "── recent growth ──" in msg
@@ -228,7 +262,10 @@ def test_recent_growth_block_renders_behavioral_log_entries(
 
 
 def test_recent_growth_block_renders_climax_event(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """A climax_event entry shows up in the growth block as 'body crested'.
     Content stays in the journal_entry memory; behavioral_log is metadata-only."""
@@ -236,7 +273,8 @@ def test_recent_growth_block_renders_climax_event(
 
     log_path = persona_dir / "behavioral_log.jsonl"
     append_behavioral_event(
-        log_path, kind="climax_event",
+        log_path,
+        kind="climax_event",
         name="mem_climax_journal_xyz",
         timestamp=datetime.now(UTC) - timedelta(days=1),
         source="climax_event",
@@ -245,17 +283,22 @@ def test_recent_growth_block_renders_climax_event(
     )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     assert "── recent growth ──" in msg
     assert "climax_event: body crested" in msg
 
 
-
 def test_recent_growth_block_omitted_when_log_empty(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """Empty behavioral_log → block omitted entirely (not rendered as 'no entries').
 
@@ -263,33 +306,48 @@ def test_recent_growth_block_omitted_when_log_empty(
     of growth events, no need for a marker.
     """
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
     assert "── recent growth ──" not in msg
 
 
 def test_recent_growth_block_filters_to_7_day_window(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     from brain.behavioral.log import append_behavioral_event
 
     log_path = persona_dir / "behavioral_log.jsonl"
     base = datetime.now(UTC)
     append_behavioral_event(
-        log_path, kind="creative_dna_emerging_added", name="old_pattern",
+        log_path,
+        kind="creative_dna_emerging_added",
+        name="old_pattern",
         timestamp=base - timedelta(days=10),
-        reasoning="r", evidence_memory_ids=(),
+        reasoning="r",
+        evidence_memory_ids=(),
     )
     append_behavioral_event(
-        log_path, kind="creative_dna_emerging_added", name="recent_pattern",
+        log_path,
+        kind="creative_dna_emerging_added",
+        name="recent_pattern",
         timestamp=base - timedelta(days=2),
-        reasoning="r", evidence_memory_ids=(),
+        reasoning="r",
+        evidence_memory_ids=(),
     )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     assert "recent_pattern" in msg
@@ -297,7 +355,10 @@ def test_recent_growth_block_filters_to_7_day_window(
 
 
 def test_recent_growth_block_handles_corrupt_log_gracefully(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """Corrupt JSONL line → skipped via read_jsonl_skipping_corrupt; block
     still renders with valid lines. Chat must NEVER break because growth
@@ -309,12 +370,15 @@ def test_recent_growth_block_handles_corrupt_log_gracefully(
     log_path.write_text(
         '{"timestamp":"2026-04-29T00:00:00Z","kind":"creative_dna_emerging_added","name":"valid_one","reasoning":"r","evidence_memory_ids":[]}\n'
         "this is not json\n"
-        f'{{"timestamp":"{(base - timedelta(days=1)).isoformat().replace("+00:00","Z")}","kind":"creative_dna_emerging_added","name":"valid_two","reasoning":"r","evidence_memory_ids":[]}}\n'
+        f'{{"timestamp":"{(base - timedelta(days=1)).isoformat().replace("+00:00", "Z")}","kind":"creative_dna_emerging_added","name":"valid_two","reasoning":"r","evidence_memory_ids":[]}}\n'
     )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     # valid_two is in the 7-day window; valid_one's hardcoded date may not be
@@ -326,33 +390,57 @@ def test_recent_growth_block_handles_corrupt_log_gracefully(
 
 
 def test_creative_dna_block_renders_active_emerging_influences_avoid(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """All four sections render; fading does NOT appear."""
     from brain.creative.dna import save_creative_dna
 
-    save_creative_dna(persona_dir, {
-        "version": 1,
-        "core_voice": "literary, sensory-dense",
-        "strengths": ["power dynamics", "slow-burn tension"],
-        "tendencies": {
-            "active": [
-                {"name": "ending on physical action", "added_at": "2026-04-01T00:00:00Z", "reasoning": "r", "evidence_memory_ids": []},
-            ],
-            "emerging": [
-                {"name": "sentence fragments as percussion", "added_at": "2026-04-23T00:00:00Z", "reasoning": "r", "evidence_memory_ids": []},
-            ],
-            "fading": [
-                {"name": "ending on questions", "demoted_to_fading_at": "2026-04-25T00:00:00Z", "last_evidence_at": "2026-04-10T00:00:00Z", "reasoning": "r"},
-            ],
+    save_creative_dna(
+        persona_dir,
+        {
+            "version": 1,
+            "core_voice": "literary, sensory-dense",
+            "strengths": ["power dynamics", "slow-burn tension"],
+            "tendencies": {
+                "active": [
+                    {
+                        "name": "ending on physical action",
+                        "added_at": "2026-04-01T00:00:00Z",
+                        "reasoning": "r",
+                        "evidence_memory_ids": [],
+                    },
+                ],
+                "emerging": [
+                    {
+                        "name": "sentence fragments as percussion",
+                        "added_at": "2026-04-23T00:00:00Z",
+                        "reasoning": "r",
+                        "evidence_memory_ids": [],
+                    },
+                ],
+                "fading": [
+                    {
+                        "name": "ending on questions",
+                        "demoted_to_fading_at": "2026-04-25T00:00:00Z",
+                        "last_evidence_at": "2026-04-10T00:00:00Z",
+                        "reasoning": "r",
+                    },
+                ],
+            },
+            "influences": ["clarice lispector"],
+            "avoid": ["hypophora"],
         },
-        "influences": ["clarice lispector"],
-        "avoid": ["hypophora"],
-    })
+    )
 
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
 
     assert "creative dna" in msg.lower()
@@ -368,7 +456,10 @@ def test_creative_dna_block_renders_active_emerging_influences_avoid(
 
 
 def test_creative_dna_block_renders_default_for_fresh_persona(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, daemon_state: DaemonState,
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+    daemon_state: DaemonState,
 ):
     """Fresh persona → load_creative_dna seeds default → block renders default content.
 
@@ -377,8 +468,11 @@ def test_creative_dna_block_renders_default_for_fresh_persona(
     and the block renders that.
     """
     msg = build_system_message(
-        persona_dir, voice_md="", daemon_state=daemon_state,
-        soul_store=soul_store, store=store,
+        persona_dir,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
     )
     assert "── creative dna" in msg.lower()
     # Default core_voice ("attentive, present, finding her own rhythm")

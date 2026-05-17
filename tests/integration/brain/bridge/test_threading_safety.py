@@ -19,6 +19,7 @@ Tests:
 2. Buffer-preservation on commit failure: monkeypatch commit_item to raise.
    Assert the session buffer file STILL EXISTS so a future tick can retry.
 """
+
 from __future__ import annotations
 
 import json as _json
@@ -50,13 +51,15 @@ class _ExtractingFakeProvider(LLMProvider):
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         # Detect the extraction prompt by its signature; return a valid JSON array.
         if "JSON array" in prompt or "TRANSCRIPT:" in prompt or "ExtractedItem" in prompt:
-            return _json.dumps([
-                {
-                    "text": "user said hello to nell",
-                    "label": "observation",
-                    "importance": 6,
-                },
-            ])
+            return _json.dumps(
+                [
+                    {
+                        "text": "user said hello to nell",
+                        "label": "observation",
+                        "importance": 6,
+                    },
+                ]
+            )
         # Otherwise (heartbeat close / dream / reflex / research prompts) return
         # something innocuous — we don't care what those engines do here.
         return "(noop)"
@@ -68,6 +71,7 @@ class _ExtractingFakeProvider(LLMProvider):
 @pytest.fixture(autouse=True)
 def _reset_session_registry():
     from brain.chat.session import reset_registry
+
     reset_registry()
     yield
     reset_registry()
@@ -79,29 +83,44 @@ def real_persona_dir(tmp_path: Path) -> Path:
     p = tmp_path / "threadtest-persona"
     p.mkdir()
     (p / "active_conversations").mkdir()
-    (p / "persona_config.json").write_text(
-        '{"provider": "extracting-fake", "searcher": "noop"}'
+    (p / "persona_config.json").write_text('{"provider": "extracting-fake", "searcher": "noop"}')
+    (p / "emotion_vocabulary.json").write_text(
+        _json.dumps(
+            {
+                "version": 1,
+                "emotions": [
+                    {
+                        "name": "vulnerability",
+                        "description": "d",
+                        "category": "x",
+                        "decay_half_life_days": 1.0,
+                        "intensity_clamp": 10.0,
+                    },
+                    {
+                        "name": "love",
+                        "description": "d",
+                        "category": "x",
+                        "decay_half_life_days": 1.0,
+                        "intensity_clamp": 10.0,
+                    },
+                ],
+            }
+        )
     )
-    (p / "emotion_vocabulary.json").write_text(_json.dumps({
-        "version": 1,
-        "emotions": [
-            {"name": "vulnerability", "description": "d", "category": "x",
-             "decay_half_life_days": 1.0, "intensity_clamp": 10.0},
-            {"name": "love", "description": "d", "category": "x",
-             "decay_half_life_days": 1.0, "intensity_clamp": 10.0},
-        ],
-    }))
     return p
 
 
 def _patch_provider(monkeypatch, provider: LLMProvider) -> None:
     """Override get_provider in server.py so the fake is used."""
     import brain.bridge.server as srv
+
     monkeypatch.setattr(srv, "get_provider", lambda _name: provider)
 
 
 def test_chat_threaded_round_trip_no_silent_sqlite_drop(
-    real_persona_dir: Path, monkeypatch, caplog,
+    real_persona_dir: Path,
+    monkeypatch,
+    caplog,
 ):
     """The H-A regression test.
 
@@ -146,8 +165,7 @@ def test_chat_threaded_round_trip_no_silent_sqlite_drop(
         # The load-bearing assertion: at least one memory committed. If the
         # threading bug were back, committed would be 0 with errors > 0.
         assert body["committed"] >= 1, (
-            f"expected >= 1 memory committed; got {body}\n"
-            f"caplog: {caplog.text[:1000]}"
+            f"expected >= 1 memory committed; got {body}\ncaplog: {caplog.text[:1000]}"
         )
 
     # Sanity: no SQLite cross-thread errors in the captured log.
@@ -155,7 +173,9 @@ def test_chat_threaded_round_trip_no_silent_sqlite_drop(
 
 
 def test_session_close_handles_commit_failure_gracefully(
-    real_persona_dir: Path, monkeypatch, caplog,
+    real_persona_dir: Path,
+    monkeypatch,
+    caplog,
 ):
     """If commit_item raises, the close handler must not crash silently.
 

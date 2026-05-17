@@ -39,19 +39,13 @@ def recall_initiate_audit(
     window_hours = _resolve_window_hours(window)
     rows = list(read_recent_audit(persona_dir, window_hours=window_hours))
     if filter_state:
-        rows = [
-            r
-            for r in rows
-            if r.delivery and r.delivery.get("current_state") == filter_state
-        ]
+        rows = [r for r in rows if r.delivery and r.delivery.get("current_state") == filter_state]
     if not rows:
         return "(no recent initiate decisions in this window)"
     lines: list[str] = []
     for r in rows:
         state = (r.delivery.get("current_state") if r.delivery else "n/a") or "n/a"
-        lines.append(
-            f"{r.ts} | {r.decision} | {r.subject[:80]} | state={state}"
-        )
+        lines.append(f"{r.ts} | {r.decision} | {r.subject[:80]} | state={state}")
     return "\n".join(lines)
 
 
@@ -85,8 +79,7 @@ def recall_voice_evolution(persona_dir: Path) -> str:
     if not evolutions:
         return "(no voice evolution history)"
     return "\n".join(
-        f"{v.accepted_at}: {v.old_text!r} -> {v.new_text!r}  ({v.rationale})"
-        for v in evolutions
+        f"{v.accepted_at}: {v.old_text!r} -> {v.new_text!r}  ({v.rationale})" for v in evolutions
     )
 
 

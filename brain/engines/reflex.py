@@ -549,9 +549,7 @@ def _emit_reflex_candidate(
 
         thresholds = load_gate_thresholds(persona_dir)
 
-        gate_ok, gate_reason = gate_reflex_firing(
-            persona_dir, firing=firing, thresholds=thresholds
-        )
+        gate_ok, gate_reason = gate_reflex_firing(persona_dir, firing=firing, thresholds=thresholds)
         if not gate_ok:
             write_gate_rejection(
                 persona_dir,
@@ -583,9 +581,7 @@ def _emit_reflex_candidate(
             )
             return
 
-        emit_reflex_firing_candidate(
-            persona_dir, firing=firing, firing_log_id=mem_id, now=now
-        )
+        emit_reflex_firing_candidate(persona_dir, firing=firing, firing_log_id=mem_id, now=now)
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("reflex fire: initiate candidate emit failed: %s", exc)

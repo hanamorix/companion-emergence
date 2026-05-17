@@ -66,8 +66,10 @@ def test_compose_draft_fragment_falls_back_to_template_on_error(tmp_path: Path) 
 def test_has_new_drafts_since_returns_true_when_file_newer(tmp_path: Path) -> None:
     last_seen_iso = "2024-01-01T00:00:00+00:00"
     append_draft_fragment(
-        tmp_path, timestamp="2026-05-11T14:32:00+00:00",
-        source="dream", body="x",
+        tmp_path,
+        timestamp="2026-05-11T14:32:00+00:00",
+        source="dream",
+        body="x",
     )
     assert has_new_drafts_since(tmp_path, last_seen_iso) is True
 

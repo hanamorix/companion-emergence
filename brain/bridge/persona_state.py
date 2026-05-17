@@ -18,6 +18,7 @@ the provider is reachable, "offline" otherwise. Provider-failover
 ("provider_down") becomes meaningful when the FailoverProvider lands;
 until then, mode is binary.
 """
+
 from __future__ import annotations
 
 import json
@@ -123,6 +124,7 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     }
     try:
         from brain.persona_config import PersonaConfig
+
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         out["provider"] = cfg.provider
         out["model"] = _default_model_for(cfg.provider)
@@ -268,7 +270,10 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
             # earliest entry — 0 when no session is open.
             session_hours = _active_session_hours(persona_dir, now=now)
             words = count_words_in_session(
-                store, persona_dir=persona_dir, session_hours=session_hours, now=now,
+                store,
+                persona_dir=persona_dir,
+                session_hours=session_hours,
+                now=now,
             )
             body = compute_body_state(
                 emotions=state.emotions,

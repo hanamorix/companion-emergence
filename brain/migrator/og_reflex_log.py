@@ -16,6 +16,7 @@ migrate without those).
 
 See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-design.md.
 """
+
 from __future__ import annotations
 
 import json
@@ -72,8 +73,6 @@ def migrate_reflex_log(
     if migrated_fires:
         dest = persona_dir / "reflex_log.json"
         payload = {"version": 1, "fires": migrated_fires}
-        save_with_backup_text(
-            dest, json.dumps(payload, ensure_ascii=False, indent=2)
-        )
+        save_with_backup_text(dest, json.dumps(payload, ensure_ascii=False, indent=2))
 
     return len(migrated_fires)

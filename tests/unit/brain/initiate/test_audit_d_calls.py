@@ -1,4 +1,5 @@
 """Tests for the initiate_d_calls audit table."""
+
 from __future__ import annotations
 
 import json
@@ -50,6 +51,7 @@ def test_d_call_row_failure_type_optional():
 
 def test_make_d_call_id_sortable():
     from datetime import UTC, datetime
+
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     ident = make_d_call_id(now)
     assert ident.startswith("dc_2026-05-12T10-00-00_")
@@ -93,16 +95,24 @@ def test_read_recent_d_calls_window_filter(tmp_path):
         ts=(now - timedelta(hours=5)).isoformat(),
         tick_id="t1",
         model_tier_used="haiku",
-        candidates_in=1, promoted_out=0, filtered_out=1,
-        latency_ms=200, tokens_input=300, tokens_output=100,
+        candidates_in=1,
+        promoted_out=0,
+        filtered_out=1,
+        latency_ms=200,
+        tokens_input=300,
+        tokens_output=100,
     )
     recent = DCallRow(
         d_call_id="dc_new",
         ts=now.isoformat(),
         tick_id="t2",
         model_tier_used="sonnet",
-        candidates_in=2, promoted_out=2, filtered_out=0,
-        latency_ms=800, tokens_input=400, tokens_output=200,
+        candidates_in=2,
+        promoted_out=2,
+        filtered_out=0,
+        latency_ms=800,
+        tokens_input=400,
+        tokens_output=200,
     )
     append_d_call_row(persona, old)
     append_d_call_row(persona, recent)
@@ -114,6 +124,7 @@ def test_read_recent_d_calls_no_file_returns_empty(tmp_path):
     from datetime import UTC, datetime
 
     from brain.initiate.audit import read_recent_d_calls
+
     persona = tmp_path / "fresh"
     out = list(read_recent_d_calls(persona, window_hours=1, now=datetime(2026, 5, 12, tzinfo=UTC)))
     assert out == []

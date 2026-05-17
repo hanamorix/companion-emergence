@@ -1,4 +1,5 @@
 """Tests for arc storage helpers — graveyard + snapshot."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -67,14 +68,18 @@ def test_recently_removed_names_window(tmp_path: Path):
     """Only entries within `grace_days` count as recently-removed."""
     now = datetime(2026, 4, 28, tzinfo=UTC)
     append_removed_arc(  # 5 days ago — within window
-        tmp_path, arc=_make_arc("recent"),
+        tmp_path,
+        arc=_make_arc("recent"),
         removed_at=now - timedelta(days=5),
-        removed_by="user_edit", reasoning=None,
+        removed_by="user_edit",
+        reasoning=None,
     )
     append_removed_arc(  # 20 days ago — outside 15d window
-        tmp_path, arc=_make_arc("ancient"),
+        tmp_path,
+        arc=_make_arc("ancient"),
         removed_at=now - timedelta(days=20),
-        removed_by="user_edit", reasoning=None,
+        removed_by="user_edit",
+        reasoning=None,
     )
     names = recently_removed_names(tmp_path, now=now, grace_days=15)
     assert names == {"recent"}
@@ -102,7 +107,7 @@ def test_graveyard_handles_corrupt_lines(tmp_path: Path):
         '{"name": "valid1", "removed_at": "2026-04-28T00:00:00+00:00", '
         '"removed_by": "user_edit", "reasoning": null, "trigger_snapshot": {}, '
         '"description_snapshot": "", "prompt_template_snapshot": ""}\n'
-        'this is not json\n'
+        "this is not json\n"
         '{"name": "valid2", "removed_at": "2026-04-28T00:00:00+00:00", '
         '"removed_by": "user_edit", "reasoning": null, "trigger_snapshot": {}, '
         '"description_snapshot": "", "prompt_template_snapshot": ""}\n'

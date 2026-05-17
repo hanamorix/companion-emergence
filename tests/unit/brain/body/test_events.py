@@ -44,7 +44,9 @@ def _seed_originating(store: MemoryStore, *, climax: float = 8.0) -> Memory:
 def test_writes_journal_entry_with_correct_metadata(store, persona_dir):
     origin = _seed_originating(store)
     new_id = record_climax_event(
-        originating_memory=origin, store=store, persona_dir=persona_dir,
+        originating_memory=origin,
+        store=store,
+        persona_dir=persona_dir,
     )
     assert new_id is not None
 
@@ -61,7 +63,9 @@ def test_writes_journal_entry_with_correct_metadata(store, persona_dir):
 def test_journal_carries_originating_emotions(store, persona_dir):
     origin = _seed_originating(store)
     record_climax_event(
-        originating_memory=origin, store=store, persona_dir=persona_dir,
+        originating_memory=origin,
+        store=store,
+        persona_dir=persona_dir,
     )
     j = store.list_by_type("journal_entry", active_only=True)[0]
     assert j.emotions["climax"] == 8.0
@@ -72,7 +76,9 @@ def test_journal_carries_originating_emotions(store, persona_dir):
 def test_journal_content_includes_originating_snippet(store, persona_dir):
     origin = _seed_originating(store)
     record_climax_event(
-        originating_memory=origin, store=store, persona_dir=persona_dir,
+        originating_memory=origin,
+        store=store,
+        persona_dir=persona_dir,
     )
     j = store.list_by_type("journal_entry", active_only=True)[0]
     assert "the body crested" in j.content
@@ -84,7 +90,9 @@ def test_journal_content_includes_originating_snippet(store, persona_dir):
 def test_emits_behavioral_log_entry(store, persona_dir):
     origin = _seed_originating(store)
     record_climax_event(
-        originating_memory=origin, store=store, persona_dir=persona_dir,
+        originating_memory=origin,
+        store=store,
+        persona_dir=persona_dir,
     )
     log_path = persona_dir / "behavioral_log.jsonl"
     assert log_path.exists()
@@ -112,11 +120,14 @@ def test_returns_none_on_store_failure(persona_dir, monkeypatch):
 
                 def boom(*a, _exc=raise_cls, **k):
                     raise _exc("simulated failure")
+
                 monkeypatch.setattr(s, "create", boom)
 
                 # Should NOT raise
                 new_id = record_climax_event(
-                    originating_memory=origin, store=s, persona_dir=persona_dir,
+                    originating_memory=origin,
+                    store=s,
+                    persona_dir=persona_dir,
                 )
                 assert new_id is None, f"{raise_cls.__name__} did not absorb"
             finally:
@@ -137,12 +148,16 @@ def test_propagates_programming_bugs(persona_dir, monkeypatch):
 
                 def boom(*a, _exc=raise_cls, **k):
                     raise _exc("simulated programming bug")
+
                 monkeypatch.setattr(s, "create", boom)
 
                 import pytest as _pytest
+
                 with _pytest.raises(raise_cls):
                     record_climax_event(
-                        originating_memory=origin, store=s, persona_dir=persona_dir,
+                        originating_memory=origin,
+                        store=s,
+                        persona_dir=persona_dir,
                     )
             finally:
                 s.close()
@@ -156,7 +171,9 @@ def test_does_not_recurse_when_journal_itself_has_climax(store, persona_dir):
     journal_entry per call."""
     origin = _seed_originating(store)
     record_climax_event(
-        originating_memory=origin, store=store, persona_dir=persona_dir,
+        originating_memory=origin,
+        store=store,
+        persona_dir=persona_dir,
     )
     entries = store.list_by_type("journal_entry", active_only=True)
     assert len(entries) == 1

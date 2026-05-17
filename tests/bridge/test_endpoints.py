@@ -1,4 +1,5 @@
 """Bridge endpoints — sync TestClient against an in-memory FastAPI app."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -285,9 +286,7 @@ def test_stream_accepts_bearer_websocket_subprotocol(persona_dir: Path, monkeypa
             json={"client": "tests"},
             headers={"Authorization": "Bearer secret-token"},
         ).json()["session_id"]
-        with c.websocket_connect(
-            f"/stream/{sid}", subprotocols=["bearer", "secret-token"]
-        ) as ws:
+        with c.websocket_connect(f"/stream/{sid}", subprotocols=["bearer", "secret-token"]) as ws:
             assert ws.accepted_subprotocol == "bearer"
             ws.send_json({"message": "hi"})
             frames = []
@@ -320,6 +319,7 @@ def test_persona_state_endpoint_returns_aggregated_shape(persona_dir: Path):
 def test_persona_state_endpoint_requires_auth(persona_dir: Path):
     """No bearer token → 401, matches every other authed endpoint."""
     from brain.bridge.server import build_app
+
     app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token="secret")
     with TestClient(app) as c:
         r = c.get("/persona/state")  # no auth header
@@ -338,9 +338,7 @@ _TINY_PNG = bytes.fromhex(
 )
 
 
-def test_chat_accepts_image_shas_and_records_in_buffer(
-    persona_dir: Path, monkeypatch
-):
+def test_chat_accepts_image_shas_and_records_in_buffer(persona_dir: Path, monkeypatch):
     """POST /chat with image_shas: ingest buffer JSONL has the shas on the user turn."""
     _patch_fake_provider(monkeypatch, reply="I see you.")
     with _make_client(persona_dir) as c:
@@ -448,7 +446,8 @@ def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch)
 
 
 def test_stream_with_reply_to_audit_id_transitions_audit_to_replied_explicit(
-    persona_dir: Path, monkeypatch,
+    persona_dir: Path,
+    monkeypatch,
 ):
     """Bundle A #4: WS /stream payload with ``reply_to_audit_id`` triggers a
     server-side audit transition + memory re-render atomically with the chat
@@ -475,7 +474,8 @@ def test_stream_with_reply_to_audit_id_transitions_audit_to_replied_explicit(
 
 
 def test_stream_without_reply_to_audit_id_leaves_audit_untouched(
-    persona_dir: Path, monkeypatch,
+    persona_dir: Path,
+    monkeypatch,
 ):
     """Sanity: a chat turn without ``reply_to_audit_id`` doesn't mutate any
     audit row. Prevents the server-side transition from over-firing.
@@ -564,14 +564,24 @@ def _seed_buffer(persona_dir: Path, sid: str, *, last_age_hours: float, pairs: i
         a_ts = last_ts - timedelta(seconds=(pairs - i) * 2 - 1)
         if i == pairs - 1:
             a_ts = last_ts  # final assistant turn anchors the age window
-        ingest_turn(persona_dir, {
-            "session_id": sid, "speaker": "user", "text": f"u{i}",
-            "ts": u_ts.isoformat(),
-        })
-        ingest_turn(persona_dir, {
-            "session_id": sid, "speaker": "assistant", "text": f"a{i}",
-            "ts": a_ts.isoformat(),
-        })
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": sid,
+                "speaker": "user",
+                "text": f"u{i}",
+                "ts": u_ts.isoformat(),
+            },
+        )
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": sid,
+                "speaker": "assistant",
+                "text": f"a{i}",
+                "ts": a_ts.isoformat(),
+            },
+        )
 
 
 def test_sessions_active_returns_null_when_no_buffers(persona_dir: Path):
@@ -643,9 +653,7 @@ def test_chat_hydrates_from_buffer_on_unknown_session(persona_dir: Path, monkeyp
         assert body["reply"] == "welcome back"
 
 
-def test_sessions_close_hydrates_from_buffer_on_unknown_session(
-    persona_dir: Path, monkeypatch
-):
+def test_sessions_close_hydrates_from_buffer_on_unknown_session(persona_dir: Path, monkeypatch):
     """F-201 Phase B: /sessions/close drains a buffer left over from a restart."""
     _patch_fake_provider(monkeypatch)
     sid = "88888888-8888-8888-8888-888888888888"
@@ -761,9 +769,7 @@ def _seed_voice_edit_audit(
         ts="2026-05-11T14:47:09+00:00",
         kind="voice_edit_proposal",
         subject="a small edit to my voice",
-        tone_rendered=(
-            f"Proposing to change my voice: {old_text!r} -> {new_text!r}."
-        ),
+        tone_rendered=(f"Proposing to change my voice: {old_text!r} -> {new_text!r}."),
         decision="send_quiet",
         decision_reasoning="the pattern showed up three times",
         gate_check={"allowed": True, "reason": None},
@@ -786,8 +792,10 @@ def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
     voice_path = persona_dir / "nell-voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
-        persona_dir, audit_id="ia_ve_001",
-        old_text="old line", new_text="new line",
+        persona_dir,
+        audit_id="ia_ve_001",
+        old_text="old line",
+        new_text="new line",
     )
     with _make_client(persona_dir) as c:
         r = c.post(
@@ -800,6 +808,7 @@ def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
     assert "old line" not in body
 
     from brain.soul.store import SoulStore
+
     store = SoulStore(str(persona_dir / "crystallizations.db"))
     try:
         evolutions = store.list_voice_evolution()
@@ -817,8 +826,10 @@ def test_post_voice_edit_accept_with_edits_records_user_modified(
     voice_path = persona_dir / "nell-voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
-        persona_dir, audit_id="ia_ve_001",
-        old_text="old line", new_text="new line proposed",
+        persona_dir,
+        audit_id="ia_ve_001",
+        old_text="old line",
+        new_text="new line proposed",
     )
     with _make_client(persona_dir) as c:
         r = c.post(
@@ -832,6 +843,7 @@ def test_post_voice_edit_accept_with_edits_records_user_modified(
     assert "hana's tweaked line" in voice_path.read_text()
 
     from brain.soul.store import SoulStore
+
     store = SoulStore(str(persona_dir / "crystallizations.db"))
     try:
         ev = store.list_voice_evolution()[0]
@@ -847,8 +859,10 @@ def test_post_voice_edit_reject_records_dismissed_no_voice_write(
     voice_path = persona_dir / "nell-voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
-        persona_dir, audit_id="ia_ve_001",
-        old_text="old line", new_text="new line",
+        persona_dir,
+        audit_id="ia_ve_001",
+        old_text="old line",
+        new_text="new line",
     )
     with _make_client(persona_dir) as c:
         r = c.post(
@@ -859,6 +873,7 @@ def test_post_voice_edit_reject_records_dismissed_no_voice_write(
     assert "old line" in voice_path.read_text()  # unchanged
 
     from brain.soul.store import SoulStore
+
     store = SoulStore(str(persona_dir / "crystallizations.db"))
     try:
         evolutions = store.list_voice_evolution()

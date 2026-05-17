@@ -57,9 +57,7 @@ def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stor
     with patch("brain.mcp_server.tools.dispatch", return_value={"ok": True}) as mock_dispatch:
         register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
         call_handler = _get_call_handler(server)
-        result = asyncio.run(
-            call_handler(_call_request("search_memories", {"query": "x"}))
-        )
+        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
 
     # Dispatch was invoked with the right args + injections
     mock_dispatch.assert_called_once_with(
@@ -95,9 +93,7 @@ def test_register_tools_dispatches_and_logs_error(persona_dir: Path, fake_stores
         call_handler = _get_call_handler(server)
         # Use search_memories with valid args so SDK input validation passes;
         # dispatch is mocked to raise regardless of which tool is called.
-        result = asyncio.run(
-            call_handler(_call_request("search_memories", {"query": "test"}))
-        )
+        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "test"})))
 
     text = result.root.content[0].text
     assert json.loads(text) == {"error": "boom"}

@@ -1,4 +1,5 @@
 """Tests for reflex migrator's Phase 2 created_by/created_at stamping."""
+
 from __future__ import annotations
 
 import json
@@ -49,7 +50,8 @@ def test_migrator_from_og_source(tmp_path: Path):
     import textwrap
 
     og_path = tmp_path / "reflex_engine.py"
-    og_path.write_text(textwrap.dedent("""\
+    og_path.write_text(
+        textwrap.dedent("""\
         REFLEX_ARCS = {
             "creative_pitch": {
                 "trigger": {"creative_hunger": 9},
@@ -61,7 +63,9 @@ def test_migrator_from_og_source(tmp_path: Path):
                 "prompt_template": "You are Nell."
             }
         }
-    """), encoding="utf-8")
+    """),
+        encoding="utf-8",
+    )
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()

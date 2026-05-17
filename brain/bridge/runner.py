@@ -52,7 +52,7 @@ def _allocate_port(max_attempts: int = 3) -> int:
             return port
         except OSError as exc:
             last_exc = exc
-            backoff_s = (10 ** attempt) / 1000.0  # 0.01, 0.1, 1.0
+            backoff_s = (10**attempt) / 1000.0  # 0.01, 0.1, 1.0
             time.sleep(backoff_s)
     raise RuntimeError(
         f"_allocate_port: failed to bind a free port after {max_attempts} attempts; "

@@ -1,4 +1,5 @@
 """list_works tool implementation."""
+
 from __future__ import annotations
 
 from pathlib import Path

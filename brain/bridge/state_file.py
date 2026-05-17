@@ -97,7 +97,10 @@ def _protect_state_files(path: Path, backup_count: int) -> None:
         path.parent.chmod(0o700)
     except OSError as exc:
         logger.warning("failed to chmod bridge state dir %s: %s", path.parent, exc)
-    for candidate in [path, *(path.with_name(f"{path.name}.bak{i}") for i in range(1, backup_count + 1))]:
+    for candidate in [
+        path,
+        *(path.with_name(f"{path.name}.bak{i}") for i in range(1, backup_count + 1)),
+    ]:
         if not candidate.exists():
             continue
         try:

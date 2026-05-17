@@ -616,40 +616,8 @@ def test_reflex_arc_has_created_by_field():
 def test_reflex_arc_from_dict_backward_compat_no_created_by():
     """Loading an arc from old persona file (pre-Phase-2): missing created_by
     defaults to 'og_migration', missing created_at defaults to epoch sentinel."""
-    arc = ReflexArc.from_dict({
-        "name": "x",
-        "description": "y",
-        "trigger": {"e": 5.0},
-        "days_since_human_min": 0.0,
-        "cooldown_hours": 12.0,
-        "action": "z",
-        "output_memory_type": "reflex_x",
-        "prompt_template": "t",
-    })
-    assert arc.created_by == "og_migration"
-    assert arc.created_at == datetime(1970, 1, 1, tzinfo=UTC)
-
-
-def test_reflex_arc_from_dict_with_created_by():
-    arc = ReflexArc.from_dict({
-        "name": "x",
-        "description": "y",
-        "trigger": {"e": 5.0},
-        "days_since_human_min": 0.0,
-        "cooldown_hours": 12.0,
-        "action": "z",
-        "output_memory_type": "reflex_x",
-        "prompt_template": "t",
-        "created_by": "brain_emergence",
-        "created_at": "2026-04-28T10:00:00+00:00",
-    })
-    assert arc.created_by == "brain_emergence"
-    assert arc.created_at == datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
-
-
-def test_reflex_arc_from_dict_rejects_invalid_created_by():
-    with pytest.raises(ValueError, match="created_by"):
-        ReflexArc.from_dict({
+    arc = ReflexArc.from_dict(
+        {
             "name": "x",
             "description": "y",
             "trigger": {"e": 5.0},
@@ -658,9 +626,47 @@ def test_reflex_arc_from_dict_rejects_invalid_created_by():
             "action": "z",
             "output_memory_type": "reflex_x",
             "prompt_template": "t",
-            "created_by": "alien_source",  # not in allowed enum
+        }
+    )
+    assert arc.created_by == "og_migration"
+    assert arc.created_at == datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def test_reflex_arc_from_dict_with_created_by():
+    arc = ReflexArc.from_dict(
+        {
+            "name": "x",
+            "description": "y",
+            "trigger": {"e": 5.0},
+            "days_since_human_min": 0.0,
+            "cooldown_hours": 12.0,
+            "action": "z",
+            "output_memory_type": "reflex_x",
+            "prompt_template": "t",
+            "created_by": "brain_emergence",
             "created_at": "2026-04-28T10:00:00+00:00",
-        })
+        }
+    )
+    assert arc.created_by == "brain_emergence"
+    assert arc.created_at == datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+
+
+def test_reflex_arc_from_dict_rejects_invalid_created_by():
+    with pytest.raises(ValueError, match="created_by"):
+        ReflexArc.from_dict(
+            {
+                "name": "x",
+                "description": "y",
+                "trigger": {"e": 5.0},
+                "days_since_human_min": 0.0,
+                "cooldown_hours": 12.0,
+                "action": "z",
+                "output_memory_type": "reflex_x",
+                "prompt_template": "t",
+                "created_by": "alien_source",  # not in allowed enum
+                "created_at": "2026-04-28T10:00:00+00:00",
+            }
+        )
 
 
 # ---- behavioral_log emission from _fire ----
@@ -683,8 +689,12 @@ def test_reflex_fire_emits_behavioral_log_for_journal_arcs(tmp_path: Path):
     from brain.memory.store import MemoryStore
 
     class _FakeProvider(LLMProvider):
-        def name(self): return "fake"
-        def generate(self, prompt, *, system=None): return "a brief journal-like reply"
+        def name(self):
+            return "fake"
+
+        def generate(self, prompt, *, system=None):
+            return "a brief journal-like reply"
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(content="a brief journal-like reply", tool_calls=[])
 
@@ -737,8 +747,12 @@ def test_reflex_fire_does_not_log_for_non_journal_arcs(tmp_path: Path):
     from brain.memory.store import MemoryStore
 
     class _FakeProvider(LLMProvider):
-        def name(self): return "fake"
-        def generate(self, prompt, *, system=None): return "story pitch text"
+        def name(self):
+            return "fake"
+
+        def generate(self, prompt, *, system=None):
+            return "story pitch text"
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(content="story pitch text", tool_calls=[])
 
@@ -756,7 +770,8 @@ def test_reflex_fire_does_not_log_for_non_journal_arcs(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:
         engine = ReflexEngine(
-            store=store, provider=_FakeProvider(),
+            store=store,
+            provider=_FakeProvider(),
             persona_name="testpersona",
             persona_system_prompt="You are testpersona.",
             arcs_path=tmp_path / "reflex_arcs.json",
@@ -783,8 +798,12 @@ def test_reflex_dry_run_does_not_emit_behavioral_log(tmp_path: Path):
     from brain.memory.store import MemoryStore
 
     class _FakeProvider(LLMProvider):
-        def name(self): return "fake"
-        def generate(self, prompt, *, system=None): return "x"
+        def name(self):
+            return "fake"
+
+        def generate(self, prompt, *, system=None):
+            return "x"
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(content="x", tool_calls=[])
 
@@ -802,7 +821,8 @@ def test_reflex_dry_run_does_not_emit_behavioral_log(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:
         engine = ReflexEngine(
-            store=store, provider=_FakeProvider(),
+            store=store,
+            provider=_FakeProvider(),
             persona_name="t",
             persona_system_prompt="You are t.",
             arcs_path=tmp_path / "reflex_arcs.json",
@@ -829,8 +849,12 @@ def test_reflex_firing_above_threshold_emits_initiate_candidate(tmp_path: Path):
     from brain.initiate.emit import read_candidates
 
     class _FakeProvider(LLMProvider):
-        def name(self): return "fake"
-        def generate(self, prompt, *, system=None): return "reflex output"
+        def name(self):
+            return "fake"
+
+        def generate(self, prompt, *, system=None):
+            return "reflex output"
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(content="reflex output", tool_calls=[])
 
@@ -889,8 +913,12 @@ def test_reflex_firing_below_threshold_does_not_emit_candidate(tmp_path: Path):
     )
 
     class _FakeProvider(LLMProvider):
-        def name(self): return "fake"
-        def generate(self, prompt, *, system=None): return "reflex output"
+        def name(self):
+            return "fake"
+
+        def generate(self, prompt, *, system=None):
+            return "reflex output"
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(content="reflex output", tool_calls=[])
 

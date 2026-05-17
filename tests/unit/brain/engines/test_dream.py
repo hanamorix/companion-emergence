@@ -464,8 +464,7 @@ def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
             persona_dir=persona_dir,
             persona_name="Nell",
             persona_system_prompt=(
-                "You are Nell. Reflect in first person, 2-3 sentences, "
-                "starting with 'DREAM: '."
+                "You are Nell. Reflect in first person, 2-3 sentences, starting with 'DREAM: '."
             ),
         )
         engine.run_cycle()
@@ -505,8 +504,7 @@ def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path) ->
             persona_dir=persona_dir,
             persona_name="Nell",
             persona_system_prompt=(
-                "You are Nell. Reflect in first person, 2-3 sentences, "
-                "starting with 'DREAM: '."
+                "You are Nell. Reflect in first person, 2-3 sentences, starting with 'DREAM: '."
             ),
         )
         engine.run_cycle()

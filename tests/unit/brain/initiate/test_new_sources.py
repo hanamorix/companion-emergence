@@ -1,4 +1,5 @@
 """Tests for the v0.0.10 new emitter gates and emitters."""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +13,7 @@ from brain.initiate.new_sources import GateThresholds, load_gate_thresholds
 @dataclass(frozen=True)
 class _FakeReflexFiring:
     """Test double for the fields gate_reflex_firing inspects."""
+
     pattern_id: str
     confidence: float
     flinch_intensity: float
@@ -34,9 +36,7 @@ def test_load_gate_thresholds_returns_defaults_when_no_file(tmp_path: Path):
 def test_load_gate_thresholds_overrides_from_persona_file(tmp_path: Path):
     persona = tmp_path / "p"
     persona.mkdir()
-    (persona / "gate_thresholds.json").write_text(
-        '{"reflex_confidence_min": 0.5}'
-    )
+    (persona / "gate_thresholds.json").write_text('{"reflex_confidence_min": 0.5}')
     t = load_gate_thresholds(persona)
     assert t.reflex_confidence_min == 0.5
     # Unset fields use defaults.
@@ -184,6 +184,7 @@ def test_check_shared_meta_gates_passes(tmp_path: Path):
 
 def test_gate_reflex_firing_passes_when_above_thresholds(tmp_path: Path):
     from brain.initiate.new_sources import gate_reflex_firing
+
     persona = tmp_path / "p"
     persona.mkdir()
     firing = _FakeReflexFiring(
@@ -195,7 +196,9 @@ def test_gate_reflex_firing_passes_when_above_thresholds(tmp_path: Path):
         ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
     )
     allowed, reason = gate_reflex_firing(
-        persona, firing=firing, thresholds=GateThresholds(),
+        persona,
+        firing=firing,
+        thresholds=GateThresholds(),
     )
     assert allowed is True
     assert reason is None
@@ -203,6 +206,7 @@ def test_gate_reflex_firing_passes_when_above_thresholds(tmp_path: Path):
 
 def test_gate_reflex_firing_blocks_on_low_confidence(tmp_path: Path):
     from brain.initiate.new_sources import gate_reflex_firing
+
     persona = tmp_path / "p"
     persona.mkdir()
     firing = _FakeReflexFiring(
@@ -214,7 +218,9 @@ def test_gate_reflex_firing_blocks_on_low_confidence(tmp_path: Path):
         ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
     )
     allowed, reason = gate_reflex_firing(
-        persona, firing=firing, thresholds=GateThresholds(),
+        persona,
+        firing=firing,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "confidence_min"
@@ -222,6 +228,7 @@ def test_gate_reflex_firing_blocks_on_low_confidence(tmp_path: Path):
 
 def test_gate_reflex_firing_blocks_on_low_flinch(tmp_path: Path):
     from brain.initiate.new_sources import gate_reflex_firing
+
     persona = tmp_path / "p"
     persona.mkdir()
     firing = _FakeReflexFiring(
@@ -233,7 +240,9 @@ def test_gate_reflex_firing_blocks_on_low_flinch(tmp_path: Path):
         ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
     )
     allowed, reason = gate_reflex_firing(
-        persona, firing=firing, thresholds=GateThresholds(),
+        persona,
+        firing=firing,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "flinch_intensity_min"
@@ -241,6 +250,7 @@ def test_gate_reflex_firing_blocks_on_low_flinch(tmp_path: Path):
 
 def test_gate_reflex_firing_blocks_on_anti_feedback(tmp_path: Path):
     from brain.initiate.new_sources import gate_reflex_firing
+
     persona = tmp_path / "p"
     persona.mkdir()
     firing = _FakeReflexFiring(
@@ -252,7 +262,9 @@ def test_gate_reflex_firing_blocks_on_anti_feedback(tmp_path: Path):
         ts=datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC),
     )
     allowed, reason = gate_reflex_firing(
-        persona, firing=firing, thresholds=GateThresholds(),
+        persona,
+        firing=firing,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "anti_feedback"
@@ -283,7 +295,9 @@ def test_gate_reflex_firing_blocks_on_pattern_anti_flood(tmp_path: Path):
         ts=now,
     )
     allowed, reason = gate_reflex_firing(
-        persona, firing=firing, thresholds=GateThresholds(),
+        persona,
+        firing=firing,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "pattern_anti_flood"
@@ -330,6 +344,7 @@ class _FakeResearchThread:
 
 def test_gate_research_completion_passes(tmp_path: Path):
     from brain.initiate.new_sources import gate_research_completion
+
     persona = tmp_path / "p"
     persona.mkdir()
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
@@ -355,17 +370,25 @@ def test_gate_research_completion_passes(tmp_path: Path):
 
 def test_gate_research_completion_blocks_on_low_maturity(tmp_path: Path):
     from brain.initiate.new_sources import gate_research_completion
+
     persona = tmp_path / "p"
     persona.mkdir()
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     thread = _FakeResearchThread(
-        thread_id="t2", topic="x", maturity_score=0.50,
-        summary_excerpt="...", linked_memory_ids=[],
-        completed_at=now, previously_linked_to_audit=False,
+        thread_id="t2",
+        topic="x",
+        maturity_score=0.50,
+        summary_excerpt="...",
+        linked_memory_ids=[],
+        completed_at=now,
+        previously_linked_to_audit=False,
     )
     allowed, reason = gate_research_completion(
-        persona, thread=thread, now=now,
-        topic_overlap_score=0.40, thresholds=GateThresholds(),
+        persona,
+        thread=thread,
+        now=now,
+        topic_overlap_score=0.40,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "maturity_min"
@@ -373,17 +396,25 @@ def test_gate_research_completion_blocks_on_low_maturity(tmp_path: Path):
 
 def test_gate_research_completion_blocks_on_previously_linked(tmp_path: Path):
     from brain.initiate.new_sources import gate_research_completion
+
     persona = tmp_path / "p"
     persona.mkdir()
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     thread = _FakeResearchThread(
-        thread_id="t3", topic="x", maturity_score=0.90,
-        summary_excerpt="...", linked_memory_ids=[],
-        completed_at=now, previously_linked_to_audit=True,
+        thread_id="t3",
+        topic="x",
+        maturity_score=0.90,
+        summary_excerpt="...",
+        linked_memory_ids=[],
+        completed_at=now,
+        previously_linked_to_audit=True,
     )
     allowed, reason = gate_research_completion(
-        persona, thread=thread, now=now,
-        topic_overlap_score=0.40, thresholds=GateThresholds(),
+        persona,
+        thread=thread,
+        now=now,
+        topic_overlap_score=0.40,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "previously_linked"
@@ -391,17 +422,25 @@ def test_gate_research_completion_blocks_on_previously_linked(tmp_path: Path):
 
 def test_gate_research_completion_blocks_on_low_topic_overlap(tmp_path: Path):
     from brain.initiate.new_sources import gate_research_completion
+
     persona = tmp_path / "p"
     persona.mkdir()
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     thread = _FakeResearchThread(
-        thread_id="t4", topic="x", maturity_score=0.90,
-        summary_excerpt="...", linked_memory_ids=[],
-        completed_at=now, previously_linked_to_audit=False,
+        thread_id="t4",
+        topic="x",
+        maturity_score=0.90,
+        summary_excerpt="...",
+        linked_memory_ids=[],
+        completed_at=now,
+        previously_linked_to_audit=False,
     )
     allowed, reason = gate_research_completion(
-        persona, thread=thread, now=now,
-        topic_overlap_score=0.10, thresholds=GateThresholds(),
+        persona,
+        thread=thread,
+        now=now,
+        topic_overlap_score=0.10,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "topic_overlap_min"
@@ -409,18 +448,25 @@ def test_gate_research_completion_blocks_on_low_topic_overlap(tmp_path: Path):
 
 def test_gate_research_completion_blocks_on_stale(tmp_path: Path):
     from brain.initiate.new_sources import gate_research_completion
+
     persona = tmp_path / "p"
     persona.mkdir()
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     thread = _FakeResearchThread(
-        thread_id="t5", topic="x", maturity_score=0.90,
-        summary_excerpt="...", linked_memory_ids=[],
+        thread_id="t5",
+        topic="x",
+        maturity_score=0.90,
+        summary_excerpt="...",
+        linked_memory_ids=[],
         completed_at=now - timedelta(hours=2),  # outside 30-min freshness
         previously_linked_to_audit=False,
     )
     allowed, reason = gate_research_completion(
-        persona, thread=thread, now=now,
-        topic_overlap_score=0.40, thresholds=GateThresholds(),
+        persona,
+        thread=thread,
+        now=now,
+        topic_overlap_score=0.40,
+        thresholds=GateThresholds(),
     )
     assert allowed is False
     assert reason == "freshness_window"
@@ -433,13 +479,19 @@ def test_emit_research_completion_candidate_writes_queue_row(tmp_path: Path):
     persona = tmp_path / "p"
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     thread = _FakeResearchThread(
-        thread_id="t_emit", topic="midnight gardens",
-        maturity_score=0.85, summary_excerpt="A study of...",
+        thread_id="t_emit",
+        topic="midnight gardens",
+        maturity_score=0.85,
+        summary_excerpt="A study of...",
         linked_memory_ids=["m_x"],
-        completed_at=now, previously_linked_to_audit=False,
+        completed_at=now,
+        previously_linked_to_audit=False,
     )
     emit_research_completion_candidate(
-        persona, thread=thread, topic_overlap_score=0.45, now=now,
+        persona,
+        thread=thread,
+        topic_overlap_score=0.45,
+        now=now,
     )
     out = read_candidates(persona)
     assert len(out) == 1
@@ -469,9 +521,7 @@ def test_load_gate_thresholds_includes_resonance_defaults(tmp_path):
 def test_load_gate_thresholds_resonance_override(tmp_path):
     persona = tmp_path / "p"
     persona.mkdir()
-    (persona / "gate_thresholds.json").write_text(
-        '{"recall_resonance_z_threshold": 3.0}'
-    )
+    (persona / "gate_thresholds.json").write_text('{"recall_resonance_z_threshold": 3.0}')
     t = load_gate_thresholds(persona)
     assert t.recall_resonance_z_threshold == 3.0
     assert t.recall_resonance_top_n == 50  # default preserved

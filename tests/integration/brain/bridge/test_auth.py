@@ -1,4 +1,5 @@
 """Bridge auth tests — H-C ephemeral bearer token + WS Origin allowlist."""
+
 from __future__ import annotations
 
 import json as _json
@@ -29,6 +30,7 @@ class _FakeProvider(LLMProvider):
 @pytest.fixture(autouse=True)
 def _reset_session_registry():
     from brain.chat.session import reset_registry
+
     reset_registry()
     yield
     reset_registry()
@@ -39,17 +41,14 @@ def persona_dir_for_auth(tmp_path: Path) -> Path:
     p = tmp_path / "auth-persona"
     p.mkdir()
     (p / "active_conversations").mkdir()
-    (p / "persona_config.json").write_text(
-        '{"provider": "fake-auth", "searcher": "noop"}'
-    )
-    (p / "emotion_vocabulary.json").write_text(
-        _json.dumps({"version": 1, "emotions": []})
-    )
+    (p / "persona_config.json").write_text('{"provider": "fake-auth", "searcher": "noop"}')
+    (p / "emotion_vocabulary.json").write_text(_json.dumps({"version": 1, "emotions": []}))
     return p
 
 
 def _patch_provider(monkeypatch, provider: LLMProvider) -> None:
     import brain.bridge.server as srv
+
     monkeypatch.setattr(srv, "get_provider", lambda _name: provider)
 
 
@@ -87,7 +86,8 @@ def test_http_rejects_wrong_token(persona_dir_for_auth: Path, monkeypatch):
 
 
 def test_http_rejects_malformed_authorization_header(
-    persona_dir_for_auth: Path, monkeypatch,
+    persona_dir_for_auth: Path,
+    monkeypatch,
 ):
     _patch_provider(monkeypatch, _FakeProvider())
     app = build_app(persona_dir=persona_dir_for_auth, auth_token="secret-token")
@@ -143,7 +143,8 @@ def test_http_cors_allows_tauri_dev_origin(persona_dir_for_auth: Path, monkeypat
 
 
 def test_http_cors_allows_private_network_preflight_for_tauri_origin(
-    persona_dir_for_auth: Path, monkeypatch,
+    persona_dir_for_auth: Path,
+    monkeypatch,
 ):
     """Windows WebView2 can send Chromium Private Network Access preflights.
 

@@ -256,18 +256,14 @@ def _build_user_message(
         except (FileNotFoundError, ValueError) as exc:
             # Don't let a missing or malformed sha break the turn — log
             # and skip. The user's text portion still goes through.
-            logger.warning(
-                "skipping image_sha=%s: %s", sha[:8] if len(sha) >= 8 else sha, exc
-            )
+            logger.warning("skipping image_sha=%s: %s", sha[:8] if len(sha) >= 8 else sha, exc)
     if not blocks:
         # Defensive: every block dropped (unlikely). Fall back to text.
         return ChatMessage(role="user", content=user_input or "")
     return ChatMessage(role="user", content=tuple(blocks))
 
 
-def _buffer_turns_to_messages(
-    persona_dir: Path, turns: list[dict]
-) -> list[ChatMessage]:
+def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[ChatMessage]:
     """Reconstruct ChatMessage list from buffer JSONL records.
 
     Image-bearing user turns rebuild a (TextBlock, *ImageBlock) content

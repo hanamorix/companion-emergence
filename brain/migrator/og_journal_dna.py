@@ -9,6 +9,7 @@ Per spec §6: two migrations.
 
 Both idempotent: re-running on already-migrated data is a no-op.
 """
+
 from __future__ import annotations
 
 import json

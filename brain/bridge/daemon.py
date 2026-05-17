@@ -344,7 +344,9 @@ def cmd_status(args) -> int:
         try:
             headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
             r = httpx.get(
-                f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=1.0,
+                f"http://127.0.0.1:{s.port}/health",
+                headers=headers,
+                timeout=1.0,
             )
             health = r.json()
             print(f"bridge: running pid={s.pid} port={s.port}")

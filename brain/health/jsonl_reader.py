@@ -66,8 +66,7 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
                 yield data
             else:
                 logger.warning(
-                    "skipping non-dict jsonl line %d in %s "
-                    "(value type=%s) | content: %r",
+                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
                     line_index,
                     path,
                     type(data).__name__,
@@ -121,8 +120,7 @@ def iter_jsonl_streaming(path: Path) -> Iterator[dict]:
                 yield data
             else:
                 logger.warning(
-                    "skipping non-dict jsonl line %d in %s "
-                    "(value type=%s) | content: %r",
+                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
                     line_index,
                     path,
                     type(data).__name__,

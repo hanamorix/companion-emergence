@@ -141,8 +141,12 @@ def test_get_body_state_returns_real_shape(tmp_path: Path) -> None:
     assert result["session_hours"] == 0.0
     assert "body_emotions" in result
     assert set(result["body_emotions"].keys()) == {
-        "arousal", "desire", "climax",
-        "touch_hunger", "comfort_seeking", "rest_need",
+        "arousal",
+        "desire",
+        "climax",
+        "touch_hunger",
+        "comfort_seeking",
+        "rest_need",
     }
 
 

@@ -55,9 +55,11 @@ def test_run_server_opens_and_closes_stores(tmp_path: Path) -> None:
     async def _fake_run(self, *_args, **_kwargs):
         return None
 
-    with patch("brain.mcp_server.register_tools", side_effect=_capture_register), \
-         patch("brain.mcp_server.stdio_server", lambda: _FakeStdio()), \
-         patch("mcp.server.Server.run", _fake_run):
+    with (
+        patch("brain.mcp_server.register_tools", side_effect=_capture_register),
+        patch("brain.mcp_server.stdio_server", lambda: _FakeStdio()),
+        patch("mcp.server.Server.run", _fake_run),
+    ):
         run_server(persona)
 
     # Stores were captured (and the run completed without raising on close)
@@ -87,9 +89,7 @@ def test_main_entry_runs(tmp_path: Path) -> None:
         stdout, stderr = proc.communicate(input=b"", timeout=5)
         # Exit code 0 means the entry point parsed args and the server
         # ran cleanly. Non-zero means a crash before stdio_server returned.
-        assert proc.returncode == 0, (
-            f"Server exited {proc.returncode}.\nstderr:\n{stderr.decode()}"
-        )
+        assert proc.returncode == 0, f"Server exited {proc.returncode}.\nstderr:\n{stderr.decode()}"
     finally:
         if proc.poll() is None:
             proc.kill()

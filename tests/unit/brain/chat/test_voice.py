@@ -83,9 +83,7 @@ def test_default_voice_template_lists_all_brain_tools() -> None:
 
     template = DEFAULT_VOICE_TEMPLATE
     for name in NELL_TOOL_NAMES:
-        assert f"`{name}`" in template, (
-            f"missing brain-tool {name!r} in default voice template"
-        )
+        assert f"`{name}`" in template, f"missing brain-tool {name!r} in default voice template"
 
 
 def test_default_voice_template_states_load_bearing_rules() -> None:

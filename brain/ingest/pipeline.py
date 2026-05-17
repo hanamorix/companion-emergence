@@ -240,10 +240,7 @@ def extract_session_snapshot(
     # window, skip extraction entirely until the window expires. Stops the
     # 5-min snapshot sweep from burning LLM calls on a wedged buffer.
     backoff_state = read_backoff(persona_dir, session_id)
-    if (
-        backoff_state is not None
-        and backoff_state["failures"] >= _BACKOFF_FAILURE_THRESHOLD
-    ):
+    if backoff_state is not None and backoff_state["failures"] >= _BACKOFF_FAILURE_THRESHOLD:
         first_failure_dt = datetime.fromisoformat(
             backoff_state["first_failure_at"].replace("Z", "+00:00")
         )
@@ -333,7 +330,10 @@ def extract_session_snapshot(
         report.memory_ids.append(mem_id)
         if item.importance >= crystallize_threshold:
             queued = queue_soul_candidate(
-                persona_dir, memory_id=mem_id, item=item, session_id=session_id,
+                persona_dir,
+                memory_id=mem_id,
+                item=item,
+                session_id=session_id,
             )
             if queued:
                 report.soul_candidates += 1
@@ -463,9 +463,13 @@ def finalize_stale_sessions(
             continue
         try:
             report = extract_session_snapshot(
-                persona_dir, sid,
-                store=store, hebbian=hebbian, provider=provider,
-                embeddings=embeddings, config=config,
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                embeddings=embeddings,
+                config=config,
             )
         except Exception:
             logger.exception("finalize_stale_sessions: snapshot failed session=%s", sid)

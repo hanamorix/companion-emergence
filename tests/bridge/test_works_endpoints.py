@@ -1,4 +1,5 @@
 """Bridge endpoints for /self/works[*]."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

@@ -64,7 +64,9 @@ def test_compose_subject_includes_linked_memories() -> None:
 
 def test_compose_tone_receives_subject_immutable() -> None:
     """Tone prompt sees the subject as input but must not change it."""
-    provider = MagicMock(complete=MagicMock(return_value="the dream from this morning landed somewhere"))
+    provider = MagicMock(
+        complete=MagicMock(return_value="the dream from this morning landed somewhere")
+    )
     cand = _candidate()
     result = compose_tone(
         provider,
@@ -161,9 +163,11 @@ def test_compose_decision_handles_malformed_json_as_hold() -> None:
 
 def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
     """Voice-edit decision prompt must include the gravity instruction."""
-    provider = MagicMock(complete=MagicMock(
-        return_value='{"decision": "send_quiet", "reasoning": "evidence is strong"}'
-    ))
+    provider = MagicMock(
+        complete=MagicMock(
+            return_value='{"decision": "send_quiet", "reasoning": "evidence is strong"}'
+        )
+    )
     result = compose_decision_voice_edit(
         provider,
         proposal={

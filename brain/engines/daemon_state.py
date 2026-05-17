@@ -98,7 +98,9 @@ class DaemonFireEntry:
         # was the symptom that drove this fix).
         if len(self.summary) > _SUMMARY_MAX_CHARS:
             object.__setattr__(
-                self, "summary", _truncate_at_sentence(self.summary, _SUMMARY_MAX_CHARS),
+                self,
+                "summary",
+                _truncate_at_sentence(self.summary, _SUMMARY_MAX_CHARS),
             )
 
     def to_dict(self) -> dict:

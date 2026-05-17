@@ -124,9 +124,7 @@ def test_commit_item_empty_image_shas_treated_as_unset(
 ) -> None:
     """An empty list is dropped — keeps metadata clean for downstream consumers."""
     item = ExtractedItem(text="Plain text", label="fact", importance=4)
-    mem_id = commit_item(
-        item, session_id="s", store=store, hebbian=hebbian, image_shas=[]
-    )
+    mem_id = commit_item(item, session_id="s", store=store, hebbian=hebbian, image_shas=[])
     assert mem_id is not None
     memory = store.get(mem_id)
     assert "image_shas" not in memory.metadata

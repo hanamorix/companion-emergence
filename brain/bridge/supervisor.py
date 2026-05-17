@@ -106,24 +106,12 @@ def run_folded(
         f"{soul_review_interval_s:.0f}s" if soul_review_interval_s is not None else "disabled",
         f"{finalize_interval_s:.0f}s" if finalize_interval_s is not None else "disabled",
     )
-    last_heartbeat_at = (
-        time.monotonic() if heartbeat_interval_s is not None else None
-    )
-    last_soul_review_at = (
-        time.monotonic() if soul_review_interval_s is not None else None
-    )
-    last_finalize_at = (
-        time.monotonic() if finalize_interval_s is not None else None
-    )
-    last_log_rotation_at = (
-        time.monotonic() if log_rotation_interval_s is not None else None
-    )
-    last_initiate_review_at = (
-        time.monotonic() if initiate_review_interval_s is not None else None
-    )
-    last_voice_reflection_at = (
-        time.monotonic() if voice_reflection_interval_s is not None else None
-    )
+    last_heartbeat_at = time.monotonic() if heartbeat_interval_s is not None else None
+    last_soul_review_at = time.monotonic() if soul_review_interval_s is not None else None
+    last_finalize_at = time.monotonic() if finalize_interval_s is not None else None
+    last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
+    last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
+    last_voice_reflection_at = time.monotonic() if voice_reflection_interval_s is not None else None
     while not stop_event.is_set():
         try:
             with ExitStack() as stack:
@@ -132,7 +120,8 @@ def run_folded(
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db")
                 stack.callback(hebbian.close)
                 embeddings = EmbeddingCache(
-                    persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+                    persona_dir / "embeddings.db",
+                    FakeEmbeddingProvider(dim=256),
                 )
                 stack.callback(embeddings.close)
 
@@ -246,8 +235,7 @@ def run_folded(
         if (
             initiate_review_interval_s is not None
             and last_initiate_review_at is not None
-            and time.monotonic() - last_initiate_review_at
-            >= initiate_review_interval_s
+            and time.monotonic() - last_initiate_review_at >= initiate_review_interval_s
         ):
             try:
                 _run_initiate_review_tick(persona_dir, provider, event_bus)
@@ -262,8 +250,7 @@ def run_folded(
         if (
             voice_reflection_interval_s is not None
             and last_voice_reflection_at is not None
-            and time.monotonic() - last_voice_reflection_at
-            >= voice_reflection_interval_s
+            and time.monotonic() - last_voice_reflection_at >= voice_reflection_interval_s
         ):
             try:
                 _run_voice_reflection_tick(persona_dir, provider, event_bus)
@@ -311,9 +298,7 @@ def _run_heartbeat_tick(
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
 
-            load_persona_vocabulary(
-                persona_dir / "emotion_vocabulary.json", store=store
-            )
+            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         except Exception:
             logger.exception("supervisor heartbeat: vocabulary load skipped")
 
@@ -382,8 +367,7 @@ def _run_soul_review_tick(
     from brain.soul.store import SoulStore
 
     pending = [
-        rec for rec in list_soul_candidates(persona_dir)
-        if rec.get("status") == "auto_pending"
+        rec for rec in list_soul_candidates(persona_dir) if rec.get("status") == "auto_pending"
     ]
     if not pending:
         # No candidates — skip the pass and don't pay the open-store cost.
@@ -399,9 +383,8 @@ def _run_soul_review_tick(
 
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
-            load_persona_vocabulary(
-                persona_dir / "emotion_vocabulary.json", store=store
-            )
+
+            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         except Exception:
             logger.exception("supervisor soul-review: vocabulary load skipped")
 
@@ -449,7 +432,8 @@ def _run_finalize_tick(
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
         embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
         )
         stack.callback(embeddings.close)
 
@@ -489,9 +473,7 @@ def _run_initiate_review_tick(
     Publishes an ``initiate_review_tick`` event on success.
     """
     voice_path = persona_dir / "nell-voice.md"
-    voice_template = (
-        voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
-    )
+    voice_template = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
     try:
         config = PersonaConfig.load(persona_dir / "persona_config.json")
         cap_per_tick = getattr(config, "initiate_review_cap_per_tick", 3) or 3
@@ -640,13 +622,9 @@ def _run_log_rotation_tick(
     for log_name, keep in _ROLLING_LOG_POLICIES:
         log_path = persona_dir / log_name
         try:
-            archive = rotate_rolling_size(
-                log_path, max_bytes=rolling_size_bytes, archive_keep=keep
-            )
+            archive = rotate_rolling_size(log_path, max_bytes=rolling_size_bytes, archive_keep=keep)
         except Exception as exc:
-            logger.exception(
-                "log rotation failed for %s: %s", log_name, exc
-            )
+            logger.exception("log rotation failed for %s: %s", log_name, exc)
             event_bus.publish(
                 {
                     "type": "log_rotation",
@@ -672,9 +650,7 @@ def _run_log_rotation_tick(
     for log_name, ts_field in _YEARLY_ARCHIVE_LOGS:
         audit_path = persona_dir / log_name
         try:
-            archives = rotate_age_archive_yearly(
-                audit_path, now=now, timestamp_field=ts_field
-            )
+            archives = rotate_age_archive_yearly(audit_path, now=now, timestamp_field=ts_field)
         except Exception as exc:
             logger.exception("%s yearly rotation failed: %s", log_name, exc)
             event_bus.publish(

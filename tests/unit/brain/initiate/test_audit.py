@@ -15,7 +15,9 @@ from brain.initiate.audit import (
 from brain.initiate.schemas import AuditRow
 
 
-def _row(audit_id: str, candidate_id: str, decision: str = "send_quiet", ts: str | None = None) -> AuditRow:
+def _row(
+    audit_id: str, candidate_id: str, decision: str = "send_quiet", ts: str | None = None
+) -> AuditRow:
     if ts is None:
         ts = datetime.now(UTC).isoformat()
     return AuditRow(

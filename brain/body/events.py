@@ -78,7 +78,8 @@ def record_climax_event(
         # (TypeError, AttributeError, KeyError) propagate so we see them.
         logger.warning(
             "record_climax_event: journal_entry write failed (originating=%s): %s",
-            originating_memory.id, exc,
+            originating_memory.id,
+            exc,
         )
         return None
 
@@ -97,7 +98,8 @@ def record_climax_event(
     except (OSError, ValueError) as exc:
         logger.warning(
             "record_climax_event: behavioral_log append failed (memory=%s): %s",
-            journal.id, exc,
+            journal.id,
+            exc,
         )
 
     return journal.id

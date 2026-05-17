@@ -35,15 +35,25 @@ def test_returns_loaded_true(store, hebbian, tmp_path):
 def test_returns_real_schema(store, hebbian, tmp_path):
     out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
     assert set(out.keys()) == {
-        "loaded", "energy", "temperature", "exhaustion",
-        "session_hours", "days_since_contact", "body_emotions", "computed_at",
+        "loaded",
+        "energy",
+        "temperature",
+        "exhaustion",
+        "session_hours",
+        "days_since_contact",
+        "body_emotions",
+        "computed_at",
     }
     assert isinstance(out["energy"], int)
     assert isinstance(out["temperature"], int)
     assert isinstance(out["exhaustion"], int)
     assert set(out["body_emotions"].keys()) == {
-        "arousal", "desire", "climax",
-        "touch_hunger", "comfort_seeking", "rest_need",
+        "arousal",
+        "desire",
+        "climax",
+        "touch_hunger",
+        "comfort_seeking",
+        "rest_need",
     }
 
 
@@ -60,7 +70,10 @@ def test_session_hours_default_zero(store, hebbian, tmp_path):
 
 def test_session_hours_passed_through(store, hebbian, tmp_path):
     out = get_body_state(
-        store=store, hebbian=hebbian, persona_dir=tmp_path, session_hours=2.5,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+        session_hours=2.5,
     )
     assert out["session_hours"] == 2.5
 

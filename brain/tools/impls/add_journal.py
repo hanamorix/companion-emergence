@@ -9,6 +9,7 @@ The chat system message reinforces the privacy contract every turn (per
 feedback_contracts_adjacent_to_data.md). This tool's role is only to write;
 the contract enforcement happens at chat-composition time.
 """
+
 from __future__ import annotations
 
 import logging
