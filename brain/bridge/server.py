@@ -934,6 +934,21 @@ def build_app(
 
         return build_persona_state(persona_dir)
 
+    # ── /persona/feed — visible inner life journal ──────────────────────────
+    @app.get("/persona/feed", dependencies=[Depends(require_http_auth)])
+    def get_persona_feed() -> dict[str, Any]:
+        """Visible inner life journal for the NellFace feed panel.
+
+        Returns up to 50 entries (newest first) from all five inner-life
+        streams: dreams, research, soul crystallizations, outreach, and
+        voice-edit proposals. Fail-soft per source — partial data still
+        returns 200 with the available entries.
+        """
+        from brain.bridge.feed import build_feed
+
+        entries = build_feed(persona_dir, limit=50)
+        return {"entries": [e.to_dict() for e in entries]}
+
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])
     def get_self_works(type: str | None = None, limit: int = 20) -> dict:
