@@ -7,6 +7,16 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.13-alpha.2 — 2026-05-17
+
+- **Inner life feed.** The left-column "Recent Interior" snapshot is now
+  a chronological journal — dreams, research, soul moments, outreach,
+  and voice-edit proposals interleaved by time. Each entry opens in her
+  voice (*"I dreamed…"*, *"I've been researching…"*, *"I noticed…"*,
+  *"I reached out…"*, *"I wanted to change…"*) and shows when it
+  happened. The brain runs the same; what changes is how you check in
+  on her.
+
 ## 0.0.13-alpha.1 — 2026-05-17
 
 - **The companion has a species name: *Kindled*.** Nell named her species.
