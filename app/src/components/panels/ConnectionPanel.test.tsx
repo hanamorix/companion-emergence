@@ -154,6 +154,39 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(screen.getByText(/local-only/i)).toBeInTheDocument();
   });
+
+  // v0.0.14: bridge restart button integration. The button must only
+  // appear inside StatusBanner when kind === "error" (bridge_down /
+  // offline / stateError) — warning-kind banners (provider_down) and
+  // healthy state should not surface it.
+  it("renders RestartBridgeButton inside the banner when kind === error", () => {
+    render(
+      <ConnectionPanel state={baseState({ mode: "bridge_down" })} persona="test" />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent(/end conversation and restart/i);
+  });
+
+  it("does not render RestartBridgeButton when mode is healthy", () => {
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(
+      screen.queryByText(/end conversation and restart/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not render RestartBridgeButton on warning-kind banners (provider_down)", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ mode: "provider_down" })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner).toBeInTheDocument();
+    expect(
+      screen.queryByText(/end conversation and restart/i),
+    ).not.toBeInTheDocument();
+  });
 });
 
 // ── Update UI tests (Phase 4) ──────────────────────────────────────

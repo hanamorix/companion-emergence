@@ -7,6 +7,20 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.14-alpha.1 — 2026-05-17
+
+- **Bridge restart button in the Connection panel.** When the status
+  banner goes red — bridge offline, offline mode, or a state-poll
+  failure — a new **"End conversation and restart"** button appears
+  inside the banner. Clicking it closes the active session safely (so
+  the buffer commits to memory and nothing is lost), asks the bridge
+  to shut down gracefully, and lets the supervisor respawn it. If any
+  step times out (5s on close, 3s on shutdown, 30s on health poll),
+  the app falls back to a SIGKILL-by-PID and brings the bridge back
+  itself. Stays invisible whenever the bridge is healthy — no
+  settings, no toggle. Screen-reader users get every transition
+  announced via `aria-live="polite"`.
+
 ## 0.0.13-alpha.3 — 2026-05-17
 
 - **Body-state self-read fix.** When the brain called `get_body_state`

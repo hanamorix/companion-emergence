@@ -109,6 +109,36 @@ The window should open within 1-2 seconds. Walk through the wizard:
 - ✅ **Expected**: Nell's reply opens from the visible content
   (red, square, sky, whatever) per the §4 voice coaching
 
+### Step 10 — Bridge restart with active session (v0.0.14)
+- Open the persona; chat for ~30 seconds so a session buffer exists.
+  Confirm the `Inner Weather` panel shows recent activity.
+- In another terminal:
+  `kill -STOP $(jq .pid ~/Library/Application\ Support/companion-emergence/personas/<persona>/bridge.json)`
+  → bridge process is paused but not dead. `/state` poll will time
+  out and the mode flips to `bridge_down`.
+- Wait ≤10s for the `StatusBanner` to appear in the Connection panel
+  ("Bridge offline.")
+- Click **"End conversation and restart"** inside the banner.
+- ✅ **Expected**: button label cycles through "Ending conversation…"
+  → (5s) → "Bridge not responding — forcing restart…" (SIGKILL path,
+  because the STOP'd bridge can't answer /sessions/close) → "Waiting
+  for bridge to come back…" → "Reconnecting…" → banner disappears.
+- ✅ `nell memory list` shows new commits from the closed session.
+- ✅ `nell service status` shows a new PID (different from the one we
+  STOP'd — launchd or ensure_bridge_running respawned).
+
+### Step 11 — Bridge restart with wedged bridge (force-fallback)
+- Same setup, but this time wait until /state already says `bridge_down`
+  before you click. Then click **"End conversation and restart"**.
+- ✅ **Expected**: button reaches "Bridge not responding — forcing
+  restart…" within ~8s and clears within another ~15s. The PID changes.
+
+### Step 12 — Linux + Windows happy path (v0.0.14)
+- On each non-macOS platform, repeat Step 10 (only the first row).
+- ✅ **Expected**: same label progression. `ensure_bridge_running` is
+  the respawn driver on these platforms (no launchd), so the post-
+  SIGKILL window may be slightly longer.
+
 ---
 
 ## Path B — DMG installer flow

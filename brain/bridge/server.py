@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import threading
 from collections.abc import AsyncIterator
@@ -1665,6 +1666,33 @@ def build_app(
             pass
         finally:
             s.event_bus.unsubscribe(q)
+
+    # ── POST /supervisor/shutdown — manual restart trigger ──────────────────
+    @app.post(
+        "/supervisor/shutdown",
+        status_code=202,
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def supervisor_shutdown() -> dict[str, Any]:
+        """Trigger graceful shutdown via the same SIGTERM path the idle watcher uses.
+
+        Returns 202 immediately. The actual drain (30s in-flight chat wait +
+        supervisor join + buffer snapshot) runs in the FastAPI lifespan
+        teardown that SIGTERM triggers via uvicorn's signal handler.
+
+        Manual recovery path for the Connection-panel restart button.
+        Audit-logged at INFO so user-triggered restarts are correlatable
+        in bug reports.
+        """
+        logger.info("manual restart via /supervisor/shutdown")
+
+        async def _fire_sigterm() -> None:
+            # 100ms delay so the 202 response flushes before uvicorn tears down.
+            await asyncio.sleep(0.1)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        asyncio.create_task(_fire_sigterm())
+        return {"status": "shutting_down", "drain_seconds": 30}
 
     # ── POST /sessions/close — explicit ingest trigger ─────────────────────
     @app.post("/sessions/close", dependencies=[Depends(require_http_auth)])
