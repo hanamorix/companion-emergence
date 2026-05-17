@@ -55,9 +55,7 @@ def test_service_unit_name_validates_persona() -> None:
         systemd.service_unit_name("../etc")
 
 
-def test_paths_for_persona_assembles_expected_layout(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_paths_for_persona_assembles_expected_layout(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     data = home / "data"
     home.mkdir()
@@ -100,9 +98,7 @@ def test_resolve_nell_path_rejects_non_executable(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_systemd_unit_text_contains_required_sections(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_build_systemd_unit_text_contains_required_sections(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -141,12 +137,26 @@ def test_build_systemd_unit_text_embeds_nellbrain_home_env_when_given(
         nell_path=nell,
         nellbrain_home=str(custom_home),
     )
-    assert f'Environment="NELLBRAIN_HOME={custom_home.resolve()}"' in body
+    assert f'Environment="KINDLED_HOME={custom_home.resolve()}"' in body
+    assert 'Environment="NELLBRAIN_HOME=' not in body
 
 
-def test_build_systemd_unit_text_embeds_path_environment(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_systemd_unit_emits_kindled_not_nellbrain_env_line(tmp_path, monkeypatch):
+    """v0.0.13 rename: newly built systemd units must not embed NELLBRAIN_HOME."""
+    custom_home = tmp_path / "custom"
+    custom_home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    nell = _make_executable(tmp_path / "nell")
+    body = systemd.build_systemd_unit_text(
+        persona="nell",
+        nell_path=nell,
+        nellbrain_home=str(custom_home),
+    )
+    assert 'Environment="KINDLED_HOME=' in body
+    assert 'Environment="NELLBRAIN_HOME=' not in body
+
+
+def test_build_systemd_unit_text_embeds_path_environment(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -187,9 +197,7 @@ def test_build_systemd_unit_text_rejects_missing_nell_binary(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_write_systemd_unit_creates_file_at_expected_path(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_write_systemd_unit_creates_file_at_expected_path(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))

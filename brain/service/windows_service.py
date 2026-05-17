@@ -44,10 +44,7 @@ from brain.setup import validate_persona_name
 
 TASK_PREFIX = "CompanionEmergence"
 DEFAULT_WINDOWS_PATH = (
-    "%LOCALAPPDATA%\\Programs\\claude;"
-    "%USERPROFILE%\\.local\\bin;"
-    "C:\\Windows\\System32;"
-    "C:\\Windows"
+    "%LOCALAPPDATA%\\Programs\\claude;%USERPROFILE%\\.local\\bin;C:\\Windows\\System32;C:\\Windows"
 )
 
 
@@ -134,9 +131,7 @@ def resolve_nell_path(explicit: str | None = None) -> Path:
     if explicit:
         path = Path(explicit).expanduser()
         if not path.is_absolute():
-            raise WindowsServiceConfigError(
-                f"--nell-path must be absolute (got {path!s})"
-            )
+            raise WindowsServiceConfigError(f"--nell-path must be absolute (got {path!s})")
         if not path.is_file():
             raise WindowsServiceConfigError(f"nell at {path} not found")
         return path
@@ -199,10 +194,7 @@ def build_task_xml(
     # tokenize it the way argv does. Wrap any path with spaces in
     # double quotes so claude --print can find its image attachments
     # later when the path includes ``Documents``-style folders.
-    args = (
-        f"supervisor run --persona {persona} "
-        "--client-origin task-scheduler --idle-shutdown 0"
-    )
+    args = f"supervisor run --persona {persona} --client-origin task-scheduler --idle-shutdown 0"
 
     # Working directory and stdout/stderr can't be set per-task in
     # Task Scheduler the way launchd / systemd do — we let the runner
@@ -216,7 +208,7 @@ def build_task_xml(
         nellbrain_home_str = _xml_escape(str(Path(nellbrain_home).expanduser()))
         env_block = (
             "    <Environment>\n"
-            f"      <Variable><Name>NELLBRAIN_HOME</Name>"
+            f"      <Variable><Name>KINDLED_HOME</Name>"
             f"<Value>{nellbrain_home_str}</Value></Variable>\n"
             "    </Environment>\n"
         )
@@ -337,9 +329,7 @@ def install_service(
     name = task_name(persona)
     result = run_schtasks(["/Create", "/XML", str(xml_path), "/TN", name, "/F"])
     if result.returncode != 0:
-        raise WindowsServiceCommandError(
-            _format_schtasks_error("/Create", result)
-        )
+        raise WindowsServiceCommandError(_format_schtasks_error("/Create", result))
     # Kick it off immediately so the user doesn't have to log out + back in.
     run_schtasks(["/Run", "/TN", name])
     return xml_path
@@ -388,7 +378,9 @@ def doctor_checks(
         DoctorCheck(
             "platform",
             plat_ok,
-            "Windows Task Scheduler available" if plat_ok else f"unsupported platform {_sys.platform}",
+            "Windows Task Scheduler available"
+            if plat_ok
+            else f"unsupported platform {_sys.platform}",
         )
     )
 
@@ -457,7 +449,8 @@ def doctor_checks(
         )
     )
 
-    home_env = os.environ.get("NELLBRAIN_HOME")
+    # KINDLED_HOME (canonical v0.0.13+; NELLBRAIN_HOME honoured as legacy-compat)
+    home_env = os.environ.get("KINDLED_HOME") or os.environ.get("NELLBRAIN_HOME")
     if home_env:
         checks.append(DoctorCheck("home", True, home_env))
     else:

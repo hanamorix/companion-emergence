@@ -34,14 +34,23 @@ class _FakeBackend:
         return Path(explicit or self.tmp_path / "nell")
 
     def doctor_checks(self, *, persona, nell_path, env_path):
-        self.calls.append(("doctor_checks", {"persona": persona, "nell_path": nell_path, "env_path": env_path}))
+        self.calls.append(
+            ("doctor_checks", {"persona": persona, "nell_path": nell_path, "env_path": env_path})
+        )
         return [DoctorCheck("backend", True, "fake backend ok")]
 
     def install_service(self, *, persona, nell_path, env_path, nellbrain_home):
-        self.calls.append((
-            "install_service",
-            {"persona": persona, "nell_path": nell_path, "env_path": env_path, "nellbrain_home": nellbrain_home},
-        ))
+        self.calls.append(
+            (
+                "install_service",
+                {
+                    "persona": persona,
+                    "nell_path": nell_path,
+                    "env_path": env_path,
+                    "nellbrain_home": nellbrain_home,
+                },
+            )
+        )
         return self.tmp_path / "fake.service"
 
     def uninstall_service(self, *, persona, keep_plist):
@@ -59,10 +68,17 @@ class _FakeBackend:
         )
 
     def render_service_config(self, *, persona, nell_path, env_path, nellbrain_home):
-        self.calls.append((
-            "render_service_config",
-            {"persona": persona, "nell_path": nell_path, "env_path": env_path, "nellbrain_home": nellbrain_home},
-        ))
+        self.calls.append(
+            (
+                "render_service_config",
+                {
+                    "persona": persona,
+                    "nell_path": nell_path,
+                    "env_path": env_path,
+                    "nellbrain_home": nellbrain_home,
+                },
+            )
+        )
         return "fake dry-run config\n"
 
 
@@ -98,7 +114,7 @@ def test_service_print_plist_outputs_launchagent_xml(
     parsed = plistlib.loads(capsys.readouterr().out.encode("utf-8"))
     assert parsed["Label"] == "com.companion-emergence.supervisor.nell"
     assert parsed["ProgramArguments"][:3] == [str(nell.resolve()), "supervisor", "run"]
-    assert parsed["EnvironmentVariables"]["NELLBRAIN_HOME"] == str(data_home.resolve())
+    assert parsed["EnvironmentVariables"]["KINDLED_HOME"] == str(data_home.resolve())
 
 
 def test_service_print_plist_invalid_nell_path_returns_1(monkeypatch, capsys) -> None:
@@ -153,16 +169,30 @@ def test_service_doctor_uses_current_backend(monkeypatch, tmp_path: Path, capsys
     backend = _FakeBackend(tmp_path)
     monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
-    rc = cli.main([
-        "service", "doctor", "--persona", "nell", "--nell-path", "/tmp/nell", "--env-path", "/tmp/bin",
-    ])
+    rc = cli.main(
+        [
+            "service",
+            "doctor",
+            "--persona",
+            "nell",
+            "--nell-path",
+            "/tmp/nell",
+            "--env-path",
+            "/tmp/bin",
+        ]
+    )
 
     assert rc == 0
-    assert ("doctor_checks", {"persona": "nell", "nell_path": "/tmp/nell", "env_path": "/tmp/bin"}) in backend.calls
+    assert (
+        "doctor_checks",
+        {"persona": "nell", "nell_path": "/tmp/nell", "env_path": "/tmp/bin"},
+    ) in backend.calls
     assert "fake backend ok" in capsys.readouterr().out
 
 
-def test_service_lifecycle_commands_use_current_backend(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_service_lifecycle_commands_use_current_backend(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
     backend = _FakeBackend(tmp_path)
     monkeypatch.setattr("brain.service.current_backend", lambda: backend)
 
@@ -241,12 +271,15 @@ def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, caps
     )
 
     assert rc == 0
-    install_call = ("install_service", {
-        "persona": "nell",
-        "nell_path": nell.resolve(),
-        "env_path": "/tmp/bin",
-        "nellbrain_home": None,
-    })
+    install_call = (
+        "install_service",
+        {
+            "persona": "nell",
+            "nell_path": nell.resolve(),
+            "env_path": "/tmp/bin",
+            "nellbrain_home": None,
+        },
+    )
     assert install_call in backend.calls
     assert "service installed" in capsys.readouterr().out
 

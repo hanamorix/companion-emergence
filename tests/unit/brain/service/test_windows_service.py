@@ -84,9 +84,7 @@ def test_resolve_nell_path_rejects_missing(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_task_xml_contains_required_sections(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_build_task_xml_contains_required_sections(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -111,9 +109,7 @@ def test_build_task_xml_contains_required_sections(
     assert "<RestartOnFailure>" in body
 
 
-def test_build_task_xml_embeds_nellbrain_home_env_when_given(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_build_task_xml_embeds_kindled_home_env_when_given(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -126,7 +122,8 @@ def test_build_task_xml_embeds_nellbrain_home_env_when_given(
         nell_path=nell,
         nellbrain_home=str(custom_home),
     )
-    assert "<Variable><Name>NELLBRAIN_HOME</Name>" in body
+    assert "<Variable><Name>KINDLED_HOME</Name>" in body
+    assert "<Variable><Name>NELLBRAIN_HOME</Name>" not in body  # regression guard
     # Path should be XML-escaped, not raw
     assert str(custom_home.resolve()).replace("&", "&amp;") in body
 
@@ -142,9 +139,7 @@ def test_build_task_xml_escapes_persona_name_in_description() -> None:
     assert "&amp;" not in body or "<Description>" in body  # body may have entities elsewhere
 
 
-def test_build_task_xml_logon_trigger_with_hidden_window(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_build_task_xml_logon_trigger_with_hidden_window(tmp_path: Path, monkeypatch) -> None:
     """Task should fire AtLogon and not pop a console window."""
     home = tmp_path / "home"
     home.mkdir()
@@ -161,9 +156,7 @@ def test_build_task_xml_logon_trigger_with_hidden_window(
 # ---------------------------------------------------------------------------
 
 
-def test_write_task_xml_creates_file_at_expected_path(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_write_task_xml_creates_file_at_expected_path(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
