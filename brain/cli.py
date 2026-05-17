@@ -494,7 +494,9 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     print(f"type: {memory.memory_type}")
     print(f"domain: {memory.domain}")
     print(f"created_at: {memory.created_at.isoformat()}")
-    print(f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}")
+    print(
+        f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}"
+    )
     print(f"importance: {memory.importance:.2f}")
     print(f"score: {memory.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
@@ -1205,9 +1207,7 @@ def _soul_audit_handler(args: argparse.Namespace) -> int:
 
         limit = getattr(args, "limit", 20)
         entries = read_audit_log(persona_dir, limit=limit)
-        header = (
-            f"Soul audit log for persona {args.persona!r} (last {len(entries)} entries):"
-        )
+        header = f"Soul audit log for persona {args.persona!r} (last {len(entries)} entries):"
 
     print(header)
     if not entries:
@@ -1244,10 +1244,7 @@ def _initiate_audit_handler(args: argparse.Namespace) -> int:
         from brain.initiate.audit import iter_initiate_audit_full
 
         rows = list(iter_initiate_audit_full(persona_dir))
-        header = (
-            f"Initiate audit (full history — {len(rows)} entries across "
-            "active + archives):"
-        )
+        header = f"Initiate audit (full history — {len(rows)} entries across active + archives):"
     else:
         from brain.initiate.audit import read_recent_audit
 
@@ -1263,9 +1260,7 @@ def _initiate_audit_handler(args: argparse.Namespace) -> int:
     for r in rows:
         ts = str(r.ts)[:19].replace("T", " ")
         state = (r.delivery.get("current_state") if r.delivery else "n/a") or "n/a"
-        print(
-            f"\n  {ts}  {r.decision:<14}  audit_id={r.audit_id}  state={state}"
-        )
+        print(f"\n  {ts}  {r.decision:<14}  audit_id={r.audit_id}  state={state}")
         if r.subject:
             print(f"    subject: {r.subject[:100]}")
         if r.decision_reasoning:
@@ -1286,9 +1281,7 @@ def _initiate_candidates_handler(args: argparse.Namespace) -> int:
         print("  (empty)")
         return 0
     for c in candidates:
-        print(
-            f"\n  {c.ts}  source={c.source}  kind={c.kind}  source_id={c.source_id}"
-        )
+        print(f"\n  {c.ts}  source={c.source}  kind={c.kind}  source_id={c.source_id}")
     return 0
 
 
@@ -1567,7 +1560,9 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
         sid = sid_arg
     else:
         sid = httpx.post(
-            f"{base}/session/new", json={"client": "cli"}, headers=http_headers,
+            f"{base}/session/new",
+            json={"client": "cli"},
+            headers=http_headers,
         ).json()["session_id"]
 
     print(f"chat session {sid} (Ctrl-D to exit)")
@@ -1715,7 +1710,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     """Set up a new persona — interactive wizard or flag-driven.
 
     Three things this command guarantees:
-      1. <NELLBRAIN_HOME>/personas/<name>/ exists
+      1. <KINDLED_HOME>/personas/<name>/ exists
       2. persona_config.json is written with user_name set (closes Bug A
          attribution drift — extractor needs to know who the user is)
       3. voice.md is written from the chosen template (or absent, in
@@ -1742,11 +1737,13 @@ def _init_handler(args: argparse.Namespace) -> int:
         return 1
 
     if user_name is None:  # explicit empty string allowed (means "leave unset")
-        user_name = _prompt(
-            "your name (the human's — used so the brain knows who's "
-            "talking to her)",
-            default="",
-        ) or None
+        user_name = (
+            _prompt(
+                "your name (the human's — used so the brain knows who's talking to her)",
+                default="",
+            )
+            or None
+        )
 
     if migrate_from is None and not getattr(args, "fresh", False):
         if _prompt_yes_no("migrate from OG NellBrain data?", default=False):
@@ -1824,14 +1821,10 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
             print(
-                "    edit it before chatting — replace Nell-specific "
-                "identity content with your own"
+                "    edit it before chatting — replace Nell-specific identity content with your own"
             )
     else:
-        print(
-            "  - voice.md: not written; framework's DEFAULT_VOICE_TEMPLATE "
-            "applies on first chat"
-        )
+        print("  - voice.md: not written; framework's DEFAULT_VOICE_TEMPLATE applies on first chat")
     if migrate_from:
         print(f"  - migrated from {migrate_from}")
     print()
@@ -2167,7 +2160,8 @@ def _build_parser() -> argparse.ArgumentParser:
     s_status.set_defaults(func=cmd_status)
 
     s_restart = s_actions.add_parser(
-        "restart", help="Stop and start — gated on stop success.",
+        "restart",
+        help="Stop and start — gated on stop success.",
     )
     _add_persona_arg(s_restart)
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
@@ -2175,14 +2169,13 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--timeout", type=float, default=180.0)
     s_restart.set_defaults(func=cmd_restart)
 
-    s_tail_events = s_actions.add_parser(
-        "tail-events", help="Tail /events as JSON lines."
-    )
+    s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
     _add_persona_arg(s_tail_events)
     s_tail_events.set_defaults(func=cmd_tail)
 
     s_tail_log = s_actions.add_parser(
-        "tail-log", help="Tail the bridge log file (cross-platform).",
+        "tail-log",
+        help="Tail the bridge log file (cross-platform).",
     )
     _add_persona_arg(s_tail_log)
     s_tail_log.add_argument(
@@ -2241,7 +2234,8 @@ def _build_parser() -> argparse.ArgumentParser:
     svc_print.add_argument(
         "--nellbrain-home",
         default=None,
-        help="Optional NELLBRAIN_HOME value to embed in the LaunchAgent environment.",
+        help="Optional KINDLED_HOME value to embed in the LaunchAgent environment. "
+        "Accepts the older NELLBRAIN_HOME spelling for compatibility.",
     )
     svc_print.set_defaults(func=_service_print_plist_handler)
 
@@ -2253,7 +2247,8 @@ def _build_parser() -> argparse.ArgumentParser:
     svc_install.add_argument(
         "--nellbrain-home",
         default=None,
-        help="Optional NELLBRAIN_HOME value to embed in the LaunchAgent environment.",
+        help="Optional KINDLED_HOME value to embed in the LaunchAgent environment. "
+        "Accepts the older NELLBRAIN_HOME spelling for compatibility.",
     )
     svc_install.add_argument(
         "--dry-run",
@@ -2453,14 +2448,10 @@ def _build_parser() -> argparse.ArgumentParser:
     initiate_sub = subparsers.add_parser(
         "initiate", help="Inspect Nell's autonomous-outbound state."
     )
-    initiate_actions = initiate_sub.add_subparsers(
-        dest="initiate_action", required=True
-    )
+    initiate_actions = initiate_sub.add_subparsers(dest="initiate_action", required=True)
 
     # nell initiate audit
-    il_audit = initiate_actions.add_parser(
-        "audit", help="Tail initiate_audit.jsonl entries."
-    )
+    il_audit = initiate_actions.add_parser("audit", help="Tail initiate_audit.jsonl entries.")
     il_audit.add_argument("--persona", required=True)
     il_audit.add_argument("--limit", type=int, default=20)
     il_audit.add_argument(
