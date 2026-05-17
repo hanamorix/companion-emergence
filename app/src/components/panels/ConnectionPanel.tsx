@@ -4,6 +4,7 @@ import { installNellCliSymlink, installSupervisorService } from "../../appConfig
 import type { PersonaState } from "../../bridge";
 import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
+import { RestartBridgeButton } from "./RestartBridgeButton";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 
@@ -131,7 +132,7 @@ export function ConnectionPanel({
       <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
       <Row label="Privacy" value="Local-only" accent />
 
-      <StatusBanner mode={mode} stateError={stateError} />
+      <StatusBanner mode={mode} stateError={stateError} persona={persona} />
 
       <Divider />
       <SectionLabel>Supervisor</SectionLabel>
@@ -363,9 +364,11 @@ function UpdateSection({
 function StatusBanner({
   mode,
   stateError,
+  persona,
 }: {
   mode: PersonaState["mode"];
   stateError: string | null;
+  persona: string;
 }) {
   // Pick the worst signal — bridge_down is more critical than provider_down.
   let kind: "warning" | "error" | null = null;
@@ -437,6 +440,9 @@ function StatusBanner({
       >
         {detail}
       </div>
+      {kind === "error" && (
+        <RestartBridgeButton persona={persona} currentMode={mode} />
+      )}
     </div>
   );
 }
