@@ -117,18 +117,36 @@ def dispatch(
                 f"got {type(arguments['emotions']).__name__!r}"
             )
 
-    if name == "get_body_state" and "session_hours" in arguments:
-        try:
-            session_hours_float = float(arguments["session_hours"])
-        except (TypeError, ValueError) as exc:
-            raise ToolDispatchError(
-                f"tool 'get_body_state' arg 'session_hours' must be a number, "
-                f"got {type(arguments['session_hours']).__name__!r}"
-            ) from exc
-        # M-4: don't mutate the caller's dict — shallow-copy then update.
-        # The chat engine logs `arguments` straight into the invocations
-        # record; mutating it bleeds float coercion into the audit trail.
-        arguments = {**arguments, "session_hours": session_hours_float}
+    if name == "get_body_state":
+        if "session_hours" in arguments:
+            try:
+                session_hours_float = float(arguments["session_hours"])
+            except (TypeError, ValueError) as exc:
+                raise ToolDispatchError(
+                    f"tool 'get_body_state' arg 'session_hours' must be a number, "
+                    f"got {type(arguments['session_hours']).__name__!r}"
+                ) from exc
+            # M-4: don't mutate the caller's dict — shallow-copy then update.
+            # The chat engine logs `arguments` straight into the invocations
+            # record; mutating it bleeds float coercion into the audit trail.
+            arguments = {**arguments, "session_hours": session_hours_float}
+        else:
+            # Caller didn't provide session_hours — the LLM never knows
+            # the session age and the MCP tool schema doesn't ask. Inject
+            # the same live value the UI's /persona/state body block
+            # already uses (active-conversation-buffer age), so the
+            # brain's self-read matches what the panel shows. Bug
+            # surfaced 2026-05-17: without this, get_body_state always
+            # returned session_hours=0.0 + fresh-persona defaults
+            # (energy 7, exhaustion 0) regardless of session age.
+            from datetime import UTC, datetime
+
+            from brain.body.session_hours import compute_active_session_hours
+
+            arguments = {
+                **arguments,
+                "session_hours": compute_active_session_hours(persona_dir, now=datetime.now(UTC)),
+            }
 
     if name in _WORKS_TOOLS:
         try:

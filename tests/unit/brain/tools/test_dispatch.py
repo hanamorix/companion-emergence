@@ -162,6 +162,84 @@ def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# get_body_state — dispatcher session_hours injection
+# (Bug surfaced 2026-05-17: MCP tool path returned session_hours=0.0,
+#  energy=7, exhaustion=0 even hours into a session, because the
+#  dispatcher claimed to inject session_hours but never did.)
+# ---------------------------------------------------------------------------
+
+
+def _seed_active_buffer(persona_dir: Path, *, hours_old: float) -> None:
+    """Plant an active_conversations buffer whose first entry is `hours_old` ago."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    conv_dir = persona_dir / "active_conversations"
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC) - timedelta(hours=hours_old)
+    entry = {
+        "timestamp": started_at.isoformat(),
+        "role": "user",
+        "content": "session opener",
+    }
+    (conv_dir / "test-session.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+
+def test_get_body_state_dispatcher_injects_session_hours_from_active_buffer(
+    tmp_path: Path,
+) -> None:
+    """When the LLM calls get_body_state with no session_hours, the dispatcher
+    must compute it from the active conversation buffer — matching what the
+    UI's /persona/state path already does. Before this fix the MCP tool path
+    returned session_hours=0.0 (fresh-persona defaults) even hours into a
+    session, so the brain's self-read disagreed with what the panel showed."""
+    ctx = _make_ctx(tmp_path)
+    _seed_active_buffer(tmp_path, hours_old=3.0)
+
+    result = dispatch("get_body_state", {}, **ctx)
+
+    # Returned body's session_hours must reflect the live buffer age, not
+    # the function-default 0.0. Allow ±0.1h tolerance (test runtime, ISO
+    # parsing rounding).
+    assert result["session_hours"] >= 2.9, (
+        f"dispatcher failed to inject session_hours; got "
+        f"session_hours={result['session_hours']!r} "
+        f"(expected ~3.0 from 3h-old active buffer)"
+    )
+
+
+def test_get_body_state_caller_session_hours_wins_over_dispatcher_injection(
+    tmp_path: Path,
+) -> None:
+    """Explicit caller-provided session_hours is NOT overwritten by the
+    dispatcher's injection. Honors any CLI path or tool-loop caller that
+    knows its own session age."""
+    ctx = _make_ctx(tmp_path)
+    _seed_active_buffer(tmp_path, hours_old=3.0)
+
+    result = dispatch("get_body_state", {"session_hours": 1.5}, **ctx)
+
+    assert result["session_hours"] == 1.5, (
+        f"caller-provided session_hours overridden by dispatcher; got "
+        f"session_hours={result['session_hours']!r} (expected 1.5)"
+    )
+
+
+def test_get_body_state_no_active_buffer_keeps_session_hours_zero(
+    tmp_path: Path,
+) -> None:
+    """No active_conversations dir → injection yields 0.0 (no change to the
+    fresh-persona behaviour). Guards against regression on CLI / fresh
+    install path."""
+    ctx = _make_ctx(tmp_path)
+    # Deliberately do NOT plant an active buffer.
+
+    result = dispatch("get_body_state", {}, **ctx)
+
+    assert result["session_hours"] == 0.0
+
+
+# ---------------------------------------------------------------------------
 # All dispatched tools smoke-test
 # ---------------------------------------------------------------------------
 
