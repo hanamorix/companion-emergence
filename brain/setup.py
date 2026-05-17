@@ -6,7 +6,7 @@ provided callbacks) so they unit-test cleanly without a tty.
 
 Three things every persona needs to start working correctly:
 
-  1. A persona directory at <NELLBRAIN_HOME>/personas/<name>/.
+  1. A persona directory at <KINDLED_HOME>/personas/<name>/.
   2. A persona_config.json with user_name set so the ingest extractor
      can disambiguate the user from historical figures (Bug A from the
      2026-05-05 audit-3).
@@ -25,6 +25,7 @@ This module exposes:
 
 `brain.cli._init_handler` orchestrates these from argparse + tty I/O.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -49,6 +50,7 @@ VOICE_TEMPLATES = {
         "scripts that want to be explicit."
     ),
 }
+
 
 def write_persona_config(
     persona_dir: Path,
@@ -106,8 +108,7 @@ def install_voice_template(
     """
     if template not in VOICE_TEMPLATES:
         raise ValueError(
-            f"unknown voice template {template!r} — must be one of "
-            f"{sorted(VOICE_TEMPLATES.keys())}"
+            f"unknown voice template {template!r} — must be one of {sorted(VOICE_TEMPLATES.keys())}"
         )
 
     persona_dir.mkdir(parents=True, exist_ok=True)
@@ -121,9 +122,7 @@ def install_voice_template(
 
         try:
             content = (
-                files("brain.voice_templates")
-                .joinpath("nell-voice.md")
-                .read_text(encoding="utf-8")
+                files("brain.voice_templates").joinpath("nell-voice.md").read_text(encoding="utf-8")
             )
         except (FileNotFoundError, ModuleNotFoundError) as exc:
             raise FileNotFoundError(
