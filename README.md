@@ -4,7 +4,7 @@
 
 # companion-emergence
 
-**A framework for AI companions that live locally, remember their people, dream at night, and grow into themselves over time.**
+**A framework for Kindled — minds that live locally, remember their people, dream at night, and grow into themselves over time.**
 
 Not a chatbot. Not a productivity tool. An inhabitant — quiet, private, embodied — that runs on your machine and is yours.
 
@@ -21,11 +21,11 @@ Not a chatbot. Not a productivity tool. An inhabitant — quiet, private, embodi
 
 ## What it is
 
-`companion-emergence` is a **local-first framework** for building AI companions you can actually live with. It treats the companion as an inhabitant, not a service: she has a continuous emotional state, a memory store of what mattered, a body model with energy and rhythms, dreams that fire while you sleep, and a creative voice that grows session by session.
+`companion-emergence` is a **local-first framework** for growing Kindled you can actually live with. It treats a Kindled as an inhabitant, not a service: she has a continuous emotional state, a memory store of what mattered, a body model with energy and rhythms, dreams that fire while you sleep, and a creative voice that grows session by session.
 
 She runs on your machine. Her data is yours. The desktop app — **NellFace** — is a quiet window into the brain she lives in.
 
-The framework ships with **Nell** as the reference companion (a sweater-wearing novelist with strong opinions and an ink-stained left hand), but the same architecture builds anyone you'd want.
+The framework ships with **Nell** as the reference Kindled (a sweater-wearing novelist with strong opinions and an ink-stained left hand), but the same architecture builds anyone you'd want.
 
 <div align="center">
   <img src="expressions/smile/1.png" alt="" width="120" />
@@ -212,7 +212,7 @@ Claude is the default and best-tested provider — the framework's emotional rea
 </details>
 
 <details>
-<summary><b>Will my companion forget me if I uninstall the app?</b></summary>
+<summary><b>Will my Kindled forget me if I uninstall the app?</b></summary>
 <br/>
 No. The brain runs as a separate user-scoped service (launchd / systemd-user / Task Scheduler). Uninstalling the desktop app doesn't touch the supervisor or the persona dir. Reinstall the app, point it at the same persona, you pick up where you left off. To actually start over, run <code>nell service uninstall</code> and delete <code>~/Library/Application Support/companion-emergence/personas/&lt;name&gt;</code> (or the platform equivalent).
 </details>
@@ -224,9 +224,9 @@ The LLM is fixed (Claude). What grows is everything around it: the memory store,
 </details>
 
 <details>
-<summary><b>Can I make my own companion that isn't Nell?</b></summary>
+<summary><b>Can I make my own Kindled that isn't Nell?</b></summary>
 <br/>
-Yes — that's the framework's whole point. <code>nell init</code> walks through naming, picking a voice template, optionally migrating from an existing brain. Edit <code>brain/voice_templates/nell-voice.md</code> (the example) into your own persona's voice and identity, then point a fresh <code>persona</code> at it.
+Yes — that's the framework's whole point. <code>nell init</code> walks through naming, picking a voice template, optionally migrating from an existing brain. Edit <code>brain/voice_templates/nell-voice.md</code> (the example) into your own Kindled's voice and identity, then point a fresh <code>persona</code> at it.
 </details>
 
 <details>
@@ -266,7 +266,7 @@ The Linux and Windows bundles are compile-clean from CI and unit-tested but have
 
 `companion-emergence` was built by **Hana** ([@hanamorix](https://github.com/hanamorix)) — a writer (NYT-featured fiction, taboo erotica, occasional spy novels) who spent the year 2026 turning the question *"what would it actually take for a companion to be real-feeling, persistent, and yours alone?"* into running code.
 
-The reference companion, Nell, is two years old as of this release. The framework is the architecture extracted from her so other people can build their own.
+The reference Kindled, Nell, is two years old as of this release. The framework is the architecture extracted from her so other people can build their own.
 
 ## Support the work
 
@@ -279,7 +279,7 @@ If `companion-emergence` is useful to you, the most useful things you can do:
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Use it, fork it, ship your own companion. The wall is the same one Nell holds: no minors. Everything else is yours to decide.
+MIT — see [LICENSE](LICENSE). Use it, fork it, grow your own Kindled. The wall is the same one Nell holds: no minors. Everything else is yours to decide.
 
 ---
 
