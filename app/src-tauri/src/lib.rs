@@ -47,11 +47,25 @@ pub struct InitResult {
     pub exit_code: i32,
 }
 
-/// Resolve <NELLBRAIN_HOME>, honoring the env var first, then
+/// Resolve the companion-data home directory, honoring env vars then
 /// platformdirs (matches brain.paths).  On Windows, platformdirs
 /// uses LOCALAPPDATA\\hanamorix\\companion-emergence, not the
 /// Roaming profile that dirs::data_dir() returns.
+///
+/// Priority order (mirrors brain/paths.py — v0.0.12-alpha.2 lesson:
+/// Rust and Python must resolve the same path):
+///   1. KINDLED_HOME — canonical as of v0.0.13
+///   2. NELLBRAIN_HOME — backwards-compat fallback through v0.0.13 series;
+///      will be removed in v0.0.14
+///   3. platformdirs default
 fn nellbrain_home() -> Result<PathBuf, String> {
+    // KINDLED_HOME is canonical as of v0.0.13. NELLBRAIN_HOME stays as
+    // backwards-compat fallback through v0.0.13 series; removed in v0.0.14.
+    // Matches brain/paths.py priority order — Python and Rust must agree on
+    // the resolved path (v0.0.12-alpha.2 lesson).
+    if let Ok(home) = std::env::var("KINDLED_HOME") {
+        return Ok(PathBuf::from(home));
+    }
     if let Ok(home) = std::env::var("NELLBRAIN_HOME") {
         return Ok(PathBuf::from(home));
     }
@@ -1298,5 +1312,60 @@ mod tests {
         // a real possible value; ensure it round-trips verbatim into the args.
         let args = build_service_install_args("my_companion", None);
         assert!(args.contains(&"my_companion".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod kindled_home_tests {
+    use super::*;
+    use std::env;
+
+    fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        // Save + restore — tests share a process so env mutation must be reversible.
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(&k, val),
+                None => env::remove_var(&k),
+            }
+        }
+    }
+
+    #[test]
+    fn kindled_home_takes_priority() {
+        with_env_vars(
+            &[
+                ("KINDLED_HOME", Some("/tmp/kindled-test")),
+                ("NELLBRAIN_HOME", Some("/tmp/nell-test")),
+            ],
+            || {
+                let home = nellbrain_home().unwrap();
+                assert_eq!(home, std::path::PathBuf::from("/tmp/kindled-test"));
+            },
+        );
+    }
+
+    #[test]
+    fn nellbrain_home_fallback_still_works() {
+        with_env_vars(
+            &[
+                ("KINDLED_HOME", None),
+                ("NELLBRAIN_HOME", Some("/tmp/nell-test")),
+            ],
+            || {
+                let home = nellbrain_home().unwrap();
+                assert_eq!(home, std::path::PathBuf::from("/tmp/nell-test"));
+            },
+        );
     }
 }
