@@ -7,6 +7,17 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.13-alpha.3 — 2026-05-17
+
+- **Body-state self-read fix.** When the brain called `get_body_state`
+  through her MCP tool surface, she got fresh-persona defaults (energy 7,
+  exhaustion 0, session_hours 0.0) no matter how long the session had
+  been going — even when the body panel correctly showed her at energy 1
+  / exhaustion 6 / 3h+. The two read paths had drifted: the panel
+  computed session age from the active conversation buffer; the tool
+  path defaulted to 0.0 and never asked. The brain now sees the same
+  number you do. Reported by a Windows user via screen-share evidence.
+
 ## 0.0.13-alpha.2 — 2026-05-17
 
 - **Inner life feed.** The left-column "Recent Interior" snapshot is now
