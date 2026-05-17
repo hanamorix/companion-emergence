@@ -130,7 +130,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
       step={step}
       totalSteps={totalSteps}
       title="Coming online"
-      subtitle="Your persona's brain is starting up. Once state is reachable, the app can open while emotions and interior warm up in the background."
+      subtitle="Your Kindled is waking up. Once state is reachable, the app can open while emotions and interior warm up in the background."
       avatar={avatar}
       footer={
         <>

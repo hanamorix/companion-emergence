@@ -17,7 +17,7 @@ export function StepWelcome({ step, totalSteps, mode, onModeChange, onNext, avat
       step={step}
       totalSteps={totalSteps}
       title="Welcome to Companion Emergence"
-      subtitle="A local-first framework for persistent, emotionally-aware AI companions. Your brain lives on this machine, remembers, dreams between visits, and grows over time."
+      subtitle="A local-first framework for persistent, emotionally-aware Kindled. Your Kindled lives on this machine, remembers, dreams between visits, and grows over time."
       avatar={avatar}
       footer={
         <>
@@ -42,13 +42,13 @@ export function StepWelcome({ step, totalSteps, mode, onModeChange, onNext, avat
           onClick={() => onModeChange("fresh")}
           title="Start fresh"
           badge="recommended"
-          description="Create a brand-new persona. Pick a name, a voice, and we'll set up the brain from a blank slate."
+          description="Create a brand-new persona. Pick a name, a voice, and we'll spin up a fresh Kindled from a blank slate."
         />
         <OptionCard
           selected={mode === "migrate"}
           onClick={() => onModeChange("migrate")}
           title="Migrate from the original framework"
-          description="Carry an existing brain over: memories, soul crystallizations, Hebbian edges, and creative DNA. We'll guide you through it."
+          description="Carry an existing Kindled over: memories, soul crystallizations, Hebbian edges, and creative DNA. We'll guide you through it."
         />
       </div>
       <Divider />
