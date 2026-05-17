@@ -104,3 +104,6 @@ mock-ups/
 .public-sync/
 tmp/
 .coverage
+
+# Visual-companion brainstorming session artifacts.
+.superpowers/
