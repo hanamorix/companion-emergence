@@ -28,6 +28,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# Re-export the canonical helper so existing call sites in this module
+# (and any external imports of the private name) keep working. The
+# function moved to brain.body.session_hours so brain.tools.dispatch can
+# import it without crossing into the bridge layer. See the new module's
+# docstring for the migration context.
+from brain.body.session_hours import (
+    compute_active_session_hours as _active_session_hours,  # noqa: F401
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,51 +202,6 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: emotions aggregation failed", exc_info=True)
         return {}
-
-
-def _active_session_hours(persona_dir: Path, *, now: datetime) -> float:
-    """How long the current chat session has been live, in hours.
-
-    Reads the earliest entry timestamp from any active conversation
-    buffer in ``<persona>/active_conversations/`` — if a session is
-    open, that's when the user started this turn-block. If multiple
-    buffers exist (rare; concurrent sessions), takes the earliest.
-    Returns 0.0 when no session is open, which matches the panel's
-    "fresh session" expectation.
-    """
-    conv_dir = persona_dir / "active_conversations"
-    if not conv_dir.exists():
-        return 0.0
-    earliest_ts: datetime | None = None
-    try:
-        for buffer in conv_dir.glob("*.jsonl"):
-            try:
-                with buffer.open("r", encoding="utf-8") as fh:
-                    first = fh.readline().strip()
-                if not first:
-                    continue
-                entry = json.loads(first)
-                ts_raw = entry.get("timestamp") or entry.get("ts")
-                if not ts_raw:
-                    continue
-                if isinstance(ts_raw, str):
-                    if ts_raw.endswith("Z"):
-                        ts_raw = ts_raw[:-1] + "+00:00"
-                    ts = datetime.fromisoformat(ts_raw)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=UTC)
-                else:
-                    continue
-                if earliest_ts is None or ts < earliest_ts:
-                    earliest_ts = ts
-            except (json.JSONDecodeError, OSError, ValueError):
-                continue
-    except OSError:
-        return 0.0
-    if earliest_ts is None:
-        return 0.0
-    elapsed = (now - earliest_ts).total_seconds() / 3600.0
-    return max(0.0, elapsed)
 
 
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:

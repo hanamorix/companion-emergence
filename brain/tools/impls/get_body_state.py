@@ -33,9 +33,12 @@ def get_body_state(
 ) -> dict[str, Any]:
     """Return the brain's current body state.
 
-    `session_hours` is injected by the dispatcher when the bridge is the
-    caller (it knows the session age). CLI / tool-loop callers default to
-    0.0; count_words_in_session falls back to a 1-hour window.
+    `session_hours` is injected by the dispatcher when the caller doesn't
+    provide it — the dispatcher computes it from the active conversation
+    buffer's earliest timestamp (same signal the UI's /persona/state body
+    block uses). Caller-provided values take precedence; explicit 0.0
+    from a CLI / fresh-install path is honored and
+    count_words_in_session falls back to a 1-hour window.
     """
     now = datetime.now(UTC)
 
