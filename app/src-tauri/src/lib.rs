@@ -1414,9 +1414,23 @@ mod tests {
 mod kindled_home_tests {
     use super::*;
     use std::env;
+    use std::sync::Mutex;
+
+    // Rust runs tests in parallel by default; the two tests below both
+    // mutate KINDLED_HOME and NELLBRAIN_HOME on a shared process env, so
+    // without serialization one test's set_var races the other's
+    // remove_var/restore and ~60% of full-suite runs flake. A module-
+    // local Mutex serializes the env-touching critical section without
+    // pulling in serial_test as a dev-dependency.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        // Save + restore — tests share a process so env mutation must be reversible.
+        // Hold the lock across mutate → run → restore so two tests can't
+        // interleave their save/restore cycles. unwrap_or_else recovers
+        // from poisoning so an earlier panic doesn't taint the whole
+        // module — env state is wholly determined by the save/restore
+        // logic below, not by anything the previous test stashed.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let saved: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| (k.to_string(), env::var(k).ok()))
