@@ -40,9 +40,7 @@ def _seed_voice_edit_audit(
         ts="2026-05-11T14:47:09+00:00",
         kind="voice_edit_proposal",
         subject="a small edit to my voice",
-        tone_rendered=(
-            f"Proposing to change my voice: {old_text!r} -> {new_text!r}."
-        ),
+        tone_rendered=(f"Proposing to change my voice: {old_text!r} -> {new_text!r}."),
         decision="send_quiet",
         decision_reasoning="the pattern showed up three times",
         gate_check={"allowed": True, "reason": None},
@@ -92,8 +90,7 @@ def test_voice_edit_accept_writes_voice_audit_and_soul(tmp_path: Path) -> None:
 
     # Place 3: audit row state mutated to replied_explicit.
     matched = next(
-        row for row in iter_initiate_audit_full(persona_dir)
-        if row.audit_id == "ia_ve_001"
+        row for row in iter_initiate_audit_full(persona_dir) if row.audit_id == "ia_ve_001"
     )
     assert matched.delivery is not None
     assert matched.delivery["current_state"] == "replied_explicit"
@@ -157,8 +154,7 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
     # transition with reason `voice_write_failed`, or retrying once the
     # disk is healthy.
     matched = next(
-        row for row in iter_initiate_audit_full(persona_dir)
-        if row.audit_id == "ia_ve_002"
+        row for row in iter_initiate_audit_full(persona_dir) if row.audit_id == "ia_ve_002"
     )
     assert matched.delivery is not None
     assert matched.delivery["current_state"] == "replied_explicit"

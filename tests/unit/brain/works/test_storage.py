@@ -1,4 +1,5 @@
 """Tests for brain.works storage layer + Work dataclass."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

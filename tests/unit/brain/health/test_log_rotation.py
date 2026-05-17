@@ -203,10 +203,13 @@ def test_rotate_age_archive_skips_corrupt_lines(tmp_path: Path) -> None:
     """A malformed line in the middle doesn't abort the split."""
     log = tmp_path / "soul_audit.jsonl"
     log.write_text(
-        json.dumps({"at": _ts(2024), "seq": 0}) + "\n"
+        json.dumps({"at": _ts(2024), "seq": 0})
+        + "\n"
         + "{this is not json\n"
-        + json.dumps({"at": _ts(2024), "seq": 1}) + "\n"
-        + json.dumps({"at": _ts(2026), "seq": 2}) + "\n",
+        + json.dumps({"at": _ts(2024), "seq": 1})
+        + "\n"
+        + json.dumps({"at": _ts(2026), "seq": 2})
+        + "\n",
         encoding="utf-8",
     )
     now = datetime(2026, 5, 11, tzinfo=UTC)

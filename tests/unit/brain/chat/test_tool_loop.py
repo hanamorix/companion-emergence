@@ -325,16 +325,25 @@ def test_run_tool_loop_surfaces_dispatched_invocations(
 
     Closes the telemetry gap surfaced by the 2026-05-05 voice stress retest:
     tools fired correctly but bridge response showed tool_invocations=[]."""
+
     class _ProviderWithDispatched(LLMProvider):
-        def name(self) -> str: return "fake-dispatched"
-        def generate(self, prompt: str, *, system: str | None = None) -> str: return ""
+        def name(self) -> str:
+            return "fake-dispatched"
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            return ""
+
         def chat(self, messages, *, tools=None, options=None):
             return ChatResponse(
                 content="reply text",
                 tool_calls=(),  # not OllamaProvider path
                 dispatched_invocations=(
                     {"name": "get_soul", "arguments": {}, "result_summary": "{count: 38}"},
-                    {"name": "search_memories", "arguments": {"query": "x"}, "result_summary": "[]"},
+                    {
+                        "name": "search_memories",
+                        "arguments": {"query": "x"},
+                        "result_summary": "[]",
+                    },
                 ),
                 raw=None,
             )

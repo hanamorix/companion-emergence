@@ -20,6 +20,7 @@ to source memory). Counted in skipped_missing_memory_id tally.
 
 See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-design.md.
 """
+
 from __future__ import annotations
 
 import json
@@ -57,16 +58,16 @@ def migrate_soul_candidates(
     migrated_records: list[dict[str, Any]] = []
     skipped_missing_memory_id = 0
 
-    for line_num, raw in enumerate(
-        src.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for line_num, raw in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1):
         if not raw.strip():
             continue
         try:
             og = json.loads(raw)
         except json.JSONDecodeError as exc:
             logger.warning(
-                "soul_candidates.jsonl line %d malformed: %s", line_num, exc,
+                "soul_candidates.jsonl line %d malformed: %s",
+                line_num,
+                exc,
             )
             continue
 
@@ -79,10 +80,7 @@ def migrate_soul_candidates(
 
     if migrated_records:
         dest = persona_dir / "soul_candidates.jsonl"
-        text = "".join(
-            json.dumps(record, ensure_ascii=False) + "\n"
-            for record in migrated_records
-        )
+        text = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in migrated_records)
         save_with_backup_text(dest, text)
 
     return (len(migrated_records), skipped_missing_memory_id)

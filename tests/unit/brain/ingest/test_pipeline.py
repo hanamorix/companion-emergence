@@ -299,7 +299,9 @@ def test_close_session_counts_soul_queue_failure_without_claiming_success(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A committed memory is not reported as queued if the soul queue append fails."""
-    ingest_turn(tmp_path, {"session_id": "sess_soul_fail", "speaker": "Hana", "text": "this matters"})
+    ingest_turn(
+        tmp_path, {"session_id": "sess_soul_fail", "speaker": "Hana", "text": "this matters"}
+    )
     provider = _CannedProvider(
         [{"text": "The important truth was remembered", "label": "observation", "importance": 10}]
     )
@@ -397,14 +399,22 @@ def test_close_session_passes_named_speakers_to_extract(
 
     # Buffer with both speaker types
     ingest_turn(persona_dir, {"session_id": "sess_named", "speaker": "user", "text": "hi"})
-    ingest_turn(persona_dir, {"session_id": "sess_named", "speaker": "assistant", "text": "hey love"})
+    ingest_turn(
+        persona_dir, {"session_id": "sess_named", "speaker": "assistant", "text": "hey love"}
+    )
 
     captured: list[str] = []
 
     class _CapProvider(LLMProvider):
-        def name(self): return "cap"
-        def healthy(self): return True
-        def chat(self, *a, **kw): raise NotImplementedError
+        def name(self):
+            return "cap"
+
+        def healthy(self):
+            return True
+
+        def chat(self, *a, **kw):
+            raise NotImplementedError
+
         def generate(self, prompt, *, system=None):
             captured.append(prompt)
             return "[]"  # empty extraction valid
@@ -435,9 +445,15 @@ def test_close_session_falls_back_to_legacy_when_user_name_unset(
     captured: list[str] = []
 
     class _CapProvider(LLMProvider):
-        def name(self): return "cap"
-        def healthy(self): return True
-        def chat(self, *a, **kw): raise NotImplementedError
+        def name(self):
+            return "cap"
+
+        def healthy(self):
+            return True
+
+        def chat(self, *a, **kw):
+            raise NotImplementedError
+
         def generate(self, prompt, *, system=None):
             captured.append(prompt)
             return "[]"
@@ -468,7 +484,11 @@ def test_snapshot_preserves_buffer_and_writes_cursor(
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "assistant", "text": "noted"})
 
     report = extract_session_snapshot(
-        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
@@ -485,15 +505,23 @@ def test_snapshot_with_cursor_only_extracts_new_turns(
     tracking_provider: _TrackingProvider,
 ) -> None:
     sid = "sess_abc"
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "old",
-                           "ts": "2026-05-10T20:00:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "old", "ts": "2026-05-10T20:00:00+00:00"},
+    )
     write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "new",
-                           "ts": "2026-05-10T20:05:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "new", "ts": "2026-05-10T20:05:00+00:00"},
+    )
 
     tracking_provider.reset_calls()
     extract_session_snapshot(
-        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert tracking_provider.last_transcript is not None
@@ -508,13 +536,19 @@ def test_snapshot_with_no_new_turns_skips_provider_call(
     tracking_provider: _TrackingProvider,
 ) -> None:
     sid = "sess_abc"
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x",
-                           "ts": "2026-05-10T20:00:00+00:00"})
+    ingest_turn(
+        tmp_path,
+        {"session_id": sid, "speaker": "user", "text": "x", "ts": "2026-05-10T20:00:00+00:00"},
+    )
     write_cursor(tmp_path, sid, "2026-05-10T20:00:00+00:00")
 
     tracking_provider.reset_calls()
     report = extract_session_snapshot(
-        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert tracking_provider.call_count == 0
@@ -534,7 +568,11 @@ def test_snapshot_malformed_cursor_falls_back_to_full(
 
     tracking_provider.reset_calls()
     extract_session_snapshot(
-        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert tracking_provider.last_transcript is not None
@@ -553,7 +591,11 @@ def test_snapshot_on_empty_buffer_returns_empty_report(
 
     tracking_provider.reset_calls()
     report = extract_session_snapshot(
-        tmp_path, sid, store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert report.extracted == 0
@@ -573,8 +615,7 @@ def test_snapshot_stale_sessions_keeps_buffer_alive(
 ) -> None:
     sid = "sess_abc"
     old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
-                           "text": "earlier", "ts": old_ts})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "earlier", "ts": old_ts})
 
     reports = snapshot_stale_sessions(
         tmp_path,
@@ -647,10 +688,8 @@ def test_snapshot_stale_sessions_per_session_error_isolation(
     sid_bad = "sess_bad"
     sid_good = "sess_good"
     old = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
-    ingest_turn(tmp_path, {"session_id": sid_bad, "speaker": "user",
-                           "text": "boom", "ts": old})
-    ingest_turn(tmp_path, {"session_id": sid_good, "speaker": "user",
-                           "text": "ok", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_bad, "speaker": "user", "text": "boom", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid_good, "speaker": "user", "text": "ok", "ts": old})
 
     import brain.ingest.pipeline as pipeline_mod
 
@@ -691,13 +730,14 @@ def test_finalize_under_threshold_skips(
 ) -> None:
     sid = "sess_abc"
     recent = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
-                           "text": "x", "ts": recent})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x", "ts": recent})
 
     reports = finalize_stale_sessions(
         tmp_path,
         finalize_after_hours=24.0,
-        store=store, hebbian=hebbian, provider=tracking_provider,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert reports == []
@@ -713,14 +753,15 @@ def test_finalize_at_threshold_deletes_buffer_and_cursor(
 ) -> None:
     sid = "sess_abc"
     old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
-    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
-                           "text": "x", "ts": old})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x", "ts": old})
     write_cursor(tmp_path, sid, old)
 
     reports = finalize_stale_sessions(
         tmp_path,
         finalize_after_hours=24.0,
-        store=store, hebbian=hebbian, provider=tracking_provider,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     assert len(reports) == 1
@@ -764,7 +805,9 @@ def test_finalize_per_session_error_isolation(
     reports = finalize_stale_sessions(
         tmp_path,
         finalize_after_hours=24.0,
-        store=store, hebbian=hebbian, provider=_ExplodingOnceProvider(),
+        store=store,
+        hebbian=hebbian,
+        provider=_ExplodingOnceProvider(),
     )
 
     # Both stale sessions reach finalize regardless of the first one exploding.
@@ -791,9 +834,11 @@ def test_close_session_full_path_also_deletes_cursor(
         ingest_turn(tmp_path, {"session_id": sid, "speaker": speaker, "text": text})
     write_cursor(tmp_path, sid, datetime.now(UTC).isoformat())
 
-    provider = _CannedProvider([
-        {"text": "test memory", "label": "fact", "importance": 5},
-    ])
+    provider = _CannedProvider(
+        [
+            {"text": "test memory", "label": "fact", "importance": 5},
+        ]
+    )
     close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=provider)
 
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
@@ -837,8 +882,11 @@ def test_snapshot_records_backoff_on_extraction_failure(
 
     provider = _GarbageProvider()
     report = extract_session_snapshot(
-        tmp_path, sid,
-        store=store, hebbian=hebbian, provider=provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
         config={"extraction_max_retries": 0},
     )
 
@@ -863,8 +911,11 @@ def test_snapshot_backoff_increments_anchor_stays(
 
     provider = _GarbageProvider()
     extract_session_snapshot(
-        tmp_path, sid,
-        store=store, hebbian=hebbian, provider=provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
         config={"extraction_max_retries": 0},
     )
 
@@ -886,8 +937,11 @@ def test_snapshot_backoff_skips_after_threshold_within_window(
     write_backoff(tmp_path, sid, failures=3, first_failure_at=now)
 
     report = extract_session_snapshot(
-        tmp_path, sid,
-        store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     # Provider must NOT be called.
@@ -914,8 +968,11 @@ def test_snapshot_backoff_resumes_after_window_expires(
     write_backoff(tmp_path, sid, failures=5, first_failure_at=stale)
 
     extract_session_snapshot(
-        tmp_path, sid,
-        store=store, hebbian=hebbian, provider=tracking_provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
     )
 
     # Provider WAS called this time.
@@ -934,16 +991,19 @@ def test_snapshot_backoff_clears_on_success(
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
     # Pre-existing backoff state under the threshold so guard doesn't fire.
     write_backoff(
-        tmp_path, sid, failures=2,
+        tmp_path,
+        sid,
+        failures=2,
         first_failure_at=datetime.now(UTC).isoformat(),
     )
 
-    provider = _CannedProvider(
-        [{"text": "Hana said hi", "label": "fact", "importance": 4}]
-    )
+    provider = _CannedProvider([{"text": "Hana said hi", "label": "fact", "importance": 4}])
     report = extract_session_snapshot(
-        tmp_path, sid,
-        store=store, hebbian=hebbian, provider=provider,
+        tmp_path,
+        sid,
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
     )
 
     assert report.errors == 0
@@ -961,7 +1021,9 @@ def test_close_session_deletes_backoff(
     sid = "sess_close_backoff"
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hi"})
     write_backoff(
-        tmp_path, sid, failures=2,
+        tmp_path,
+        sid,
+        failures=2,
         first_failure_at=datetime.now(UTC).isoformat(),
     )
 
@@ -983,7 +1045,9 @@ def test_close_session_empty_path_deletes_backoff(
     (tmp_path / "active_conversations").mkdir(parents=True, exist_ok=True)
     (tmp_path / "active_conversations" / f"{sid}.jsonl").touch()
     write_backoff(
-        tmp_path, sid, failures=3,
+        tmp_path,
+        sid,
+        failures=3,
         first_failure_at=datetime.now(UTC).isoformat(),
     )
 
@@ -1007,14 +1071,18 @@ def test_finalize_stale_sessions_deletes_backoff(
         {"session_id": sid, "speaker": "Hana", "text": "hi", "ts": stale_ts},
     )
     write_backoff(
-        tmp_path, sid, failures=2,
+        tmp_path,
+        sid,
+        failures=2,
         first_failure_at=datetime.now(UTC).isoformat(),
     )
 
     finalize_stale_sessions(
         tmp_path,
         finalize_after_hours=24.0,
-        store=store, hebbian=hebbian, provider=canned_provider,
+        store=store,
+        hebbian=hebbian,
+        provider=canned_provider,
     )
 
     assert read_backoff(tmp_path, sid) is None

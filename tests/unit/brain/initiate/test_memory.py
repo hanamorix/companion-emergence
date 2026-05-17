@@ -37,46 +37,34 @@ def test_render_memory_for_state_delivered_not_read() -> None:
 
 
 def test_render_memory_for_state_read() -> None:
-    text = render_memory_for_state(
-        subject="the dream", message="x", state="read"
-    )
+    text = render_memory_for_state(subject="the dream", message="x", state="read")
     assert "seen it" in text
 
 
 def test_render_memory_for_state_replied_explicit() -> None:
-    text = render_memory_for_state(
-        subject="the dream", message="x", state="replied_explicit"
-    )
+    text = render_memory_for_state(subject="the dream", message="x", state="replied_explicit")
     assert "answered" in text or "replied" in text
 
 
 def test_render_memory_for_state_acknowledged_unclear() -> None:
-    text = render_memory_for_state(
-        subject="the dream", message="x", state="acknowledged_unclear"
-    )
+    text = render_memory_for_state(subject="the dream", message="x", state="acknowledged_unclear")
     assert "can't tell" in text or "unclear" in text or "not sure" in text
 
 
 def test_render_memory_for_state_unanswered() -> None:
-    text = render_memory_for_state(
-        subject="the dream", message="x", state="unanswered"
-    )
+    text = render_memory_for_state(subject="the dream", message="x", state="unanswered")
     assert "hasn't said anything" in text or "no answer" in text
 
 
 def test_render_memory_for_state_dismissed() -> None:
-    text = render_memory_for_state(
-        subject="the dream", message="x", state="dismissed"
-    )
+    text = render_memory_for_state(subject="the dream", message="x", state="dismissed")
     assert "dismissed" in text or "closed" in text
 
 
 def test_render_memory_truncates_long_message() -> None:
     """Long messages truncated to 240 chars in the quoted block."""
     long_msg = "a" * 500
-    text = render_memory_for_state(
-        subject="x", message=long_msg, state="delivered"
-    )
+    text = render_memory_for_state(subject="x", message=long_msg, state="delivered")
     # original message length 500 must not appear; truncation marker present
     assert "..." in text
     assert "a" * 500 not in text

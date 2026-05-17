@@ -268,6 +268,4 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
 
 def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:
     """Atomic JSON save with .bak rotation. Delegates to save_with_backup_text."""
-    save_with_backup_text(
-        path, json.dumps(data, indent=2) + "\n", backup_count=backup_count
-    )
+    save_with_backup_text(path, json.dumps(data, indent=2) + "\n", backup_count=backup_count)

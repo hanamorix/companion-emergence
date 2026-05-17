@@ -402,7 +402,9 @@ def test_research_fire_emits_initiate_candidate_when_maturity_passes(
     store = MemoryStore(":memory:")
     try:
         engine = _build_engine(tmp_path, store)
-        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        result = engine.run_tick(
+            trigger="days_since_human", dry_run=False, days_since_human_override=5.0
+        )
         assert result.fired is not None, "Expected research to fire"
 
         candidates = read_candidates(tmp_path)
@@ -446,24 +448,29 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(
     store = MemoryStore(":memory:")
     try:
         engine = _build_engine(tmp_path, store)
-        result = engine.run_tick(trigger="days_since_human", dry_run=False, days_since_human_override=5.0)
+        result = engine.run_tick(
+            trigger="days_since_human", dry_run=False, days_since_human_override=5.0
+        )
         assert result.fired is not None, "Expected research to fire (engine gate passed)"
 
         candidates = read_candidates(tmp_path)
         research_candidates = [c for c in candidates if c.source == "research_completion"]
-        assert len(research_candidates) == 0, "Low-maturity fire must NOT emit a research_completion candidate"
+        assert len(research_candidates) == 0, (
+            "Low-maturity fire must NOT emit a research_completion candidate"
+        )
 
         # Confirm gate rejection was recorded
         rejection_path = tmp_path / "gate_rejections.jsonl"
-        assert rejection_path.exists(), "gate_rejections.jsonl should exist after maturity gate rejection"
+        assert rejection_path.exists(), (
+            "gate_rejections.jsonl should exist after maturity gate rejection"
+        )
         rows = [
             json.loads(line)
             for line in rejection_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         assert any(
-            r["gate_name"] == "maturity_min" and r["source"] == "research_completion"
-            for r in rows
+            r["gate_name"] == "maturity_min" and r["source"] == "research_completion" for r in rows
         )
         assert overlap_calls == []
     finally:

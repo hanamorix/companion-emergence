@@ -12,6 +12,7 @@ the contract — a future refactor that re-introduces a hard-coded
 constant will break here, and a pyproject bump that forgets to re-lock
 will also surface here.
 """
+
 from __future__ import annotations
 
 import re
@@ -63,9 +64,7 @@ def test_tauri_conf_version_matches_pyproject():
 
     pyproject_version = _read_pyproject_version()
     conf = json.loads(
-        (REPO_ROOT / "app" / "src-tauri" / "tauri.conf.json").read_text(
-            encoding="utf-8"
-        )
+        (REPO_ROOT / "app" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
     )
     assert conf["version"] == pyproject_version, (
         f"tauri.conf.json version={conf['version']!r} but "
@@ -78,13 +77,10 @@ def test_tauri_conf_version_matches_pyproject():
 def test_cargo_toml_version_matches_pyproject():
     """The nellface crate version. Same lockstep contract."""
     pyproject_version = _read_pyproject_version()
-    cargo_text = (REPO_ROOT / "app" / "src-tauri" / "Cargo.toml").read_text(
-        encoding="utf-8"
-    )
+    cargo_text = (REPO_ROOT / "app" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
     # First `version = "..."` line is the [package] block.
     match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_text, flags=re.MULTILINE)
     assert match, "Cargo.toml has no version line"
     assert match.group(1) == pyproject_version, (
-        f"Cargo.toml version={match.group(1)!r} but "
-        f"pyproject says {pyproject_version!r}."
+        f"Cargo.toml version={match.group(1)!r} but pyproject says {pyproject_version!r}."
     )

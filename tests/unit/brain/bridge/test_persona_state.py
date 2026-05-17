@@ -1,4 +1,5 @@
 """Tests for brain.bridge.persona_state — the NellFace app's aggregator."""
+
 from __future__ import annotations
 
 import json
@@ -23,7 +24,10 @@ def test_build_persona_state_fresh_persona_returns_safe_shape(tmp_path: Path) ->
     assert state["body"]["energy"] == 8  # baseline
     assert state["body"]["days_since_contact"] == 999.0  # "never contacted"
     assert state["interior"] == {
-        "dream": None, "research": None, "heartbeat": None, "reflex": None,
+        "dream": None,
+        "research": None,
+        "heartbeat": None,
+        "reflex": None,
     }
     assert state["soul_highlight"] is None
     assert state["mode"] == "live"
@@ -37,14 +41,22 @@ def test_build_persona_state_emotions_sorted_desc(tmp_path: Path) -> None:
     persona_dir.mkdir()
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        store.create(Memory.create_new(
-            content="loved you fiercely", memory_type="feeling",
-            domain="us", emotions={"love": 9.0, "tenderness": 6.5},
-        ))
-        store.create(Memory.create_new(
-            content="curious about Lispector", memory_type="observation",
-            domain="self", emotions={"curiosity": 8.0, "love": 5.0},
-        ))
+        store.create(
+            Memory.create_new(
+                content="loved you fiercely",
+                memory_type="feeling",
+                domain="us",
+                emotions={"love": 9.0, "tenderness": 6.5},
+            )
+        )
+        store.create(
+            Memory.create_new(
+                content="curious about Lispector",
+                memory_type="observation",
+                domain="self",
+                emotions={"curiosity": 8.0, "love": 5.0},
+            )
+        )
     finally:
         store.close()
 
@@ -67,10 +79,14 @@ def test_build_persona_state_body_block_when_memories_exist(tmp_path: Path) -> N
     persona_dir.mkdir()
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        store.create(Memory.create_new(
-            content="x", memory_type="feeling",
-            domain="us", emotions={"peace": 7.0},
-        ))
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="feeling",
+                domain="us",
+                emotions={"peace": 7.0},
+            )
+        )
     finally:
         store.close()
 
@@ -78,8 +94,14 @@ def test_build_persona_state_body_block_when_memories_exist(tmp_path: Path) -> N
     body = state["body"]
     assert body is not None
     # to_dict() shape — verify the keys the panel expects
-    for required in ("energy", "temperature", "exhaustion",
-                     "session_hours", "days_since_contact", "body_emotions"):
+    for required in (
+        "energy",
+        "temperature",
+        "exhaustion",
+        "session_hours",
+        "days_since_contact",
+        "body_emotions",
+    ):
         assert required in body
     assert isinstance(body["energy"], int)
     assert isinstance(body["body_emotions"], dict)
@@ -92,22 +114,26 @@ def test_build_persona_state_interior_from_daemon_state(tmp_path: Path) -> None:
     live instead of static)."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
-    (persona_dir / "daemon_state.json").write_text(json.dumps({
-        "last_dream": {
-            "theme": "a window facing nothing",
-            "dominant_emotion": "awe",
-            "timestamp": "2026-05-08T12:00:00+00:00",
-        },
-        "last_research": {
-            "theme": "Lispector diagonal syntax",
-            "ts": "2026-05-08T11:30:00Z",
-        },
-        "last_heartbeat": {
-            "dominant_emotion": "love",
-            "intensity": 9.0,
-            "written_at": "2026-05-08T13:15:00+00:00",
-        },
-    }))
+    (persona_dir / "daemon_state.json").write_text(
+        json.dumps(
+            {
+                "last_dream": {
+                    "theme": "a window facing nothing",
+                    "dominant_emotion": "awe",
+                    "timestamp": "2026-05-08T12:00:00+00:00",
+                },
+                "last_research": {
+                    "theme": "Lispector diagonal syntax",
+                    "ts": "2026-05-08T11:30:00Z",
+                },
+                "last_heartbeat": {
+                    "dominant_emotion": "love",
+                    "intensity": 9.0,
+                    "written_at": "2026-05-08T13:15:00+00:00",
+                },
+            }
+        )
+    )
     state = build_persona_state(persona_dir)
     interior = state["interior"]
     assert interior["dream"]["summary"] == "a window facing nothing"
@@ -126,11 +152,15 @@ def test_build_persona_state_interior_strips_self_narrated_label(tmp_path: Path)
     """
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
-    (persona_dir / "daemon_state.json").write_text(json.dumps({
-        "last_dream": {"theme": "DREAM: I was back in every conversation"},
-        "last_research": {"theme": "research — Lispector diagonal syntax"},
-        "last_reflex": {"summary": "Reflex: love and grief in the same chest"},
-    }))
+    (persona_dir / "daemon_state.json").write_text(
+        json.dumps(
+            {
+                "last_dream": {"theme": "DREAM: I was back in every conversation"},
+                "last_research": {"theme": "research — Lispector diagonal syntax"},
+                "last_reflex": {"summary": "Reflex: love and grief in the same chest"},
+            }
+        )
+    )
     state = build_persona_state(persona_dir)
     interior = state["interior"]
     assert interior["dream"]["summary"] == "I was back in every conversation"
@@ -147,7 +177,10 @@ def test_build_persona_state_interior_corrupt_daemon_state_fails_soft(tmp_path: 
     (persona_dir / "daemon_state.json").write_text("{not valid json")
     state = build_persona_state(persona_dir)
     assert state["interior"] == {
-        "dream": None, "research": None, "heartbeat": None, "reflex": None,
+        "dream": None,
+        "research": None,
+        "heartbeat": None,
+        "reflex": None,
     }
 
 
@@ -168,12 +201,17 @@ def test_build_persona_state_soul_highlight_picks_highest_resonance(tmp_path: Pa
         ("old high resonance", "romantic", 9, older),
         ("recent high resonance — winner", "belonging", 9, newer),
     ]:
-        store.create(Crystallization(
-            id=str(uuid.uuid4()),
-            moment=moment, love_type=love_type,
-            why_it_matters="x", who_or_what="hana",
-            resonance=resonance, crystallized_at=when,
-        ))
+        store.create(
+            Crystallization(
+                id=str(uuid.uuid4()),
+                moment=moment,
+                love_type=love_type,
+                why_it_matters="x",
+                who_or_what="hana",
+                resonance=resonance,
+                crystallized_at=when,
+            )
+        )
     store.close()
 
     state = build_persona_state(persona_dir)
@@ -206,9 +244,7 @@ def test_build_persona_state_connection_block(tmp_path: Path) -> None:
 
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
-    PersonaConfig(provider="claude-cli", user_name="Hana").save(
-        persona_dir / "persona_config.json"
-    )
+    PersonaConfig(provider="claude-cli", user_name="Hana").save(persona_dir / "persona_config.json")
     (persona_dir / "heartbeat_state.json").write_text(
         '{"last_tick_at": "2026-05-06T13:00:00Z", "tick_count": 5}'
     )
@@ -254,9 +290,7 @@ def test_recovering_true_when_orphan_buffer_exists(tmp_path: Path) -> None:
     # Orphan buffer — directory + turns.jsonl, no in-memory session.
     sid_dir = persona_dir / "active_conversations" / "orphan-from-prev-run"
     sid_dir.mkdir(parents=True)
-    (sid_dir / "turns.jsonl").write_text(
-        '{"speaker":"user","text":"hi"}\n', encoding="utf-8"
-    )
+    (sid_dir / "turns.jsonl").write_text('{"speaker":"user","text":"hi"}\n', encoding="utf-8")
 
     reset_registry()
     try:
@@ -302,9 +336,7 @@ def test_recovering_true_when_orphan_alongside_live(tmp_path: Path) -> None:
         sess = create_session(persona_name="nell")
         live_dir = persona_dir / "active_conversations" / sess.session_id
         live_dir.mkdir(parents=True)
-        (live_dir / "turns.jsonl").write_text(
-            '{"speaker":"user","text":"hi"}\n', encoding="utf-8"
-        )
+        (live_dir / "turns.jsonl").write_text('{"speaker":"user","text":"hi"}\n', encoding="utf-8")
         orphan_dir = persona_dir / "active_conversations" / "orphan-id"
         orphan_dir.mkdir(parents=True)
         (orphan_dir / "turns.jsonl").write_text(

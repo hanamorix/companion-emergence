@@ -85,7 +85,10 @@ def read_removed_arcs(persona_dir: Path) -> list[dict]:
 
 
 def recently_removed_names(
-    persona_dir: Path, *, now: datetime, grace_days: float,
+    persona_dir: Path,
+    *,
+    now: datetime,
+    grace_days: float,
 ) -> set[str]:
     """Return names removed within the grace window. Spec gate 3 uses this."""
     cutoff = now - timedelta(days=grace_days)
@@ -106,7 +109,10 @@ def recently_removed_names(
 
 
 def write_arc_snapshot(
-    persona_dir: Path, *, arcs: list[ReflexArc], snapshot_at: datetime,
+    persona_dir: Path,
+    *,
+    arcs: list[ReflexArc],
+    snapshot_at: datetime,
 ) -> None:
     """Atomic write of .last_arc_snapshot.json via save_with_backup."""
     path = persona_dir / SNAPSHOT_FILENAME
@@ -132,7 +138,9 @@ def read_arc_snapshot(persona_dir: Path) -> list[ReflexArc] | None:
     if anomaly is not None:
         logger.warning(
             "arc snapshot at %s anomaly %s (action=%s)",
-            path, anomaly.kind, anomaly.action,
+            path,
+            anomaly.kind,
+            anomaly.action,
         )
     arcs_raw = data.get("arcs", [])
     if not arcs_raw:

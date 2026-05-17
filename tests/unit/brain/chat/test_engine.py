@@ -295,13 +295,9 @@ def test_respond_reads_prior_turns_from_buffer_not_history(
     )
 
     sent = recording_provider.last_messages
-    user_texts = [
-        m.content for m in sent if m.role == "user" and isinstance(m.content, str)
-    ]
+    user_texts = [m.content for m in sent if m.role == "user" and isinstance(m.content, str)]
     assistant_texts = [
-        m.content
-        for m in sent
-        if m.role == "assistant" and isinstance(m.content, str)
+        m.content for m in sent if m.role == "assistant" and isinstance(m.content, str)
     ]
     assert "I love watercolour" in user_texts
     assert "tell me about the brushes" in assistant_texts
@@ -434,9 +430,7 @@ def test_respond_replays_image_turn_from_buffer(
     )
 
     sent = recording_provider.last_messages
-    image_msgs = [
-        m for m in sent if m.role == "user" and not isinstance(m.content, str)
-    ]
+    image_msgs = [m for m in sent if m.role == "user" and not isinstance(m.content, str)]
     assert image_msgs, "expected at least one user msg with tuple content"
     # The replayed prior turn should be among them. The live turn ("what do you
     # think?") is text-only so it stays a string-content message.

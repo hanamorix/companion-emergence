@@ -126,6 +126,7 @@ def test_persona_config_user_name_defaults_to_none(tmp_path: Path) -> None:
 
 def test_persona_config_user_name_loads_from_file(tmp_path: Path) -> None:
     import json
+
     p = tmp_path / "persona_config.json"
     p.write_text(json.dumps({"provider": "claude-cli", "user_name": "Hana"}))
     cfg = PersonaConfig.load(p)
@@ -144,6 +145,7 @@ def test_persona_config_user_name_strips_whitespace_and_treats_empty_as_none(
 ) -> None:
     """Whitespace-only or empty user_name → None (treated as unset)."""
     import json
+
     p = tmp_path / "persona_config.json"
     p.write_text(json.dumps({"user_name": "  Hana  "}))
     assert PersonaConfig.load(p).user_name == "Hana"

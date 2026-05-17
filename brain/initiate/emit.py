@@ -103,9 +103,7 @@ def remove_candidate(persona_dir: Path, candidate_id: str) -> None:
     queue = persona_dir / "initiate_candidates.jsonl"
     if not queue.exists():
         return
-    surviving = [
-        c for c in read_candidates(persona_dir) if c.candidate_id != candidate_id
-    ]
+    surviving = [c for c in read_candidates(persona_dir) if c.candidate_id != candidate_id]
     tmp = queue.with_suffix(queue.suffix + ".tmp")
     try:
         with tmp.open("w", encoding="utf-8") as f:

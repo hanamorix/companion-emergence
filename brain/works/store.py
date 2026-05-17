@@ -113,9 +113,7 @@ class WorksStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                cur = conn.execute(
-                    "SELECT 1 FROM works WHERE id = ?", (work.id,)
-                )
+                cur = conn.execute("SELECT 1 FROM works WHERE id = ?", (work.id,))
                 if cur.fetchone() is not None:
                     conn.execute("ROLLBACK")
                     return False  # idempotent duplicate
@@ -138,8 +136,7 @@ class WorksStore:
                     ),
                 )
                 conn.execute(
-                    "INSERT INTO works_fts (id, title, summary, content) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO works_fts (id, title, summary, content) VALUES (?, ?, ?, ?)",
                     (work.id, work.title, work.summary or "", content),
                 )
                 conn.execute("COMMIT")
@@ -184,9 +181,7 @@ class WorksStore:
     def get(self, work_id: str) -> Work | None:
         with self._connect() as conn:
             try:
-                row = conn.execute(
-                    "SELECT * FROM works WHERE id = ?", (work_id,)
-                ).fetchone()
+                row = conn.execute("SELECT * FROM works WHERE id = ?", (work_id,)).fetchone()
             except sqlite3.OperationalError as exc:
                 # Audit 2026-05-07 P3-5: corrupt DB / partial WAL /
                 # schema mismatch is operationally distinct from
@@ -194,15 +189,11 @@ class WorksStore:
                 # None so the chat path stays graceful, but operators
                 # tailing the log + future health-anomaly readers can
                 # spot a real data-integrity problem.
-                logger.warning(
-                    "WorksStore.get operational error for id=%s: %s", work_id, exc
-                )
+                logger.warning("WorksStore.get operational error for id=%s: %s", work_id, exc)
                 return None
             return _row_to_work(row) if row else None
 
-    def list_recent(
-        self, *, limit: int = 20, type: str | None = None
-    ) -> list[Work]:
+    def list_recent(self, *, limit: int = 20, type: str | None = None) -> list[Work]:
         sql = "SELECT * FROM works"
         params: list[object] = []
         if type is not None:
@@ -216,15 +207,11 @@ class WorksStore:
             except sqlite3.OperationalError as exc:
                 # Audit 2026-05-07 P3-5: log + return empty rather
                 # than silent. Same posture as get() / search().
-                logger.warning(
-                    "WorksStore.list_recent operational error: %s", exc
-                )
+                logger.warning("WorksStore.list_recent operational error: %s", exc)
                 return []
             return [_row_to_work(r) for r in rows]
 
-    def search(
-        self, query: str, *, limit: int = 20, type: str | None = None
-    ) -> list[Work]:
+    def search(self, query: str, *, limit: int = 20, type: str | None = None) -> list[Work]:
         if not query.strip():
             return []
         sql = """

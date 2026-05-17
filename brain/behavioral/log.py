@@ -14,6 +14,7 @@ OG reference: NellBrain/data/behavioral_log.jsonl (different scope — OG
 logged every daemon fire and conversation; v1 narrows to lifecycle changes
 of creative_dna + journal).
 """
+
 from __future__ import annotations
 
 import json
@@ -25,18 +26,20 @@ from typing import Any
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 from brain.utils.time import iso_utc
 
-_VALID_KINDS = frozenset({
-    "creative_dna_active_added",
-    "creative_dna_emerging_added",
-    "creative_dna_emerging_promoted",
-    "creative_dna_active_demoted",
-    "creative_dna_fading_dropped",
-    "journal_entry_added",
-    # body lifecycle — emitted by brain/body/events.py when an add_memory
-    # commit lands with climax >= 7. Same wire shape as journal_entry_added
-    # (uses source/reflex_arc_name/emotional_state slots).
-    "climax_event",
-})
+_VALID_KINDS = frozenset(
+    {
+        "creative_dna_active_added",
+        "creative_dna_emerging_added",
+        "creative_dna_emerging_promoted",
+        "creative_dna_active_demoted",
+        "creative_dna_fading_dropped",
+        "journal_entry_added",
+        # body lifecycle — emitted by brain/body/events.py when an add_memory
+        # commit lands with climax >= 7. Same wire shape as journal_entry_added
+        # (uses source/reflex_arc_name/emotional_state slots).
+        "climax_event",
+    }
+)
 
 
 def append_behavioral_event(

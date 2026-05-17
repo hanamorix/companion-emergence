@@ -241,7 +241,8 @@ def _respond_blocking(
 
 
 def _apply_replied_explicit_transition(
-    persona_dir: Path, audit_id: str,
+    persona_dir: Path,
+    audit_id: str,
 ) -> None:
     """Record a ``replied_explicit`` audit transition + re-render its memory.
 
@@ -262,7 +263,10 @@ def _apply_replied_explicit_transition(
 
     now = datetime.now(UTC).isoformat()
     update_audit_state(
-        persona_dir, audit_id=audit_id, new_state="replied_explicit", at=now,
+        persona_dir,
+        audit_id=audit_id,
+        new_state="replied_explicit",
+        at=now,
     )
     matched = next(
         (r for r in iter_initiate_audit_full(persona_dir) if r.audit_id == audit_id),
@@ -285,7 +289,9 @@ def _apply_replied_explicit_transition(
 
 
 def _close_session_blocking(
-    persona_dir: Path, session_id: str, provider: LLMProvider,
+    persona_dir: Path,
+    session_id: str,
+    provider: LLMProvider,
 ) -> Any:
     """Wrap brain.ingest.pipeline.close_session — blocks; called via asyncio.to_thread.
 
@@ -302,7 +308,8 @@ def _close_session_blocking(
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
         embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
         )
         stack.callback(embeddings.close)
         return close_session(
@@ -329,8 +336,9 @@ async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 3
         await asyncio.sleep(0.1)
     held = sum(1 for lock in state.in_flight_locks.values() if lock.locked())
     if held:
-        logger.warning("shutdown drain: %d in-flight chat(s) did not release in %.0fs",
-                       held, timeout)
+        logger.warning(
+            "shutdown drain: %d in-flight chat(s) did not release in %.0fs", held, timeout
+        )
 
 
 _CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
@@ -373,7 +381,8 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
                 if age < _CLOSE_HEARTBEAT_DEBOUNCE_S:
                     logger.info(
                         "close-heartbeat debounced (last fire %.0fs ago < %.0fs)",
-                        age, _CLOSE_HEARTBEAT_DEBOUNCE_S,
+                        age,
+                        _CLOSE_HEARTBEAT_DEBOUNCE_S,
                     )
                     return
         except Exception:  # noqa: BLE001
@@ -381,9 +390,7 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
 
     config = PersonaConfig.load(persona_dir / "persona_config.json")
     searcher = get_searcher(config.searcher)
-    default_arcs_path = (
-        Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
-    )
+    default_arcs_path = Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
@@ -406,7 +413,8 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=Path(__file__).parent.parent
-            / "engines" / "default_interests.json",
+            / "engines"
+            / "default_interests.json",
             persona_name=persona_dir.name,
             persona_system_prompt=f"You are {persona_dir.name}.",
         )
@@ -414,7 +422,9 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
 
 
 def _drain_sessions_blocking(
-    persona_dir: Path, provider: LLMProvider, silence_minutes: float = 0,
+    persona_dir: Path,
+    provider: LLMProvider,
+    silence_minutes: float = 0,
 ) -> Any:
     """Wrap brain.ingest.pipeline.snapshot_stale_sessions — used by shutdown.
 
@@ -437,7 +447,8 @@ def _drain_sessions_blocking(
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
         embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256),
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
         )
         stack.callback(embeddings.close)
         return snapshot_stale_sessions(
@@ -483,9 +494,7 @@ class ChatReq(BaseModel):
     def _validate_image_shas(cls, v: list[str]) -> list[str]:
         for sha in v:
             if not _SHA256_HEX_RE.fullmatch(sha):
-                raise ValueError(
-                    f"image_sha must be 64 lowercase hex chars, got {sha!r}"
-                )
+                raise ValueError(f"image_sha must be 64 lowercase hex chars, got {sha!r}")
         return v
 
 
@@ -599,9 +608,7 @@ def build_app(
         # Idle-shutdown watcher (only if requested)
         idle_task = None
         if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
-            idle_task = asyncio.create_task(
-                _idle_watcher(app.state.bridge, idle_shutdown_seconds)
-            )
+            idle_task = asyncio.create_task(_idle_watcher(app.state.bridge, idle_shutdown_seconds))
 
         try:
             yield
@@ -634,7 +641,10 @@ def build_app(
             drain_errors = 0
             try:
                 reports = await asyncio.to_thread(
-                    _drain_sessions_blocking, persona_dir, provider, 0,
+                    _drain_sessions_blocking,
+                    persona_dir,
+                    provider,
+                    0,
                 )
             except Exception:
                 logger.exception("shutdown drain failed")
@@ -652,6 +662,7 @@ def build_app(
             if drain_errors > 0:
                 try:
                     from brain.bridge import state_file as _state_file_mod
+
                     cur = _state_file_mod.read(persona_dir)
                     if cur is not None:
                         cur.drain_errors = drain_errors
@@ -681,7 +692,13 @@ def build_app(
             # 6. Publish shutdown event
             try:
                 bus.publish(
-                    {"type": "shutdown", "clean": drain_errors == 0, "drained": len(reports), "drain_errors": drain_errors, "at": _now()}
+                    {
+                        "type": "shutdown",
+                        "clean": drain_errors == 0,
+                        "drained": len(reports),
+                        "drain_errors": drain_errors,
+                        "at": _now(),
+                    }
                 )
             except Exception:
                 logger.exception("shutdown event publish failed")
@@ -738,7 +755,7 @@ def build_app(
             return  # auth disabled (tests / offline dev)
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="missing bearer token")
-        token = authorization[len("Bearer "):]
+        token = authorization[len("Bearer ") :]
         if not _consteq(token, auth_token):
             raise HTTPException(status_code=401, detail="invalid token")
 
@@ -821,7 +838,9 @@ def build_app(
             "anomalies": len(anomalies),
         }
 
-    @app.post("/session/new", response_model=NewSessionResp, dependencies=[Depends(require_http_auth)])
+    @app.post(
+        "/session/new", response_model=NewSessionResp, dependencies=[Depends(require_http_auth)]
+    )
     def session_new(req: NewSessionReq) -> NewSessionResp:
         s: BridgeAppState = app.state.bridge
         sess = create_session(s.persona)
@@ -892,10 +911,7 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        in_flight = (
-            session_id in s.in_flight_locks
-            and s.in_flight_locks[session_id].locked()
-        )
+        in_flight = session_id in s.in_flight_locks and s.in_flight_locks[session_id].locked()
         return {
             "session_id": sess.session_id,
             "persona": sess.persona_name,
@@ -915,6 +931,7 @@ def build_app(
         partial data still return 200 with the available pieces.
         """
         from brain.bridge.persona_state import build_persona_state
+
         return build_persona_state(persona_dir)
 
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
@@ -922,18 +939,21 @@ def build_app(
     def get_self_works(type: str | None = None, limit: int = 20) -> dict:
         """List recent works (most recent first). Optional ?type=NAME."""
         from brain.tools.impls.list_works import list_works
+
         return {"works": list_works(type=type, limit=limit, persona_dir=persona_dir)}
 
     @app.get("/self/works/search", dependencies=[Depends(require_http_auth)])
     def search_self_works(q: str, type: str | None = None, limit: int = 20) -> dict:
         """Full-text search over works. ?q=QUERY required."""
         from brain.tools.impls.search_works import search_works
+
         return {"works": search_works(query=q, type=type, limit=limit, persona_dir=persona_dir)}
 
     @app.get("/self/works/{work_id}", dependencies=[Depends(require_http_auth)])
     def get_self_work_by_id(work_id: str) -> dict:
         """Return one work's full content + metadata."""
         from brain.tools.impls.read_work import read_work
+
         result = read_work(id=work_id, persona_dir=persona_dir)
         if "error" in result:
             raise HTTPException(status_code=404, detail=result["error"])
@@ -942,8 +962,12 @@ def build_app(
     # ── POST /initiate/state — renderer-driven state transitions ─────────
     _VALID_INITIATE_STATES = frozenset(  # noqa: N806 — local constant
         {
-            "pending", "delivered", "read",
-            "replied_explicit", "acknowledged_unclear", "unanswered",
+            "pending",
+            "delivered",
+            "read",
+            "replied_explicit",
+            "acknowledged_unclear",
+            "unanswered",
             "dismissed",
         }
     )
@@ -978,20 +1002,21 @@ def build_app(
             )
         now = datetime.now(UTC).isoformat()
         update_audit_state(
-            s.persona_dir, audit_id=audit_id, new_state=new_state, at=now,
+            s.persona_dir,
+            audit_id=audit_id,
+            new_state=new_state,
+            at=now,
         )
         # Re-render memory if we can locate the audit row's subject + body.
         matched = next(
-            (
-                r for r in iter_initiate_audit_full(s.persona_dir)
-                if r.audit_id == audit_id
-            ),
+            (r for r in iter_initiate_audit_full(s.persona_dir) if r.audit_id == audit_id),
             None,
         )
         if matched is not None:
             try:
                 store = MemoryStore(
-                    s.persona_dir / "memories.db", integrity_check=False,
+                    s.persona_dir / "memories.db",
+                    integrity_check=False,
                 )
                 try:
                     update_initiate_memory_for_state(
@@ -1038,15 +1063,13 @@ def build_app(
         audit_id = req.get("audit_id")
         with_edits = req.get("with_edits")
         if not isinstance(audit_id, str):
-            raise HTTPException(
-                status_code=422, detail="audit_id required (string)"
-            )
+            raise HTTPException(status_code=422, detail="audit_id required (string)")
 
         matched = next(
             (
-                r for r in iter_initiate_audit_full(s.persona_dir)
-                if r.audit_id == audit_id
-                and r.kind == "voice_edit_proposal"
+                r
+                for r in iter_initiate_audit_full(s.persona_dir)
+                if r.audit_id == audit_id and r.kind == "voice_edit_proposal"
             ),
             None,
         )
@@ -1073,16 +1096,12 @@ def build_app(
         # the audit update — see comment below.
         voice_path = s.persona_dir / "nell-voice.md"
         if not voice_path.exists():
-            raise HTTPException(
-                status_code=409, detail="nell-voice.md not found"
-            )
+            raise HTTPException(status_code=409, detail="nell-voice.md not found")
         current = voice_path.read_text(encoding="utf-8")
         if old_text not in current:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "cannot apply voice edit: old text not present in template"
-                ),
+                detail=("cannot apply voice edit: old text not present in template"),
             )
         new_content = current.replace(old_text, new_text, 1)
 
@@ -1115,9 +1134,7 @@ def build_app(
 
         # Place 3: SoulStore voice_evolution.
         try:
-            soul_store = SoulStore(
-                str(s.persona_dir / "crystallizations.db")
-            )
+            soul_store = SoulStore(str(s.persona_dir / "crystallizations.db"))
             try:
                 soul_store.save_voice_evolution(
                     VoiceEvolution(
@@ -1135,14 +1152,13 @@ def build_app(
             finally:
                 soul_store.close()
         except Exception:
-            logger.exception(
-                "voice-edit: voice_evolution write failed for %s", audit_id
-            )
+            logger.exception("voice-edit: voice_evolution write failed for %s", audit_id)
 
         # Parallel episodic memory re-render (degrades gracefully).
         try:
             store = MemoryStore(
-                s.persona_dir / "memories.db", integrity_check=False,
+                s.persona_dir / "memories.db",
+                integrity_check=False,
             )
             try:
                 update_initiate_memory_for_state(
@@ -1156,9 +1172,7 @@ def build_app(
             finally:
                 store.close()
         except Exception:
-            logger.exception(
-                "voice-edit: memory update failed for %s", audit_id
-            )
+            logger.exception("voice-edit: memory update failed for %s", audit_id)
 
         return {
             "ok": True,
@@ -1181,9 +1195,7 @@ def build_app(
         s: BridgeAppState = app.state.bridge
         audit_id = req.get("audit_id")
         if not isinstance(audit_id, str):
-            raise HTTPException(
-                status_code=422, detail="audit_id required (string)"
-            )
+            raise HTTPException(status_code=422, detail="audit_id required (string)")
         now_iso = datetime.now(UTC).isoformat()
         update_audit_state(
             s.persona_dir,
@@ -1194,16 +1206,14 @@ def build_app(
         # Parallel episodic memory re-render so ambient recall sees the
         # dismissal. Best-effort.
         matched = next(
-            (
-                r for r in iter_initiate_audit_full(s.persona_dir)
-                if r.audit_id == audit_id
-            ),
+            (r for r in iter_initiate_audit_full(s.persona_dir) if r.audit_id == audit_id),
             None,
         )
         if matched is not None:
             try:
                 store = MemoryStore(
-                    s.persona_dir / "memories.db", integrity_check=False,
+                    s.persona_dir / "memories.db",
+                    integrity_check=False,
                 )
                 try:
                     update_initiate_memory_for_state(
@@ -1275,10 +1285,7 @@ def build_app(
         if sniffed != declared_media_type:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    f"declared {declared_media_type!r} but bytes look like "
-                    f"{sniffed!r}"
-                ),
+                detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
             )
         record = save_image_bytes(s.persona_dir, raw, sniffed)
         return {
@@ -1329,7 +1336,8 @@ def build_app(
                                 seen[sha] = turn_ts
                 except Exception:
                     logger.warning(
-                        "list_images: skip unreadable buffer %s", buf_path,
+                        "list_images: skip unreadable buffer %s",
+                        buf_path,
                         exc_info=True,
                     )
 
@@ -1347,12 +1355,14 @@ def build_app(
             ext = _resolve_image_ext(images_dir, sha)
             if ext is None:
                 continue  # file missing on disk — skip gracefully
-            results.append({
-                "sha": sha,
-                "ext": ext,
-                "first_seen_ts": ts,
-                "first_8_chars": sha[:8],
-            })
+            results.append(
+                {
+                    "sha": sha,
+                    "ext": ext,
+                    "first_seen_ts": ts,
+                    "first_8_chars": sha[:8],
+                }
+            )
 
         return results
 
@@ -1368,6 +1378,7 @@ def build_app(
         s: BridgeAppState = app.state.bridge
         try:
             from brain.images import media_type_for_sha, read_image_bytes
+
             media_type = media_type_for_sha(s.persona_dir, sha)
             data = read_image_bytes(s.persona_dir, sha, media_type)
         except (ValueError, FileNotFoundError):
@@ -1403,9 +1414,7 @@ def build_app(
                 # Audit 2026-05-07 P3-2: keep detailed exception text in
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
-                raise HTTPException(
-                    status_code=502, detail="provider_failed"
-                ) from exc
+                raise HTTPException(status_code=502, detail="provider_failed") from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -1466,23 +1475,17 @@ def build_app(
         except (WebSocketDisconnect, ValueError):
             return
         if len(raw_frame.encode("utf-8")) > _WS_FRAME_MAX_BYTES:
-            await ws.send_json(
-                {"type": "error", "code": "frame_too_large", "done": True}
-            )
+            await ws.send_json({"type": "error", "code": "frame_too_large", "done": True})
             await ws.close()
             return
         try:
             req = json.loads(raw_frame)
         except (ValueError, json.JSONDecodeError):
-            await ws.send_json(
-                {"type": "error", "code": "invalid_json", "done": True}
-            )
+            await ws.send_json({"type": "error", "code": "invalid_json", "done": True})
             await ws.close()
             return
         if not isinstance(req, dict):
-            await ws.send_json(
-                {"type": "error", "code": "invalid_frame_shape", "done": True}
-            )
+            await ws.send_json({"type": "error", "code": "invalid_frame_shape", "done": True})
             await ws.close()
             return
         message = req.get("message", "")
@@ -1508,9 +1511,7 @@ def build_app(
                 and all(_SHA256_HEX_RE.fullmatch(x) for x in raw_shas)
             )
             if not valid:
-                await ws.send_json(
-                    {"type": "error", "code": "invalid_image_shas", "done": True}
-                )
+                await ws.send_json({"type": "error", "code": "invalid_image_shas", "done": True})
                 await ws.close()
                 return
             image_shas = list(raw_shas)
@@ -1570,9 +1571,7 @@ def build_app(
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
                 # full exception text stays in the log only.
-                await ws.send_json(
-                    {"type": "error", "code": "provider_failed", "done": True}
-                )
+                await ws.send_json({"type": "error", "code": "provider_failed", "done": True})
                 await ws.close()
                 return
 
@@ -1685,7 +1684,10 @@ def build_app(
             # Wrap the pipeline call so internal exceptions don't crash the handler.
             try:
                 report = await asyncio.to_thread(
-                    _close_session_blocking, s.persona_dir, req.session_id, s.provider,
+                    _close_session_blocking,
+                    s.persona_dir,
+                    req.session_id,
+                    s.provider,
                 )
             except Exception as exc:
                 logger.exception("close_session failed session=%s", req.session_id)

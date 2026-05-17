@@ -154,6 +154,7 @@ def test_register_rejects_duplicate_name() -> None:
 
 def test_baseline_includes_climax():
     from brain.emotion.vocabulary import get
+
     e = get("climax")
     assert e is not None
     assert e.category == "body"
@@ -163,6 +164,7 @@ def test_baseline_includes_climax():
 
 def test_baseline_includes_touch_hunger():
     from brain.emotion.vocabulary import get
+
     e = get("touch_hunger")
     assert e is not None
     assert e.category == "body"
@@ -171,6 +173,7 @@ def test_baseline_includes_touch_hunger():
 
 def test_baseline_includes_comfort_seeking():
     from brain.emotion.vocabulary import get
+
     e = get("comfort_seeking")
     assert e is not None
     assert e.category == "body"
@@ -179,6 +182,7 @@ def test_baseline_includes_comfort_seeking():
 
 def test_baseline_includes_rest_need():
     from brain.emotion.vocabulary import get
+
     e = get("rest_need")
     assert e is not None
     assert e.category == "body"
@@ -188,6 +192,7 @@ def test_baseline_includes_rest_need():
 def test_existing_arousal_unchanged():
     """Reconciliation guard — we are NOT renaming or recategorizing arousal."""
     from brain.emotion.vocabulary import get
+
     e = get("arousal")
     assert e is not None
     assert e.category == "core"
@@ -197,6 +202,7 @@ def test_existing_arousal_unchanged():
 def test_existing_desire_unchanged():
     """Reconciliation guard — we are NOT renaming or recategorizing desire."""
     from brain.emotion.vocabulary import get
+
     e = get("desire")
     assert e is not None
     assert e.category == "core"
@@ -207,6 +213,7 @@ def test_body_emotions_loadable_via_state_set():
     """Climax + the three new ones must be settable on EmotionalState
     without raising — proves the registry accepts them."""
     from brain.emotion.state import EmotionalState
+
     s = EmotionalState()
     for name in ("climax", "touch_hunger", "comfort_seeking", "rest_need"):
         s.set(name, 5.0)

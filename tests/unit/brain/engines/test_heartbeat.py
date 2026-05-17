@@ -2069,9 +2069,7 @@ def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
             engine.run_tick(trigger="close", forced_resonance=5.0 + 0.1 * (i % 3))
         engine.run_tick(trigger="close", forced_resonance=5.1)
 
-        assert not any(
-            c.source == "emotion_spike" for c in read_candidates(persona_dir)
-        )
+        assert not any(c.source == "emotion_spike" for c in read_candidates(persona_dir))
     finally:
         engine.store.close()
         engine.hebbian.close()
@@ -2092,9 +2090,7 @@ def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
         engine.run_tick(trigger="close", forced_resonance=5.4)
 
         # No initiate candidate from emotion_spike.
-        assert not any(
-            c.source == "emotion_spike" for c in read_candidates(persona_dir)
-        )
+        assert not any(c.source == "emotion_spike" for c in read_candidates(persona_dir))
         # A draft entry exists and references the emotion_spike source.
         draft_path = persona_dir / "draft_space.md"
         assert draft_path.exists()

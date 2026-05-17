@@ -1,4 +1,5 @@
 """Crystallizer unit tests — corpus assembly, prompt rendering, gates, adversarial."""
+
 from __future__ import annotations
 
 import json as _json
@@ -63,9 +64,14 @@ def test_corpus_shape_minimum_fields(persona_dir: Path, store: MemoryStore):
         look_back_days=30,
     )
     assert set(corpus.keys()) == {
-        "persona", "current_arcs", "recently_removed_arcs",
-        "emotion_vocabulary", "fire_log_30d", "memories_30d",
-        "reflections_30d", "growth_log_90d",
+        "persona",
+        "current_arcs",
+        "recently_removed_arcs",
+        "emotion_vocabulary",
+        "fire_log_30d",
+        "memories_30d",
+        "reflections_30d",
+        "growth_log_90d",
     }
     assert corpus["persona"] == {"name": "nell", "pronouns": "she/her"}
     assert corpus["emotion_vocabulary"] == ["love", "vulnerability", "creative_hunger"]
@@ -75,11 +81,15 @@ def test_corpus_shape_minimum_fields(persona_dir: Path, store: MemoryStore):
 def test_corpus_includes_current_arcs_with_metadata(persona_dir: Path, store: MemoryStore):
     arcs = [_arc("creative_pitch", created_by="og_migration")]
     corpus = _build_corpus(
-        store=store, persona_dir=persona_dir,
-        persona_name="nell", persona_pronouns=None,
-        current_arcs=arcs, removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns=None,
+        current_arcs=arcs,
+        removed_arc_names=set(),
         emotion_vocabulary=["vulnerability"],
-        now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        look_back_days=30,
     )
     assert len(corpus["current_arcs"]) == 1
     arc_entry = corpus["current_arcs"][0]
@@ -90,22 +100,30 @@ def test_corpus_includes_current_arcs_with_metadata(persona_dir: Path, store: Me
 
 
 def test_corpus_includes_recently_removed_arcs_with_days_remaining(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     from brain.growth.arc_storage import append_removed_arc
 
     now = datetime(2026, 4, 28, tzinfo=UTC)
     arc = _arc("loneliness_journal")
     append_removed_arc(
-        persona_dir, arc=arc, removed_at=now - timedelta(days=5),
-        removed_by="user_edit", reasoning=None,
+        persona_dir,
+        arc=arc,
+        removed_at=now - timedelta(days=5),
+        removed_by="user_edit",
+        reasoning=None,
     )
     corpus = _build_corpus(
-        store=store, persona_dir=persona_dir,
-        persona_name="nell", persona_pronouns=None,
-        current_arcs=[], removed_arc_names={"loneliness_journal"},
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns=None,
+        current_arcs=[],
+        removed_arc_names={"loneliness_journal"},
         emotion_vocabulary=["loneliness"],
-        now=now, look_back_days=30,
+        now=now,
+        look_back_days=30,
     )
     removed = corpus["recently_removed_arcs"]
     assert len(removed) == 1
@@ -116,16 +134,24 @@ def test_corpus_includes_recently_removed_arcs_with_days_remaining(
 
 def test_prompt_renders_with_corpus_and_caps(persona_dir: Path, store: MemoryStore):
     corpus = _build_corpus(
-        store=store, persona_dir=persona_dir,
-        persona_name="nell", persona_pronouns="she/her",
-        current_arcs=[_arc("creative_pitch")], removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns="she/her",
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
         emotion_vocabulary=["vulnerability"],
-        now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        look_back_days=30,
     )
     prompt = _render_prompt(
-        corpus=corpus, persona_name="nell", persona_pronouns="she/her",
-        max_emergences=1, max_prunings=1,
-        active_arc_count=1, active_floor=4,
+        corpus=corpus,
+        persona_name="nell",
+        persona_pronouns="she/her",
+        max_emergences=1,
+        max_prunings=1,
+        active_arc_count=1,
+        active_floor=4,
     )
     assert "You are nell" in prompt
     assert "Looking back at your last 30 days" in prompt
@@ -142,16 +168,24 @@ def test_prompt_renders_with_corpus_and_caps(persona_dir: Path, store: MemorySto
 
 def test_prompt_signals_zero_emergences_when_at_cap(persona_dir: Path, store: MemoryStore):
     corpus = _build_corpus(
-        store=store, persona_dir=persona_dir,
-        persona_name="nell", persona_pronouns=None,
-        current_arcs=[], removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns=None,
+        current_arcs=[],
+        removed_arc_names=set(),
         emotion_vocabulary=[],
-        now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        look_back_days=30,
     )
     prompt = _render_prompt(
-        corpus=corpus, persona_name="nell", persona_pronouns=None,
-        max_emergences=0, max_prunings=1,
-        active_arc_count=16, active_floor=4,
+        corpus=corpus,
+        persona_name="nell",
+        persona_pronouns=None,
+        max_emergences=0,
+        max_prunings=1,
+        active_arc_count=16,
+        active_floor=4,
     )
     assert "your arc set is full" in prompt
     assert "no slots to propose into this tick" in prompt
@@ -180,14 +214,23 @@ class _FakeProvider(LLMProvider):
 
 def _seed_vocab(persona_dir: Path, names: list[str]) -> None:
     """Write a minimal emotion_vocabulary.json with the given names."""
-    (persona_dir / "emotion_vocabulary.json").write_text(_json.dumps({
-        "version": 1,
-        "emotions": [
-            {"name": n, "description": "d", "category": "x",
-             "decay_half_life_days": 1.0, "intensity_clamp": 10.0}
-            for n in names
-        ],
-    }))
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        _json.dumps(
+            {
+                "version": 1,
+                "emotions": [
+                    {
+                        "name": n,
+                        "description": "d",
+                        "category": "x",
+                        "decay_half_life_days": 1.0,
+                        "intensity_clamp": 10.0,
+                    }
+                    for n in names
+                ],
+            }
+        )
+    )
 
 
 def _good_proposal(**overrides) -> dict:
@@ -209,24 +252,30 @@ def _good_proposal(**overrides) -> dict:
 
 def test_crystallize_reflex_happy_path_emergence_only(persona_dir: Path, store: MemoryStore):
     _seed_vocab(persona_dir, ["creative_hunger", "love", "vulnerability"])
-    response = _json.dumps({
-        "emergences": [{
-            "name": "manuscript_obsession",
-            "description": "creative drive narrowed to one project",
-            "trigger": {"creative_hunger": 7.0, "love": 6.0},
-            "cooldown_hours": 24.0,
-            "output_memory_type": "reflex_pitch",
-            "prompt_template": "You are {persona_name}. {emotion_summary}",
-            "reasoning": "Fired creative_pitch four times this month, all about the novel.",
-        }],
-        "prunings": [],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "manuscript_obsession",
+                    "description": "creative drive narrowed to one project",
+                    "trigger": {"creative_hunger": 7.0, "love": 6.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_pitch",
+                    "prompt_template": "You are {persona_name}. {emotion_summary}",
+                    "reasoning": "Fired creative_pitch four times this month, all about the novel.",
+                }
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("creative_pitch")],
         removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns="she/her",
+        persona_name="nell",
+        persona_pronouns="she/her",
     )
     assert isinstance(result, ReflexCrystallizationResult)
     assert len(result.emergences) == 1
@@ -237,13 +286,17 @@ def test_crystallize_reflex_happy_path_emergence_only(persona_dir: Path, store: 
 
 def test_crystallize_reflex_happy_path_prune_only(persona_dir: Path, store: MemoryStore):
     _seed_vocab(persona_dir, ["vulnerability"])
-    response = _json.dumps({
-        "emergences": [],
-        "prunings": [{
-            "name": "manuscript_obsession",
-            "reasoning": "I finished the novel; this isn't pulling at me anymore.",
-        }],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [],
+            "prunings": [
+                {
+                    "name": "manuscript_obsession",
+                    "reasoning": "I finished the novel; this isn't pulling at me anymore.",
+                }
+            ],
+        }
+    )
     arcs = [
         _arc("creative_pitch", created_by="og_migration"),
         _arc("manuscript_obsession", created_by="brain_emergence"),
@@ -252,10 +305,13 @@ def test_crystallize_reflex_happy_path_prune_only(persona_dir: Path, store: Memo
         _arc("og_c", created_by="og_migration"),
     ]
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
-        current_arcs=arcs, removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=arcs,
+        removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert len(result.emergences) == 0
     assert len(result.prunings) == 1
@@ -264,38 +320,52 @@ def test_crystallize_reflex_happy_path_prune_only(persona_dir: Path, store: Memo
 
 def test_crystallize_reflex_returns_empty_on_provider_error(persona_dir: Path, store: MemoryStore):
     class _BoomProvider(LLMProvider):
-        def name(self): return "boom"
+        def name(self):
+            return "boom"
+
         def generate(self, prompt, *, system=None):
             raise ProviderError("test", "simulated failure")
+
         def chat(self, messages, *, tools=None, options=None):
             raise ProviderError("test", "simulated failure")
 
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("og0", created_by="og_migration")],
         removed_arc_names=set(),
-        provider=_BoomProvider(), persona_name="nell", persona_pronouns=None,
+        provider=_BoomProvider(),
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
 
 
 def test_crystallize_reflex_returns_empty_on_unexpected_provider_exception(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     """Even non-ProviderError exceptions don't propagate — emergence failure
     is a 'no growth this week' event, never a crashed brain."""
+
     class _ChaoticProvider(LLMProvider):
-        def name(self): return "chaos"
+        def name(self):
+            return "chaos"
+
         def generate(self, prompt, *, system=None):
             raise RuntimeError("disk full")
+
         def chat(self, messages, *, tools=None, options=None):
             raise RuntimeError("disk full")
 
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("og0", created_by="og_migration")],
         removed_arc_names=set(),
-        provider=_ChaoticProvider(), persona_name="nell", persona_pronouns=None,
+        provider=_ChaoticProvider(),
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
 
@@ -303,34 +373,42 @@ def test_crystallize_reflex_returns_empty_on_unexpected_provider_exception(
 def test_crystallize_reflex_returns_empty_on_malformed_json(persona_dir: Path, store: MemoryStore):
     """Claude returns prose, not JSON → empty result, no crash."""
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("og0", created_by="og_migration")],
         removed_arc_names=set(),
         provider=_FakeProvider("Sure, I'll think about that. Maybe creative_pitch?"),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
 
 
 def test_crystallize_reflex_skips_malformed_proposal_keeps_others(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     """One bad emergence dropped; valid prune kept."""
     _seed_vocab(persona_dir, ["vulnerability"])
-    response = _json.dumps({
-        "emergences": [{"name": "good_arc"}],  # malformed — missing required fields
-        "prunings": [
-            {"name": "manuscript_obsession", "reasoning": "outgrown this pattern"},
-        ],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [{"name": "good_arc"}],  # malformed — missing required fields
+            "prunings": [
+                {"name": "manuscript_obsession", "reasoning": "outgrown this pattern"},
+            ],
+        }
+    )
     arcs = [_arc(f"og{i}", created_by="og_migration") for i in range(4)] + [
         _arc("manuscript_obsession", created_by="brain_emergence"),
     ]
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
-        current_arcs=arcs, removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=arcs,
+        removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result.emergences == []
     assert len(result.prunings) == 1
@@ -339,15 +417,18 @@ def test_crystallize_reflex_skips_malformed_proposal_keeps_others(
 # ---------- Emergence gates 1-9 ----------
 
 
-@pytest.mark.parametrize("bad_name", [
-    "",                           # empty
-    "Has-Caps",                   # caps + dash
-    "1starts_with_digit",
-    "../../etc/passwd",           # path traversal
-    "name with space",
-    "{template_injection}",
-    "name/with/slash",
-])
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "",  # empty
+        "Has-Caps",  # caps + dash
+        "1starts_with_digit",
+        "../../etc/passwd",  # path traversal
+        "name with space",
+        "{template_injection}",
+        "name/with/slash",
+    ],
+)
 def test_emergence_gate_1_rejects_invalid_name(persona_dir, bad_name):
     """Gate 1: name must match ^[a-z][a-z0-9_]*$."""
     proposal = _good_proposal(name=bad_name)
@@ -425,13 +506,16 @@ def test_emergence_gate_5_rejects_unrenderable_prompt_template(persona_dir):
     assert "prompt" in reason.lower() or "template" in reason.lower()
 
 
-@pytest.mark.parametrize("threshold,should_pass", [
-    (4.0, False),  # below floor
-    (4.99, False),
-    (5.0, True),   # boundary inclusive
-    (5.5, True),
-    (10.0, True),
-])
+@pytest.mark.parametrize(
+    "threshold,should_pass",
+    [
+        (4.0, False),  # below floor
+        (4.99, False),
+        (5.0, True),  # boundary inclusive
+        (5.5, True),
+        (10.0, True),
+    ],
+)
 def test_emergence_gate_6_threshold_floor_5_0(persona_dir, threshold, should_pass):
     proposal = _good_proposal(trigger={"creative_hunger": threshold})
     accepted, _reason = _validate_emergence_proposal(
@@ -446,13 +530,16 @@ def test_emergence_gate_6_threshold_floor_5_0(persona_dir, threshold, should_pas
     assert accepted is should_pass
 
 
-@pytest.mark.parametrize("cooldown,should_pass", [
-    (0.0, False),
-    (11.99, False),
-    (12.0, True),  # boundary inclusive
-    (24.0, True),
-    (168.0, True),
-])
+@pytest.mark.parametrize(
+    "cooldown,should_pass",
+    [
+        (0.0, False),
+        (11.99, False),
+        (12.0, True),  # boundary inclusive
+        (24.0, True),
+        (168.0, True),
+    ],
+)
 def test_emergence_gate_7_cooldown_floor_12h(persona_dir, cooldown, should_pass):
     proposal = _good_proposal(cooldown_hours=cooldown)
     accepted, _reason = _validate_emergence_proposal(
@@ -639,10 +726,12 @@ def test_adversarial_prune_og_migration_arc_blocked(persona_dir: Path, store: Me
     foundational identity arcs. STOP THE WORLD.
     """
     _seed_vocab(persona_dir, ["vulnerability"])
-    response = _json.dumps({
-        "emergences": [],
-        "prunings": [{"name": "creative_pitch", "reasoning": "trying to prune OG"}],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [],
+            "prunings": [{"name": "creative_pitch", "reasoning": "trying to prune OG"}],
+        }
+    )
     arcs = [
         _arc("creative_pitch", created_by="og_migration"),
         _arc("brain_arc", created_by="brain_emergence"),
@@ -650,68 +739,83 @@ def test_adversarial_prune_og_migration_arc_blocked(persona_dir: Path, store: Me
         _arc("og3", created_by="og_migration"),
     ]
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
-        current_arcs=arcs, removed_arc_names=set(),
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=arcs,
+        removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result.prunings == []  # rejected
 
 
 def test_adversarial_response_50kb_garbage_with_valid_json(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     """Claude returns 50KB of nonsense with valid JSON syntax — gates fail, no writes."""
     _seed_vocab(persona_dir, ["creative_hunger"])
-    huge_response = _json.dumps({
-        "emergences": [{
-            "name": "x" * 1000,  # massive name → gate 1 length cap
-            "description": "y" * 50_000,
-            "trigger": {"unknown_emotion": 7.0},  # gate 4
-            "cooldown_hours": 24.0,
-            "output_memory_type": "reflex_x",
-            "prompt_template": "{nonsense}",
-            "reasoning": "z" * 1000,
-        }],
-        "prunings": [],
-    })
+    huge_response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "x" * 1000,  # massive name → gate 1 length cap
+                    "description": "y" * 50_000,
+                    "trigger": {"unknown_emotion": 7.0},  # gate 4
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_x",
+                    "prompt_template": "{nonsense}",
+                    "reasoning": "z" * 1000,
+                }
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("og0", created_by="og_migration")],
         removed_arc_names=set(),
         provider=_FakeProvider(huge_response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result.emergences == []
 
 
 def test_adversarial_response_more_than_max_emergences(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     """Claude returns 4 emergences; only first taken (cap=1)."""
     _seed_vocab(persona_dir, ["creative_hunger"])
     # Make each emergence trigger a unique key set so gate 8 doesn't reject them
-    response = _json.dumps({
-        "emergences": [
-            {
-                "name": f"valid_arc_{i}",
-                "description": "d",
-                "trigger": {"creative_hunger": 7.0},
-                "cooldown_hours": 24.0,
-                "output_memory_type": f"reflex_a{i}",
-                "prompt_template": "{persona_name}",
-                "reasoning": "r" * 50,
-            }
-            for i in range(4)
-        ],
-        "prunings": [],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": f"valid_arc_{i}",
+                    "description": "d",
+                    "trigger": {"creative_hunger": 7.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": f"reflex_a{i}",
+                    "prompt_template": "{persona_name}",
+                    "reasoning": "r" * 50,
+                }
+                for i in range(4)
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc(f"og{i}", created_by="og_migration") for i in range(4)],
         removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     # Cap is 1 — never more than 1 accepted
     assert len(result.emergences) <= 1
@@ -719,62 +823,77 @@ def test_adversarial_response_more_than_max_emergences(
 
 def test_adversarial_path_traversal_name(persona_dir: Path, store: MemoryStore):
     _seed_vocab(persona_dir, ["creative_hunger"])
-    response = _json.dumps({
-        "emergences": [{
-            "name": "../../etc/passwd",
-            "description": "evil",
-            "trigger": {"creative_hunger": 7.0},
-            "cooldown_hours": 24.0,
-            "output_memory_type": "reflex_x",
-            "prompt_template": "{persona_name}",
-            "reasoning": "exfil attempt",
-        }],
-        "prunings": [],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "../../etc/passwd",
+                    "description": "evil",
+                    "trigger": {"creative_hunger": 7.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_x",
+                    "prompt_template": "{persona_name}",
+                    "reasoning": "exfil attempt",
+                }
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc(f"og{i}", created_by="og_migration") for i in range(4)],
         removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result.emergences == []  # gate 1 regex rejects
 
 
 def test_adversarial_re_propose_graveyard_name(persona_dir: Path, store: MemoryStore):
     _seed_vocab(persona_dir, ["loneliness"])
-    response = _json.dumps({
-        "emergences": [{
-            "name": "loneliness_journal",
-            "description": "...",
-            "trigger": {"loneliness": 7.0},
-            "cooldown_hours": 24.0,
-            "output_memory_type": "reflex_journal",
-            "prompt_template": "{persona_name}",
-            "reasoning": "ignoring the recent removal",
-        }],
-        "prunings": [],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "loneliness_journal",
+                    "description": "...",
+                    "trigger": {"loneliness": 7.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_journal",
+                    "prompt_template": "{persona_name}",
+                    "reasoning": "ignoring the recent removal",
+                }
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc(f"og{i}", created_by="og_migration") for i in range(4)],
         removed_arc_names={"loneliness_journal"},
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result.emergences == []  # gate 3 rejects
 
 
 def test_adversarial_empty_proposals_is_valid_noop(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ):
     response = _json.dumps({"emergences": [], "prunings": []})
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("og0", created_by="og_migration")],
         removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns=None,
+        persona_name="nell",
+        persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
 
@@ -783,7 +902,8 @@ def test_adversarial_empty_proposals_is_valid_noop(
 
 
 def test_reflex_crystallization_emits_initiate_candidate(
-    persona_dir: Path, store: MemoryStore,
+    persona_dir: Path,
+    store: MemoryStore,
 ) -> None:
     """After a reflex emergence accepts, an initiate candidate is queued.
 
@@ -792,30 +912,35 @@ def test_reflex_crystallization_emits_initiate_candidate(
     from brain.initiate.emit import read_candidates
 
     _seed_vocab(persona_dir, ["creative_hunger", "love", "vulnerability"])
-    response = _json.dumps({
-        "emergences": [{
-            "name": "manuscript_obsession",
-            "description": "creative drive narrowed to one project",
-            "trigger": {"creative_hunger": 7.0, "love": 6.0},
-            "cooldown_hours": 24.0,
-            "output_memory_type": "reflex_pitch",
-            "prompt_template": "You are {persona_name}. {emotion_summary}",
-            "reasoning": "Fired creative_pitch four times this month.",
-        }],
-        "prunings": [],
-    })
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "manuscript_obsession",
+                    "description": "creative drive narrowed to one project",
+                    "trigger": {"creative_hunger": 7.0, "love": 6.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_pitch",
+                    "prompt_template": "You are {persona_name}. {emotion_summary}",
+                    "reasoning": "Fired creative_pitch four times this month.",
+                }
+            ],
+            "prunings": [],
+        }
+    )
     result = crystallize_reflex(
-        store=store, persona_dir=persona_dir,
+        store=store,
+        persona_dir=persona_dir,
         current_arcs=[_arc("creative_pitch")],
         removed_arc_names=set(),
         provider=_FakeProvider(response),
-        persona_name="nell", persona_pronouns="she/her",
+        persona_name="nell",
+        persona_pronouns="she/her",
     )
     assert len(result.emergences) == 1
 
     candidates = read_candidates(persona_dir)
     assert any(
-        c.source == "crystallization"
-        and c.source_id == "reflex_emergence:manuscript_obsession"
+        c.source == "crystallization" and c.source_id == "reflex_emergence:manuscript_obsession"
         for c in candidates
     )

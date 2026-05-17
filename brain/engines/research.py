@@ -461,8 +461,7 @@ def _emit_research_candidate(
         # candidate with the same source_id (mem_id) already exists in the queue.
         existing = read_candidates(persona_dir)
         prev_linked = any(
-            c.source == "research_completion" and c.source_id == mem_id
-            for c in existing
+            c.source == "research_completion" and c.source_id == mem_id for c in existing
         )
 
         # Build a minimal Protocol-conformant adapter (inline dataclass).

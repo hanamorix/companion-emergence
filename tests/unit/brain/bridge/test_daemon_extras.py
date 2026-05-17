@@ -2,6 +2,7 @@
 added with the `nell supervisor` rename. The four existing handlers
 (cmd_start/stop/status/tail) are covered by tests/bridge/test_lifecycle.py
 at the integration layer; we don't duplicate that here."""
+
 from __future__ import annotations
 
 import argparse
@@ -394,14 +395,16 @@ def test_cmd_tail_uses_subprotocol_auth_not_url_token(
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    monkeypatch.setattr(
-        "brain.paths.get_persona_dir", lambda name: persona_dir
-    )
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
 
     s = state_file.BridgeState(
-        persona="nell", pid=12345, port=50000,
+        persona="nell",
+        pid=12345,
+        port=50000,
         started_at="2026-05-05T00:00:00+00:00",
-        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
         auth_token="secret-token-aaa",
     )
     state_file.write(persona_dir, s)
@@ -413,14 +416,15 @@ def test_cmd_tail_uses_subprotocol_auth_not_url_token(
     def fake_connect(url, *, subprotocols=None, **kw):
         captured["url"] = url
         captured["subprotocols"] = subprotocols
+
         # Raise KeyboardInterrupt immediately to bail out of the recv loop
         class _WS:
-            def recv(self): raise KeyboardInterrupt()
+            def recv(self):
+                raise KeyboardInterrupt()
+
         yield _WS()
 
-    monkeypatch.setattr(
-        "websockets.sync.client.connect", fake_connect
-    )
+    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
 
     rc = daemon.cmd_tail(_args("nell"))
     assert rc == 0
@@ -441,14 +445,16 @@ def test_cmd_tail_no_subprotocols_when_token_absent(
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    monkeypatch.setattr(
-        "brain.paths.get_persona_dir", lambda name: persona_dir
-    )
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
 
     s = state_file.BridgeState(
-        persona="nell", pid=12345, port=50000,
+        persona="nell",
+        pid=12345,
+        port=50000,
         started_at="2026-05-05T00:00:00+00:00",
-        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
         auth_token=None,
     )
     state_file.write(persona_dir, s)
@@ -459,8 +465,11 @@ def test_cmd_tail_no_subprotocols_when_token_absent(
     @contextmanager
     def fake_connect(url, *, subprotocols=None, **kw):
         captured["subprotocols"] = subprotocols
+
         class _WS:
-            def recv(self): raise KeyboardInterrupt()
+            def recv(self):
+                raise KeyboardInterrupt()
+
         yield _WS()
 
     monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
@@ -483,14 +492,16 @@ def test_cmd_start_populates_readiness_when_already_running(
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    monkeypatch.setattr(
-        "brain.paths.get_persona_dir", lambda name: persona_dir
-    )
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
 
     s = state_file.BridgeState(
-        persona="nell", pid=4321, port=51234,
+        persona="nell",
+        pid=4321,
+        port=51234,
         started_at="2026-05-05T00:00:00+00:00",
-        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
         auth_token="tok-aaa",
     )
     state_file.write(persona_dir, s)
@@ -515,14 +526,16 @@ def test_cmd_start_readiness_is_optional_for_legacy_callers(
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    monkeypatch.setattr(
-        "brain.paths.get_persona_dir", lambda name: persona_dir
-    )
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
 
     s = state_file.BridgeState(
-        persona="nell", pid=4321, port=51234,
+        persona="nell",
+        pid=4321,
+        port=51234,
         started_at="2026-05-05T00:00:00+00:00",
-        stopped_at=None, shutdown_clean=False, client_origin="cli",
+        stopped_at=None,
+        shutdown_clean=False,
+        client_origin="cli",
         auth_token=None,
     )
     state_file.write(persona_dir, s)
@@ -591,7 +604,8 @@ def test_run_recovery_returns_none_when_previous_shutdown_clean(
 
 
 def test_run_recovery_returns_none_when_dirty_but_pid_still_alive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Dirty shutdown but the recorded pid is still alive → bridge actually
     running, recovery would clobber it. Must return None."""
@@ -616,7 +630,8 @@ def test_run_recovery_returns_none_when_dirty_but_pid_still_alive(
 
 
 def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Dirty shutdown + dead pid → recovery fires, drains stale sessions,
     returns the report count."""
@@ -642,7 +657,13 @@ def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
     captured: dict[str, object] = {}
 
     def fake_close_stale(
-        persona_dir_arg, *, silence_minutes, store, hebbian, provider, embeddings,
+        persona_dir_arg,
+        *,
+        silence_minutes,
+        store,
+        hebbian,
+        provider,
+        embeddings,
     ):
         captured["persona_dir"] = persona_dir_arg
         captured["silence_minutes"] = silence_minutes
@@ -658,7 +679,8 @@ def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
 
 
 def test_run_recovery_fires_on_drain_errors_even_when_shutdown_clean(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """drain_errors>0 arm: shutdown_clean=True but the last drain failed,
     so the buffer was retained — recovery must run anyway."""
@@ -703,7 +725,8 @@ def test_acquire_lock_succeeds_on_fresh_persona_dir(tmp_path: Path) -> None:
 
 
 def test_acquire_lock_returns_none_when_existing_pid_alive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
@@ -715,7 +738,8 @@ def test_acquire_lock_returns_none_when_existing_pid_alive(
 
 
 def test_acquire_lock_recovers_stale_lockfile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Existing lock holds a dead pid → unlink + re-acquire."""
     persona_dir = tmp_path / "persona"
@@ -761,7 +785,8 @@ def test_release_lock_is_idempotent_after_external_unlink(
 
 
 def test_spawn_detached_invokes_popen_with_detach_flags(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
@@ -805,7 +830,8 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
 
 
 def test_spawn_detached_omits_idle_arg_when_none(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
@@ -829,7 +855,9 @@ def test_spawn_detached_omits_idle_arg_when_none(
 
 
 def test_cmd_start_returns_1_when_persona_dir_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -841,7 +869,9 @@ def test_cmd_start_returns_1_when_persona_dir_missing(
 
 
 def test_cmd_start_returns_2_when_lock_held(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """is_running=False but acquire_lock returns None — another starter is
     mid-flight. Must surface code 2, not spawn."""
@@ -859,7 +889,9 @@ def test_cmd_start_returns_2_when_lock_held(
 
 
 def test_cmd_start_prints_drain_message_when_recovery_ran(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Recovery returns 2 drained sessions → user-visible message + spawn proceeds."""
     from brain.bridge import state_file
@@ -906,7 +938,9 @@ def test_cmd_start_prints_drain_message_when_recovery_ran(
 
 
 def test_cmd_start_prints_no_drain_message_when_recovery_ran_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Recovery ran but drained 0 sessions → "no orphan sessions to drain" message."""
     from brain.bridge import state_file
@@ -947,7 +981,9 @@ def test_cmd_start_prints_no_drain_message_when_recovery_ran_empty(
 
 
 def test_cmd_start_kills_orphan_child_when_health_never_responds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """H-D regression: bridge spawned, /health never came up — must SIGTERM
     the orphan child and return 1 with a "killed orphan child" message."""
@@ -1001,6 +1037,7 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
     assert rc == 1
     assert killed["pid"] == orphan_pid
     import signal as _signal
+
     assert killed["sig"] == _signal.SIGTERM
     err = capsys.readouterr().err
     assert "killed orphan child" in err
@@ -1011,7 +1048,9 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
 
 
 def test_cmd_run_persona_not_found_returns_1(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Bonus test: cmd_run mirrors cmd_start's persona-not-found path."""
     home = tmp_path / "home"
@@ -1024,7 +1063,9 @@ def test_cmd_run_persona_not_found_returns_1(
 
 
 def test_cmd_run_returns_2_when_lock_held(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """is_running=False but acquire_lock=None — surface 2, do not call runner."""
     _patch_paths(monkeypatch, tmp_path)
@@ -1044,7 +1085,9 @@ def test_cmd_run_returns_2_when_lock_held(
 
 
 def test_cmd_stop_returns_0_when_no_state_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _patch_paths(monkeypatch, tmp_path)
     rc = daemon.cmd_stop(_args("nell"))
@@ -1053,7 +1096,9 @@ def test_cmd_stop_returns_0_when_no_state_file(
 
 
 def test_cmd_stop_returns_0_when_pid_already_dead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """State file present but pid is dead → no-op clean exit."""
     from brain.bridge import state_file
@@ -1079,7 +1124,9 @@ def test_cmd_stop_returns_0_when_pid_already_dead(
 
 
 def test_cmd_stop_sends_sigterm_and_waits_for_pid_to_die(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Monkeypatched lifecycle: pid_is_alive returns True initially, False after
     SIGTERM. cmd_stop sends SIGTERM, polls, exits 0. No real subprocess spawned."""
@@ -1117,6 +1164,7 @@ def test_cmd_stop_sends_sigterm_and_waits_for_pid_to_die(
 
     rc = daemon.cmd_stop(_args("nell", timeout=5.0))
     import signal as _signal
+
     assert killed["pid"] == 33333
     assert killed["sig"] == _signal.SIGTERM
     assert rc == 0
@@ -1124,7 +1172,9 @@ def test_cmd_stop_sends_sigterm_and_waits_for_pid_to_die(
 
 
 def test_cmd_stop_returns_1_when_timeout_exceeded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """SIGTERM sent but pid never dies within timeout → return 1."""
     from brain.bridge import state_file
@@ -1158,7 +1208,9 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
 
 
 def test_cmd_stop_handles_processlookuperror_during_kill(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """If the process dies between liveness probe and SIGTERM, os.kill raises
     ProcessLookupError — cmd_stop must catch and report no-op."""
@@ -1194,7 +1246,9 @@ def test_cmd_stop_handles_processlookuperror_during_kill(
 
 
 def test_cmd_status_no_state_file_prints_not_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _patch_paths(monkeypatch, tmp_path)
     rc = daemon.cmd_status(_args("nell"))
@@ -1203,7 +1257,9 @@ def test_cmd_status_no_state_file_prints_not_running(
 
 
 def test_cmd_status_running_prints_health_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Live bridge: /health succeeds, status prints pid/port + health fields."""
     from brain.bridge import state_file
@@ -1257,7 +1313,9 @@ def test_cmd_status_running_prints_health_fields(
 
 
 def test_cmd_status_returns_1_when_health_unreachable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """is_running=True but /health raises → return 1 + stderr."""
     import httpx
@@ -1290,7 +1348,9 @@ def test_cmd_status_returns_1_when_health_unreachable(
 
 
 def test_cmd_status_reports_dirty_crash_when_recovery_needed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """State file present, not running, recovery_needed=True → dirty-crash message."""
     from brain.bridge import state_file
@@ -1317,7 +1377,9 @@ def test_cmd_status_reports_dirty_crash_when_recovery_needed(
 
 
 def test_cmd_status_reports_clean_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """State file present, not running, recovery_needed=False → clean stop message."""
     from brain.bridge import state_file
@@ -1348,7 +1410,9 @@ def test_cmd_status_reports_clean_stop(
 
 
 def test_cmd_tail_returns_1_when_bridge_not_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """No state file → cmd_tail prints "bridge not running" to stderr, returns 1."""
     _patch_paths(monkeypatch, tmp_path)

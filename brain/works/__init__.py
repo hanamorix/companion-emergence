@@ -11,6 +11,7 @@ Storage and indexing live in submodules:
 
 See docs/superpowers/specs/2026-05-04-nell-works-design.md.
 """
+
 from __future__ import annotations
 
 import hashlib

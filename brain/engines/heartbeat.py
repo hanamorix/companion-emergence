@@ -603,9 +603,7 @@ class HeartbeatEngine:
             # Emotion-spike initiate emitter (Phase 4.3). Runs after the
             # heartbeat log append so a spike emit can never roll back the
             # tick's audit trail. Fully fault-isolated inside the helper.
-            current_resonance, current_vector = self._compute_current_resonance(
-                forced_resonance
-            )
+            current_resonance, current_vector = self._compute_current_resonance(forced_resonance)
             self._maybe_emit_emotion_spike(
                 persona_dir=persona_dir,
                 current_resonance=current_resonance,
@@ -1111,9 +1109,7 @@ class HeartbeatEngine:
         peak = max(0.0, min(10.0, peak))
         return peak, combined
 
-    def _update_rolling_baseline(
-        self, current_resonance: float
-    ) -> tuple[float, float, float]:
+    def _update_rolling_baseline(self, current_resonance: float) -> tuple[float, float, float]:
         """Update the in-memory rolling-baseline window. Returns (mean, stdev, delta_sigma).
 
         Window: last 24 ticks (~6h at default cadence). Below 5 ticks we

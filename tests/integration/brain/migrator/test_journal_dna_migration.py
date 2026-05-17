@@ -1,4 +1,5 @@
 """brain.migrator.og_journal_dna — migrate OG creative_dna + reflex_journal memories."""
+
 from __future__ import annotations
 
 import json
@@ -90,7 +91,16 @@ def test_migrate_creative_dna_idempotent(tmp_path: Path):
     """Re-migration produces deterministic same output."""
     og_root = tmp_path / "og"
     (og_root / "data").mkdir(parents=True)
-    og_dna = {"version": "1.0", "writing_style": {"core_voice": "v", "strengths": [], "tendencies": [], "influences": [], "avoid": []}}
+    og_dna = {
+        "version": "1.0",
+        "writing_style": {
+            "core_voice": "v",
+            "strengths": [],
+            "tendencies": [],
+            "influences": [],
+            "avoid": [],
+        },
+    }
     (og_root / "data" / "nell_creative_dna.json").write_text(json.dumps(og_dna))
 
     persona_dir = tmp_path / "p"
@@ -154,8 +164,10 @@ def test_migrate_journal_memories_idempotent(tmp_path: Path):
     store = MemoryStore(persona_dir / "memories.db")
     try:
         mem = Memory.create_new(
-            content="x", memory_type="reflex_journal",
-            domain="self", emotions={},
+            content="x",
+            memory_type="reflex_journal",
+            domain="self",
+            emotions={},
         )
         store.create(mem)
 

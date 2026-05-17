@@ -15,9 +15,7 @@ from pathlib import Path
 from brain.bridge.runner import _setup_runtime_logging
 
 
-def test_setup_runtime_logging_attaches_rotating_handler(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_setup_runtime_logging_attaches_rotating_handler(tmp_path: Path, monkeypatch) -> None:
     """Calling _setup_runtime_logging adds a RotatingFileHandler that
     points at <log_dir>/runtime-<persona>.log."""
     monkeypatch.setenv(
@@ -51,9 +49,7 @@ def test_setup_runtime_logging_attaches_rotating_handler(
                 h.close()
 
 
-def test_setup_runtime_logging_swallows_failures(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_setup_runtime_logging_swallows_failures(tmp_path: Path, monkeypatch, capsys) -> None:
     """Best-effort: a failed setup must not raise, only breadcrumb to stderr.
 
     Forces failure by pointing the log dir at a path that can't be created

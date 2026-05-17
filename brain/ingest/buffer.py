@@ -44,10 +44,7 @@ def _validate_session_id(session_id: str) -> None:
     we'd rather surface as the same ValueError.
     """
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError(
-            f"invalid session_id {session_id!r} — must match "
-            f"[A-Za-z0-9_-]{{1,64}}"
-        )
+        raise ValueError(f"invalid session_id {session_id!r} — must match [A-Za-z0-9_-]{{1,64}}")
 
 
 def _session_path(persona_dir: Path, session_id: str) -> Path:
@@ -213,9 +210,7 @@ def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
         return None
 
 
-def write_backoff(
-    persona_dir: Path, session_id: str, failures: int, first_failure_at: str
-) -> None:
+def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failure_at: str) -> None:
     """Atomically write the backoff state. Raises ValueError on bad ts."""
     datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
     path = _backoff_path(persona_dir, session_id)
@@ -233,9 +228,7 @@ def delete_backoff(persona_dir: Path, session_id: str) -> None:
     path.unlink(missing_ok=True)
 
 
-def read_session_after(
-    persona_dir: Path, session_id: str, after_ts: str | None
-) -> list[dict]:
+def read_session_after(persona_dir: Path, session_id: str, after_ts: str | None) -> list[dict]:
     """Return turns whose ts > after_ts.
 
     after_ts=None returns all turns. Malformed after_ts also returns all

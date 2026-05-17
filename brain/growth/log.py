@@ -156,7 +156,11 @@ def arc_added_event(
 
 
 def arc_pruned_by_brain_event(
-    *, timestamp: datetime, name: str, description: str, reasoning: str,
+    *,
+    timestamp: datetime,
+    name: str,
+    description: str,
+    reasoning: str,
 ) -> GrowthLogEvent:
     """Constructor for arc_pruned_by_brain events."""
     return GrowthLogEvent(
@@ -173,7 +177,10 @@ def arc_pruned_by_brain_event(
 
 
 def arc_removed_by_user_event(
-    *, timestamp: datetime, name: str, description: str,
+    *,
+    timestamp: datetime,
+    name: str,
+    description: str,
 ) -> GrowthLogEvent:
     """Constructor for arc_removed_by_user events. Reason is hardcoded
     because user file-edit removals don't carry explicit reasoning."""
@@ -191,7 +198,10 @@ def arc_removed_by_user_event(
 
 
 def arc_rejected_user_removed_event(
-    *, timestamp: datetime, name: str, reasoning: str,
+    *,
+    timestamp: datetime,
+    name: str,
+    reasoning: str,
 ) -> GrowthLogEvent:
     """Constructor for arc_rejected_user_removed events — fired when the
     brain proposes an arc whose name is in the 15-day graveyard window."""
@@ -209,7 +219,10 @@ def arc_rejected_user_removed_event(
 
 
 def arc_proposal_dropped_event(
-    *, timestamp: datetime, name: str, reasoning: str,
+    *,
+    timestamp: datetime,
+    name: str,
+    reasoning: str,
 ) -> GrowthLogEvent:
     """Constructor for arc_proposal_dropped events — generic gate-rejection."""
     return GrowthLogEvent(

@@ -40,16 +40,11 @@ _TEMPLATES: dict[str, str] = {
         "{message_quoted}. I haven't sent it yet — waiting for a better hour."
     ),
     "delivered": (
-        "I reached out to Hana about {subject}. I said: {message_quoted}. "
-        "She hasn't seen it yet."
+        "I reached out to Hana about {subject}. I said: {message_quoted}. She hasn't seen it yet."
     ),
-    "read": (
-        "I reached out to Hana about {subject}. I said: {message_quoted}. "
-        "She's seen it."
-    ),
+    "read": ("I reached out to Hana about {subject}. I said: {message_quoted}. She's seen it."),
     "replied_explicit": (
-        "I reached out to Hana about {subject}. I said: {message_quoted}. "
-        "She answered."
+        "I reached out to Hana about {subject}. I said: {message_quoted}. She answered."
     ),
     "acknowledged_unclear": (
         "I reached out to Hana about {subject}. I said: {message_quoted}. "

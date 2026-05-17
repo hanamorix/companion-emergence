@@ -1,4 +1,5 @@
 """Argparse wiring tests for `nell works`."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

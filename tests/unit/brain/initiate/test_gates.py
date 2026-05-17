@@ -71,9 +71,7 @@ def test_check_send_allowed_blocks_notify_in_blackout(tmp_path: Path) -> None:
     """If user-local time is in 23:00-07:00, notify is denied."""
     tz = ZoneInfo("America/Los_Angeles")
     blackout_local = datetime(2026, 5, 11, 1, 30, tzinfo=tz)
-    allowed, reason = check_send_allowed(
-        tmp_path, urgency="notify", now=blackout_local
-    )
+    allowed, reason = check_send_allowed(tmp_path, urgency="notify", now=blackout_local)
     assert allowed is False
     assert reason is not None
     assert "blackout" in reason

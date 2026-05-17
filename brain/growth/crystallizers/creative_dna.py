@@ -12,6 +12,7 @@ Six validation gates per proposal. Total accepted ≤ 3 per tick. Never raises
 to caller. Atomic writes via brain.creative.dna.save_creative_dna; biographical
 record via brain.behavioral.log.append_behavioral_event.
 """
+
 from __future__ import annotations
 
 import json
@@ -141,7 +142,9 @@ def crystallize_creative_dna(
         if not isinstance(proposal, dict):
             continue
         if not _validate_emerging_addition(
-            proposal, dna=dna, recently_dropped=recently_dropped,
+            proposal,
+            dna=dna,
+            recently_dropped=recently_dropped,
         ):
             continue
         accepted_additions.append(proposal)
@@ -179,7 +182,9 @@ def crystallize_creative_dna(
     # Apply atomically — single save_creative_dna after mutating dna in place
     try:
         _apply_changes(
-            persona_dir, dna, now,
+            persona_dir,
+            dna,
+            now,
             additions=accepted_additions,
             promotions=accepted_promotions,
             demotions=accepted_demotions,
@@ -200,7 +205,9 @@ def crystallize_creative_dna(
 
 
 def _gather_recent_fiction(
-    store: MemoryStore, *, cutoff: datetime,
+    store: MemoryStore,
+    *,
+    cutoff: datetime,
 ) -> list[dict[str, Any]]:
     """Pull memories likely to be fiction-tagged content from the last 30 days."""
     out: list[dict[str, Any]] = []
@@ -209,11 +216,13 @@ def _gather_recent_fiction(
         try:
             for m in store.list_by_type(mtype):
                 if m.created_at >= cutoff:
-                    out.append({
-                        "memory_id": m.id,
-                        "type": mtype,
-                        "excerpt": (m.content or "")[:_FICTION_EXCERPT_MAX_CHARS],
-                    })
+                    out.append(
+                        {
+                            "memory_id": m.id,
+                            "type": mtype,
+                            "excerpt": (m.content or "")[:_FICTION_EXCERPT_MAX_CHARS],
+                        }
+                    )
         except Exception:  # noqa: BLE001
             pass
 
@@ -224,11 +233,13 @@ def _gather_recent_fiction(
                 continue
             content = m.content or ""
             if _looks_like_prose(content):
-                out.append({
-                    "memory_id": m.id,
-                    "type": "conversation_prose",
-                    "excerpt": content[:_FICTION_EXCERPT_MAX_CHARS],
-                })
+                out.append(
+                    {
+                        "memory_id": m.id,
+                        "type": "conversation_prose",
+                        "excerpt": content[:_FICTION_EXCERPT_MAX_CHARS],
+                    }
+                )
     except Exception:  # noqa: BLE001
         pass
 
@@ -249,25 +260,31 @@ def _looks_like_prose(content: str) -> bool:
 
 
 def _gather_growth_log(
-    persona_dir: Path, *, now: datetime,
+    persona_dir: Path,
+    *,
+    now: datetime,
 ) -> list[dict[str, Any]]:
     log_path = persona_dir / "behavioral_log.jsonl"
     cutoff = now - timedelta(days=_BEHAVIORAL_LOG_LOOK_BACK_DAYS)
     return [
-        e for e in read_behavioral_log(log_path, since=cutoff)
+        e
+        for e in read_behavioral_log(log_path, since=cutoff)
         if e.get("kind", "").startswith("creative_dna_")
     ]
 
 
 def _recently_dropped_names(
-    growth_log: list[dict[str, Any]], *, now: datetime,
+    growth_log: list[dict[str, Any]],
+    *,
+    now: datetime,
 ) -> set[str]:
     from brain.utils.time import iso_utc
+
     cutoff_iso = iso_utc(now - timedelta(days=_RECENTLY_DROPPED_WINDOW_DAYS))
     return {
-        e["name"] for e in growth_log
-        if e.get("kind") == "creative_dna_fading_dropped"
-        and e.get("timestamp", "") >= cutoff_iso
+        e["name"]
+        for e in growth_log
+        if e.get("kind") == "creative_dna_fading_dropped" and e.get("timestamp", "") >= cutoff_iso
     }
 
 
@@ -284,13 +301,11 @@ def _render_prompt(
     )
 
     recent_writing_str = (
-        json.dumps(recent_writing, indent=2) if recent_writing
+        json.dumps(recent_writing, indent=2)
+        if recent_writing
         else "(no recent fiction-tagged samples)"
     )
-    growth_log_str = (
-        json.dumps(growth_log, indent=2) if growth_log
-        else "(no recent trajectory)"
-    )
+    growth_log_str = json.dumps(growth_log, indent=2) if growth_log else "(no recent trajectory)"
 
     return f"""{pronouns_clause}
 
@@ -407,7 +422,9 @@ def _validate_emerging_addition(
 
 
 def _validate_emerging_promotion(
-    proposal: dict[str, Any], *, dna: dict[str, Any],
+    proposal: dict[str, Any],
+    *,
+    dna: dict[str, Any],
 ) -> bool:
     name = proposal.get("name")
     if not _validate_name(name):
@@ -423,7 +440,9 @@ def _validate_emerging_promotion(
 
 
 def _validate_active_demotion(
-    proposal: dict[str, Any], *, dna: dict[str, Any],
+    proposal: dict[str, Any],
+    *,
+    dna: dict[str, Any],
 ) -> bool:
     name = proposal.get("name")
     if not _validate_name(name):
@@ -442,7 +461,10 @@ def _validate_active_demotion(
 
 
 def _aggregate_recent_emotion_vector(
-    store: MemoryStore, *, now: datetime, look_back_days: int = 30,
+    store: MemoryStore,
+    *,
+    now: datetime,
+    look_back_days: int = 30,
 ) -> dict[str, float]:
     """Return a max-pooled emotion vector across recent active memories.
 
@@ -457,7 +479,8 @@ def _aggregate_recent_emotion_vector(
 
         cutoff = now - timedelta(days=look_back_days)
         recent = [
-            m for m in list_conversation_memories(store, active_only=True)
+            m
+            for m in list_conversation_memories(store, active_only=True)
             if m.created_at >= cutoff and m.emotions
         ]
         if not recent:
@@ -485,12 +508,14 @@ def _apply_changes(
 
     # Apply additions → emerging
     for a in additions:
-        dna["tendencies"]["emerging"].append({
-            "name": a["name"],
-            "added_at": now_iso,
-            "reasoning": a["reasoning"],
-            "evidence_memory_ids": list(a.get("evidence_memory_ids", [])),
-        })
+        dna["tendencies"]["emerging"].append(
+            {
+                "name": a["name"],
+                "added_at": now_iso,
+                "reasoning": a["reasoning"],
+                "evidence_memory_ids": list(a.get("evidence_memory_ids", [])),
+            }
+        )
 
     # Apply promotions: remove from emerging, add to active
     for p in promotions:
@@ -498,13 +523,15 @@ def _apply_changes(
         match = next((t for t in emerging if t["name"] == p["name"]), None)
         if match:
             emerging.remove(match)
-            dna["tendencies"]["active"].append({
-                "name": match["name"],
-                "added_at": match.get("added_at", now_iso),
-                "promoted_from_emerging_at": now_iso,
-                "reasoning": p["reasoning"],
-                "evidence_memory_ids": match.get("evidence_memory_ids", []),
-            })
+            dna["tendencies"]["active"].append(
+                {
+                    "name": match["name"],
+                    "added_at": match.get("added_at", now_iso),
+                    "promoted_from_emerging_at": now_iso,
+                    "reasoning": p["reasoning"],
+                    "evidence_memory_ids": match.get("evidence_memory_ids", []),
+                }
+            )
 
     # Apply demotions: remove from active, add to fading
     for d in demotions:
@@ -512,12 +539,14 @@ def _apply_changes(
         match = next((t for t in active if t["name"] == d["name"]), None)
         if match:
             active.remove(match)
-            dna["tendencies"]["fading"].append({
-                "name": match["name"],
-                "demoted_to_fading_at": now_iso,
-                "last_evidence_at": d.get("last_evidence_at", now_iso),
-                "reasoning": d["reasoning"],
-            })
+            dna["tendencies"]["fading"].append(
+                {
+                    "name": match["name"],
+                    "demoted_to_fading_at": now_iso,
+                    "last_evidence_at": d.get("last_evidence_at", now_iso),
+                    "reasoning": d["reasoning"],
+                }
+            )
 
     # Persist atomically
     save_creative_dna(persona_dir, dna)
@@ -553,8 +582,10 @@ def _apply_changes(
     for a in additions:
         try:
             append_behavioral_event(
-                log_path, kind="creative_dna_emerging_added",
-                name=a["name"], timestamp=now,
+                log_path,
+                kind="creative_dna_emerging_added",
+                name=a["name"],
+                timestamp=now,
                 reasoning=a["reasoning"],
                 evidence_memory_ids=a.get("evidence_memory_ids", []),
             )
@@ -564,8 +595,10 @@ def _apply_changes(
     for p in promotions:
         try:
             append_behavioral_event(
-                log_path, kind="creative_dna_emerging_promoted",
-                name=p["name"], timestamp=now,
+                log_path,
+                kind="creative_dna_emerging_promoted",
+                name=p["name"],
+                timestamp=now,
                 reasoning=p["reasoning"],
                 evidence_memory_ids=(),
             )
@@ -575,8 +608,10 @@ def _apply_changes(
     for d in demotions:
         try:
             append_behavioral_event(
-                log_path, kind="creative_dna_active_demoted",
-                name=d["name"], timestamp=now,
+                log_path,
+                kind="creative_dna_active_demoted",
+                name=d["name"],
+                timestamp=now,
                 reasoning=d["reasoning"],
                 evidence_memory_ids=(),
             )

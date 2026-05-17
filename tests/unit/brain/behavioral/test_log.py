@@ -1,4 +1,5 @@
 """brain.behavioral.log — append-only JSONL for creative_dna + journal lifecycle changes."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

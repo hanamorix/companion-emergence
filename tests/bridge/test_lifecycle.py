@@ -1,4 +1,5 @@
 """Bridge lifecycle — supervisor tick, idle-shutdown, graceful close."""
+
 from __future__ import annotations
 
 import time
@@ -47,7 +48,8 @@ def test_supervisor_prunes_old_empty_sessions(persona_dir: Path):
 
 
 def test_graceful_shutdown_drains_via_snapshot_and_preserves_buffer(
-    persona_dir: Path, monkeypatch,
+    persona_dir: Path,
+    monkeypatch,
 ):
     """Lifespan teardown drains via snapshot_stale_sessions(silence_minutes=0)
     — non-destructive: memories extract durably, but the buffer + cursor
@@ -89,7 +91,8 @@ def test_graceful_shutdown_drains_via_snapshot_and_preserves_buffer(
 
 
 def test_graceful_shutdown_records_dirty_when_snapshot_drain_raises(
-    persona_dir: Path, monkeypatch,
+    persona_dir: Path,
+    monkeypatch,
 ):
     """A catastrophic shutdown drain exception must still arm dirty recovery."""
     from brain.bridge import state_file
@@ -241,6 +244,7 @@ def test_recovery_needed_predicate_drain_errors_arm(tmp_path: Path):
     flipped clean=True before the lifespan had a chance to write
     drain_errors, the saved drain_errors still wins)."""
     from brain.bridge import state_file
+
     persona_dir = tmp_path
     persona_dir.mkdir(exist_ok=True)
     s = state_file.BridgeState(

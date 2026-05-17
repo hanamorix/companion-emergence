@@ -1,4 +1,5 @@
 """Shared fixtures for bridge tests."""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -27,6 +28,7 @@ def persona_dir(tmp_path: Path) -> Path:
 def _reset_session_registry():
     """Clear the in-memory session registry between bridge tests."""
     from brain.chat.session import reset_registry
+
     reset_registry()
     yield
     reset_registry()

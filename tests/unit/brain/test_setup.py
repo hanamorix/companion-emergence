@@ -1,4 +1,5 @@
 """Tests for brain.setup — pure persona-setup helpers used by `nell init`."""
+
 from __future__ import annotations
 
 import json
@@ -22,8 +23,7 @@ def test_validate_persona_name_accepts_simple_names() -> None:
 
 
 def test_validate_persona_name_rejects_path_traversal_and_garbage() -> None:
-    for evil in ["../escape", "a/b", "..", "", "n e l l", "x" * 41,
-                 "weird:char", "name.with.dots"]:
+    for evil in ["../escape", "a/b", "..", "", "n e l l", "x" * 41, "weird:char", "name.with.dots"]:
         with pytest.raises(ValueError, match="invalid persona name"):
             validate_persona_name(evil)
 
@@ -51,11 +51,15 @@ def test_write_persona_config_preserves_existing_fields(tmp_path: Path) -> None:
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
     config_path = persona_dir / "persona_config.json"
-    config_path.write_text(json.dumps({
-        "provider": "ollama",
-        "searcher": "ddgs",
-        "mcp_audit_log_level": "full",
-    }))
+    config_path.write_text(
+        json.dumps(
+            {
+                "provider": "ollama",
+                "searcher": "ddgs",
+                "mcp_audit_log_level": "full",
+            }
+        )
+    )
 
     write_persona_config(persona_dir, user_name="Hana")
     data = json.loads(config_path.read_text())
@@ -172,9 +176,7 @@ def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -
     # Every (thread, event) pair must be present exactly once
     names = {e.name for e in events}
     expected_names = {
-        f"thread_{t}_event_{i}"
-        for t in range(num_threads)
-        for i in range(events_per_thread)
+        f"thread_{t}_event_{i}" for t in range(num_threads) for i in range(events_per_thread)
     }
     assert names == expected_names
 

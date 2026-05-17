@@ -1,4 +1,5 @@
 """brain.tools.impls.add_journal — writes journal_entry memories with privacy metadata."""
+
 from __future__ import annotations
 
 import pytest
@@ -26,7 +27,9 @@ def test_add_journal_writes_journal_entry_memory_type(tmp_path, store, hebbian):
     """memory_type must be 'journal_entry' (was 'journal' pre-spec)."""
     result = add_journal(
         "today felt heavy",
-        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
     )
     mem = store.get(result["created_id"])
     assert mem.memory_type == "journal_entry"
@@ -36,7 +39,9 @@ def test_add_journal_writes_journal_entry_memory_type(tmp_path, store, hebbian):
 def test_add_journal_metadata_marks_private(tmp_path, store, hebbian):
     result = add_journal(
         "private thought",
-        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
     )
     mem = store.get(result["created_id"])
     assert mem.metadata.get("private") is True
@@ -50,7 +55,9 @@ def test_add_journal_emits_behavioral_log_entry(tmp_path, store, hebbian):
 
     add_journal(
         "an entry",
-        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
     )
     entries = read_behavioral_log(tmp_path / "behavioral_log.jsonl")
     assert len(entries) == 1
@@ -64,7 +71,9 @@ def test_add_journal_returns_dict_shape(tmp_path, store, hebbian):
     """Return shape: {created_id, memory_type}."""
     result = add_journal(
         "x",
-        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
     )
     assert set(result.keys()) == {"created_id", "memory_type"}
     assert isinstance(result["created_id"], str)
@@ -75,7 +84,9 @@ def test_add_journal_emotions_field_is_dict(tmp_path, store, hebbian):
     """V1 doesn't extract emotions at write-time (YAGNI per spec). Empty dict OK."""
     result = add_journal(
         "i am feeling grateful and tender today",
-        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
     )
     mem = store.get(result["created_id"])
     assert isinstance(mem.emotions, dict)

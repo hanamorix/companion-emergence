@@ -18,9 +18,7 @@ from typing import Any, Literal
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
-_ALLOWED_MEDIA_TYPES = frozenset(
-    {"image/png", "image/jpeg", "image/webp", "image/gif"}
-)
+_ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -131,9 +129,7 @@ class ChatMessage:
         if isinstance(self.content, str):
             d["content"] = self.content
         elif all(isinstance(b, TextBlock) for b in self.content):
-            d["content"] = "".join(
-                b.text for b in self.content if isinstance(b, TextBlock)
-            )
+            d["content"] = "".join(b.text for b in self.content if isinstance(b, TextBlock))
         else:
             d["content"] = [_block_to_dict(b) for b in self.content]
         if self.tool_call_id is not None:

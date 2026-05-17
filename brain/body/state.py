@@ -18,14 +18,16 @@ from typing import Any
 # The 6-emotion body set tracked by compute_body_state.
 # Reconciliation 2026-04-30: arousal + desire are existing core emotions
 # (not new); the four new ones live in vocabulary._BASELINE under category="body".
-BODY_EMOTION_NAMES: frozenset[str] = frozenset({
-    "arousal",
-    "desire",
-    "climax",
-    "touch_hunger",
-    "comfort_seeking",
-    "rest_need",
-})
+BODY_EMOTION_NAMES: frozenset[str] = frozenset(
+    {
+        "arousal",
+        "desire",
+        "climax",
+        "touch_hunger",
+        "comfort_seeking",
+        "rest_need",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -82,10 +84,7 @@ def compute_body_state(
     energy = _compute_energy(emotions, session_hours, words_written)
     temperature = _compute_temperature(emotions, days_since_contact)
     exhaustion = max(0, 7 - energy)
-    body_emotions = {
-        name: float(emotions.get(name, 0.0))
-        for name in BODY_EMOTION_NAMES
-    }
+    body_emotions = {name: float(emotions.get(name, 0.0)) for name in BODY_EMOTION_NAMES}
     return BodyState(
         energy=energy,
         temperature=temperature,

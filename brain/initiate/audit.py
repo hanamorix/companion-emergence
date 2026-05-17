@@ -187,26 +187,32 @@ def read_recent_d_calls(
 
 
 # Decision values that mark D-promoted rows.
-_D_PROMOTED_DECISIONS: frozenset[str] = frozenset({
-    "promoted_by_d",
-    "promoted_by_d_malformed_fallback",
-    "promoted_by_d_after_3_failures",
-})
+_D_PROMOTED_DECISIONS: frozenset[str] = frozenset(
+    {
+        "promoted_by_d",
+        "promoted_by_d_malformed_fallback",
+        "promoted_by_d_after_3_failures",
+    }
+)
 
 # Decision values that mark D-filtered rows (used by Pass 2 in T11).
-_D_FILTERED_DECISIONS: frozenset[str] = frozenset({
-    "filtered_pre_compose",
-    "filtered_pre_compose_low_confidence",
-    "filtered_d_budget",
-})
+_D_FILTERED_DECISIONS: frozenset[str] = frozenset(
+    {
+        "filtered_pre_compose",
+        "filtered_pre_compose_low_confidence",
+        "filtered_d_budget",
+    }
+)
 
 # Delivery states that count as "terminal" for promoted candidates.
-_TERMINAL_STATES: frozenset[str] = frozenset({
-    "replied_explicit",
-    "acknowledged_unclear",
-    "unanswered",
-    "dismissed",
-})
+_TERMINAL_STATES: frozenset[str] = frozenset(
+    {
+        "replied_explicit",
+        "acknowledged_unclear",
+        "unanswered",
+        "dismissed",
+    }
+)
 
 
 def run_calibration_closer_tick(
@@ -234,10 +240,7 @@ def run_calibration_closer_tick(
     now = now or datetime.now(UTC)
 
     # Build dedupe set from existing calibration rows.
-    seen_ids = {
-        r.candidate_id
-        for r in read_recent_calibration_rows(persona_dir, limit=500)
-    }
+    seen_ids = {r.candidate_id for r in read_recent_calibration_rows(persona_dir, limit=500)}
 
     # Pass 1 — promoted-by-D rows that have reached terminal.
     for audit_row in read_recent_audit(persona_dir, window_hours=24 * 90, now=now):

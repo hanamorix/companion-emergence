@@ -8,6 +8,7 @@ Atomic writes via brain.health.attempt_heal.save_with_backup_text. ID
 is validated at read time to defend against path traversal even though
 make_work_id guarantees hex-only by construction.
 """
+
 from __future__ import annotations
 
 import re
@@ -26,9 +27,7 @@ def _works_dir(persona_dir: Path) -> Path:
 
 def _work_path(persona_dir: Path, work_id: str) -> Path:
     if not _ID_REGEX.fullmatch(work_id):
-        raise ValueError(
-            f"invalid work id {work_id!r} — must be 12 lowercase hex chars"
-        )
+        raise ValueError(f"invalid work id {work_id!r} — must be 12 lowercase hex chars")
     return _works_dir(persona_dir) / f"{work_id}.md"
 
 

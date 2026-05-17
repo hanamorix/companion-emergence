@@ -24,9 +24,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-_ALLOWED_MEDIA_TYPES = frozenset(
-    {"image/png", "image/jpeg", "image/webp", "image/gif"}
-)
+_ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _MEDIA_TYPE_TO_EXT = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -69,17 +67,14 @@ def media_type_to_ext(media_type: str) -> str:
         return _MEDIA_TYPE_TO_EXT[media_type]
     except KeyError as exc:
         raise ValueError(
-            f"unsupported media_type {media_type!r}; "
-            f"must be one of {sorted(_ALLOWED_MEDIA_TYPES)}"
+            f"unsupported media_type {media_type!r}; must be one of {sorted(_ALLOWED_MEDIA_TYPES)}"
         ) from exc
 
 
 def _validate_sha(sha: str) -> None:
     """Raise ``ValueError`` unless ``sha`` is 64 lowercase hex chars."""
     if not _SHA256_HEX.fullmatch(sha):
-        raise ValueError(
-            f"image_sha must be 64 lowercase hex chars, got {sha!r}"
-        )
+        raise ValueError(f"image_sha must be 64 lowercase hex chars, got {sha!r}")
 
 
 def image_path(persona_dir: Path, sha: str, media_type: str) -> Path:
@@ -110,8 +105,7 @@ def save_image_bytes(
     """
     if media_type not in _ALLOWED_MEDIA_TYPES:
         raise ValueError(
-            f"unsupported media_type {media_type!r}; "
-            f"must be one of {sorted(_ALLOWED_MEDIA_TYPES)}"
+            f"unsupported media_type {media_type!r}; must be one of {sorted(_ALLOWED_MEDIA_TYPES)}"
         )
     # Defense in depth: the bridge /upload endpoint already sniffs at the
     # network boundary, but library callers (migration tools, internal
@@ -125,10 +119,7 @@ def save_image_bytes(
             "expected one of PNG, JPEG, WebP, GIF magic bytes"
         )
     if sniffed != media_type:
-        raise ValueError(
-            f"declared media_type {media_type!r} but bytes' signature "
-            f"is {sniffed!r}"
-        )
+        raise ValueError(f"declared media_type {media_type!r} but bytes' signature is {sniffed!r}")
     sha = compute_sha(data)
     target = image_path(persona_dir, sha, media_type)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -140,9 +131,7 @@ def save_image_bytes(
     # `os.replace` is atomic so the target reflects exactly one writer.
     import uuid
 
-    tmp = target.with_suffix(
-        f"{target.suffix}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
-    )
+    tmp = target.with_suffix(f"{target.suffix}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new")
     try:
         tmp.write_bytes(data)
         os.replace(tmp, target)

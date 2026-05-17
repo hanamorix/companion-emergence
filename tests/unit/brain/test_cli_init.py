@@ -1,4 +1,5 @@
 """Tests for the `nell init` CLI handler — interactive wizard + flag-driven."""
+
 from __future__ import annotations
 
 import json
@@ -38,10 +39,10 @@ def test_init_fresh_with_all_flags_writes_config(monkeypatch, tmp_path: Path) ->
 def test_init_interactive_prompts_for_missing(monkeypatch, tmp_path: Path) -> None:
     """No flags → prompts for everything. Defaults accepted via empty input."""
     inputs = [
-        "siren",      # persona name
-        "Hana",       # user name
-        "n",          # migrate? → no
-        "default",    # voice template
+        "siren",  # persona name
+        "Hana",  # user name
+        "n",  # migrate? → no
+        "default",  # voice template
     ]
     rc = _run_init(monkeypatch, tmp_path, [], inputs=inputs)
     assert rc == 0
@@ -87,7 +88,16 @@ def test_init_existing_persona_with_force_writes_config(monkeypatch, tmp_path: P
     rc = _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default", "--force"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--force",
+        ],
     )
     assert rc == 0
     assert (persona_dir / "memories.db").read_text() == "fake_db"  # preserved
@@ -100,7 +110,15 @@ def test_init_voice_template_nell_example_copies_voice_md(monkeypatch, tmp_path:
     rc = _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "nell-example"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "nell-example",
+        ],
     )
     assert rc == 0
     voice = tmp_path / "personas" / "siren" / "voice.md"
@@ -109,9 +127,7 @@ def test_init_voice_template_nell_example_copies_voice_md(monkeypatch, tmp_path:
     assert "You are Nell" in voice.read_text()
 
 
-def test_init_unknown_voice_template_argparse_rejects(
-    monkeypatch, tmp_path: Path, capsys
-) -> None:
+def test_init_unknown_voice_template_argparse_rejects(monkeypatch, tmp_path: Path, capsys) -> None:
     """argparse rejects unknown choices at parse time and raises SystemExit.
     This is standard argparse behaviour — the user sees the allowed list."""
     with pytest.raises(SystemExit) as excinfo:
@@ -142,9 +158,7 @@ def test_init_invalid_voice_template_via_prompt_returns_1(
     assert "unknown voice template" in err
 
 
-def test_init_summary_includes_next_step_command(
-    monkeypatch, tmp_path: Path, capsys
-) -> None:
+def test_init_summary_includes_next_step_command(monkeypatch, tmp_path: Path, capsys) -> None:
     _run_init(
         monkeypatch,
         tmp_path,
@@ -154,9 +168,7 @@ def test_init_summary_includes_next_step_command(
     assert "uv run nell chat --persona siren" in out
 
 
-def test_init_summary_is_encodable_on_windows_cp1252(
-    monkeypatch, tmp_path: Path, capsys
-) -> None:
+def test_init_summary_is_encodable_on_windows_cp1252(monkeypatch, tmp_path: Path, capsys) -> None:
     rc = _run_init(
         monkeypatch,
         tmp_path,

@@ -26,6 +26,7 @@ the desktop app). Add a Windows-specific test file when the
 ~/.local/bin Windows story lands; for now, skip cleanly on Windows
 so CI stays green.
 """
+
 from __future__ import annotations
 
 import os
@@ -83,11 +84,11 @@ def _make_bundled_layout(td: Path) -> Path:
     # reached the bundled python and not some other one on PATH.
     python3 = bundled_bin / "python3"
     python3.write_text(
-        '#!/bin/sh\n'
+        "#!/bin/sh\n"
         'echo "BUNDLED_PYTHON_INVOKED $0"\n'
         # Suppress the "from brain.cli import main" - we don't have it here.
         'echo "$@" | grep -q "from brain.cli" && exit 0\n'
-        'exit 0\n'
+        "exit 0\n"
     )
     python3.chmod(0o755)
 

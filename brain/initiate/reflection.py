@@ -12,6 +12,7 @@ low-confidence/parse-fail. Failure modes are dispatched by type per spec §E.
 D bypasses the v0.0.9 daily cost cap entirely — it's the editorial layer,
 not a budget claimant.
 """
+
 from __future__ import annotations
 
 import json
@@ -135,9 +136,7 @@ def build_system_message(
 
     calibration_prefix = ""
     if persona_dir is not None and load_d_mode(persona_dir) == "adaptive":
-        calibration_prefix = build_calibration_block(
-            persona_dir, user_name=user_name
-        ) + "\n"
+        calibration_prefix = build_calibration_block(persona_dir, user_name=user_name) + "\n"
 
     frame = _TASK_FRAME_TEMPLATE.format(
         companion_name=companion_name,
@@ -169,9 +168,7 @@ def build_user_message(
     now_local = now.astimezone()
     part_of_day = _part_of_day(now_local.hour)
     weekday = now_local.strftime("%A")
-    indexed = "\n\n".join(
-        f"[{i + 1}] {summary}" for i, summary in enumerate(candidate_summaries)
-    )
+    indexed = "\n\n".join(f"[{i + 1}] {summary}" for i, summary in enumerate(candidate_summaries))
     return (
         f"=== Current time ({user_name}'s local) ===\n"
         f"{now_local.isoformat(timespec='minutes')}  —  {part_of_day}  —  {weekday}\n\n"
@@ -233,9 +230,7 @@ def _render_candidate_summary(c: InitiateCandidate, *, now: datetime) -> str:
         age_str = f"{age_min} min ago"
     except ValueError:
         age_str = "unknown"
-    delta_sigma = (
-        c.emotional_snapshot.delta_sigma if c.emotional_snapshot is not None else 0.0
-    )
+    delta_sigma = c.emotional_snapshot.delta_sigma if c.emotional_snapshot is not None else 0.0
     meta = c.semantic_context.source_meta or {}
     meta_summary = ", ".join(f"{k}={v}" for k, v in meta.items()) or "—"
     linked = ", ".join(c.semantic_context.linked_memory_ids) or "—"
@@ -273,13 +268,12 @@ def run(
         user_name=deps.user_name,
         now=deps.now,
         outbound_recall_block=deps.outbound_recall_block,
-        candidate_summaries=[
-            _render_candidate_summary(c, now=deps.now) for c in candidates
-        ],
+        candidate_summaries=[_render_candidate_summary(c, now=deps.now) for c in candidates],
     )
 
-    def _empty_call_row(*, failure_type: str, latency_ms: int = 0,
-                       model_tier: str = "haiku") -> DCallRow:
+    def _empty_call_row(
+        *, failure_type: str, latency_ms: int = 0, model_tier: str = "haiku"
+    ) -> DCallRow:
         return DCallRow(
             d_call_id=make_d_call_id(deps.now),
             ts=deps.now.isoformat(),
@@ -300,11 +294,17 @@ def run(
     try:
         raw_h, latency_h, tin_h, tout_h = deps.haiku_call(system=system, user=user)
     except DTimeoutError:
-        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="timeout")
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="timeout"
+        )
     except DRateLimitError:
-        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="rate_limit")
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="rate_limit"
+        )
     except DProviderError:
-        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(failure_type="provider_error")
+        return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
+            failure_type="provider_error"
+        )
 
     haiku_result: DReflectionResult | None
     try:
@@ -339,15 +339,21 @@ def run(
         raw_s, latency_s, tin_s, tout_s = deps.sonnet_call(system=system, user=user)
     except DTimeoutError:
         return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
-            failure_type="timeout", latency_ms=latency_h, model_tier="sonnet",
+            failure_type="timeout",
+            latency_ms=latency_h,
+            model_tier="sonnet",
         )
     except DRateLimitError:
         return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
-            failure_type="rate_limit", latency_ms=latency_h, model_tier="sonnet",
+            failure_type="rate_limit",
+            latency_ms=latency_h,
+            model_tier="sonnet",
         )
     except DProviderError:
         return DReflectionResult(decisions=[], tick_note=None), _empty_call_row(
-            failure_type="provider_error", latency_ms=latency_h, model_tier="sonnet",
+            failure_type="provider_error",
+            latency_ms=latency_h,
+            model_tier="sonnet",
         )
 
     try:
@@ -360,11 +366,14 @@ def run(
             tick_id=deps.tick_id,
             model_tier_used="sonnet",
             candidates_in=len(candidates),
-            promoted_out=0, filtered_out=0,
+            promoted_out=0,
+            filtered_out=0,
             latency_ms=latency_h + latency_s,
-            tokens_input=tin_h + tin_s, tokens_output=tout_h + tout_s,
+            tokens_input=tin_h + tin_s,
+            tokens_output=tout_h + tout_s,
             failure_type="malformed_json",
-            retry_count=1, tick_note=None,
+            retry_count=1,
+            tick_note=None,
         )
 
     forced: list[DDecision] = []

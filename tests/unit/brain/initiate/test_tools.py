@@ -16,6 +16,7 @@ from brain.initiate.tools import (
 
 def _seed_audit(persona_dir: Path, audit_id: str, ts: str | None = None) -> None:
     from datetime import UTC, datetime
+
     if ts is None:
         ts = datetime.now(UTC).isoformat()
     row = AuditRow(

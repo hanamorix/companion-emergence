@@ -1,4 +1,5 @@
 """Tests for the four works MCP tools."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -136,7 +137,9 @@ def test_list_works_filters_by_type(tmp_path: Path) -> None:
 def test_search_works_finds_by_content(tmp_path: Path) -> None:
     persona_dir = _persona(tmp_path)
     save_work(
-        title="A note", type="idea", content="chrysanthemums in autumn",
+        title="A note",
+        type="idea",
+        content="chrysanthemums in autumn",
         persona_dir=persona_dir,
     )
     matches = search_works(query="chrysanthemums", persona_dir=persona_dir)
@@ -156,8 +159,11 @@ def test_search_works_returns_empty_on_no_match(tmp_path: Path) -> None:
 def test_read_work_returns_full_content(tmp_path: Path) -> None:
     persona_dir = _persona(tmp_path)
     saved = save_work(
-        title="t", type="story", content="full content body here",
-        summary="my summary", persona_dir=persona_dir,
+        title="t",
+        type="story",
+        content="full content body here",
+        summary="my summary",
+        persona_dir=persona_dir,
     )
     fetched = read_work(id=saved["id"], persona_dir=persona_dir)
     assert fetched["content"] == "full content body here"

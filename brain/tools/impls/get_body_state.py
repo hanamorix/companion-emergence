@@ -49,7 +49,10 @@ def get_body_state(
 
     days_since = days_since_human(store, now=now, persona_dir=persona_dir)
     words = count_words_in_session(
-        store, persona_dir=persona_dir, session_hours=session_hours, now=now,
+        store,
+        persona_dir=persona_dir,
+        session_hours=session_hours,
+        now=now,
     )
 
     body = compute_body_state(

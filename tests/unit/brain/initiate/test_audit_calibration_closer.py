@@ -1,4 +1,5 @@
 """Tests for run_calibration_closer_tick in brain.initiate.audit."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -43,10 +44,15 @@ def _make_promoted_audit_row(
 def test_closer_writes_row_for_promoted_replied(tmp_path):
     persona = tmp_path / "p"
     now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
-    append_audit_row(persona, _make_promoted_audit_row(
-        audit_id="ia_1", candidate_id="ic_1",
-        ts=now.isoformat(), state="replied_explicit",
-    ))
+    append_audit_row(
+        persona,
+        _make_promoted_audit_row(
+            audit_id="ia_1",
+            candidate_id="ic_1",
+            ts=now.isoformat(),
+            state="replied_explicit",
+        ),
+    )
     run_calibration_closer_tick(persona, now=now + timedelta(minutes=10))
     rows = list(read_recent_calibration_rows(persona, limit=10))
     assert len(rows) == 1
@@ -59,8 +65,10 @@ def test_closer_skips_promoted_still_pending(tmp_path):
     persona = tmp_path / "p"
     now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
     row = _make_promoted_audit_row(
-        audit_id="ia_p", candidate_id="ic_p",
-        ts=now.isoformat(), state="replied_explicit",
+        audit_id="ia_p",
+        candidate_id="ic_p",
+        ts=now.isoformat(),
+        state="replied_explicit",
     )
     # Replace current_state with non-terminal:
     row.delivery["current_state"] = "delivered"
@@ -75,10 +83,15 @@ def test_closer_skips_promoted_still_pending(tmp_path):
 def test_closer_dedupes_promoted_rows(tmp_path):
     persona = tmp_path / "p"
     now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
-    append_audit_row(persona, _make_promoted_audit_row(
-        audit_id="ia_x", candidate_id="ic_x",
-        ts=now.isoformat(), state="replied_explicit",
-    ))
+    append_audit_row(
+        persona,
+        _make_promoted_audit_row(
+            audit_id="ia_x",
+            candidate_id="ic_x",
+            ts=now.isoformat(),
+            state="replied_explicit",
+        ),
+    )
     # Run twice — should only write one calibration row.
     run_calibration_closer_tick(persona, now=now + timedelta(minutes=10))
     run_calibration_closer_tick(persona, now=now + timedelta(minutes=20))
@@ -115,10 +128,14 @@ def test_closer_writes_filtered_row_after_48h_no_recurrence(tmp_path):
     persona = tmp_path / "p"
     decision_ts = datetime(2026, 5, 11, 10, 0, 0, tzinfo=UTC)  # 2 days ago
     now = datetime(2026, 5, 13, 12, 0, 0, tzinfo=UTC)
-    append_audit_row(persona, _make_filtered_audit_row(
-        audit_id="ia_f1", candidate_id="ic_f1",
-        ts=decision_ts.isoformat(),
-    ))
+    append_audit_row(
+        persona,
+        _make_filtered_audit_row(
+            audit_id="ia_f1",
+            candidate_id="ic_f1",
+            ts=decision_ts.isoformat(),
+        ),
+    )
     run_calibration_closer_tick(persona, now=now)
     rows = list(read_recent_calibration_rows(persona, limit=10))
     assert len(rows) == 1
@@ -136,14 +153,22 @@ def test_closer_writes_filtered_row_with_recurrence(tmp_path):
     persona = tmp_path / "p"
     decision_ts = datetime(2026, 5, 11, 10, 0, 0, tzinfo=UTC)
     now = datetime(2026, 5, 13, 12, 0, 0, tzinfo=UTC)
-    append_audit_row(persona, _make_filtered_audit_row(
-        audit_id="ia_f2", candidate_id="ic_f2",
-        ts=decision_ts.isoformat(),
-        source="dream", source_id="d_recur",
-    ))
+    append_audit_row(
+        persona,
+        _make_filtered_audit_row(
+            audit_id="ia_f2",
+            candidate_id="ic_f2",
+            ts=decision_ts.isoformat(),
+            source="dream",
+            source_id="d_recur",
+        ),
+    )
     # Re-emit a candidate with the same (source, source_id) 12 hours after.
     emit_initiate_candidate(
-        persona, kind="message", source="dream", source_id="d_recur",
+        persona,
+        kind="message",
+        source="dream",
+        source_id="d_recur",
         semantic_context=SemanticContext(),
         now=decision_ts + timedelta(hours=12),
     )
@@ -157,10 +182,14 @@ def test_closer_skips_filtered_row_before_48h(tmp_path):
     persona = tmp_path / "p"
     decision_ts = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
     now = decision_ts + timedelta(hours=24)  # only 24h elapsed
-    append_audit_row(persona, _make_filtered_audit_row(
-        audit_id="ia_f3", candidate_id="ic_f3",
-        ts=decision_ts.isoformat(),
-    ))
+    append_audit_row(
+        persona,
+        _make_filtered_audit_row(
+            audit_id="ia_f3",
+            candidate_id="ic_f3",
+            ts=decision_ts.isoformat(),
+        ),
+    )
     run_calibration_closer_tick(persona, now=now)
     rows = list(read_recent_calibration_rows(persona, limit=10))
     assert rows == []
@@ -170,10 +199,14 @@ def test_closer_idempotent_across_multiple_runs(tmp_path):
     persona = tmp_path / "p"
     decision_ts = datetime(2026, 5, 11, 10, 0, 0, tzinfo=UTC)
     now = datetime(2026, 5, 13, 12, 0, 0, tzinfo=UTC)
-    append_audit_row(persona, _make_filtered_audit_row(
-        audit_id="ia_f4", candidate_id="ic_f4",
-        ts=decision_ts.isoformat(),
-    ))
+    append_audit_row(
+        persona,
+        _make_filtered_audit_row(
+            audit_id="ia_f4",
+            candidate_id="ic_f4",
+            ts=decision_ts.isoformat(),
+        ),
+    )
     run_calibration_closer_tick(persona, now=now)
     run_calibration_closer_tick(persona, now=now + timedelta(minutes=10))
     rows = list(read_recent_calibration_rows(persona, limit=10))

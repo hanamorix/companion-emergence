@@ -1,4 +1,5 @@
 """brain.creative.dna — load/save creative_dna with default fallback."""
+
 from __future__ import annotations
 
 import json
@@ -66,6 +67,7 @@ def test_save_writes_atomic_and_round_trips(tmp_path: Path):
 
 def test_load_corrupt_falls_back_to_default(tmp_path: Path, caplog):
     import logging
+
     caplog.set_level(logging.WARNING)
     (tmp_path / "creative_dna.json").write_text("not valid json")
     dna = load_creative_dna(tmp_path)

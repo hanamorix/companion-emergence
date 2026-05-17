@@ -112,11 +112,7 @@ def format_report(report: MigrationReport) -> str:
     lines.append(
         f"  Legacy files:   {report.legacy_files_preserved:,} preserved, "
         f"{report.legacy_files_missing:,} missing"
-        + (
-            f" (skipped: {report.legacy_skipped_reason})"
-            if report.legacy_skipped_reason
-            else ""
-        )
+        + (f" (skipped: {report.legacy_skipped_reason})" if report.legacy_skipped_reason else "")
     )
     if report.legacy_integrity_issues:
         lines.append(

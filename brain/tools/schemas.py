@@ -276,8 +276,13 @@ SCHEMAS: dict[str, dict] = {
                         "One of: story, code, planning, idea, role_play, letter, other."
                     ),
                     "enum": [
-                        "story", "code", "planning", "idea",
-                        "role_play", "letter", "other",
+                        "story",
+                        "code",
+                        "planning",
+                        "idea",
+                        "role_play",
+                        "letter",
+                        "other",
                     ],
                 },
                 "content": {
@@ -305,8 +310,13 @@ SCHEMAS: dict[str, dict] = {
                     "type": "string",
                     "description": "Filter by type. One of WORK_TYPES, or omit for all.",
                     "enum": [
-                        "story", "code", "planning", "idea",
-                        "role_play", "letter", "other",
+                        "story",
+                        "code",
+                        "planning",
+                        "idea",
+                        "role_play",
+                        "letter",
+                        "other",
                     ],
                 },
                 "limit": {
@@ -335,8 +345,13 @@ SCHEMAS: dict[str, dict] = {
                     "type": "string",
                     "description": "Filter by type. One of WORK_TYPES, or omit for all.",
                     "enum": [
-                        "story", "code", "planning", "idea",
-                        "role_play", "letter", "other",
+                        "story",
+                        "code",
+                        "planning",
+                        "idea",
+                        "role_play",
+                        "letter",
+                        "other",
                     ],
                 },
                 "limit": {

@@ -1,4 +1,5 @@
 """Bridge event bus — module-level publisher + EventBus class."""
+
 from __future__ import annotations
 
 import asyncio
@@ -30,10 +31,12 @@ def test_publish_calls_registered_publisher_with_envelope():
 
 def test_publish_swallows_publisher_exception(caplog):
     import logging
+
     caplog.set_level(logging.WARNING)
 
     def boom(_event):
         raise RuntimeError("publisher crashed")
+
     events.set_publisher(boom)
     try:
         events.publish("anything")  # must not raise

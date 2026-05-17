@@ -1,4 +1,5 @@
 """Bridge /events WS — server-pushed broadcast tests."""
+
 from __future__ import annotations
 
 from pathlib import Path

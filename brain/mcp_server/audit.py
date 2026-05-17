@@ -24,13 +24,29 @@ _REDACTED = "[REDACTED]"
 _OMITTED = "[OMITTED]"
 _SENSITIVE_KEYS = {
     # Original (P3 baseline) — content-shaped fields
-    "content", "message", "messages", "prompt", "raw", "response", "result", "text",
+    "content",
+    "message",
+    "messages",
+    "prompt",
+    "raw",
+    "response",
+    "result",
+    "text",
     # Audit 2026-05-07 P3-3: search terms + metadata fields can be
     # just as identifying as content. A "redacted" log shouldn't
     # leak the search query that found Hana, the title of a private
     # work she wrote, or the name of a relationship she's grieving.
-    "query", "title", "summary", "emotion", "tag", "tags", "name",
-    "id", "memory_id", "session_id", "work_id",
+    "query",
+    "title",
+    "summary",
+    "emotion",
+    "tag",
+    "tags",
+    "name",
+    "id",
+    "memory_id",
+    "session_id",
+    "work_id",
 }
 
 

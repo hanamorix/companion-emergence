@@ -1,4 +1,5 @@
 """Unit tests for the D-reflection module."""
+
 from __future__ import annotations
 
 import pytest
@@ -59,9 +60,7 @@ def test_build_system_message_substitutes_names(tmp_path):
     from brain.initiate.reflection import build_system_message
 
     voice_template_path = tmp_path / "voice.md"
-    voice_template_path.write_text(
-        "# Voice\n\nSweater-wearing novelist; southern english flair.\n"
-    )
+    voice_template_path.write_text("# Voice\n\nSweater-wearing novelist; southern english flair.\n")
     msg = build_system_message(
         companion_name="Nell",
         user_name="Hana",
@@ -186,8 +185,11 @@ def test_reflection_run_escalates_on_low_confidence(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -208,11 +210,14 @@ def test_reflection_run_escalates_on_low_confidence(tmp_path):
         return sonnet_response, 700, 400, 100
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     result, dcall = run(candidates, deps=deps)
     assert dcall.model_tier_used == "sonnet"
@@ -231,8 +236,11 @@ def test_reflection_run_escalates_on_malformed_haiku(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -244,15 +252,20 @@ def test_reflection_run_escalates_on_malformed_haiku(tmp_path):
         return (
             '{"decisions":[{"candidate_index":1,"decision":"filter",'
             '"reason":"ok","confidence":"high"}],"tick_note":null}',
-            700, 400, 100,
+            700,
+            400,
+            100,
         )
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     result, dcall = run(candidates, deps=deps)
     assert dcall.model_tier_used == "sonnet"
@@ -270,8 +283,11 @@ def test_reflection_run_filters_when_both_tiers_low_confidence(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -292,11 +308,14 @@ def test_reflection_run_filters_when_both_tiers_low_confidence(tmp_path):
         return sonnet_response, 700, 400, 100
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     result, dcall = run(candidates, deps=deps)
     assert dcall.model_tier_used == "sonnet"
@@ -316,8 +335,11 @@ def test_reflection_run_records_timeout_failure(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -329,11 +351,14 @@ def test_reflection_run_records_timeout_failure(tmp_path):
         raise AssertionError("should not escalate on timeout — passthrough retry")
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     result, dcall = run(candidates, deps=deps)
     assert dcall.failure_type == "timeout"
@@ -353,8 +378,11 @@ def test_reflection_run_records_rate_limit_failure(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -366,11 +394,14 @@ def test_reflection_run_records_rate_limit_failure(tmp_path):
         raise AssertionError("should not escalate on rate_limit")
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     result, dcall = run(candidates, deps=deps)
     assert dcall.failure_type == "rate_limit"
@@ -387,8 +418,11 @@ def test_reflection_run_records_provider_error(tmp_path):
     now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
     candidates = [
         InitiateCandidate(
-            candidate_id="ic_a", ts=(now - timedelta(minutes=1)).isoformat(),
-            kind="message", source="dream", source_id="d1",
+            candidate_id="ic_a",
+            ts=(now - timedelta(minutes=1)).isoformat(),
+            kind="message",
+            source="dream",
+            source_id="d1",
             semantic_context=SemanticContext(),
         ),
     ]
@@ -400,11 +434,14 @@ def test_reflection_run_records_provider_error(tmp_path):
         raise AssertionError("should not escalate on provider_error")
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="t1",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="t1",
     )
     _, dcall = run(candidates, deps=deps)
     assert dcall.failure_type == "provider_error"
@@ -470,14 +507,21 @@ def test_build_system_message_adaptive_includes_calibration_block(tmp_path):
     persona = tmp_path / "p"
     persona.mkdir()
     # Seed one calibration row + flip the mode.
-    append_calibration_row(persona, CalibrationRow(
-        ts_decision="2026-05-13T10:00:00+00:00",
-        ts_closed="2026-05-13T11:00:00+00:00",
-        candidate_id="ic_x", source="dream",
-        decision="promote", confidence="high", model_tier="haiku",
-        promoted_to_state="replied_explicit", filtered_recurred=None,
-        reason_short="x",
-    ))
+    append_calibration_row(
+        persona,
+        CalibrationRow(
+            ts_decision="2026-05-13T10:00:00+00:00",
+            ts_closed="2026-05-13T11:00:00+00:00",
+            candidate_id="ic_x",
+            source="dream",
+            decision="promote",
+            confidence="high",
+            model_tier="haiku",
+            promoted_to_state="replied_explicit",
+            filtered_recurred=None,
+            reason_short="x",
+        ),
+    )
     (persona / "d_mode.json").write_text('{"mode": "adaptive"}')
 
     msg = build_system_message(

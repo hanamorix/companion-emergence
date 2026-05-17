@@ -1,4 +1,5 @@
 """Tests for brain.utils.llm_output."""
+
 from __future__ import annotations
 
 import pytest

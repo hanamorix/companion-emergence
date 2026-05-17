@@ -1,4 +1,5 @@
 """Tests for brain.initiate.adaptive — Bundle C adaptive-D layer."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -97,18 +98,21 @@ def test_append_and_read_calibration_rows(tmp_path: Path):
 
     persona = tmp_path / "p"
     for i in range(5):
-        append_calibration_row(persona, CalibrationRow(
-            ts_decision=f"2026-05-13T10:0{i}:00+00:00",
-            ts_closed=f"2026-05-13T11:0{i}:00+00:00",
-            candidate_id=f"ic_{i}",
-            source="dream",
-            decision="promote",
-            confidence="high",
-            model_tier="haiku",
-            promoted_to_state="replied_explicit",
-            filtered_recurred=None,
-            reason_short=f"reason {i}",
-        ))
+        append_calibration_row(
+            persona,
+            CalibrationRow(
+                ts_decision=f"2026-05-13T10:0{i}:00+00:00",
+                ts_closed=f"2026-05-13T11:0{i}:00+00:00",
+                candidate_id=f"ic_{i}",
+                source="dream",
+                decision="promote",
+                confidence="high",
+                model_tier="haiku",
+                promoted_to_state="replied_explicit",
+                filtered_recurred=None,
+                reason_short=f"reason {i}",
+            ),
+        )
     rows = list(read_recent_calibration_rows(persona, limit=3))
     assert len(rows) == 3
     # Newest first.
@@ -126,24 +130,38 @@ def test_build_calibration_block_with_mixed_outcomes(tmp_path):
     persona = tmp_path / "p"
     # 3 promoted: 2 replied, 1 dismissed.
     for i, state in enumerate(["replied_explicit", "replied_explicit", "dismissed"]):
-        append_calibration_row(persona, CalibrationRow(
-            ts_decision=f"2026-05-13T10:0{i}:00+00:00",
-            ts_closed=f"2026-05-13T11:0{i}:00+00:00",
-            candidate_id=f"ic_p{i}", source="dream",
-            decision="promote", confidence="high", model_tier="haiku",
-            promoted_to_state=state, filtered_recurred=None,
-            reason_short="x",
-        ))
+        append_calibration_row(
+            persona,
+            CalibrationRow(
+                ts_decision=f"2026-05-13T10:0{i}:00+00:00",
+                ts_closed=f"2026-05-13T11:0{i}:00+00:00",
+                candidate_id=f"ic_p{i}",
+                source="dream",
+                decision="promote",
+                confidence="high",
+                model_tier="haiku",
+                promoted_to_state=state,
+                filtered_recurred=None,
+                reason_short="x",
+            ),
+        )
     # 2 filtered: 1 stayed silent, 1 recurred.
     for i, rec in enumerate([False, True]):
-        append_calibration_row(persona, CalibrationRow(
-            ts_decision=f"2026-05-13T10:1{i}:00+00:00",
-            ts_closed=f"2026-05-15T10:1{i}:00+00:00",
-            candidate_id=f"ic_f{i}", source="reflex_firing",
-            decision="filter", confidence="high", model_tier="haiku",
-            promoted_to_state=None, filtered_recurred=rec,
-            reason_short="y",
-        ))
+        append_calibration_row(
+            persona,
+            CalibrationRow(
+                ts_decision=f"2026-05-13T10:1{i}:00+00:00",
+                ts_closed=f"2026-05-15T10:1{i}:00+00:00",
+                candidate_id=f"ic_f{i}",
+                source="reflex_firing",
+                decision="filter",
+                confidence="high",
+                model_tier="haiku",
+                promoted_to_state=None,
+                filtered_recurred=rec,
+                reason_short="y",
+            ),
+        )
 
     block = build_calibration_block(persona, user_name="Hana")
     assert "=== Your recent editorial track record ===" in block
@@ -174,12 +192,21 @@ def test_detect_drift_below_bootstrap_returns_none(tmp_path):
     now = datetime.now(UTC)
     # 50 d_call rows — below the 100 bootstrap floor.
     for i in range(50):
-        append_d_call_row(persona, DCallRow(
-            d_call_id=f"dc_{i}", ts=(now - timedelta(hours=i)).isoformat(),
-            tick_id=f"t_{i}", model_tier_used="haiku",
-            candidates_in=2, promoted_out=1, filtered_out=1,
-            latency_ms=300, tokens_input=400, tokens_output=150,
-        ))
+        append_d_call_row(
+            persona,
+            DCallRow(
+                d_call_id=f"dc_{i}",
+                ts=(now - timedelta(hours=i)).isoformat(),
+                tick_id=f"t_{i}",
+                model_tier_used="haiku",
+                candidates_in=2,
+                promoted_out=1,
+                filtered_out=1,
+                latency_ms=300,
+                tokens_input=400,
+                tokens_output=150,
+            ),
+        )
     assert detect_drift(persona) is None
 
 
@@ -195,12 +222,21 @@ def test_detect_drift_stable_history_returns_none(tmp_path):
     # 150 rows, all the same promote rate (flat → stdev ~ 0).
     for i in range(150):
         ts = (now - timedelta(hours=i)).isoformat()
-        append_d_call_row(persona, DCallRow(
-            d_call_id=f"dc_{i}", ts=ts,
-            tick_id=f"t_{i}", model_tier_used="haiku",
-            candidates_in=2, promoted_out=1, filtered_out=1,
-            latency_ms=300, tokens_input=400, tokens_output=150,
-        ))
+        append_d_call_row(
+            persona,
+            DCallRow(
+                d_call_id=f"dc_{i}",
+                ts=ts,
+                tick_id=f"t_{i}",
+                model_tier_used="haiku",
+                candidates_in=2,
+                promoted_out=1,
+                filtered_out=1,
+                latency_ms=300,
+                tokens_input=400,
+                tokens_output=150,
+            ),
+        )
     assert detect_drift(persona) is None
 
 
@@ -222,22 +258,40 @@ def test_detect_drift_clear_promote_rate_increase(tmp_path):
     for i in range(120):
         ts = (now - timedelta(days=60 + i // 4)).isoformat()
         promoted = 1 if rng.random() < 0.3 else 0
-        append_d_call_row(persona, DCallRow(
-            d_call_id=f"dc_h_{i}", ts=ts,
-            tick_id=f"t_h_{i}", model_tier_used="haiku",
-            candidates_in=2, promoted_out=promoted, filtered_out=2 - promoted,
-            latency_ms=300, tokens_input=400, tokens_output=150,
-        ))
+        append_d_call_row(
+            persona,
+            DCallRow(
+                d_call_id=f"dc_h_{i}",
+                ts=ts,
+                tick_id=f"t_h_{i}",
+                model_tier_used="haiku",
+                candidates_in=2,
+                promoted_out=promoted,
+                filtered_out=2 - promoted,
+                latency_ms=300,
+                tokens_input=400,
+                tokens_output=150,
+            ),
+        )
 
     # 30 recent rows with 1.0 promote rate (clear drift).
     for i in range(30):
         ts = (now - timedelta(hours=i)).isoformat()
-        append_d_call_row(persona, DCallRow(
-            d_call_id=f"dc_r_{i}", ts=ts,
-            tick_id=f"t_r_{i}", model_tier_used="haiku",
-            candidates_in=2, promoted_out=2, filtered_out=0,
-            latency_ms=300, tokens_input=400, tokens_output=150,
-        ))
+        append_d_call_row(
+            persona,
+            DCallRow(
+                d_call_id=f"dc_r_{i}",
+                ts=ts,
+                tick_id=f"t_r_{i}",
+                model_tier_used="haiku",
+                candidates_in=2,
+                promoted_out=2,
+                filtered_out=0,
+                latency_ms=300,
+                tokens_input=400,
+                tokens_output=150,
+            ),
+        )
 
     alert = detect_drift(persona)
     assert alert is not None

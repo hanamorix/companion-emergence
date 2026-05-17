@@ -78,7 +78,9 @@ def add_memory(
         from brain.body.events import record_climax_event
 
         record_climax_event(
-            originating_memory=memory, store=store, persona_dir=persona_dir,
+            originating_memory=memory,
+            store=store,
+            persona_dir=persona_dir,
         )
 
     # Auto-Hebbian: find the 3 most text-related existing memories and
@@ -111,7 +113,9 @@ def add_memory(
         # Hebbian strengthening is best-effort — don't fail the write, but do
         # surface the partial failure so callers and logs are not misled.
         auto_link_error = f"{type(exc).__name__}: {exc}"
-        logger.warning("add_memory auto-link failed memory_id=%s err=%s", memory.id, auto_link_error)
+        logger.warning(
+            "add_memory auto-link failed memory_id=%s err=%s", memory.id, auto_link_error
+        )
 
     result = {
         "created": True,

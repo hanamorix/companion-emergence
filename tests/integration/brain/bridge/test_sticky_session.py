@@ -56,9 +56,9 @@ class _RecordingProvider(LLMProvider):
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
         self.last_messages = list(messages)
-        h = hashlib.sha256(json.dumps(
-            [m.to_dict() for m in messages], sort_keys=True
-        ).encode()).hexdigest()[:16]
+        h = hashlib.sha256(
+            json.dumps([m.to_dict() for m in messages], sort_keys=True).encode()
+        ).hexdigest()[:16]
         return ChatResponse(content=f"REC: {h}", tool_calls=())
 
 
@@ -92,14 +92,24 @@ def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
     # 6 minutes in the past so they trip the silence threshold.
     base = datetime.now(UTC) - timedelta(minutes=6)
     for i in range(25):
-        ingest_turn(persona_dir, {
-            "session_id": sid, "speaker": "user", "text": f"u{i}",
-            "ts": (base + timedelta(seconds=i * 2)).isoformat(),
-        })
-        ingest_turn(persona_dir, {
-            "session_id": sid, "speaker": "assistant", "text": f"a{i}",
-            "ts": (base + timedelta(seconds=i * 2 + 1)).isoformat(),
-        })
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": sid,
+                "speaker": "user",
+                "text": f"u{i}",
+                "ts": (base + timedelta(seconds=i * 2)).isoformat(),
+            },
+        )
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": sid,
+                "speaker": "assistant",
+                "text": f"a{i}",
+                "ts": (base + timedelta(seconds=i * 2 + 1)).isoformat(),
+            },
+        )
 
     bus = _CapturingBus()
     stop = threading.Event()
@@ -134,15 +144,16 @@ def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
 
     # User returns and sends a new message.
     respond(
-        persona_dir, "still here",
-        store=store, hebbian=hebbian, provider=provider,
+        persona_dir,
+        "still here",
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
         session=sess,
     )
 
     sent = provider.last_messages
-    user_texts = [
-        m.content for m in sent if m.role == "user" and isinstance(m.content, str)
-    ]
+    user_texts = [m.content for m in sent if m.role == "user" and isinstance(m.content, str)]
     assistant_texts = [
         m.content for m in sent if m.role == "assistant" and isinstance(m.content, str)
     ]

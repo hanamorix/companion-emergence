@@ -1,4 +1,5 @@
 """Tests for brain.works.store — SQLite index with FTS5 search."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -88,7 +89,11 @@ def test_store_list_recent_respects_limit(tmp_path: Path) -> None:
     store = WorksStore(tmp_path / "works.db")
     for i in range(5):
         store.insert(
-            _w(work_id=f"{i:012d}", title=f"work {i}", created_at=datetime(2026, 5, i + 1, tzinfo=UTC)),
+            _w(
+                work_id=f"{i:012d}",
+                title=f"work {i}",
+                created_at=datetime(2026, 5, i + 1, tzinfo=UTC),
+            ),
             content=f"content {i}",
         )
     assert len(store.list_recent(limit=3)) == 3
@@ -151,12 +156,12 @@ def test_search_returns_empty_on_malformed_fts5_query(tmp_path: Path) -> None:
     # sqlite3.OperationalError ("unterminated string", "fts5: syntax error",
     # "unknown special query: ...").
     for malformed in [
-        'lighthouse"',     # unbalanced quote
-        'AND',             # bare operator
-        '"lighthouse',     # unclosed quote
-        'NEAR(',           # malformed near
-        '*lighthouse',     # leading wildcard
-        '(lighthouse',     # unbalanced paren
+        'lighthouse"',  # unbalanced quote
+        "AND",  # bare operator
+        '"lighthouse',  # unclosed quote
+        "NEAR(",  # malformed near
+        "*lighthouse",  # leading wildcard
+        "(lighthouse",  # unbalanced paren
     ]:
         result = store.search(malformed, limit=10)
         assert result == [], f"query {malformed!r} should return [] (got {result!r})"
@@ -173,6 +178,7 @@ def test_list_recent_returns_empty_on_operational_error(
     Reproduces I-3 from the 2026-05-05 follow-up audit: the original I-2 fix
     only protected search() — list_recent + get were left uncaught."""
     import sqlite3
+
     store = WorksStore(tmp_path / "works.db")
     w = _w(work_id="111111111111", title="A")
     store.insert(w, content="content")
@@ -180,9 +186,15 @@ def test_list_recent_returns_empty_on_operational_error(
     real_connect = store._connect
 
     class _RaisingConn:
-        def __init__(self, conn): self._conn = conn
-        def __enter__(self): return self
-        def __exit__(self, *a): self._conn.__exit__(*a)
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self._conn.__exit__(*a)
+
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
 
@@ -197,6 +209,7 @@ def test_get_returns_none_on_operational_error(
     sqlite3.OperationalError instead of propagating. Mirrors how the
     function already handles the missing-row case."""
     import sqlite3
+
     store = WorksStore(tmp_path / "works.db")
     w = _w(work_id="222222222222", title="B")
     store.insert(w, content="content")
@@ -204,9 +217,15 @@ def test_get_returns_none_on_operational_error(
     real_connect = store._connect
 
     class _RaisingConn:
-        def __init__(self, conn): self._conn = conn
-        def __enter__(self): return self
-        def __exit__(self, *a): self._conn.__exit__(*a)
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self._conn.__exit__(*a)
+
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
 
@@ -228,6 +247,7 @@ def test_insert_rolls_back_works_row_when_fts_insert_fails(
     Repro: monkeypatch sqlite3.Connection.execute to raise OperationalError
     on the works_fts INSERT (second statement)."""
     import sqlite3
+
     store = WorksStore(tmp_path / "works.db")
     w = _w(work_id="aaaaaaaaaaaa", title="Atomic Test")
 
@@ -237,14 +257,23 @@ def test_insert_rolls_back_works_row_when_fts_insert_fails(
         """Forwards to a real sqlite3.Connection except execute() raises
         on the works_fts INSERT — sqlite3.Connection itself is immutable
         so we wrap rather than monkey-patch."""
-        def __init__(self, real): self._real = real
+
+        def __init__(self, real):
+            self._real = real
+
         def execute(self, sql, *a, **kw):
             if "INSERT INTO works_fts" in sql:
                 raise sqlite3.OperationalError("simulated FTS5 failure")
             return self._real.execute(sql, *a, **kw)
-        def close(self): return self._real.close()
-        def __enter__(self): return self
-        def __exit__(self, *a): return self._real.__exit__(*a)
+
+        def close(self):
+            return self._real.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return self._real.__exit__(*a)
 
     monkeypatch.setattr(store, "_connect", lambda: _ConnWrapper(real_connect()))
 
@@ -253,9 +282,7 @@ def test_insert_rolls_back_works_row_when_fts_insert_fails(
 
     monkeypatch.undo()
     # The works row must be absent — full rollback expected.
-    assert store.get("aaaaaaaaaaaa") is None, (
-        "works row leaked despite works_fts insert failing"
-    )
+    assert store.get("aaaaaaaaaaaa") is None, "works row leaked despite works_fts insert failing"
 
 
 def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
@@ -264,6 +291,7 @@ def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
     serializes the SELECT-then-INSERT compound op so the second writer
     sees the first's row in the same transaction."""
     import threading
+
     store = WorksStore(tmp_path / "works.db")
     w = _w(work_id="bbbbbbbbbbbb", title="Concurrent")
 
@@ -285,13 +313,10 @@ def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
     assert errors == [], f"unexpected errors: {errors[:3]}"
     # Exactly one row in works AND exactly one in works_fts
     import sqlite3
+
     conn = sqlite3.connect(str(tmp_path / "works.db"))
-    n_works = conn.execute(
-        "SELECT COUNT(*) FROM works WHERE id = ?", (w.id,)
-    ).fetchone()[0]
-    n_fts = conn.execute(
-        "SELECT COUNT(*) FROM works_fts WHERE id = ?", (w.id,)
-    ).fetchone()[0]
+    n_works = conn.execute("SELECT COUNT(*) FROM works WHERE id = ?", (w.id,)).fetchone()[0]
+    n_fts = conn.execute("SELECT COUNT(*) FROM works_fts WHERE id = ?", (w.id,)).fetchone()[0]
     conn.close()
     assert n_works == 1, f"expected 1 works row, got {n_works}"
     assert n_fts == 1, f"expected 1 fts row, got {n_fts}"

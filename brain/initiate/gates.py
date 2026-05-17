@@ -120,15 +120,11 @@ def check_send_allowed(
         return False, "blackout_window"
 
     cap = notify_cap if urgency == "notify" else quiet_cap
-    sent = count_recent_sends(
-        persona_dir, urgency=urgency, window_hours=24, now=now
-    )
+    sent = count_recent_sends(persona_dir, urgency=urgency, window_hours=24, now=now)
     if sent >= cap:
         return False, f"{urgency}_cap_24h_reached"
 
-    min_gap = (
-        notify_min_gap_hours if urgency == "notify" else quiet_min_gap_hours
-    )
+    min_gap = notify_min_gap_hours if urgency == "notify" else quiet_min_gap_hours
     last = _latest_send_time(persona_dir, urgency=urgency, now=now)
     if last is not None:
         delta = now - last

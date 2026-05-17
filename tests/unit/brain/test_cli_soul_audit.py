@@ -18,8 +18,12 @@ def _ts(year: int) -> str:
     return datetime(year, 6, 15, tzinfo=UTC).isoformat()
 
 
-def _make_persona(tmp_path: Path, *, active: list[dict] | None = None,
-                  archives: dict[int, list[dict]] | None = None) -> Path:
+def _make_persona(
+    tmp_path: Path,
+    *,
+    active: list[dict] | None = None,
+    archives: dict[int, list[dict]] | None = None,
+) -> Path:
     persona_dir = tmp_path / "test-persona"
     persona_dir.mkdir()
     if active:
@@ -52,18 +56,14 @@ def _entry(year: int, marker: str) -> dict:
     }
 
 
-def test_soul_audit_default_uses_active_file_only(
-    tmp_path: Path, capsys, monkeypatch
-) -> None:
+def test_soul_audit_default_uses_active_file_only(tmp_path: Path, capsys, monkeypatch) -> None:
     """Without --full, only the active soul_audit.jsonl tail is shown."""
     persona_dir = _make_persona(
         tmp_path,
         active=[_entry(2026, "active1"), _entry(2026, "active2")],
         archives={2024: [_entry(2024, "old1")]},
     )
-    monkeypatch.setattr(
-        "brain.cli.get_persona_dir", lambda _name: persona_dir
-    )
+    monkeypatch.setattr("brain.cli.get_persona_dir", lambda _name: persona_dir)
     rc = _soul_audit_handler(_args(persona_dir, full=False))
     assert rc == 0
     out = capsys.readouterr().out
@@ -84,9 +84,7 @@ def test_soul_audit_full_walks_all_archives_chronologically(
             2025: [_entry(2025, "y25_a")],
         },
     )
-    monkeypatch.setattr(
-        "brain.cli.get_persona_dir", lambda _name: persona_dir
-    )
+    monkeypatch.setattr("brain.cli.get_persona_dir", lambda _name: persona_dir)
     rc = _soul_audit_handler(_args(persona_dir, full=True))
     assert rc == 0
     out = capsys.readouterr().out
@@ -105,24 +103,18 @@ def test_soul_audit_full_no_archives_falls_back_to_active(
         tmp_path,
         active=[_entry(2026, "only_active")],
     )
-    monkeypatch.setattr(
-        "brain.cli.get_persona_dir", lambda _name: persona_dir
-    )
+    monkeypatch.setattr("brain.cli.get_persona_dir", lambda _name: persona_dir)
     rc = _soul_audit_handler(_args(persona_dir, full=True))
     assert rc == 0
     out = capsys.readouterr().out
     assert "only_active" in out
 
 
-def test_soul_audit_full_empty_persona_returns_zero(
-    tmp_path: Path, capsys, monkeypatch
-) -> None:
+def test_soul_audit_full_empty_persona_returns_zero(tmp_path: Path, capsys, monkeypatch) -> None:
     """--full with no active file and no archives → clean empty output, rc=0."""
     persona_dir = tmp_path / "test-persona"
     persona_dir.mkdir()
-    monkeypatch.setattr(
-        "brain.cli.get_persona_dir", lambda _name: persona_dir
-    )
+    monkeypatch.setattr("brain.cli.get_persona_dir", lambda _name: persona_dir)
     rc = _soul_audit_handler(_args(persona_dir, full=True))
     assert rc == 0
     out = capsys.readouterr().out

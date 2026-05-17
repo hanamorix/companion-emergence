@@ -51,9 +51,7 @@ def test_build_outbound_recall_block_surfaces_acknowledged_unclear(
     """acknowledged_unclear entries from last 24h get a 'Pending uncertainty' block."""
     now = datetime(2026, 5, 11, 18, 0, tzinfo=UTC)
     ts = (now - timedelta(hours=2)).isoformat()
-    append_audit_row(
-        tmp_path, _row("ia_1", ts, "send_quiet", state="acknowledged_unclear")
-    )
+    append_audit_row(tmp_path, _row("ia_1", ts, "send_quiet", state="acknowledged_unclear"))
     block = build_outbound_recall_block(tmp_path, now=now)
     assert "Pending uncertainty" in block
     assert "acknowledged_unclear" in block

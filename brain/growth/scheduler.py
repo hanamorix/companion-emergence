@@ -48,7 +48,10 @@ class GrowthTickResult:
 
 
 def _should_run_growth_tick(
-    *, last_tick: datetime | None, now: datetime, throttle_days: float,
+    *,
+    last_tick: datetime | None,
+    now: datetime,
+    throttle_days: float,
 ) -> bool:
     """True iff enough time has elapsed since the last growth tick.
 
@@ -277,7 +280,10 @@ def _emit_vocabulary_initiate_candidate(
 
 
 def _aggregate_recent_emotion_vector(
-    store: MemoryStore, *, now: datetime, look_back_days: int = 30,
+    store: MemoryStore,
+    *,
+    now: datetime,
+    look_back_days: int = 30,
 ) -> dict[str, float]:
     """Return a max-pooled emotion vector across recent active memories.
 
@@ -289,7 +295,8 @@ def _aggregate_recent_emotion_vector(
 
         cutoff = now - timedelta(days=look_back_days)
         recent = [
-            m for m in list_conversation_memories(store, active_only=True)
+            m
+            for m in list_conversation_memories(store, active_only=True)
             if m.created_at >= cutoff and m.emotions
         ]
         if not recent:

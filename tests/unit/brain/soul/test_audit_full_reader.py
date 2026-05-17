@@ -40,35 +40,47 @@ def test_iter_audit_full_no_logs_returns_empty(tmp_path: Path) -> None:
 
 def test_iter_audit_full_active_only(tmp_path: Path) -> None:
     """No archives → yields just active-file lines."""
-    _write_active(tmp_path, [
-        {"ts": _ts(2026), "seq": 0},
-        {"ts": _ts(2026), "seq": 1},
-    ])
+    _write_active(
+        tmp_path,
+        [
+            {"ts": _ts(2026), "seq": 0},
+            {"ts": _ts(2026), "seq": 1},
+        ],
+    )
     out = list(iter_audit_full(tmp_path))
     assert [e["seq"] for e in out] == [0, 1]
 
 
 def test_iter_audit_full_chronological_across_archives(tmp_path: Path) -> None:
     """Active + 2024 + 2025 archives → 2024 entries first, then 2025, then active."""
-    _write_archive(tmp_path, 2025, [
-        {"ts": _ts(2025), "seq": "y25_a"},
-        {"ts": _ts(2025), "seq": "y25_b"},
-    ])
-    _write_archive(tmp_path, 2024, [
-        {"ts": _ts(2024), "seq": "y24_a"},
-    ])
-    _write_active(tmp_path, [
-        {"ts": _ts(2026), "seq": "active_a"},
-        {"ts": _ts(2026), "seq": "active_b"},
-    ])
+    _write_archive(
+        tmp_path,
+        2025,
+        [
+            {"ts": _ts(2025), "seq": "y25_a"},
+            {"ts": _ts(2025), "seq": "y25_b"},
+        ],
+    )
+    _write_archive(
+        tmp_path,
+        2024,
+        [
+            {"ts": _ts(2024), "seq": "y24_a"},
+        ],
+    )
+    _write_active(
+        tmp_path,
+        [
+            {"ts": _ts(2026), "seq": "active_a"},
+            {"ts": _ts(2026), "seq": "active_b"},
+        ],
+    )
     out = list(iter_audit_full(tmp_path))
     seqs = [e["seq"] for e in out]
     assert seqs == ["y24_a", "y25_a", "y25_b", "active_a", "active_b"]
 
 
-def test_iter_audit_full_skips_corrupt_in_gz_archive(
-    tmp_path: Path, caplog
-) -> None:
+def test_iter_audit_full_skips_corrupt_in_gz_archive(tmp_path: Path, caplog) -> None:
     """A malformed line inside a .gz archive is skipped, not aborted on."""
     caplog.set_level(logging.WARNING)
     # Hand-craft an archive with one bad line in the middle.
@@ -83,8 +95,9 @@ def test_iter_audit_full_skips_corrupt_in_gz_archive(
     seqs = [e["seq"] for e in out]
     assert seqs == ["a", "b", "active"]
     # The skip emitted a warning.
-    assert any("malformed" in r.message.lower() or "skipping" in r.message.lower()
-               for r in caplog.records)
+    assert any(
+        "malformed" in r.message.lower() or "skipping" in r.message.lower() for r in caplog.records
+    )
 
 
 def test_iter_audit_full_archives_only_no_active(tmp_path: Path) -> None:

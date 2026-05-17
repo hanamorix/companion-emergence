@@ -185,9 +185,7 @@ def _import_kit_crystallizations(
     finally:
         soul_store.close()
     skipped_summary = (
-        f"skipped {len(skipped_reasons)}: {skipped_reasons[:3]}"
-        if skipped_reasons
-        else None
+        f"skipped {len(skipped_reasons)}: {skipped_reasons[:3]}" if skipped_reasons else None
     )
     return imported, skipped_summary
 

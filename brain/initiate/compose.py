@@ -40,12 +40,8 @@ def compose_subject(
     Prompt deliberately excludes emotional state — only candidate facts
     and recent semantic memory excerpts.
     """
-    sources_line = (
-        f"Source: {candidate.source} (id: {candidate.source_id})"
-    )
-    tags_line = (
-        f"Topic tags: {', '.join(candidate.semantic_context.topic_tags) or '(none)'}"
-    )
+    sources_line = f"Source: {candidate.source} (id: {candidate.source_id})"
+    tags_line = f"Topic tags: {', '.join(candidate.semantic_context.topic_tags) or '(none)'}"
     excerpt_block = "\n".join(f"- {e}" for e in semantic_memory_excerpts[:5])
 
     prompt = (
@@ -85,10 +81,7 @@ def compose_tone(
             vector_str = ", ".join(f"{k}={v}" for k, v in vector.items())
             emotional_line = f"Emotional state right now: {vector_str}"
         else:
-            emotional_line = (
-                "Emotional state right now: (no specific emotional vector "
-                "available)"
-            )
+            emotional_line = "Emotional state right now: (no specific emotional vector available)"
     prompt = (
         "You are Nell. Render the following subject as a message to Hana, "
         "in your voice as defined below, coloured by your current "
@@ -116,10 +109,13 @@ def compose_decision(
     Malformed JSON output defaults to 'hold' so a bad LLM day never
     accidentally fires a send.
     """
-    history_block = "\n".join(
-        f"- {h['ts']} ({h['urgency']}): {h.get('subject_preview', '?')}"
-        for h in recent_send_history[-8:]
-    ) or "(no recent outbound)"
+    history_block = (
+        "\n".join(
+            f"- {h['ts']} ({h['urgency']}): {h.get('subject_preview', '?')}"
+            for h in recent_send_history[-8:]
+        )
+        or "(no recent outbound)"
+    )
 
     rate_line = (
         f"Recent voice-edit acceptance rate: {voice_edit_acceptance_rate:.0%}"
@@ -175,10 +171,13 @@ def compose_decision_voice_edit(
     never use the urgent `send_notify` path. Malformed output defaults
     to `hold` to keep the bias safe.
     """
-    recent_block = "\n".join(
-        f"- {e['accepted_at']}: {e['old_text']} -> {e['new_text']}"
-        for e in recent_voice_evolutions[-5:]
-    ) or "(no recent voice edits)"
+    recent_block = (
+        "\n".join(
+            f"- {e['accepted_at']}: {e['old_text']} -> {e['new_text']}"
+            for e in recent_voice_evolutions[-5:]
+        )
+        or "(no recent voice edits)"
+    )
 
     evidence_list = proposal.get("evidence") or []
     evidence_str = ", ".join(evidence_list) if evidence_list else "(none)"

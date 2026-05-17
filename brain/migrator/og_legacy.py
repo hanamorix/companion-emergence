@@ -15,6 +15,7 @@ higher level (backup + atomic rename of the whole persona dir).
 
 See docs/superpowers/specs/2026-05-04-migrator-legacy-preservation-design.md.
 """
+
 from __future__ import annotations
 
 import hashlib

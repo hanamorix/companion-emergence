@@ -215,9 +215,15 @@ def test_extract_items_uses_named_prompt_when_both_names_set() -> None:
     captured: list[str] = []
 
     class _CaptureProvider:
-        def name(self): return "capture"
-        def healthy(self): return True
-        def chat(self, *a, **kw): raise NotImplementedError
+        def name(self):
+            return "capture"
+
+        def healthy(self):
+            return True
+
+        def chat(self, *a, **kw):
+            raise NotImplementedError
+
         def generate(self, prompt, *, system=None):
             captured.append(prompt)
             return "[]"  # empty extraction is valid
@@ -245,9 +251,15 @@ def test_extract_items_uses_legacy_prompt_when_names_missing() -> None:
     captured: list[str] = []
 
     class _CaptureProvider:
-        def name(self): return "capture"
-        def healthy(self): return True
-        def chat(self, *a, **kw): raise NotImplementedError
+        def name(self):
+            return "capture"
+
+        def healthy(self):
+            return True
+
+        def chat(self, *a, **kw):
+            raise NotImplementedError
+
         def generate(self, prompt, *, system=None):
             captured.append(prompt)
             return "[]"

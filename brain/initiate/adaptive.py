@@ -7,6 +7,7 @@ companion's recent editorial track record. Default behaviour is
 
 Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md
 """
+
 from __future__ import annotations
 
 import json
@@ -163,16 +164,13 @@ def build_calibration_block(persona_dir: Path, *, user_name: str) -> str:
     rows = list(read_recent_calibration_rows(persona_dir, limit=20))
 
     n_replied = sum(
-        1 for r in rows
-        if r.decision == "promote" and r.promoted_to_state == "replied_explicit"
+        1 for r in rows if r.decision == "promote" and r.promoted_to_state == "replied_explicit"
     )
     n_acknowledged = sum(
-        1 for r in rows
-        if r.decision == "promote" and r.promoted_to_state == "acknowledged_unclear"
+        1 for r in rows if r.decision == "promote" and r.promoted_to_state == "acknowledged_unclear"
     )
     n_dismissed = sum(
-        1 for r in rows
-        if r.decision == "promote" and r.promoted_to_state == "dismissed"
+        1 for r in rows if r.decision == "promote" and r.promoted_to_state == "dismissed"
     )
     # "Pending" = promoted rows not yet closed. read_recent_calibration_rows
     # only returns closed rows, so this is 0 from the calibration view.
@@ -180,13 +178,9 @@ def build_calibration_block(persona_dir: Path, *, user_name: str) -> str:
     n_pending = 0
 
     n_stayed_silent = sum(
-        1 for r in rows
-        if r.decision == "filter" and r.filtered_recurred is False
+        1 for r in rows if r.decision == "filter" and r.filtered_recurred is False
     )
-    n_recurred = sum(
-        1 for r in rows
-        if r.decision == "filter" and r.filtered_recurred is True
-    )
+    n_recurred = sum(1 for r in rows if r.decision == "filter" and r.filtered_recurred is True)
 
     return _CALIBRATION_BLOCK_TEMPLATE.format(
         n_replied=n_replied,
@@ -254,9 +248,7 @@ def detect_drift(persona_dir: Path) -> DriftAlert | None:
         return total_promoted / max(1, total_in)
 
     current_rate = promote_rate(current)
-    historical_rates = [
-        promote_rate([r]) for r in historical if r.candidates_in > 0
-    ]
+    historical_rates = [promote_rate([r]) for r in historical if r.candidates_in > 0]
     if len(historical_rates) < 2:
         return None
     historical_median = statistics.median(historical_rates)

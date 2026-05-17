@@ -238,8 +238,11 @@ def test_arc_events_round_trip_through_jsonl(tmp_path: Path):
     log_path = tmp_path / "emotion_growth.log.jsonl"
     events = [
         arc_added_event(
-            timestamp=_now(), name="x", description="d",
-            reasoning="r", created_by="brain_emergence",
+            timestamp=_now(),
+            name="x",
+            description="d",
+            reasoning="r",
+            created_by="brain_emergence",
         ),
         arc_pruned_by_brain_event(timestamp=_now(), name="y", description="d", reasoning="r"),
         arc_removed_by_user_event(timestamp=_now(), name="z", description="d"),
@@ -252,6 +255,9 @@ def test_arc_events_round_trip_through_jsonl(tmp_path: Path):
     read_back = read_growth_log(log_path)
     assert len(read_back) == 5
     assert [e.type for e in read_back] == [
-        "arc_added", "arc_pruned_by_brain", "arc_removed_by_user",
-        "arc_rejected_user_removed", "arc_proposal_dropped",
+        "arc_added",
+        "arc_pruned_by_brain",
+        "arc_removed_by_user",
+        "arc_rejected_user_removed",
+        "arc_proposal_dropped",
     ]

@@ -13,14 +13,16 @@ from brain.initiate.voice_reflection import run_voice_reflection_tick
 def _evidence_provider(emit: bool = True) -> MagicMock:
     """Provider that returns a structured proposal or a 'no edit needed' response."""
     if emit:
-        canned = json.dumps({
-            "should_propose": True,
-            "diff": "- old line\n+ new line",
-            "old_text": "old line",
-            "new_text": "new line",
-            "rationale": "the old wording felt too clipped",
-            "evidence": ["dream_a", "cryst_b", "tone_c"],
-        })
+        canned = json.dumps(
+            {
+                "should_propose": True,
+                "diff": "- old line\n+ new line",
+                "old_text": "old line",
+                "new_text": "new line",
+                "rationale": "the old wording felt too clipped",
+                "evidence": ["dream_a", "cryst_b", "tone_c"],
+            }
+        )
     else:
         canned = json.dumps({"should_propose": False, "reason": "no coherent pattern"})
     provider = MagicMock(complete=MagicMock(return_value=canned))
@@ -69,14 +71,16 @@ def test_voice_reflection_requires_at_least_3_evidence_pieces(
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
     (persona_dir / "nell-voice.md").write_text("voice\n")
-    canned = json.dumps({
-        "should_propose": True,
-        "diff": "- a\n+ b",
-        "old_text": "a",
-        "new_text": "b",
-        "rationale": "x",
-        "evidence": ["only_one"],
-    })
+    canned = json.dumps(
+        {
+            "should_propose": True,
+            "diff": "- a\n+ b",
+            "old_text": "a",
+            "new_text": "b",
+            "rationale": "x",
+            "evidence": ["only_one"],
+        }
+    )
     provider = MagicMock(complete=MagicMock(return_value=canned))
     run_voice_reflection_tick(
         persona_dir,

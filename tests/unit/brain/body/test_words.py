@@ -40,7 +40,10 @@ def _seed_turn(persona_dir: Path, *, speaker: str, text: str, age_hours: float) 
 
 def test_empty_persona_returns_zero(store, tmp_path):
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=2.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=2.0,
+        now=_now(),
     )
     assert n == 0
 
@@ -49,7 +52,10 @@ def test_only_assistant_turns_counted(store, tmp_path):
     _seed_turn(tmp_path, speaker="assistant", text="one two three four", age_hours=0.5)
     _seed_turn(tmp_path, speaker="user", text="five six seven eight nine", age_hours=0.5)
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=2.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=2.0,
+        now=_now(),
     )
     assert n == 4  # assistant only
 
@@ -58,7 +64,10 @@ def test_window_filter_excludes_old_turns(store, tmp_path):
     _seed_turn(tmp_path, speaker="assistant", text="recent words count here", age_hours=0.5)
     _seed_turn(tmp_path, speaker="assistant", text="old turn does not count", age_hours=5.0)
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=2.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=2.0,
+        now=_now(),
     )
     assert n == 4
 
@@ -68,7 +77,10 @@ def test_session_hours_zero_falls_back_to_one_hour(store, tmp_path):
     _seed_turn(tmp_path, speaker="assistant", text="should count", age_hours=0.5)
     _seed_turn(tmp_path, speaker="assistant", text="should not count this old turn", age_hours=2.0)
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=0.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=0.0,
+        now=_now(),
     )
     assert n == 2  # only "should count"
 
@@ -79,16 +91,27 @@ def test_multiple_session_files_summed(store, tmp_path):
     # Manually write two separate session jsonl files
     ingest_turn(
         tmp_path,
-        {"session_id": "sess_aaaaaaaa", "speaker": "assistant",
-         "text": "one two three", "ts": (_now() - timedelta(hours=0.5)).isoformat()},
+        {
+            "session_id": "sess_aaaaaaaa",
+            "speaker": "assistant",
+            "text": "one two three",
+            "ts": (_now() - timedelta(hours=0.5)).isoformat(),
+        },
     )
     ingest_turn(
         tmp_path,
-        {"session_id": "sess_bbbbbbbb", "speaker": "assistant",
-         "text": "four five", "ts": (_now() - timedelta(hours=0.3)).isoformat()},
+        {
+            "session_id": "sess_bbbbbbbb",
+            "speaker": "assistant",
+            "text": "four five",
+            "ts": (_now() - timedelta(hours=0.3)).isoformat(),
+        },
     )
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=2.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=2.0,
+        now=_now(),
     )
     assert n == 5
 
@@ -100,6 +123,9 @@ def test_returns_zero_on_corrupt_jsonl(store, tmp_path):
     active.mkdir()
     (active / "sess_corrupt.jsonl").write_text("not json at all\n", encoding="utf-8")
     n = count_words_in_session(
-        store, persona_dir=tmp_path, session_hours=2.0, now=_now(),
+        store,
+        persona_dir=tmp_path,
+        session_hours=2.0,
+        now=_now(),
     )
     assert n == 0

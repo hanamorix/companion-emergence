@@ -83,9 +83,7 @@ def test_iter_missing_file_yields_nothing(tmp_path: Path) -> None:
     assert list(iter_jsonl_skipping_corrupt(tmp_path / "missing.jsonl")) == []
 
 
-def test_iter_skips_corrupt_lines_without_breaking_the_stream(
-    tmp_path: Path, caplog
-) -> None:
+def test_iter_skips_corrupt_lines_without_breaking_the_stream(tmp_path: Path, caplog) -> None:
     """A bad line in the middle doesn't stop the iterator from yielding the rest."""
     from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
@@ -106,11 +104,16 @@ def test_iter_skips_non_dict_json(tmp_path: Path) -> None:
 
     p = tmp_path / "log.jsonl"
     p.write_text(
-        json.dumps({"ok": True}) + "\n"
-        + json.dumps([1, 2, 3]) + "\n"
-        + json.dumps("just a string") + "\n"
-        + json.dumps(None) + "\n"
-        + json.dumps({"also": "ok"}) + "\n",
+        json.dumps({"ok": True})
+        + "\n"
+        + json.dumps([1, 2, 3])
+        + "\n"
+        + json.dumps("just a string")
+        + "\n"
+        + json.dumps(None)
+        + "\n"
+        + json.dumps({"also": "ok"})
+        + "\n",
         encoding="utf-8",
     )
     out = list(iter_jsonl_skipping_corrupt(p))

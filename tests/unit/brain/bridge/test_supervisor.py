@@ -25,9 +25,7 @@ def _persona_dir(tmp_path: Path) -> Path:
     p = tmp_path / "test-persona"
     p.mkdir()
     (p / "active_conversations").mkdir()
-    (p / "persona_config.json").write_text(
-        '{"provider": "fake", "searcher": "noop"}'
-    )
+    (p / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
     return p
 
 
@@ -74,9 +72,7 @@ def test_run_folded_skips_heartbeat_when_disabled(tmp_path: Path) -> None:
         fired.append(1)
 
     def runner():
-        with patch(
-            "brain.bridge.supervisor._run_heartbeat_tick", side_effect=fake_heartbeat
-        ):
+        with patch("brain.bridge.supervisor._run_heartbeat_tick", side_effect=fake_heartbeat):
             run_folded(
                 stop,
                 persona_dir=persona_dir,
@@ -114,9 +110,7 @@ def test_run_folded_fires_heartbeat_after_interval(tmp_path: Path) -> None:
         fired.set()
 
     def runner():
-        with patch(
-            "brain.bridge.supervisor._run_heartbeat_tick", side_effect=fake_heartbeat
-        ):
+        with patch("brain.bridge.supervisor._run_heartbeat_tick", side_effect=fake_heartbeat):
             run_folded(
                 stop,
                 persona_dir=persona_dir,
@@ -187,16 +181,18 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
         reflex_error=None,
         growth_error=None,
     )
-    fake_engine_class = MagicMock(return_value=MagicMock(run_tick=MagicMock(return_value=fake_result)))
+    fake_engine_class = MagicMock(
+        return_value=MagicMock(run_tick=MagicMock(return_value=fake_result))
+    )
     with (
         patch("brain.engines.heartbeat.HeartbeatEngine", fake_engine_class),
         patch("brain.emotion.persona_loader.load_persona_vocabulary"),
     ):
         _run_heartbeat_tick(persona_dir, FakeProvider(), bus)
 
-    assert any(
-        e.get("type") == "heartbeat_tick" for e in bus.events
-    ), "heartbeat_tick event was not published"
+    assert any(e.get("type") == "heartbeat_tick" for e in bus.events), (
+        "heartbeat_tick event was not published"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +211,9 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
     sess = create_session(persona_dir.name)
     sid = sess.session_id
     old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
-    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user",
-                              "text": "earlier", "ts": old_ts})
+    ingest_turn(
+        persona_dir, {"session_id": sid, "speaker": "user", "text": "earlier", "ts": old_ts}
+    )
 
     bus = _CapturingBus()
 
@@ -260,8 +257,9 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     sess = create_session(persona_dir.name)
     sid = sess.session_id
     old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
-    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user",
-                              "text": "ancient", "ts": old_ts})
+    ingest_turn(
+        persona_dir, {"session_id": sid, "speaker": "user", "text": "ancient", "ts": old_ts}
+    )
 
     bus = _CapturingBus()
 
@@ -304,6 +302,7 @@ def _write_oversize_log(persona_dir: Path, name: str, size_bytes: int) -> Path:
     p = persona_dir / name
     big = "x" * 1000
     import json as _json
+
     with p.open("w", encoding="utf-8") as f:
         line = _json.dumps({"at": "2026-01-01T00:00:00+00:00", "pad": big}) + "\n"
         # Write enough lines to exceed size_bytes.
@@ -339,6 +338,7 @@ def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
     persona_dir = _persona_dir(tmp_path)
     audit = persona_dir / "soul_audit.jsonl"
     import json as _json
+
     with audit.open("w", encoding="utf-8") as f:
         f.write(_json.dumps({"ts": "2024-06-15T00:00:00+00:00", "seq": 0}) + "\n")
         f.write(_json.dumps({"ts": "2026-06-15T00:00:00+00:00", "seq": 1}) + "\n")
@@ -352,9 +352,7 @@ def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
 
     assert (persona_dir / "soul_audit.2024.jsonl.gz").exists()
     # Active retains only 2026 entries.
-    remaining = [
-        _json.loads(line) for line in audit.read_text().splitlines() if line.strip()
-    ]
+    remaining = [_json.loads(line) for line in audit.read_text().splitlines() if line.strip()]
     assert len(remaining) == 1
     assert remaining[0]["seq"] == 1
 
@@ -366,13 +364,12 @@ def test_run_log_rotation_tick_archives_old_year_in_initiate_audit(
     persona_dir = _persona_dir(tmp_path)
     audit = persona_dir / "initiate_audit.jsonl"
     import json as _json
+
     with audit.open("w", encoding="utf-8") as f:
         f.write(_json.dumps({"ts": "2024-06-15T00:00:00+00:00", "seq": 0}) + "\n")
         f.write(_json.dumps({"ts": "2026-06-15T00:00:00+00:00", "seq": 1}) + "\n")
     bus = _CapturingBus()
-    _run_log_rotation_tick(
-        persona_dir, bus, now=datetime(2026, 5, 11, tzinfo=UTC)
-    )
+    _run_log_rotation_tick(persona_dir, bus, now=datetime(2026, 5, 11, tzinfo=UTC))
     assert (persona_dir / "initiate_audit.2024.jsonl.gz").exists()
 
 
@@ -404,9 +401,7 @@ def test_run_log_rotation_tick_fault_isolated_per_log(tmp_path: Path) -> None:
             raise OSError("simulated disk error")
         return real_rotate(log_path, **kw)
 
-    with patch(
-        "brain.bridge.supervisor.rotate_rolling_size", side_effect=selective
-    ):
+    with patch("brain.bridge.supervisor.rotate_rolling_size", side_effect=selective):
         _run_log_rotation_tick(persona_dir, bus, rolling_size_bytes=10_000)
 
     # heartbeats archive missing (failed), dreams archive present.

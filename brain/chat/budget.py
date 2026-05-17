@@ -73,9 +73,7 @@ def apply_budget(
     transcript = "\n".join(f"{m.role}: {m.content_text()}" for m in head)
     summary_msg: ChatMessage
     try:
-        summary = provider.generate(
-            prompt=_COMPRESSION_PROMPT.format(transcript=transcript)
-        )
+        summary = provider.generate(prompt=_COMPRESSION_PROMPT.format(transcript=transcript))
         summary_msg = ChatMessage(
             role="system",
             content=f"[Earlier in this conversation: {summary.strip()}]",

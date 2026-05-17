@@ -1,4 +1,5 @@
 """Tests for GET /images — past-image gallery listing."""
+
 from __future__ import annotations
 
 import hashlib
@@ -24,10 +25,14 @@ def _patch_fake_provider(monkeypatch):
     class _FakeProvider:
         def chat(self, *args, **kwargs):
             return ChatResponse(
-                session_id="fake", reply="ok", turn=1,
-                tool_invocations=[], duration_ms=1,
+                session_id="fake",
+                reply="ok",
+                turn=1,
+                tool_invocations=[],
+                duration_ms=1,
                 metadata={"persistence_ok": True},
             )
+
         def extract_memories(self, *args, **kwargs):
             return []
 
@@ -78,10 +83,14 @@ class TestListImages:
         persona_dir.mkdir()
         sha1, ext1 = _write_real_image(persona_dir, "png")
         sha2, ext2 = _write_real_image(persona_dir, "jpg")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha1]},
-            {"ts": "2026-05-01T11:00:00Z", "image_shas": [sha2]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha1]},
+                {"ts": "2026-05-01T11:00:00Z", "image_shas": [sha2]},
+            ],
+        )
         with _make_client(persona_dir) as c:
             r = c.get("/images")
         assert r.status_code == 200
@@ -95,12 +104,20 @@ class TestListImages:
         persona_dir = tmp_path / "test-persona"
         persona_dir.mkdir()
         sha, _ = _write_real_image(persona_dir, "png")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-02T10:00:00Z", "image_shas": [sha]},
-        ])
-        _write_buffer(persona_dir, "session-2", [
-            {"ts": "2026-05-01T09:00:00Z", "image_shas": [sha]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-02T10:00:00Z", "image_shas": [sha]},
+            ],
+        )
+        _write_buffer(
+            persona_dir,
+            "session-2",
+            [
+                {"ts": "2026-05-01T09:00:00Z", "image_shas": [sha]},
+            ],
+        )
         with _make_client(persona_dir) as c:
             r = c.get("/images")
         assert r.status_code == 200
@@ -114,9 +131,13 @@ class TestListImages:
         persona_dir.mkdir()
         for i in range(10):
             sha, _ = _write_real_image(persona_dir, "png")
-            _write_buffer(persona_dir, f"session-{i}", [
-                {"ts": f"2026-05-{i+1:02d}T10:00:00Z", "image_shas": [sha]},
-            ])
+            _write_buffer(
+                persona_dir,
+                f"session-{i}",
+                [
+                    {"ts": f"2026-05-{i + 1:02d}T10:00:00Z", "image_shas": [sha]},
+                ],
+            )
         with _make_client(persona_dir) as c:
             r = c.get("/images", params={"limit": 3})
         assert r.status_code == 200
@@ -128,10 +149,14 @@ class TestListImages:
         persona_dir.mkdir()
         sha1, _ = _write_real_image(persona_dir, "png")
         sha2, _ = _write_real_image(persona_dir, "jpg")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha1]},
-            {"ts": "2026-05-05T10:00:00Z", "image_shas": [sha2]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha1]},
+                {"ts": "2026-05-05T10:00:00Z", "image_shas": [sha2]},
+            ],
+        )
         with _make_client(persona_dir) as c:
             r = c.get("/images", params={"before_ts": "2026-05-03T00:00:00Z"})
         assert r.status_code == 200
@@ -144,10 +169,14 @@ class TestListImages:
         persona_dir = tmp_path / "test-persona"
         persona_dir.mkdir()
         sha_present, _ = _write_real_image(persona_dir, "png")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha_present]},
-            {"ts": "2026-05-01T11:00:00Z", "image_shas": ["a" * 64]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha_present]},
+                {"ts": "2026-05-01T11:00:00Z", "image_shas": ["a" * 64]},
+            ],
+        )
         with _make_client(persona_dir) as c:
             r = c.get("/images")
         assert r.status_code == 200
@@ -175,9 +204,13 @@ class TestListImages:
         persona_dir = tmp_path / "test-persona"
         persona_dir.mkdir()
         sha, _ = _write_real_image(persona_dir, "png")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha]},
+            ],
+        )
         with _make_client(persona_dir, auth_token="secret") as c:
             r = c.get("/images")
         assert r.status_code == 401
@@ -187,9 +220,13 @@ class TestListImages:
         persona_dir = tmp_path / "test-persona"
         persona_dir.mkdir()
         sha, _ = _write_real_image(persona_dir, "png")
-        _write_buffer(persona_dir, "session-1", [
-            {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha]},
-        ])
+        _write_buffer(
+            persona_dir,
+            "session-1",
+            [
+                {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha]},
+            ],
+        )
         with _make_client(persona_dir, auth_token="secret") as c:
             r = c.get("/images", headers=_auth_headers("secret"))
         assert r.status_code == 200

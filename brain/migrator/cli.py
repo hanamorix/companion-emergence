@@ -453,9 +453,7 @@ def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
     if not any(path.iterdir()):
         return  # empty dir is safe to use
     if not force:
-        raise FileExistsError(
-            f"{label} is non-empty: {path}. Pass --force to overwrite."
-        )
+        raise FileExistsError(f"{label} is non-empty: {path}. Pass --force to overwrite.")
     # --force: only clobber if the directory looks like a prior migration target
     has_marker = any((path / m).exists() for m in _MIGRATOR_MARKER_FILES)
     if not has_marker:

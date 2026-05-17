@@ -73,6 +73,7 @@ def test_allocate_port_retries_then_succeeds(monkeypatch) -> None:
 
 def test_allocate_port_exhausts_attempts_raises(monkeypatch) -> None:
     """All attempts fail → RuntimeError with the last OSError attached."""
+
     def always_failing_socket(*args, **kwargs):
         m = MagicMock()
         m.bind.side_effect = OSError("address in use")
@@ -129,9 +130,7 @@ def test_write_clean_shutdown_already_clean_noop(tmp_path: Path) -> None:
     assert after.stopped_at == "2026-05-10T00:00:01+00:00"  # unchanged
 
 
-def test_write_clean_shutdown_swallows_exceptions(
-    tmp_path: Path, monkeypatch, caplog
-) -> None:
+def test_write_clean_shutdown_swallows_exceptions(tmp_path: Path, monkeypatch, caplog) -> None:
     """If state_file.read raises, the helper logs a warning instead of
     propagating — exit-path code must never re-raise."""
     persona_dir = tmp_path / "persona"

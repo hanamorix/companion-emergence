@@ -249,12 +249,17 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         # falls back to 1-hour window. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         words = count_words_in_session(
-            store, persona_dir=persona_dir,
-            session_hours=0.0, now=now,
+            store,
+            persona_dir=persona_dir,
+            session_hours=0.0,
+            now=now,
         )
         body = compute_body_state(
-            emotions=state.emotions, session_hours=0.0,
-            words_written=words, days_since_contact=days, now=now,
+            emotions=state.emotions,
+            session_hours=0.0,
+            words_written=words,
+            days_since_contact=days,
+            now=now,
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -269,7 +274,8 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
 
     nonzero = sorted(
         ((n, v) for n, v in body.body_emotions.items() if v >= 0.5),
-        key=lambda kv: kv[1], reverse=True,
+        key=lambda kv: kv[1],
+        reverse=True,
     )
     if nonzero:
         parts = [f"{n} {v:.1f}" for n, v in nonzero]
@@ -414,7 +420,8 @@ def _build_recall_block(
 
 
 def _build_reply_to_outbound_block(
-    persona_dir: Path, audit_id: str,
+    persona_dir: Path,
+    audit_id: str,
 ) -> str:
     """Render the "you are replying to your earlier outbound" block.
 
@@ -430,10 +437,7 @@ def _build_reply_to_outbound_block(
         from brain.initiate.audit import iter_initiate_audit_full
 
         matched = next(
-            (
-                r for r in iter_initiate_audit_full(persona_dir)
-                if r.audit_id == audit_id
-            ),
+            (r for r in iter_initiate_audit_full(persona_dir) if r.audit_id == audit_id),
             None,
         )
     except Exception:  # noqa: BLE001
@@ -526,7 +530,7 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> 
         "── recent journal (private; do not quote) ──\n"
         "your journal is your private space. the entries below are metadata only —\n"
         "content stays in your files. you may reference themes if relevant (\"i've been\n"
-        "working through X\"), but do not quote entries verbatim unless your user\n"
+        'working through X"), but do not quote entries verbatim unless your user\n'
         "explicitly asks to read them. hana may read the files herself; that doesn't\n"
         "change how you use them."
     )
@@ -534,10 +538,7 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> 
     cutoff = datetime.now(UTC) - timedelta(days=window_days)
 
     try:
-        entries = [
-            m for m in store.list_by_type("journal_entry")
-            if m.created_at >= cutoff
-        ]
+        entries = [m for m in store.list_by_type("journal_entry") if m.created_at >= cutoff]
     except Exception:  # noqa: BLE001
         # If the store query fails for any reason, render the empty-state
         # contract rather than break chat composition. Failure logged
@@ -559,7 +560,9 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> 
         source_str = f"reflex_arc({arc_name})" if arc_name else source
         # Top-2 emotions by intensity
         emotions = sorted(
-            (m.emotions or {}).items(), key=lambda kv: kv[1], reverse=True,
+            (m.emotions or {}).items(),
+            key=lambda kv: kv[1],
+            reverse=True,
         )[:2]
         if emotions:
             emotions_str = ", ".join(f"{n} {v:.0f}" for n, v in emotions)

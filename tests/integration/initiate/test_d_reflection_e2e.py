@@ -1,4 +1,5 @@
 """End-to-end: source event → emitter → queue → D-tick → outcome."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -27,16 +28,28 @@ def test_e2e_five_candidates_d_promotes_one_filters_four(tmp_path):
 
     # Seed 5 candidates across 5 source types.
     emit_initiate_candidate(
-        persona, kind="message", source="dream", source_id="d1",
-        semantic_context=SemanticContext(), now=now - timedelta(minutes=10),
+        persona,
+        kind="message",
+        source="dream",
+        source_id="d1",
+        semantic_context=SemanticContext(),
+        now=now - timedelta(minutes=10),
     )
     emit_initiate_candidate(
-        persona, kind="message", source="crystallization", source_id="c1",
-        semantic_context=SemanticContext(), now=now - timedelta(minutes=8),
+        persona,
+        kind="message",
+        source="crystallization",
+        source_id="c1",
+        semantic_context=SemanticContext(),
+        now=now - timedelta(minutes=8),
     )
     emit_initiate_candidate(
-        persona, kind="message", source="emotion_spike", source_id="e1",
-        semantic_context=SemanticContext(), now=now - timedelta(minutes=6),
+        persona,
+        kind="message",
+        source="emotion_spike",
+        source_id="e1",
+        semantic_context=SemanticContext(),
+        now=now - timedelta(minutes=6),
     )
 
     class FakeFiring:
@@ -48,7 +61,10 @@ def test_e2e_five_candidates_d_promotes_one_filters_four(tmp_path):
         ts = now - timedelta(minutes=4)
 
     emit_reflex_firing_candidate(
-        persona, firing=FakeFiring(), firing_log_id="rfx_e2e", now=now - timedelta(minutes=4),
+        persona,
+        firing=FakeFiring(),
+        firing_log_id="rfx_e2e",
+        now=now - timedelta(minutes=4),
     )
 
     class FakeThread:
@@ -61,37 +77,51 @@ def test_e2e_five_candidates_d_promotes_one_filters_four(tmp_path):
         previously_linked_to_audit = False
 
     emit_research_completion_candidate(
-        persona, thread=FakeThread(), topic_overlap_score=0.50, now=now - timedelta(minutes=2),
+        persona,
+        thread=FakeThread(),
+        topic_overlap_score=0.50,
+        now=now - timedelta(minutes=2),
     )
 
     candidates = read_candidates(persona)
     assert len(candidates) == 5
     sources = sorted(c.source for c in candidates)
     assert sources == [
-        "crystallization", "dream", "emotion_spike",
-        "reflex_firing", "research_completion",
+        "crystallization",
+        "dream",
+        "emotion_spike",
+        "reflex_firing",
+        "research_completion",
     ]
 
     def haiku_call(*, system, user):
         return (
-            '{"decisions":['
-            '{"candidate_index":1,"decision":"filter","reason":"old weather","confidence":"high"},'
-            '{"candidate_index":2,"decision":"filter","reason":"already settled","confidence":"high"},'
-            '{"candidate_index":3,"decision":"promote","reason":"genuine spike","confidence":"high"},'
-            '{"candidate_index":4,"decision":"filter","reason":"reflex echo","confidence":"high"},'
-            '{"candidate_index":5,"decision":"filter","reason":"interesting but private","confidence":"high"}'
-            '],"tick_note":"only one worth Hana hearing"}'
-        ), 250, 600, 200
+            (
+                '{"decisions":['
+                '{"candidate_index":1,"decision":"filter","reason":"old weather","confidence":"high"},'
+                '{"candidate_index":2,"decision":"filter","reason":"already settled","confidence":"high"},'
+                '{"candidate_index":3,"decision":"promote","reason":"genuine spike","confidence":"high"},'
+                '{"candidate_index":4,"decision":"filter","reason":"reflex echo","confidence":"high"},'
+                '{"candidate_index":5,"decision":"filter","reason":"interesting but private","confidence":"high"}'
+                '],"tick_note":"only one worth Hana hearing"}'
+            ),
+            250,
+            600,
+            200,
+        )
 
     def sonnet_call(*, system, user):
         raise AssertionError("should not escalate")
 
     deps = ReflectionDeps(
-        companion_name="Nell", user_name="Hana",
+        companion_name="Nell",
+        user_name="Hana",
         voice_template_path=tmp_path / "voice.md",
         outbound_recall_block="(none)",
-        haiku_call=haiku_call, sonnet_call=sonnet_call,
-        now=now, tick_id="tick_e2e",
+        haiku_call=haiku_call,
+        sonnet_call=sonnet_call,
+        now=now,
+        tick_id="tick_e2e",
     )
     result, dcall = reflection_run(candidates, deps=deps)
     append_d_call_row(persona, dcall)

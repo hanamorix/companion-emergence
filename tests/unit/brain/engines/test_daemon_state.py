@@ -133,11 +133,7 @@ def test_daemon_fire_entry_truncates_at_sentence_when_over_cap() -> None:
     Symptom this guards against: reflex summary ending mid-clause at
     "expects him to" because the prior hard-slice cut at exactly 250.
     """
-    summary = (
-        "First sentence is short. "
-        + "x" * 1200
-        + ". Final sentence sits beyond the cap."
-    )
+    summary = "First sentence is short. " + "x" * 1200 + ". Final sentence sits beyond the cap."
     entry = _fire(summary=summary)
     assert len(entry.summary) <= 1500
     assert entry.summary.endswith(".")

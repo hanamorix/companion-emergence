@@ -552,26 +552,32 @@ def test_run_migrate_migrates_soul_candidates_end_to_end(tmp_path: Path) -> None
     (og_data / "hebbian_state.json").write_text("{}")
     # Two soul candidates: one accepted, one rejected
     (og_data / "soul_candidates.jsonl").write_text(
-        json.dumps({
-            "memory_id": "mem-acc",
-            "text": "accepted one",
-            "label": "high_emotion_peak",
-            "importance": 95,
-            "queued_at": "2026-04-06T17:14:28+00:00",
-            "status": "accepted",
-            "decided_at": "2026-04-07T18:39:29.989825+00:00",
-            "crystallization_id": "cryst-xyz",
-        }) + "\n"
-        + json.dumps({
-            "memory_id": "mem-rej",
-            "text": "rejected one",
-            "label": "high_emotion_peak",
-            "importance": 50,
-            "queued_at": "2026-04-06T17:14:28+00:00",
-            "status": "rejected",
-            "decided_at": "2026-04-07T18:39:29.989836+00:00",
-            "rejection_reason": "duplicate",
-        }) + "\n"
+        json.dumps(
+            {
+                "memory_id": "mem-acc",
+                "text": "accepted one",
+                "label": "high_emotion_peak",
+                "importance": 95,
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "accepted",
+                "decided_at": "2026-04-07T18:39:29.989825+00:00",
+                "crystallization_id": "cryst-xyz",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "memory_id": "mem-rej",
+                "text": "rejected one",
+                "label": "high_emotion_peak",
+                "importance": 50,
+                "queued_at": "2026-04-06T17:14:28+00:00",
+                "status": "rejected",
+                "decided_at": "2026-04-07T18:39:29.989836+00:00",
+                "rejection_reason": "duplicate",
+            }
+        )
+        + "\n"
     )
 
     output = tmp_path / "out"
@@ -610,23 +616,27 @@ def test_run_migrate_migrates_reflex_log_end_to_end(tmp_path: Path) -> None:
     matrix = np.zeros((0, 0), dtype=np.float32)
     np.save(og_data / "connection_matrix.npy", matrix)
     (og_data / "hebbian_state.json").write_text("{}")
-    (og_data / "nell_reflex_log.json").write_text(json.dumps({
-        "fires": [
+    (og_data / "nell_reflex_log.json").write_text(
+        json.dumps(
             {
-                "arc": "creative_pitch",
-                "fired_at": "2026-03-31T11:30:52.498666+00:00",
-                "trigger_state": {"creative_hunger": 9},
-                "output_preview": "Listen to this, babe...",
-                "description": "creative hunger overwhelmed",
-            },
-            {
-                "arc": "gift_creation",
-                "fired_at": "2026-03-31T11:31:02.122702+00:00",
-                "trigger_state": {"love": 9, "creative_hunger": 9},
-                "output_preview": "Dear Hana...",
-            },
-        ],
-    }))
+                "fires": [
+                    {
+                        "arc": "creative_pitch",
+                        "fired_at": "2026-03-31T11:30:52.498666+00:00",
+                        "trigger_state": {"creative_hunger": 9},
+                        "output_preview": "Listen to this, babe...",
+                        "description": "creative hunger overwhelmed",
+                    },
+                    {
+                        "arc": "gift_creation",
+                        "fired_at": "2026-03-31T11:31:02.122702+00:00",
+                        "trigger_state": {"love": 9, "creative_hunger": 9},
+                        "output_preview": "Dear Hana...",
+                    },
+                ],
+            }
+        )
+    )
 
     output = tmp_path / "out"
     args = MigrateArgs(input_dir=og_data, output_dir=output, install_as=None, force=False)
@@ -661,9 +671,7 @@ def test_run_migrate_refuses_force_clobber_of_non_migrator_directory(
     sub.mkdir()
     (sub / "main.rs").write_text("fn main() {}")
 
-    args = MigrateArgs(
-        input_dir=og_dir, output_dir=innocent, install_as=None, force=True
-    )
+    args = MigrateArgs(input_dir=og_dir, output_dir=innocent, install_as=None, force=True)
 
     with pytest.raises(FileExistsError) as excinfo:
         run_migrate(args)
@@ -690,9 +698,7 @@ def test_run_migrate_force_clobber_succeeds_when_marker_present(
     # Marker indicating this was a prior migration target
     (output / "migration-report.md").write_text("prior run")
 
-    args = MigrateArgs(
-        input_dir=og_dir, output_dir=output, install_as=None, force=True
-    )
+    args = MigrateArgs(input_dir=og_dir, output_dir=output, install_as=None, force=True)
     # Should not raise
     report = run_migrate(args)
     assert report.memories_migrated > 0
@@ -742,9 +748,7 @@ def test_run_migrate_lock_lives_outside_target_dir(
     assert lock_path.name == ".migrated.migrate.lock"
 
 
-def test_run_migrate_refuses_when_lock_held_by_live_pid(
-    og_dir: Path, tmp_path: Path
-) -> None:
+def test_run_migrate_refuses_when_lock_held_by_live_pid(og_dir: Path, tmp_path: Path) -> None:
     """Pre-create lockfile with a live PID (our own). run_migrate must raise
     a clear error and leave the lockfile untouched (it's not ours to remove)."""
     import os

@@ -35,9 +35,7 @@ def build_outbound_recall_block(
 
     # Recent outbound: actual sends (send_notify / send_quiet), latest first, capped.
     sent_rows = [
-        r
-        for r in rows
-        if r.decision in ("send_notify", "send_quiet") and r.delivery is not None
+        r for r in rows if r.decision in ("send_notify", "send_quiet") and r.delivery is not None
     ]
     sent_rows.sort(key=lambda r: r.ts, reverse=True)
     sent_rows = sent_rows[:recent_cap]
@@ -91,17 +89,13 @@ def build_recent_conversation_excerpt(
     store = MemoryStore(store_path)
     try:
         recent = [
-            memory
-            for memory in store.list_by_type("conversation")
-            if memory.created_at >= cutoff
+            memory for memory in store.list_by_type("conversation") if memory.created_at >= cutoff
         ]
     finally:
         store.close()
 
     recent.sort(key=lambda memory: memory.created_at)
-    excerpt = "\n".join(
-        f"[{memory.created_at.isoformat()}] {memory.content}" for memory in recent
-    )
+    excerpt = "\n".join(f"[{memory.created_at.isoformat()}] {memory.content}" for memory in recent)
 
     if len(excerpt) <= max_chars:
         return excerpt

@@ -9,6 +9,7 @@ Used by:
 - brain.initiate.reflection.parse_structured_response (D-reflection output)
 - brain.engines.research._compute_topic_overlap_via_haiku (topic-overlap score)
 """
+
 from __future__ import annotations
 
 import re
