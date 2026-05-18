@@ -39,8 +39,13 @@ def test_render_prompt_context_full_state():
     blob = render_prompt_context(s)
     assert "felt time" in blob.lower()
     assert "412" in blob  # lived age
+    assert "baseline pace" in blob  # lived-age pace annotation
     assert "the boat one" in blob
     assert "sorrow lifted" in blob
+    assert "current stretch (since the" in blob
+    # dream is the newest anchor (2026-05-17) — label should say "dream"
+    assert "since the dream" in blob
+    assert any(tag in blob for tag in ("quiet", "steady", "dense"))
 
 
 def test_render_prompt_context_stays_under_token_budget():
@@ -63,3 +68,18 @@ def test_render_prompt_context_stays_under_token_budget():
     blob = render_prompt_context(s)
     # Rough token estimate: 1 token ≈ 4 chars in English. 150 tokens ≈ 600 chars budget.
     assert len(blob) <= 600
+
+
+def test_render_prompt_context_uses_dense_tag_for_high_activity():
+    s = FeltTimeState(
+        lived_age_hours=10.0,
+        anchors={
+            "dream": Anchor("dream", "2026-05-17T20:00:00+00:00", "x", "dreams.log.jsonl:1"),
+        },
+        pressure=PressureCounters(
+            heartbeats=300, chat_turns=25, reflex_firings=5, wall_clock_s=10000.0
+        ),
+        last_tick_ts="2026-05-19T10:00:00+00:00",
+    )
+    blob = render_prompt_context(s)
+    assert "dense" in blob
