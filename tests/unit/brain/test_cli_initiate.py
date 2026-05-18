@@ -25,10 +25,16 @@ def _args(persona_dir: Path, **kw) -> argparse.Namespace:
 
 
 def _seed_one_audit(persona_dir: Path) -> None:
+    # Use a recent timestamp so the row falls within the default 7-day
+    # tail window in _initiate_audit_handler. Previously hardcoded to
+    # 2026-05-11, which broke once that date drifted past the window.
+    from datetime import UTC, datetime, timedelta
+
+    recent_ts = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     row = AuditRow(
         audit_id="ia_001",
         candidate_id="ic_001",
-        ts="2026-05-11T14:00:00+00:00",
+        ts=recent_ts,
         kind="message",
         subject="the dream",
         tone_rendered="x",
