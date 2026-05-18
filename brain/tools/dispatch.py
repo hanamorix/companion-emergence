@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from brain.felt_time.tool import felt_time_now as _felt_time_now_impl
+from brain.felt_time.tool import pressure_since as _pressure_since_impl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools.impls.add_journal import add_journal
@@ -41,6 +43,15 @@ class ToolDispatchError(RuntimeError):
 # Dispatch table — name → impl callable
 # ---------------------------------------------------------------------------
 
+
+def _felt_time_now_wrapper(*, store, hebbian, persona_dir, **_):
+    return _felt_time_now_impl(persona_dir=persona_dir)
+
+
+def _pressure_since_wrapper(*, store, hebbian, persona_dir, anchor_type=None, **_):
+    return _pressure_since_impl(arguments={"anchor_type": anchor_type}, persona_dir=persona_dir)
+
+
 _DISPATCH: dict[str, Any] = {
     "get_emotional_state": get_emotional_state,
     "get_personality": get_personality,
@@ -55,6 +66,8 @@ _DISPATCH: dict[str, Any] = {
     "list_works": list_works,
     "search_works": search_works,
     "read_work": read_work,
+    "felt_time_now": _felt_time_now_wrapper,
+    "pressure_since": _pressure_since_wrapper,
 }
 
 
