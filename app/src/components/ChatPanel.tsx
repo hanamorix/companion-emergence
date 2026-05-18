@@ -97,6 +97,11 @@ interface Props {
    *  quit sees that their last conversation is being saved, not
    *  forgotten. Source: PersonaState.recovering from /persona/state. */
   recovering?: boolean;
+  /** True iff felt-time state was rebuilt from JSONL logs after a
+   *  stale or missing felt_time_state.json. Cleared on the next
+   *  supervisor tick — banner is naturally short-lived.
+   *  Source: PersonaState.felt_time_recovered from /persona/state. */
+  feltTimeRecovered?: boolean;
   /** Optional event-stream override — used in tests to inject a mock
    *  bridge /events subscription without opening a real WebSocket. When
    *  omitted, ChatPanel opens its own /events socket scoped to the
@@ -113,7 +118,7 @@ interface Props {
  * message on the `done` frame. Avatar speaking animation runs from
  * stream-open until done, so the mouth animates while text appears.
  */
-export function ChatPanel({ persona, onSpeakingChange, recovering = false, eventStream }: Props) {
+export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltTimeRecovered = false, eventStream }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -646,6 +651,20 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, event
             }}
           >
             Reconnecting your previous chat — give it a moment.
+          </div>
+        )}
+        {feltTimeRecovered && (
+          <div
+            data-testid="felt-time-recovery-banner"
+            role="status"
+            style={{
+              fontSize: 11,
+              color: "var(--text-mute)",
+              padding: "6px 4px",
+              fontStyle: "italic",
+            }}
+          >
+            Felt time recovered from logs.
           </div>
         )}
       </div>

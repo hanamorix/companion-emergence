@@ -321,6 +321,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         persona={persona}
         onSpeakingChange={setIsSpeaking}
         recovering={state?.recovering ?? false}
+        feltTimeRecovered={state?.felt_time_recovered ?? false}
       />
     </div>
   );

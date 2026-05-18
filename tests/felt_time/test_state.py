@@ -16,6 +16,7 @@ def test_felt_time_state_cold_start_defaults():
     assert s.pressure == PressureCounters()
     assert s.last_tick_ts is None
     assert s.weather_baselines == {}
+    assert s.replayed is False
 
 
 def test_persist_writes_atomic_json(tmp_path):
@@ -84,3 +85,26 @@ def test_load_or_recover_treats_corrupt_state_file_as_recovery_trigger(tmp_path)
     loaded, recovered = load_or_recover(tmp_path)
     assert recovered is True
     assert loaded.lived_age_hours == 0.0
+
+
+def test_persist_round_trip_preserves_replayed_flag(tmp_path):
+    s = FeltTimeState(lived_age_hours=1.0, replayed=True)
+    persist(s, tmp_path)
+
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    assert data["replayed"] is True
+
+    loaded, _recovered = load_or_recover(tmp_path)
+    assert loaded.replayed is True
+
+
+def test_persist_round_trip_replayed_false_round_trips_correctly(tmp_path):
+    s = FeltTimeState(lived_age_hours=5.0, last_tick_ts="2026-05-17T22:00:00+00:00", replayed=False)
+    persist(s, tmp_path)
+
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    assert data["replayed"] is False
+
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.replayed is False

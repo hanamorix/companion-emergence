@@ -272,6 +272,31 @@ describe("ChatPanel — recovery banner (Phase 3.B)", () => {
   });
 });
 
+// ── Task 10.1: felt-time recovery banner ────────────────────────────────
+describe("ChatPanel — felt-time recovery banner (Task 10.1)", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders no felt-time banner when feltTimeRecovered is undefined (default)", () => {
+    render(<ChatPanel persona="nell" />);
+    expect(screen.queryByTestId("felt-time-recovery-banner")).toBeNull();
+  });
+
+  it("renders no felt-time banner when feltTimeRecovered is false", () => {
+    render(<ChatPanel persona="nell" feltTimeRecovered={false} />);
+    expect(screen.queryByTestId("felt-time-recovery-banner")).toBeNull();
+  });
+
+  it("renders the felt-time recovery banner when feltTimeRecovered is true", () => {
+    render(<ChatPanel persona="nell" feltTimeRecovered={true} />);
+    const banner = screen.getByTestId("felt-time-recovery-banner");
+    expect(banner).toBeInTheDocument();
+    expect(banner).toHaveAttribute("role", "status");
+    expect(banner.textContent).toMatch(/felt time recovered from logs/i);
+  });
+});
+
 // ── Task 26: initiate banner integration ──────────────────────────────
 // ChatPanel subscribes to bridge /events and renders an InitiateBanner
 // for every initiate_delivered event. After 2s on screen the banner

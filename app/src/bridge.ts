@@ -127,6 +127,11 @@ export interface PersonaState {
    *  3.A) without the field still parse — falls through to undefined and
    *  the UI treats it as false. */
   recovering?: boolean;
+  /** True iff felt-time state was rebuilt from JSONL logs after the
+   *  bridge restarted with a stale or missing felt_time_state.json.
+   *  Cleared on the next supervisor tick — banner is naturally short-lived.
+   *  Optional so older bridge builds without the field degrade gracefully. */
+  felt_time_recovered?: boolean;
 }
 
 export interface BodyState {

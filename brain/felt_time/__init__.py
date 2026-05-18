@@ -109,6 +109,7 @@ class FeltTime:
             pressure=pressure,
             last_tick_ts=ctx.now_iso,
             weather_baselines=self._state.weather_baselines,
+            replayed=False,  # first real tick clears the recovery banner
         )
         persist(self._state, self.persona_dir)
 
@@ -135,6 +136,7 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
         pressure=PressureCounters(),
         last_tick_ts=None,
         weather_baselines={},
+        replayed=True,
     )
 
 

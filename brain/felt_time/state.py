@@ -40,6 +40,7 @@ class FeltTimeState:
     pressure: PressureCounters = field(default_factory=PressureCounters)
     last_tick_ts: str | None = None  # ISO 8601 UTC of last tick()
     weather_baselines: dict[str, dict] = field(default_factory=dict)  # per-channel rolling baseline
+    replayed: bool = False  # True iff state was rebuilt from JSONLs, not loaded from state file.
 
     @classmethod
     def cold_start(cls) -> FeltTimeState:
@@ -59,6 +60,7 @@ def persist(state: FeltTimeState, persona_dir: Path) -> None:
         "pressure": asdict(state.pressure),
         "last_tick_ts": state.last_tick_ts,
         "weather_baselines": state.weather_baselines,
+        "replayed": state.replayed,
     }
     save_with_backup(target, payload)
 
@@ -108,4 +110,5 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
         pressure=PressureCounters(**(data.get("pressure") or {})),
         last_tick_ts=data.get("last_tick_ts"),
         weather_baselines=data.get("weather_baselines") or {},
+        replayed=bool(data.get("replayed", False)),
     ), False

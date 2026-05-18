@@ -92,3 +92,36 @@ def test_load_or_recover_replays_when_logs_newer_than_state(tmp_path):
     loaded, recovered = load_or_recover(tmp_path)
     assert recovered is True
     assert loaded.anchors["dream"].label == "later"
+
+
+def test_replay_marks_state_as_replayed(tmp_path):
+    _write_jsonl(
+        tmp_path / "dreams.log.jsonl",
+        [{"ts": "2026-05-17T20:00:00+00:00", "summary": "test dream"}],
+    )
+    ft = FeltTime.from_logs(persona_dir=tmp_path)
+    assert ft.get_state().replayed is True
+
+
+def test_tick_clears_replayed_flag(tmp_path):
+    _write_jsonl(
+        tmp_path / "dreams.log.jsonl",
+        [{"ts": "2026-05-17T20:00:00+00:00", "summary": "test dream"}],
+    )
+    ft = FeltTime.from_logs(persona_dir=tmp_path)
+    assert ft.get_state().replayed is True  # precondition
+
+    ft.tick(
+        TickContext(
+            now_iso="2026-05-17T22:00:00+00:00",
+            heartbeats_in_tick=1,
+            chat_turns_in_tick=0,
+            reflex_firings_in_tick=0,
+            wall_clock_s_in_tick=900.0,
+            drivers=IntensityDrivers(),
+        )
+    )
+    assert ft.get_state().replayed is False
+    # Persisted state also has replayed=False so the bridge flag clears.
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    assert data["replayed"] is False
