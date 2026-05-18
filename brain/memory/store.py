@@ -410,8 +410,15 @@ class MemoryStore:
         """Fade a memory: snapshot content into content_snapshot, replace
         content with summary, set state='fading'. Raises KeyError if unknown.
         """
-        if self.get(memory_id) is None:
+        row = self._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if row is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
+        if row["state"] == "fading":
+            logger.warning(
+                "fade called on memory id=%s already in fading state — noop to preserve content_snapshot",
+                memory_id,
+            )
+            return
         self._conn.execute(
             "UPDATE memories SET content_snapshot = content, content = ?, state = 'fading' WHERE id = ?",
             (summary, memory_id),
@@ -423,7 +430,7 @@ class MemoryStore:
         snapshot, set state='active'. NULL snapshot logs a warning and
         returns without mutating (defensive). Raises KeyError if unknown.
         """
-        if self.get(memory_id) is None:
+        if not self._conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         row = self._conn.execute(
             "SELECT content_snapshot FROM memories WHERE id = ?", (memory_id,)
@@ -444,7 +451,7 @@ class MemoryStore:
         """Drop the row. Caller MUST write the graveyard entry first.
         Raises KeyError if unknown.
         """
-        if self.get(memory_id) is None:
+        if not self._conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self._conn.commit()
