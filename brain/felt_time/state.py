@@ -84,6 +84,10 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
     """Returns (state, recovered_from_logs)."""
     state_file = persona_dir / STATE_FILENAME
     if not state_file.exists():
+        if _newest_log_ts(persona_dir) is not None:
+            from brain.felt_time import _replay_from_logs  # local import avoids cycle
+
+            return _replay_from_logs(persona_dir), True
         return FeltTimeState.cold_start(), True
 
     try:
@@ -94,8 +98,9 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
     newest_log = _newest_log_ts(persona_dir)
     last_tick = data.get("last_tick_ts")
     if newest_log and (last_tick is None or newest_log > last_tick):
-        # Phase 6 will replace this with a real replay; for now just signal recovery.
-        return FeltTimeState.cold_start(), True
+        from brain.felt_time import _replay_from_logs  # local import avoids cycle
+
+        return _replay_from_logs(persona_dir), True
 
     return FeltTimeState(
         lived_age_hours=float(data.get("lived_age_hours", 0.0)),
