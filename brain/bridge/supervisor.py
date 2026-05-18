@@ -44,6 +44,7 @@ from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
+from brain.forgetting import run_pass as forgetting_run_pass
 from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
@@ -212,6 +213,10 @@ def run_folded(
                 _run_soul_review_tick(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor soul-review tick raised")
+            try:
+                forgetting_run_pass(persona_dir, event_bus=event_bus)
+            except Exception:
+                logger.exception("supervisor forgetting pass raised")
             last_soul_review_at = time.monotonic()
 
         # Finalize cadence — 24h silence (default) or explicit. Each pass
