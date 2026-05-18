@@ -12,12 +12,15 @@ this store.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_utc(ts: str) -> datetime:
@@ -86,6 +89,9 @@ class Memory:
     active: bool = True
     protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    state: str = "active"
+    content_snapshot: str | None = None
+    recall_count: int = 0
 
     @classmethod
     def create_new(
@@ -182,7 +188,10 @@ CREATE TABLE IF NOT EXISTS memories (
     last_accessed_at TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     protected INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'active',
+    content_snapshot TEXT,
+    recall_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
@@ -235,6 +244,22 @@ class MemoryStore:
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        # Idempotent column migration for upgraded personas — _SCHEMA's
+        # CREATE TABLE IF NOT EXISTS leaves pre-existing tables alone, so
+        # we check for missing columns + add them with their defaults.
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "state" not in existing:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "content_snapshot" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN content_snapshot TEXT")
+        if "recall_count" not in existing:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0"
+            )
+        # Index on state — used by forgetting pass to find fading rows fast.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
 
     def close(self) -> None:
@@ -277,9 +302,20 @@ class MemoryStore:
         return memory.id
 
     def get(self, memory_id: str) -> Memory | None:
-        """Return the Memory with the given id, or None."""
+        """Return the Memory with the given id, or None. Bumps
+        last_accessed_at + recall_count on hit so salience scoring sees
+        the access (Forgetting integration — spec v0.0.14-alpha.3).
+        """
         row = self._conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        return _row_to_memory(row) if row else None
+        if row is None:
+            return None
+        now_iso = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE memories SET recall_count = recall_count + 1, last_accessed_at = ? WHERE id = ?",
+            (now_iso, memory_id),
+        )
+        self._conn.commit()
+        return _row_to_memory(row)
 
     def list_by_domain(
         self, domain: str, active_only: bool = True, limit: int | None = None
@@ -370,6 +406,56 @@ class MemoryStore:
         self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
         self._conn.commit()
 
+    def fade(self, memory_id: str, *, summary: str) -> None:
+        """Fade a memory: snapshot content into content_snapshot, replace
+        content with summary, set state='fading'. Raises KeyError if unknown.
+        """
+        row = self._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
+        if row["state"] == "fading":
+            logger.warning(
+                "fade called on memory id=%s already in fading state — noop to preserve content_snapshot",
+                memory_id,
+            )
+            return
+        self._conn.execute(
+            "UPDATE memories SET content_snapshot = content, content = ?, state = 'fading' WHERE id = ?",
+            (summary, memory_id),
+        )
+        self._conn.commit()
+
+    def unfade(self, memory_id: str) -> None:
+        """Unfade a memory: restore content from content_snapshot, clear
+        snapshot, set state='active'. NULL snapshot logs a warning and
+        returns without mutating (defensive). Raises KeyError if unknown.
+        """
+        if not self._conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
+        row = self._conn.execute(
+            "SELECT content_snapshot FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row["content_snapshot"] is None:
+            logger.warning(
+                "unfade called on memory id=%s with NULL content_snapshot — noop",
+                memory_id,
+            )
+            return
+        self._conn.execute(
+            "UPDATE memories SET content = content_snapshot, content_snapshot = NULL, state = 'active' WHERE id = ?",
+            (memory_id,),
+        )
+        self._conn.commit()
+
+    def hard_delete(self, memory_id: str) -> None:
+        """Drop the row. Caller MUST write the graveyard entry first.
+        Raises KeyError if unknown.
+        """
+        if not self._conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
+        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        self._conn.commit()
+
     def count(self, active_only: bool = True) -> int:
         """Return the total count of memories."""
         sql = "SELECT COUNT(*) FROM memories"
@@ -378,13 +464,22 @@ class MemoryStore:
         return int(self._conn.execute(sql).fetchone()[0])
 
     def search_text(
-        self, query: str, active_only: bool = True, limit: int | None = None
+        self,
+        query: str,
+        active_only: bool = True,
+        limit: int | None = None,
+        include_fading: bool = True,
     ) -> list[Memory]:
         """Case-insensitive substring search on content.
 
         `%` and `_` in `query` are escaped so a caller passing `"%"` does
         not match every row. Empty queries are rejected; use list_active()
         when the caller intentionally wants a bounded/all-memory scan.
+
+        include_fading: when True (default), faded memories appear in
+        results with their summary as content and state='fading'.
+        When False, only active memories are returned. Set False on
+        callers that need pre-Forgetting search semantics.
         """
         if query == "":
             raise ValueError("empty query passed to search_text; use list_active() instead")
@@ -393,11 +488,22 @@ class MemoryStore:
         params: list[Any] = [f"%{escaped}%"]
         if active_only:
             sql += " AND active = 1"
+        if not include_fading:
+            sql += " AND state != 'fading'"
         sql += " ORDER BY created_at DESC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
+        if rows:
+            now_iso = datetime.now(UTC).isoformat()
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"UPDATE memories SET recall_count = recall_count + 1, last_accessed_at = ? WHERE id IN ({placeholders})",
+                (now_iso, *ids),
+            )
+            self._conn.commit()
         return [_row_to_memory(row) for row in rows]
 
     def list_active(self, limit: int | None = None) -> list[Memory]:
@@ -431,6 +537,7 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
     """Materialise a sqlite row into a Memory dataclass."""
     created = _coerce_utc(row["created_at"])
     last_accessed = _coerce_utc(row["last_accessed_at"]) if row["last_accessed_at"] else None
+    row_keys = row.keys()
     return Memory(
         id=row["id"],
         content=row["content"],
@@ -445,4 +552,7 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         active=bool(row["active"]),
         protected=bool(row["protected"]),
         metadata=_safe_load_metadata(row["metadata_json"]),
+        state=row["state"] if "state" in row_keys else "active",
+        content_snapshot=row["content_snapshot"] if "content_snapshot" in row_keys else None,
+        recall_count=row["recall_count"] if "recall_count" in row_keys else 0,
     )

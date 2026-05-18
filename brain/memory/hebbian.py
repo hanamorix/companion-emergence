@@ -131,6 +131,14 @@ class HebbianMatrix:
         self._conn.commit()
         return cursor.rowcount
 
+    def activation_count(self, memory_id: str) -> int:
+        """Return the count of edges incident on this memory id."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM hebbian_edges WHERE memory_a = ? OR memory_b = ?",
+            (memory_id, memory_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def spreading_activation(
         self,
         seed_ids: Iterable[str],

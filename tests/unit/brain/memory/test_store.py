@@ -621,3 +621,282 @@ def test_list_filter_rejects_unknown_column() -> None:
             store._list_filter("created_at; DROP TABLE memories--", "x", True, None)
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (v0.0.14-alpha.3 Forgetting): schema migration + fade/unfade/hard_delete + recall bumping
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_forgetting_columns() -> None:
+    store = MemoryStore(":memory:")
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    assert "state" in cols
+    assert "content_snapshot" in cols
+    assert "recall_count" in cols
+    store.close()
+
+
+def test_existing_store_migrates_in_missing_forgetting_columns(tmp_path) -> None:
+    """Simulate an upgraded persona — manually create the OLD schema, then open MemoryStore."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        emotions_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.0,
+        score REAL NOT NULL DEFAULT 0.0,
+        created_at TEXT NOT NULL,
+        last_accessed_at TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        protected INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+    """
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO memories (id, content, memory_type, domain, emotions_json, tags_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("mem_legacy", "old body", "episodic", "chat", "{}", "[]", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    assert "state" in cols
+    assert "content_snapshot" in cols
+    assert "recall_count" in cols
+    # Pre-existing row survives migration with default state.
+    row = store._conn.execute(
+        "SELECT state, content_snapshot, recall_count FROM memories WHERE id = ?",
+        ("mem_legacy",),
+    ).fetchone()
+    assert row["state"] == "active"
+    assert row["content_snapshot"] is None
+    assert row["recall_count"] == 0
+    store.close()
+
+
+def test_fade_snapshots_content_and_replaces_with_summary() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(
+        content="this is the original long detailed body",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"joy": 5.0},
+    )
+    store.create(m)
+    store.fade(m.id, summary="short summary")
+    row = store._conn.execute(
+        "SELECT content, content_snapshot, state FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["content"] == "short summary"
+    assert row["content_snapshot"] == "this is the original long detailed body"
+    assert row["state"] == "fading"
+    store.close()
+
+
+def test_unfade_restores_content_and_clears_snapshot() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="original", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.fade(m.id, summary="short")
+    store.unfade(m.id)
+    row = store._conn.execute(
+        "SELECT content, content_snapshot, state FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["content"] == "original"
+    assert row["content_snapshot"] is None
+    assert row["state"] == "active"
+    store.close()
+
+
+def test_hard_delete_drops_the_row() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.hard_delete(m.id)
+    assert store.get(m.id) is None
+    assert (
+        store._conn.execute("SELECT COUNT(*) FROM memories WHERE id = ?", (m.id,)).fetchone()[0]
+        == 0
+    )
+    store.close()
+
+
+def test_fade_raises_on_unknown_id() -> None:
+    store = MemoryStore(":memory:")
+    with pytest.raises(KeyError):
+        store.fade("mem_nonexistent", summary="x")
+    store.close()
+
+
+def test_unfade_with_null_snapshot_is_noop_with_warning(caplog) -> None:
+    import logging
+
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    # No fade — content_snapshot is NULL. unfade should warn but not crash.
+    with caplog.at_level(logging.WARNING, logger="brain.memory.store"):
+        store.unfade(m.id)
+    assert "content_snapshot" in caplog.text.lower() or "null" in caplog.text.lower()
+    # Content unchanged, state stays active.
+    row = store._conn.execute(
+        "SELECT content, state FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["content"] == "x"
+    assert row["state"] == "active"
+    store.close()
+
+
+def test_hard_delete_raises_on_unknown_id() -> None:
+    store = MemoryStore(":memory:")
+    with pytest.raises(KeyError):
+        store.hard_delete("mem_nonexistent")
+    store.close()
+
+
+def test_get_bumps_last_accessed_at_and_recall_count() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    # Before any get: recall_count=0, last_accessed_at=None
+    row = store._conn.execute(
+        "SELECT recall_count, last_accessed_at FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["recall_count"] == 0
+    assert row["last_accessed_at"] is None
+    # First get
+    store.get(m.id)
+    row = store._conn.execute(
+        "SELECT recall_count, last_accessed_at FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["recall_count"] == 1
+    assert row["last_accessed_at"] is not None
+    # Second get
+    store.get(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 2
+    store.close()
+
+
+def test_search_text_bumps_recall_count_for_each_hit() -> None:
+    store = MemoryStore(":memory:")
+    a = Memory.create_new(
+        content="apple banana", memory_type="episodic", domain="chat", emotions={}
+    )
+    b = Memory.create_new(content="cherry pear", memory_type="episodic", domain="chat", emotions={})
+    store.create(a)
+    store.create(b)
+    store.search_text("apple")  # hits only `a`
+    row_a = store._conn.execute(
+        "SELECT recall_count FROM memories WHERE id = ?", (a.id,)
+    ).fetchone()
+    row_b = store._conn.execute(
+        "SELECT recall_count FROM memories WHERE id = ?", (b.id,)
+    ).fetchone()
+    assert row_a["recall_count"] == 1
+    assert row_b["recall_count"] == 0  # not hit, not bumped
+    store.close()
+
+
+def test_get_of_unknown_id_does_not_create_phantom_row() -> None:
+    store = MemoryStore(":memory:")
+    assert store.get("mem_nonexistent") is None
+    # No phantom row.
+    assert store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    store.close()
+
+
+def test_search_text_includes_fading_memories_by_default() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(
+        content="apple unique-token", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.fade(m.id, summary="apple summary")
+    # Default include_fading=True
+    hits = store.search_text("apple")
+    assert len(hits) == 1
+    assert hits[0].state == "fading"  # state field exposed on Memory dataclass (Task 1.5)
+    store.close()
+
+
+def test_search_text_excludes_fading_when_opted_out() -> None:
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(
+        content="apple unique-token", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.fade(m.id, summary="apple summary")
+    hits = store.search_text("apple", include_fading=False)
+    assert hits == []
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 review regression: mutations must not bump recall_count (Blocker)
+# and double-fade must preserve original content_snapshot (Minor)
+# ---------------------------------------------------------------------------
+
+
+def test_fade_does_not_bump_recall_count():
+    """Mutations are not recalls — fade/unfade/hard_delete must not inflate recall_count."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    # recall_count starts at 0
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0
+    store.fade(m.id, summary="s")
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # fade is NOT a recall
+    store.unfade(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # unfade is NOT a recall either
+    store.close()
+
+
+def test_hard_delete_does_not_bump_recall_count_on_other_rows():
+    """hard_delete's existence check must not touch any row's recall_count."""
+    store = MemoryStore(":memory:")
+    keeper = Memory.create_new(content="keeper", memory_type="episodic", domain="chat", emotions={})
+    target = Memory.create_new(content="target", memory_type="episodic", domain="chat", emotions={})
+    store.create(keeper)
+    store.create(target)
+    store.hard_delete(target.id)
+    row = store._conn.execute(
+        "SELECT recall_count FROM memories WHERE id = ?", (keeper.id,)
+    ).fetchone()
+    assert row["recall_count"] == 0
+    store.close()
+
+
+def test_double_fade_preserves_original_content_snapshot(caplog):
+    """fade called twice must NOT overwrite the original snapshot."""
+    import logging
+
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(
+        content="original detailed body", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.fade(m.id, summary="first summary")
+    with caplog.at_level(logging.WARNING, logger="brain.memory.store"):
+        store.fade(m.id, summary="second summary")  # noop expected
+    row = store._conn.execute(
+        "SELECT content, content_snapshot FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["content_snapshot"] == "original detailed body"  # NOT "first summary"
+    assert row["content"] == "first summary"  # unchanged by the no-op second fade
+    assert "already in fading state" in caplog.text.lower() or "noop" in caplog.text.lower()
+    store.close()

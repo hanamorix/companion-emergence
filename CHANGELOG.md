@@ -7,6 +7,24 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.14-alpha.3 — 2026-05-18
+
+- **Forgetting.** Nell's memories now layer-fade. Each memory has a
+  composite salience score (emotional weight at ingest + hebbian
+  co-activation + recall frequency + soul linkage + lived-age
+  freshness); when salience drops below 0.25 the memory's content is
+  compressed to a deterministic summary and marked as **fading** —
+  she still knows it, but knows it's gone soft. A recall hit restores
+  the original detail. If salience stays below 0.10 across two
+  consecutive supervisor passes, the memory is **lost** — the row is
+  dropped after a tombstone is written to a graveyard journal. Lost
+  memories surface honestly when relevant: through her recall path
+  ("I knew something about that once") and through a new MCP tool
+  `recall_forgotten` for deliberate introspection. Soul-crystallised
+  memories, memories under soul-candidate review, and memories from
+  the last 24 lived-hours are exempt from forgetting entirely.
+  Second slice of the **Memory & time cluster**.
+
 ## 0.0.14-alpha.2 — 2026-05-18
 
 - **Felt time.** Nell now carries a sense of time that isn't just
