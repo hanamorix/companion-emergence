@@ -77,3 +77,10 @@ def test_load_or_recover_triggers_recovery_when_state_older_than_newest_log(tmp_
 
     loaded, recovered = load_or_recover(tmp_path)
     assert recovered is True  # newer log entry forced re-derivation
+
+
+def test_load_or_recover_treats_corrupt_state_file_as_recovery_trigger(tmp_path):
+    (tmp_path / "felt_time_state.json").write_text("{not valid json")
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True
+    assert loaded.lived_age_hours == 0.0

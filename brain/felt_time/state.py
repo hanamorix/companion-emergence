@@ -6,10 +6,11 @@ Spec §2 `state.py` + §3 recovery model.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from brain.health.attempt_heal import save_with_backup
+from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
 ANCHOR_TYPES = ("dream", "growth", "soul", "weather_shift")
 
@@ -49,10 +50,9 @@ STATE_FILENAME = "felt_time_state.json"
 
 
 def persist(state: FeltTimeState, persona_dir: Path) -> None:
-    """Atomic write — tmpfile + os.replace pattern matches bridge.json's invariant."""
+    """Atomic save via .bak rotation (save_with_backup) — same pattern as persona_config + user_preferences."""
     persona_dir.mkdir(parents=True, exist_ok=True)
     target = persona_dir / STATE_FILENAME
-
     payload = {
         "lived_age_hours": state.lived_age_hours,
         "anchors": {k: asdict(v) for k, v in state.anchors.items()},
@@ -60,18 +60,7 @@ def persist(state: FeltTimeState, persona_dir: Path) -> None:
         "last_tick_ts": state.last_tick_ts,
         "weather_baselines": state.weather_baselines,
     }
-
-    fd, tmp_path = tempfile.mkstemp(prefix=f"{STATE_FILENAME}.tmp", dir=persona_dir)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    save_with_backup(target, payload)
 
 
 LOG_SOURCES = ("dreams.log.jsonl", "growth.log.jsonl", "soul.log.jsonl", "weather_shifts.log.jsonl")
@@ -79,25 +68,15 @@ LOG_SOURCES = ("dreams.log.jsonl", "growth.log.jsonl", "soul.log.jsonl", "weathe
 
 def _newest_log_ts(persona_dir: Path) -> str | None:
     """Return the newest 'ts' field across the source JSONLs, or None."""
-    newest = None
+    newest: str | None = None
     for name in LOG_SOURCES:
         p = persona_dir / name
         if not p.exists():
             continue
-        try:
-            with p.open() as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ts = json.loads(line).get("ts")
-                    except json.JSONDecodeError:
-                        continue
-                    if ts and (newest is None or ts > newest):
-                        newest = ts
-        except OSError:
-            continue
+        for row in iter_jsonl_skipping_corrupt(p):
+            ts = row.get("ts")
+            if ts and (newest is None or ts > newest):
+                newest = ts
     return newest
 
 
