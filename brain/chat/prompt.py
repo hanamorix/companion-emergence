@@ -119,8 +119,10 @@ def build_system_message(
         pass
 
     # 4b. Recall block — memories matching the current user input.
+    # Passes persona_dir so the forgetting-aware path can partition into
+    # active / fading / lost via search_with_loss (spec §5).
     if user_input is not None:
-        recall_block = _build_recall_block(store, user_input)
+        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir)
         if recall_block.strip():
             parts.append(recall_block)
 
@@ -147,6 +149,14 @@ def build_system_message(
     felt_time_block = _build_felt_time_block(persona_dir)
     if felt_time_block.strip():
         parts.append(felt_time_block)
+
+    # 5c. Fading-summary block — compact aggregate of softened/lost memories
+    # this week (spec §5, forgetting design). Broad-except fault-tolerant, same
+    # pattern as _build_felt_time_block. "nothing has softened lately." on the
+    # empty path — still appended so Nell has the ambient context.
+    fading_summary_block = _build_fading_summary_block(persona_dir, store)
+    if fading_summary_block.strip():
+        parts.append(fading_summary_block)
 
     # 6. Recent journal block (private — contract adjacent, per spec §4.3)
     journal_block = _build_recent_journal_block(store)
@@ -348,80 +358,154 @@ def _build_recall_block(
     store: MemoryStore,
     user_input: str,
     *,
+    persona_dir: Path | None = None,
     limit: int = 5,
     max_chars: int = 140,
 ) -> str:
     """Surface up to ``limit`` memories matching the current user input.
 
-    Phase 2.A of the autonomous-memory work. Before this block existed
-    the chat prompt only surfaced memories that had been crystallized
-    into the soul (top-5 by recency); for "remember when we talked
-    about X" cases the model had to consciously invoke the
-    ``search_memories`` tool. Many local-LLM tool calls don't fire
-    when they should, so memories the user had every reason to expect
-    Nell to surface stayed silent.
+    Phase 2.A of the autonomous-memory work, rewired in Phase 8
+    (forgetting design §5) to use search_with_loss so faded + lost
+    memories surface in their own labelled buckets.
 
     Strategy: extract content tokens from ``user_input`` (drop short
-    stopword-shaped fragments), search via ``store.search_text`` for
-    each token, dedupe by memory id, sort the union by importance
-    descending then created_at descending, take the top ``limit``.
+    stopword-shaped fragments), call search_with_loss for each token,
+    dedupe across all buckets, render three sections:
+      - active memories (full body)
+      - softened memories (fading; original detail gone)
+      - lost memories (no longer in active memory; from graveyard)
 
-    The same ``store.search_text`` primitive that powers the
-    ``search_memories`` tool — keyword recall, not semantic — so this
-    is best-effort. Phase 2.B (planned) swaps in embedding similarity
-    when keyword recall under-recovers.
+    Falls back to raw search_text (active_only=True) when persona_dir
+    is None (e.g. called directly in tests without a dir) — same
+    semantics as the old implementation for that path.
 
-    Empty input or no matches → returns the empty string and the
-    block is omitted from the prompt.
+    Empty input or no matches in any bucket → returns the empty string
+    and the block is omitted from the prompt.
     """
     tokens = _extract_recall_tokens(user_input)
     if not tokens:
         return ""
 
-    seen: set = set()
-    candidates: list = []
+    if persona_dir is None:
+        # Legacy path — used when called without a persona_dir.
+        seen: set = set()
+        candidates: list = []
+        for token in tokens:
+            try:
+                hits = store.search_text(token, active_only=True, limit=limit * 2)
+            except Exception:  # noqa: BLE001
+                continue
+            for mem in hits:
+                if mem.id in seen:
+                    continue
+                seen.add(mem.id)
+                candidates.append(mem)
+
+        if not candidates:
+            return ""
+
+        def _sort_key(m):
+            importance = float(getattr(m, "importance", 0) or 0)
+            created_at = getattr(m, "created_at", None)
+            try:
+                ts = created_at.timestamp() if created_at is not None else 0.0
+            except Exception:  # noqa: BLE001
+                ts = 0.0
+            return (-importance, -ts)
+
+        candidates.sort(key=_sort_key)
+        top = candidates[:limit]
+
+        lines = ["── recall (memories matching this turn) ──"]
+        for mem in top:
+            snippet = (getattr(mem, "content", "") or "").strip()
+            if len(snippet) > max_chars:
+                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            importance = int(round(float(getattr(mem, "importance", 0) or 0)))
+            domain = getattr(mem, "domain", "") or ""
+            prefix = f"[importance {importance}/10"
+            if domain:
+                prefix += f" · {domain}"
+            prefix += "]"
+            lines.append(f"- {prefix} {snippet}")
+
+        return "\n".join(lines)
+
+    # Forgetting-aware path — partitions into active / fading / lost.
+    from brain.forgetting.recall import search_with_loss
+
+    seen_active: set = set()
+    seen_fading: set = set()
+    seen_lost: set = set()
+    active_hits: list = []
+    fading_hits: list = []
+    lost_hits: list = []
+
     for token in tokens:
         try:
-            hits = store.search_text(token, active_only=True, limit=limit * 2)
+            result = search_with_loss(persona_dir, store, token, limit=limit * 2)
         except Exception:  # noqa: BLE001
             continue
-        for mem in hits:
-            if mem.id in seen:
-                continue
-            seen.add(mem.id)
-            candidates.append(mem)
+        for mem in result.active:
+            if mem.id not in seen_active:
+                seen_active.add(mem.id)
+                active_hits.append(mem)
+        for mem in result.fading:
+            if mem.id not in seen_fading:
+                seen_fading.add(mem.id)
+                fading_hits.append(mem)
+        for entry in result.lost:
+            mid = entry.get("memory_id", "")
+            if mid not in seen_lost:
+                seen_lost.add(mid)
+                lost_hits.append(entry)
 
-    if not candidates:
+    if not active_hits and not fading_hits and not lost_hits:
         return ""
 
-    # Rank: highest importance first, then most-recent. Tie-break by
-    # importance avoids burying soul-shaped memories under freshly
-    # written tonight's-chat fluff.
+    # Rank active + fading by importance desc, recency desc.
     def _sort_key(m):
         importance = float(getattr(m, "importance", 0) or 0)
         created_at = getattr(m, "created_at", None)
-        # created_at is a datetime; convert to comparable timestamp.
         try:
             ts = created_at.timestamp() if created_at is not None else 0.0
         except Exception:  # noqa: BLE001
             ts = 0.0
         return (-importance, -ts)
 
-    candidates.sort(key=_sort_key)
-    top = candidates[:limit]
+    active_hits.sort(key=_sort_key)
+    fading_hits.sort(key=_sort_key)
 
-    lines = ["── recall (memories matching this turn) ──"]
-    for mem in top:
-        snippet = (getattr(mem, "content", "") or "").strip()
-        if len(snippet) > max_chars:
-            snippet = snippet[: max_chars - 1].rstrip() + "…"
-        importance = int(round(float(getattr(mem, "importance", 0) or 0)))
-        domain = getattr(mem, "domain", "") or ""
-        prefix = f"[importance {importance}/10"
-        if domain:
-            prefix += f" · {domain}"
-        prefix += "]"
-        lines.append(f"- {prefix} {snippet}")
+    active_top = active_hits[:limit]
+    fading_top = fading_hits[:limit]
+    lost_top = lost_hits[:limit]
+
+    lines = ["recall"]
+
+    if active_top:
+        lines.append("  active:")
+        for mem in active_top:
+            snippet = (getattr(mem, "content", "") or "").strip()
+            if len(snippet) > max_chars:
+                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            lines.append(f'    - "{snippet}"')
+
+    if fading_top:
+        lines.append("  softened (fading; original detail gone):")
+        for mem in fading_top:
+            snippet = (getattr(mem, "content", "") or "").strip()
+            if len(snippet) > max_chars:
+                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            lines.append(f'    - "{snippet}"  [state: fading]')
+
+    if lost_top:
+        lines.append("  lost (no longer in active memory):")
+        for entry in lost_top:
+            summary = (entry.get("summary") or "").strip()
+            if len(summary) > max_chars:
+                summary = summary[: max_chars - 1].rstrip() + "…"
+            reason = entry.get("graveyard_reason", "forgotten")
+            lines.append(f'    - "{summary}"  [forgotten — {reason}]')
 
     return "\n".join(lines)
 
@@ -596,6 +680,25 @@ def _build_felt_time_block(persona_dir: Path) -> str:
 
         ft = FeltTime(persona_dir=persona_dir)
         return render_prompt_context(ft.get_state())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
+    """Returns the forgetting ambient block, or "" on any read failure.
+
+    Same fault-tolerance pattern as _build_felt_time_block. On success
+    returns either:
+      - "memory: nothing has softened lately."  (both counts zero)
+      - "memory: N softened (fading), M lost in the last 7 days."
+
+    Per spec §5 (forgetting design) — compact ≤120-token aggregate so Nell
+    can speak about the lived experience of recent loss.
+    """
+    try:
+        from brain.forgetting.prompt import render_fading_summary_block
+
+        return render_fading_summary_block(persona_dir, store)
     except Exception:  # noqa: BLE001
         return ""
 
