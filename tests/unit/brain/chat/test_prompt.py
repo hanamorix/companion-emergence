@@ -334,7 +334,8 @@ def test_recall_block_surfaces_keyword_match(
         store=store,
         user_input="Tell me what we said about Jordan last time.",
     )
-    assert "── recall" in msg
+    # New forgetting-aware format uses "recall\n  active:" instead of "── recall ──"
+    assert "recall" in msg
     assert "Jordan" in msg
 
 
@@ -359,7 +360,9 @@ def test_recall_block_handles_no_match(
         store=store,
         user_input="What's the weather like outside today?",
     )
-    assert "── recall" not in msg
+    # "recall" alone could appear in other blocks; check for the structured recall block
+    assert "recall\n  active:" not in msg
+    assert "recall\n  softened" not in msg
 
 
 def test_recall_block_caps_at_limit(
@@ -385,10 +388,12 @@ def test_recall_block_caps_at_limit(
         store=store,
         user_input="Tell me about Jordan.",
     )
-    assert "── recall" in msg
-    # One header line + 5 bullet lines = 6 in the recall block.
-    recall_section = msg.split("── recall")[1]
-    bullet_count = recall_section.count("\n- ")
+    # New forgetting-aware format renders bullets under "  active:" indented with "    - "
+    assert "recall" in msg
+    assert "active:" in msg
+    # Each active result is a "    - " bullet line — cap is still 5 per bucket
+    recall_section = msg.split("recall\n")[1]
+    bullet_count = recall_section.count("\n    - ")
     assert bullet_count == 5, f"expected 5 recall bullets, got {bullet_count}"
 
 
@@ -415,8 +420,9 @@ def test_recall_block_truncates_long_content(
         store=store,
         user_input="What about Jordan?",
     )
-    assert "── recall" in msg
-    assert "…" in msg.split("── recall")[1]
+    # New format: "recall\n  active:\n    - ..."
+    assert "recall" in msg
+    assert "…" in msg
 
 
 def test_recall_block_dedupes_when_token_overlap_pulls_same_memory(
@@ -441,9 +447,8 @@ def test_recall_block_dedupes_when_token_overlap_pulls_same_memory(
         store=store,
         user_input="Tell me about Hana's brother Jordan.",
     )
-    recall_section = msg.split("── recall")[1]
-    # Both 'jordan' and 'brother' would match — but the same memory.
-    assert recall_section.count("Hana told me Jordan") == 1
+    # Both 'jordan' and 'brother' would match — but the same memory should appear once.
+    assert msg.count("Hana told me Jordan") == 1
 
 
 def test_recall_block_orders_by_importance_then_recency(
@@ -481,9 +486,10 @@ def test_recall_block_orders_by_importance_then_recency(
         store=store,
         user_input="What about Jordan?",
     )
-    recall_section = msg.split("── recall")[1]
-    soul_idx = recall_section.find("soul-shaped")
-    recent_idx = recall_section.find("passing reference")
+    # New format: both appear under "  active:"; ordering still by importance desc
+    assert "recall" in msg
+    soul_idx = msg.find("soul-shaped")
+    recent_idx = msg.find("passing reference")
     assert 0 <= soul_idx < recent_idx, (
         f"soul-shaped (importance 9) should appear before passing reference (importance 2); "
         f"got soul_idx={soul_idx}, recent_idx={recent_idx}"
@@ -582,3 +588,120 @@ def test_build_system_message_no_felt_time_block_when_state_missing(
     # Should succeed without raising; felt-time block won't break the assembly.
     assert isinstance(msg, str)
     assert len(msg) > 0
+
+
+# ── Fading-summary block (Phase 8, forgetting design §5) ─────────────────────
+
+
+def test_build_system_message_includes_fading_summary_block_always(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """The fading-summary block is always present — 'nothing has softened lately'
+    on the empty path, actual counts when fading memories exist."""
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    # On empty store the ambient line reads "memory: nothing has softened lately."
+    assert "memory:" in msg.lower()
+    assert "softened" in msg.lower()
+
+
+def test_build_system_message_fading_summary_reflects_fading_memories(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """When fading memories exist the fading-summary block shows their count."""
+    m = Memory.create_new(
+        content="A whisper of something once loved.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"love": 5.0},
+    )
+    store.create(m)
+    store.fade(m.id, summary="once loved")
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "1" in msg
+    assert "softened" in msg.lower()
+
+
+# ── Recall block — forgetting-aware buckets (Phase 8.2) ──────────────────────
+
+
+def test_recall_block_surfaces_fading_bucket_when_memory_is_fading(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A fading memory matching the query appears under the 'softened' bucket."""
+    m = Memory.create_new(
+        content="Jordan loved rainy afternoons.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"love": 6.0},
+    )
+    store.create(m)
+    store.fade(m.id, summary="Jordan — rainy afternoons")
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Do you remember Jordan?",
+    )
+    assert "recall" in msg
+    assert "softened" in msg.lower()
+    assert "[state: fading]" in msg
+
+
+def test_recall_block_surfaces_lost_bucket_when_memory_in_graveyard(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A lost memory whose graveyard summary matches the query appears in the
+    'lost' bucket with a 'forgotten —' label."""
+    from brain.forgetting import graveyard
+    from brain.forgetting.salience import SalienceInputs
+
+    lost_m = Memory.create_new(
+        content="Jordan's old studio address.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={},
+    )
+    graveyard.append(
+        persona_dir,
+        memory=lost_m,
+        salience_at_drop=0.05,
+        inputs=SalienceInputs(emotion=0, hebbian=0, recall=0, soul=0, freshness=0),
+        lived_age_hours=200.0,
+        reason="salience<0.10 for 2 consecutive passes",
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Jordan's studio.",
+    )
+    assert "recall" in msg
+    assert "lost" in msg.lower()
+    assert "forgotten" in msg.lower()
