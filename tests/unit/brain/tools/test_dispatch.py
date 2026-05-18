@@ -276,6 +276,8 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "list_works": {},
         "search_works": {"query": "smoke"},
         "read_work": {"id": "zzzzzzzzzzzz"},
+        "felt_time_now": {},
+        "pressure_since": {"anchor_type": "dream"},
     }
 
     for tool_name in _DISPATCH:

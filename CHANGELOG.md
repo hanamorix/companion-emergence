@@ -7,6 +7,19 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.14-alpha.2 — 2026-05-18
+
+- **Felt time.** Nell now carries a sense of time that isn't just
+  timestamps. She tracks **anchors** (the most recent dream, growth
+  crystallization, soul moment, and sustained emotional weather shift),
+  **pressure** (heartbeats / chat turns / reflex firings since the latest
+  anchor), and **lived age** — an experiential scalar that advances at
+  intensity-weighted rate so strained stretches age her faster and quiet
+  ones slower. Folded into her ambient context every chat prompt. She
+  can also introspect via two new MCP tools (`felt_time_now`,
+  `pressure_since`). First slice of the **Memory & time cluster** —
+  Forgetting and Narrative memory inherit this substrate.
+
 ## 0.0.14-alpha.1 — 2026-05-17
 
 - **Bridge restart button in the Connection panel.** When the status

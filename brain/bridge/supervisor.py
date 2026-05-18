@@ -42,6 +42,8 @@ from pathlib import Path
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
+from brain.felt_time import FeltTime, TickContext
+from brain.felt_time.lived_age import IntensityDrivers
 from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
@@ -179,6 +181,23 @@ def run_folded(
                 _run_heartbeat_tick(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor heartbeat tick raised")
+            try:
+                wall_s = time.monotonic() - last_heartbeat_at
+                # heartbeats/chat_turns/reflex_firings counter sources are
+                # placeholders (1/0/0) for v1 — Phase 9.2 (follow-up) tightens
+                # these by reading actual engine counters once the right
+                # accessor is identified.
+                # TODO(v0.0.15): replace 0 chat_turns + 0 reflex_firings with
+                # real counters from the event bus or engine state.
+                _run_felt_time_tick(
+                    persona_dir,
+                    wall_clock_s_since_last=wall_s,
+                    heartbeats_since_last=1,
+                    chat_turns_since_last=0,
+                    reflex_firings_since_last=0,
+                )
+            except Exception:
+                logger.exception("supervisor felt-time tick raised")
             last_heartbeat_at = time.monotonic()
 
         # Soul-review cadence — slowest of the three. Each pass is up to
@@ -261,6 +280,117 @@ def run_folded(
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _run_felt_time_tick(
+    persona_dir: Path,
+    wall_clock_s_since_last: float,
+    heartbeats_since_last: int,
+    chat_turns_since_last: int,
+    reflex_firings_since_last: int,
+) -> None:
+    """Fold one supervisor heartbeat cycle into felt-time state.
+
+    drivers values are derived from existing body + emotion accessors;
+    cold-start cases (no body state, no emotion vector) collapse all
+    drivers to 0.0 so lived-age advances at baseline.
+
+    Fault-isolated upstream: caller wraps in try/except so a raise here
+    cannot cascade into bridge shutdown or take down the heartbeat loop.
+    """
+    drivers = _derive_intensity_drivers(persona_dir, chat_turns_since_last, wall_clock_s_since_last)
+    ft = FeltTime(persona_dir=persona_dir)
+    ft.tick(
+        TickContext(
+            now_iso=datetime.now(UTC).isoformat(),
+            heartbeats_in_tick=heartbeats_since_last,
+            chat_turns_in_tick=chat_turns_since_last,
+            reflex_firings_in_tick=reflex_firings_since_last,
+            wall_clock_s_in_tick=wall_clock_s_since_last,
+            drivers=drivers,
+        )
+    )
+
+
+def _derive_intensity_drivers(
+    persona_dir: Path,
+    chat_turns_in_tick: int,
+    wall_clock_s_in_tick: float,
+) -> IntensityDrivers:
+    """Build IntensityDrivers from body + emotion state.
+
+    Each driver clipped to [0, 1]; missing inputs collapse to 0.0
+    so lived-age advances at baseline rate rather than crashing.
+
+    Body strain is derived from exhaustion + energy via a full
+    compute_body_state pass (opens its own MemoryStore per-call,
+    thread-local, same pattern as _run_heartbeat_tick).
+
+    Emotional intensity — TODO(v0.0.15): wire to brain.emotion once a
+    clean normalized accessor exists (current aggregate_state returns
+    raw channel scores, not a single normalized deviation scalar).
+    For now returns 0.0 (baseline lived-age rate; no false inflation).
+
+    Chat activity uses a fixed 6 turns/h baseline for the supervisor
+    tick window. Phase 9.2 follow-up will tighten to a rolling baseline
+    once weather_shift per-channel baselines are proven stable.
+    """
+    # Best-effort body strain from exhaustion / energy.
+    body_strain = 0.0
+    try:
+        from brain.body.state import compute_body_state
+        from brain.body.words import count_words_in_session
+        from brain.emotion.aggregate import aggregate_state
+        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.utils.memory import days_since_human
+
+        store = MemoryStore(persona_dir / "memories.db")
+        try:
+            rows = store._conn.execute(  # noqa: SLF001
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+            memories = [_row_to_memory(row) for row in rows]
+            emotion_state = aggregate_state(memories)
+            _now = datetime.now(UTC)
+            days = days_since_human(store, now=_now, persona_dir=persona_dir)
+            words = count_words_in_session(
+                store, persona_dir=persona_dir, session_hours=0.0, now=_now
+            )
+            body = compute_body_state(
+                emotions=emotion_state.emotions,
+                session_hours=0.0,
+                words_written=words,
+                days_since_contact=days,
+                now=_now,
+            )
+            # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
+            # Normalize each to [0, 1] then take the max (strain = worst axis).
+            raw_exhaustion = float(body.exhaustion) / 9.0
+            raw_energy_lack = 1.0 - float(body.energy) / 10.0
+            body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
+        finally:
+            store.close()
+    except Exception:
+        logger.debug("supervisor felt-time: body strain read failed; using 0.0", exc_info=True)
+
+    # Emotional intensity — best-effort, 0.0 fallback.
+    # TODO(v0.0.15): wire to brain.emotion once a clean normalized accessor exists.
+    emotional_intensity = 0.0
+
+    # Chat activity normalized against a fixed 6 turns/h baseline.
+    # TODO(v0.0.15): replace with rolling per-tick baseline from weather_shift.
+    baseline_per_tick = max(0.1, 6.0 * (wall_clock_s_in_tick / 3600.0))
+    chat_activity = min(1.0, float(chat_turns_in_tick) / baseline_per_tick)
+
+    return IntensityDrivers(
+        emotional_intensity=emotional_intensity,
+        body_strain=body_strain,
+        chat_activity=chat_activity,
+    )
 
 
 def _run_heartbeat_tick(

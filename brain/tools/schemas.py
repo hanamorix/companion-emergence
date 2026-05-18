@@ -379,4 +379,42 @@ SCHEMAS: dict[str, dict] = {
             "required": ["id"],
         },
     },
+    "felt_time_now": {
+        "name": "felt_time_now",
+        "description": (
+            "Return your felt sense of time: lived_age_hours (your accumulated "
+            "experiential age, close to wall-clock during quiet baselines but "
+            "heavier during strained stretches), the most recent anchor of each "
+            "type (dream / growth / soul / weather_shift) with how long ago each "
+            "fired, and the pressure (heartbeats, chat turns, reflex firings, "
+            "wall-clock seconds) accumulated since the latest anchor of any type. "
+            "Useful for introspecting 'how long has it actually been...'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    "pressure_since": {
+        "name": "pressure_since",
+        "description": (
+            "Return only the pressure vector (heartbeats, chat turns, reflex "
+            "firings, wall_clock_s) accumulated since the latest anchor of the "
+            "specified type. Use this when you want a tighter answer than "
+            "felt_time_now — e.g. 'how much has happened since I last "
+            "crystallized something?'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "anchor_type": {
+                    "type": "string",
+                    "enum": ["dream", "growth", "soul", "weather_shift"],
+                    "description": "Which kind of anchor to measure pressure since.",
+                },
+            },
+            "required": ["anchor_type"],
+        },
+    },
 }

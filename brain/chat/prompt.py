@@ -141,6 +141,13 @@ def build_system_message(
     if body_block.strip():
         parts.append(body_block)
 
+    # 5b. Felt-time block — ambient temporal texture (spec §4, felt-time design).
+    # Reads cached state; DOES NOT call tick() — tick is supervisor-owned.
+    # Any failure returns "" so a felt-time disk/parse error can't break chat.
+    felt_time_block = _build_felt_time_block(persona_dir)
+    if felt_time_block.strip():
+        parts.append(felt_time_block)
+
     # 6. Recent journal block (private — contract adjacent, per spec §4.3)
     journal_block = _build_recent_journal_block(store)
     if journal_block.strip():
@@ -573,6 +580,24 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> 
     lines.append("")
     lines.append("(content not shown — read your files only when asked)")
     return "\n".join(lines)
+
+
+def _build_felt_time_block(persona_dir: Path) -> str:
+    """Returns the felt-time ambient block or empty string on any error.
+
+    Reads cached state from disk; does NOT call FeltTime.tick(). The
+    tick cadence is supervisor-driven (Phase 9). A read failure (no
+    state file yet, JSON parse error, etc.) returns "" so a felt-time
+    persistence bug can't break chat assembly.
+    """
+    try:
+        from brain.felt_time import FeltTime
+        from brain.felt_time.prompt import render_prompt_context
+
+        ft = FeltTime(persona_dir=persona_dir)
+        return render_prompt_context(ft.get_state())
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:
