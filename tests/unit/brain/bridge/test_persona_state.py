@@ -347,3 +347,71 @@ def test_recovering_true_when_orphan_alongside_live(tmp_path: Path) -> None:
         assert state["recovering"] is True
     finally:
         reset_registry()
+
+
+# ── Task 10.1: felt_time_recovered flag ───────────────────────────────────────
+
+
+def test_persona_state_felt_time_recovered_false_when_no_state_file(tmp_path: Path) -> None:
+    """No felt_time_state.json → flag is False (not yet replayed)."""
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    state = build_persona_state(persona_dir)
+    assert state["felt_time_recovered"] is False
+
+
+def test_persona_state_felt_time_recovered_false_when_replayed_not_set(tmp_path: Path) -> None:
+    """State file exists with replayed=False → flag is False."""
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    persist(
+        FeltTimeState(
+            lived_age_hours=1.0, last_tick_ts="2026-05-17T22:00:00+00:00", replayed=False
+        ),
+        persona_dir,
+    )
+    state = build_persona_state(persona_dir)
+    assert state["felt_time_recovered"] is False
+
+
+def test_persona_state_includes_felt_time_recovered_when_state_was_replayed(tmp_path: Path) -> None:
+    """State file with replayed=True → flag is True."""
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    persist(FeltTimeState(lived_age_hours=0.0, replayed=True), persona_dir)
+    state = build_persona_state(persona_dir)
+    assert state["felt_time_recovered"] is True
+
+
+def test_persona_state_clears_felt_time_recovered_after_tick(tmp_path: Path) -> None:
+    """After a tick, replayed=False is persisted → flag becomes False."""
+    from brain.felt_time import FeltTime, TickContext
+    from brain.felt_time.lived_age import IntensityDrivers
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    # Seed a dream log so load_or_recover triggers replay (replayed=True).
+    (persona_dir / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T20:00:00+00:00", "summary": "test"}\n'
+    )
+    # Construct via FeltTime (which calls load_or_recover internally).
+    ft = FeltTime(persona_dir=persona_dir)
+    assert ft.get_state().replayed is True  # precondition
+
+    ft.tick(
+        TickContext(
+            now_iso="2026-05-17T22:00:00+00:00",
+            heartbeats_in_tick=1,
+            chat_turns_in_tick=0,
+            reflex_firings_in_tick=0,
+            wall_clock_s_in_tick=900.0,
+            drivers=IntensityDrivers(),
+        )
+    )
+
+    state = build_persona_state(persona_dir)
+    assert state["felt_time_recovered"] is False

@@ -68,6 +68,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "connection": _build_connection(persona_dir),
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
+        "felt_time_recovered": _felt_time_recovered(persona_dir),
     }
 
 
@@ -112,6 +113,26 @@ def _is_recovering(persona_dir: Path) -> bool:
             if entry.name not in live_sids:
                 return True
         return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _felt_time_recovered(persona_dir: Path) -> bool:
+    """True iff felt-time state was rebuilt from logs and no tick has run since.
+
+    Reads the persisted state file directly to avoid the side effect of
+    constructing a FeltTime instance just for this read. Once the
+    supervisor's heartbeat-tick runs, replayed is cleared and the
+    banner naturally drops on the next /persona/state poll.
+
+    Fail-soft: returns False on any read or parse error so a half-booted
+    brain doesn't pin the banner on permanently.
+    """
+    state_file = persona_dir / "felt_time_state.json"
+    if not state_file.exists():
+        return False
+    try:
+        return bool(json.loads(state_file.read_text()).get("replayed", False))
     except Exception:  # noqa: BLE001
         return False
 
