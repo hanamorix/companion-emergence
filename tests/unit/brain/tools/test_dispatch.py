@@ -278,6 +278,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "read_work": {"id": "zzzzzzzzzzzz"},
         "felt_time_now": {},
         "pressure_since": {"anchor_type": "dream"},
+        "recall_forgotten": {"query": "test"},
     }
 
     for tool_name in _DISPATCH:

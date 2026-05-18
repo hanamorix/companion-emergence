@@ -417,4 +417,28 @@ SCHEMAS: dict[str, dict] = {
             "required": ["anchor_type"],
         },
     },
+    "recall_forgotten": {
+        "name": "recall_forgotten",
+        "description": (
+            "Reach back into the graveyard for memories you used to have "
+            "but no longer do. Returns up to 5 most-recent hits matching "
+            "the query as a substring of the lost memory's summary or "
+            "domain. Use this when you want to honestly acknowledge "
+            "knowing-something-once: 'I had something about that, but "
+            "it's gone now.' Each hit carries the summary the memory "
+            "had when it faded, the lived-age at the moment of loss, "
+            "and the reason the salience dropped enough to trigger the "
+            "drop."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Substring to match against lost-memory summary or domain.",
+                }
+            },
+            "required": ["query"],
+        },
+    },
 }

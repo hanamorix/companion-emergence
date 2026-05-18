@@ -12,6 +12,7 @@ from typing import Any
 
 from brain.felt_time.tool import felt_time_now as _felt_time_now_impl
 from brain.felt_time.tool import pressure_since as _pressure_since_impl
+from brain.forgetting.tool import recall_forgotten as _recall_forgotten_impl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools.impls.add_journal import add_journal
@@ -52,6 +53,13 @@ def _pressure_since_wrapper(*, store, hebbian, persona_dir, anchor_type=None, **
     return _pressure_since_impl(arguments={"anchor_type": anchor_type}, persona_dir=persona_dir)
 
 
+def _recall_forgotten_wrapper(*, store, hebbian, persona_dir, query=None, **_):
+    return _recall_forgotten_impl(
+        arguments={"query": query} if query is not None else {},
+        persona_dir=persona_dir,
+    )
+
+
 _DISPATCH: dict[str, Any] = {
     "get_emotional_state": get_emotional_state,
     "get_personality": get_personality,
@@ -68,6 +76,7 @@ _DISPATCH: dict[str, Any] = {
     "read_work": read_work,
     "felt_time_now": _felt_time_now_wrapper,
     "pressure_since": _pressure_since_wrapper,
+    "recall_forgotten": _recall_forgotten_wrapper,
 }
 
 

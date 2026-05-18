@@ -32,6 +32,7 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "read_work",
     "felt_time_now",
     "pressure_since",
+    "recall_forgotten",
 )
 
 __all__ = [
