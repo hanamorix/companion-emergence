@@ -250,6 +250,18 @@ fi
 
 # 6a. Verify the brain entry point + import work in the bundled python
 echo "[build] verify brain import + entry point"
+# On MSYS / Git Bash $RUNTIME_DIR is in /c/Users/... form, but Python on
+# Windows builds Path() from a Windows-native drive-letter path
+# (C:\Users\...). Embedding the MSYS form directly into the Python
+# heredoc made Path.resolve() treat /c/Users/... as a *relative* path
+# from the filesystem root, so the startswith check never matched
+# brain.__file__ (which is correctly C:\...) on a clean Windows source
+# build. Convert to native form via cygpath -w before embedding.
+if [ "$HOST_OS" = "windows" ]; then
+  RUNTIME_DIR_NATIVE=$(cygpath -w "$RUNTIME_DIR")
+else
+  RUNTIME_DIR_NATIVE="$RUNTIME_DIR"
+fi
 (
   cd "$TMP_VERIFY"
   "$PY_BIN" -c "
@@ -257,7 +269,7 @@ from pathlib import Path
 import brain
 import brain.cli
 brain_file = Path(brain.__file__).resolve()
-runtime_root = Path('$RUNTIME_DIR').resolve()
+runtime_root = Path(r'$RUNTIME_DIR_NATIVE').resolve()
 print('  brain:', brain_file)
 assert str(brain_file).startswith(str(runtime_root)), brain_file
 "
