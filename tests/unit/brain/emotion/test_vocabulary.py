@@ -49,10 +49,13 @@ def test_get_returns_none_for_unknown() -> None:
     assert vocabulary.get("nonsense") is None
 
 
-def test_list_all_contains_baseline_25() -> None:
-    """The baseline vocabulary ships 25 emotions (11 core + 10 complex + 4 body)."""
+def test_list_all_contains_baseline_26() -> None:
+    """The baseline vocabulary ships 26 emotions (11 core + 11 complex + 4 body).
+
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    """
     all_emotions = vocabulary.list_all()
-    assert len(all_emotions) == 25
+    assert len(all_emotions) == 26
     assert all(isinstance(e, Emotion) for e in all_emotions)
 
 
@@ -66,13 +69,17 @@ def test_by_category_core_has_eleven() -> None:
     assert "grief" in names
 
 
-def test_by_category_complex_has_ten() -> None:
-    """The 'complex' category has 10 emotions."""
+def test_by_category_complex_has_eleven() -> None:
+    """The 'complex' category has 11 emotions.
+
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    """
     complex_ = vocabulary.by_category("complex")
-    assert len(complex_) == 10
+    assert len(complex_) == 11
     names = {e.name for e in complex_}
     assert "nostalgia" in names
     assert "curiosity" in names
+    assert "memory_grief" in names
 
 
 def test_baseline_excludes_nell_specific() -> None:
@@ -82,8 +89,11 @@ def test_baseline_excludes_nell_specific() -> None:
 
 
 def test_baseline_count_after_split() -> None:
-    """Framework baseline ships exactly 25 emotions (11 core + 10 complex + 4 body)."""
-    assert len(vocabulary._BASELINE) == 25
+    """Framework baseline ships exactly 26 emotions (11 core + 11 complex + 4 body).
+
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    """
+    assert len(vocabulary._BASELINE) == 26
 
 
 def test_grief_has_60_day_half_life() -> None:
