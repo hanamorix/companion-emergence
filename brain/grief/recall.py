@@ -122,6 +122,11 @@ def handle_recall_touch(
             )
         else:
             raw_emotion_max = 0.0
+        # Graveyard stores raw 0-10 emotion values; compute_touch_intensity expects
+        # normalised [0, 1]. Divide-by-10 normalises; clamp protects against malformed
+        # input. Before this normalisation was added, raw 0-10 values were passed
+        # directly — silently producing 10x-inflated intensities (always clamped to
+        # the max). The old salience multiplier (≤ 0.10) was masking the bug.
         emotion_max = max(0.0, min(1.0, raw_emotion_max / 10.0))
         lived_days_since = _lived_days_since_loss(
             entry=entry, lived_age_hours_now=lived_age_hours_now

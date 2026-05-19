@@ -54,14 +54,13 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     """A high-emotion memory that ages out via the forgetting pass should
     produce a grief breadcrumb attached to its now-deleted id.
 
-    joy=9.0 → normalised emotion 0.9 → grief intensity 0.9 × 7.0 = 6.3, above
-    THRESHOLD (3.0). However, the emotion contribution also lifts composite
-    salience (≈ 0.9 × 0.3 = 0.27) above LOST_THRESHOLD (0.10), so the memory
-    would NOT naturally LOSE.
-
-    Test fixture: monkeypatch LOST_THRESHOLD to 0.5 and FADE_THRESHOLD to 0.6
-    so the high-emotion memory is LOSE-eligible. The grief THRESHOLD (3.0) is
-    NOT touched — we verify the grief contract under real conditions.
+    Design note: under real production thresholds (LOST_THRESHOLD=0.10),
+    high-emotion memories are unlikely to reach LOSE transition at all
+    — emotion contributes to salience (~ joy × 0.3), lifting them above
+    the floor. This test is a contract test for the wiring, not a
+    simulation of typical production behavior. If the salience formula
+    ever changes (e.g., emotion weight reduced), high-emotion losses
+    may become common and the monkeypatch may no longer be needed.
     """
     from brain.felt_time.state import FeltTimeState
     from brain.felt_time.state import persist as persist_felt_time
@@ -81,6 +80,11 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     monkeypatch.setattr(forgetting_policy, "LOST_PASS_COUNT", 1)
 
     bus = _NullBus()
+    # Five passes is belt-and-suspenders: with LOST_PASS_COUNT=1, the memory
+    # transitions FADE on pass 1 and LOSE on pass 2. The extra three passes
+    # verify the grief breadcrumb isn't duplicated (write_breadcrumb has no
+    # debounce for drop subtype — relies on the memory being hard-deleted
+    # before further passes can re-LOSE it).
     for _ in range(5):
         run_pass(tmp_path, event_bus=bus)
 
