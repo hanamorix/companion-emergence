@@ -45,3 +45,21 @@ def test_empty_state_defaults():
     assert s.recently_closed == []
     assert s.last_pass_ts_iso is None
     assert s.replayed is False
+
+
+def test_save_state_writes_json(tmp_path: Path):
+    state = ArcsState(
+        open={"arc_1": _make_arc("arc_1")},
+        recently_closed=[_make_arc("arc_old", state="closed")],
+        last_pass_ts_iso="2026-05-19T10:00:00+00:00",
+    )
+    save_state(tmp_path, state)
+
+    raw = json.loads((tmp_path / "arcs_state.json").read_text())
+    assert "open" in raw and "recently_closed" in raw
+    assert raw["last_pass_ts_iso"] == "2026-05-19T10:00:00+00:00"
+    assert "arc_1" in raw["open"]
+    assert raw["open"]["arc_1"]["state"] == "open"
+    assert raw["open"]["arc_1"]["title"] == "the boat one"
+    assert raw["recently_closed"][0]["state"] == "closed"
+    assert raw["recently_closed"][0]["closed_at_iso"] == "2026-05-22T10:00:00+00:00"

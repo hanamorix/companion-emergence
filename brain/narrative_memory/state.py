@@ -48,8 +48,67 @@ class ArcsState:
 
 
 def save_state(persona_dir: Path, state: ArcsState) -> None:
-    """Atomic JSON save of ArcsState via save_with_backup."""
-    raise NotImplementedError
+    """Atomic JSON save of ArcsState via save_with_backup.
+
+    Arc + ArcMember dataclasses serialise via _arc_to_dict; tuples become
+    lists in JSON, deserialised back to tuples on load.
+    """
+    payload = {
+        "open": {arc_id: _arc_to_dict(arc) for arc_id, arc in state.open.items()},
+        "recently_closed": [_arc_to_dict(arc) for arc in state.recently_closed],
+        "last_pass_ts_iso": state.last_pass_ts_iso,
+    }
+    save_with_backup(persona_dir / STATE_FILENAME, payload)
+
+
+def _arc_to_dict(arc: Arc) -> dict[str, Any]:
+    return {
+        "id": arc.id,
+        "state": arc.state,
+        "seed_anchor_type": arc.seed_anchor_type,
+        "seed_anchor_ref": arc.seed_anchor_ref,
+        "seed_memory_ids": list(arc.seed_memory_ids),
+        "title": arc.title,
+        "opened_at_iso": arc.opened_at_iso,
+        "lived_age_at_open": arc.lived_age_at_open,
+        "last_extended_at_iso": arc.last_extended_at_iso,
+        "closed_at_iso": arc.closed_at_iso,
+        "lived_age_at_close": arc.lived_age_at_close,
+        "members": [
+            {
+                "memory_id": m.memory_id,
+                "joined_at_iso": m.joined_at_iso,
+                "lived_age_at_join": m.lived_age_at_join,
+                "salience_at_join": m.salience_at_join,
+            }
+            for m in arc.members
+        ],
+    }
+
+
+def _arc_from_dict(d: dict[str, Any]) -> Arc:
+    return Arc(
+        id=d["id"],
+        state=d["state"],
+        seed_anchor_type=d["seed_anchor_type"],
+        seed_anchor_ref=d["seed_anchor_ref"],
+        seed_memory_ids=tuple(d["seed_memory_ids"]),
+        title=d["title"],
+        opened_at_iso=d["opened_at_iso"],
+        lived_age_at_open=d["lived_age_at_open"],
+        last_extended_at_iso=d["last_extended_at_iso"],
+        closed_at_iso=d.get("closed_at_iso"),
+        lived_age_at_close=d.get("lived_age_at_close"),
+        members=tuple(
+            ArcMember(
+                memory_id=m["memory_id"],
+                joined_at_iso=m["joined_at_iso"],
+                lived_age_at_join=m["lived_age_at_join"],
+                salience_at_join=m["salience_at_join"],
+            )
+            for m in d.get("members", [])
+        ),
+    )
 
 
 def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
