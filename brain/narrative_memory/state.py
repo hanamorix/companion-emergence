@@ -112,8 +112,19 @@ def _arc_from_dict(d: dict[str, Any]) -> Arc:
 
 
 def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
-    """Append one lifecycle event to arcs.log.jsonl with file_lock + fsync."""
-    raise NotImplementedError
+    """Append one lifecycle event to arcs.log.jsonl with file_lock + fsync.
+
+    Mirrors the brain.growth.arc_storage.append_removed_arc precedent —
+    file_lock for cross-process safety, fsync for durability.
+    """
+    log_path = persona_dir / LOG_FILENAME
+    line = json.dumps(event) + "\n"
+    with file_lock(log_path):
+        with log_path.open("a", encoding="utf-8") as fp:
+            fp.write(line)
+            fp.flush()
+            import os
+            os.fsync(fp.fileno())
 
 
 def load_or_recover(persona_dir: Path) -> ArcsState:

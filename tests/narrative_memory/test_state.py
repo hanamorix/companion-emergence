@@ -63,3 +63,31 @@ def test_save_state_writes_json(tmp_path: Path):
     assert raw["open"]["arc_1"]["title"] == "the boat one"
     assert raw["recently_closed"][0]["state"] == "closed"
     assert raw["recently_closed"][0]["closed_at_iso"] == "2026-05-22T10:00:00+00:00"
+
+
+def test_append_event_writes_jsonl_line(tmp_path: Path):
+    event = {
+        "event": "arc_opened",
+        "arc_id": "arc_20260519_a1b2c3d4",
+        "seed_anchor_type": "dream",
+        "seed_anchor_ref": "dream_evt_1",
+        "seed_memory_ids": ["mem_seed"],
+        "title": "the boat one",
+        "ts_iso": "2026-05-19T10:00:00+00:00",
+        "lived_age_hours": 412.7,
+    }
+    append_event(tmp_path, event)
+
+    log_path = tmp_path / "arcs.log.jsonl"
+    assert log_path.exists()
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == event
+
+
+def test_append_event_appends_multiple(tmp_path: Path):
+    for i in range(3):
+        append_event(tmp_path, {"event": "member_added", "n": i})
+    lines = (tmp_path / "arcs.log.jsonl").read_text().splitlines()
+    assert len(lines) == 3
+    assert [json.loads(line)["n"] for line in lines] == [0, 1, 2]
