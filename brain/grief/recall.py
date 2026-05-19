@@ -37,15 +37,24 @@ def compute_touch_intensity(
 
     Half-life of 14 lived-days — a 14-day-old loss feels half as sharp as fresh,
     a 28-day-old loss a quarter as sharp, and so on.
+
+    Args:
+        grave_emotion_max: max emotion intensity on the lost memory, NORMALISED
+            to [0, 1] (i.e., raw emotion / 10). Same scale as
+            SalienceInputs.emotion and the same scale compute_drop_intensity
+            expects.
+        salience_at_drop: composite salience score at time of loss, [0, 1].
+        lived_days_since_loss: lived-days elapsed since the memory entered
+            the graveyard.
+
+    Returns:
+        Grief intensity in [0, 10].
     """
     d = max(lived_days_since_loss, 0.0)
     half_life = policy.RECENCY_LIVED_DAYS_HALF_LIFE
     recency = 0.5 ** (d / half_life)
     raw = grave_emotion_max * salience_at_drop * policy.RECALL_TOUCH_SCALE * recency
     return _clamp(raw)
-
-
-_SECONDS_PER_HOUR = 3600.0
 
 
 def _lived_days_since_loss(
@@ -85,7 +94,6 @@ def handle_recall_touch(
     persona_dir: Path,
     store: MemoryStore,
     lived_age_hours_now: float,
-    lived_age_rate_hours_per_wall_hour: float,
     triggering_arc_id: str | None = None,
 ) -> None:
     """For each touched_id that resolves to a graveyard entry, write a grief
@@ -93,10 +101,6 @@ def handle_recall_touch(
 
     Pure side-effect — no return value. Fault-isolated by callers (try/except
     wraps this call at every wiring site).
-
-    `lived_age_rate_hours_per_wall_hour` is reserved for arc-close paths that
-    derive lived-days from wall-clock; unused here because graveyard entries
-    already carry lived_age_hours_at_forgetting.
     """
     if not touched_ids or not graveyard_entries:
         return

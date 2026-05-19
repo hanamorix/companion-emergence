@@ -39,12 +39,13 @@ def test_touch_intensity_clamped_at_10() -> None:
 
 
 def test_touch_intensity_old_loss_low() -> None:
-    # 60 lived-days ago — recency factor 0.5^(60/14) ≈ 0.0512, still well
-    # below the 3.0 threshold callers apply downstream.
+    # 60 lived-days ago → recency 0.5^(60/14) ≈ 0.051
+    # Full-score inputs (g=0.9, s=0.9) still produce raw ≈ 0.207 — well below
+    # the 3.0 write threshold callers apply via policy.THRESHOLD.
     result = recall.compute_touch_intensity(
         grave_emotion_max=0.9, salience_at_drop=0.9, lived_days_since_loss=60.0
     )
-    assert result < 0.3  # well below callers' 3.0 threshold
+    assert result < 0.3
 
 
 def _make_graveyard_entry(
@@ -86,7 +87,6 @@ def test_handle_recall_touch_writes_breadcrumb_above_threshold(tmp_path: Path) -
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
     )
     rows = store._conn.execute(
         "SELECT id FROM memories WHERE memory_type = 'grief_event'"
@@ -105,7 +105,6 @@ def test_handle_recall_touch_skips_below_threshold(tmp_path: Path) -> None:
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
     )
     rows = store._conn.execute(
         "SELECT id FROM memories WHERE memory_type = 'grief_event'"
@@ -122,7 +121,6 @@ def test_handle_recall_touch_debounces_within_2_hours(tmp_path: Path) -> None:
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
     )
     recall.handle_recall_touch(
         touched_ids=["mem-x"],
@@ -130,7 +128,6 @@ def test_handle_recall_touch_debounces_within_2_hours(tmp_path: Path) -> None:
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
     )
     rows = store._conn.execute(
         "SELECT id FROM memories WHERE memory_type = 'grief_event'"
@@ -147,7 +144,6 @@ def test_handle_recall_touch_attaches_triggering_arc(tmp_path: Path) -> None:
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
         triggering_arc_id="arc-42",
     )
     row = store._conn.execute(
@@ -167,9 +163,23 @@ def test_handle_recall_touch_ignores_untouched_entries(tmp_path: Path) -> None:
         persona_dir=tmp_path,
         store=store,
         lived_age_hours_now=24.0,
-        lived_age_rate_hours_per_wall_hour=1.0,
     )
     rows = store._conn.execute(
         "SELECT id FROM memories WHERE memory_type='grief_event'"
     ).fetchall()
     assert len(rows) == 1
+
+
+def test_handle_recall_touch_empty_graveyard_no_writes(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    recall.handle_recall_touch(
+        touched_ids=["mem-anything"],
+        graveyard_entries=[],
+        persona_dir=tmp_path,
+        store=store,
+        lived_age_hours_now=24.0,
+    )
+    rows = store._conn.execute(
+        "SELECT id FROM memories WHERE memory_type='grief_event'"
+    ).fetchall()
+    assert rows == []
