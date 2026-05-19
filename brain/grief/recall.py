@@ -31,18 +31,16 @@ def compute_touch_intensity(
 ) -> float:
     """Recall-touch grief intensity per spec §3.
 
-    intensity = clamp(grave_emotion_max × salience_at_drop × 5.0 × recency_factor, 0, 10)
+    intensity = clamp(grave_emotion_max * salience_at_drop * 5.0 * recency_factor)
+    recency_factor = 0.5 ** (lived_days_since_loss / 14.0)
+                 = exp(-ln(2) * lived_days_since_loss / 14.0)
 
-    recency_factor = 0.5 ** ((d / T) ** 2)
-
-    where T = RECENCY_LIVED_DAYS_HALF_LIFE (default 14). This is a Gaussian
-    half-life: at exactly T lived-days since loss, recency_factor = 0.5 and
-    intensity is halved. Beyond T the decay accelerates — a 60-day-old loss
-    is nearly imperceptible even with high salience inputs.
+    Half-life of 14 lived-days — a 14-day-old loss feels half as sharp as fresh,
+    a 28-day-old loss a quarter as sharp, and so on.
     """
     d = max(lived_days_since_loss, 0.0)
     half_life = policy.RECENCY_LIVED_DAYS_HALF_LIFE
-    recency = 0.5 ** ((d / half_life) ** 2)
+    recency = 0.5 ** (d / half_life)
     raw = grave_emotion_max * salience_at_drop * policy.RECALL_TOUCH_SCALE * recency
     return _clamp(raw)
 

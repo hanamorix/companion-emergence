@@ -39,10 +39,12 @@ def test_touch_intensity_clamped_at_10() -> None:
 
 
 def test_touch_intensity_old_loss_low() -> None:
+    # 60 lived-days ago — recency factor 0.5^(60/14) ≈ 0.0512, still well
+    # below the 3.0 threshold callers apply downstream.
     result = recall.compute_touch_intensity(
         grave_emotion_max=0.9, salience_at_drop=0.9, lived_days_since_loss=60.0
     )
-    assert result < 0.1
+    assert result < 0.3  # well below callers' 3.0 threshold
 
 
 def _make_graveyard_entry(
