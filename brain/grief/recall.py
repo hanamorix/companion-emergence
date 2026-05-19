@@ -10,7 +10,13 @@ Spec: docs/superpowers/specs/2026-05-19-grief-design.md §3 + §6
 
 from __future__ import annotations
 
-from brain.grief import policy
+import logging
+from pathlib import Path
+
+from brain.grief import breadcrumb, policy
+from brain.memory.store import MemoryStore
+
+log = logging.getLogger(__name__)
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
@@ -39,3 +45,105 @@ def compute_touch_intensity(
     recency = 0.5 ** ((d / half_life) ** 2)
     raw = grave_emotion_max * salience_at_drop * policy.RECALL_TOUCH_SCALE * recency
     return _clamp(raw)
+
+
+_SECONDS_PER_HOUR = 3600.0
+
+
+def _lived_days_since_loss(
+    *,
+    entry: dict,
+    lived_age_hours_now: float,
+) -> float:
+    """Compute lived-days since forgetting for a graveyard entry.
+
+    Uses the stored lived_age_hours_at_forgetting field — already a
+    felt-time stamp. No approximation needed.
+    """
+    at_forget = float(entry.get("lived_age_hours_at_forgetting") or 0.0)
+    delta_hours = max(0.0, lived_age_hours_now - at_forget)
+    return delta_hours / 24.0
+
+
+def _dominant_lost_emotion(entry: dict) -> tuple[str, float] | None:
+    """Return (emotion_name, intensity_0_to_10) for the dominant non-grief emotion
+    in a graveyard entry's emotion_at_ingest, or None if empty.
+    """
+    emotions = entry.get("emotion_at_ingest") or {}
+    candidates = [
+        (name, float(val))
+        for name, val in emotions.items()
+        if name != "memory_grief" and isinstance(val, (int, float)) and float(val) > 0.0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda kv: kv[1])
+
+
+def handle_recall_touch(
+    *,
+    touched_ids: list[str],
+    graveyard_entries: list[dict],
+    persona_dir: Path,
+    store: MemoryStore,
+    lived_age_hours_now: float,
+    lived_age_rate_hours_per_wall_hour: float,
+    triggering_arc_id: str | None = None,
+) -> None:
+    """For each touched_id that resolves to a graveyard entry, write a grief
+    breadcrumb if intensity >= THRESHOLD and not debounced. Spec §6.
+
+    Pure side-effect — no return value. Fault-isolated by callers (try/except
+    wraps this call at every wiring site).
+
+    `lived_age_rate_hours_per_wall_hour` is reserved for arc-close paths that
+    derive lived-days from wall-clock; unused here because graveyard entries
+    already carry lived_age_hours_at_forgetting.
+    """
+    if not touched_ids or not graveyard_entries:
+        return
+    by_id = {e["memory_id"]: e for e in graveyard_entries if "memory_id" in e}
+
+    for memory_id in touched_ids:
+        entry = by_id.get(memory_id)
+        if entry is None:
+            continue  # active or fading hit — not lost
+
+        salience_at_drop = float(entry.get("salience_at_drop") or 0.0)
+        # Use raw emotion_at_ingest max (0-10 scale) as grave_emotion_max.
+        # compute_touch_intensity is scale-agnostic; the caller passes what
+        # makes physical sense. Passing the 0-10 value keeps the same
+        # emotional weight as the live memory had at ingest.
+        emotion_at_ingest = entry.get("emotion_at_ingest") or {}
+        if emotion_at_ingest:
+            emotion_max = max(
+                float(v) for v in emotion_at_ingest.values()
+                if isinstance(v, (int, float))
+            )
+        else:
+            emotion_max = 0.0
+        lived_days_since = _lived_days_since_loss(
+            entry=entry, lived_age_hours_now=lived_age_hours_now
+        )
+
+        intensity = compute_touch_intensity(
+            grave_emotion_max=emotion_max,
+            salience_at_drop=salience_at_drop,
+            lived_days_since_loss=lived_days_since,
+        )
+        if intensity < policy.THRESHOLD:
+            continue
+        if store.exists_recent_grief_touch(memory_id, hours=policy.DEBOUNCE_HOURS):
+            continue
+
+        residue = _dominant_lost_emotion(entry)
+        breadcrumb.write_breadcrumb(
+            store=store,
+            intensity=intensity,
+            subtype="recall_touch",
+            referent_type="memory",
+            referent_id=memory_id,
+            content=breadcrumb.recall_touch_phrase(entry.get("summary") or ""),
+            residue_emotion=residue,
+            triggering_arc_id=triggering_arc_id,
+        )
