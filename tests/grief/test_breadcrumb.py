@@ -132,3 +132,82 @@ def test_write_breadcrumb_recall_touch_with_triggering_arc(tmp_path: Path) -> No
     assert saved.emotions == {"memory_grief": 3.5}
     assert saved.metadata["triggering_arc_id"] == "arc-foo"
     assert saved.metadata["grief_subtype"] == "recall_touch"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — public surface (handle_drop / handle_arc_close via brain.grief)
+# ---------------------------------------------------------------------------
+
+from brain.memory.store import Memory  # noqa: E402
+
+
+def _make_dropped_memory(*, memory_id: str = "mem-drop", joy: float = 8.0) -> Memory:
+    m = Memory.create_new(
+        content="we drove out to the rooftop and watched the morning",
+        memory_type="episodic",
+        domain="memory",
+        emotions={"joy": joy},
+    )
+    object.__setattr__(m, "id", memory_id)
+    return m
+
+
+def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
+    from brain import grief
+    store = MemoryStore(tmp_path / "memories.db")
+    memory = _make_dropped_memory(memory_id="mem-drop-1", joy=8.0)
+
+    grief.handle_drop(
+        memory=memory,
+        salience_at_drop=0.5,
+        persona_dir=tmp_path,
+        store=store,
+    )
+    rows = store._conn.execute(
+        "SELECT id, content, emotions_json, metadata_json FROM memories WHERE memory_type='grief_event'"
+    ).fetchall()
+    assert len(rows) == 1
+    import json
+    em = json.loads(rows[0]["emotions_json"])
+    assert em["memory_grief"] >= 3.0
+    assert em.get("joy", 0.0) == pytest.approx(4.0, abs=0.01)  # residue: 8.0 * 0.5
+    meta = json.loads(rows[0]["metadata_json"])
+    assert meta["grief_referent_id"] == "mem-drop-1"
+    assert meta["grief_subtype"] == "drop"
+
+
+def test_handle_drop_skips_below_threshold(tmp_path: Path) -> None:
+    from brain import grief
+    store = MemoryStore(tmp_path / "memories.db")
+    memory = _make_dropped_memory(memory_id="mem-drop-2", joy=2.0)
+    grief.handle_drop(memory=memory, salience_at_drop=0.2, persona_dir=tmp_path, store=store)
+    rows = store._conn.execute(
+        "SELECT id FROM memories WHERE memory_type='grief_event'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
+    from brain import grief
+    store = MemoryStore(tmp_path / "memories.db")
+
+    class FakeArc:
+        id = "arc-1"
+        title = "first cold week"
+        max_member_emotion_normalised = 0.85
+        dominant_non_grief_emotion = ("sorrow", 7.5)
+
+    grief.handle_arc_close(arc=FakeArc(), persona_dir=tmp_path, store=store)
+    rows = store._conn.execute(
+        "SELECT id, content, emotions_json, metadata_json FROM memories WHERE memory_type='grief_event'"
+    ).fetchall()
+    assert len(rows) == 1
+    import json
+    em = json.loads(rows[0]["emotions_json"])
+    assert em["memory_grief"] >= 3.0
+    assert em.get("sorrow", 0.0) == pytest.approx(3.75, abs=0.01)  # 7.5 * 0.5
+    meta = json.loads(rows[0]["metadata_json"])
+    assert meta["grief_referent_id"] == "arc-1"
+    assert meta["grief_subtype"] == "arc_close"
+    content_str = rows[0]["content"] if isinstance(rows[0]["content"], str) else rows[0]["content"].decode()
+    assert "first cold week" in content_str
