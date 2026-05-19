@@ -416,9 +416,9 @@ def _compute_arc_close_emotion_inputs(
 
     For each member: if a live MemoryStore record exists, use its raw [0, 10]
     emotion values directly. Otherwise, fall back to the graveyard entry's
-    `emotion_norm × salience_at_drop × 10` proxy (reconstructing a 0-10 value
-    from the normalised salience inputs captured at drop time — see
-    brain/forgetting/salience.SalienceInputs).
+    `emotion_norm × 10` proxy (reconstructing the original 0-10 emotion at
+    the same scale as a live lookup — no salience factor, per spec §3; see
+    brain/forgetting/salience.SalienceInputs for the stored fields).
 
     Returns:
         (max_normalised_emotion, dominant_non_grief_emotion):
@@ -454,9 +454,11 @@ def _compute_arc_close_emotion_inputs(
             continue
         inputs = entry.get("salience_inputs_at_drop") or {}
         emotion_norm = float(inputs.get("emotion") or 0.0)
-        salience = float(entry.get("salience_at_drop") or 0.0)
-        # Graveyard proxy: emotion_norm × salience × 10 -> proxied 0-10 emotion value
-        proxy = emotion_norm * salience * 10.0
+        # Reconstruct the original 0-10 emotion at the same scale as a live lookup.
+        # Spec §3 caller responsibility: no salience factor — salience_at_drop is
+        # near zero by definition (LOST_THRESHOLD = 0.10 in forgetting/policy.py),
+        # so multiplying suppressed grief for fully-forgotten arcs.
+        proxy = emotion_norm * 10.0
         if proxy > best_emotion_value:
             best_emotion_value = proxy
             em_dict = entry.get("emotion_at_ingest") or {}
