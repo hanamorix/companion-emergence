@@ -274,7 +274,10 @@ def run_pass(
             counts["evicted"] += 1
         state.open[arc_id] = _replace(arc, members=tuple(kept))
 
-    # --- Close sweep ---
+    # --- Membership refresh: detect lost members in open arcs, fire grief touches ---
+    # Per spec §6 Phase 9.2: when an arc member-id resolves to a graveyard entry
+    # rather than a live memory, call handle_recall_touch with triggering_arc_id set
+    # so the breadcrumb attributes the touch to both the lost memory and the open arc.
     db_path = persona_dir / "memories.db"
     store_for_grief = None
     if db_path.exists():
@@ -282,6 +285,43 @@ def run_pass(
 
         store_for_grief = MemoryStore(db_path)
 
+    if store_for_grief is not None and state.open:
+        try:
+            from brain.forgetting import graveyard as _grave
+
+            grave_entries = _grave.read_all(persona_dir)
+            grave_by_id = {e.get("memory_id"): e for e in grave_entries if "memory_id" in e}
+            if grave_by_id:
+                for arc_id, arc in state.open.items():
+                    lost_member_ids = []
+                    for member in arc.members:
+                        if member.memory_id in grave_by_id:
+                            live = store_for_grief.get(member.memory_id)
+                            if live is None:
+                                lost_member_ids.append(member.memory_id)
+                    if lost_member_ids:
+                        try:
+                            from brain import grief as _grief
+                            from brain.felt_time.state import load_or_recover as _load_felt_time
+
+                            felt_state, _ = _load_felt_time(persona_dir)
+                            _grief.handle_recall_touch(
+                                touched_ids=sorted(lost_member_ids),
+                                graveyard_entries=grave_entries,
+                                persona_dir=persona_dir,
+                                store=store_for_grief,
+                                lived_age_hours_now=felt_state.lived_age_hours,
+                                triggering_arc_id=arc_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            _LOG.exception(
+                                "grief.handle_recall_touch (membership) failed for arc_id=%s",
+                                arc_id,
+                            )
+        except Exception:  # noqa: BLE001
+            _LOG.exception("narrative_memory membership refresh (grief) raised")
+
+    # --- Close sweep ---
     try:
         for arc_id, arc in list(state.open.items()):
             # Use lived_age_at_join of the most recent member as the "last extended" lived age
