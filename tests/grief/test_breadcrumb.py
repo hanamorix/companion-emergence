@@ -40,6 +40,15 @@ def test_compute_arc_close_intensity_under_floor() -> None:
     assert result == pytest.approx(1.4, abs=0.01)
 
 
+def test_compute_arc_close_intensity_zero() -> None:
+    assert breadcrumb.compute_arc_close_intensity(arc_max_member_emotion=0.0) == 0.0
+
+
+def test_compute_arc_close_intensity_clamped_at_10() -> None:
+    result = breadcrumb.compute_arc_close_intensity(arc_max_member_emotion=2.0)
+    assert result == 10.0
+
+
 def test_first_n_words_long_summary() -> None:
     summary = "I drove out to the rooftop morning before the cold rain hit hard."
     assert breadcrumb.first_n_words(summary, 6) == "I drove out to the rooftop"
@@ -67,6 +76,11 @@ def test_drop_phrase_empty_summary_fallback() -> None:
 def test_recall_touch_phrase() -> None:
     phrase = breadcrumb.recall_touch_phrase("I drove out to the rooftop morning before")
     assert phrase == "reached for I drove out to the rooftop — gone"
+
+
+def test_recall_touch_phrase_empty_summary() -> None:
+    phrase = breadcrumb.recall_touch_phrase("")
+    assert phrase == "reached for a lost memory — gone"
 
 
 def test_arc_close_phrase() -> None:

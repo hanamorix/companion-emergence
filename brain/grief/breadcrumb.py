@@ -115,6 +115,7 @@ def write_breadcrumb(
     emotions: dict[str, float] = {"memory_grief": float(intensity)}
     if residue_emotion is not None:
         name, value = residue_emotion
+        # Skip if name is the primary grief key (avoid double-counting) or value <= 0.
         if name != "memory_grief" and value > 0.0:
             emotions[name] = float(value) * policy.RESIDUE_FACTOR
 
