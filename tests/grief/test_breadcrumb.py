@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from brain.grief import breadcrumb
+from brain.memory.store import MemoryStore
 
 
 def test_compute_drop_intensity_high_emotion_high_salience() -> None:
@@ -69,3 +72,49 @@ def test_recall_touch_phrase() -> None:
 def test_arc_close_phrase() -> None:
     phrase = breadcrumb.arc_close_phrase("first cold week")
     assert phrase == "the arc 'first cold week' has closed"
+
+
+def _make_store(tmp_path: Path) -> MemoryStore:
+    return MemoryStore(tmp_path / "memories.db")
+
+
+def test_write_breadcrumb_drop_with_residue(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    bc_id = breadcrumb.write_breadcrumb(
+        store=store,
+        intensity=4.4,
+        subtype="drop",
+        referent_type="memory",
+        referent_id="mem-abc-123",
+        content="the memory of the rooftop morning is gone",
+        residue_emotion=("joy", 7.0),
+    )
+    saved = store.get(bc_id)
+    assert saved is not None
+    assert saved.memory_type == "grief_event"
+    assert saved.domain == "grief"
+    assert saved.emotions == {"memory_grief": 4.4, "joy": 3.5}
+    assert saved.metadata["grief_referent_id"] == "mem-abc-123"
+    assert saved.metadata["grief_referent_type"] == "memory"
+    assert saved.metadata["grief_subtype"] == "drop"
+    assert saved.metadata.get("triggering_arc_id") is None
+    assert saved.state == "active"
+
+
+def test_write_breadcrumb_recall_touch_with_triggering_arc(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    bc_id = breadcrumb.write_breadcrumb(
+        store=store,
+        intensity=3.5,
+        subtype="recall_touch",
+        referent_type="memory",
+        referent_id="mem-xyz",
+        content="reached for the night of — gone",
+        residue_emotion=None,
+        triggering_arc_id="arc-foo",
+    )
+    saved = store.get(bc_id)
+    assert saved is not None
+    assert saved.emotions == {"memory_grief": 3.5}
+    assert saved.metadata["triggering_arc_id"] == "arc-foo"
+    assert saved.metadata["grief_subtype"] == "recall_touch"
