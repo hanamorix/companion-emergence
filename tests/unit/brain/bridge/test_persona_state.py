@@ -415,3 +415,54 @@ def test_persona_state_clears_felt_time_recovered_after_tick(tmp_path: Path) -> 
 
     state = build_persona_state(persona_dir)
     assert state["felt_time_recovered"] is False
+
+
+# ── narrative-memory recovered flag (Phase 8.2) ───────────────────────────────
+
+
+def test_persona_state_narrative_memory_recovered_true_when_state_replayed(
+    tmp_path: Path,
+) -> None:
+    """When ArcsState.replayed=True (state rebuilt from JSONL log on bridge
+    startup), the bridge persona-state payload reports it so the frontend can
+    show a recovery banner — mirroring the felt-time flag.
+
+    Trigger replay by writing an arcs log with no matching state file; on the
+    next load_or_recover() the state is reconstructed from the log and
+    .replayed is True.
+    """
+    from brain.bridge.persona_state import build_persona_state
+    from brain.narrative_memory.state import append_event
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+
+    append_event(
+        persona_dir,
+        {
+            "event": "arc_opened",
+            "arc_id": "arc_recovered",
+            "seed_anchor_type": "dream",
+            "seed_anchor_ref": "dream_evt_1",
+            "seed_memory_ids": ["mem_seed"],
+            "title": "recovered arc",
+            "ts_iso": "2026-05-19T10:00:00+00:00",
+            "lived_age_hours": 412.0,
+        },
+    )
+
+    state = build_persona_state(persona_dir)
+    assert state["narrative_memory_recovered"] is True
+
+
+def test_persona_state_narrative_memory_recovered_false_on_fresh_persona(
+    tmp_path: Path,
+) -> None:
+    """Fresh persona dir → narrative_memory_recovered is False."""
+    from brain.bridge.persona_state import build_persona_state
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+
+    state = build_persona_state(persona_dir)
+    assert state["narrative_memory_recovered"] is False

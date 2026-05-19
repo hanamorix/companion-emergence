@@ -69,6 +69,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
+        "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
     }
 
 
@@ -113,6 +114,26 @@ def _is_recovering(persona_dir: Path) -> bool:
             if entry.name not in live_sids:
                 return True
         return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _narrative_memory_replayed(persona_dir: Path) -> bool:
+    """True iff narrative-memory ArcsState was rebuilt from JSONL log on
+    bridge startup (i.e. ``replayed=True`` on the recovered state).
+
+    Phase 8.2 of the narrative-memory work — mirrors ``_felt_time_recovered``.
+    Surfaces the recovery path to the frontend so a banner can fire on the
+    next ``/persona/state`` poll. Once the supervisor's next arc-update pass
+    runs, ``save_state`` persists a clean state file and the flag drops.
+
+    Fail-soft: any exception (corrupt log, import error) returns False so a
+    half-booted brain doesn't pin the banner on.
+    """
+    try:
+        from brain.narrative_memory.state import load_or_recover
+
+        return bool(load_or_recover(persona_dir).replayed)
     except Exception:  # noqa: BLE001
         return False
 

@@ -441,4 +441,41 @@ SCHEMAS: dict[str, dict] = {
             "required": ["query"],
         },
     },
+    "list_open_arcs": {
+        "name": "list_open_arcs",
+        "description": (
+            "List the narrative arcs Nell currently has open, plus the most "
+            "recently closed ones. Each arc is a thread seeded by an anchor "
+            "(a dream, a growth crystallization, or a soul moment) that grew "
+            "by pulling in thematically related memories. Use to introspect: "
+            "'let me check what threads I'm in.'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    "recall_arc": {
+        "name": "recall_arc",
+        "description": (
+            "Look up a narrative arc by id (exact arc_*) or by title substring. "
+            "Returns the matched arc's full member list (each memory's body "
+            "and join time) or the top 3 candidates if the substring matches "
+            "multiple arcs. Falls back to scanning the lifecycle log for "
+            "closed arcs older than the in-memory cap."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Arc id (exact match) or title substring (case-insensitive).",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
 }

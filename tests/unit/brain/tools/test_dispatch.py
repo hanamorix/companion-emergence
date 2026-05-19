@@ -279,6 +279,8 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "felt_time_now": {},
         "pressure_since": {"anchor_type": "dream"},
         "recall_forgotten": {"query": "test"},
+        "list_open_arcs": {},
+        "recall_arc": {"query": ""},
     }
 
     for tool_name in _DISPATCH:
@@ -287,3 +289,17 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         assert isinstance(result, dict) or isinstance(result, list), (
             f"{tool_name} did not return a dict or list"
         )
+
+
+def test_dispatch_list_open_arcs(tmp_path):
+    """dispatch('list_open_arcs') returns the structured result."""
+    ctx = _make_ctx(tmp_path)
+    result = dispatch("list_open_arcs", {}, **ctx)
+    assert "open" in result
+    assert "recently_closed" in result
+
+
+def test_dispatch_recall_arc(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    result = dispatch("recall_arc", {"query": "nonexistent"}, **ctx)
+    assert result["match_type"] == "none"

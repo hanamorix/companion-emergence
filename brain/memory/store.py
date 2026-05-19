@@ -516,6 +516,25 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def list_since_iso(
+        self, opened_at_iso: str, *, include_fading: bool = True
+    ) -> list[Memory]:
+        """Return memories with created_at > opened_at_iso, ordered ascending.
+
+        Used by narrative_memory ArcUpdatePass to draw the candidate pool —
+        memories born after the arc opened (or after the last pass ts).
+
+        Includes ``state='fading'`` rows by default — their content is a
+        deterministic summary, still eligible for arc membership. Lost
+        rows are gone (hard-deleted) so they never appear here.
+        """
+        sql = "SELECT * FROM memories WHERE created_at > ?"
+        if not include_fading:
+            sql += " AND state = 'active'"
+        sql += " ORDER BY created_at ASC"
+        rows = self._conn.execute(sql, (opened_at_iso,)).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
     def _list_filter(
         self, column: str, value: str, active_only: bool, limit: int | None
     ) -> list[Memory]:
