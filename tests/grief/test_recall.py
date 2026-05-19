@@ -57,6 +57,13 @@ def _make_graveyard_entry(
     lived_age_hours_at_forgetting: float = 24.0,
     forgotten_at_iso: str | None = None,
 ) -> dict:
+    """Construct a graveyard entry dict matching brain/forgetting/graveyard.append.
+
+    Note: salience_at_drop is still in the graveyard schema as part of the audit
+    trail, but it is no longer read by handle_recall_touch's intensity formula
+    (see spec §3 — salience was dropped from grief intensity calculations).
+    Kept on the fixture so test entries match real-world graveyard JSON shape.
+    """
     return {
         "memory_id": memory_id,
         "forgotten_at_iso": forgotten_at_iso or datetime.now(UTC).isoformat(),

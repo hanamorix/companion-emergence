@@ -59,8 +59,8 @@ def handle_drop(
     """Write a drop-time grief breadcrumb if intensity >= THRESHOLD.
 
     Called after the graveyard write + hard_delete in forgetting.__init__.run_pass.
-    Fault-isolated by caller — this function does NOT raise on internal errors;
-    it logs and returns.
+    Internally fault-isolated — never raises. The outer try/except in run_pass
+    guards only against import-time failures, not runtime errors in this function.
     """
     try:
         emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0

@@ -157,8 +157,10 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                 store.hard_delete(memory_id)
                 summary["lost"] += 1
                 try:
-                    from brain import grief
+                    from brain import grief  # lazy — avoids circular import with brain.memory
 
+                    # handle_drop is internally fault-isolated; this outer try guards only
+                    # against import-time failures or attribute errors on brain.grief.
                     grief.handle_drop(
                         memory=memory,
                         persona_dir=persona_dir,
