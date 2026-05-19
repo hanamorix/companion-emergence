@@ -302,15 +302,13 @@ def run_pass(
                     if lost_member_ids:
                         try:
                             from brain import grief as _grief
-                            from brain.felt_time.state import load_or_recover as _load_felt_time
 
-                            felt_state, _ = _load_felt_time(persona_dir)
                             _grief.handle_recall_touch(
                                 touched_ids=sorted(lost_member_ids),
                                 graveyard_entries=grave_entries,
                                 persona_dir=persona_dir,
                                 store=store_for_grief,
-                                lived_age_hours_now=felt_state.lived_age_hours,
+                                lived_age_hours_now=lived_age_now if lived_age_now is not None else 0.0,
                                 triggering_arc_id=arc_id,
                             )
                         except Exception:  # noqa: BLE001
