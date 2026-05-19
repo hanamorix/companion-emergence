@@ -7,6 +7,7 @@ against the schema, type-checks critical args, then delegates to the impl.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ from brain.tools.impls.search_memories import search_memories
 from brain.tools.impls.search_works import search_works
 from brain.tools.schemas import SCHEMAS
 
+log = logging.getLogger(__name__)
+
 
 class ToolDispatchError(RuntimeError):
     """Raised on unknown tool name, missing required args, or type mismatch.
@@ -56,10 +59,31 @@ def _pressure_since_wrapper(*, store, hebbian, persona_dir, anchor_type=None, **
 
 
 def _recall_forgotten_wrapper(*, store, hebbian, persona_dir, query=None, **_):
-    return _recall_forgotten_impl(
+    result = _recall_forgotten_impl(
         arguments={"query": query} if query is not None else {},
         persona_dir=persona_dir,
     )
+    # Fault-isolated grief write — wired per spec §6 / Phase 9.1.
+    # handle_recall_touch is internally fault-isolated; this outer try guards
+    # only against import-time failures on brain.grief / brain.felt_time.
+    try:
+        hits = result.get("hits") or []
+        hit_ids = [h["memory_id"] for h in hits if "memory_id" in h]
+        if hit_ids:
+            from brain.felt_time.state import load_or_recover as _load_felt_time
+            from brain.grief import handle_recall_touch
+
+            felt_state, _ = _load_felt_time(persona_dir)
+            handle_recall_touch(
+                touched_ids=hit_ids,
+                graveyard_entries=hits,
+                persona_dir=persona_dir,
+                store=store,
+                lived_age_hours_now=felt_state.lived_age_hours,
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("grief.handle_recall_touch failed inside recall_forgotten dispatch")
+    return result
 
 
 def _list_open_arcs_wrapper(*, store, hebbian, persona_dir, **_):
