@@ -275,67 +275,74 @@ def run_pass(
         state.open[arc_id] = _replace(arc, members=tuple(kept))
 
     # --- Close sweep ---
-    for arc_id, arc in list(state.open.items()):
-        # Use lived_age_at_join of the most recent member as the "last extended" lived age
-        last_ext_lived_age = max(
-            (m.lived_age_at_join for m in arc.members), default=arc.lived_age_at_open
-        )
-        reason: str | None = None
-        if not arc.members:
-            reason = "all_members_lost"
-        elif arc_id in touched_arc_ids:
-            # Freshly opened/extended this pass — cannot be stale by definition.
-            reason = None
-        elif should_close(arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age):
-            reason = "stale_72h"
-        if reason is None:
-            continue
+    db_path = persona_dir / "memories.db"
+    store_for_grief = None
+    if db_path.exists():
+        from brain.memory.store import MemoryStore
 
-        # Lookup MemoryStore for grief computation
-        db_path = persona_dir / "memories.db"
-        store_for_grief = None
-        max_emotion, dominant = (0.0, None)
-        if db_path.exists():
-            from brain.memory.store import MemoryStore
+        store_for_grief = MemoryStore(db_path)
 
-            store_for_grief = MemoryStore(db_path)
-            max_emotion, dominant = _compute_arc_close_emotion_inputs(
-                arc=arc, store=store_for_grief, persona_dir=persona_dir
+    try:
+        for arc_id, arc in list(state.open.items()):
+            # Use lived_age_at_join of the most recent member as the "last extended" lived age
+            last_ext_lived_age = max(
+                (m.lived_age_at_join for m in arc.members), default=arc.lived_age_at_open
             )
+            reason: str | None = None
+            if not arc.members:
+                reason = "all_members_lost"
+            elif arc_id in touched_arc_ids:
+                # Freshly opened/extended this pass — cannot be stale by definition.
+                reason = None
+            elif should_close(arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age):
+                reason = "stale_72h"
+            if reason is None:
+                continue
 
-        closed = _replace(
-            arc,
-            state="closed",
-            closed_at_iso=_now_iso(),
-            lived_age_at_close=lived_age_now,
-            max_member_emotion_normalised=max_emotion,
-            dominant_non_grief_emotion=dominant,
-        )
-        state.recently_closed.append(closed)
-        del state.open[arc_id]
-        append_event(
-            persona_dir,
-            {
-                "event": "arc_closed",
-                "arc_id": arc_id,
-                "ts_iso": closed.closed_at_iso,
-                "lived_age_hours": lived_age_now if lived_age_now is not None else 0.0,
-                "reason": reason,
-                "final_member_count": len(closed.members),
-            },
-        )
-        counts["closed"] += 1
-
-        # Fault-isolated grief write — after the state mutation + JSONL append.
-        try:
-            from brain import grief as _grief
-
+            max_emotion, dominant = (0.0, None)
             if store_for_grief is not None:
-                _grief.handle_arc_close(
-                    arc=closed, persona_dir=persona_dir, store=store_for_grief
+                max_emotion, dominant = _compute_arc_close_emotion_inputs(
+                    arc=arc, store=store_for_grief, persona_dir=persona_dir
                 )
-        except Exception:
-            _LOG.exception("grief.handle_arc_close failed for arc_id=%s", arc_id)
+
+            closed = _replace(
+                arc,
+                state="closed",
+                closed_at_iso=_now_iso(),
+                lived_age_at_close=lived_age_now,
+                max_member_emotion_normalised=max_emotion,
+                dominant_non_grief_emotion=dominant,
+            )
+            state.recently_closed.append(closed)
+            del state.open[arc_id]
+            append_event(
+                persona_dir,
+                {
+                    "event": "arc_closed",
+                    "arc_id": arc_id,
+                    "ts_iso": closed.closed_at_iso,
+                    "lived_age_hours": lived_age_now if lived_age_now is not None else 0.0,
+                    "reason": reason,
+                    "final_member_count": len(closed.members),
+                },
+            )
+            counts["closed"] += 1
+
+            # Fault-isolated grief write — after the state mutation + JSONL append.
+            # handle_arc_close is internally fault-isolated; this outer try guards
+            # only against import-time failures on brain.grief.
+            try:
+                from brain import grief as _grief
+
+                if store_for_grief is not None:
+                    _grief.handle_arc_close(
+                        arc=closed, persona_dir=persona_dir, store=store_for_grief
+                    )
+            except Exception:
+                _LOG.exception("grief.handle_arc_close failed for arc_id=%s", arc_id)
+    finally:
+        if store_for_grief is not None:
+            store_for_grief.close()
 
     # Cap recently_closed
     if len(state.recently_closed) > RECENTLY_CLOSED_CAP:
@@ -367,8 +374,21 @@ def _compute_arc_close_emotion_inputs(
     store: Any,
     persona_dir: Path,
 ) -> tuple[float, tuple[str, float] | None]:
-    """For each ArcMember, look up the live memory or graveyard entry, extract
-    max emotion, and return (max_normalised_emotion, dominant_non_grief_emotion).
+    """Compute the strongest emotional signal across an arc's members.
+
+    For each member: if a live MemoryStore record exists, use its raw [0, 10]
+    emotion values directly. Otherwise, fall back to the graveyard entry's
+    `emotion_norm × salience_at_drop × 10` proxy (reconstructing a 0-10 value
+    from the normalised salience inputs captured at drop time — see
+    brain/forgetting/salience.SalienceInputs).
+
+    Returns:
+        (max_normalised_emotion, dominant_non_grief_emotion):
+            max_normalised_emotion: max emotion across all members, normalised
+                to [0, 1] for compute_arc_close_intensity.
+            dominant_non_grief_emotion: (emotion_name, intensity_0_to_10) for
+                the emotion that produced the max value, or None if no
+                member had any non-grief emotion.
 
     Per spec §3 graveyard-proxy fallback: arcs whose members have largely been
     forgotten still produce honest arc-close grief.

@@ -241,6 +241,11 @@ def _replay_from_log(log_path: Path) -> ArcsState:
             state.open[arc_id] = _arc_replace_members(arc, new_members)
         elif kind == "arc_closed" and isinstance(arc_id, str) and arc_id in state.open:
             arc = state.open.pop(arc_id)
+            # max_member_emotion_normalised and dominant_non_grief_emotion are NOT
+            # stored in the JSONL arc_closed event — they are populated by run_pass at
+            # close time and only live in arcs_state.json. Replayed recently_closed
+            # arcs carry the open-arc defaults (0.0 / None); grief breadcrumbs have
+            # already been written and are unaffected by replay.
             closed = Arc(
                 id=arc.id,
                 state="closed",
