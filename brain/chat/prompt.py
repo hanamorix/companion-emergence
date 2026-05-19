@@ -150,6 +150,15 @@ def build_system_message(
     if felt_time_block.strip():
         parts.append(felt_time_block)
 
+    # 5b-bis. Current-arc block — ambient narrative-memory texture (spec §6,
+    # narrative-memory design). Reads cached arcs_state.json; does NOT run
+    # the ArcUpdatePass — that's supervisor-owned. Slotted between felt-time
+    # and fading-summary so the ambient ordering reads: lived time → open
+    # threads → softened memories.
+    current_arc_block = _build_current_arc_block(persona_dir)
+    if current_arc_block.strip():
+        parts.append(current_arc_block)
+
     # 5c. Fading-summary block — compact aggregate of softened/lost memories
     # this week (spec §5, forgetting design). Broad-except fault-tolerant, same
     # pattern as _build_felt_time_block. "nothing has softened lately." on the
@@ -680,6 +689,21 @@ def _build_felt_time_block(persona_dir: Path) -> str:
 
         ft = FeltTime(persona_dir=persona_dir)
         return render_prompt_context(ft.get_state())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _build_current_arc_block(persona_dir: Path) -> str:
+    """Returns the narrative-arc ambient block or '' on any error.
+
+    Same fault-tolerance pattern as _build_felt_time_block and
+    _build_fading_summary_block. Reads cached arcs_state.json; does NOT
+    re-run the ArcUpdatePass.
+    """
+    try:
+        from brain.narrative_memory.prompt import render_current_arc_block
+
+        return render_current_arc_block(persona_dir)
     except Exception:  # noqa: BLE001
         return ""
 
