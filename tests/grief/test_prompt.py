@@ -137,6 +137,9 @@ def test_render_grief_block_token_cap_truncates_first_step_shrinks_memory_phrase
         arc_closed_days_ago=5,
         arc_weight="medium",
         coda="20 have softened, 17 more lost in the last 7 days.",
+        # token_cap=42: full block ~43 tokens (just over), step-1 shrunk to ~41 tokens
+        # (passes), step-2 not needed. If prefix or coda format changes, recompute
+        # with prompt._count_tokens().
         token_cap=42,
     )
     # Step 1 must have fired: memory_phrase shrunk to first 2 words.
@@ -158,6 +161,8 @@ def test_render_grief_block_token_cap_truncates_second_step_drops_arc() -> None:
         arc_closed_days_ago=5,
         arc_weight="medium",
         coda="20 have softened, 17 more lost in the last 7 days.",
+        # token_cap=30: full block ~55 tokens, step-1 still ~53 tokens (over), step-2
+        # drops arc to ~28 tokens (passes). Tightest cascade-step-2 cap.
         token_cap=30,
     )
     # Step 2 must have fired: arc dropped.
@@ -195,3 +200,35 @@ def test_format_block_strips_leading_a_in_memory_phrase() -> None:
     )
     assert "the a quiet afternoon" not in block
     assert "the quiet afternoon" in block
+
+
+def test_format_block_strips_leading_an_in_memory_phrase() -> None:
+    block = prompt._format_block_with_budget(
+        memory_summary_first_4="an unusual evening",
+        memory_lost_days_ago=1,
+        memory_weight="medium",
+        arc_name=None,
+        arc_closed_days_ago=None,
+        arc_weight=None,
+        coda="",
+        token_cap=200,
+    )
+    assert "the an " not in block
+    assert "the unusual evening" in block
+
+
+def test_count_recent_lost_counts_within_window() -> None:
+    """Direct test of the private helper — counts entries with forgotten_at_iso
+    inside the 7-lived-day window. Entries with None forgotten_at_iso don't count.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    recent = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    entries = [
+        {"forgotten_at_iso": recent},
+        {"forgotten_at_iso": old},
+        {"forgotten_at_iso": None},
+    ]
+    count = prompt._count_recent_lost(entries)
+    assert count == 1

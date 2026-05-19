@@ -292,9 +292,10 @@ def render_grief_block(persona_dir: Path, store: MemoryStore) -> str:
         entries=grave_entries,
         lived_age_hours_now=felt_state.lived_age_hours,
     )
+    now_iso = _now_iso()
     top_arc = pick_top_closed_arc(
         arcs=closed_arcs,
-        now_iso=_now_iso(),
+        now_iso=now_iso,
         lived_age_rate=_lived_age_rate_from_felt(felt_state),
     )
 
@@ -334,8 +335,8 @@ def render_grief_block(persona_dir: Path, store: MemoryStore) -> str:
         arc_name = top_arc.get("title")
         arc_days = int(
             _arc_lived_days_since_close(
-                closed_at_iso=str(top_arc.get("closed_at_iso") or _now_iso()),
-                now_iso=_now_iso(),
+                closed_at_iso=str(top_arc.get("closed_at_iso") or now_iso),
+                now_iso=now_iso,
                 lived_age_rate=_lived_age_rate_from_felt(felt_state),
             )
         )
