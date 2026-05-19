@@ -812,3 +812,71 @@ def test_build_system_message_includes_current_arc_block_when_arc_open(
     )
     assert "the boat one" in msg
     assert "current:" in msg
+
+
+# ── _build_emotion_summary — non-empty-emotions filter (heartbeat-flood fix) ──
+
+
+def test_build_emotion_summary_survives_heartbeat_flood(store: MemoryStore) -> None:
+    """`_build_emotion_summary` must filter for non-empty emotions_json.
+
+    The naive LIMIT 50 ORDER BY created_at DESC slice was identified as
+    broken for `_build_body` and `_build_emotions` (see comments at
+    brain/bridge/persona_state.py:260-264). On a steady-state brain
+    the last 50 memories are almost all heartbeats / observations /
+    facts with `emotions_json = '{}'`, so the aggregator returned an
+    empty top-3 even when emotion-bearing memories existed just
+    outside the window. This regression test pins the fix.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.chat.prompt import _build_emotion_summary
+
+    base = datetime.now(UTC)
+    # One emotion-bearing memory — older.
+    strong = Memory.create_new(
+        content="A moment of real love and tenderness.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"love": 8.5, "tenderness": 6.2, "awe": 5.0},
+    )
+    strong = Memory(
+        id=strong.id,
+        content=strong.content,
+        memory_type=strong.memory_type,
+        domain=strong.domain,
+        created_at=base - timedelta(hours=1),
+        emotions=strong.emotions,
+        tags=strong.tags,
+        importance=strong.importance,
+        score=strong.score,
+    )
+    store.create(strong)
+
+    # 60 heartbeat-style memories with empty emotions, newer than `strong`.
+    for i in range(60):
+        beat = Memory.create_new(
+            content=f"heartbeat {i}",
+            memory_type="heartbeat",
+            domain="engine",
+            emotions={},  # the bug — these dominate the LIMIT 50 window
+        )
+        beat = Memory(
+            id=beat.id,
+            content=beat.content,
+            memory_type=beat.memory_type,
+            domain=beat.domain,
+            created_at=base + timedelta(seconds=i),
+            emotions=beat.emotions,
+            tags=beat.tags,
+            importance=beat.importance,
+            score=beat.score,
+        )
+        store.create(beat)
+
+    summary = _build_emotion_summary(store)
+    # Before fix: returns "" because heartbeats fill the LIMIT 50.
+    # After fix: returns "love:8.5, tenderness:6.2, awe:5.0".
+    assert "love" in summary, f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
+    assert "tenderness" in summary
+    assert "awe" in summary

@@ -311,19 +311,27 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
 
 
 def _build_emotion_summary(store: MemoryStore) -> str:
-    """Return top-3 emotion summary string from recent memories.
+    """Return top-3 emotion summary string from recent emotion-bearing memories.
 
     Example: "love:8.5, tenderness:6.2, awe:5.0"
 
-    Uses aggregate_state over the most-recent 50 memories for a fast,
-    representative snapshot. Returns empty string if no emotions found.
+    Filters to memories that actually carry an emotion vector. The naive
+    last-50-by-date slice was almost all heartbeats / observations / facts
+    (empty emotions_json) on a steady-state brain, so the aggregator
+    returned an empty top-3 even when emotion-bearing memories existed
+    just outside the window. Same fix as _build_emotions / _build_body in
+    brain/bridge/persona_state.py (see comments at lines 209-217, 260-264).
     """
     try:
         from brain.emotion.aggregate import aggregate_state
         from brain.memory.store import _row_to_memory
 
         rows = store._conn.execute(  # noqa: SLF001 — internal same-tier access
-            "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT 200"
         ).fetchall()
         memories = [_row_to_memory(row) for row in rows]
         state = aggregate_state(memories)
