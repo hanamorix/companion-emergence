@@ -26,34 +26,34 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
 def compute_touch_intensity(
     *,
     grave_emotion_max: float,
-    salience_at_drop: float,
     lived_days_since_loss: float,
 ) -> float:
     """Recall-touch grief intensity per spec §3.
 
-    intensity = clamp(grave_emotion_max * salience_at_drop * 5.0 * recency_factor)
+    intensity = clamp(grave_emotion_max * 5.0 * recency_factor)
     recency_factor = 0.5 ** (lived_days_since_loss / 14.0)
                  = exp(-ln(2) * lived_days_since_loss / 14.0)
 
-    Half-life of 14 lived-days — a 14-day-old loss feels half as sharp as fresh,
-    a 28-day-old loss a quarter as sharp, and so on.
+    Half-life of 14 lived-days — a 14-day-old loss feels half as sharp
+    as fresh, a 28-day-old loss a quarter as sharp, and so on.
 
     Args:
-        grave_emotion_max: max emotion intensity on the lost memory, NORMALISED
-            to [0, 1] (i.e., raw emotion / 10). Same scale as
-            SalienceInputs.emotion and the same scale compute_drop_intensity
-            expects.
-        salience_at_drop: composite salience score at time of loss, [0, 1].
-        lived_days_since_loss: lived-days elapsed since the memory entered
-            the graveyard.
+        grave_emotion_max: max emotion intensity on the lost memory,
+            NORMALISED to [0, 1] (raw emotion / 10). Same scale as
+            SalienceInputs.emotion and compute_drop_intensity expects.
+        lived_days_since_loss: lived-days elapsed since the memory
+            entered the graveyard.
 
     Returns:
         Grief intensity in [0, 10].
+
+    Note:
+        salience_at_drop is NOT a factor — see spec §3 for why.
     """
     d = max(lived_days_since_loss, 0.0)
     half_life = policy.RECENCY_LIVED_DAYS_HALF_LIFE
     recency = 0.5 ** (d / half_life)
-    raw = grave_emotion_max * salience_at_drop * policy.RECALL_TOUCH_SCALE * recency
+    raw = grave_emotion_max * policy.RECALL_TOUCH_SCALE * recency
     return _clamp(raw)
 
 
@@ -111,26 +111,24 @@ def handle_recall_touch(
         if entry is None:
             continue  # active or fading hit — not lost
 
-        salience_at_drop = float(entry.get("salience_at_drop") or 0.0)
-        # Use raw emotion_at_ingest max (0-10 scale) as grave_emotion_max.
-        # compute_touch_intensity is scale-agnostic; the caller passes what
-        # makes physical sense. Passing the 0-10 value keeps the same
-        # emotional weight as the live memory had at ingest.
+        # Normalise emotion to [0, 1] — graveyard stores raw 0-10 values.
+        # compute_touch_intensity expects the [0,1]-normalised scale, matching
+        # handle_drop's convention (raw/10).
         emotion_at_ingest = entry.get("emotion_at_ingest") or {}
         if emotion_at_ingest:
-            emotion_max = max(
+            raw_emotion_max = max(
                 float(v) for v in emotion_at_ingest.values()
                 if isinstance(v, (int, float))
             )
         else:
-            emotion_max = 0.0
+            raw_emotion_max = 0.0
+        emotion_max = max(0.0, min(1.0, raw_emotion_max / 10.0))
         lived_days_since = _lived_days_since_loss(
             entry=entry, lived_age_hours_now=lived_age_hours_now
         )
 
         intensity = compute_touch_intensity(
             grave_emotion_max=emotion_max,
-            salience_at_drop=salience_at_drop,
             lived_days_since_loss=lived_days_since,
         )
         if intensity < policy.THRESHOLD:

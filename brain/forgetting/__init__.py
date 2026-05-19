@@ -161,7 +161,6 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
 
                     grief.handle_drop(
                         memory=memory,
-                        salience_at_drop=s,
                         persona_dir=persona_dir,
                         store=store,
                     )

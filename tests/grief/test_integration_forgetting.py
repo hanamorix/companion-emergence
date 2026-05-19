@@ -32,8 +32,8 @@ def _seed_memory(
         emotions={"joy": joy},
     )
     object.__setattr__(m, "id", id_)
-    # Back-date created_at so the recent-buffer exemption (RECENT_LIVED_HOURS=24h
-    # wall-clock) does not protect this memory from the forgetting pass.
+    # Back-date created_at so the recent-buffer exemption does not protect this
+    # memory from the forgetting pass.
     object.__setattr__(
         m, "created_at", datetime.now(UTC) - timedelta(days=last_accessed_days_ago)
     )
@@ -54,29 +54,31 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     """A high-emotion memory that ages out via the forgetting pass should
     produce a grief breadcrumb attached to its now-deleted id.
 
-    The intensity formula (emotion × salience × 7.0) yields < 0.70 at LOSE
-    time because salience < LOST_THRESHOLD (0.10).  We monkeypatch
-    brain.grief.policy.THRESHOLD to 0.0 so the test verifies the wiring —
-    handle_drop is called and writes a breadcrumb — independently of the
-    threshold gate, which is covered by unit tests in test_breadcrumb.py.
+    joy=9.0 → normalised emotion 0.9 → grief intensity 0.9 × 7.0 = 6.3, above
+    THRESHOLD (3.0). However, the emotion contribution also lifts composite
+    salience (≈ 0.9 × 0.3 = 0.27) above LOST_THRESHOLD (0.10), so the memory
+    would NOT naturally LOSE.
+
+    Test fixture: monkeypatch LOST_THRESHOLD to 0.5 and FADE_THRESHOLD to 0.6
+    so the high-emotion memory is LOSE-eligible. The grief THRESHOLD (3.0) is
+    NOT touched — we verify the grief contract under real conditions.
     """
-    import brain.grief.policy as grief_policy
-
-    monkeypatch.setattr(grief_policy, "THRESHOLD", 0.0)
-
     from brain.felt_time.state import FeltTimeState
     from brain.felt_time.state import persist as persist_felt_time
+    from brain.forgetting import policy as forgetting_policy
 
     persist_felt_time(
-        FeltTimeState(lived_age_hours=720.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        FeltTimeState(lived_age_hours=720.0 * 5, last_tick_ts="2026-05-18T00:00:00+00:00"),
         tmp_path,
     )
     store = MemoryStore(tmp_path / "memories.db")
-    # joy=0.0 → emotion salience ≈ 0; created_at + last_accessed 60 days ago →
-    # freshness ≈ 0; no soul link, no hebbian, no recalls → salience ≈ 0 <
-    # LOST_THRESHOLD (0.10) so the LOSE transition fires after LOST_PASS_COUNT passes.
-    _seed_memory(store, id_="mem-target", joy=0.0, last_accessed_days_ago=60)
+    _seed_memory(store, id_="mem-target", joy=9.0, last_accessed_days_ago=180)
     store.close()
+
+    # Raise LOST_THRESHOLD high enough that joy=9.0 (salience ~0.27) is below it.
+    monkeypatch.setattr(forgetting_policy, "LOST_THRESHOLD", 0.5)
+    monkeypatch.setattr(forgetting_policy, "FADE_THRESHOLD", 0.6)
+    monkeypatch.setattr(forgetting_policy, "LOST_PASS_COUNT", 1)
 
     bus = _NullBus()
     for _ in range(5):
@@ -87,10 +89,14 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     assert rows == [], "target memory should have been hard-deleted by the forgetting pass"
 
     grief_rows = store._conn.execute(
-        "SELECT metadata_json FROM memories WHERE memory_type = 'grief_event'"
+        "SELECT metadata_json, emotions_json FROM memories WHERE memory_type = 'grief_event'"
     ).fetchall()
     assert len(grief_rows) >= 1, "drop-time grief breadcrumb should have been written"
     meta = json.loads(grief_rows[0]["metadata_json"])
     assert meta["grief_referent_id"] == "mem-target"
     assert meta["grief_subtype"] == "drop"
+    em = json.loads(grief_rows[0]["emotions_json"])
+    assert em["memory_grief"] == pytest.approx(6.3, abs=0.01), (
+        "intensity should be joy_normalised * DROP_SCALE = 0.9 * 7.0 = 6.3"
+    )
     store.close()

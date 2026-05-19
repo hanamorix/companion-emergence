@@ -3,7 +3,7 @@
 Public surface — three entry points wired into the brain at fault-isolated
 call sites:
 
-    handle_drop(memory=, salience_at_drop=, persona_dir=, store=)
+    handle_drop(memory=, persona_dir=, store=)
         Called inline by forgetting.__init__.run_pass after hard_delete.
 
     handle_arc_close(arc=, persona_dir=, store=)
@@ -53,7 +53,6 @@ def _dominant_non_grief_emotion(emotions: dict[str, float]) -> tuple[str, float]
 def handle_drop(
     *,
     memory: Memory,
-    salience_at_drop: float,
     persona_dir: Path,
     store: MemoryStore,
 ) -> None:
@@ -66,9 +65,7 @@ def handle_drop(
     try:
         emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0
         emotion_max = max(0.0, min(1.0, emotion_max))
-        intensity = breadcrumb.compute_drop_intensity(
-            emotion_at_ingest_max=emotion_max, salience_at_drop=salience_at_drop
-        )
+        intensity = breadcrumb.compute_drop_intensity(emotion_at_ingest_max=emotion_max)
         if intensity < policy.THRESHOLD:
             return
         residue = _dominant_non_grief_emotion(dict(memory.emotions or {}))

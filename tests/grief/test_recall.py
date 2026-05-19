@@ -13,37 +13,37 @@ from brain.memory.store import MemoryStore
 
 
 def test_touch_intensity_fresh_loss() -> None:
+    # 0.8 emotion × 5.0 × 1.0 (recency at d=0) = 4.0
     result = recall.compute_touch_intensity(
         grave_emotion_max=0.8,
-        salience_at_drop=0.5,
         lived_days_since_loss=0.0,
     )
-    assert result == pytest.approx(2.0, abs=0.01)
+    assert result == pytest.approx(4.0, abs=0.01)
 
 
 def test_touch_intensity_recency_decay() -> None:
     fresh = recall.compute_touch_intensity(
-        grave_emotion_max=1.0, salience_at_drop=1.0, lived_days_since_loss=0.0
+        grave_emotion_max=1.0, lived_days_since_loss=0.0
     )
     aged = recall.compute_touch_intensity(
-        grave_emotion_max=1.0, salience_at_drop=1.0, lived_days_since_loss=14.0
+        grave_emotion_max=1.0, lived_days_since_loss=14.0
     )
     assert aged == pytest.approx(fresh * 0.5, abs=0.01)
 
 
 def test_touch_intensity_clamped_at_10() -> None:
+    # 3.0 emotion (out-of-range) × 5.0 × 1.0 = 15, clamped to 10
     result = recall.compute_touch_intensity(
-        grave_emotion_max=3.0, salience_at_drop=3.0, lived_days_since_loss=0.0
+        grave_emotion_max=3.0, lived_days_since_loss=0.0
     )
     assert result == 10.0
 
 
 def test_touch_intensity_old_loss_low() -> None:
     # 60 lived-days ago → recency 0.5^(60/14) ≈ 0.051
-    # Full-score inputs (g=0.9, s=0.9) still produce raw ≈ 0.207 — well below
-    # the 3.0 write threshold callers apply via policy.THRESHOLD.
+    # Full-score input g=0.9 produces raw ≈ 0.230 — well below 3.0 threshold.
     result = recall.compute_touch_intensity(
-        grave_emotion_max=0.9, salience_at_drop=0.9, lived_days_since_loss=60.0
+        grave_emotion_max=0.9, lived_days_since_loss=60.0
     )
     assert result < 0.3
 

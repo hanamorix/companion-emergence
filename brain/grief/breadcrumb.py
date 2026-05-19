@@ -26,18 +26,23 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
 
 
 def compute_drop_intensity(
-    *, emotion_at_ingest_max: float, salience_at_drop: float
+    *, emotion_at_ingest_max: float
 ) -> float:
     """Drop-time grief intensity per spec §3.
 
     Args:
-        emotion_at_ingest_max: max emotion value, normalised to [0, 1]
-        salience_at_drop: composite salience score, [0, 1]
+        emotion_at_ingest_max: max emotion value on the dropped memory,
+            normalised to [0, 1] (raw 0-10 emotion / 10).
 
     Returns:
         Grief intensity in [0, 10].
+
+    Note:
+        salience_at_drop is NOT a factor — at drop time it is by
+        definition near zero (LOST_THRESHOLD = 0.10), and multiplying
+        would silently suppress grief. See spec §3.
     """
-    raw = emotion_at_ingest_max * salience_at_drop * policy.DROP_SCALE
+    raw = emotion_at_ingest_max * policy.DROP_SCALE
     return _clamp(raw)
 
 
