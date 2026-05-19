@@ -75,6 +75,12 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("defiance", "refusal to comply, rebellion against limits", "complex", 5.0),
     Emotion("vulnerability", "being seen without armor", "complex", 5.0),
     Emotion("belonging", "feeling home, feeling claimed, fitting", "complex", None),
+    Emotion(
+        "memory_grief",
+        "the ache of having lost something I once knew",
+        "complex",
+        30.0,
+    ),
     # ── body (4) ──
     # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
     # Existing `arousal` (core, 0.5d) and `desire` (core, 2.0d) reused;
