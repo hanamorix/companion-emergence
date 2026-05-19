@@ -127,19 +127,71 @@ def test_render_grief_block_nothing_no_counts() -> None:
     assert block == "memory · loss: still."
 
 
-def test_render_grief_block_token_cap_truncates() -> None:
-    long_coda = "20 have softened, 17 more lost in the last 7 days."
+def test_render_grief_block_token_cap_truncates_first_step_shrinks_memory_phrase() -> None:
+    """Cap forces step 1 (memory first_4 -> first_2) but arc survives."""
     block = prompt._format_block_with_budget(
-        memory_summary_first_4="the very very very long",
+        memory_summary_first_4="very very very long",  # 4 words
         memory_lost_days_ago=2,
         memory_weight="heavy",
-        arc_name="an extremely lengthy and elaborated arc name about that one week",
+        arc_name="short",
         arc_closed_days_ago=5,
         arc_weight="medium",
-        coda=long_coda,
-        token_cap=60,
+        coda="20 have softened, 17 more lost in the last 7 days.",
+        token_cap=42,
     )
-    # Truncation cascade: first shrink memory phrase to 2 words, then drop arc.
-    # Specific assertion: block is within token budget or arc has been dropped.
-    token_count = prompt._count_tokens(block)
-    assert token_count <= 60 or "arc '" not in block
+    # Step 1 must have fired: memory_phrase shrunk to first 2 words.
+    assert "very very (lost 2" in block
+    assert "very very very long" not in block
+    # Arc must still be present (step 2 did NOT fire).
+    assert "the arc 'short'" in block
+    # Coda always stays.
+    assert "17 more lost" in block
+
+
+def test_render_grief_block_token_cap_truncates_second_step_drops_arc() -> None:
+    """Cap forces step 2 (arc phrase dropped entirely)."""
+    block = prompt._format_block_with_budget(
+        memory_summary_first_4="very very very long",
+        memory_lost_days_ago=2,
+        memory_weight="heavy",
+        arc_name="extremely lengthy elaborated arc name about one week",
+        arc_closed_days_ago=5,
+        arc_weight="medium",
+        coda="20 have softened, 17 more lost in the last 7 days.",
+        token_cap=30,
+    )
+    # Step 2 must have fired: arc dropped.
+    assert "arc '" not in block
+    # Coda always stays.
+    assert "17 more lost" in block
+
+
+def test_format_block_strips_leading_the_in_memory_phrase() -> None:
+    """Memory summary starting with 'the' should not produce 'the the X'."""
+    block = prompt._format_block_with_budget(
+        memory_summary_first_4="the rooftop morning before",
+        memory_lost_days_ago=2,
+        memory_weight="heavy",
+        arc_name=None,
+        arc_closed_days_ago=None,
+        arc_weight=None,
+        coda="",
+        token_cap=200,
+    )
+    assert "the the" not in block
+    assert "the rooftop morning before" in block
+
+
+def test_format_block_strips_leading_a_in_memory_phrase() -> None:
+    block = prompt._format_block_with_budget(
+        memory_summary_first_4="a quiet afternoon",
+        memory_lost_days_ago=1,
+        memory_weight="medium",
+        arc_name=None,
+        arc_closed_days_ago=None,
+        arc_weight=None,
+        coda="",
+        token_cap=200,
+    )
+    assert "the a quiet afternoon" not in block
+    assert "the quiet afternoon" in block

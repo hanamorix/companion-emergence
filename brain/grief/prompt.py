@@ -20,6 +20,19 @@ from brain.memory.store import MemoryStore
 _LOST_WINDOW_DAYS = 7
 
 
+def _strip_leading_article(text: str) -> str:
+    """If text starts with 'the ', 'a ', or 'an ', return without the article.
+
+    Used by the memory-phrase formatter to avoid 'the the X' duplication
+    when summary already starts with an article.
+    """
+    lower = text.lower()
+    for article in ("the ", "an ", "a "):
+        if lower.startswith(article):
+            return text[len(article):]
+    return text
+
+
 def weight_bucket(*, emotion_max_normalised: float) -> str:
     """Bucket emotion_at_ingest_max into heavy / medium / light per spec §5.
 
@@ -151,7 +164,8 @@ def _format_block_with_budget(
     """
 
     def _memory_phrase(summary: str) -> str:
-        return f"the {summary} (lost {memory_lost_days_ago} lived-days ago, {memory_weight})"
+        cleaned = _strip_leading_article(summary)
+        return f"the {cleaned} (lost {memory_lost_days_ago} lived-days ago, {memory_weight})"
 
     def _arc_phrase() -> str:
         return f"the arc '{arc_name}' (closed {arc_closed_days_ago} lived-days ago, {arc_weight})"
