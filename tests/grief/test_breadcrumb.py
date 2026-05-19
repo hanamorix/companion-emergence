@@ -35,3 +35,37 @@ def test_compute_arc_close_intensity_heavy_member() -> None:
 def test_compute_arc_close_intensity_under_floor() -> None:
     result = breadcrumb.compute_arc_close_intensity(arc_max_member_emotion=0.2)
     assert result == pytest.approx(1.4, abs=0.01)
+
+
+def test_first_n_words_long_summary() -> None:
+    summary = "I drove out to the rooftop morning before the cold rain hit hard."
+    assert breadcrumb.first_n_words(summary, 6) == "I drove out to the rooftop"
+
+
+def test_first_n_words_short_summary() -> None:
+    summary = "quiet day"
+    assert breadcrumb.first_n_words(summary, 6) == "quiet day"
+
+
+def test_first_n_words_empty() -> None:
+    assert breadcrumb.first_n_words("", 6) == ""
+
+
+def test_drop_phrase_with_summary() -> None:
+    phrase = breadcrumb.drop_phrase("I drove out to the rooftop morning before")
+    assert phrase == "the memory of I drove out to the rooftop is gone"
+
+
+def test_drop_phrase_empty_summary_fallback() -> None:
+    phrase = breadcrumb.drop_phrase("", lived_days_ago=2.3)
+    assert phrase == "a memory from 2 lived-days ago is gone"
+
+
+def test_recall_touch_phrase() -> None:
+    phrase = breadcrumb.recall_touch_phrase("I drove out to the rooftop morning before")
+    assert phrase == "reached for I drove out to the rooftop — gone"
+
+
+def test_arc_close_phrase() -> None:
+    phrase = breadcrumb.arc_close_phrase("first cold week")
+    assert phrase == "the arc 'first cold week' has closed"
