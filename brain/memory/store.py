@@ -516,6 +516,29 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
+        """Return True if a grief_event memory with grief_referent_id == referent_id
+        exists in the memories table created within the last `hours`.
+
+        Implementation: SQL filter on (memory_type='grief_event', created_at >= cutoff),
+        then Python-side filter on metadata.grief_referent_id. Recent grief volume is
+        sparse — linear filter cost is negligible. Avoids depending on SQLite
+        json_extract. Spec §4 + §6.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        rows = self._conn.execute(
+            "SELECT metadata_json FROM memories "
+            "WHERE memory_type = 'grief_event' AND created_at >= ?",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            meta = _safe_load_metadata(row["metadata_json"])
+            if meta.get("grief_referent_id") == referent_id:
+                return True
+        return False
+
     def list_since_iso(
         self, opened_at_iso: str, *, include_fading: bool = True
     ) -> list[Memory]:
