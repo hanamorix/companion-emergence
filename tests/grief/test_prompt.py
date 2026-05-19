@@ -91,3 +91,55 @@ def test_rank_arc_picks_heavy_recent() -> None:
         lived_age_rate=1.0,
     )
     assert best is not None and best["id"] == "a1"
+
+
+def test_render_grief_block_only_memory() -> None:
+    block = prompt._format_block(
+        memory_phrase="the rooftop morning before (lost 2 lived-days ago, heavy)",
+        arc_phrase=None,
+        coda="3 have softened, 1 more lost in the last 7 days.",
+    )
+    assert block.startswith("memory · loss:")
+    assert "the rooftop morning before" in block
+    assert "3 have softened" in block
+
+
+def test_render_grief_block_only_arc() -> None:
+    block = prompt._format_block(
+        memory_phrase=None,
+        arc_phrase="the arc 'first cold week' (closed 5 lived-days ago, medium)",
+        coda="0 have softened, 0 more lost in the last 7 days.",
+    )
+    assert "first cold week" in block
+
+
+def test_render_grief_block_nothing_with_counts() -> None:
+    block = prompt._format_block(
+        memory_phrase=None,
+        arc_phrase=None,
+        coda="2 have softened, 0 more lost in the last 7 days.",
+    )
+    assert block == "memory · loss: still. 2 have softened, 0 more lost in the last 7 days."
+
+
+def test_render_grief_block_nothing_no_counts() -> None:
+    block = prompt._format_block(memory_phrase=None, arc_phrase=None, coda="")
+    assert block == "memory · loss: still."
+
+
+def test_render_grief_block_token_cap_truncates() -> None:
+    long_coda = "20 have softened, 17 more lost in the last 7 days."
+    block = prompt._format_block_with_budget(
+        memory_summary_first_4="the very very very long",
+        memory_lost_days_ago=2,
+        memory_weight="heavy",
+        arc_name="an extremely lengthy and elaborated arc name about that one week",
+        arc_closed_days_ago=5,
+        arc_weight="medium",
+        coda=long_coda,
+        token_cap=60,
+    )
+    # Truncation cascade: first shrink memory phrase to 2 words, then drop arc.
+    # Specific assertion: block is within token budget or arc has been dropped.
+    token_count = prompt._count_tokens(block)
+    assert token_count <= 60 or "arc '" not in block
