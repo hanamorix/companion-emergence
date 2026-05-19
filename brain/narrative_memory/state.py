@@ -10,7 +10,6 @@ newest log event, replay arcs.log.jsonl from beginning to rebuild state.
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -130,6 +129,155 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
 def load_or_recover(persona_dir: Path) -> ArcsState:
     """Load arcs_state.json, falling back to JSONL log replay on miss/corrupt.
 
-    Returns fresh empty ArcsState if both are missing.
+    Per spec §3 recovery model:
+      1. If state.json exists AND last_pass_ts_iso is newer than the newest
+         log event, load as-is.
+      2. Otherwise, replay arcs.log.jsonl from beginning to reconstruct state.
+      3. Empty dir → fresh empty ArcsState.
     """
-    raise NotImplementedError
+    state_path = persona_dir / STATE_FILENAME
+    log_path = persona_dir / LOG_FILENAME
+
+    loaded_state: ArcsState | None = None
+    if state_path.exists():
+        try:
+            raw = json.loads(state_path.read_text())
+            loaded_state = ArcsState(
+                open={arc_id: _arc_from_dict(d) for arc_id, d in raw.get("open", {}).items()},
+                recently_closed=[_arc_from_dict(d) for d in raw.get("recently_closed", [])],
+                last_pass_ts_iso=raw.get("last_pass_ts_iso"),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            loaded_state = None
+
+    if loaded_state is not None and not _log_newer_than_state(log_path, loaded_state):
+        return loaded_state
+
+    if not log_path.exists():
+        # No state + no log → fresh empty state
+        return ArcsState()
+
+    return _replay_from_log(log_path)
+
+
+def _log_newer_than_state(log_path: Path, state: ArcsState) -> bool:
+    """True iff the JSONL log's newest event is newer than state.last_pass_ts_iso.
+
+    Conservative: if the state has no last_pass_ts_iso or any event has no
+    ts_iso, treat as stale (force replay).
+    """
+    if not log_path.exists():
+        return False
+    if state.last_pass_ts_iso is None:
+        return True
+    state_ts = state.last_pass_ts_iso
+    newest_event_ts: str | None = None
+    for event in iter_jsonl_skipping_corrupt(log_path):
+        ts = event.get("ts_iso")
+        if isinstance(ts, str) and (newest_event_ts is None or ts > newest_event_ts):
+            newest_event_ts = ts
+    if newest_event_ts is None:
+        return False
+    return newest_event_ts > state_ts
+
+
+def _replay_from_log(log_path: Path) -> ArcsState:
+    """Reconstruct ArcsState by replaying arcs.log.jsonl event-by-event.
+
+    Idempotent across event types. Sets replayed=True so the frontend
+    recovery banner can fire on next persona-state read.
+    """
+    state = ArcsState(replayed=True)
+
+    for event in iter_jsonl_skipping_corrupt(log_path):
+        kind = event.get("event")
+        arc_id = event.get("arc_id")
+        if kind == "arc_opened" and isinstance(arc_id, str):
+            state.open[arc_id] = Arc(
+                id=arc_id,
+                state="open",
+                seed_anchor_type=event.get("seed_anchor_type", "dream"),
+                seed_anchor_ref=event.get("seed_anchor_ref", ""),
+                seed_memory_ids=tuple(event.get("seed_memory_ids", [])),
+                title=event.get("title", ""),
+                opened_at_iso=event.get("ts_iso", ""),
+                lived_age_at_open=float(event.get("lived_age_hours", 0.0)),
+                last_extended_at_iso=event.get("ts_iso", ""),
+                closed_at_iso=None,
+                lived_age_at_close=None,
+                members=(),
+            )
+        elif kind == "member_added" and isinstance(arc_id, str) and arc_id in state.open:
+            arc = state.open[arc_id]
+            member_id = event.get("memory_id", "")
+            # Idempotent — skip if already a member.
+            if any(m.memory_id == member_id for m in arc.members):
+                continue
+            new_member = ArcMember(
+                memory_id=member_id,
+                joined_at_iso=event.get("ts_iso", ""),
+                lived_age_at_join=float(event.get("lived_age_hours", 0.0)),
+                salience_at_join=float(event.get("salience_at_join", 0.0)),
+            )
+            state.open[arc_id] = _arc_with_member(arc, new_member, event.get("ts_iso", ""))
+        elif kind == "member_evicted" and isinstance(arc_id, str) and arc_id in state.open:
+            arc = state.open[arc_id]
+            evicted_id = event.get("memory_id", "")
+            new_members = tuple(m for m in arc.members if m.memory_id != evicted_id)
+            state.open[arc_id] = _arc_replace_members(arc, new_members)
+        elif kind == "arc_closed" and isinstance(arc_id, str) and arc_id in state.open:
+            arc = state.open.pop(arc_id)
+            closed = Arc(
+                id=arc.id,
+                state="closed",
+                seed_anchor_type=arc.seed_anchor_type,
+                seed_anchor_ref=arc.seed_anchor_ref,
+                seed_memory_ids=arc.seed_memory_ids,
+                title=arc.title,
+                opened_at_iso=arc.opened_at_iso,
+                lived_age_at_open=arc.lived_age_at_open,
+                last_extended_at_iso=arc.last_extended_at_iso,
+                closed_at_iso=event.get("ts_iso"),
+                lived_age_at_close=float(event.get("lived_age_hours", 0.0)),
+                members=arc.members,
+            )
+            state.recently_closed.append(closed)
+
+    # Cap recently_closed at RECENTLY_CLOSED_CAP after replay.
+    if len(state.recently_closed) > RECENTLY_CLOSED_CAP:
+        state.recently_closed = state.recently_closed[-RECENTLY_CLOSED_CAP:]
+    return state
+
+
+def _arc_with_member(arc: Arc, member: ArcMember, ts_iso: str) -> Arc:
+    return Arc(
+        id=arc.id,
+        state=arc.state,
+        seed_anchor_type=arc.seed_anchor_type,
+        seed_anchor_ref=arc.seed_anchor_ref,
+        seed_memory_ids=arc.seed_memory_ids,
+        title=arc.title,
+        opened_at_iso=arc.opened_at_iso,
+        lived_age_at_open=arc.lived_age_at_open,
+        last_extended_at_iso=ts_iso or arc.last_extended_at_iso,
+        closed_at_iso=arc.closed_at_iso,
+        lived_age_at_close=arc.lived_age_at_close,
+        members=arc.members + (member,),
+    )
+
+
+def _arc_replace_members(arc: Arc, members: tuple[ArcMember, ...]) -> Arc:
+    return Arc(
+        id=arc.id,
+        state=arc.state,
+        seed_anchor_type=arc.seed_anchor_type,
+        seed_anchor_ref=arc.seed_anchor_ref,
+        seed_memory_ids=arc.seed_memory_ids,
+        title=arc.title,
+        opened_at_iso=arc.opened_at_iso,
+        lived_age_at_open=arc.lived_age_at_open,
+        last_extended_at_iso=arc.last_extended_at_iso,
+        closed_at_iso=arc.closed_at_iso,
+        lived_age_at_close=arc.lived_age_at_close,
+        members=members,
+    )
