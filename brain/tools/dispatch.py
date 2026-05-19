@@ -15,6 +15,8 @@ from brain.felt_time.tool import pressure_since as _pressure_since_impl
 from brain.forgetting.tool import recall_forgotten as _recall_forgotten_impl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.narrative_memory.tool import list_open_arcs as _list_open_arcs_impl
+from brain.narrative_memory.tool import recall_arc as _recall_arc_impl
 from brain.tools.impls.add_journal import add_journal
 from brain.tools.impls.add_memory import add_memory
 from brain.tools.impls.boot import boot
@@ -60,6 +62,16 @@ def _recall_forgotten_wrapper(*, store, hebbian, persona_dir, query=None, **_):
     )
 
 
+def _list_open_arcs_wrapper(*, store, hebbian, persona_dir, **_):
+    return _list_open_arcs_impl(persona_dir=persona_dir)
+
+
+def _recall_arc_wrapper(*, store, hebbian, persona_dir, query="", **_):
+    if not isinstance(query, str):
+        raise ToolDispatchError("recall_arc: 'query' must be a string")
+    return _recall_arc_impl(query=query, persona_dir=persona_dir)
+
+
 _DISPATCH: dict[str, Any] = {
     "get_emotional_state": get_emotional_state,
     "get_personality": get_personality,
@@ -77,6 +89,8 @@ _DISPATCH: dict[str, Any] = {
     "felt_time_now": _felt_time_now_wrapper,
     "pressure_since": _pressure_since_wrapper,
     "recall_forgotten": _recall_forgotten_wrapper,
+    "list_open_arcs": _list_open_arcs_wrapper,
+    "recall_arc": _recall_arc_wrapper,
 }
 
 
