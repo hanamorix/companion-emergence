@@ -57,6 +57,7 @@ from brain.initiate.review import run_initiate_review_tick
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
@@ -217,6 +218,14 @@ def run_folded(
                 forgetting_run_pass(persona_dir, event_bus=event_bus)
             except Exception:
                 logger.exception("supervisor forgetting pass raised")
+            # Narrative-memory arc-update runs AFTER forgetting in the same
+            # cadence so any memory forgetting just dropped doesn't enter
+            # an arc born this tick. Fault-isolated; an arc-update raise
+            # cannot cascade into the soul-review loop.
+            try:
+                _run_narrative_memory_pass(persona_dir, provider, event_bus)
+            except Exception:
+                logger.exception("supervisor narrative-memory pass raised")
             last_soul_review_at = time.monotonic()
 
         # Finalize cadence — 24h silence (default) or explicit. Each pass
@@ -543,6 +552,203 @@ def _run_soul_review_tick(
             "at": _now_iso(),
         }
     )
+
+
+def _run_narrative_memory_pass(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus,
+) -> None:
+    """Soul-review-cadence wrapper around narrative_memory.run_pass.
+
+    Opens per-call MemoryStore, HebbianMatrix, EmbeddingCache (ExitStack —
+    mirrors `_run_finalize_tick` ownership pattern), reads FeltTimeState,
+    and builds the anchor-sweep + candidate-pool + salience + is_exempt
+    closures against the real stores. Dispatches to the orchestrator.
+
+    Runs AFTER forgetting_run_pass within the same soul-review cadence
+    block so memories forgetting just dropped don't enter arcs born this
+    same tick. Fault-isolated upstream.
+    """
+    # Local imports keep the module-load surface light — narrative_memory
+    # is only exercised on the (slow) soul-review cadence.
+    import numpy as np
+
+    from brain.felt_time import FeltTime
+    from brain.felt_time.anchors import scan_since as anchors_scan_since
+    from brain.forgetting import _load_soul_linked_ids
+    from brain.forgetting.policy import is_exempt as forgetting_is_exempt
+    from brain.forgetting.salience import score as forgetting_salience
+    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+
+    # Map felt-time anchor type -> JSONL filename (matches
+    # brain.felt_time.anchors._SOURCES; v1 skips weather_shift per spec).
+    anchor_sources: dict[str, tuple[str, str]] = {
+        "dream": ("dreams.log.jsonl", "summary"),
+        "growth": ("growth.log.jsonl", "title"),
+        "soul": ("soul.log.jsonl", "moment_label"),
+    }
+
+    class _AnchorAdapter:
+        """Narrative-memory `_AnchorLike` view over a felt-time Anchor.
+
+        Pulls seed_memory_ids + lived_age_hours from the raw JSONL entry the
+        anchor's source_ref points at; falls back to empty tuple / 0.0 when
+        absent. The orchestrator silently skips anchors with empty
+        seed_memory_ids (see brain/narrative_memory/__init__.py:108).
+        """
+
+        def __init__(
+            self,
+            *,
+            anchor_type: str,
+            ref: str,
+            label: str,
+            ts_iso: str,
+            lived_age_hours: float,
+            seed_memory_ids: tuple[str, ...],
+        ) -> None:
+            self.type = anchor_type
+            self.ref = ref
+            self.label = label
+            self.ts_iso = ts_iso
+            self.lived_age_hours = lived_age_hours
+            self.seed_memory_ids = seed_memory_ids
+
+    def _extract_seed_memory_ids(entry: dict) -> tuple[str, ...]:
+        """Best-effort: pluck a memory-id list from a JSONL anchor entry.
+
+        Each anchor source uses a slightly different field name; we accept
+        any of the known shapes. Returns empty tuple when no field matches,
+        which causes the orchestrator to skip the anchor cleanly.
+        """
+        for key in ("seed_memory_ids", "linked_memory_ids", "evidence_memory_ids", "memory_ids"):
+            val = entry.get(key)
+            if isinstance(val, (list, tuple)) and val:
+                return tuple(str(x) for x in val)
+        single = entry.get("memory_id")
+        if isinstance(single, str) and single:
+            return (single,)
+        return ()
+
+    def _adapt_anchors(persona_dir: Path, last_pass_ts: str | None) -> list[_AnchorAdapter]:
+        """Convert felt-time Anchors into narrative_memory _AnchorLike views.
+
+        Iterates the underlying JSONL once per source so we can pluck
+        per-entry seed_memory_ids + lived_age_hours alongside the matched
+        anchor. v1 covers dream / growth / soul; weather_shift skipped.
+        """
+        felt_anchors = anchors_scan_since(persona_dir, last_pass_ts)
+        # Index felt anchors by (filename, idx_1based) for fast match.
+        wanted: dict[tuple[str, int], object] = {}
+        for fa in felt_anchors:
+            if fa.type not in anchor_sources:
+                continue
+            try:
+                filename, _ = fa.source_ref.rsplit(":", 1)
+                idx = int(_)
+            except (ValueError, AttributeError):
+                continue
+            wanted[(filename, idx)] = fa
+
+        adapted: list[_AnchorAdapter] = []
+        for anchor_type, (filename, _label_key) in anchor_sources.items():
+            path = persona_dir / filename
+            if not path.exists():
+                continue
+            for entry_idx, entry in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
+                fa = wanted.get((filename, entry_idx))
+                if fa is None:
+                    continue
+                seed_ids = _extract_seed_memory_ids(entry)
+                if not seed_ids:
+                    # Skip anchors we can't seed — orchestrator would too.
+                    continue
+                lived = entry.get("lived_age_hours")
+                if not isinstance(lived, (int, float)):
+                    lived = 0.0
+                adapted.append(
+                    _AnchorAdapter(
+                        anchor_type=anchor_type,
+                        ref=fa.source_ref,
+                        label=fa.label,
+                        ts_iso=fa.ts,
+                        lived_age_hours=float(lived),
+                        seed_memory_ids=seed_ids,
+                    )
+                )
+        adapted.sort(key=lambda a: a.ts_iso)
+        return adapted
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings_cache = EmbeddingCache(
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings_cache.close)
+
+        # FeltTime read — get_state() is cheap, doesn't tick.
+        felt_time_state = FeltTime(persona_dir=persona_dir).get_state()
+
+        # Soul-linked ids — best-effort, mirrors forgetting wrapper.
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+        soul_linked = crystallised_ids | under_review_ids
+
+        class _EmbeddingsByMemoryId:
+            """Adapter exposing the narrative_memory EmbeddingsView protocol.
+
+            Maps memory_id -> content -> cached vector via store + embedding
+            cache. Returns None when the memory is missing or the embedding
+            provider raises (defensive — the membership path falls back).
+            """
+
+            def get(self, memory_id: str):
+                try:
+                    mem = store.get(memory_id)
+                    if mem is None:
+                        return None
+                    vec = embeddings_cache.get_or_compute(mem.content)
+                    return np.asarray(vec)
+                except Exception:
+                    return None
+
+        embeddings_view = _EmbeddingsByMemoryId()
+
+        def _candidate_pool(_persona_dir, *, opened_at_iso: str):
+            return store.list_since_iso(opened_at_iso, include_fading=True)
+
+        def _salience(memory, *, ctx=None):
+            return forgetting_salience(
+                memory,
+                store=store,
+                hebbian=hebbian,
+                felt_time_state=felt_time_state,
+                soul_linked_ids=soul_linked,
+            )
+
+        def _is_exempt(memory):
+            return forgetting_is_exempt(
+                memory,
+                soul_crystallised_ids=crystallised_ids,
+                under_review_ids=under_review_ids,
+                now_lived_age_hours=felt_time_state.lived_age_hours,
+            )
+
+        narrative_memory_run_pass(
+            persona_dir,
+            event_bus=event_bus,
+            anchor_sweep=_adapt_anchors,
+            candidate_pool=_candidate_pool,
+            salience_score=_salience,
+            is_exempt=_is_exempt,
+            hebbian=hebbian,
+            embeddings=embeddings_view,
+            felt_time_state=felt_time_state,
+        )
 
 
 def _run_finalize_tick(

@@ -900,3 +900,32 @@ def test_double_fade_preserves_original_content_snapshot(caplog):
     assert row["content"] == "first summary"  # unchanged by the no-op second fade
     assert "already in fading state" in caplog.text.lower() or "noop" in caplog.text.lower()
     store.close()
+
+
+def test_list_since_iso_includes_fading_by_default():
+    """list_since_iso returns active + fading memories with created_at > cutoff."""
+    store = MemoryStore(":memory:")
+    a = Memory.create_new(content="A", memory_type="episodic", domain="chat", emotions={})
+    b = Memory.create_new(content="B", memory_type="episodic", domain="chat", emotions={})
+    store.create(a)
+    store.create(b)
+    store.fade(b.id, summary="B (summary)")
+    results = store.list_since_iso("2000-01-01T00:00:00+00:00")
+    assert len(results) == 2
+    states = {m.state for m in results}
+    assert "fading" in states
+    store.close()
+
+
+def test_list_since_iso_excludes_fading_when_disabled():
+    """include_fading=False filters out fading rows."""
+    store = MemoryStore(":memory:")
+    a = Memory.create_new(content="A", memory_type="episodic", domain="chat", emotions={})
+    b = Memory.create_new(content="B", memory_type="episodic", domain="chat", emotions={})
+    store.create(a)
+    store.create(b)
+    store.fade(b.id, summary="B (summary)")
+    results = store.list_since_iso("2000-01-01T00:00:00+00:00", include_fading=False)
+    assert len(results) == 1
+    assert results[0].state == "active"
+    store.close()
