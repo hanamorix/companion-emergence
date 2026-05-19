@@ -82,10 +82,20 @@ def _arc_to_dict(arc: Arc) -> dict[str, Any]:
             }
             for m in arc.members
         ],
+        "max_member_emotion_normalised": arc.max_member_emotion_normalised,
+        "dominant_non_grief_emotion": (
+            list(arc.dominant_non_grief_emotion)
+            if arc.dominant_non_grief_emotion is not None
+            else None
+        ),
     }
 
 
 def _arc_from_dict(d: dict[str, Any]) -> Arc:
+    raw_dom = d.get("dominant_non_grief_emotion")
+    dom: tuple[str, float] | None = None
+    if raw_dom and len(raw_dom) == 2:
+        dom = (str(raw_dom[0]), float(raw_dom[1]))
     return Arc(
         id=d["id"],
         state=d["state"],
@@ -107,6 +117,8 @@ def _arc_from_dict(d: dict[str, Any]) -> Arc:
             )
             for m in d.get("members", [])
         ),
+        max_member_emotion_normalised=float(d.get("max_member_emotion_normalised") or 0.0),
+        dominant_non_grief_emotion=dom,
     )
 
 
@@ -206,6 +218,8 @@ def _replay_from_log(log_path: Path) -> ArcsState:
                 closed_at_iso=None,
                 lived_age_at_close=None,
                 members=(),
+                max_member_emotion_normalised=0.0,
+                dominant_non_grief_emotion=None,
             )
         elif kind == "member_added" and isinstance(arc_id, str) and arc_id in state.open:
             arc = state.open[arc_id]
@@ -240,6 +254,8 @@ def _replay_from_log(log_path: Path) -> ArcsState:
                 closed_at_iso=event.get("ts_iso"),
                 lived_age_at_close=float(event.get("lived_age_hours", 0.0)),
                 members=arc.members,
+                max_member_emotion_normalised=arc.max_member_emotion_normalised,
+                dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
             )
             state.recently_closed.append(closed)
 
@@ -263,6 +279,8 @@ def _arc_with_member(arc: Arc, member: ArcMember, ts_iso: str) -> Arc:
         closed_at_iso=arc.closed_at_iso,
         lived_age_at_close=arc.lived_age_at_close,
         members=arc.members + (member,),
+        max_member_emotion_normalised=arc.max_member_emotion_normalised,
+        dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
     )
 
 
@@ -280,4 +298,6 @@ def _arc_replace_members(arc: Arc, members: tuple[ArcMember, ...]) -> Arc:
         closed_at_iso=arc.closed_at_iso,
         lived_age_at_close=arc.lived_age_at_close,
         members=members,
+        max_member_emotion_normalised=arc.max_member_emotion_normalised,
+        dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
     )

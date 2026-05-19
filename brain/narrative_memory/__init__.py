@@ -291,11 +291,25 @@ def run_pass(
         if reason is None:
             continue
 
+        # Lookup MemoryStore for grief computation
+        db_path = persona_dir / "memories.db"
+        store_for_grief = None
+        max_emotion, dominant = (0.0, None)
+        if db_path.exists():
+            from brain.memory.store import MemoryStore
+
+            store_for_grief = MemoryStore(db_path)
+            max_emotion, dominant = _compute_arc_close_emotion_inputs(
+                arc=arc, store=store_for_grief, persona_dir=persona_dir
+            )
+
         closed = _replace(
             arc,
             state="closed",
             closed_at_iso=_now_iso(),
             lived_age_at_close=lived_age_now,
+            max_member_emotion_normalised=max_emotion,
+            dominant_non_grief_emotion=dominant,
         )
         state.recently_closed.append(closed)
         del state.open[arc_id]
@@ -311,6 +325,17 @@ def run_pass(
             },
         )
         counts["closed"] += 1
+
+        # Fault-isolated grief write — after the state mutation + JSONL append.
+        try:
+            from brain import grief as _grief
+
+            if store_for_grief is not None:
+                _grief.handle_arc_close(
+                    arc=closed, persona_dir=persona_dir, store=store_for_grief
+                )
+        except Exception:
+            _LOG.exception("grief.handle_arc_close failed for arc_id=%s", arc_id)
 
     # Cap recently_closed
     if len(state.recently_closed) > RECENTLY_CLOSED_CAP:
@@ -336,6 +361,58 @@ def run_pass(
     return aggregate  # type: ignore[return-value]
 
 
+def _compute_arc_close_emotion_inputs(
+    *,
+    arc: Arc,
+    store: Any,
+    persona_dir: Path,
+) -> tuple[float, tuple[str, float] | None]:
+    """For each ArcMember, look up the live memory or graveyard entry, extract
+    max emotion, and return (max_normalised_emotion, dominant_non_grief_emotion).
+
+    Per spec §3 graveyard-proxy fallback: arcs whose members have largely been
+    forgotten still produce honest arc-close grief.
+    """
+    from brain.forgetting import graveyard as _grave
+
+    grave_entries = _grave.read_all(persona_dir)
+    grave_by_id = {e.get("memory_id"): e for e in grave_entries}
+
+    best_emotion_value = 0.0
+    best_named: tuple[str, float] | None = None
+    for member in arc.members:
+        live = store.get(member.memory_id)
+        if live is not None and live.emotions:
+            for name, val in live.emotions.items():
+                if name == "memory_grief":
+                    continue
+                v = float(val)
+                if v > best_emotion_value:
+                    best_emotion_value = v
+                    best_named = (name, v)
+            continue
+        entry = grave_by_id.get(member.memory_id)
+        if entry is None:
+            continue
+        inputs = entry.get("salience_inputs_at_drop") or {}
+        emotion_norm = float(inputs.get("emotion") or 0.0)
+        salience = float(entry.get("salience_at_drop") or 0.0)
+        # Graveyard proxy: emotion_norm × salience × 10 -> proxied 0-10 emotion value
+        proxy = emotion_norm * salience * 10.0
+        if proxy > best_emotion_value:
+            best_emotion_value = proxy
+            em_dict = entry.get("emotion_at_ingest") or {}
+            non_grief = [
+                (n, float(v))
+                for n, v in em_dict.items()
+                if n != "memory_grief" and float(v) > 0.0
+            ]
+            if non_grief:
+                best_named = max(non_grief, key=lambda kv: kv[1])
+
+    return (max(0.0, min(1.0, best_emotion_value / 10.0)), best_named)
+
+
 def _replace(arc: Arc, **changes: Any) -> Arc:
     """Frozen-Arc replace helper."""
     return Arc(
@@ -351,6 +428,12 @@ def _replace(arc: Arc, **changes: Any) -> Arc:
         closed_at_iso=changes.get("closed_at_iso", arc.closed_at_iso),
         lived_age_at_close=changes.get("lived_age_at_close", arc.lived_age_at_close),
         members=changes.get("members", arc.members),
+        max_member_emotion_normalised=changes.get(
+            "max_member_emotion_normalised", arc.max_member_emotion_normalised
+        ),
+        dominant_non_grief_emotion=changes.get(
+            "dominant_non_grief_emotion", arc.dominant_non_grief_emotion
+        ),
     )
 
 
