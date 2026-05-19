@@ -16,7 +16,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -525,15 +525,13 @@ class MemoryStore:
         sparse — linear filter cost is negligible. Avoids depending on SQLite
         json_extract. Spec §4 + §6.
         """
-        from datetime import UTC, datetime, timedelta
-
         cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             "SELECT metadata_json FROM memories "
             "WHERE memory_type = 'grief_event' AND created_at >= ?",
             (cutoff,),
-        ).fetchall()
-        for row in rows:
+        )
+        for row in cursor:
             meta = _safe_load_metadata(row["metadata_json"])
             if meta.get("grief_referent_id") == referent_id:
                 return True
