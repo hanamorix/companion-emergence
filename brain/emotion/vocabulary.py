@@ -1,6 +1,6 @@
 """Emotion vocabulary — the typed taxonomy + persona extension registry.
 
-Baseline: 21 emotions (11 core + 10 complex) shipped with the framework.
+Baseline: 26 emotions (11 core + 11 complex + 4 body) shipped with the framework.
 Personas extend via register() — typically via the persona-loader at
 engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
 The 5 emotions previously in `nell_specific` (body_grief, emergence,
@@ -64,7 +64,7 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("shame", "the weight of being wrong or insufficient", "core", 14.0),
     Emotion("tenderness", "soft protective caring, gentleness toward the fragile", "core", 7.0),
     Emotion("awe", "overwhelm at something greater than yourself", "core", 3.0),
-    # ── complex (10) ──
+    # ── complex (11) ──
     Emotion("nostalgia", "bittersweet memory of what was", "complex", 21.0),
     Emotion("jealousy", "the fear of being replaced or insufficient", "complex", 7.0),
     Emotion("guilt", "responsibility for harm, intended or not", "complex", 14.0),
