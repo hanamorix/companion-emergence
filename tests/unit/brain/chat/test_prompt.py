@@ -705,3 +705,110 @@ def test_recall_block_surfaces_lost_bucket_when_memory_in_graveyard(
     assert "recall" in msg
     assert "lost" in msg.lower()
     assert "forgotten" in msg.lower()
+
+
+# ── Current-arc ambient block (narrative_memory Phase 6) ─────────────────────
+
+
+def test_assembled_prompt_includes_current_arc_block(tmp_path: Path, monkeypatch):
+    """Ambient section includes 'arcs' block when narrative_memory state has open arcs."""
+    from brain.narrative_memory.arc import Arc, ArcMember
+    from brain.narrative_memory.state import ArcsState, save_state
+
+    save_state(
+        tmp_path,
+        ArcsState(
+            open={
+                "arc_1": Arc(
+                    id="arc_1",
+                    state="open",
+                    seed_anchor_type="dream",
+                    seed_anchor_ref="dream_evt_1",
+                    seed_memory_ids=("mem_seed",),
+                    title="the boat one",
+                    opened_at_iso="2026-05-19T10:00:00+00:00",
+                    lived_age_at_open=412.0,
+                    last_extended_at_iso="2026-05-19T11:00:00+00:00",
+                    closed_at_iso=None,
+                    lived_age_at_close=None,
+                    members=(
+                        ArcMember(
+                            memory_id="mem_seed",
+                            joined_at_iso="2026-05-19T10:00:00+00:00",
+                            lived_age_at_join=412.0,
+                            salience_at_join=0.7,
+                        ),
+                    ),
+                )
+            },
+            last_pass_ts_iso="2026-05-19T11:00:00+00:00",
+        ),
+    )
+    from brain.chat.prompt import _build_current_arc_block
+
+    block = _build_current_arc_block(tmp_path)
+    assert "the boat one" in block
+    assert "current:" in block
+
+
+def test_build_current_arc_block_swallows_errors(tmp_path: Path):
+    """_build_current_arc_block returns a string on any read failure (cold-start)."""
+    from brain.chat.prompt import _build_current_arc_block
+
+    # Cold-start behavior — bad dir's load_or_recover handles non-existent
+    # state.json + log gracefully and renders cold-start text. Confirm
+    # the helper doesn't raise.
+    bad = tmp_path / "nonexistent_dir_for_failure"
+    out = _build_current_arc_block(bad)
+    assert isinstance(out, str)
+
+
+def test_build_system_message_includes_current_arc_block_when_arc_open(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """The assembled system message surfaces the arcs ambient block when
+    narrative_memory state has at least one open arc."""
+    from brain.narrative_memory.arc import Arc, ArcMember
+    from brain.narrative_memory.state import ArcsState, save_state
+
+    save_state(
+        persona_dir,
+        ArcsState(
+            open={
+                "arc_1": Arc(
+                    id="arc_1",
+                    state="open",
+                    seed_anchor_type="dream",
+                    seed_anchor_ref="dream_evt_1",
+                    seed_memory_ids=("mem_seed",),
+                    title="the boat one",
+                    opened_at_iso="2026-05-19T10:00:00+00:00",
+                    lived_age_at_open=412.0,
+                    last_extended_at_iso="2026-05-19T11:00:00+00:00",
+                    closed_at_iso=None,
+                    lived_age_at_close=None,
+                    members=(
+                        ArcMember(
+                            memory_id="mem_seed",
+                            joined_at_iso="2026-05-19T10:00:00+00:00",
+                            lived_age_at_join=412.0,
+                            salience_at_join=0.7,
+                        ),
+                    ),
+                )
+            },
+            last_pass_ts_iso="2026-05-19T11:00:00+00:00",
+        ),
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "the boat one" in msg
+    assert "current:" in msg
