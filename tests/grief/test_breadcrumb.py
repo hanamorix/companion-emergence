@@ -155,11 +155,13 @@ def _make_dropped_memory(*, memory_id: str = "mem-drop", joy: float = 8.0) -> Me
 def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
     from brain import grief
     store = MemoryStore(tmp_path / "memories.db")
-    memory = _make_dropped_memory(memory_id="mem-drop-1", joy=8.0)
+    # joy=9.0 (raw), salience=0.7 -> normalised emotion 0.9 × 0.7 × 7.0 = 4.41 ≥ THRESHOLD.
+    # Residue: joy × RESIDUE_FACTOR = 9.0 × 0.5 = 4.5.
+    memory = _make_dropped_memory(memory_id="mem-drop-1", joy=9.0)
 
     grief.handle_drop(
         memory=memory,
-        salience_at_drop=0.5,
+        salience_at_drop=0.7,
         persona_dir=tmp_path,
         store=store,
     )
@@ -169,8 +171,8 @@ def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
     assert len(rows) == 1
     import json
     em = json.loads(rows[0]["emotions_json"])
-    assert em["memory_grief"] >= 3.0
-    assert em.get("joy", 0.0) == pytest.approx(4.0, abs=0.01)  # residue: 8.0 * 0.5
+    assert em["memory_grief"] == pytest.approx(4.41, abs=0.01)
+    assert em.get("joy", 0.0) == pytest.approx(4.5, abs=0.01)
     meta = json.loads(rows[0]["metadata_json"])
     assert meta["grief_referent_id"] == "mem-drop-1"
     assert meta["grief_subtype"] == "drop"

@@ -64,9 +64,8 @@ def handle_drop(
     it logs and returns.
     """
     try:
-        # emotions are stored on a 0-10 scale; pass raw value — compute_drop_intensity
-        # clamps its result to [0, 10], so out-of-range inputs are safe.
-        emotion_max = max(memory.emotions.values()) if memory.emotions else 0.0
+        emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0
+        emotion_max = max(0.0, min(1.0, emotion_max))
         intensity = breadcrumb.compute_drop_intensity(
             emotion_at_ingest_max=emotion_max, salience_at_drop=salience_at_drop
         )
