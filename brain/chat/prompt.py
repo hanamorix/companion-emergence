@@ -13,11 +13,14 @@ SoulStore and inject the top 5 most-recent as brief highlights.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
+
+log = logging.getLogger(__name__)
 
 # Direct-address framing — keeps the LLM speaking *to* the user rather than
 # narrating about them. OG source: nell_bridge.py:88-91.
@@ -717,22 +720,18 @@ def _build_current_arc_block(persona_dir: Path) -> str:
 
 
 def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
-    """Returns the forgetting ambient block, or "" on any read failure.
+    """Compact ambient block about loss + fading. Spec: 2026-05-19-grief-design.md §5.
 
-    Same fault-tolerance pattern as _build_felt_time_block. On success
-    returns either:
-      - "memory: nothing has softened lately."  (both counts zero)
-      - "memory: N softened (fading), M lost in the last 7 days."
-
-    Per spec §5 (forgetting design) — compact ≤120-token aggregate so Nell
-    can speak about the lived experience of recent loss.
+    Replaces the previous forgetting.prompt.render_fading_summary_block with
+    grief.prompt.render_grief_block — same call site, richer block.
     """
     try:
-        from brain.forgetting.prompt import render_fading_summary_block
+        from brain.grief.prompt import render_grief_block
 
-        return render_fading_summary_block(persona_dir, store)
-    except Exception:  # noqa: BLE001
-        return ""
+        return render_grief_block(persona_dir, store)
+    except Exception:
+        log.exception("grief.render_grief_block failed — falling back to silent block")
+        return "memory · loss: still."
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:

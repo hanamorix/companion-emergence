@@ -598,8 +598,12 @@ def test_build_system_message_includes_fading_summary_block_always(
     store: MemoryStore,
     soul_store: SoulStore,
 ) -> None:
-    """The fading-summary block is always present — 'nothing has softened lately'
-    on the empty path, actual counts when fading memories exist."""
+    """The fading-summary block is always present — grief block on the empty path,
+    actual counts when fading memories exist.
+
+    After Phase 8.1 the block reads 'memory · loss: still.' on the empty path
+    instead of 'memory: nothing has softened lately.'
+    """
     msg = build_system_message(
         persona_dir,
         voice_md="",
@@ -607,9 +611,8 @@ def test_build_system_message_includes_fading_summary_block_always(
         soul_store=soul_store,
         store=store,
     )
-    # On empty store the ambient line reads "memory: nothing has softened lately."
-    assert "memory:" in msg.lower()
-    assert "softened" in msg.lower()
+    # On empty store the ambient line reads "memory · loss: still."
+    assert "memory · loss:" in msg
 
 
 def test_build_system_message_fading_summary_reflects_fading_memories(
