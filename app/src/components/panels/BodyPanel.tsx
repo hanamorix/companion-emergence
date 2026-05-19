@@ -37,7 +37,7 @@ export function BodyPanel({ state }: Props) {
               ))}
             {Object.values(body.body_emotions).every((v) => v <= 0.4) && (
               <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-                Quiet.
+                Body quiet.
               </div>
             )}
           </div>
