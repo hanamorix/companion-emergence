@@ -456,6 +456,11 @@ def _build_recall_block(
 
     seen_active: set = set()
     seen_fading: set = set()
+    # seen_lost accumulates graveyard hit IDs for two purposes:
+    #   1. Dedup across per-token loop iterations (render path below).
+    #   2. Passed to handle_recall_touch as the grief accumulator (see the
+    #      fault-isolated block after this loop). Both paths read the same
+    #      set — no separate copy needed.
     seen_lost: set = set()
     active_hits: list = []
     fading_hits: list = []
@@ -483,7 +488,9 @@ def _build_recall_block(
     if not active_hits and not fading_hits and not lost_hits:
         return ""
 
-    # Fire recall-touch grief breadcrumbs for any graveyard hits, fault-isolated.
+    # Fire recall-touch grief breadcrumbs for any graveyard hits.
+    # handle_recall_touch is internally fault-isolated; this outer try
+    # guards only against import-time failures on brain.grief / brain.felt_time.
     if seen_lost:
         try:
             from brain.felt_time.state import load_or_recover as _load_felt
@@ -499,7 +506,7 @@ def _build_recall_block(
                 store=store,
                 lived_age_hours_now=felt_state.lived_age_hours,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             log.exception("grief.handle_recall_touch failed inside _build_recall_block")
 
     # Rank active + fading by importance desc, recency desc.
@@ -748,7 +755,7 @@ def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
         from brain.grief.prompt import render_grief_block
 
         return render_grief_block(persona_dir, store)
-    except Exception:
+    except Exception:  # noqa: BLE001
         log.exception("grief.render_grief_block failed — falling back to silent block")
         return "memory · loss: still."
 
