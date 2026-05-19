@@ -483,6 +483,25 @@ def _build_recall_block(
     if not active_hits and not fading_hits and not lost_hits:
         return ""
 
+    # Fire recall-touch grief breadcrumbs for any graveyard hits, fault-isolated.
+    if seen_lost:
+        try:
+            from brain.felt_time.state import load_or_recover as _load_felt
+            from brain.forgetting import graveyard as _grave
+            from brain.grief import handle_recall_touch
+
+            felt_state, _ = _load_felt(persona_dir)
+            grave_entries = _grave.read_all(persona_dir)
+            handle_recall_touch(
+                touched_ids=sorted(seen_lost),
+                graveyard_entries=grave_entries,
+                persona_dir=persona_dir,
+                store=store,
+                lived_age_hours_now=felt_state.lived_age_hours,
+            )
+        except Exception:
+            log.exception("grief.handle_recall_touch failed inside _build_recall_block")
+
     # Rank active + fading by importance desc, recency desc.
     def _sort_key(m):
         importance = float(getattr(m, "importance", 0) or 0)
