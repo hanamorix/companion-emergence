@@ -8,9 +8,29 @@ import signal
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
+
+
+@pytest.fixture(autouse=True)
+def _patch_os_kill():
+    """Block `brain.bridge.server.os.kill` for every test in this module.
+
+    The POST /supervisor/shutdown handler schedules an async task that, 100ms
+    after the response, calls `os.kill(os.getpid(), SIGTERM)`. Per-test
+    `with patch(...)` scopes exit when the test's `with TestClient(...)` block
+    exits — but the asyncio.create_task() fire-and-forget can still complete
+    *after* the patch is torn down, calling the real `os.kill` on the running
+    pytest process. On POSIX that signal is caught and ignored by pytest's
+    default handlers, so the next test runs fine. On Windows
+    `os.kill(pid, SIGTERM)` maps to TerminateProcess — pytest dies mid-test,
+    exit code 1, no FAILED traceback. Patching at module scope outlives the
+    deferred task and survives the platform difference.
+    """
+    with patch("brain.bridge.server.os.kill"):
+        yield
 
 
 def _make_client(persona_dir: Path) -> TestClient:
@@ -20,13 +40,12 @@ def _make_client(persona_dir: Path) -> TestClient:
 
 def test_post_supervisor_shutdown_returns_202_immediately(persona_dir: Path):
     """Endpoint returns 202 Accepted without blocking on the 30s drain."""
-    with patch("brain.bridge.server.os.kill"):
-        with _make_client(persona_dir) as c:
-            r = c.post("/supervisor/shutdown")
-            assert r.status_code == 202
-            body = r.json()
-            assert body["status"] == "shutting_down"
-            assert body["drain_seconds"] == 30
+    with _make_client(persona_dir) as c:
+        r = c.post("/supervisor/shutdown")
+        assert r.status_code == 202
+        body = r.json()
+        assert body["status"] == "shutting_down"
+        assert body["drain_seconds"] == 30
 
 
 def test_post_supervisor_shutdown_requires_auth(persona_dir: Path):
@@ -38,24 +57,21 @@ def test_post_supervisor_shutdown_requires_auth(persona_dir: Path):
     )
     with TestClient(app) as c:
         # No Authorization header → 401
-        with patch("brain.bridge.server.os.kill"):
-            r = c.post("/supervisor/shutdown")
+        r = c.post("/supervisor/shutdown")
         assert r.status_code == 401
 
         # Wrong token → 401
-        with patch("brain.bridge.server.os.kill"):
-            r = c.post(
-                "/supervisor/shutdown",
-                headers={"Authorization": "Bearer wrong-token"},
-            )
+        r = c.post(
+            "/supervisor/shutdown",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
         assert r.status_code == 401
 
-        # Correct token → 202
-        with patch("brain.bridge.server.os.kill"):
-            r = c.post(
-                "/supervisor/shutdown",
-                headers={"Authorization": "Bearer secret-token-for-test"},
-            )
+        # Correct token → 202 (autouse fixture has os.kill patched)
+        r = c.post(
+            "/supervisor/shutdown",
+            headers={"Authorization": "Bearer secret-token-for-test"},
+        )
         assert r.status_code == 202
 
 
