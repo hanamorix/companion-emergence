@@ -9,6 +9,8 @@ import { RestartBridgeButton } from "./RestartBridgeButton";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 
+const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
+
 interface Props {
   state: PersonaState | null;
   /** Active persona — needed by the supervisor install button. */
@@ -59,7 +61,15 @@ export function ConnectionPanel({
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
   const [upd, setUpd] = useState<UpdateStatus>({ kind: "idle" });
   const [shape, setShape] = useState<InstallShape | null>(null);
-  useEffect(() => { void detectInstallShape().then(setShape); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    void detectInstallShape().then((s) => {
+      if (!cancelled) setShape(s);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function checkForUpdates() {
     setUpd({ kind: "checking" });
@@ -329,7 +339,7 @@ function UpdateSection({
               Auto-update is only available for the AppImage build.
             </div>
             <a
-              href="https://github.com/hanamorix/companion-emergence/releases"
+              href={RELEASES_URL}
               target="_blank"
               rel="noopener noreferrer"
               style={{
