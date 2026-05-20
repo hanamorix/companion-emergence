@@ -122,9 +122,7 @@ def test_chat_with_mcp_tools_passes_dangerously_skip_permissions(tmp_path: Path)
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
 
-    with patch(
-        "brain.bridge.provider.subprocess.run", return_value=_run_returns_ok()
-    ) as run:
+    with patch("brain.bridge.provider.subprocess.run", return_value=_run_returns_ok()) as run:
         provider = ClaudeCliProvider(model="sonnet", timeout_seconds=5)
         provider.chat(
             [
