@@ -209,3 +209,18 @@ html[data-reduced-motion="true"] *::after {
   animation: none !important;
   transition: none !important;
 }
+
+/* Chat panel — vertical fill + responsive width */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+@media (min-width: 900px) {
+  .chat-panel {
+    max-width: 820px;
+    margin-inline: auto;
+  }
+}

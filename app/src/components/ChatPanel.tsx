@@ -674,11 +674,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   return (
     <div
+      className="chat-panel"
       style={{
-        display: "flex",
-        flexDirection: "column",
-        width: 290,
-        height: 380,
         position: "relative",
         outline: dragOver ? "2px dashed var(--accent)" : "none",
         outlineOffset: 4,
@@ -691,8 +688,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     >
       <div
         ref={scrollRef}
+        data-testid="chat-messages"
         style={{
-          flex: 1,
+          flex: "1 1 auto",
+          minHeight: "0",
           overflowY: "auto",
           padding: "0 2px",
           display: "flex",
@@ -790,6 +789,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       )}
       <div
         style={{
+          flexShrink: 0,
           marginTop: 10,
           display: "flex",
           gap: 6,
