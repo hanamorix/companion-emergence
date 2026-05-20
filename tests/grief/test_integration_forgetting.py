@@ -34,9 +34,7 @@ def _seed_memory(
     object.__setattr__(m, "id", id_)
     # Back-date created_at so the recent-buffer exemption does not protect this
     # memory from the forgetting pass.
-    object.__setattr__(
-        m, "created_at", datetime.now(UTC) - timedelta(days=last_accessed_days_ago)
-    )
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=last_accessed_days_ago))
     store.create(m)
     cutoff = (
         datetime.now(UTC).replace(microsecond=0) - timedelta(days=last_accessed_days_ago)

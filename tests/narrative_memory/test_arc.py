@@ -1,4 +1,5 @@
 """Arc + ArcMember dataclass shape tests."""
+
 from __future__ import annotations
 
 import dataclasses

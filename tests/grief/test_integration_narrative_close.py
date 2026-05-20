@@ -207,7 +207,8 @@ def test_arc_close_grieves_when_all_members_forgotten(tmp_path: Path) -> None:
         "SELECT content, emotions_json, metadata_json FROM memories WHERE memory_type='grief_event'"
     ).fetchall()
     arc_close_rows = [
-        r for r in all_grief_rows
+        r
+        for r in all_grief_rows
         if json.loads(r["metadata_json"]).get("grief_subtype") == "arc_close"
     ]
     # Expect ONE arc-close breadcrumb (not zero — the bug was that all-forgotten arcs never grieved)

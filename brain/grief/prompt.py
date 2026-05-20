@@ -29,7 +29,7 @@ def _strip_leading_article(text: str) -> str:
     lower = text.lower()
     for article in ("the ", "an ", "a "):
         if lower.startswith(article):
-            return text[len(article):]
+            return text[len(article) :]
     return text
 
 
@@ -87,9 +87,7 @@ def _arc_lived_days_since_close(
     return lived_hours / 24.0
 
 
-def pick_top_closed_arc(
-    *, arcs: list[dict], now_iso: str, lived_age_rate: float
-) -> dict | None:
+def pick_top_closed_arc(*, arcs: list[dict], now_iso: str, lived_age_rate: float) -> dict | None:
     """Pick the highest-ranked closed arc whose weight bucket is heavy or medium.
 
     Each arc dict must contain: id, title, closed_at_iso, max_member_emotion_normalised.
@@ -129,9 +127,7 @@ def _count_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-def _format_block(
-    *, memory_phrase: str | None, arc_phrase: str | None, coda: str
-) -> str:
+def _format_block(*, memory_phrase: str | None, arc_phrase: str | None, coda: str) -> str:
     parts: list[str] = []
     if memory_phrase:
         parts.append(memory_phrase)
@@ -172,15 +168,9 @@ def _format_block_with_budget(
 
     summary = memory_summary_first_4
     have_memory = (
-        summary is not None
-        and memory_lost_days_ago is not None
-        and memory_weight is not None
+        summary is not None and memory_lost_days_ago is not None and memory_weight is not None
     )
-    have_arc = (
-        arc_name is not None
-        and arc_closed_days_ago is not None
-        and arc_weight is not None
-    )
+    have_arc = arc_name is not None and arc_closed_days_ago is not None and arc_weight is not None
 
     mp = _memory_phrase(summary) if have_memory else None  # type: ignore[arg-type]
     ap = _arc_phrase() if have_arc else None
@@ -206,16 +196,13 @@ def _format_coda(*, fading_count: int, more_lost: int) -> str:
     if fading_count == 0 and more_lost == 0:
         return ""
     return (
-        f"{fading_count} have softened, "
-        f"{more_lost} more lost in the last {_LOST_WINDOW_DAYS} days."
+        f"{fading_count} have softened, {more_lost} more lost in the last {_LOST_WINDOW_DAYS} days."
     )
 
 
 def _count_fading(store: MemoryStore) -> int:
     """Count memories in state='fading'. Local equivalent of forgetting.prompt._count_fading."""
-    row = store._conn.execute(
-        "SELECT COUNT(*) FROM memories WHERE state = 'fading'"
-    ).fetchone()
+    row = store._conn.execute("SELECT COUNT(*) FROM memories WHERE state = 'fading'").fetchone()
     return int(row[0]) if row else 0
 
 
@@ -310,9 +297,7 @@ def render_grief_block(persona_dir: Path, store: MemoryStore) -> str:
     lost_days = None
     grave_weight = None
     if top_grave is not None:
-        summary_first_4 = breadcrumb.first_n_words(
-            top_grave.get("summary") or "", 4
-        )
+        summary_first_4 = breadcrumb.first_n_words(top_grave.get("summary") or "", 4)
         lost_days = int(
             max(
                 0.0,
@@ -323,9 +308,7 @@ def render_grief_block(persona_dir: Path, store: MemoryStore) -> str:
                 / 24.0,
             )
         )
-        em = float(
-            (top_grave.get("salience_inputs_at_drop") or {}).get("emotion") or 0.0
-        )
+        em = float((top_grave.get("salience_inputs_at_drop") or {}).get("emotion") or 0.0)
         grave_weight = weight_bucket(emotion_max_normalised=em)
 
     arc_name = None
@@ -341,9 +324,7 @@ def render_grief_block(persona_dir: Path, store: MemoryStore) -> str:
             )
         )
         arc_weight = weight_bucket(
-            emotion_max_normalised=float(
-                top_arc.get("max_member_emotion_normalised") or 0.0
-            )
+            emotion_max_normalised=float(top_arc.get("max_member_emotion_normalised") or 0.0)
         )
 
     return _format_block_with_budget(

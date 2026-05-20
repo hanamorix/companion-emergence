@@ -1,4 +1,5 @@
 """Membership test — hebbian path + embedding path + boundaries."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -86,7 +87,9 @@ def test_is_candidate_hebbian_path_above_threshold():
     hebbian = FakeHebbian(weights={("mem_c", "mem_b"): MEMBER_HEBBIAN_THRESHOLD})
     embeddings = FakeEmbeddings(vectors={})
     cache: dict[str, np.ndarray] = {}
-    result, via = is_candidate(candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache)
+    result, via = is_candidate(
+        candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache
+    )
     assert result is True
     assert via == "hebbian"
 
@@ -97,7 +100,9 @@ def test_is_candidate_hebbian_path_below_threshold():
     hebbian = FakeHebbian(weights={("mem_c", "mem_a"): MEMBER_HEBBIAN_THRESHOLD - 0.5})
     embeddings = FakeEmbeddings(vectors={})
     cache: dict[str, np.ndarray] = {}
-    result, via = is_candidate(candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache)
+    result, via = is_candidate(
+        candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache
+    )
     assert result is False
     assert via is None
 
@@ -110,7 +115,9 @@ def test_is_candidate_embedding_path_above_threshold():
     vec = np.array([1.0, 0.0, 0.0])
     embeddings = FakeEmbeddings(vectors={"mem_a": vec, "mem_c": vec})
     cache: dict[str, np.ndarray] = {}
-    result, via = is_candidate(candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache)
+    result, via = is_candidate(
+        candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache
+    )
     assert result is True
     assert via == "embedding"
 
@@ -124,7 +131,9 @@ def test_is_candidate_embedding_path_below_threshold():
         vectors={"mem_a": np.array([1.0, 0.0]), "mem_c": np.array([0.0, 1.0])}
     )
     cache: dict[str, np.ndarray] = {}
-    result, via = is_candidate(candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache)
+    result, via = is_candidate(
+        candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache
+    )
     assert result is False
     assert via is None
 
@@ -135,7 +144,9 @@ def test_is_candidate_both_paths_fail():
     hebbian = FakeHebbian(weights={})
     embeddings = FakeEmbeddings(vectors={})
     cache: dict[str, np.ndarray] = {}
-    result, via = is_candidate(candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache)
+    result, via = is_candidate(
+        candidate, arc, hebbian=hebbian, embeddings=embeddings, centroid_cache=cache
+    )
     assert result is False
     assert via is None
 

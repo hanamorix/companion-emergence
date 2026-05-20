@@ -7,6 +7,7 @@ Two files in <persona_dir>:
 Recovery model (spec §3): if state.json is corrupt or staler than the
 newest log event, replay arcs.log.jsonl from beginning to rebuild state.
 """
+
 from __future__ import annotations
 
 import json
@@ -135,6 +136,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
             fp.write(line)
             fp.flush()
             import os
+
             os.fsync(fp.fileno())
 
 

@@ -22,29 +22,21 @@ def test_touch_intensity_fresh_loss() -> None:
 
 
 def test_touch_intensity_recency_decay() -> None:
-    fresh = recall.compute_touch_intensity(
-        grave_emotion_max=1.0, lived_days_since_loss=0.0
-    )
-    aged = recall.compute_touch_intensity(
-        grave_emotion_max=1.0, lived_days_since_loss=14.0
-    )
+    fresh = recall.compute_touch_intensity(grave_emotion_max=1.0, lived_days_since_loss=0.0)
+    aged = recall.compute_touch_intensity(grave_emotion_max=1.0, lived_days_since_loss=14.0)
     assert aged == pytest.approx(fresh * 0.5, abs=0.01)
 
 
 def test_touch_intensity_clamped_at_10() -> None:
     # 3.0 emotion (out-of-range) × 5.0 × 1.0 = 15, clamped to 10
-    result = recall.compute_touch_intensity(
-        grave_emotion_max=3.0, lived_days_since_loss=0.0
-    )
+    result = recall.compute_touch_intensity(grave_emotion_max=3.0, lived_days_since_loss=0.0)
     assert result == 10.0
 
 
 def test_touch_intensity_old_loss_low() -> None:
     # 60 lived-days ago → recency 0.5^(60/14) ≈ 0.051
     # Full-score input g=0.9 produces raw ≈ 0.230 — well below 3.0 threshold.
-    result = recall.compute_touch_intensity(
-        grave_emotion_max=0.9, lived_days_since_loss=60.0
-    )
+    result = recall.compute_touch_intensity(grave_emotion_max=0.9, lived_days_since_loss=60.0)
     assert result < 0.3
 
 
@@ -171,9 +163,7 @@ def test_handle_recall_touch_ignores_untouched_entries(tmp_path: Path) -> None:
         store=store,
         lived_age_hours_now=24.0,
     )
-    rows = store._conn.execute(
-        "SELECT id FROM memories WHERE memory_type='grief_event'"
-    ).fetchall()
+    rows = store._conn.execute("SELECT id FROM memories WHERE memory_type='grief_event'").fetchall()
     assert len(rows) == 1
 
 
@@ -186,7 +176,5 @@ def test_handle_recall_touch_empty_graveyard_no_writes(tmp_path: Path) -> None:
         store=store,
         lived_age_hours_now=24.0,
     )
-    rows = store._conn.execute(
-        "SELECT id FROM memories WHERE memory_type='grief_event'"
-    ).fetchall()
+    rows = store._conn.execute("SELECT id FROM memories WHERE memory_type='grief_event'").fetchall()
     assert rows == []

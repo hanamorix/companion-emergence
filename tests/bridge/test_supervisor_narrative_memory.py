@@ -45,9 +45,7 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
             stop_event.set()
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _fake_forgetting)
-    monkeypatch.setattr(
-        "brain.bridge.supervisor._run_narrative_memory_pass", _fake_arc_update
-    )
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", _fake_arc_update)
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
@@ -86,13 +84,16 @@ def test_supervisor_arc_update_failure_is_isolated(
     def _exploding_arc_update(*args, **kwargs):
         raise RuntimeError("synthetic arc-update failure")
 
-    monkeypatch.setattr(
-        "brain.bridge.supervisor._run_narrative_memory_pass", _exploding_arc_update
-    )
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", _exploding_arc_update)
     monkeypatch.setattr(
         "brain.bridge.supervisor.forgetting_run_pass",
         lambda *a, **k: {
-            "faded": 0, "lost": 0, "total": 0, "exempt": 0, "unfaded": 0, "duration_ms": 0,
+            "faded": 0,
+            "lost": 0,
+            "total": 0,
+            "exempt": 0,
+            "unfaded": 0,
+            "duration_ms": 0,
         },
     )
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)

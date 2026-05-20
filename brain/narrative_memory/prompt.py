@@ -4,6 +4,7 @@ Spec §6. ≤80 token budget. Renders the most-recently-extended open arc
 as "current"; lists one-line digests of up to two other open arcs;
 overflow becomes `+ N more`.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -34,12 +35,12 @@ def render_current_arc_block(persona_dir: Path) -> str:
     others = sorted_arcs[1:]
 
     lines = ["arcs"]
-    lines.append(f"  current: \"{current.title}\" — {_describe_arc(current)}")
+    lines.append(f'  current: "{current.title}" — {_describe_arc(current)}')
 
     if others:
         shown = others[:_ALSO_OPEN_CAP]
         rest = others[_ALSO_OPEN_CAP:]
-        digests = ", ".join(f"\"{a.title}\" ({len(a.members)} memories)" for a in shown)
+        digests = ", ".join(f'"{a.title}" ({len(a.members)} memories)' for a in shown)
         suffix = f", + {len(rest)} more" if rest else ""
         lines.append(f"  also open: {digests}{suffix}")
 

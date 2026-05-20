@@ -2,6 +2,7 @@
 
 Per spec §3 — no I/O here. Serialisation lives in state.py.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

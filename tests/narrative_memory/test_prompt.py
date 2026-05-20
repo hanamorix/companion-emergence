@@ -1,4 +1,5 @@
 """Ambient narrative-arc block render."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -64,8 +65,18 @@ def test_render_single_arc(tmp_path: Path):
 def test_render_two_arcs_shows_also_open(tmp_path: Path):
     state = ArcsState(
         open={
-            "arc_1": _arc("arc_1", "the boat one", last_extended_iso="2026-05-19T11:00:00+00:00", member_count=8),
-            "arc_2": _arc("arc_2", "the kitchen one", last_extended_iso="2026-05-19T10:00:00+00:00", member_count=12),
+            "arc_1": _arc(
+                "arc_1",
+                "the boat one",
+                last_extended_iso="2026-05-19T11:00:00+00:00",
+                member_count=8,
+            ),
+            "arc_2": _arc(
+                "arc_2",
+                "the kitchen one",
+                last_extended_iso="2026-05-19T10:00:00+00:00",
+                member_count=12,
+            ),
         },
         last_pass_ts_iso="2026-05-19T11:00:00+00:00",
     )
