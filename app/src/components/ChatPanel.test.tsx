@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../bridge", () => ({
   newSession: vi.fn(async () => "test-session-id"),
   fetchActiveSession: vi.fn(async () => null),
+  fetchChatHistory: vi.fn(async () => ({ messages: [], next_before_turn: null })),
   closeSession: vi.fn(async () => undefined),
   uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
   getBridgeCredentials: vi.fn(async () => ({
@@ -215,7 +216,12 @@ describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
 
     await typeAndSend("nell");
 
-    expect(mockedFetchActive).toHaveBeenCalledTimes(1);
+    // Phase 3B (v0.0.15-alpha.2) mount-time hydration also probes
+    // /sessions/active so the chat panel can replay JSONL turns on
+    // reopen. Mount call → null (no active session) → no hydration,
+    // sessionRef stays null. Send call → null again → newSession.
+    // Net: fetchActiveSession is invoked twice, both with the persona.
+    expect(mockedFetchActive).toHaveBeenCalledTimes(2);
     expect(mockedNewSession).toHaveBeenCalledTimes(1);
     expect(mockedNewSession).toHaveBeenCalledWith("nell");
     const [, sessionId] = mockedStreamChat.mock.calls[0] as [
@@ -233,9 +239,10 @@ describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
 
     await typeAndSend("nell");
 
-    // fetchActiveSession was tried — the throw was swallowed by the
-    // try/catch in send(), not propagated to the user.
-    expect(mockedFetchActive).toHaveBeenCalledTimes(1);
+    // fetchActiveSession was tried — the throw was swallowed both at
+    // mount-time hydration (Phase 3B) and inside send(), not propagated
+    // to the user.
+    expect(mockedFetchActive).toHaveBeenCalledTimes(2);
     // We still landed on a fresh session via newSession.
     expect(mockedNewSession).toHaveBeenCalledTimes(1);
     const [, sessionId] = mockedStreamChat.mock.calls[0] as [

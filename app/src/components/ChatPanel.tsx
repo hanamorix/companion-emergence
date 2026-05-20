@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { closeSession, fetchActiveSession, getBridgeCredentials, newSession, uploadImage } from "../bridge";
+import { closeSession, fetchActiveSession, fetchChatHistory, getBridgeCredentials, newSession, uploadImage } from "../bridge";
 import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
 import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { streamChat } from "../streamChat";
@@ -185,6 +185,58 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       // the renderer doesn't keep blob bytes pinned across unmount.
       for (const url of trackedUrlsRef.current) URL.revokeObjectURL(url);
       trackedUrlsRef.current.clear();
+    };
+  }, [persona]);
+
+  // ── Mount-time history hydration (Phase 3B, v0.0.15-alpha.2) ──────────
+  // When the user reopens the app, the bridge's session JSONL is still on
+  // disk and /sessions/active will hand back the previous sid. Replay the
+  // turn log so the conversation doesn't appear to have evaporated. Lazy
+  // session creation (deferred until first send) stays the default when
+  // no active session exists — we don't eagerly mint an empty one.
+  //
+  // Race note: hydration only writes to setMessages BEFORE any send() can
+  // possibly have appended a new turn — sessionRef.current is null until
+  // the user types and clicks send, and we set it here before any visible
+  // affordance reveals the hydrated state. The cancelled guard ensures a
+  // late resolution after persona switch / unmount doesn't clobber the
+  // new panel's empty state.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let sid: string | null;
+      try {
+        sid = await fetchActiveSession(persona);
+      } catch {
+        // Bridge can't tell us — treat as fresh session, no hydration.
+        return;
+      }
+      if (cancelled || !sid) return;
+      sessionRef.current = sid;
+      try {
+        const { messages: history } = await fetchChatHistory(persona, sid, 200);
+        if (cancelled) return;
+        setMessages(
+          history.map((h) => ({
+            id: h.turn,
+            from: h.role === "assistant" ? "nell" : "hana",
+            text: h.content,
+            time: h.ts
+              ? new Date(h.ts).toLocaleTimeString("en", {
+                  hour: "numeric",
+                  minute: "2-digit",
+                })
+              : "",
+          })),
+        );
+      } catch {
+        // Non-fatal: empty messages array is the legitimate fresh-session
+        // UX. A bridge that briefly 5xxs on /chat/history just renders an
+        // empty panel; the next send still works.
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, [persona]);
 

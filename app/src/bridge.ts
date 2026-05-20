@@ -403,6 +403,57 @@ export async function invokeForceRestart(persona: string): Promise<void> {
   await invoke<void>("force_restart_bridge", { persona });
 }
 
+// ── Chat history hydration (v0.0.15-alpha.2 Phase 3B) ──────────────────
+
+/** One turn on the bridge's on-disk JSONL log, translated for the UI. */
+export interface ChatHistoryEntry {
+  /** "user" / "assistant" — the bridge maps speaker→role server-side. */
+  role: "user" | "assistant" | string;
+  /** Plain text body (the bridge stripped/translated "text" → "content"). */
+  content: string;
+  /** ISO-8601 timestamp when the turn was logged, or null on older entries
+   *  where the writer didn't record one. */
+  ts?: string | null;
+  /** 1-indexed turn number synthesized from the log's line order. */
+  turn: number;
+}
+
+export interface ChatHistoryResponse {
+  messages: ChatHistoryEntry[];
+  /** Pagination cursor for the next older page — null when no more turns. */
+  next_before_turn: number | null;
+}
+
+/**
+ * Fetch the on-disk turn history for a session so the chat panel can
+ * replay a reopened conversation. Missing-session responses come back
+ * with an empty messages array (the bridge returns 200, not 404), so
+ * callers only need to handle the empty-array case + non-2xx throws.
+ *
+ * ``beforeTurn`` is the pagination cursor: omit for the most recent
+ * page, pass ``next_before_turn`` from a previous response to walk
+ * back. ``limit`` caps the page size; the bridge clamps it to its own
+ * upper bound.
+ */
+export async function fetchChatHistory(
+  persona: string,
+  sessionId: string,
+  limit = 200,
+  beforeTurn?: number,
+): Promise<ChatHistoryResponse> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    limit: String(limit),
+  });
+  if (beforeTurn !== undefined) params.set("before_turn", String(beforeTurn));
+  const qs = params.toString();
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/chat/history?${qs}`, { headers: authOnlyHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/chat/history ${r.status}`);
+  return (await r.json()) as ChatHistoryResponse;
+}
+
 /** Lightweight /health probe used by the restart hook's poll loop. */
 export async function fetchHealth(persona: string): Promise<{ liveness: string }> {
   const r = await bridgeFetch(persona, (creds) =>
