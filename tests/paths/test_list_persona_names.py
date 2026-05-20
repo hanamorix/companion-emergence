@@ -1,6 +1,5 @@
 """list_persona_names() scans <home>/personas/ deterministically."""
 
-from pathlib import Path
 import pytest
 
 from brain.paths import list_persona_names

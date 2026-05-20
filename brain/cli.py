@@ -1945,8 +1945,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     status_sub.add_argument(
         "--persona",
-        default="nell",
-        help="Persona name to inspect. Defaults to nell.",
+        default=None,
+        help="Persona name to inspect. If omitted and exactly one is installed, that one is used.",
     )
     status_sub.set_defaults(func=_status_handler)
 
@@ -1957,7 +1957,11 @@ def _build_parser() -> argparse.ArgumentParser:
     memory_actions = memory_sub.add_subparsers(dest="action", required=True)
 
     memory_list = memory_actions.add_parser("list", help="List recent active memories.")
-    memory_list.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_list.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
     memory_list.add_argument(
         "--limit",
         type=_positive_int,
@@ -1968,7 +1972,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     memory_search = memory_actions.add_parser("search", help="Search active memories by text.")
     memory_search.add_argument("query", help="Non-empty text to search for.")
-    memory_search.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_search.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
     memory_search.add_argument(
         "--limit",
         type=_positive_int,
@@ -1979,7 +1987,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     memory_show = memory_actions.add_parser("show", help="Show one full memory by id.")
     memory_show.add_argument("memory_id", help="Memory UUID to inspect.")
-    memory_show.add_argument("--persona", default="nell", help="Persona name. Defaults to nell.")
+    memory_show.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
     memory_show.set_defaults(func=_memory_show_handler)
 
     _build_migrate_parser(subparsers)
@@ -2616,6 +2628,23 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 1
+    # Post-parse persona resolution: any subcommand that declared --persona with
+    # default=None will have args.persona == None when the user omits the flag.
+    # _resolve_persona_or_exit() handles the three cases: explicit arg (pass
+    # through), single installed persona (silent pick), zero/multi (exit with
+    # helpful message). Subcommands that use required=True on --persona are
+    # unaffected because argparse exits before we reach this point.
+    #
+    # `nell init` is excluded: it is the bootstrapping command that creates the
+    # first persona, so it may legitimately run with no personas installed. Its
+    # handler prompts interactively for the persona name when --persona is absent.
+    _persona_resolver_skip = {"init"}
+    if (
+        hasattr(args, "persona")
+        and args.persona is None
+        and args.command not in _persona_resolver_skip
+    ):
+        args.persona = _resolve_persona_or_exit(None)
     return args.func(args)
 
 
