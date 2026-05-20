@@ -203,12 +203,8 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     proc.stderr.read.return_value = ""
 
     # Override the idle-timeout knob to keep the test fast.
-    monkeypatch.setattr(
-        "brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True
-    )
-    monkeypatch.setattr(
-        "brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True
-    )
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
         events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
