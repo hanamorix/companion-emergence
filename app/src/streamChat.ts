@@ -47,15 +47,17 @@ export interface StreamChatOptions {
   openTimeoutMs?: number;
   /** Time after open to receive the first bridge frame. */
   firstFrameTimeoutMs?: number;
-  /** Overall stream budget. */
-  overallTimeoutMs?: number;
+  /** Per-frame idle budget. Resets on every server frame. */
+  idleTimeoutMs?: number;
 }
 
 const DEFAULT_OPEN_TIMEOUT_MS = 10_000;
 const DEFAULT_FIRST_FRAME_TIMEOUT_MS = 20_000;
-const DEFAULT_OVERALL_TIMEOUT_MS = 600_000;
-// Test-only seam — retired in Phase 6 when overall_timer becomes idle_timer.
-export const __DEFAULT_OVERALL_TIMEOUT_MS__ = DEFAULT_OVERALL_TIMEOUT_MS;
+// Idle-timer: resets on every server frame. Fires only when the WS goes truly
+// silent. Long-thinking Opus replies complete cleanly as long as reply_chunk
+// frames keep arriving from the streaming provider.
+const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
+export const __DEFAULT_IDLE_TIMEOUT_MS__ = DEFAULT_IDLE_TIMEOUT_MS;
 
 /**
  * Open a WS stream, send the message, and dispatch frames to the
@@ -77,11 +79,11 @@ export async function streamChat(
   let errorSent = false;
   let openTimer: ReturnType<typeof setTimeout> | null = null;
   let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
-  let overallTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   const openTimeoutMs = options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
   const firstFrameTimeoutMs = options.firstFrameTimeoutMs ?? DEFAULT_FIRST_FRAME_TIMEOUT_MS;
-  const overallTimeoutMs = options.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS;
+  const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 
   const clearTimer = (timer: ReturnType<typeof setTimeout> | null) => {
     if (timer !== null) clearTimeout(timer);
@@ -89,10 +91,14 @@ export async function streamChat(
   const clearTimers = () => {
     clearTimer(openTimer);
     clearTimer(firstFrameTimer);
-    clearTimer(overallTimer);
+    clearTimer(idleTimer);
     openTimer = null;
     firstFrameTimer = null;
-    overallTimer = null;
+    idleTimer = null;
+  };
+  const resetIdle = () => {
+    clearTimer(idleTimer);
+    idleTimer = setTimeout(() => fail("stream idle timeout"), idleTimeoutMs);
   };
 
   const fail = (message: string) => {
@@ -116,7 +122,6 @@ export async function streamChat(
     errorSent = false;
 
     openTimer = setTimeout(() => fail("websocket open timed out"), openTimeoutMs);
-    overallTimer = setTimeout(() => fail("stream timed out"), overallTimeoutMs);
 
     ws.addEventListener("open", () => {
       if (cancelled || !ws) return;
@@ -140,6 +145,7 @@ export async function streamChat(
       if (cancelled || completed) return;
       clearTimer(firstFrameTimer);
       firstFrameTimer = null;
+      resetIdle();
       let frame: { type: string; [key: string]: unknown };
       try {
         frame = JSON.parse(event.data as string);
