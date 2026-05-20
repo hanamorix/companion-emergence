@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState } from "../../bridge";
-import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../../platform";
+import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions, detectInstallShape } from "../../platform";
+import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { check } from "@tauri-apps/plugin-updater";
@@ -57,6 +58,8 @@ export function ConnectionPanel({
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
   const [upd, setUpd] = useState<UpdateStatus>({ kind: "idle" });
+  const [shape, setShape] = useState<InstallShape | null>(null);
+  useEffect(() => { void detectInstallShape().then(setShape); }, []);
 
   async function checkForUpdates() {
     setUpd({ kind: "checking" });
@@ -209,7 +212,7 @@ export function ConnectionPanel({
 
       <Divider />
       <SectionLabel>Updates</SectionLabel>
-      <UpdateSection upd={upd} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
+      <UpdateSection upd={upd} shape={shape} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
     </PanelShell>
   );
 }
@@ -220,10 +223,12 @@ export function ConnectionPanel({
 
 function UpdateSection({
   upd,
+  shape,
   onCheck,
   onDownload,
 }: {
   upd: UpdateStatus;
+  shape: InstallShape | null;
   onCheck: () => void;
   onDownload: (update: Update) => void;
 }) {
@@ -311,22 +316,48 @@ function UpdateSection({
         >
           v{upd.update.version} available. Current: v0.0.11.
         </div>
-        <button
-          onClick={() => onDownload(upd.update)}
-          style={{
-            width: "100%",
-            padding: "7px 10px",
-            fontSize: 11,
-            fontFamily: "var(--font-ui)",
-            background: "rgba(60, 130, 90, 0.15)",
-            color: "var(--text)",
-            border: "1px solid rgba(60, 130, 90, 0.45)",
-            borderRadius: 6,
-            cursor: "pointer",
-          }}
-        >
-          Download &amp; Install
-        </button>
+        {shape === "deb" ? (
+          <>
+            <div
+              style={{
+                fontSize: 11.5,
+                color: "var(--text-mute)",
+                marginBottom: 6,
+                lineHeight: 1.45,
+              }}
+            >
+              Auto-update is only available for the AppImage build.
+            </div>
+            <a
+              href="https://github.com/hanamorix/companion-emergence/releases"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                fontSize: 11,
+                color: "var(--accent)",
+              }}
+            >
+              Visit releases page
+            </a>
+          </>
+        ) : (
+          <button
+            onClick={() => onDownload(upd.update)}
+            style={{
+              width: "100%",
+              padding: "7px 10px",
+              fontSize: 11,
+              fontFamily: "var(--font-ui)",
+              background: "rgba(60, 130, 90, 0.15)",
+              color: "var(--text)",
+              border: "1px solid rgba(60, 130, 90, 0.45)",
+              borderRadius: 6,
+              cursor: "pointer",
+            }}
+          >
+            Download &amp; Install
+          </button>
+        )}
       </div>
     );
   }

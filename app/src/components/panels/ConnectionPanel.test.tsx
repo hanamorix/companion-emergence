@@ -25,6 +25,7 @@ vi.mock("../../platform", () => ({
   getClientPlatform: vi.fn(() => "macos"),
   platformLabel: (platform: string) => platform === "macos" ? "macOS" : platform === "windows" ? "Windows" : platform === "linux" ? "Linux" : "this platform",
   supportsMacOnlyInstallActions: (platform: string) => platform === "macos",
+  detectInstallShape: vi.fn(async () => "native"),
 }));
 
 const { check } = vi.hoisted(() => ({
@@ -39,7 +40,7 @@ vi.mock("@tauri-apps/plugin-updater", () => ({
 
 import { ConnectionPanel } from "./ConnectionPanel";
 import type { PersonaState } from "../../bridge";
-import { getClientPlatform } from "../../platform";
+import { getClientPlatform, detectInstallShape } from "../../platform";
 import type { Update } from "@tauri-apps/plugin-updater";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
@@ -262,5 +263,53 @@ describe("ConnectionPanel — UpdateSection (Phase 4)", () => {
     await waitFor(() => {
       expect(screen.getByText(/downloading update/i)).toBeInTheDocument();
     });
+  });
+});
+
+// ── Install-shape gating (Phase 2) ────────────────────────────────
+
+describe("ConnectionPanel — install shape gating (Phase 2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    vi.mocked(check).mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows release-page link instead of Download button when shape is deb", async () => {
+    vi.mocked(detectInstallShape).mockResolvedValue("deb");
+    vi.mocked(check).mockResolvedValue(fakeUpdate("0.0.15"));
+
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/0.0.15 available/i)).toBeInTheDocument();
+    });
+
+    // shape resolves after check — wait for the link to appear
+    await waitFor(() => {
+      expect(screen.getByRole("link", { name: /releases page/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("button", { name: /download/i })).not.toBeInTheDocument();
+  });
+
+  it("shows Download & Install button when shape is appimage", async () => {
+    vi.mocked(detectInstallShape).mockResolvedValue("appimage");
+    vi.mocked(check).mockResolvedValue(fakeUpdate("0.0.15"));
+
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/0.0.15 available/i)).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /download/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("link", { name: /releases page/i })).not.toBeInTheDocument();
   });
 });
