@@ -25,9 +25,7 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
     return max(lo, min(hi, x))
 
 
-def compute_drop_intensity(
-    *, emotion_at_ingest_max: float
-) -> float:
+def compute_drop_intensity(*, emotion_at_ingest_max: float) -> float:
     """Drop-time grief intensity per spec §3.
 
     Args:

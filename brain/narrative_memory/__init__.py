@@ -7,6 +7,7 @@ Inherits substrate from felt-time (FeltTimeState anchors + lived_age) and
 forgetting (policy.is_exempt + salience.score). See spec
 docs/superpowers/specs/2026-05-19-narrative-memory-design.md.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -234,7 +235,9 @@ def run_pass(
                 lived_age_at_join=lived_age_now if lived_age_now is not None else 0.0,
                 salience_at_join=sal,
             )
-            arc = _replace(arc, members=arc.members + (new_member,), last_extended_at_iso=_now_iso())
+            arc = _replace(
+                arc, members=arc.members + (new_member,), last_extended_at_iso=_now_iso()
+            )
             state.open[arc_id] = arc
             touched_arc_ids.add(arc_id)
             append_event(
@@ -308,7 +311,9 @@ def run_pass(
                                 graveyard_entries=grave_entries,
                                 persona_dir=persona_dir,
                                 store=store_for_grief,
-                                lived_age_hours_now=lived_age_now if lived_age_now is not None else 0.0,
+                                lived_age_hours_now=lived_age_now
+                                if lived_age_now is not None
+                                else 0.0,
                                 triggering_arc_id=arc_id,
                             )
                         except Exception:  # noqa: BLE001
@@ -332,7 +337,9 @@ def run_pass(
             elif arc_id in touched_arc_ids:
                 # Freshly opened/extended this pass — cannot be stale by definition.
                 reason = None
-            elif should_close(arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age):
+            elif should_close(
+                arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age
+            ):
                 reason = "stale_72h"
             if reason is None:
                 continue
@@ -463,9 +470,7 @@ def _compute_arc_close_emotion_inputs(
             best_emotion_value = proxy
             em_dict = entry.get("emotion_at_ingest") or {}
             non_grief = [
-                (n, float(v))
-                for n, v in em_dict.items()
-                if n != "memory_grief" and float(v) > 0.0
+                (n, float(v)) for n, v in em_dict.items() if n != "memory_grief" and float(v) > 0.0
             ]
             if non_grief:
                 best_named = max(non_grief, key=lambda kv: kv[1])

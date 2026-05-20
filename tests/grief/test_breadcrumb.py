@@ -157,6 +157,7 @@ def _make_dropped_memory(*, memory_id: str = "mem-drop", joy: float = 8.0) -> Me
 
 def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
     from brain import grief
+
     store = MemoryStore(tmp_path / "memories.db")
     # joy=9.0 (raw), normalised to 0.9, × 7.0 = 6.3 — above THRESHOLD (3.0).
     # Residue: joy × 0.5 = 4.5.
@@ -172,6 +173,7 @@ def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
     ).fetchall()
     assert len(rows) == 1
     import json
+
     em = json.loads(rows[0]["emotions_json"])
     assert em["memory_grief"] == pytest.approx(6.3, abs=0.01)
     assert em.get("joy", 0.0) == pytest.approx(4.5, abs=0.01)
@@ -182,18 +184,18 @@ def test_handle_drop_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
 
 def test_handle_drop_skips_below_threshold(tmp_path: Path) -> None:
     from brain import grief
+
     store = MemoryStore(tmp_path / "memories.db")
     # joy=2.0 (raw) -> normalised 0.2 -> intensity 0.2 × 7.0 = 1.4, below threshold.
     memory = _make_dropped_memory(memory_id="mem-drop-2", joy=2.0)
     grief.handle_drop(memory=memory, persona_dir=tmp_path, store=store)
-    rows = store._conn.execute(
-        "SELECT id FROM memories WHERE memory_type='grief_event'"
-    ).fetchall()
+    rows = store._conn.execute("SELECT id FROM memories WHERE memory_type='grief_event'").fetchall()
     assert rows == []
 
 
 def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> None:
     from brain import grief
+
     store = MemoryStore(tmp_path / "memories.db")
 
     class FakeArc:
@@ -208,11 +210,14 @@ def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> N
     ).fetchall()
     assert len(rows) == 1
     import json
+
     em = json.loads(rows[0]["emotions_json"])
     assert em["memory_grief"] >= 3.0
     assert em.get("sorrow", 0.0) == pytest.approx(3.75, abs=0.01)  # 7.5 * 0.5
     meta = json.loads(rows[0]["metadata_json"])
     assert meta["grief_referent_id"] == "arc-1"
     assert meta["grief_subtype"] == "arc_close"
-    content_str = rows[0]["content"] if isinstance(rows[0]["content"], str) else rows[0]["content"].decode()
+    content_str = (
+        rows[0]["content"] if isinstance(rows[0]["content"], str) else rows[0]["content"].decode()
+    )
     assert "first cold week" in content_str

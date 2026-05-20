@@ -117,8 +117,7 @@ def handle_recall_touch(
         emotion_at_ingest = entry.get("emotion_at_ingest") or {}
         if emotion_at_ingest:
             raw_emotion_max = max(
-                float(v) for v in emotion_at_ingest.values()
-                if isinstance(v, (int, float))
+                float(v) for v in emotion_at_ingest.values() if isinstance(v, (int, float))
             )
         else:
             raw_emotion_max = 0.0

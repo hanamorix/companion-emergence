@@ -537,9 +537,7 @@ class MemoryStore:
                 return True
         return False
 
-    def list_since_iso(
-        self, opened_at_iso: str, *, include_fading: bool = True
-    ) -> list[Memory]:
+    def list_since_iso(self, opened_at_iso: str, *, include_fading: bool = True) -> list[Memory]:
         """Return memories with created_at > opened_at_iso, ordered ascending.
 
         Used by narrative_memory ArcUpdatePass to draw the candidate pool —

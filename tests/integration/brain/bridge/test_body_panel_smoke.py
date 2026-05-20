@@ -12,6 +12,7 @@ The BodyPanel.tsx then:
 This file walks three scenarios and asserts the dict shape the UI would see.
 Run with ``-s -v`` to see the human-readable transition demo printed.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -116,10 +117,7 @@ def test_multi_bar_arousal_desire_touch_hunger(persona_dir, capsys):
     ui = _ui_render(body_emotions)
 
     with capsys.disabled():
-        print(
-            f"\n[scenario 3: arousal=7, desire=6, touch_hunger=5] "
-            f"body_emotions={body_emotions}"
-        )
+        print(f"\n[scenario 3: arousal=7, desire=6, touch_hunger=5] body_emotions={body_emotions}")
         print(f"  UI renders: {ui!r}")
 
     assert body_emotions["arousal"] == pytest.approx(7.0)

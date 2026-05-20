@@ -880,6 +880,8 @@ def test_build_emotion_summary_survives_heartbeat_flood(store: MemoryStore) -> N
     summary = _build_emotion_summary(store)
     # Before fix: returns "" because heartbeats fill the LIMIT 50.
     # After fix: returns "love:8.5, tenderness:6.2, awe:5.0".
-    assert "love" in summary, f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
+    assert "love" in summary, (
+        f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
+    )
     assert "tenderness" in summary
     assert "awe" in summary
