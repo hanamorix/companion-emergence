@@ -94,6 +94,31 @@ def get_persona_dir(name: str) -> Path:
     return get_home() / "personas" / name
 
 
+def list_persona_names() -> list[str]:
+    """Return the sorted list of valid persona names installed under
+    <home>/personas/.
+
+    A name is "valid" iff:
+      - the entry is a directory
+      - the entry's basename matches the persona-name grammar
+        ([A-Za-z0-9_-]{1,40})
+
+    Missing personas/ root returns [] rather than raising.
+    """
+    root = get_home() / "personas"
+    if not root.is_dir():
+        return []
+    names: list[str] = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        if not _PERSONA_NAME_RE.fullmatch(entry.name):
+            continue
+        names.append(entry.name)
+    names.sort()
+    return names
+
+
 def get_cache_dir() -> Path:
     """Return the cache directory (embeddings, computed matrices, etc).
 
