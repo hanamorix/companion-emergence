@@ -521,6 +521,14 @@ class ChatHistoryEntry(BaseModel):
 
 
 class ChatHistoryResponse(BaseModel):
+    """Wire response for GET /chat/history.
+
+    ``messages`` is the tail of the surviving (post-corrupt-skip) turns,
+    most recent ``limit`` items, ascending by ``turn``. ``next_before_turn``
+    is the cursor for fetching the older page — ``None`` when there's no
+    older page to fetch.
+    """
+
     messages: list[ChatHistoryEntry]
     next_before_turn: int | None
 
@@ -1471,8 +1479,10 @@ def build_app(
         # the reader, so ``idx`` advances over surviving lines only —
         # paging stays stable as long as the file isn't rewritten.
         for idx, raw in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
+            # ``idx`` is monotonic — once it crosses the cursor we're done
+            # reading; ``break`` avoids paying O(buffer size) per page.
             if before_turn is not None and idx >= before_turn:
-                continue
+                break
             entries.append(
                 ChatHistoryEntry(
                     role=str(raw.get("speaker", "user")),
