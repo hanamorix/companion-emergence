@@ -54,6 +54,7 @@ export interface StreamChatOptions {
 const DEFAULT_OPEN_TIMEOUT_MS = 10_000;
 const DEFAULT_FIRST_FRAME_TIMEOUT_MS = 20_000;
 const DEFAULT_OVERALL_TIMEOUT_MS = 600_000;
+// Test-only seam — retired in Phase 6 when overall_timer becomes idle_timer.
 export const __DEFAULT_OVERALL_TIMEOUT_MS__ = DEFAULT_OVERALL_TIMEOUT_MS;
 
 /**
