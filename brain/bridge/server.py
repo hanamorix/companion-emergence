@@ -54,6 +54,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
+from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -501,6 +502,34 @@ class ChatReq(BaseModel):
 
 class CloseReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+
+
+class ChatHistoryEntry(BaseModel):
+    """One turn surfaced to the renderer.
+
+    Renames the on-disk schema (``speaker``/``text``/``ts``) to the
+    renderer-friendly ``role``/``content``/``ts``. ``turn`` is a 1-based
+    line index synthesised by the endpoint — the buffer JSONL doesn't
+    store turn numbers, but the client needs a stable cursor for
+    pagination via ``before_turn``.
+    """
+
+    role: str
+    content: str
+    ts: str | None = None
+    turn: int
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: list[ChatHistoryEntry]
+    next_before_turn: int | None
+
+
+# Buffer session_id grammar — matches brain.ingest.buffer._SESSION_ID_RE
+# so /chat/history can serve any legitimately written session file (UUIDs
+# from the bridge plus the ``sess_<8hex>`` fallback). Stricter than
+# ChatReq (which requires UUIDs) but still rejects path traversal.
+_BUFFER_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +1429,64 @@ def build_app(
         except (ValueError, FileNotFoundError):
             raise HTTPException(status_code=404, detail="image not found") from None
         return Response(content=data, media_type=media_type)
+
+    # ── GET /chat/history — buffer-backed hydration for the renderer ───────
+    @app.get(
+        "/chat/history",
+        response_model=ChatHistoryResponse,
+        dependencies=[Depends(require_http_auth)],
+    )
+    async def chat_history(
+        session_id: str,
+        limit: int = 200,
+        before_turn: int | None = None,
+    ) -> ChatHistoryResponse:
+        """Return buffered turns for a session, paginated newest-tail-first.
+
+        Reads ``<persona>/active_conversations/<session_id>.jsonl`` line
+        by line through the canonical
+        :func:`iter_jsonl_skipping_corrupt`, then yields the latest
+        ``limit`` turns whose ``turn`` index is strictly less than
+        ``before_turn`` (when supplied). ``turn`` is the 1-based line
+        index — synthetic, since the buffer doesn't store it on disk —
+        which gives the client a stable cursor for paging older history.
+
+        Missing buffer file → ``messages=[], next_before_turn=None``
+        (the renderer treats that as "fresh session"). Corrupt lines are
+        silently skipped (logged at warning by the reader).
+        """
+        if not _BUFFER_SESSION_ID_RE.fullmatch(session_id):
+            raise HTTPException(status_code=400, detail="invalid_session_id")
+        # Clamp limit defensively — a renderer with a bug shouldn't be
+        # able to materialise a 50k-turn buffer into a single response.
+        limit = max(1, min(int(limit), 1000))
+
+        s: BridgeAppState = app.state.bridge
+        path = s.persona_dir / "active_conversations" / f"{session_id}.jsonl"
+        if not path.exists():
+            return ChatHistoryResponse(messages=[], next_before_turn=None)
+
+        entries: list[ChatHistoryEntry] = []
+        # 1-based line index = turn cursor. Corrupt lines are dropped by
+        # the reader, so ``idx`` advances over surviving lines only —
+        # paging stays stable as long as the file isn't rewritten.
+        for idx, raw in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
+            if before_turn is not None and idx >= before_turn:
+                continue
+            entries.append(
+                ChatHistoryEntry(
+                    role=str(raw.get("speaker", "user")),
+                    content=str(raw.get("text", "")),
+                    ts=raw.get("ts"),
+                    turn=idx,
+                )
+            )
+
+        # Tail — most recent ``limit`` turns. Renderer paints them in the
+        # order returned; older pages come back via ``before_turn``.
+        trimmed = entries[-limit:]
+        next_cursor = trimmed[0].turn if trimmed and len(entries) > len(trimmed) else None
+        return ChatHistoryResponse(messages=trimmed, next_before_turn=next_cursor)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
