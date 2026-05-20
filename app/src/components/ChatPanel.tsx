@@ -16,6 +16,17 @@ async function tryInvoke(cmd: string, args: Record<string, unknown>): Promise<vo
   }
 }
 
+// v0.0.15-alpha.2 Phase 4 — defensive empty-error fallback.
+//
+// A Linux user reported "(Nell couldn't answer — see the error below.)"
+// rendering with no error text underneath. streamChat's onError can
+// fire with "" or a stringified Error with no message, and the raw
+// setError("") leaves the error banner blank. setErrorSafe (below)
+// substitutes a fixed copy pointing the user at the bridge restart
+// button in Connection.
+const EMPTY_ERROR_FALLBACK =
+  "The bridge couldn't respond. The supervisor may have stalled — try the bridge restart button in Connection, or close and reopen the app.";
+
 interface Message {
   id: number;
   from: "hana" | "nell";
@@ -123,6 +134,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Phase 4 (v0.0.15-alpha.2): map empty/whitespace-only strings to a
+  // fixed user-facing copy so the error banner never renders blank
+  // beneath the "see the error below" failure marker.
+  const setErrorSafe = (msg: string | null) => {
+    if (msg === null) {
+      setError(null);
+      return;
+    }
+    const trimmed = msg.trim();
+    setError(trimmed.length > 0 ? trimmed : EMPTY_ERROR_FALLBACK);
+  };
   const [memorySaveWarning, setMemorySaveWarning] = useState<string | null>(null);
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -348,14 +370,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   async function handleFile(file: File) {
     if (!file.type.startsWith("image/")) {
-      setError(`Unsupported file type: ${file.type}.`);
+      setErrorSafe(`Unsupported file type: ${file.type}.`);
       return;
     }
     if (file.size > MAX_BYTES) {
-      setError(`Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB).`);
+      setErrorSafe(`Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB).`);
       return;
     }
-    setError(null);
+    setErrorSafe(null);
     const previewUrl = URL.createObjectURL(file);
     // F-007 (v0.0.7 audit, polish): track the preview URL the moment it's
     // created — not when the message is sent. If the user stages an image
@@ -436,7 +458,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
-          setError(`Bridge unreachable: ${(e as Error).message}`);
+          setErrorSafe(`Bridge unreachable: ${(e as Error).message}`);
           return;
         }
       }
@@ -479,7 +501,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       setActiveReplyTarget(null);
     }
     setStreaming(true);
-    setError(null);
+    setErrorSafe(null);
     setMemorySaveWarning(null);
 
     // Wraps the streamChat call so we can rerun it with a fresh
@@ -528,7 +550,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
                   sessionRef.current = fresh;
                   await runStream(fresh, /* isRetry */ true);
                 } catch (e) {
-                  setError(`Bridge unreachable: ${(e as Error).message}`);
+                  setErrorSafe(`Bridge unreachable: ${(e as Error).message}`);
                   setStreaming(false);
                   setMessages((m) =>
                     m.map((b) =>
@@ -546,7 +568,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
               })();
               return;
             }
-            setError(msg);
+            setErrorSafe(msg);
             setStreaming(false);
             cancelRef.current = null;
             // Audit 2026-05-07 P2-10: replace the empty streaming
@@ -581,7 +603,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     try {
       await runStream(sessionId, /* isRetry */ false);
     } catch (e) {
-      setError((e as Error).message);
+      setErrorSafe((e as Error).message);
       setStreaming(false);
       // Same defense for synchronous failures before streamChat returns.
       setMessages((m) =>
