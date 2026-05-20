@@ -21,10 +21,12 @@ import hashlib
 import json
 import logging
 import os
+import queue as _queue_mod
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -36,8 +38,12 @@ import httpx
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
+    ChatStreamEvent,
     ImageBlock,
+    StreamDone,
+    StreamError,
     TextBlock,
+    TextDelta,
     ToolCall,
 )
 
@@ -45,6 +51,24 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300
 _PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
+
+# Per-event idle budget for chat_stream. If no stdout line arrives within
+# this many seconds, the subprocess is treated as wedged: it gets terminated
+# and the stream yields StreamError(stage="claude_cli_idle_timeout"). This
+# is deliberately not bounded by total wall-clock duration — long Opus
+# thinking is a feature, not a bug.
+_STREAM_PER_EVENT_IDLE_SECONDS: float = 60.0
+
+# First-event budget. Wider than the per-event budget because Opus can
+# spend significant time in extended thinking before emitting any
+# stream_event frames. Also bounds the initial subprocess spawn +
+# system-prompt-file write + MCP server boot.
+_STREAM_FIRST_EVENT_SECONDS: float = 120.0
+
+# A sentinel object pushed onto the stdout queue by the reader thread
+# when the subprocess closes its stdout (normal exit, error, etc.). Lets
+# the main generator distinguish "reader hit EOF" from a real line.
+_STREAM_EOF = object()
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +484,242 @@ class ClaudeCliProvider(LLMProvider):
             tool_calls=(),
             raw=None,
         )
+
+    def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> Iterator[ChatStreamEvent]:
+        """Yield ChatStreamEvent values as the claude subprocess streams.
+
+        Per-event idle timeout: _STREAM_PER_EVENT_IDLE_SECONDS (60s default).
+        First-event timeout: _STREAM_FIRST_EVENT_SECONDS (120s default).
+        Both can be monkeypatched in tests for fast verification.
+
+        Yields:
+          TextDelta    — one per streamed text chunk
+          StreamDone   — when the result frame arrives (or EOF)
+          StreamError  — on timeout, non-zero exit, or spawn failure
+
+        Note: images are not supported; pass image-bearing turns through
+        chat() which routes to _chat_with_images.
+        """
+        system_prompt: str | None = None
+        conversation_messages: list[ChatMessage] = []
+        for msg in messages:
+            if msg.role == "system" and system_prompt is None:
+                system_prompt = msg.content_text()
+            else:
+                conversation_messages.append(msg)
+
+        flat_prompt = _format_claude_print_prompt(conversation_messages)
+
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            self._model,
+        ]
+
+        # MCP tools path — write a temp config and extend argv.
+        tmp_mcp_path: str | None = None
+        if tools:
+            persona_dir_str = (options or {}).get("persona_dir")
+            if not persona_dir_str:
+                yield StreamError(
+                    stage="mcp_unavailable",
+                    detail="tool-calling via MCP requires options['persona_dir']",
+                )
+                return
+            persona_dir_path = Path(persona_dir_str)
+            try:
+                from brain.tools import NELL_TOOL_NAMES  # local import avoids circular
+            except ImportError as exc:
+                yield StreamError(
+                    stage="mcp_unavailable",
+                    detail=f"brain.tools not importable: {exc}",
+                )
+                return
+            allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
+            config = {
+                "mcpServers": {
+                    "brain-tools": {
+                        "command": sys.executable,
+                        "args": [
+                            "-m",
+                            "brain.mcp_server",
+                            "--persona-dir",
+                            str(persona_dir_path),
+                        ],
+                    }
+                }
+            }
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".json",
+                    delete=False,
+                    encoding="utf-8",
+                ) as tmp:
+                    json.dump(config, tmp)
+                    tmp_mcp_path = tmp.name
+            except OSError as exc:
+                yield StreamError(
+                    stage="claude_cli_setup",
+                    detail=f"failed to write temp mcp.json: {exc}",
+                )
+                return
+            cmd.extend(["--mcp-config", tmp_mcp_path])
+            cmd.extend(["--allowedTools", *allowed_mcp])
+
+        try:
+            yield from self._run_chat_stream(
+                cmd=cmd,
+                flat_prompt=flat_prompt,
+                system_prompt=system_prompt,
+            )
+        finally:
+            if tmp_mcp_path is not None:
+                try:
+                    os.unlink(tmp_mcp_path)
+                except OSError:
+                    pass
+
+    def _run_chat_stream(
+        self,
+        cmd: list[str],
+        flat_prompt: str,
+        system_prompt: str | None,
+    ) -> Iterator[ChatStreamEvent]:
+        """Core Popen + queue-based streaming loop.
+
+        Separated from chat_stream() so the generator's finally-block can
+        clean up the MCP tempfile after the inner generator is exhausted
+        (you can't have both yield and return in the same try/finally when
+        the outer try manages non-generator resources).
+        """
+        q: _queue_mod.Queue[str | object] = _queue_mod.Queue()
+
+        with _system_prompt_tempfile(system_prompt) as sp_path:
+            if sp_path is not None:
+                cmd = list(cmd) + ["--system-prompt-file", sp_path]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError as exc:
+                yield StreamError(stage="claude_cli_spawn", detail=str(exc))
+                return
+
+            # Reader thread: drains stdout onto the queue; signals EOF with sentinel.
+            def _reader(stdout=proc.stdout, out_q=q) -> None:  # type: ignore[assignment]
+                try:
+                    for line in stdout:
+                        out_q.put(line)
+                finally:
+                    out_q.put(_STREAM_EOF)
+
+            reader = threading.Thread(target=_reader, daemon=True)
+            reader.start()
+
+            # Send prompt via stdin then close so the subprocess can start.
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(flat_prompt)
+                proc.stdin.close()
+            except OSError:
+                pass
+
+            delta_chunks: list[str] = []
+            assistant_snapshot: str | None = None
+            done_emitted = False
+            timeout = _STREAM_FIRST_EVENT_SECONDS
+
+            try:
+                while True:
+                    try:
+                        item = q.get(timeout=timeout)
+                    except _queue_mod.Empty:
+                        proc.terminate()
+                        yield StreamError(
+                            stage="claude_cli_idle_timeout",
+                            detail=f"no stdout line after {timeout:.1f}s",
+                        )
+                        return
+
+                    if item is _STREAM_EOF:
+                        break
+
+                    timeout = _STREAM_PER_EVENT_IDLE_SECONDS
+
+                    line = str(item).strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    t = obj.get("type")
+                    if t == "stream_event":
+                        event = obj.get("event", {})
+                        if event.get("type") == "content_block_delta":
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = str(delta.get("text", ""))
+                                delta_chunks.append(text)
+                                yield TextDelta(text=text)
+                    elif t == "assistant":
+                        # Snapshot frame — fallback content when result frame absent.
+                        msg_content = obj.get("message", {}).get("content", [])
+                        if isinstance(msg_content, list):
+                            parts = [
+                                blk.get("text", "")
+                                for blk in msg_content
+                                if isinstance(blk, dict) and blk.get("type") == "text"
+                            ]
+                            assistant_snapshot = "".join(parts)
+                    elif t == "result":
+                        result_text = str(obj.get("result", ""))
+                        metadata: dict[str, Any] = {
+                            k: obj[k]
+                            for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
+                            if k in obj
+                        }
+                        yield StreamDone(content=result_text, metadata=metadata)
+                        done_emitted = True
+
+                # EOF: emit terminal event if result frame never arrived.
+                if not done_emitted:
+                    rc = proc.wait()
+                    if rc != 0:
+                        stderr_text = proc.stderr.read() if proc.stderr else ""
+                        yield StreamError(
+                            stage="claude_cli_exit",
+                            detail=f"exit {rc}: {stderr_text[:200]}",
+                        )
+                    else:
+                        content = "".join(delta_chunks) or (assistant_snapshot or "")
+                        yield StreamDone(content=content, metadata={})
+
+            except GeneratorExit:
+                proc.terminate()
+                raise
+            finally:
+                reader.join(timeout=5)
 
     def _chat_with_images(
         self,
