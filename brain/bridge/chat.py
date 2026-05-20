@@ -229,6 +229,71 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class TextDelta:
+    """Incremental text fragment from a streaming provider.
+
+    Emitted as the underlying LLM produces tokens. Joining the ``text``
+    of every TextDelta in order reproduces the assistant's prose reply.
+    Thinking deltas are NOT surfaced as TextDelta — only user-visible
+    text output.
+    """
+
+    text: str = ""
+    kind: Literal["text_delta"] = field(default="text_delta", init=False)
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    """A tool invocation surfaced by the provider mid-stream.
+
+    Most Claude CLI tool calls are dispatched inside the subprocess
+    and surface via ``ChatResponse.dispatched_invocations`` after the
+    stream completes; this event type is reserved for providers (or
+    future Claude CLI versions) that expose tool calls in-line as
+    they happen.
+    """
+
+    name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    kind: Literal["tool_call"] = field(default="tool_call", init=False)
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """Terminal event marking a successful stream completion.
+
+    ``content`` is the canonical final text (preferred over concatenating
+    deltas — Claude's ``result`` frame is authoritative). ``metadata``
+    carries provider-native bookkeeping such as ``duration_ms``,
+    ``num_turns``, ``stop_reason``, ``total_cost_usd``.
+    """
+
+    content: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    kind: Literal["done"] = field(default="done", init=False)
+
+
+@dataclass(frozen=True)
+class StreamError:
+    """Terminal event marking a stream failure.
+
+    ``stage`` is the same short tag used by ProviderError (e.g.
+    ``claude_cli_timeout``, ``claude_cli_idle_timeout``,
+    ``claude_cli_exit``, ``claude_cli_parse``). ``detail`` is the
+    human-readable explanation. Callers that drain a stream into a
+    blocking response (see ClaudeCliProvider.chat) should raise
+    ProviderError(stage, detail) on receipt.
+    """
+
+    stage: str = ""
+    detail: str = ""
+    kind: Literal["error"] = field(default="error", init=False)
+
+
+ChatStreamEvent = TextDelta | ToolCallEvent | StreamDone | StreamError
+
+
+@dataclass(frozen=True)
 class ChatResponse:
     """Full response from a multi-turn chat call.
 
