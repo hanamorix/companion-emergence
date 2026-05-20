@@ -16,6 +16,8 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+mod install_shape;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeCredentials {
     pub port: u16,
@@ -920,6 +922,18 @@ async fn check_claude_cli() -> Result<ClaudeCliCheck, String> {
     })
 }
 
+/// Expose install-shape detection to the frontend.
+///
+/// Returns a string matching one of the InstallShape variants:
+///   "appimage" | "deb" | "native" | "unknown"
+///
+/// Not cfg-gated — install_shape::detect() has its own platform
+/// branches internally. One command definition, all build targets.
+#[tauri::command]
+fn detect_install_shape() -> String {
+    install_shape::detect().as_str().to_string()
+}
+
 /// Apply the always-on-top toggle to the main window. Hits the Tauri
 /// Manager API directly — the previous implementation only persisted
 /// the bool to app_config.json without ever calling the window API,
@@ -978,6 +992,7 @@ pub fn run() {
             install_supervisor_service,
             install_nell_cli_symlink,
             check_claude_cli,
+            detect_install_shape,
             set_always_on_top,
             show_initiate_notification,
         ])
