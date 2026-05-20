@@ -46,8 +46,15 @@ from fastapi import (
 from pydantic import BaseModel, Field, field_validator
 
 from brain.bridge import events
+from brain.bridge.chat import (
+    ChatMessage,
+    ChatResponse,
+    StreamDone,
+    StreamError,
+    TextDelta,
+)
 from brain.bridge.events import EventBus
-from brain.bridge.provider import LLMProvider, get_provider
+from brain.bridge.provider import LLMProvider, ProviderError, get_provider
 from brain.chat.session import (
     all_sessions,
     create_session,
@@ -239,6 +246,75 @@ def _respond_blocking(
             session=sess,
             image_shas=image_shas,
             reply_to_audit_id=reply_to_audit_id,
+        )
+
+
+class _StreamingProxy:
+    """Thin provider wrapper that intercepts chat() to forward TextDelta chunks.
+
+    When _respond_blocking runs in a worker thread with this proxy, each
+    TextDelta emitted by the underlying provider's chat_stream() is forwarded
+    to an asyncio.Queue via loop.call_soon_threadsafe so the WS handler can
+    send reply_chunk frames in real time — while memory recall, tool dispatch,
+    and buffer persistence still go through the full engine pipeline.
+
+    If the real provider does not implement chat_stream() (e.g. OllamaProvider,
+    FakeProvider), chat() falls back to the real provider's chat() unchanged and
+    no chunks are forwarded (the None sentinel is still sent so the WS loop exits).
+    """
+
+    def __init__(
+        self,
+        real: LLMProvider,
+        chunk_q: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._real = real
+        self._q = chunk_q
+        self._loop = loop
+
+    def name(self) -> str:
+        return self._real.name()
+
+    def healthy(self) -> bool:
+        return self._real.healthy()
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        return self._real.generate(prompt, system=system)
+
+    def complete(self, prompt: str) -> str:
+        return self._real.complete(prompt)
+
+    def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ChatResponse:
+        chat_stream = getattr(self._real, "chat_stream", None)
+        if chat_stream is None:
+            # Provider has no streaming support; call chat() and forward the
+            # full content as word tokens so the WS still emits reply_chunk frames.
+            resp = self._real.chat(messages, tools=tools, options=options)
+            for word in _word_chunks(resp.content):
+                self._loop.call_soon_threadsafe(self._q.put_nowait, word)
+            return resp
+
+        chunks: list[str] = []
+        for ev in chat_stream(messages, tools=tools, options=options):
+            if isinstance(ev, TextDelta):
+                chunks.append(ev.text)
+                self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
+            elif isinstance(ev, StreamDone):
+                if ev.content and not chunks:
+                    chunks = [ev.content]
+            elif isinstance(ev, StreamError):
+                raise ProviderError(ev.stage, ev.detail)
+        return ChatResponse(
+            content="".join(chunks),
+            tool_calls=(),
+            raw=None,
         )
 
 
@@ -1645,8 +1721,6 @@ def build_app(
                 return
             reply_to_audit_id = raw_reply_id
 
-        chunk_delay_ms = int(os.environ.get("NELL_STREAM_CHUNK_DELAY_MS", "30"))
-
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
@@ -1670,16 +1744,38 @@ def build_app(
                         reply_to_audit_id,
                     )
 
+            # Real-time streaming: proxy intercepts provider.chat() calls and
+            # puts TextDelta.text on chunk_q so we can forward reply_chunk
+            # frames while _respond_blocking is still running in the thread.
+            chunk_q: asyncio.Queue[str | None] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            streaming_provider = _StreamingProxy(s.provider, chunk_q, loop)
+
+            async def _guarded_respond() -> Any:
+                try:
+                    return await asyncio.to_thread(
+                        _respond_blocking,
+                        s.persona_dir,
+                        sess,
+                        message,
+                        streaming_provider,
+                        image_shas,
+                        reply_to_audit_id,
+                    )
+                finally:
+                    chunk_q.put_nowait(None)
+
+            respond_task = asyncio.create_task(_guarded_respond())
+
+            # Forward reply chunks to the client as they arrive from the provider.
+            while True:
+                chunk = await chunk_q.get()
+                if chunk is None:
+                    break
+                await ws.send_json({"type": "reply_chunk", "text": chunk})
+
             try:
-                result = await asyncio.to_thread(
-                    _respond_blocking,
-                    s.persona_dir,
-                    sess,
-                    message,
-                    s.provider,
-                    image_shas,
-                    reply_to_audit_id,
-                )
+                result = await respond_task
             except Exception:
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
@@ -1688,7 +1784,8 @@ def build_app(
                 await ws.close()
                 return
 
-            # Tool events fire BEFORE reply chunks — they happened first in the loop.
+            # Tool events fire BEFORE reply chunks in the old word-by-word path;
+            # here they follow because the real chunks already arrived inline.
             # tool_invocations shape per brain/chat/tool_loop.py:79 —
             # {name, arguments, result_summary, error?}. Pinned to canonical keys.
             for inv in result.tool_invocations:
@@ -1706,12 +1803,6 @@ def build_app(
                         "at": _now(),
                     }
                 )
-
-            # Word-by-word chunking
-            for word in _word_chunks(result.content):
-                await ws.send_json({"type": "reply_chunk", "text": word})
-                if chunk_delay_ms > 0:
-                    await asyncio.sleep(chunk_delay_ms / 1000.0)
 
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
