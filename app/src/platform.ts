@@ -2,12 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type ClientPlatform = "macos" | "windows" | "linux" | "other";
 
-export type InstallShape = "appimage" | "deb" | "native" | "unknown";
+const INSTALL_SHAPES = ["appimage", "deb", "native", "unknown"] as const;
+export type InstallShape = (typeof INSTALL_SHAPES)[number];
 
 export async function detectInstallShape(): Promise<InstallShape> {
   try {
-    const v = (await invoke<string>("detect_install_shape")) as InstallShape;
-    return v;
+    const v = await invoke<string>("detect_install_shape");
+    return (INSTALL_SHAPES as readonly string[]).includes(v) ? (v as InstallShape) : "unknown";
   } catch {
     return "unknown";
   }

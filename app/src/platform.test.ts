@@ -36,4 +36,10 @@ describe("detectInstallShape", () => {
     const shape = await detectInstallShape();
     expect(shape).toBe("unknown");
   });
+
+  it("returns 'unknown' when invoke returns an unrecognised string", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce("definitely-not-a-shape");
+    const shape = await detectInstallShape();
+    expect(shape).toBe("unknown");
+  });
 });
