@@ -1,4 +1,5 @@
 """End-to-end ArcUpdatePass orchestrator coverage."""
+
 from __future__ import annotations
 
 import json
@@ -53,18 +54,21 @@ class _StubEventBus:
 def _stub_anchor_sweep(anchors: list[FakeAnchor]):
     def _sweep(persona_dir: Path, last_pass_ts_iso: str | None) -> list[FakeAnchor]:
         return list(anchors)
+
     return _sweep
 
 
 def _stub_candidate_pool(candidates: list[FakeMemory]):
     def _pool(persona_dir: Path, *, opened_at_iso: str) -> list[FakeMemory]:
         return [c for c in candidates if c.created_at_iso > opened_at_iso]
+
     return _pool
 
 
 def _stub_salience(value: float = 0.5):
     def _score(memory: FakeMemory, *, ctx: Any) -> float:
         return value
+
     return _score
 
 
@@ -126,7 +130,9 @@ def test_orchestrator_extends_existing_arc_when_seed_already_member(tmp_path: Pa
     bus = _StubEventBus()
     # First pass — open arc with mem_seed
     anchors_1 = [
-        FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",))
+        FakeAnchor(
+            "dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",)
+        )
     ]
     run_pass(
         tmp_path,
@@ -141,7 +147,14 @@ def test_orchestrator_extends_existing_arc_when_seed_already_member(tmp_path: Pa
     )
     # Second pass — a growth anchor whose seed includes mem_seed should EXTEND
     anchors_2 = [
-        FakeAnchor("growth", "growth_1", "the same theme", "2026-05-19T11:00:00+00:00", 413.0, ("mem_seed", "mem_new")),
+        FakeAnchor(
+            "growth",
+            "growth_1",
+            "the same theme",
+            "2026-05-19T11:00:00+00:00",
+            413.0,
+            ("mem_seed", "mem_new"),
+        ),
     ]
     result = run_pass(
         tmp_path,
@@ -166,7 +179,9 @@ def test_orchestrator_adds_candidate_via_hebbian(tmp_path: Path):
     bus = _StubEventBus()
     # Open arc seeded
     anchors = [
-        FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",))
+        FakeAnchor(
+            "dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",)
+        )
     ]
     candidate = FakeMemory(id="mem_c", created_at_iso="2026-05-19T10:30:00+00:00")
     # Hebbian weight >= MEMBER_HEBBIAN_THRESHOLD (3.0)
@@ -187,7 +202,9 @@ def test_orchestrator_adds_candidate_via_hebbian(tmp_path: Path):
     assert any(m.memory_id == "mem_c" for m in arc.members)
     # via=hebbian should appear in log
     log_lines = (tmp_path / LOG_FILENAME).read_text().splitlines()
-    added_events = [json.loads(line) for line in log_lines if json.loads(line)["event"] == "member_added"]
+    added_events = [
+        json.loads(line) for line in log_lines if json.loads(line)["event"] == "member_added"
+    ]
     assert any(e["memory_id"] == "mem_c" and e["via"] == "hebbian" for e in added_events)
 
 
@@ -294,7 +311,9 @@ def test_orchestrator_member_cap_evicts_lowest_salience(tmp_path: Path):
 def test_orchestrator_skips_exempt_memories(tmp_path: Path):
     bus = _StubEventBus()
     anchors = [
-        FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",))
+        FakeAnchor(
+            "dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",)
+        )
     ]
     candidate = FakeMemory(id="mem_c", created_at_iso="2026-05-19T10:30:00+00:00")
     hebbian = _StubHebbian(weights={("mem_c", "mem_seed"): 5.0})

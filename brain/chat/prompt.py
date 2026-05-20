@@ -13,11 +13,14 @@ SoulStore and inject the top 5 most-recent as brief highlights.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
+
+log = logging.getLogger(__name__)
 
 # Direct-address framing — keeps the LLM speaking *to* the user rather than
 # narrating about them. OG source: nell_bridge.py:88-91.
@@ -453,6 +456,11 @@ def _build_recall_block(
 
     seen_active: set = set()
     seen_fading: set = set()
+    # seen_lost accumulates graveyard hit IDs for two purposes:
+    #   1. Dedup across per-token loop iterations (render path below).
+    #   2. Passed to handle_recall_touch as the grief accumulator (see the
+    #      fault-isolated block after this loop). Both paths read the same
+    #      set — no separate copy needed.
     seen_lost: set = set()
     active_hits: list = []
     fading_hits: list = []
@@ -479,6 +487,27 @@ def _build_recall_block(
 
     if not active_hits and not fading_hits and not lost_hits:
         return ""
+
+    # Fire recall-touch grief breadcrumbs for any graveyard hits.
+    # handle_recall_touch is internally fault-isolated; this outer try
+    # guards only against import-time failures on brain.grief / brain.felt_time.
+    if seen_lost:
+        try:
+            from brain.felt_time.state import load_or_recover as _load_felt
+            from brain.forgetting import graveyard as _grave
+            from brain.grief import handle_recall_touch
+
+            felt_state, _ = _load_felt(persona_dir)
+            grave_entries = _grave.read_all(persona_dir)
+            handle_recall_touch(
+                touched_ids=sorted(seen_lost),
+                graveyard_entries=grave_entries,
+                persona_dir=persona_dir,
+                store=store,
+                lived_age_hours_now=felt_state.lived_age_hours,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("grief.handle_recall_touch failed inside _build_recall_block")
 
     # Rank active + fading by importance desc, recency desc.
     def _sort_key(m):
@@ -717,22 +746,18 @@ def _build_current_arc_block(persona_dir: Path) -> str:
 
 
 def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
-    """Returns the forgetting ambient block, or "" on any read failure.
+    """Compact ambient block about loss + fading. Spec: 2026-05-19-grief-design.md §5.
 
-    Same fault-tolerance pattern as _build_felt_time_block. On success
-    returns either:
-      - "memory: nothing has softened lately."  (both counts zero)
-      - "memory: N softened (fading), M lost in the last 7 days."
-
-    Per spec §5 (forgetting design) — compact ≤120-token aggregate so Nell
-    can speak about the lived experience of recent loss.
+    Replaces the previous forgetting.prompt.render_fading_summary_block with
+    grief.prompt.render_grief_block — same call site, richer block.
     """
     try:
-        from brain.forgetting.prompt import render_fading_summary_block
+        from brain.grief.prompt import render_grief_block
 
-        return render_fading_summary_block(persona_dir, store)
+        return render_grief_block(persona_dir, store)
     except Exception:  # noqa: BLE001
-        return ""
+        log.exception("grief.render_grief_block failed — falling back to silent block")
+        return "memory · loss: still."
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:

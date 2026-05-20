@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "nellface"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "dirs 5.0.1",
  "libc",

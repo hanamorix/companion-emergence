@@ -6,6 +6,7 @@ Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from brain.forgetting.policy import Transition
 from brain.health.attempt_heal import save_with_backup
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore, _row_to_memory
+
+log = logging.getLogger(__name__)
 
 FORGETTING_STATE_FILENAME = "forgetting_state.json"
 
@@ -153,6 +156,21 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                 )
                 store.hard_delete(memory_id)
                 summary["lost"] += 1
+                try:
+                    from brain import grief  # lazy — avoids circular import with brain.memory
+
+                    # handle_drop is internally fault-isolated; this outer try guards only
+                    # against import-time failures or attribute errors on brain.grief.
+                    grief.handle_drop(
+                        memory=memory,
+                        persona_dir=persona_dir,
+                        store=store,
+                    )
+                except Exception:
+                    log.exception(
+                        "grief.handle_drop failed inside forgetting pass for memory_id=%s",
+                        memory_id,
+                    )
                 next_low = 0  # cleared; row gone
 
             if next_low > 0:

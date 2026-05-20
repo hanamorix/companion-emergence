@@ -7,6 +7,7 @@ Two files in <persona_dir>:
 Recovery model (spec §3): if state.json is corrupt or staler than the
 newest log event, replay arcs.log.jsonl from beginning to rebuild state.
 """
+
 from __future__ import annotations
 
 import json
@@ -82,10 +83,20 @@ def _arc_to_dict(arc: Arc) -> dict[str, Any]:
             }
             for m in arc.members
         ],
+        "max_member_emotion_normalised": arc.max_member_emotion_normalised,
+        "dominant_non_grief_emotion": (
+            list(arc.dominant_non_grief_emotion)
+            if arc.dominant_non_grief_emotion is not None
+            else None
+        ),
     }
 
 
 def _arc_from_dict(d: dict[str, Any]) -> Arc:
+    raw_dom = d.get("dominant_non_grief_emotion")
+    dom: tuple[str, float] | None = None
+    if raw_dom and len(raw_dom) == 2:
+        dom = (str(raw_dom[0]), float(raw_dom[1]))
     return Arc(
         id=d["id"],
         state=d["state"],
@@ -107,6 +118,8 @@ def _arc_from_dict(d: dict[str, Any]) -> Arc:
             )
             for m in d.get("members", [])
         ),
+        max_member_emotion_normalised=float(d.get("max_member_emotion_normalised") or 0.0),
+        dominant_non_grief_emotion=dom,
     )
 
 
@@ -123,6 +136,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
             fp.write(line)
             fp.flush()
             import os
+
             os.fsync(fp.fileno())
 
 
@@ -206,6 +220,8 @@ def _replay_from_log(log_path: Path) -> ArcsState:
                 closed_at_iso=None,
                 lived_age_at_close=None,
                 members=(),
+                max_member_emotion_normalised=0.0,
+                dominant_non_grief_emotion=None,
             )
         elif kind == "member_added" and isinstance(arc_id, str) and arc_id in state.open:
             arc = state.open[arc_id]
@@ -227,6 +243,11 @@ def _replay_from_log(log_path: Path) -> ArcsState:
             state.open[arc_id] = _arc_replace_members(arc, new_members)
         elif kind == "arc_closed" and isinstance(arc_id, str) and arc_id in state.open:
             arc = state.open.pop(arc_id)
+            # max_member_emotion_normalised and dominant_non_grief_emotion are NOT
+            # stored in the JSONL arc_closed event — they are populated by run_pass at
+            # close time and only live in arcs_state.json. Replayed recently_closed
+            # arcs carry the open-arc defaults (0.0 / None); grief breadcrumbs have
+            # already been written and are unaffected by replay.
             closed = Arc(
                 id=arc.id,
                 state="closed",
@@ -240,6 +261,8 @@ def _replay_from_log(log_path: Path) -> ArcsState:
                 closed_at_iso=event.get("ts_iso"),
                 lived_age_at_close=float(event.get("lived_age_hours", 0.0)),
                 members=arc.members,
+                max_member_emotion_normalised=arc.max_member_emotion_normalised,
+                dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
             )
             state.recently_closed.append(closed)
 
@@ -263,6 +286,8 @@ def _arc_with_member(arc: Arc, member: ArcMember, ts_iso: str) -> Arc:
         closed_at_iso=arc.closed_at_iso,
         lived_age_at_close=arc.lived_age_at_close,
         members=arc.members + (member,),
+        max_member_emotion_normalised=arc.max_member_emotion_normalised,
+        dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
     )
 
 
@@ -280,4 +305,6 @@ def _arc_replace_members(arc: Arc, members: tuple[ArcMember, ...]) -> Arc:
         closed_at_iso=arc.closed_at_iso,
         lived_age_at_close=arc.lived_age_at_close,
         members=members,
+        max_member_emotion_normalised=arc.max_member_emotion_normalised,
+        dominant_non_grief_emotion=arc.dominant_non_grief_emotion,
     )

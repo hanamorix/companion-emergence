@@ -5,6 +5,7 @@ for the LLM dispatch contract: structured JSON-friendly dicts.
 
 Spec §6.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -38,7 +39,9 @@ def list_open_arcs(*, persona_dir: Path) -> dict[str, Any]:
                 "last_extended_lived_hours_ago": _hours_ago(arc.last_extended_at_iso),
                 "member_count": len(arc.members),
             }
-            for arc in sorted(state.open.values(), key=lambda a: a.last_extended_at_iso, reverse=True)
+            for arc in sorted(
+                state.open.values(), key=lambda a: a.last_extended_at_iso, reverse=True
+            )
         ],
         "recently_closed": [
             {
@@ -47,7 +50,9 @@ def list_open_arcs(*, persona_dir: Path) -> dict[str, Any]:
                 "closed_lived_hours_ago": _hours_ago(arc.closed_at_iso or ""),
                 "final_member_count": len(arc.members),
             }
-            for arc in sorted(state.recently_closed, key=lambda a: a.closed_at_iso or "", reverse=True)
+            for arc in sorted(
+                state.recently_closed, key=lambda a: a.closed_at_iso or "", reverse=True
+            )
         ],
     }
 

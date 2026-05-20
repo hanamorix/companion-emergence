@@ -7,6 +7,7 @@ the real HebbianMatrix / EmbeddingIndex classes.
 `centroid_for` is memoised per pass via a caller-supplied cache dict
 keyed on arc.id, thrown away after the pass.
 """
+
 from __future__ import annotations
 
 from typing import Protocol

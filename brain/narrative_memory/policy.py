@@ -5,6 +5,7 @@ membership.py for grep-ability — the membership thresholds are
 clustered with the per-call function, the lifecycle thresholds with
 the per-pass decisions.
 """
+
 from __future__ import annotations
 
 from brain.narrative_memory.arc import Arc

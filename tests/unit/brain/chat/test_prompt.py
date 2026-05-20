@@ -598,8 +598,12 @@ def test_build_system_message_includes_fading_summary_block_always(
     store: MemoryStore,
     soul_store: SoulStore,
 ) -> None:
-    """The fading-summary block is always present — 'nothing has softened lately'
-    on the empty path, actual counts when fading memories exist."""
+    """The fading-summary block is always present — grief block on the empty path,
+    actual counts when fading memories exist.
+
+    After Phase 8.1 the block reads 'memory · loss: still.' on the empty path
+    instead of 'memory: nothing has softened lately.'
+    """
     msg = build_system_message(
         persona_dir,
         voice_md="",
@@ -607,9 +611,8 @@ def test_build_system_message_includes_fading_summary_block_always(
         soul_store=soul_store,
         store=store,
     )
-    # On empty store the ambient line reads "memory: nothing has softened lately."
-    assert "memory:" in msg.lower()
-    assert "softened" in msg.lower()
+    # On empty store the ambient line reads "memory · loss: still."
+    assert "memory · loss:" in msg
 
 
 def test_build_system_message_fading_summary_reflects_fading_memories(
@@ -877,6 +880,8 @@ def test_build_emotion_summary_survives_heartbeat_flood(store: MemoryStore) -> N
     summary = _build_emotion_summary(store)
     # Before fix: returns "" because heartbeats fill the LIMIT 50.
     # After fix: returns "love:8.5, tenderness:6.2, awe:5.0".
-    assert "love" in summary, f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
+    assert "love" in summary, (
+        f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
+    )
     assert "tenderness" in summary
     assert "awe" in summary

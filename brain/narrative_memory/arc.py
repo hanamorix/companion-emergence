@@ -2,6 +2,7 @@
 
 Per spec §3 — no I/O here. Serialisation lives in state.py.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,3 +45,5 @@ class Arc:
     closed_at_iso: str | None
     lived_age_at_close: float | None
     members: tuple[ArcMember, ...]
+    max_member_emotion_normalised: float = 0.0
+    dominant_non_grief_emotion: tuple[str, float] | None = None

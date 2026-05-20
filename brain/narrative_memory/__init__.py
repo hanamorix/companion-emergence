@@ -7,6 +7,7 @@ Inherits substrate from felt-time (FeltTimeState anchors + lived_age) and
 forgetting (policy.is_exempt + salience.score). See spec
 docs/superpowers/specs/2026-05-19-narrative-memory-design.md.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -234,7 +235,9 @@ def run_pass(
                 lived_age_at_join=lived_age_now if lived_age_now is not None else 0.0,
                 salience_at_join=sal,
             )
-            arc = _replace(arc, members=arc.members + (new_member,), last_extended_at_iso=_now_iso())
+            arc = _replace(
+                arc, members=arc.members + (new_member,), last_extended_at_iso=_now_iso()
+            )
             state.open[arc_id] = arc
             touched_arc_ids.add(arc_id)
             append_event(
@@ -274,43 +277,117 @@ def run_pass(
             counts["evicted"] += 1
         state.open[arc_id] = _replace(arc, members=tuple(kept))
 
-    # --- Close sweep ---
-    for arc_id, arc in list(state.open.items()):
-        # Use lived_age_at_join of the most recent member as the "last extended" lived age
-        last_ext_lived_age = max(
-            (m.lived_age_at_join for m in arc.members), default=arc.lived_age_at_open
-        )
-        reason: str | None = None
-        if not arc.members:
-            reason = "all_members_lost"
-        elif arc_id in touched_arc_ids:
-            # Freshly opened/extended this pass — cannot be stale by definition.
-            reason = None
-        elif should_close(arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age):
-            reason = "stale_72h"
-        if reason is None:
-            continue
+    # --- Membership refresh: detect lost members in open arcs, fire grief touches ---
+    # Per spec §6 Phase 9.2: when an arc member-id resolves to a graveyard entry
+    # rather than a live memory, call handle_recall_touch with triggering_arc_id set
+    # so the breadcrumb attributes the touch to both the lost memory and the open arc.
+    db_path = persona_dir / "memories.db"
+    store_for_grief = None
+    if db_path.exists():
+        from brain.memory.store import MemoryStore
 
-        closed = _replace(
-            arc,
-            state="closed",
-            closed_at_iso=_now_iso(),
-            lived_age_at_close=lived_age_now,
-        )
-        state.recently_closed.append(closed)
-        del state.open[arc_id]
-        append_event(
-            persona_dir,
-            {
-                "event": "arc_closed",
-                "arc_id": arc_id,
-                "ts_iso": closed.closed_at_iso,
-                "lived_age_hours": lived_age_now if lived_age_now is not None else 0.0,
-                "reason": reason,
-                "final_member_count": len(closed.members),
-            },
-        )
-        counts["closed"] += 1
+        store_for_grief = MemoryStore(db_path)
+
+    if store_for_grief is not None and state.open:
+        try:
+            from brain.forgetting import graveyard as _grave
+
+            grave_entries = _grave.read_all(persona_dir)
+            grave_by_id = {e.get("memory_id"): e for e in grave_entries if "memory_id" in e}
+            if grave_by_id:
+                for arc_id, arc in state.open.items():
+                    lost_member_ids = []
+                    for member in arc.members:
+                        if member.memory_id in grave_by_id:
+                            live = store_for_grief.get(member.memory_id)
+                            if live is None:
+                                lost_member_ids.append(member.memory_id)
+                    if lost_member_ids:
+                        try:
+                            from brain import grief as _grief
+
+                            _grief.handle_recall_touch(
+                                touched_ids=sorted(lost_member_ids),
+                                graveyard_entries=grave_entries,
+                                persona_dir=persona_dir,
+                                store=store_for_grief,
+                                lived_age_hours_now=lived_age_now
+                                if lived_age_now is not None
+                                else 0.0,
+                                triggering_arc_id=arc_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            _LOG.exception(
+                                "grief.handle_recall_touch (membership) failed for arc_id=%s",
+                                arc_id,
+                            )
+        except Exception:  # noqa: BLE001
+            _LOG.exception("narrative_memory membership refresh (grief) raised")
+
+    # --- Close sweep ---
+    try:
+        for arc_id, arc in list(state.open.items()):
+            # Use lived_age_at_join of the most recent member as the "last extended" lived age
+            last_ext_lived_age = max(
+                (m.lived_age_at_join for m in arc.members), default=arc.lived_age_at_open
+            )
+            reason: str | None = None
+            if not arc.members:
+                reason = "all_members_lost"
+            elif arc_id in touched_arc_ids:
+                # Freshly opened/extended this pass — cannot be stale by definition.
+                reason = None
+            elif should_close(
+                arc, lived_age_now=lived_age_now, last_extended_lived_age=last_ext_lived_age
+            ):
+                reason = "stale_72h"
+            if reason is None:
+                continue
+
+            max_emotion, dominant = (0.0, None)
+            if store_for_grief is not None:
+                max_emotion, dominant = _compute_arc_close_emotion_inputs(
+                    arc=arc, store=store_for_grief, persona_dir=persona_dir
+                )
+
+            closed = _replace(
+                arc,
+                state="closed",
+                closed_at_iso=_now_iso(),
+                lived_age_at_close=lived_age_now,
+                max_member_emotion_normalised=max_emotion,
+                dominant_non_grief_emotion=dominant,
+            )
+            state.recently_closed.append(closed)
+            del state.open[arc_id]
+            append_event(
+                persona_dir,
+                {
+                    "event": "arc_closed",
+                    "arc_id": arc_id,
+                    "ts_iso": closed.closed_at_iso,
+                    "lived_age_hours": lived_age_now if lived_age_now is not None else 0.0,
+                    "reason": reason,
+                    "final_member_count": len(closed.members),
+                },
+            )
+            counts["closed"] += 1
+
+            # Fault-isolated grief write — after the state mutation + JSONL append.
+            # handle_arc_close is internally fault-isolated; this outer try guards
+            # only against import-time failures on brain.grief.
+            try:
+                from brain import grief as _grief
+
+                if store_for_grief is not None:
+                    _grief.handle_arc_close(
+                        arc=closed, persona_dir=persona_dir, store=store_for_grief
+                    )
+            except Exception:
+                _LOG.exception("grief.handle_arc_close failed for arc_id=%s", arc_id)
+    finally:
+        if store_for_grief is not None:
+            store_for_grief.close()
 
     # Cap recently_closed
     if len(state.recently_closed) > RECENTLY_CLOSED_CAP:
@@ -336,6 +413,71 @@ def run_pass(
     return aggregate  # type: ignore[return-value]
 
 
+def _compute_arc_close_emotion_inputs(
+    *,
+    arc: Arc,
+    store: Any,
+    persona_dir: Path,
+) -> tuple[float, tuple[str, float] | None]:
+    """Compute the strongest emotional signal across an arc's members.
+
+    For each member: if a live MemoryStore record exists, use its raw [0, 10]
+    emotion values directly. Otherwise, fall back to the graveyard entry's
+    `emotion_norm × 10` proxy (reconstructing the original 0-10 emotion at
+    the same scale as a live lookup — no salience factor, per spec §3; see
+    brain/forgetting/salience.SalienceInputs for the stored fields).
+
+    Returns:
+        (max_normalised_emotion, dominant_non_grief_emotion):
+            max_normalised_emotion: max emotion across all members, normalised
+                to [0, 1] for compute_arc_close_intensity.
+            dominant_non_grief_emotion: (emotion_name, intensity_0_to_10) for
+                the emotion that produced the max value, or None if no
+                member had any non-grief emotion.
+
+    Per spec §3 graveyard-proxy fallback: arcs whose members have largely been
+    forgotten still produce honest arc-close grief.
+    """
+    from brain.forgetting import graveyard as _grave
+
+    grave_entries = _grave.read_all(persona_dir)
+    grave_by_id = {e.get("memory_id"): e for e in grave_entries}
+
+    best_emotion_value = 0.0
+    best_named: tuple[str, float] | None = None
+    for member in arc.members:
+        live = store.get(member.memory_id)
+        if live is not None and live.emotions:
+            for name, val in live.emotions.items():
+                if name == "memory_grief":
+                    continue
+                v = float(val)
+                if v > best_emotion_value:
+                    best_emotion_value = v
+                    best_named = (name, v)
+            continue
+        entry = grave_by_id.get(member.memory_id)
+        if entry is None:
+            continue
+        inputs = entry.get("salience_inputs_at_drop") or {}
+        emotion_norm = float(inputs.get("emotion") or 0.0)
+        # Reconstruct the original 0-10 emotion at the same scale as a live lookup.
+        # Spec §3 caller responsibility: no salience factor — salience_at_drop is
+        # near zero by definition (LOST_THRESHOLD = 0.10 in forgetting/policy.py),
+        # so multiplying suppressed grief for fully-forgotten arcs.
+        proxy = emotion_norm * 10.0
+        if proxy > best_emotion_value:
+            best_emotion_value = proxy
+            em_dict = entry.get("emotion_at_ingest") or {}
+            non_grief = [
+                (n, float(v)) for n, v in em_dict.items() if n != "memory_grief" and float(v) > 0.0
+            ]
+            if non_grief:
+                best_named = max(non_grief, key=lambda kv: kv[1])
+
+    return (max(0.0, min(1.0, best_emotion_value / 10.0)), best_named)
+
+
 def _replace(arc: Arc, **changes: Any) -> Arc:
     """Frozen-Arc replace helper."""
     return Arc(
@@ -351,6 +493,12 @@ def _replace(arc: Arc, **changes: Any) -> Arc:
         closed_at_iso=changes.get("closed_at_iso", arc.closed_at_iso),
         lived_age_at_close=changes.get("lived_age_at_close", arc.lived_age_at_close),
         members=changes.get("members", arc.members),
+        max_member_emotion_normalised=changes.get(
+            "max_member_emotion_normalised", arc.max_member_emotion_normalised
+        ),
+        dominant_non_grief_emotion=changes.get(
+            "dominant_non_grief_emotion", arc.dominant_non_grief_emotion
+        ),
     )
 
 
