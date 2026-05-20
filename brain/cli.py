@@ -26,7 +26,7 @@ from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
-from brain.paths import get_home, get_persona_dir
+from brain.paths import _PERSONA_NAME_RE, get_home, get_persona_dir, list_persona_names
 from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
 from brain.setup import (
@@ -48,6 +48,54 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     provider = getattr(args, "provider", None) or config.provider
     searcher = getattr(args, "searcher", None) or config.searcher
     return provider, searcher
+
+
+def _resolve_persona_or_exit(arg: str | None) -> str:
+    """Resolve the persona name for a CLI command.
+
+    - If ``arg`` is given, validate the name grammar and return it. Downstream
+      code (e.g., ``nell init``) decides whether the persona dir must exist.
+    - If ``arg`` is None and exactly one persona is installed, return its name
+      silently. This is the common single-persona case.
+    - If ``arg`` is None and zero or 2+ personas exist, print a helpful
+      message to stderr and ``sys.exit`` non-zero. Callers receive a clean
+      exit-with-error path, not an exception to unwind.
+
+    The grammar is shared with ``validate_persona_name``; we re-validate
+    here so that the explicit-arg path can't smuggle in invalid names.
+    """
+    if arg is not None:
+        # Grammar check — match list_persona_names()'s filter.
+        if not _PERSONA_NAME_RE.fullmatch(arg):
+            print(
+                f"error: persona name {arg!r} is invalid. "
+                f"Allowed characters: A-Z, a-z, 0-9, _ and -. Length 1-40.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return arg
+
+    names = list_persona_names()
+    if len(names) == 1:
+        return names[0]
+
+    if len(names) == 0:
+        print(
+            "error: no personas found under <KINDLED_HOME>/personas/. "
+            "Run `nell init <name>` to create one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Multiple personas — list them.
+    print(
+        "error: multiple personas installed. Pass --persona <name> to pick one.",
+        file=sys.stderr,
+    )
+    print("Installed personas:", file=sys.stderr)
+    for n in names:
+        print(f"  {n}", file=sys.stderr)
+    sys.exit(2)
 
 
 # All Week-1 framework stubs have been resolved:
