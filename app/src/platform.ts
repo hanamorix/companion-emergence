@@ -1,4 +1,17 @@
+import { invoke } from "@tauri-apps/api/core";
+
 export type ClientPlatform = "macos" | "windows" | "linux" | "other";
+
+export type InstallShape = "appimage" | "deb" | "native" | "unknown";
+
+export async function detectInstallShape(): Promise<InstallShape> {
+  try {
+    const v = (await invoke<string>("detect_install_shape")) as InstallShape;
+    return v;
+  } catch {
+    return "unknown";
+  }
+}
 
 export function getClientPlatform(): ClientPlatform {
   const nav = typeof navigator === "undefined" ? null : navigator;
