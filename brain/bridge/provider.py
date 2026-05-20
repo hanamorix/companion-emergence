@@ -298,7 +298,7 @@ class ClaudeCliProvider(LLMProvider):
         # Prompt piped via stdin; system prompt via --system-prompt-file.
         # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
         # limit — WinError 206). See _system_prompt_tempfile for context.
-        cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", "--model", self._model]
         with _system_prompt_tempfile(system) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -418,7 +418,7 @@ class ClaudeCliProvider(LLMProvider):
         # User:/Assistant: labels, because those labels can leak into replies.
         # Prompt → stdin, system_prompt → tempfile + --system-prompt-file
         # keeps both off argv (Windows CreateProcess 32,767-char limit).
-        cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", "--model", self._model]
         with _system_prompt_tempfile(system_prompt) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -524,6 +524,7 @@ class ClaudeCliProvider(LLMProvider):
         cmd = [
             "claude",
             "--print",
+            "--dangerously-skip-permissions",
             "--input-format",
             "stream-json",
             "--output-format",
@@ -725,7 +726,7 @@ class ClaudeCliProvider(LLMProvider):
             # even after a long session has grown voice.md + buffer into the
             # tens of KB. This is the exact code path that surfaced WinError
             # 206 in the field.
-            cmd = ["claude", "-p", "--output-format", "json", "--model", self._model]
+            cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", "--model", self._model]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
 
