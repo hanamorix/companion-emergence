@@ -1444,6 +1444,106 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _paths_for_persona(persona: str) -> dict[str, Path]:
+    """Build the key → path map for the given persona."""
+    from brain.paths import get_cache_dir, get_log_dir
+
+    home = get_home()
+    pd = get_persona_dir(persona)
+    return {
+        # Global
+        "home": home,
+        "cache": get_cache_dir(),
+        "logs": get_log_dir(),
+        "personas_root": home / "personas",
+        # Per-persona
+        "persona_dir": pd,
+        "bridge_json": pd / "bridge.json",
+        "memories_db": pd / "memories.db",
+        "hebbian_db": pd / "hebbian.db",
+        "embeddings_db": pd / "embeddings.db",
+        "crystallizations_db": pd / "crystallizations.db",
+        "soul_candidates": pd / "soul_candidates.jsonl",
+        "active_conversations": pd / "active_conversations",
+        "voice_template": pd / "nell-voice.md",
+        "persona_config": pd / "persona_config.json",
+        "felt_time_state": pd / "felt_time_state.json",
+        "d_mode": pd / "d_mode.json",
+        "dreams_log": pd / "dreams.log.jsonl",
+        "heartbeats_log": pd / "heartbeats.log.jsonl",
+        "forgotten_memories": pd / "forgotten_memories.jsonl",
+    }
+
+
+def _print_paths(persona: str, *, json_mode: bool) -> None:
+    paths = _paths_for_persona(persona)
+    if json_mode:
+        payload = {key: {"path": str(p), "exists": p.exists()} for key, p in paths.items()}
+        print(json.dumps(payload, indent=2))
+        return
+    width = max(len(k) for k in paths)
+    for key, p in paths.items():
+        marker = "  (missing)" if not p.exists() else ""
+        print(f"{key:<{width}}  {p}{marker}")
+
+
+def _paths_handler(args: argparse.Namespace) -> int:
+    if args.all:
+        names = list_persona_names()
+        if not names:
+            print("no persona installed — run `nell init`.", file=sys.stderr)
+            return 2
+        for n in names:
+            print(f"[ {n} ]")
+            _print_paths(n, json_mode=args.json)
+            print()
+        return 0
+
+    persona = _resolve_persona_or_exit(args.persona)
+
+    if args.key:
+        paths = _paths_for_persona(persona)
+        if args.key not in paths:
+            print(
+                f"unknown key '{args.key}' — valid keys: {', '.join(sorted(paths))}",
+                file=sys.stderr,
+            )
+            return 2
+        print(str(paths[args.key]))
+        return 0
+
+    _print_paths(persona, json_mode=args.json)
+    return 0
+
+
+def _personas_handler(args: argparse.Namespace) -> int:
+    names = list_persona_names()
+    if args.json:
+        rows = []
+        for n in names:
+            pd = get_persona_dir(n)
+            st = state_file.read(pd)
+            running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+            rows.append({"name": n, "bridge_running": running})
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    if not names:
+        print("no personas installed — run `nell init` to create one.")
+        return 0
+
+    width = max(len(n) for n in names)
+    print(f"{'persona':<{width}}  bridge")
+    print(f"{'-' * width}  ------")
+    for n in names:
+        pd = get_persona_dir(n)
+        st = state_file.read(pd)
+        running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+        marker = "running" if running else "not running"
+        print(f"{n:<{width}}  {marker}")
+    return 0
+
+
 def _chat_direct_mode(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` to the chat engine (in-process, no bridge).
 
@@ -2618,6 +2718,46 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sl_review.set_defaults(func=_soul_review_handler)
 
+    # nell paths — filesystem introspection (alpha.4)
+    paths_sub = subparsers.add_parser(
+        "paths",
+        help="Show resolved filesystem paths for a persona.",
+    )
+    paths_sub.add_argument(
+        "key",
+        nargs="?",
+        default=None,
+        help="If given, print only this path (script-friendly one-liner).",
+    )
+    paths_sub.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
+    paths_sub.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON with path + exists fields.",
+    )
+    paths_sub.add_argument(
+        "--all",
+        action="store_true",
+        help="Show paths for every installed persona.",
+    )
+    paths_sub.set_defaults(func=_paths_handler)
+
+    # nell personas — installed-persona inventory (alpha.4)
+    personas_sub = subparsers.add_parser(
+        "personas",
+        help="List installed personas and bridge running state.",
+    )
+    personas_sub.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON array.",
+    )
+    personas_sub.set_defaults(func=_personas_handler)
+
     return parser
 
 
@@ -2638,7 +2778,11 @@ def main(argv: list[str] | None = None) -> int:
     # `nell init` is excluded: it is the bootstrapping command that creates the
     # first persona, so it may legitimately run with no personas installed. Its
     # handler prompts interactively for the persona name when --persona is absent.
-    _persona_resolver_skip = {"init"}
+    # `nell paths` and `nell personas` are excluded because they call
+    # _resolve_persona_or_exit() themselves (paths) or don't need it at all
+    # (personas lists every persona). Pre-resolving here would cause a double-call
+    # for paths and a spurious exit-on-no-persona for personas.
+    _persona_resolver_skip = {"init", "paths", "personas"}
     if (
         hasattr(args, "persona")
         and args.persona is None
