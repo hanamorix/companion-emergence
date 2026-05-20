@@ -143,12 +143,14 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(screen.getByText(/nothing is broken/i)).toBeInTheDocument();
   });
 
-  it("shows calm unsupported notes instead of macOS install buttons on Linux", () => {
+  it("shows calm unsupported notes instead of macOS install buttons on Linux (supervisor now supported on Linux — this test updated in Phase 3.2)", () => {
     vi.mocked(getClientPlatform).mockReturnValue("linux");
     render(<ConnectionPanel state={baseState()} persona="test" />);
 
+    // Linux now has its own systemd install button — launchd button should not appear
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/on Linux, Companion will use the app-managed supervisor lifecycle/i)).toBeInTheDocument();
+    // But the systemd button IS present
+    expect(screen.getByRole("button", { name: /install systemd supervisor/i })).toBeInTheDocument();
   });
 
   it("renders the privacy row marked accent (local-only)", () => {
@@ -311,5 +313,40 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
       expect(screen.getByRole("button", { name: /download/i })).toBeInTheDocument();
     });
     expect(screen.queryByRole("link", { name: /releases page/i })).not.toBeInTheDocument();
+  });
+});
+
+// ── Supervisor install (Phase 3.2) ────────────────────────────────
+
+describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(check).mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("Linux: renders systemd copy in the supervisor section", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.getByText(/systemd --user/i)).toBeInTheDocument();
+  });
+
+  it("Linux: install button is rendered and enabled", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    const btn = screen.getByRole("button", { name: /install systemd supervisor/i });
+    expect(btn).toBeInTheDocument();
+    expect(btn).toBeEnabled();
+  });
+
+  it("macOS: still renders launchd copy and button", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.getByText(/launchd LaunchAgent/i)).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: /install launchd supervisor/i });
+    expect(btn).toBeInTheDocument();
+    expect(btn).toBeEnabled();
   });
 });

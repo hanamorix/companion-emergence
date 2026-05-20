@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState } from "../../bridge";
-import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions, detectInstallShape } from "../../platform";
+import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
@@ -53,7 +53,7 @@ export function ConnectionPanel({
   const conn = state?.connection;
   const mode = state?.mode ?? "live";
   const platform = getClientPlatform();
-  const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
+  const supervisorSupported = platform === "macos" || platform === "linux";
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
@@ -148,15 +148,15 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        {macInstallActionsSupported
-          ? "Install the brain as a launchd LaunchAgent so it stays alive when you close the app. Idempotent — safe to click again."
-          : `Persistent supervisor installation from the app is macOS-only right now. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
+        {platform === "macos" && "Install the brain as a launchd LaunchAgent so it stays alive when you close the app. Idempotent — safe to click again."}
+        {platform === "linux" && "Install the brain as a systemd --user service so it stays alive when you close the app. Idempotent — safe to click again."}
+        {!supervisorSupported && `Persistent supervisor installation from the app is macOS-only right now. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
       </div>
-      {macInstallActionsSupported ? (
+      {supervisorSupported ? (
         <InstallActionButton
           state={install}
           onClick={onInstallSupervisor}
-          idleLabel="install launchd supervisor"
+          idleLabel={platform === "linux" ? "install systemd supervisor" : "install launchd supervisor"}
           runningLabel="installing…"
           successLabel="✓ supervisor installed"
           errorLabel="retry install"
@@ -178,11 +178,11 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        {macInstallActionsSupported
+        {platform === "macos"
           ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
           : `The bundled Terminal shortcut installer is macOS-only right now. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
-      {macInstallActionsSupported ? (
+      {platform === "macos" ? (
         <InstallActionButton
           state={cliInstall}
           onClick={onInstallCli}
