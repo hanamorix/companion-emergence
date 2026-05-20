@@ -53,7 +53,8 @@ export interface StreamChatOptions {
 
 const DEFAULT_OPEN_TIMEOUT_MS = 10_000;
 const DEFAULT_FIRST_FRAME_TIMEOUT_MS = 20_000;
-const DEFAULT_OVERALL_TIMEOUT_MS = 120_000;
+const DEFAULT_OVERALL_TIMEOUT_MS = 600_000;
+export const __DEFAULT_OVERALL_TIMEOUT_MS__ = DEFAULT_OVERALL_TIMEOUT_MS;
 
 /**
  * Open a WS stream, send the message, and dispatch frames to the
