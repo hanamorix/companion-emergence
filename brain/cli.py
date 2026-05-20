@@ -1877,7 +1877,14 @@ def _init_handler(args: argparse.Namespace) -> int:
 
     # ----- interactive fill-in for missing flags -----
     if not persona:
-        persona = _prompt("persona name (e.g. 'nell', 'siren')", default="nell")
+        while True:
+            persona = _prompt(
+                "persona name (e.g. 'nell', 'siren', 'mira') — yours to choose",
+                default=None,
+            )
+            if persona:
+                break
+            print("persona name is required — please enter a name", file=sys.stderr)
     try:
         validate_persona_name(persona)
     except ValueError as exc:
