@@ -17,8 +17,6 @@ def test_wizard_persona_prompt_default_is_not_nell():
     """
     src = inspect.getsource(cli)
     bad = [
-        line.strip()
-        for line in src.splitlines()
-        if "_prompt" in line and 'default="nell"' in line
+        line.strip() for line in src.splitlines() if "_prompt" in line and 'default="nell"' in line
     ]
     assert not bad, f"_prompt calls still using default='nell': {bad}"
