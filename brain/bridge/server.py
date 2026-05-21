@@ -43,6 +43,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from brain.bridge import events
@@ -542,6 +543,10 @@ def _drain_sessions_blocking(
 # ---------------------------------------------------------------------------
 # Request/response models
 # ---------------------------------------------------------------------------
+
+
+class ModelConfigReq(BaseModel):
+    model: str
 
 
 class NewSessionReq(BaseModel):
@@ -1062,6 +1067,42 @@ def build_app(
 
         entries = build_feed(persona_dir, limit=50)
         return {"entries": [e.to_dict() for e in entries]}
+
+    # ── POST /persona/config/model — live model switching ──────────────────
+    @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
+    async def set_persona_model(req: ModelConfigReq) -> dict:
+        """Switch the active LLM model without restarting the bridge.
+
+        Validates `model` against KNOWN_MODELS (sonnet / opus / haiku),
+        persists to persona_config.json, and hot-swaps provider._model so
+        the next chat uses the new model immediately.
+
+        Returns: {ok: true, model: <new_model>}
+        Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+        """
+        from dataclasses import replace as dc_replace
+
+        from brain.persona_config import KNOWN_MODELS, PersonaConfig
+
+        if req.model not in KNOWN_MODELS:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "unknown_model",
+                    "valid": sorted(KNOWN_MODELS),
+                },
+            )
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        current = PersonaConfig.load(config_path)
+        updated = dc_replace(current, model=req.model)
+        updated.save(config_path)
+        # Hot-swap: if the live provider exposes _model, update it so the
+        # next chat call uses the new model without a bridge restart.
+        if hasattr(s.provider, "_model"):
+            s.provider._model = req.model
+        return {"ok": True, "model": req.model}
 
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])
