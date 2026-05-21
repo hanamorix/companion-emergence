@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 DEFAULT_PROVIDER = "claude-cli"
 DEFAULT_SEARCHER = "ddgs"
 DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
+DEFAULT_MODEL = "sonnet"
 
 # Allowlists for hand-edited or migrated config files. A value outside
 # the set degrades to the default with an attempt_heal anomaly logged
@@ -34,6 +35,7 @@ DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
 # brain/bridge/provider.py:get_provider and brain/search/factory.py.
 KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
+KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ def _default_persona_config_dict() -> dict:
         "searcher": DEFAULT_SEARCHER,
         "mcp_audit_log_level": DEFAULT_MCP_AUDIT_LOG_LEVEL,
         "user_name": None,
+        "model": DEFAULT_MODEL,
     }
 
 
@@ -71,6 +74,7 @@ class PersonaConfig:
     searcher: str = DEFAULT_SEARCHER
     mcp_audit_log_level: str = DEFAULT_MCP_AUDIT_LOG_LEVEL
     user_name: str | None = None
+    model: str = DEFAULT_MODEL
 
     @classmethod
     def _parse_data(cls, data: object) -> PersonaConfig:
@@ -109,11 +113,23 @@ class PersonaConfig:
             if isinstance(user_name_raw, str) and user_name_raw.strip()
             else None
         )
+        model_raw = data.get("model", DEFAULT_MODEL)
+        model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
+        if model_str in KNOWN_MODELS:
+            model = model_str
+        else:
+            logger.warning(
+                "PersonaConfig: unknown model %r — falling back to %r",
+                model_str,
+                DEFAULT_MODEL,
+            )
+            model = DEFAULT_MODEL
         return cls(
             provider=provider,
             searcher=searcher,
             mcp_audit_log_level=audit_level,
             user_name=user_name,
+            model=model,
         )
 
     @classmethod
@@ -150,6 +166,7 @@ class PersonaConfig:
             "searcher": self.searcher,
             "mcp_audit_log_level": self.mcp_audit_log_level,
             "user_name": self.user_name,
+            "model": self.model,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
