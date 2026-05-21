@@ -33,7 +33,7 @@ On macOS: `~/Library/Logs/companion-emergence/`
 On Linux: `~/.local/state/companion-emergence/log/`
 On Windows: `%LOCALAPPDATA%\hanamorix\companion-emergence\Logs\`
 
-Set `KINDLED_HOME` to override the root on any platform.
+Run `nell paths` to see the exact resolved values on your machine, or set the `KINDLED_HOME` environment variable to override the root.
 
 Key files to look at:
 
