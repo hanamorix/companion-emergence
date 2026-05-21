@@ -30,6 +30,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1188,7 +1189,7 @@ def _format_claude_context_block(
     messages: list[ChatMessage],
     *,
     includes_latest_user: bool,
-    now: "datetime | None" = None,
+    now: datetime | None = None,
 ) -> str:
     """Return a JSONL context block for Claude CLI prompt/system text.
 
@@ -1199,9 +1200,7 @@ def _format_claude_context_block(
 
     ``now`` is an optional test seam — when None the real UTC clock is used.
     """
-    from datetime import UTC, datetime as _datetime
-
-    now_iso = ((now or _datetime.now(UTC))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if includes_latest_user:
         instruction = (
