@@ -316,6 +316,57 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
   });
 });
 
+// ── Model section (Phase 8.3) ─────────────────────────────────────
+
+vi.mock("./ModelPicker", () => ({
+  ModelPicker: ({ onClose }: { onClose: (m?: string) => void }) => (
+    <div data-testid="model-picker">
+      <button onClick={() => onClose("opus")}>Apply opus</button>
+      <button onClick={() => onClose()}>Cancel</button>
+    </div>
+  ),
+}));
+
+describe("ConnectionPanel — Model section (Phase 8.3)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the current model from state.connection.model", () => {
+    render(<ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null } })} persona="test" />);
+    // "Currently sonnet." text is in the Model section
+    expect(screen.getByText(/currently/i)).toBeInTheDocument();
+    // The "change" button is present
+    expect(screen.getByRole("button", { name: /change/i })).toBeInTheDocument();
+  });
+
+  it("shows 'change' button that reveals ModelPicker", () => {
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    const changeBtn = screen.getByRole("button", { name: /change/i });
+    expect(changeBtn).toBeInTheDocument();
+
+    fireEvent.click(changeBtn);
+    expect(screen.getByTestId("model-picker")).toBeInTheDocument();
+  });
+
+  it("updates local model display and hides picker after apply", async () => {
+    render(<ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null } })} persona="test" />);
+
+    fireEvent.click(screen.getByRole("button", { name: /change/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("model-picker")).not.toBeInTheDocument();
+    });
+    // Local model override applied
+    expect(screen.getByText(/opus/)).toBeInTheDocument();
+  });
+});
+
 // ── Supervisor install (Phase 3.2) ────────────────────────────────
 
 describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
