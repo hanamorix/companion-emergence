@@ -1225,6 +1225,8 @@ def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
             "speaker": _CLAUDE_SAFE_SPEAKERS.get(msg.role, msg.role),
             "text": msg.content_text(),
         }
+        if msg.ts:
+            record["ts"] = msg.ts
         if msg.tool_call_id:
             record["tool_call_id"] = msg.tool_call_id
         if msg.tool_calls:

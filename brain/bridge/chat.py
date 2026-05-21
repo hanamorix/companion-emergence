@@ -81,6 +81,7 @@ class ChatMessage:
 
     role: ChatRole
     content: tuple[ContentBlock, ...] | str
+    ts: str | None = None
     tool_call_id: str | None = None
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
 
