@@ -4,7 +4,7 @@ import json
 import logging
 from pathlib import Path
 
-from brain.persona_config import KNOWN_MODELS, DEFAULT_MODEL, PersonaConfig
+from brain.persona_config import DEFAULT_MODEL, KNOWN_MODELS, PersonaConfig
 
 
 def test_default_model_is_sonnet():
