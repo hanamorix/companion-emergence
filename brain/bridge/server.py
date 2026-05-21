@@ -309,7 +309,14 @@ class _StreamingProxy:
                 self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
             elif isinstance(ev, StreamDone):
                 if ev.content and not chunks:
+                    # No per-token deltas arrived (extended-thinking mode,
+                    # result-frame-only path, or EOF assistant-snapshot
+                    # fallback). Queue the content so the WS still emits at
+                    # least one reply_chunk frame — otherwise the chat
+                    # bubble renders empty until reopen. Bug surfaced in
+                    # v0.0.15-alpha.2; fix landed v0.0.16.1.
                     chunks = [ev.content]
+                    self._loop.call_soon_threadsafe(self._q.put_nowait, ev.content)
             elif isinstance(ev, StreamError):
                 raise ProviderError(ev.stage, ev.detail)
         return ChatResponse(
