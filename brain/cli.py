@@ -1854,6 +1854,22 @@ def _prompt_yes_no(question: str, default: bool = False) -> bool:
     return raw in {"y", "yes"}
 
 
+def _prompt_choice(label: str, choices: list[str], default: str, help: str = "") -> str:
+    """Interactive prompt restricted to an allowlist of choices.
+
+    Loops until a valid choice is entered. EOFError (non-interactive)
+    returns the default without looping. `help` is printed before the
+    prompt when non-empty.
+    """
+    while True:
+        if help:
+            print(help)
+        raw = _prompt(f"{label} [{'/'.join(choices)}]", default=default)
+        if raw in choices:
+            return raw
+        print(f"  (must be one of: {', '.join(choices)})", file=sys.stderr)
+
+
 def _init_handler(args: argparse.Namespace) -> int:
     """Set up a new persona — interactive wizard or flag-driven.
 
@@ -1874,6 +1890,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     migrate_from = args.migrate_from
     voice_template = args.voice_template
     force = bool(getattr(args, "force", False))
+    model = getattr(args, "model", None)
 
     # ----- interactive fill-in for missing flags -----
     if not persona:
@@ -1920,6 +1937,21 @@ def _init_handler(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if model is None:
+        from brain.persona_config import DEFAULT_MODEL, KNOWN_MODELS
+
+        print()
+        model = _prompt_choice(
+            "model",
+            choices=sorted(KNOWN_MODELS),
+            default=DEFAULT_MODEL,
+            help=(
+                "  sonnet — fast, smart, ~$3 per million input tokens (recommended)\n"
+                "  opus   — smartest, ~$15 per million input tokens (best for deep writing)\n"
+                "  haiku  — fastest, cheapest, less capable"
+            ),
+        )
+
     persona_dir = get_persona_dir(persona)
 
     # ----- guard against clobbering an existing persona -----
@@ -1963,7 +1995,7 @@ def _init_handler(args: argparse.Namespace) -> int:
 
     # ----- always: write persona_config + voice.md -----
     persona_dir.mkdir(parents=True, exist_ok=True)
-    config_path = write_persona_config(persona_dir, user_name=user_name)
+    config_path = write_persona_config(persona_dir, user_name=user_name, model=model)
     voice_path = install_voice_template(persona_dir, voice_template)
 
     print()
@@ -1971,7 +2003,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     # GitHub Actions Windows caught this: a leading "✓" raised
     # UnicodeEncodeError during bundled `nell init` smoke.
     print(f"OK persona '{persona}' ready at {persona_dir}")
-    print(f"  - {config_path.name}: user_name={user_name!r}")
+    print(f"  - {config_path.name}: user_name={user_name!r}, model={model!r}")
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2038,6 +2070,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=sorted(VOICE_TEMPLATES.keys()),
         help="Voice.md starter. Prompts if omitted.",
+    )
+    init_sub.add_argument(
+        "--model",
+        default=None,
+        choices=["haiku", "opus", "sonnet"],
+        help=(
+            "Claude model to use (sonnet/opus/haiku). Default: sonnet. "
+            "Prompts if omitted and running interactively."
+        ),
     )
     init_sub.add_argument(
         "--force",

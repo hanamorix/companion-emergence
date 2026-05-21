@@ -37,7 +37,7 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
         def generate(self, prompt, *, system=None):
             return extraction
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name: _Fake())
+    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _Fake())
 
 
 def test_health_returns_ok(persona_dir: Path):

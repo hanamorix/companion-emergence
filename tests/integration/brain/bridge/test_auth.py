@@ -49,7 +49,7 @@ def persona_dir_for_auth(tmp_path: Path) -> Path:
 def _patch_provider(monkeypatch, provider: LLMProvider) -> None:
     import brain.bridge.server as srv
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name: provider)
+    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: provider)
 
 
 # ---------- HTTP auth ----------

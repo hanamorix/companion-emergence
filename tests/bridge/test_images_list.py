@@ -36,7 +36,7 @@ def _patch_fake_provider(monkeypatch):
         def extract_memories(self, *args, **kwargs):
             return []
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name=None: _FakeProvider())
+    monkeypatch.setattr(srv, "get_provider", lambda _name=None, **_kw: _FakeProvider())
 
 
 def _auth_headers(token: str | None = None) -> dict[str, str]:

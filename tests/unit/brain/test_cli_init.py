@@ -25,13 +25,24 @@ def test_init_fresh_with_all_flags_writes_config(monkeypatch, tmp_path: Path) ->
     rc = _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--model",
+            "sonnet",
+        ],
     )
     assert rc == 0
     persona_dir = tmp_path / "personas" / "siren"
     assert persona_dir.exists()
     cfg = json.loads((persona_dir / "persona_config.json").read_text())
     assert cfg["user_name"] == "Hana"
+    assert cfg["model"] == "sonnet"
     # default template → no voice.md written
     assert not (persona_dir / "voice.md").exists()
 
@@ -43,11 +54,13 @@ def test_init_interactive_prompts_for_missing(monkeypatch, tmp_path: Path) -> No
         "Hana",  # user name
         "n",  # migrate? → no
         "default",  # voice template
+        "sonnet",  # model
     ]
     rc = _run_init(monkeypatch, tmp_path, [], inputs=inputs)
     assert rc == 0
     cfg = json.loads((tmp_path / "personas" / "siren" / "persona_config.json").read_text())
     assert cfg["user_name"] == "Hana"
+    assert cfg["model"] == "sonnet"
 
 
 def test_init_invalid_persona_name_returns_1(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -70,7 +83,17 @@ def test_init_existing_persona_refuses_without_force(monkeypatch, tmp_path: Path
     rc = _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--model",
+            "sonnet",
+        ],
     )
     assert rc == 1
     err = capsys.readouterr().err
@@ -96,6 +119,8 @@ def test_init_existing_persona_with_force_writes_config(monkeypatch, tmp_path: P
             "--fresh",
             "--voice-template",
             "default",
+            "--model",
+            "sonnet",
             "--force",
         ],
     )
@@ -118,6 +143,8 @@ def test_init_voice_template_nell_example_copies_voice_md(monkeypatch, tmp_path:
             "--fresh",
             "--voice-template",
             "nell-example",
+            "--model",
+            "sonnet",
         ],
     )
     assert rc == 0
@@ -150,7 +177,7 @@ def test_init_invalid_voice_template_via_prompt_returns_1(
         "siren",
         "Hana",
         "n",
-        "wat",  # bad template via prompt
+        "wat",  # bad template via prompt — validation fires before model prompt
     ]
     rc = _run_init(monkeypatch, tmp_path, [], inputs=inputs)
     assert rc == 1
@@ -162,7 +189,17 @@ def test_init_summary_includes_next_step_command(monkeypatch, tmp_path: Path, ca
     _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--model",
+            "sonnet",
+        ],
     )
     out = capsys.readouterr().out
     assert "uv run nell chat --persona siren" in out
@@ -172,7 +209,17 @@ def test_init_summary_is_encodable_on_windows_cp1252(monkeypatch, tmp_path: Path
     rc = _run_init(
         monkeypatch,
         tmp_path,
-        ["--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"],
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--model",
+            "sonnet",
+        ],
     )
     assert rc == 0
     out = capsys.readouterr().out

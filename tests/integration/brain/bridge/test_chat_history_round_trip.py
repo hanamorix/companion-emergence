@@ -57,7 +57,7 @@ def test_chat_history_round_trip_via_buffer_writer(persona_dir: Path, monkeypatc
     """Three turns written through ingest_turn surface intact over HTTP."""
     import brain.bridge.server as srv
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name: _FakeProvider())
+    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _FakeProvider())
 
     sid = "sess_abc12345"
     ingest_turn(persona_dir, {"session_id": sid, "speaker": "user", "text": "hi"})
