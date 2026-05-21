@@ -1188,6 +1188,7 @@ def _format_claude_context_block(
     messages: list[ChatMessage],
     *,
     includes_latest_user: bool,
+    now: "datetime | None" = None,
 ) -> str:
     """Return a JSONL context block for Claude CLI prompt/system text.
 
@@ -1195,7 +1196,13 @@ def _format_claude_context_block(
     ``Assistant:`` delimiters. JSON-string encoding also keeps embedded
     newlines or user-supplied delimiter-looking text inside the data field
     instead of creating new transcript lines.
+
+    ``now`` is an optional test seam — when None the real UTC clock is used.
     """
+    from datetime import UTC, datetime as _datetime
+
+    now_iso = ((now or _datetime.now(UTC))).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     if includes_latest_user:
         instruction = (
             "Answer the final human entry directly in the companion's voice. "
@@ -1211,6 +1218,8 @@ def _format_claude_context_block(
 
     lines = [
         "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
+        f"Current time: {now_iso}.",
+        "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed.",
         instruction,
         "",
     ]
