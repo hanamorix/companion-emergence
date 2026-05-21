@@ -1568,15 +1568,42 @@ class OllamaProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 
-def get_provider(name: str) -> LLMProvider:
+def get_provider(
+    name: str,
+    *,
+    persona_dir: Path | None = None,
+    model_override: str | None = None,
+) -> LLMProvider:
     """Resolve a provider identifier to an instance.
+
+    Parameters
+    ----------
+    name:
+        Provider name — "claude-cli", "ollama", or "fake".
+    persona_dir:
+        Optional path to the persona directory. When provided and the
+        provider is "claude-cli", the model is read from the persona's
+        persona_config.json (if present). Ignored for non-claude-cli providers.
+    model_override:
+        Explicit model name that wins over both persona_config and the
+        default. Useful for CLI --model flags. Ignored for non-claude-cli
+        providers.
 
     Raises ValueError on unknown name.
     """
     if name == "fake":
         return FakeProvider()
     if name == "claude-cli":
-        return ClaudeCliProvider()
+        from brain.persona_config import DEFAULT_MODEL, PersonaConfig
+
+        model = model_override
+        if model is None and persona_dir is not None:
+            cfg_path = persona_dir / "persona_config.json"
+            if cfg_path.exists():
+                model = PersonaConfig.load(cfg_path).model
+        if model is None:
+            model = DEFAULT_MODEL
+        return ClaudeCliProvider(model=model)
     if name == "ollama":
         return OllamaProvider()
     raise ValueError(f"Unknown provider: {name!r}")

@@ -681,7 +681,7 @@ def build_app(
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
         config = PersonaConfig.load(persona_dir / "persona_config.json")
-        provider = get_provider(config.provider)
+        provider = get_provider(config.provider, persona_dir=persona_dir)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())

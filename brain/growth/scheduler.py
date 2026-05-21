@@ -146,7 +146,7 @@ def run_growth_tick(
             from brain.persona_config import PersonaConfig
 
             cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-            provider = get_provider(cfg.provider)
+            provider = get_provider(cfg.provider, persona_dir=persona_dir)
             crystallize_creative_dna(
                 store=store,
                 persona_dir=persona_dir,
