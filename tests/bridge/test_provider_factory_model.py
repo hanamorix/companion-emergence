@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from brain.bridge.provider import get_provider, ClaudeCliProvider
+from brain.bridge.provider import ClaudeCliProvider, get_provider
 
 
 def test_factory_reads_model_from_config(tmp_path: Path):
