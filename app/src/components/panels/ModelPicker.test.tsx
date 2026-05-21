@@ -6,7 +6,7 @@ import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/re
 import "@testing-library/jest-dom/vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (cmd: string, args: { persona: string }) => {
+  invoke: vi.fn(async (cmd: string, _args: { persona: string }) => {
     if (cmd === "get_bridge_credentials") {
       return { port: 50000, auth_token: null };
     }
