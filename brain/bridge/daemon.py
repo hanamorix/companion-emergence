@@ -62,7 +62,7 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
     embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
     config = PersonaConfig.load(persona_dir / "persona_config.json")
-    provider = get_provider(config.provider)
+    provider = get_provider(config.provider, persona_dir=persona_dir)
     try:
         reports = close_stale_sessions(
             persona_dir,
