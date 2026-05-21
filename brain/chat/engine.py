@@ -282,6 +282,7 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
         else:
             continue  # skip unknown speakers defensively
 
+        ts = t.get("ts") or None
         image_shas = t.get("image_shas") or []
         if role == "user" and image_shas:
             blocks: list[ContentBlock] = []
@@ -298,12 +299,12 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
                         exc,
                     )
             if blocks:
-                out.append(ChatMessage(role=role, content=tuple(blocks)))
+                out.append(ChatMessage(role=role, content=tuple(blocks), ts=ts))
             elif text:
-                out.append(ChatMessage(role=role, content=text))
+                out.append(ChatMessage(role=role, content=text, ts=ts))
             continue
 
-        out.append(ChatMessage(role=role, content=text))
+        out.append(ChatMessage(role=role, content=text, ts=ts))
     return out
 
 
