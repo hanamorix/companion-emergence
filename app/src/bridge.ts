@@ -462,3 +462,26 @@ export async function fetchHealth(persona: string): Promise<{ liveness: string }
   if (!r.ok) throw new Error(`/health ${r.status}`);
   return (await r.json()) as { liveness: string };
 }
+
+/** The three model tiers the bridge supports. */
+export type ChatModel = "sonnet" | "opus" | "haiku";
+
+/**
+ * Switch the active LLM model for the given persona.
+ *
+ * POSTs {model} to POST /persona/config/model. The bridge validates
+ * against KNOWN_MODELS, persists to persona_config.json, and hot-swaps
+ * provider._model so the next chat uses the new model without a restart.
+ *
+ * Throws on any non-2xx response.
+ */
+export async function setPersonaModel(persona: string, model: ChatModel): Promise<void> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/config/model`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ model }),
+    }),
+  );
+  if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
+}

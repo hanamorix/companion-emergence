@@ -27,6 +27,7 @@ import {
   getBridgeCredentials,
   newSession,
   resetBridgeCredentialCache,
+  setPersonaModel,
   uploadImage,
 } from "./bridge";
 
@@ -229,5 +230,46 @@ describe("fetchPersonaFeed", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(fetchPersonaFeed("alice")).rejects.toThrow();
+  });
+});
+
+describe("setPersonaModel", () => {
+  beforeEach(() => {
+    resetBridgeCredentialCache();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs to /persona/config/model with the supplied model", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await setPersonaModel("alice", "opus");
+
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/persona/config/model");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    expect(init!.body).toContain("opus");
+  });
+
+  it("resolves without a value on success", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "haiku" }), { status: 200 }),
+    ));
+
+    await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
+  });
+
+  it("throws on a non-2xx response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "unknown_model" }), { status: 400 }),
+    ));
+
+    await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
   });
 });
