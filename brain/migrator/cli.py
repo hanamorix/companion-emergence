@@ -576,6 +576,11 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
             "prior crash, etc.)."
         ),
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit MigrationReport as JSON on stdout. Default when stdout is not a TTY.",
+    )
     p.set_defaults(func=_dispatch)
     return p
 
@@ -584,6 +589,10 @@ def _dispatch(args: argparse.Namespace) -> int:
     """Argparse-compatible handler: convert Namespace → run the right
     migrator for the chosen ``--source`` (nellbrain or emergence-kit).
     """
+    import sys as _sys
+
+    emit_json = getattr(args, "json", False) or not _sys.stdout.isatty()
+
     source = getattr(args, "source", "nellbrain")
     if source == "emergence-kit":
         from brain.migrator.emergence_kit import (
@@ -599,7 +608,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             force=args.force,
         )
         report = migrate_emergence_kit(kit_args)
-        print(format_report(report))
+        if emit_json:
+            print(report.to_json())
+        else:
+            print(format_report(report))
         return 0
 
     migrate_args = MigrateArgs(
@@ -609,5 +621,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         force=args.force,
         force_preflight=args.force_preflight,
     )
-    run_migrate(migrate_args)
+    report = run_migrate(migrate_args)
+    if emit_json:
+        print(report.to_json())
     return 0
