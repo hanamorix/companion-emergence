@@ -5,7 +5,10 @@ import {
   runInit,
   runMigrate,
   writeAppConfig,
+  type ExistingCePreflight,
   type InitArgs,
+  type InitResult,
+  type MigrateSource,
 } from "../appConfig";
 import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../platform";
 import { WizardAvatar } from "./Avatar";
@@ -18,10 +21,14 @@ import { StepMigrate } from "./steps/StepMigrate";
 import { StepReview } from "./steps/StepReview";
 import { StepInstalling } from "./steps/StepInstalling";
 import { StepReady } from "./steps/StepReady";
+import { errString } from "../lib/errString";
+import { computeWizardSteps } from "./wizardStepCounter";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
-export type MigrateSource = "nellbrain" | "emergence-kit";
+// MigrateSource is now canonical in appConfig.ts — imported above.
+// Re-export for consumers that import from Wizard.tsx directly.
+export type { MigrateSource };
 
 export interface WizardState {
   mode: WizardMode;
@@ -68,20 +75,14 @@ export function Wizard({ onDone }: Props) {
     output: string;
     error: string;
   } | null>(null);
+  // Preflight result for the existing companion-emergence branch.
+  // Held here so StepMigrate, StepReview, and runInstall all share the same object.
+  const [preflight, setPreflight] = useState<ExistingCePreflight | null>(null);
 
-  // Total steps depends on mode — migrate adds the migrate step
-  const totalSteps = state.mode === "migrate" ? 8 : 7;
-  const stepNum: Record<Step, number> = {
-    welcome: 1,
-    prereq: 2,
-    name: 3,
-    user: 4,
-    voice: 5,
-    migrate: 6,
-    review: state.mode === "migrate" ? 7 : 6,
-    installing: state.mode === "migrate" ? 8 : 7,
-    ready: state.mode === "migrate" ? 8 : 7,
-  };
+  // Step counter and total come from computeWizardSteps — the canonical
+  // source of truth for all three migrate branches + fresh flow.
+  const isCeMigrate = state.mode === "migrate" && state.migrateSource === "companion-emergence";
+  const { totalSteps, stepNum } = computeWizardSteps(state.mode, state.migrateSource);
 
   function update<K extends keyof WizardState>(key: K, value: WizardState[K]) {
     setState((s) => ({ ...s, [key]: value }));
@@ -100,6 +101,53 @@ export function Wizard({ onDone }: Props) {
     ready: "review",
   };
 
+  // Shared post-install helper — supervisor service + nell CLI symlink.
+  // Called from all three install branches so we don't duplicate this logic.
+  async function runPostInstall(personaName: string): Promise<{ serviceTrailer: string; cliTrailer: string }> {
+    const platform = getClientPlatform();
+    const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
+    const currentPlatformLabel = platformLabel(platform);
+
+    // Plan C — install the launchd LaunchAgent so the supervisor
+    // outlives the .app from the very first run. macOS-only; on
+    // Windows/Linux we skip quietly so the ready pane doesn't make
+    // unsupported platform work look like a failure.
+    let serviceTrailer = "";
+    if (macInstallActionsSupported) {
+      try {
+        const svc = await installSupervisorService(personaName);
+        serviceTrailer = svc.success
+          ? `\n\n[service] launchd agent installed`
+          : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
+      } catch (e) {
+        serviceTrailer =
+          `\n\n[service] could not install launchd agent: ${errString(e)}` +
+          " — supervisor will fall back to the .app's lifecycle.";
+      }
+    } else {
+      serviceTrailer = `\n\n[service] persistent service install is macOS-only; on ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle.`;
+    }
+
+    // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
+    // their Terminal without typing the .app's Resources path. Also
+    // macOS-only for now; skip on Windows/Linux with a reassuring note.
+    let cliTrailer = "";
+    if (macInstallActionsSupported) {
+      try {
+        const cli = await installNellCliSymlink();
+        cliTrailer = cli.success
+          ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
+          : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
+      } catch (e) {
+        cliTrailer = `\n\n[cli] could not install nell symlink: ${errString(e)}`;
+      }
+    } else {
+      cliTrailer = `\n\n[cli] bundled CLI shortcut install is macOS-only; no action is needed for normal app use on ${currentPlatformLabel}.`;
+    }
+
+    return { serviceTrailer, cliTrailer };
+  }
+
   async function runInstall() {
     setStep("installing");
     // emergence-kit takes the new auto-importer path: ``nell migrate
@@ -109,17 +157,55 @@ export function Wizard({ onDone }: Props) {
     // preflight + lock checks live there.
     const useEmergenceKitMigrator =
       state.mode === "migrate" && state.migrateSource === "emergence-kit";
+    const useCompanionEmergenceMigrator =
+      state.mode === "migrate" && state.migrateSource === "companion-emergence";
 
-    const args: InitArgs = {
-      persona: state.personaName,
-      user_name: state.userName.trim() || null,
-      voice_template: state.voiceTemplate,
-      migrate_from:
-        state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
-      force: false,
-    };
     try {
-      let result;
+      let result: InitResult;
+
+      if (useCompanionEmergenceMigrator) {
+        // For the existing-CE branch the preflight result carries the persona
+        // name — it was already validated by the preflight check in StepMigrate.
+        // No follow-up runInit needed: the copied dir already has persona_config.json.
+        const personaName = preflight?.persona_name ?? state.personaName;
+        result = await runMigrate({
+          persona: personaName,
+          source: "companion-emergence",
+          input_dir: state.migrateFromPath,
+          force: false,
+        });
+        if (!result.success) {
+          setInstallResult({
+            ok: false,
+            output: result.stdout,
+            error: result.stderr || `exit ${result.exit_code}`,
+          });
+          return;
+        }
+        await writeAppConfig({
+          selected_persona: personaName,
+          always_on_top: false,
+          reduced_motion: false,
+        });
+        const { serviceTrailer, cliTrailer } = await runPostInstall(personaName);
+        setInstallResult({
+          ok: true,
+          output: result.stdout + serviceTrailer + cliTrailer,
+          error: "",
+        });
+        setTimeout(() => setStep("ready"), 1200);
+        return;
+      }
+
+      const args: InitArgs = {
+        persona: state.personaName,
+        user_name: state.userName.trim() || null,
+        voice_template: state.voiceTemplate,
+        migrate_from:
+          state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
+        force: false,
+      };
+
       if (useEmergenceKitMigrator) {
         // Run the kit migrator first, which creates the persona dir
         // and seeds memories.db / crystallizations.db / personality.json.
@@ -153,6 +239,7 @@ export function Wizard({ onDone }: Props) {
       } else {
         result = await runInit(args);
       }
+
       if (!result.success) {
         setInstallResult({
           ok: false,
@@ -166,44 +253,7 @@ export function Wizard({ onDone }: Props) {
         always_on_top: false,
         reduced_motion: false,
       });
-      const platform = getClientPlatform();
-      const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
-      const currentPlatformLabel = platformLabel(platform);
-      // Plan C — install the launchd LaunchAgent so the supervisor
-      // outlives the .app from the very first run. macOS-only; on
-      // Windows/Linux we skip quietly so the ready pane doesn't make
-      // unsupported platform work look like a failure.
-      let serviceTrailer = "";
-      if (macInstallActionsSupported) {
-        try {
-          const svc = await installSupervisorService(state.personaName);
-          serviceTrailer = svc.success
-            ? `\n\n[service] launchd agent installed`
-            : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
-        } catch (e) {
-          serviceTrailer =
-            `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
-            " — supervisor will fall back to the .app's lifecycle.";
-        }
-      } else {
-        serviceTrailer = `\n\n[service] persistent service install is macOS-only; on ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle.`;
-      }
-      // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
-      // their Terminal without typing the .app's Resources path. Also
-      // macOS-only for now; skip on Windows/Linux with a reassuring note.
-      let cliTrailer = "";
-      if (macInstallActionsSupported) {
-        try {
-          const cli = await installNellCliSymlink();
-          cliTrailer = cli.success
-            ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
-            : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
-        } catch (e) {
-          cliTrailer = `\n\n[cli] could not install nell symlink: ${(e as Error).message}`;
-        }
-      } else {
-        cliTrailer = `\n\n[cli] bundled CLI shortcut install is macOS-only; no action is needed for normal app use on ${currentPlatformLabel}.`;
-      }
+      const { serviceTrailer, cliTrailer } = await runPostInstall(state.personaName);
       setInstallResult({
         ok: true,
         output: result.stdout + serviceTrailer + cliTrailer,
@@ -214,7 +264,7 @@ export function Wizard({ onDone }: Props) {
       // brain is fully alive.
       setTimeout(() => setStep("ready"), 1200);
     } catch (e) {
-      setInstallResult({ ok: false, output: "", error: (e as Error).message });
+      setInstallResult({ ok: false, output: "", error: errString(e) });
     }
   }
 
@@ -241,7 +291,9 @@ export function Wizard({ onDone }: Props) {
         <StepPrerequisites
           step={stepNum.prereq}
           totalSteps={totalSteps}
-          onNext={() => setStep("name")}
+          // New ordering: in migrate mode, go to the source-picker BEFORE
+          // name/user/voice so the CE branch can skip those steps entirely.
+          onNext={() => state.mode === "migrate" ? setStep("migrate") : setStep("name")}
           onBack={() => setStep("welcome")}
           avatar={avatar}
         />
@@ -254,7 +306,8 @@ export function Wizard({ onDone }: Props) {
           value={state.personaName}
           onChange={(v) => update("personaName", v)}
           onNext={() => setStep("user")}
-          onBack={() => setStep("prereq")}
+          // Back from name goes to migrate (if migrate mode) or prereq (fresh).
+          onBack={() => state.mode === "migrate" ? setStep("migrate") : setStep("prereq")}
           avatar={avatar}
         />
       );
@@ -277,7 +330,8 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           template={state.voiceTemplate}
           onTemplateChange={(t) => update("voiceTemplate", t)}
-          onNext={() => setStep(state.mode === "migrate" ? "migrate" : "review")}
+          // voice always proceeds to review (migrate step is now earlier in the flow)
+          onNext={() => setStep("review")}
           onBack={() => setStep("user")}
           avatar={avatar}
         />
@@ -291,8 +345,15 @@ export function Wizard({ onDone }: Props) {
           onPathChange={(p) => update("migrateFromPath", p)}
           source={state.migrateSource}
           onSourceChange={(s) => update("migrateSource", s)}
-          onNext={() => setStep("review")}
-          onBack={() => setStep("voice")}
+          preflight={preflight}
+          onPreflightChange={setPreflight}
+          // CE branch skips name/user/voice and goes straight to review.
+          onNext={() =>
+            state.migrateSource === "companion-emergence"
+              ? setStep("review")
+              : setStep("name")
+          }
+          onBack={() => setStep("prereq")}
           avatar={avatar}
         />
       );
@@ -302,8 +363,9 @@ export function Wizard({ onDone }: Props) {
           step={stepNum.review}
           totalSteps={totalSteps}
           state={state}
+          preflight={preflight}
           onInstall={runInstall}
-          onBack={() => setStep(state.mode === "migrate" ? "migrate" : "voice")}
+          onBack={() => state.mode === "migrate" ? setStep("migrate") : setStep("voice")}
           avatar={avatar}
         />
       );
@@ -326,8 +388,18 @@ export function Wizard({ onDone }: Props) {
         <StepReady
           step={stepNum.ready}
           totalSteps={totalSteps}
-          persona={state.personaName}
-          onDone={() => onDone(state.personaName)}
+          persona={
+            isCeMigrate && preflight?.persona_name
+              ? preflight.persona_name
+              : state.personaName
+          }
+          onDone={() =>
+            onDone(
+              isCeMigrate && preflight?.persona_name
+                ? preflight.persona_name
+                : state.personaName
+            )
+          }
           avatar={avatar}
         />
       );

@@ -417,6 +417,8 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         soul_candidates_skipped_reason=soul_candidates_skipped_reason,
         reflex_log_fires_migrated=reflex_log_fires_migrated,
         reflex_log_skipped_reason=reflex_log_skipped_reason,
+        bytes_copied=0,
+        source_kind="nellbrain",
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
@@ -530,7 +532,7 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
         )
     p.add_argument(
         "--source",
-        choices=["nellbrain", "emergence-kit"],
+        choices=["nellbrain", "emergence-kit", "companion-emergence"],
         default="nellbrain",
         help=(
             "Source format. ``nellbrain`` (default) expects a full OG "
@@ -560,6 +562,15 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
         type=str,
         help="Install migrated data as this persona name.",
     )
+    g.add_argument(
+        "--preflight",
+        action="store_true",
+        default=False,
+        help=(
+            "Run preflight checks only — inspect source dir and emit JSON report; do NOT copy. "
+            "Only valid for --source companion-emergence."
+        ),
+    )
     p.add_argument(
         "--force",
         action="store_true",
@@ -574,6 +585,11 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
             "prior crash, etc.)."
         ),
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit MigrationReport as JSON on stdout. Default when stdout is not a TTY.",
+    )
     p.set_defaults(func=_dispatch)
     return p
 
@@ -582,7 +598,37 @@ def _dispatch(args: argparse.Namespace) -> int:
     """Argparse-compatible handler: convert Namespace → run the right
     migrator for the chosen ``--source`` (nellbrain or emergence-kit).
     """
+    import sys as _sys
+
+    emit_json = getattr(args, "json", False) or not _sys.stdout.isatty()
+
     source = getattr(args, "source", "nellbrain")
+    if source == "companion-emergence":
+        from brain.migrator.companion_emergence import (
+            CompanionEmergenceMigrateArgs,
+            migrate_companion_emergence,
+            preflight_companion_emergence,
+        )
+        from brain.migrator.report import format_report as _format_report
+
+        if getattr(args, "preflight", False):
+            result = preflight_companion_emergence(args.input_dir)
+            print(json.dumps(result, default=str))
+            return 0
+        if not args.install_as:
+            import sys as _sys2
+            _sys2.exit("--install-as is required for a non-preflight companion-emergence migrate")
+        report = migrate_companion_emergence(CompanionEmergenceMigrateArgs(
+            input_dir=args.input_dir,
+            install_as=args.install_as,
+            force=args.force,
+        ))
+        if emit_json:
+            print(report.to_json())
+        else:
+            print(_format_report(report))
+        return 0
+
     if source == "emergence-kit":
         from brain.migrator.emergence_kit import (
             EmergenceKitMigrateArgs,
@@ -597,7 +643,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             force=args.force,
         )
         report = migrate_emergence_kit(kit_args)
-        print(format_report(report))
+        if emit_json:
+            print(report.to_json())
+        else:
+            print(format_report(report))
         return 0
 
     migrate_args = MigrateArgs(
@@ -607,5 +656,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         force=args.force,
         force_preflight=args.force_preflight,
     )
-    run_migrate(migrate_args)
+    report = run_migrate(migrate_args)
+    if emit_json:
+        print(report.to_json())
     return 0

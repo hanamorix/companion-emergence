@@ -17,6 +17,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -75,6 +76,11 @@ class PersonaConfig:
     mcp_audit_log_level: str = DEFAULT_MCP_AUDIT_LOG_LEVEL
     user_name: str | None = None
     model: str = DEFAULT_MODEL
+    last_opened_at: str | None = None  # ISO8601 with Z suffix; written by bridge on startup
+
+    def touch_last_opened(self) -> None:
+        """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
+        self.last_opened_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     @classmethod
     def _parse_data(cls, data: object) -> PersonaConfig:
@@ -124,12 +130,19 @@ class PersonaConfig:
                 DEFAULT_MODEL,
             )
             model = DEFAULT_MODEL
+        last_opened_at_raw = data.get("last_opened_at")
+        last_opened_at = (
+            last_opened_at_raw
+            if isinstance(last_opened_at_raw, str) and last_opened_at_raw.strip()
+            else None
+        )
         return cls(
             provider=provider,
             searcher=searcher,
             mcp_audit_log_level=audit_level,
             user_name=user_name,
             model=model,
+            last_opened_at=last_opened_at,
         )
 
     @classmethod
@@ -167,6 +180,7 @@ class PersonaConfig:
             "mcp_audit_log_level": self.mcp_audit_log_level,
             "user_name": self.user_name,
             "model": self.model,
+            "last_opened_at": self.last_opened_at,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)

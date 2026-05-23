@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from brain.health.attempt_heal import save_with_backup_text
 from brain.migrator.og import FileManifest
 from brain.migrator.transform import SkippedMemory
+
+SourceKind = Literal["nellbrain", "emergence-kit", "companion-emergence"]
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,21 @@ class MigrationReport:
     soul_candidates_skipped_reason: str | None = None
     reflex_log_fires_migrated: int = 0
     reflex_log_skipped_reason: str | None = None
+    # NEW in v0.0.18 — kept at end for backwards-compat positional construction:
+    bytes_copied: int = 0
+    source_kind: SourceKind = "nellbrain"
+
+    def to_json(self) -> str:
+        """Serialise the report to a JSON string suitable for machine parsing.
+
+        The payload includes a kind discriminator key ("MigrationReport")
+        so consumers can detect the message type without inspecting the shape.
+        Nested dataclasses (e.g. SkippedMemory) are recursively converted
+        to dicts by dataclasses.asdict.
+        """
+        payload = asdict(self)
+        payload["kind"] = "MigrationReport"
+        return json.dumps(payload, default=str)
 
 
 def format_report(report: MigrationReport) -> str:

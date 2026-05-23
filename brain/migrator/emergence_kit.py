@@ -329,6 +329,8 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
         legacy_skipped_reason=(
             None if personality_copied else "personality.json not present in source"
         ),
+        bytes_copied=0,
+        source_kind="emergence-kit",
     )
 
 

@@ -11,12 +11,13 @@
 //! Everything else (state polling, chat) is plain HTTP from the frontend
 //! and goes via the bridge daemon (see brain/bridge/server.py).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
 mod install_shape;
+pub mod launch_log;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeCredentials {
@@ -200,30 +201,64 @@ fn write_app_config(config: AppConfig) -> Result<(), String> {
     std::fs::write(&path, serialized).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
-/// Walk a personas directory and return the visible persona names.
+/// Summary of one on-disk persona, surfaced to NellFace's boot picker.
+/// `last_opened_at` (written by the bridge on startup) drives recency sort;
+/// `has_memories_db` lets the picker flag incomplete/interrupted dirs.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct PersonaSummary {
+    pub name: String,
+    pub last_opened_at: Option<String>,
+    pub has_memories_db: bool,
+}
+
+/// Walk a personas directory and return a summary per visible persona.
 /// Pure function — extracted for unit testing (audit 2026-05-08 P4-3).
 /// Filters out: ``<name>.new`` migrator working dirs, ``<name>.backup-*``
-/// install-as archives, and dotfiles.
-fn list_personas_at(personas_dir: &std::path::Path) -> Result<Vec<String>, String> {
+/// install-as archives, and dotfiles. Sorted by ``last_opened_at`` desc
+/// (most-recently-opened first), falling back to name asc.
+fn list_personas_at(personas_dir: &std::path::Path) -> Result<Vec<PersonaSummary>, String> {
     if !personas_dir.exists() {
         return Ok(vec![]);
     }
     let entries = std::fs::read_dir(personas_dir)
         .map_err(|e| format!("read {}: {}", personas_dir.display(), e))?;
-    let mut names: Vec<String> = entries
+    let mut out: Vec<PersonaSummary> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| !n.ends_with(".new"))
-        .filter(|n| !n.contains(".backup-"))
-        .filter(|n| !n.starts_with('.'))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.ends_with(".new") || name.contains(".backup-") || name.starts_with('.') {
+                return None;
+            }
+            let persona_path = e.path();
+            let has_memories_db = persona_path.join("memories.db").is_file();
+            let last_opened_at = std::fs::read_to_string(persona_path.join("persona_config.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("last_opened_at")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                });
+            Some(PersonaSummary {
+                name,
+                last_opened_at,
+                has_memories_db,
+            })
+        })
         .collect();
-    names.sort();
-    Ok(names)
+    // Recency desc, then name asc. ISO8601 strings sort lexically = chronologically.
+    out.sort_by(|a, b| match (&a.last_opened_at, &b.last_opened_at) {
+        (Some(av), Some(bv)) => bv.cmp(av), // later timestamp first
+        (Some(_), None) => std::cmp::Ordering::Less, // has timestamp → before one without
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    });
+    Ok(out)
 }
 
 #[tauri::command]
-fn list_personas() -> Result<Vec<String>, String> {
+fn list_personas() -> Result<Vec<PersonaSummary>, String> {
     list_personas_at(&nellbrain_home()?.join("personas"))
 }
 
@@ -311,6 +346,57 @@ fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// Last `n` bytes of a string (UTF-8-safe at the char boundary).
+fn tail(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let start = s.len() - n;
+    // Walk forward to the next char boundary so we never split a UTF-8 codepoint.
+    let start = (start..s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len());
+    s[start..].to_string()
+}
+
+/// Append a structured entry to `$KINDLED_HOME/launch-failures.log` for a
+/// failed CLI spawn. Best-effort: any error here is swallowed so a logging
+/// problem never masks the real spawn failure the caller is reporting.
+fn record_spawn_failure(
+    app: &tauri::AppHandle,
+    command: &str,
+    output: Option<&std::process::Output>,
+    error_msg: Option<&str>,
+    started: std::time::Instant,
+) {
+    let home = match nellbrain_home() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let (exit_code, stdout_tail, stderr_tail) = match output {
+        Some(o) => (
+            o.status.code(),
+            tail(&String::from_utf8_lossy(&o.stdout), 2048),
+            tail(&String::from_utf8_lossy(&o.stderr), 2048),
+        ),
+        None => (None, String::new(), error_msg.unwrap_or("").to_string()),
+    };
+    let runtime = bundled_nell_path(app).ok().flatten();
+    let runtime_path_exists = runtime.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let failure = launch_log::LaunchFailure {
+        command: command.to_string(),
+        exit_code,
+        stdout_tail,
+        stderr_tail,
+        platform: std::env::consts::OS.to_string(),
+        platform_version: std::env::consts::ARCH.to_string(),
+        bundled_runtime_path: runtime.map(|p| p.to_string_lossy().into_owned()),
+        runtime_path_exists,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    let _ = launch_log::append_failure(&home, &failure);
+}
+
 fn unstable_macos_app_path_reason(path: &std::path::Path) -> Option<String> {
     let text = path.to_string_lossy();
     if text.starts_with("/Volumes/") {
@@ -364,6 +450,7 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     // through `await ensureBridgeRunning(...)` indefinitely. 60s is
     // generous against typical 5-15s startup; if it triggers, the
     // user gets `supervisor_start_timeout` instead of a stuck UI.
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args(["supervisor", "start", "--persona", &persona])
@@ -374,12 +461,24 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell supervisor start: {}", e)),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell supervisor start: {}", e);
+            record_spawn_failure(&app, "nell supervisor start", None, Some(&msg), started);
+            return Err(msg);
+        }
         Err(_) => {
+            record_spawn_failure(
+                &app,
+                "nell supervisor start",
+                None,
+                Some("supervisor_start_timeout"),
+                started,
+            );
             return Err("supervisor_start_timeout".to_string());
         }
     };
     if !output.status.success() {
+        record_spawn_failure(&app, "nell supervisor start", Some(&output), None, started);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "supervisor start failed (exit {}): {}",
@@ -438,10 +537,19 @@ async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<
     ensure_bridge_running(app, persona).await
 }
 
+/// Migration sources NellFace knows how to dispatch. Kept in sync with
+/// brain/migrator/cli.py's --source choices. companion-emergence (v0.0.18)
+/// is the validated forward-copy path for CE→CE upgrades.
+const KNOWN_MIGRATE_SOURCES: [&str; 3] = ["nellbrain", "emergence-kit", "companion-emergence"];
+
+fn is_known_migrate_source(source: &str) -> bool {
+    KNOWN_MIGRATE_SOURCES.contains(&source)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MigrateArgs {
     pub persona: String,
-    pub source: String, // "nellbrain" | "emergence-kit"
+    pub source: String, // "nellbrain" | "emergence-kit" | "companion-emergence"
     pub input_dir: String,
     pub force: bool,
 }
@@ -452,12 +560,14 @@ async fn run_migrate(
     args: MigrateArgs,
 ) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
-    if args.source != "nellbrain" && args.source != "emergence-kit" {
+    if !is_known_migrate_source(&args.source) {
         return Err(format!(
-            "unknown migrate source {:?} (expected nellbrain or emergence-kit)",
-            args.source
+            "unknown migrate source {:?} (expected one of: {})",
+            args.source,
+            KNOWN_MIGRATE_SOURCES.join(" | ")
         ));
     }
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args([
@@ -487,15 +597,154 @@ async fn run_migrate(
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell migrate: {}", e)),
-        Err(_) => return Err("migrate_timeout".to_string()),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell migrate: {}", e);
+            record_spawn_failure(&app, "nell migrate", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(&app, "nell migrate", None, Some("migrate_timeout"), started);
+            return Err("migrate_timeout".to_string());
+        }
     };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell migrate", Some(&output), None, started);
+    }
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         exit_code: output.status.code().unwrap_or(-1),
     })
+}
+
+/// A single preflight finding (validation error or warning), mirroring the
+/// Python preflight_companion_emergence dict shape. `detail` carries
+/// structured extras (e.g. suggested_subdirs for the pointed_at_parent code).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreflightIssue {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Result of inspecting a candidate companion-emergence persona dir.
+/// Pure read — `preflight_existing_ce` never mutates the source.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExistingCePreflight {
+    pub ok: bool,
+    pub persona_name: Option<String>,
+    pub imported_user_name: Option<String>,
+    pub imported_voice_template: Option<String>,
+    pub memory_count: Option<i64>,
+    pub crystallization_count: Option<i64>,
+    pub hebbian_edge_count: Option<i64>,
+    pub source_size_bytes: i64,
+    pub errors: Vec<PreflightIssue>,
+    pub warnings: Vec<PreflightIssue>,
+}
+
+/// Inspect a directory the user pointed at, to decide whether it's a valid
+/// companion-emergence persona we can forward-copy. Shells out to the Python
+/// migrator's --preflight mode (single source of truth for validation rules)
+/// and parses the JSON it prints on the last stdout line.
+#[tauri::command]
+async fn preflight_existing_ce(
+    app: tauri::AppHandle,
+    input_dir: String,
+) -> Result<ExistingCePreflight, String> {
+    let started = std::time::Instant::now();
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args([
+        "migrate",
+        "--source",
+        "companion-emergence",
+        "--preflight",
+        "--input",
+        &input_dir,
+        "--json",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell migrate --preflight: {}", e);
+            record_spawn_failure(&app, "nell migrate --preflight", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(
+                &app,
+                "nell migrate --preflight",
+                None,
+                Some("preflight_timeout"),
+                started,
+            );
+            return Err("preflight_timeout".to_string());
+        }
+    };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell migrate --preflight", Some(&output), None, started);
+        return Err(format!(
+            "preflight exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last_line = stdout.lines().last().unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| format!("parse preflight json: {}", e))
+}
+
+/// Resolve $KINDLED_HOME as a string for the frontend (e.g. to show the
+/// launch-failures.log path in the bridge-error screen).
+#[tauri::command]
+fn nellbrain_home_path() -> Result<String, String> {
+    Ok(nellbrain_home()?.to_string_lossy().into_owned())
+}
+
+/// Open the OS file manager at `path`'s containing folder (or the folder
+/// itself if `path` is a directory). Best-effort; surfaces spawn errors.
+#[tauri::command]
+async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    let target = if p.is_file() {
+        p.parent().map(Path::to_path_buf).unwrap_or(p)
+    } else {
+        p
+    };
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("explorer: {e}"))?;
+    }
+    Ok(())
 }
 
 const INIT_TIMEOUT_SECS: u64 = 30;
@@ -505,6 +754,7 @@ const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.arg("init");
@@ -541,9 +791,19 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell init: {}", e)),
-        Err(_) => return Err("init_timeout".to_string()),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell init: {}", e);
+            record_spawn_failure(&app, "nell init", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(&app, "nell init", None, Some("init_timeout"), started);
+            return Err("init_timeout".to_string());
+        }
     };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell init", Some(&output), None, started);
+    }
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1072,6 +1332,9 @@ pub fn run() {
             force_restart_bridge,
             run_init,
             run_migrate,
+            preflight_existing_ce,
+            nellbrain_home_path,
+            reveal_in_file_manager,
             install_supervisor_service,
             install_nell_cli_symlink,
             check_claude_cli,
@@ -1465,7 +1728,8 @@ mod tests {
         // Stray non-dir file shouldn't show up either.
         write(&personas.join("README.md"), "not a persona");
 
-        let names = list_personas_at(&personas).unwrap();
+        let summaries = list_personas_at(&personas).unwrap();
+        let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, vec!["alice".to_string(), "nell".to_string()]);
     }
 
@@ -1474,6 +1738,42 @@ mod tests {
         let dir = tempdir().unwrap();
         let names = list_personas_at(&dir.path().join("does-not-exist")).unwrap();
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn list_personas_at_reports_memories_db_and_recency_sort() {
+        let dir = tempdir().unwrap();
+        let personas = dir.path().join("personas");
+        // phoebe: has memories.db + a recent last_opened_at
+        fs::create_dir_all(personas.join("phoebe")).unwrap();
+        write(&personas.join("phoebe").join("memories.db"), "");
+        write(
+            &personas.join("phoebe").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
+        );
+        // nell: has memories.db + an older last_opened_at
+        fs::create_dir_all(personas.join("nell")).unwrap();
+        write(&personas.join("nell").join("memories.db"), "");
+        write(
+            &personas.join("nell").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
+        );
+        // broken: no memories.db, no config
+        fs::create_dir_all(personas.join("broken")).unwrap();
+
+        let summaries = list_personas_at(&personas).unwrap();
+        let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
+        // phoebe (most recent) → nell (older) → broken (no timestamp, name asc last)
+        assert_eq!(
+            names,
+            vec!["phoebe".to_string(), "nell".to_string(), "broken".to_string()]
+        );
+        let broken = summaries.iter().find(|s| s.name == "broken").unwrap();
+        assert!(!broken.has_memories_db);
+        assert!(broken.last_opened_at.is_none());
+        let phoebe = summaries.iter().find(|s| s.name == "phoebe").unwrap();
+        assert!(phoebe.has_memories_db);
+        assert_eq!(phoebe.last_opened_at.as_deref(), Some("2026-05-23T09:00:00Z"));
     }
 
     #[test]
@@ -1541,6 +1841,19 @@ mod tests {
         assert!(args.contains(&"service".to_string()));
         assert!(args.contains(&"install".to_string()));
         assert!(args.contains(&"--persona".to_string()));
+    }
+
+    #[test]
+    fn is_known_migrate_source_accepts_all_three_sources() {
+        assert!(is_known_migrate_source("nellbrain"));
+        assert!(is_known_migrate_source("emergence-kit"));
+        assert!(is_known_migrate_source("companion-emergence"));
+    }
+
+    #[test]
+    fn is_known_migrate_source_rejects_unknown() {
+        assert!(!is_known_migrate_source("garbage"));
+        assert!(!is_known_migrate_source(""));
     }
 }
 

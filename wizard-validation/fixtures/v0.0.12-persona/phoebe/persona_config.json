@@ -1,0 +1,7 @@
+{
+  "persona_name": "phoebe",
+  "user_name": "zero",
+  "voice_template": "nell-example",
+  "provider": "claude-cli",
+  "model": "sonnet"
+}

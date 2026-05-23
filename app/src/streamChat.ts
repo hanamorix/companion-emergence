@@ -15,6 +15,7 @@
  */
 
 import { getBridgeCredentials, resetBridgeCredentialCache } from "./bridge";
+import { errString } from "./lib/errString";
 
 export interface StreamChatHandlers {
   /** Called once when the server confirms it's about to respond. */
@@ -197,7 +198,7 @@ export async function streamChat(
       if (!started && authishClose && !retriedCredentials) {
         retriedCredentials = true;
         resetBridgeCredentialCache(persona);
-        void connect().catch((e) => fail((e as Error).message));
+        void connect().catch((e) => fail(errString(e)));
         return;
       }
       fail(`ws closed before completion (${event.code || "unknown"}): ${event.reason || "no reason"}`);

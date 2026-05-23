@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ensureBridgeRunning } from "../../appConfig";
 import { fetchPersonaState } from "../../bridge";
 import { Divider, WButton, WizardShell } from "../components";
+import { errString } from "../../lib/errString";
 
 interface Props {
   step: number;
@@ -68,7 +69,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
         update("bridge", { status: "ok" });
       } catch (e) {
         if (cancelledRef.current) return;
-        update("bridge", { status: "error", detail: (e as Error).message });
+        update("bridge", { status: "error", detail: errString(e) });
         setFellThrough(true);
         return;
       }
@@ -111,7 +112,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
           // Don't flip state to error on the first failed poll —
           // bridge might still be coming up. Only surface after the
           // overall timeout.
-          update("state", { status: "running", detail: (e as Error).message });
+          update("state", { status: "running", detail: errString(e) });
         }
         await sleep(POLL_INTERVAL_MS);
       }

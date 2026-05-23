@@ -8,6 +8,7 @@ import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
 import { check } from "@tauri-apps/plugin-updater";
+import { errString } from "../../lib/errString";
 import type { Update } from "@tauri-apps/plugin-updater";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
@@ -87,7 +88,7 @@ export function ConnectionPanel({
         setUpd({ kind: "up-to-date" });
       }
     } catch (e) {
-      setUpd({ kind: "error", detail: (e as Error).message || "unknown error" });
+      setUpd({ kind: "error", detail: errString(e) || "unknown error" });
     }
   }
 
@@ -97,7 +98,7 @@ export function ConnectionPanel({
       await update.downloadAndInstall(() => {});
       setUpd({ kind: "ready" });
     } catch (e) {
-      setUpd({ kind: "error", detail: (e as Error).message || "download failed" });
+      setUpd({ kind: "error", detail: errString(e) || "download failed" });
     }
   }
 
@@ -117,7 +118,7 @@ export function ConnectionPanel({
         });
       }
     } catch (e) {
-      setInstall({ kind: "error", detail: (e as Error).message });
+      setInstall({ kind: "error", detail: errString(e) });
     }
   }
 
@@ -138,7 +139,7 @@ export function ConnectionPanel({
         });
       }
     } catch (e) {
-      setCliInstall({ kind: "error", detail: (e as Error).message });
+      setCliInstall({ kind: "error", detail: errString(e) });
     }
   }
 

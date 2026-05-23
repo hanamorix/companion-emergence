@@ -2,10 +2,14 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ensureBridgeRunning,
+  listPersonas,
+  nellbrainHomePath,
   readAppConfig,
+  revealInFileManager,
   setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
+  type PersonaSummary,
 } from "./appConfig";
 
 function dragWindow(e: React.MouseEvent) {
@@ -18,12 +22,15 @@ import { ChatPanel } from "./components/ChatPanel";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { Wizard } from "./wizard/Wizard";
+import { PersonaPicker } from "./wizard/PersonaPicker";
+import { errString } from "./lib/errString";
 
 const STATE_POLL_MS = 5000;
 
 type AppPhase =
   | { kind: "loading" }
   | { kind: "wizard" }
+  | { kind: "picker"; personas: PersonaSummary[] }
   | { kind: "starting-bridge"; persona: string; error: string | null }
   | { kind: "ready"; persona: string };
 
@@ -45,7 +52,7 @@ export default function App() {
       await ensureBridgeRunning(persona);
       setPhase({ kind: "ready", persona });
     } catch (e) {
-      setPhase({ kind: "starting-bridge", persona, error: (e as Error).message });
+      setPhase({ kind: "starting-bridge", persona, error: errString(e) });
     }
   }
 
@@ -54,15 +61,39 @@ export default function App() {
     (async () => {
       const cfg = await readAppConfig();
       setConfig(cfg);
-      if (!cfg.selected_persona) {
+      if (cfg.selected_persona) {
+        await startPersona(cfg.selected_persona);
+        return;
+      }
+      const onDisk = await listPersonas();
+      if (onDisk.length === 0) {
         setPhase({ kind: "wizard" });
         return;
       }
-      await startPersona(cfg.selected_persona);
+      if (onDisk.length === 1) {
+        await writeAppConfig({ ...cfg, selected_persona: onDisk[0].name });
+        await startPersona(onDisk[0].name);
+        return;
+      }
+      setPhase({ kind: "picker", personas: onDisk });
     })();
   }, []);
 
   if (phase.kind === "loading") return <BootScreen subtitle="Loading…" />;
+
+  if (phase.kind === "picker") {
+    return (
+      <PersonaPicker
+        personas={phase.personas}
+        onPick={async (name) => {
+          await writeAppConfig({ ...config!, selected_persona: name });
+          setPhase({ kind: "loading" });
+          await startPersona(name);
+        }}
+        onNew={() => setPhase({ kind: "wizard" })}
+      />
+    );
+  }
 
   if (phase.kind === "wizard") {
     return (
@@ -119,6 +150,14 @@ function BridgeErrorScreen({
   onRunSetup: () => void;
 }) {
   const diagnostics = `persona=${persona}\nbridge_start_error=${error}`;
+  const [logPath, setLogPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    nellbrainHomePath().then((home) => {
+      if (home) setLogPath(`${home}/launch-failures.log`);
+    });
+  }, []);
+
   async function copyDiagnostics() {
     try {
       await navigator.clipboard.writeText(diagnostics);
@@ -173,6 +212,16 @@ function BridgeErrorScreen({
           <BootButton onClick={onRunSetup}>Re-run setup</BootButton>
           <BootButton onClick={() => void copyDiagnostics()}>Copy diagnostics</BootButton>
         </div>
+        {logPath && (
+          <div style={{ marginTop: 16, fontSize: 11, color: "var(--mauve)", textAlign: "left", maxWidth: 460 }}>
+            <div style={{ marginBottom: 6 }}>
+              More detail: <code style={{ fontSize: 10.5, wordBreak: "break-all" }}>{logPath}</code>
+            </div>
+            <BootButton onClick={() => void revealInFileManager(logPath)}>
+              Open log folder
+            </BootButton>
+          </div>
+        )}
       </div>
     </>
   );
@@ -255,7 +304,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           setStateError(null);
         }
       } catch (e) {
-        if (!cancelled) setStateError((e as Error).message);
+        if (!cancelled) setStateError(errString(e));
       }
     }
     tick();

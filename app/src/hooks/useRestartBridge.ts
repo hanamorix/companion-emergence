@@ -31,6 +31,7 @@ import {
   invokeForceRestart,
   fetchHealth,
 } from "../bridge";
+import { errString } from "../lib/errString";
 
 export type RestartState =
   | "idle"
@@ -156,7 +157,7 @@ export function useRestartBridge(
           try {
             await invokeForceRestart(persona);
           } catch (e) {
-            setErrorDetail((e as Error).message || FAILED_USER_MESSAGE);
+            setErrorDetail(errString(e) || FAILED_USER_MESSAGE);
             return false;
           }
           transition("waiting_for_health");
