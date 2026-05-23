@@ -8,6 +8,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { errString } from "./lib/errString";
 
 export interface AppConfig {
   selected_persona: string | null;
@@ -40,11 +41,65 @@ export async function writeAppConfig(config: AppConfig): Promise<void> {
   }
 }
 
-export async function listPersonas(): Promise<string[]> {
+// ---------------------------------------------------------------------------
+// Migration / transfer types
+// ---------------------------------------------------------------------------
+
+export type MigrateSource = "nellbrain" | "emergence-kit" | "companion-emergence";
+
+export interface PreflightIssue {
+  code: string;
+  message: string;
+  detail?: unknown;
+}
+
+export interface ExistingCePreflight {
+  ok: boolean;
+  persona_name: string | null;
+  imported_user_name: string | null;
+  imported_voice_template: string | null;
+  memory_count: number | null;
+  crystallization_count: number | null;
+  hebbian_edge_count: number | null;
+  source_size_bytes: number;
+  errors: PreflightIssue[];
+  warnings: PreflightIssue[];
+}
+
+export interface PersonaSummary {
+  name: string;
+  last_opened_at: string | null;
+  has_memories_db: boolean;
+}
+
+export interface SkippedMemory {
+  id: string;
+  reason: string;
+  field: string;
+  raw_snippet: string;
+}
+
+export interface MigrationReport {
+  kind: "MigrationReport";
+  source_kind: MigrateSource;
+  memories_migrated: number;
+  memories_skipped: SkippedMemory[];
+  edges_migrated: number;
+  crystallizations_migrated: number;
+  bytes_copied: number;
+  elapsed_seconds: number;
+  personality_copied?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Persona helpers
+// ---------------------------------------------------------------------------
+
+export async function listPersonas(): Promise<PersonaSummary[]> {
   try {
-    return await invoke<string[]>("list_personas");
+    return await invoke<PersonaSummary[]>("list_personas");
   } catch (e) {
-    console.warn("[appConfig] list_personas failed:", e);
+    console.warn("[appConfig] list_personas:", errString(e));
     return [];
   }
 }
@@ -53,7 +108,7 @@ export async function ensureBridgeRunning(persona: string): Promise<void> {
   try {
     await invoke("ensure_bridge_running", { persona });
   } catch (e) {
-    // Browser dev mode — Tauri's `invoke` is undefined. Treat as a no-op
+    // Browser dev mode — Tauri's invoke is undefined. Treat as a no-op
     // and assume the bridge is already running externally; the next
     // fetch through bridge.ts will surface a real failure if it isn't.
     if (import.meta.env.DEV) {
@@ -73,6 +128,10 @@ export async function setAlwaysOnTop(value: boolean): Promise<void> {
     throw e;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Installer / init helpers
+// ---------------------------------------------------------------------------
 
 export interface InitArgs {
   persona: string;
@@ -95,15 +154,15 @@ export async function runInit(args: InitArgs): Promise<InitResult> {
 
 export interface MigrateArgs {
   persona: string;
-  /** "nellbrain" or "emergence-kit". */
-  source: "nellbrain" | "emergence-kit";
+  /** Migration source kind — widened to include companion-emergence. */
+  source: MigrateSource;
   /** Absolute path to the source brain's data directory. */
   input_dir: string;
   force: boolean;
 }
 
 /**
- * Run ``nell migrate`` against the given source brain. Used by the
+ * Run `nell migrate` against the given source brain. Used by the
  * wizard's StepInstalling to one-click import a NellBrain or
  * emergence-kit dataset into the new persona before the launchd
  * agent installs over it.
@@ -112,6 +171,48 @@ export async function runMigrate(args: MigrateArgs): Promise<InitResult> {
   return await invoke<InitResult>("run_migrate", { args });
 }
 
+// ---------------------------------------------------------------------------
+// Transfer / preflight helpers (Bundle 5 Tauri commands)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a preflight check against an existing companion-emergence data
+ * directory. Returns counts, detected persona name, and any errors or
+ * warnings the Rust layer found — all without modifying the source.
+ */
+export async function runPreflightExistingCE(input_dir: string): Promise<ExistingCePreflight> {
+  return await invoke<ExistingCePreflight>("preflight_existing_ce", { input_dir });
+}
+
+/**
+ * Open the given path in the OS file manager (Finder / Explorer / Nautilus).
+ * Silently swallows errors — convenience helper, never load-bearing.
+ */
+export async function revealInFileManager(path: string): Promise<void> {
+  try {
+    await invoke("reveal_in_file_manager", { path });
+  } catch (e) {
+    console.warn("[appConfig] reveal_in_file_manager:", errString(e));
+  }
+}
+
+/**
+ * Return the resolved KINDLED_HOME / NELLBRAIN_HOME path on the host.
+ * Returns null in browser dev mode (no Tauri runtime).
+ */
+export async function nellbrainHomePath(): Promise<string | null> {
+  try {
+    return await invoke<string>("nellbrain_home_path");
+  } catch (e) {
+    console.warn("[appConfig] nellbrain_home_path:", errString(e));
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System / prerequisites helpers
+// ---------------------------------------------------------------------------
+
 export interface ClaudeCliCheck {
   found: boolean;
   path: string | null;
@@ -119,13 +220,12 @@ export interface ClaudeCliCheck {
 }
 
 /**
- * Probe the host for Anthropic's ``claude`` CLI — the LLM provider
+ * Probe the host for Anthropic's `claude` CLI — the LLM provider
  * the framework shells out to. Powers the wizard's prerequisites
- * step: when ``found`` is false the user gets install instructions
+ * step: when `found` is false the user gets install instructions
  * and re-checks until it passes. The Tauri side checks several
- * common install paths AND tries a bare ``claude --version`` so
- * Homebrew, ``~/.local/bin``, and ``/usr/local/bin`` installs all
- * resolve.
+ * common install paths AND tries a bare `claude --version` so
+ * Homebrew, ~/.local/bin, and /usr/local/bin installs all resolve.
  */
 export async function checkClaudeCli(): Promise<ClaudeCliCheck> {
   return await invoke<ClaudeCliCheck>("check_claude_cli");
@@ -134,7 +234,7 @@ export async function checkClaudeCli(): Promise<ClaudeCliCheck> {
 /**
  * Install the launchd LaunchAgent for the persona's supervisor.
  *
- * Run this after a successful ``runInit`` so first-launch users land
+ * Run this after a successful runInit so first-launch users land
  * on the launchd-managed-supervisor model directly. The supervisor
  * then survives .app quit/relaunch cycles via launchd's KeepAlive,
  * which solves the "talk to Nell, close the app, brain dies" issue
