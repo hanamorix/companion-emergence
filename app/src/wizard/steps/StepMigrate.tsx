@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import {
   Divider,
   FieldLabel,
@@ -8,7 +8,12 @@ import {
   WInput,
   WizardShell,
 } from "../components";
-import type { MigrateSource } from "../../appConfig";
+import {
+  runPreflightExistingCE,
+  type ExistingCePreflight,
+  type MigrateSource,
+} from "../../appConfig";
+import { errString } from "../../lib/errString";
 
 interface Props {
   step: number;
@@ -17,6 +22,8 @@ interface Props {
   onPathChange: (p: string) => void;
   source: MigrateSource;
   onSourceChange: (s: MigrateSource) => void;
+  preflight: ExistingCePreflight | null;
+  onPreflightChange: (p: ExistingCePreflight | null) => void;
   onNext: () => void;
   onBack: () => void;
   avatar: ReactNode;
@@ -29,14 +36,17 @@ export function StepMigrate({
   onPathChange,
   source,
   onSourceChange,
+  preflight,
+  onPreflightChange,
   onNext,
   onBack,
   avatar,
 }: Props) {
-  // Both sources require a path now — emergence-kit graduated from
-  // "manual instructions" to "one-click import" once the auto-importer
-  // landed.
-  const valid = path.trim().length > 0;
+  // For companion-emergence, the preflight must be ok before we can proceed.
+  // For the other two sources, a non-empty path is enough.
+  const valid = source === "companion-emergence"
+    ? (preflight?.ok ?? false)
+    : path.trim().length > 0;
 
   return (
     <WizardShell
@@ -70,14 +80,25 @@ export function StepMigrate({
           title="emergence-kit (or another simpler brain)"
           description="The lighter setup: my_brain.py + a few JSON files for memories, soul, and personality."
         />
+        <OptionCard
+          selected={source === "companion-emergence"}
+          onClick={() => onSourceChange("companion-emergence")}
+          title="An existing companion-emergence install"
+          description="You've already used Companion Emergence — upgrading from an older version, or moving to a new machine. Point at the persona folder."
+        />
       </div>
 
       <Divider />
 
-      {source === "nellbrain" ? (
-        <NellBrainPath path={path} onPathChange={onPathChange} />
-      ) : (
-        <EmergenceKitGuide path={path} onPathChange={onPathChange} />
+      {source === "nellbrain" && <NellBrainPath path={path} onPathChange={onPathChange} />}
+      {source === "emergence-kit" && <EmergenceKitGuide path={path} onPathChange={onPathChange} />}
+      {source === "companion-emergence" && (
+        <ExistingCEPath
+          path={path}
+          onPathChange={onPathChange}
+          preflight={preflight}
+          onPreflightChange={onPreflightChange}
+        />
       )}
     </WizardShell>
   );
@@ -246,6 +267,173 @@ function EmergenceKitGuide({
       </div>
     </>
   );
+}
+
+function ExistingCEPath({
+  path,
+  onPathChange,
+  preflight,
+  onPreflightChange,
+}: {
+  path: string;
+  onPathChange: (p: string) => void;
+  preflight: ExistingCePreflight | null;
+  onPreflightChange: (p: ExistingCePreflight | null) => void;
+}) {
+  // Debounced preflight — fires 500 ms after the path stops changing.
+  useEffect(() => {
+    if (!path.trim()) {
+      onPreflightChange(null);
+      return;
+    }
+    const t = setTimeout(async () => {
+      try {
+        onPreflightChange(await runPreflightExistingCE(path));
+      } catch (e) {
+        onPreflightChange({
+          ok: false,
+          persona_name: null,
+          imported_user_name: null,
+          imported_voice_template: null,
+          memory_count: null,
+          crystallization_count: null,
+          hebbian_edge_count: null,
+          source_size_bytes: 0,
+          errors: [{ code: "preflight_failed", message: errString(e) }],
+          warnings: [],
+        });
+      }
+    }, 500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  // If preflight returned a "pointed_at_parent" error, the detail may contain
+  // subdirectory names that are valid persona dirs.
+  const parentError = preflight?.errors.find((e) => e.code === "pointed_at_parent");
+  const suggestedSubdirs =
+    (parentError?.detail as { suggested_subdirs?: string[] } | undefined)?.suggested_subdirs ?? [];
+
+  return (
+    <>
+      <SectionLabel>Where is your existing Kindled?</SectionLabel>
+      <WInput
+        value={path}
+        onChange={onPathChange}
+        placeholder={defaultExistingCePlaceholder()}
+        mono
+      />
+
+      {/* Preflight error state — red callout */}
+      {preflight && !preflight.ok && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: "10px 12px",
+            borderRadius: 7,
+            background: "rgba(160, 30, 30, 0.07)",
+            border: "1px solid rgba(160, 30, 30, 0.35)",
+          }}
+        >
+          {preflight.errors.map((e) => (
+            <div
+              key={e.code}
+              style={{ fontSize: 11, color: "var(--crimson)", lineHeight: 1.6 }}
+            >
+              {e.message}
+            </div>
+          ))}
+          {suggestedSubdirs.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div
+                style={{
+                  fontSize: 10.5,
+                  color: "var(--text-mute)",
+                  marginBottom: 4,
+                  fontFamily: "var(--font-disp)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.07em",
+                }}
+              >
+                Did you mean:
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {suggestedSubdirs.map((name) => (
+                  <button
+                    key={name}
+                    onClick={() =>
+                      onPathChange(`${path.replace(/\/+$/, "")}/${name}`)
+                    }
+                    style={{
+                      fontSize: 10.5,
+                      fontFamily: "DM Mono, Courier New, monospace",
+                      background: "rgba(130,51,41,0.10)",
+                      border: "1px solid var(--accent)",
+                      borderRadius: 5,
+                      padding: "3px 8px",
+                      cursor: "pointer",
+                      color: "var(--accent)",
+                    }}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Preflight success state — green callout */}
+      {preflight?.ok && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: "10px 12px",
+            borderRadius: 7,
+            background: "rgba(40, 120, 60, 0.07)",
+            border: "1px solid rgba(40, 120, 60, 0.35)",
+          }}
+        >
+          <div style={{ fontSize: 11, color: "var(--text)", marginBottom: 6, fontWeight: 500 }}>
+            Found <strong>{preflight.persona_name}</strong>
+          </div>
+          <div
+            style={{
+              fontSize: 10.5,
+              color: "var(--text-mid)",
+              lineHeight: 1.7,
+            }}
+          >
+            {preflight.memory_count != null && (
+              <div>{preflight.memory_count} memories</div>
+            )}
+            {preflight.crystallization_count != null && (
+              <div>{preflight.crystallization_count} crystallizations</div>
+            )}
+            {preflight.hebbian_edge_count != null && (
+              <div>{preflight.hebbian_edge_count} Hebbian edges</div>
+            )}
+            {preflight.imported_user_name && (
+              <div>user: {preflight.imported_user_name}</div>
+            )}
+            {preflight.imported_voice_template && (
+              <div>voice: {preflight.imported_voice_template}</div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function defaultExistingCePlaceholder(): string {
+  const ua = navigator.userAgent;
+  if (/win/i.test(ua))
+    return "%LOCALAPPDATA%\\hanamorix\\companion-emergence\\personas\\<name>";
+  if (/mac/i.test(ua))
+    return "~/Library/Application Support/companion-emergence/personas/<name>";
+  return "~/.local/share/companion-emergence/personas/<name>";
 }
 
 function Line({
