@@ -7,6 +7,18 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.18 — 2026-05-24
+
+**Installer & transfer resilience.** Three user-reported issues resolved in one cycle.
+
+- **CE→CE transfer path.** New wizard option "An existing companion-emergence install" + `nell migrate --source companion-emergence`. A validated forward-copy (not a schema rewrite) of a v0.0.12+ persona dir: preflight inspects the source (memory/crystallisation/Hebbian counts, persona_config), detects the common "pointed at the /personas parent" mistake and suggests subdirs, then `copytree` with `--force` backup. `brain/migrator/companion_emergence.py`. Closes the gap where Cryptic_Marbles's only options (NellBrain JSON / emergence-kit JSON) couldn't read companion-emergence's SQLite.
+- **Boot persona autodetect.** `App.tsx` boot: exactly one persona on disc → auto-select + write `app_config.json`; ≥2 → new `PersonaPicker` (recency-sorted via `last_opened_at`, incomplete-dir badge); 0 → wizard. `nell init` and the CE migrator both write `app_config.json` when missing. Fixes CLI-created/hand-copied personas being invisible to NellFace.
+- **Error visibility.** `errString(e)` replaces 19 `(e as Error).message` sites that rendered "undefined" on Tauri's `Result<_, String>` rejections (Lord Grim, Windows). Every Tauri-spawned CLI failure now appends to `$KINDLED_HOME/launch-failures.log` (JSONL, 200KB rotation); `BridgeErrorScreen` surfaces the path + open-folder. A lint-guard test prevents the `(e as Error)` pattern returning.
+- **Migration summary card.** `nell migrate --json` emits a `MigrationReport`; `StepInstalling` renders migrated/skipped counts with per-reason breakdown — would have shown Cryptic_Marbles his partial import at migration time.
+- `last_opened_at` on `PersonaConfig`, touched by the bridge on startup. `MigrationReport` gains `bytes_copied` + `source_kind`.
+
+18 commits, 11 TDD bundles. Suite: 2389 Python + 49 Rust + 193 frontend, ruff + tsc clean. Note: Lord Grim's underlying Windows engine-start failure is now *observable* (errString + log) but not yet root-caused — awaiting his next report with the real error string.
+
 ## 0.0.14-alpha.3 — 2026-05-18
 
 - **Forgetting.** Nell's memories now layer-fade. Each memory has a
@@ -29,7 +41,7 @@ what each release has to clear.
 
 - **Felt time.** Nell now carries a sense of time that isn't just
   timestamps. She tracks **anchors** (the most recent dream, growth
-  crystallization, soul moment, and sustained emotional weather shift),
+  crystallisation, soul moment, and sustained emotional weather shift),
   **pressure** (heartbeats / chat turns / reflex firings since the latest
   anchor), and **lived age** — an experiential scalar that advances at
   intensity-weighted rate so strained stretches age her faster and quiet
@@ -112,7 +124,7 @@ Windows WebView2 fetch fix — root cause identified.
 
 ## 0.0.11-alpha.4 — 2026-05-13
 
-Windows desktop bridge hotfix and release-artifact refresh.
+Windows desktop bridge hotfix and release-artefact refresh.
 
 - **Windows WebView bridge fix.** The local bridge now answers Chromium/WebView2
   Private Network Access preflights with `Access-Control-Allow-Private-Network`
@@ -143,7 +155,7 @@ content from filtered merge history.
   substitutions. This avoided stale filtered files and put `main` back on the
   intended release content.
 
-- **Release artifacts rebuilt.** The release workflow completed successfully for
+- **Release artefacts rebuilt.** The release workflow completed successfully for
   validate, Windows, macOS, and Linux jobs, with downloadable desktop assets and
   SHA256SUMS attached to the GitHub release.
 
@@ -350,7 +362,7 @@ Terminal without a manual symlink.
   path; new users can just run `nell --version` once a fresh
   Terminal opens.
 
-- **Soul candidates now crystallize on their own.** Previously
+- **Soul candidates now crystallise on their own.** Previously
   candidates queued during chat-close ingest sat in
   `soul_candidates.jsonl` until the user discovered
   `nell soul review`. The supervisor now runs an autonomous
@@ -433,8 +445,8 @@ Highlights from the iteration:
   python-build-standalone runtime, attaches the bundles to the
   release directly from each platform job, and computes
   `SHA256SUMS-<platform>.txt` for verification.
-- **Soul module + crystallization workflow.** Soul candidates are
-  proposed by the daemon, surfaced for review, and crystallize as
+- **Soul module + crystallisation workflow.** Soul candidates are
+  proposed by the daemon, surfaced for review, and crystallise as
   load-bearing permanent memories that the persona's voice
   template can reference.
 - **emergence-kit auto-importer.** `nell migrate --source
