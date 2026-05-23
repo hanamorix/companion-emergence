@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ensureBridgeRunning,
+  listPersonas,
   readAppConfig,
   setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
+  type PersonaSummary,
 } from "./appConfig";
 
 function dragWindow(e: React.MouseEvent) {
@@ -18,6 +20,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { Wizard } from "./wizard/Wizard";
+import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
 
 const STATE_POLL_MS = 5000;
@@ -25,6 +28,7 @@ const STATE_POLL_MS = 5000;
 type AppPhase =
   | { kind: "loading" }
   | { kind: "wizard" }
+  | { kind: "picker"; personas: PersonaSummary[] }
   | { kind: "starting-bridge"; persona: string; error: string | null }
   | { kind: "ready"; persona: string };
 
@@ -55,15 +59,39 @@ export default function App() {
     (async () => {
       const cfg = await readAppConfig();
       setConfig(cfg);
-      if (!cfg.selected_persona) {
+      if (cfg.selected_persona) {
+        await startPersona(cfg.selected_persona);
+        return;
+      }
+      const onDisk = await listPersonas();
+      if (onDisk.length === 0) {
         setPhase({ kind: "wizard" });
         return;
       }
-      await startPersona(cfg.selected_persona);
+      if (onDisk.length === 1) {
+        await writeAppConfig({ ...cfg, selected_persona: onDisk[0].name });
+        await startPersona(onDisk[0].name);
+        return;
+      }
+      setPhase({ kind: "picker", personas: onDisk });
     })();
   }, []);
 
   if (phase.kind === "loading") return <BootScreen subtitle="Loading…" />;
+
+  if (phase.kind === "picker") {
+    return (
+      <PersonaPicker
+        personas={phase.personas}
+        onPick={async (name) => {
+          await writeAppConfig({ ...config!, selected_persona: name });
+          setPhase({ kind: "loading" });
+          await startPersona(name);
+        }}
+        onNew={() => setPhase({ kind: "wizard" })}
+      />
+    );
+  }
 
   if (phase.kind === "wizard") {
     return (
