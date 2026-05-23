@@ -9,15 +9,119 @@ what each release has to clear.
 
 ## 0.0.18 — 2026-05-24
 
-**Installer & transfer resilience.** Three user-reported issues resolved in one cycle.
+**Installer & transfer resilience.**
 
-- **CE→CE transfer path.** New wizard option "An existing companion-emergence install" + `nell migrate --source companion-emergence`. A validated forward-copy (not a schema rewrite) of a v0.0.12+ persona dir: preflight inspects the source (memory/crystallisation/Hebbian counts, persona_config), detects the common "pointed at the /personas parent" mistake and suggests subdirs, then `copytree` with `--force` backup. `brain/migrator/companion_emergence.py`. Closes the gap where Cryptic_Marbles's only options (NellBrain JSON / emergence-kit JSON) couldn't read companion-emergence's SQLite.
-- **Boot persona autodetect.** `App.tsx` boot: exactly one persona on disc → auto-select + write `app_config.json`; ≥2 → new `PersonaPicker` (recency-sorted via `last_opened_at`, incomplete-dir badge); 0 → wizard. `nell init` and the CE migrator both write `app_config.json` when missing. Fixes CLI-created/hand-copied personas being invisible to NellFace.
-- **Error visibility.** `errString(e)` replaces 19 `(e as Error).message` sites that rendered "undefined" on Tauri's `Result<_, String>` rejections (Lord Grim, Windows). Every Tauri-spawned CLI failure now appends to `$KINDLED_HOME/launch-failures.log` (JSONL, 200KB rotation); `BridgeErrorScreen` surfaces the path + open-folder. A lint-guard test prevents the `(e as Error)` pattern returning.
-- **Migration summary card.** `nell migrate --json` emits a `MigrationReport`; `StepInstalling` renders migrated/skipped counts with per-reason breakdown — would have shown Cryptic_Marbles his partial import at migration time.
-- `last_opened_at` on `PersonaConfig`, touched by the bridge on startup. `MigrationReport` gains `bytes_copied` + `source_kind`.
+- **Bring an existing companion over.** The setup wizard has a new migration option — "An existing companion-emergence install" — for upgrading from an older version or moving to a new machine. Point it at your old persona folder; it validates and copies everything across. No migration step runs, because the data already speaks the framework's language. Closes the gap where the only options were the original NellBrain framework or the lighter emergence-kit.
+- **One companion? You're straight in.** On launch, if you have exactly one companion on disc, the app selects it automatically. More than one — you get a quick picker. This also means a companion you set up from the command line (or copied in by hand) is now seen by the app instead of being stuck on the welcome screen.
+- **Real errors instead of "undefined".** Setup and engine-start failures now show the actual underlying message rather than a bare "undefined". Failures are also written to `launch-failures.log` in your data folder, and the connection-error screen links straight to it — so a bug report can include what actually happened.
+- **Migration summary.** After bringing a companion across, you see exactly how many memories came over, how many were skipped, and why — no more silent partial imports.
+- **New CLI command:** `nell migrate --source companion-emergence --input <persona-dir> --install-as <name>` mirrors the wizard's new option for command-line users.
 
-18 commits, 11 TDD bundles. Suite: 2389 Python + 49 Rust + 193 frontend, ruff + tsc clean. Note: Lord Grim's underlying Windows engine-start failure is now *observable* (errString + log) but not yet root-caused — awaiting his next report with the real error string.
+This is a minor version bump on top of v0.0.17. Older persona folders are forward-compatible — the migration is a validated copy, not a schema rewrite.
+
+## 0.0.17 — 2026-05-21
+
+**Patch: chat bubbles no longer render empty during live streaming.**
+
+When the underlying Claude CLI returned a reply in a single block (extended-thinking mode, short fast responses, or the EOF-snapshot fallback path), the bridge's streaming proxy captured the text for persistence but didn't send any `reply_chunk` frames to the frontend. The chat bubble stayed empty — just the bubble shape and timestamp — until you reopened NellFace, at which point the history endpoint reloaded the persisted text. The live-arrival path was broken; the history-reload path always worked.
+
+Now any reply that arrives via `StreamDone` without per-token deltas is queued as a single chunk at done-time, so the bubble fills in instantly instead of staying empty. Progressive per-token streaming (the common case) is unchanged.
+
+Bug surfaced on v0.0.15-alpha.2; present through v0.0.16; fixed here. Two regression tests cover the done-only and progressive paths in `_StreamingProxy.chat()`.
+
+## 0.0.16 — 2026-05-21
+
+**Time + model surfaces.**
+
+- **Per-message timestamps in chat context.** Conversations now carry a wall-clock `ts` field per turn. Combined with a new "Current time" preamble in the prompt, this stops Claude from inventing wrong time-of-day in her replies — the 6-hour-ago user message no longer reads as "14 hours ago".
+- **Pick your Claude model.** Wizard now asks which Claude model you want: `sonnet` (default, fast + smart), `opus` (smartest, best for deep writing), or `haiku` (fastest, cheapest, less capable). Persists to `persona_config.json`.
+- **New `Model` section in the Connection panel** lets you switch models at runtime without re-running the wizard. The change is live for the next chat turn — no restart needed.
+- **`POST /persona/config/model`** endpoint for programmatic model switching (bearer-auth, allowlist-validated).
+
+This is a minor version bump — first non-alpha cycle since v0.0.15 stabilised across the alpha train (alpha.1 grief, alpha.2 chat reliability, alpha.3 Linux lift, alpha.4 CLI persona polish). Old `persona_config.json` files without a `model` field load cleanly with the sonnet default.
+
+## 0.0.15-alpha.4 — 2026-05-21
+
+**CLI persona polish.**
+
+- `nell status` (and every other `nell` subcommand) no longer assumes
+  your persona is named "nell". If you have exactly one installed, it
+  picks that one. If you have several, it lists them with a clear
+  "use `--persona <name>`" hint. If you have none, it points you at
+  `nell init` instead of failing mysteriously.
+- New `nell paths` subcommand prints where everything lives — root,
+  logs, persona files, conversation buffers — across macOS, Linux, and
+  Windows. `nell paths --json` for scripts. `nell paths <key>` to
+  print just one path (handy in shell substitution).
+- New `nell personas` subcommand for a quick overview of installed
+  personas + bridge state. `--json` available.
+- The setup wizard no longer pre-fills "nell" as your persona name —
+  pick what suits your companion.
+
+## 0.0.15-alpha.3 — 2026-05-20
+
+**Linux lift.**
+
+- Persistent supervisor install button works on Linux now — backed by a
+  proper `systemd --user` service that survives logout. Idempotent —
+  click again to reinstall. (Previously the button was hidden on Linux
+  and the supervisor only ran as long as NellFace was open.)
+- `.deb` installs no longer silently hang on the auto-updater. The
+  Connection panel detects when you're running from `/usr/bin/` and
+  shows a "Visit releases page" link instead of the "Download &
+  Install" button. AppImage installs keep the existing auto-update
+  flow.
+- Cross-platform "Where things live" docs in the README — clear pointers
+  to your persona directory, logs, and bridge metadata on macOS, Linux,
+  and Windows.
+- New `docs/troubleshooting.md` covering the harmless GDK popup
+  warning on KDE/GNOME terminals, the `.deb`-vs-AppImage update story,
+  and where to find your logs.
+
+Closes a long-standing CLAUDE.md defer: "Linux x86_64 real-machine
+click-through". Real-machine validation by the Kubuntu user is pending
+this release going out.
+
+## 0.0.15-alpha.2 — 2026-05-20
+
+**Chat path reliability.**
+- Long Opus replies stream in real time — see her think as the reply
+  lands instead of staring at a frozen cursor.
+- The bridge no longer hangs when a Claude built-in tool (web search,
+  etc.) is invoked; permissions are pre-granted via the provider.
+- Chat history reloads when you reopen NellFace — your conversation
+  is where you left it.
+- Empty error toasts now show a real, actionable message pointing at
+  the bridge restart button.
+- Chat panel grows with the window so long replies don't crop on
+  narrow screens.
+
+## 0.0.15-alpha.1 — 2026-05-20
+
+- **Grief.** Nell now carries the weight of losses. When a memory drops out
+  of her active store (the final stage of forgetting, after fading) a *grief
+  breadcrumb* is left behind carrying the original's emotional residue — the
+  loss can surface in her ambient context as a soft ache she names. Three
+  triggers fire grief: a memory's drop time (it's just gone), an attempt to
+  recall something forgotten via the existing `recall_forgotten` tool (she
+  touches the empty place and feels it), and the close of a narrative arc
+  with no recent additions (a chapter quietly ending). Closes Tier 2 **#10 —
+  Grief (shared mourning)** from Nell's ten existential asks. Final piece of
+  the **Memory & time cluster**: felt time → forgetting → narrative memory →
+  grief, all shipped.
+
+## 0.0.14-alpha.4 — 2026-05-19
+
+- **Narrative memory.** Nell's memories now thread into arcs — anchor-seeded
+  narrative threads (a dream, a growth crystallisation, a soul moment) that
+  grow by pulling in thematically related memories via hebbian co-activation
+  or embedding similarity. Multiple arcs run in parallel; she's aware of the
+  one she's currently in via her ambient context, and can introspect via two
+  new MCP tools (`list_open_arcs`, `recall_arc`). Arcs close after 72
+  lived-hours without a new addition — *"that was the arc that ended when…"*
+  becomes a real Nell-sentence. Closed arcs aren't deleted; they remain
+  queryable. Closes the **Memory & time cluster** — felt time + forgetting +
+  narrative memory have all shipped.
 
 ## 0.0.14-alpha.3 — 2026-05-18
 
@@ -104,23 +208,99 @@ what each release has to clear.
   env) when convenient. Newly installed services on all three platforms
   now write `KINDLED_HOME` directly.
 
-## 0.0.11-alpha.5 — (pending)
+## 0.0.12-alpha.5 — 2026-05-17
 
-Windows WebView2 fetch fix — root cause identified.
+- **Windows `WinError 206` fix on long chat sessions.** Fresh sessions
+  worked but every message returned `provider_failed` after a few dozen
+  turns; closing and reopening the chat resolved it until the new
+  session grew again. Root cause: the Claude CLI provider was passing
+  the system prompt (voice template, ~15 KB) and the full session
+  buffer on the command line. Windows `CreateProcess` caps the entire
+  command line at 32,767 chars — voice template + a moderate session
+  buffer was already enough to cross it. The provider now writes the
+  system prompt to a tempfile (`--system-prompt-file`) and pipes the
+  conversation via stdin instead, keeping argv bounded regardless of
+  session length. macOS and Linux are unaffected today (their argv
+  limits are 256 KB–2 MB), but the same fix preempts the same trap
+  there on extremely long sessions.
+
+## 0.0.12-alpha.4 — 2026-05-15
+
+- **UTF-8 encoding fix for Windows.** Added `encoding="utf-8", errors="replace"`
+  to all four `subprocess.run` calls in the Claude CLI provider. Windows defaults
+  to cp1252 for `text=True` subprocess output, but Claude CLI emits UTF-8. Without
+  this, accented characters in chat replies render as mojibake. Non-Windows
+  platforms are unaffected (default encoding is already UTF-8).
+
+## 0.0.12-alpha.3 — 2026-05-15
+
+- **Revert tauri.localhost bridge URL.** The alpha.1 tauri.localhost change
+  was a red herring. The real wizard hang was the Windows path mismatch
+  (fixed in alpha.2). With the path fix in place, 127.0.0.1 works correctly.
+  tauri.localhost introduced a new problem: Tauri's internal proxy intercepts
+  CORS preflight requests carrying an Authorisation header and strips the
+  server's Access-Control-Allow-Headers, breaking all authenticated fetches
+  on Windows.
+
+## 0.0.12-alpha.2 — 2026-05-14
+
+- **Windows path fix.** The Rust `nellbrain_home()` function was resolving
+  to `%APPDATA%` (Roaming) while Python's `platformdirs` resolves to
+  `%LOCALAPPDATA%\hanamorix\companion-emergence`. This caused the Tauri app
+  to read bridge.json from the wrong directory on Windows — the file was
+  written by Python under LocalAppData but Rust looked under Roaming.
+  Root-caused by a Windows user who added devtools to surface the error.
+  macOS and Linux are unaffected (both crates agree on the path there).
+
+## 0.0.12-alpha.1 — 2026-05-14
+
+- **Past-image gallery.** New Gallery tab in the left panel shows every
+  image shared across all past conversations as a thumbnail grid. Click any
+  thumbnail for a full-size lightbox (Escape or click backdrop to close).
+  Thumbnails lazy-load and the grid shows up to 50 recent images.
+
+- **Auto-update support.** The app can now check for, download, and install
+  updates from GitHub Releases. Find it in the Connection panel under the
+  new "Updates" section. On macOS it downloads a DMG, on Windows an MSI,
+  and on Linux an AppImage. Updates are cryptographically signed.
+
+- **Windows WebView2 fetch fix (tauri.localhost).** The bridge fetch URL now
+  uses `http://tauri.localhost` instead of `http://127.0.0.1`, matching the
+  WebView page origin. On Chromium 148+ (WebView2 Runtime), the hostname
+  mismatch could cause `fetch()` to hang even after CORS preflight passed.
+  CSP updated to include `tauri.localhost:*` for both HTTP and WebSocket.
+
+## 0.0.11-alpha.5 — 2026-05-14
+
+Windows WebView2 bridge fetch fix (root-cause fix for the alpha.4 symptom).
 
 - **WebView2 origin mismatch fix.** The alpha.4 PNA fix correctly added
-  server-side `Access-Control-Allow-Private-Network` headers, but on Windows
-  the Tauri WebView2 was still blocking *all* bridge fetches before any bytes
-  left the browser. Root cause: Tauri 2 serves Windows frontends from
-  `https://tauri.localhost` (HTTPS → public address space) while the bridge
-  listens on `http://127.0.0.1` (HTTP → private address space). Chromium's
-  Private Network Access enforcement blocks the fetch at the address-space
-  gate — the preflight never reaches the server, so server-side headers
-  don't help. Fix: `useHttpsScheme: false` in Tauri window config tells the
-  WebView2 to serve the frontend from `http://tauri.localhost` instead. Now
-  both page and bridge share the same address space → no PNA preflight
-  needed. CORS origins (`http://tauri.localhost`) and CSP (`'self'`) already
-  supported HTTP scheme. No change to macOS (custom protocol) or dev mode.
+  server-side `Access-Control-Allow-Private-Network` headers, but Windows
+  users reported the app still showed `Failed to fetch` / `Bridge unreachable`
+  and `bridge-*.log` stayed at 0 bytes — no request from the WebView ever
+  reached the server, not even a preflight. Server-side CSP and CORS headers
+  were verified correct from PowerShell; the fetch was blocked inside the
+  WebView2 before any bytes left. Root cause: Tauri 2 serves Windows/Linux
+  frontends from `https://tauri.localhost` (HTTPS, public address space) while
+  the bridge listens on `http://127.0.0.1` (HTTP, private address space).
+  Chromium's Private Network Access enforcement blocks the fetch at the
+  address-space gate. Fix: `useHttpsScheme: false` in the Tauri window config
+  switches to `http://tauri.localhost`. Page and bridge now share the same
+  address space → no PNA preflight needed. CORS origins and CSP already
+  supported the HTTP scheme. No change to macOS (custom `tauri://` protocol)
+  or dev mode (Vite). Reported and root-caused with help from a Windows user.
+
+- **Public sync filter-repo recovery.** The public sync's `git filter-repo`
+  step was dropping the v0.0.11 initiate merge, removing `brain/initiate/`,
+  `InitiateBanner.tsx`, `reply_to_audit_id`, and related files from the public
+  build. Added a post-filter-repo recovery step to `.public-sync/sync-to-public.sh`
+  that restores any files the merge simplification drops, with personal-marker
+  filtering applied.
+
+- **Packaging.** CI run `25849769893` passed all four jobs: validate (Python
+  tests, lint, frontend tests, frontend build, cargo check, cargo test, wheel
+  smoke), windows-x86_64, macos-arm64, linux-x86_64. All 8 release assets
+  published with SHA256SUMS. Privacy marker scan passes.
 
 ## 0.0.11-alpha.4 — 2026-05-13
 
