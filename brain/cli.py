@@ -1998,6 +1998,9 @@ def _init_handler(args: argparse.Namespace) -> int:
     config_path = write_persona_config(persona_dir, user_name=user_name, model=model)
     voice_path = install_voice_template(persona_dir, voice_template)
 
+    from brain import app_config as _app_config
+    _app_config.write_if_missing(persona)
+
     print()
     # Keep CLI status text encodable on Windows' legacy cp1252 consoles.
     # GitHub Actions Windows caught this: a leading "✓" raised
