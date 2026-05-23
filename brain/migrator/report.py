@@ -9,11 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-SourceKind = Literal["nellbrain", "emergence-kit", "companion-emergence"]
-
 from brain.health.attempt_heal import save_with_backup_text
 from brain.migrator.og import FileManifest
 from brain.migrator.transform import SkippedMemory
+
+SourceKind = Literal["nellbrain", "emergence-kit", "companion-emergence"]
 
 
 @dataclass(frozen=True)
