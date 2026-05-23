@@ -508,6 +508,79 @@ async fn run_migrate(
     })
 }
 
+/// A single preflight finding (validation error or warning), mirroring the
+/// Python preflight_companion_emergence dict shape. `detail` carries
+/// structured extras (e.g. suggested_subdirs for the pointed_at_parent code).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreflightIssue {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Result of inspecting a candidate companion-emergence persona dir.
+/// Pure read — `preflight_existing_ce` never mutates the source.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExistingCePreflight {
+    pub ok: bool,
+    pub persona_name: Option<String>,
+    pub imported_user_name: Option<String>,
+    pub imported_voice_template: Option<String>,
+    pub memory_count: Option<i64>,
+    pub crystallization_count: Option<i64>,
+    pub hebbian_edge_count: Option<i64>,
+    pub source_size_bytes: i64,
+    pub errors: Vec<PreflightIssue>,
+    pub warnings: Vec<PreflightIssue>,
+}
+
+/// Inspect a directory the user pointed at, to decide whether it's a valid
+/// companion-emergence persona we can forward-copy. Shells out to the Python
+/// migrator's --preflight mode (single source of truth for validation rules)
+/// and parses the JSON it prints on the last stdout line.
+#[tauri::command]
+async fn preflight_existing_ce(
+    app: tauri::AppHandle,
+    input_dir: String,
+) -> Result<ExistingCePreflight, String> {
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args([
+        "migrate",
+        "--source",
+        "companion-emergence",
+        "--preflight",
+        "--input",
+        &input_dir,
+        "--json",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("spawn nell migrate --preflight: {}", e)),
+        Err(_) => return Err("preflight_timeout".to_string()),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "preflight exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last_line = stdout.lines().last().unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| format!("parse preflight json: {}", e))
+}
+
 const INIT_TIMEOUT_SECS: u64 = 30;
 const MIGRATING_INIT_TIMEOUT_SECS: u64 = 300;
 const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
@@ -1082,6 +1155,7 @@ pub fn run() {
             force_restart_bridge,
             run_init,
             run_migrate,
+            preflight_existing_ce,
             install_supervisor_service,
             install_nell_cli_symlink,
             check_claude_cli,
