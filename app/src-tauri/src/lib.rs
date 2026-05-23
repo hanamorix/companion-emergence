@@ -438,10 +438,19 @@ async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<
     ensure_bridge_running(app, persona).await
 }
 
+/// Migration sources NellFace knows how to dispatch. Kept in sync with
+/// brain/migrator/cli.py's --source choices. companion-emergence (v0.0.18)
+/// is the validated forward-copy path for CE→CE upgrades.
+const KNOWN_MIGRATE_SOURCES: [&str; 3] = ["nellbrain", "emergence-kit", "companion-emergence"];
+
+fn is_known_migrate_source(source: &str) -> bool {
+    KNOWN_MIGRATE_SOURCES.contains(&source)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MigrateArgs {
     pub persona: String,
-    pub source: String, // "nellbrain" | "emergence-kit"
+    pub source: String, // "nellbrain" | "emergence-kit" | "companion-emergence"
     pub input_dir: String,
     pub force: bool,
 }
@@ -452,10 +461,11 @@ async fn run_migrate(
     args: MigrateArgs,
 ) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
-    if args.source != "nellbrain" && args.source != "emergence-kit" {
+    if !is_known_migrate_source(&args.source) {
         return Err(format!(
-            "unknown migrate source {:?} (expected nellbrain or emergence-kit)",
-            args.source
+            "unknown migrate source {:?} (expected one of: {})",
+            args.source,
+            KNOWN_MIGRATE_SOURCES.join(" | ")
         ));
     }
     let std_cmd = nell_command(&app)?;
@@ -1541,6 +1551,19 @@ mod tests {
         assert!(args.contains(&"service".to_string()));
         assert!(args.contains(&"install".to_string()));
         assert!(args.contains(&"--persona".to_string()));
+    }
+
+    #[test]
+    fn is_known_migrate_source_accepts_all_three_sources() {
+        assert!(is_known_migrate_source("nellbrain"));
+        assert!(is_known_migrate_source("emergence-kit"));
+        assert!(is_known_migrate_source("companion-emergence"));
+    }
+
+    #[test]
+    fn is_known_migrate_source_rejects_unknown() {
+        assert!(!is_known_migrate_source("garbage"));
+        assert!(!is_known_migrate_source(""));
     }
 }
 
