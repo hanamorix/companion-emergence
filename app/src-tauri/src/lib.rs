@@ -200,30 +200,64 @@ fn write_app_config(config: AppConfig) -> Result<(), String> {
     std::fs::write(&path, serialized).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
-/// Walk a personas directory and return the visible persona names.
+/// Summary of one on-disk persona, surfaced to NellFace's boot picker.
+/// `last_opened_at` (written by the bridge on startup) drives recency sort;
+/// `has_memories_db` lets the picker flag incomplete/interrupted dirs.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct PersonaSummary {
+    pub name: String,
+    pub last_opened_at: Option<String>,
+    pub has_memories_db: bool,
+}
+
+/// Walk a personas directory and return a summary per visible persona.
 /// Pure function — extracted for unit testing (audit 2026-05-08 P4-3).
 /// Filters out: ``<name>.new`` migrator working dirs, ``<name>.backup-*``
-/// install-as archives, and dotfiles.
-fn list_personas_at(personas_dir: &std::path::Path) -> Result<Vec<String>, String> {
+/// install-as archives, and dotfiles. Sorted by ``last_opened_at`` desc
+/// (most-recently-opened first), falling back to name asc.
+fn list_personas_at(personas_dir: &std::path::Path) -> Result<Vec<PersonaSummary>, String> {
     if !personas_dir.exists() {
         return Ok(vec![]);
     }
     let entries = std::fs::read_dir(personas_dir)
         .map_err(|e| format!("read {}: {}", personas_dir.display(), e))?;
-    let mut names: Vec<String> = entries
+    let mut out: Vec<PersonaSummary> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| !n.ends_with(".new"))
-        .filter(|n| !n.contains(".backup-"))
-        .filter(|n| !n.starts_with('.'))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.ends_with(".new") || name.contains(".backup-") || name.starts_with('.') {
+                return None;
+            }
+            let persona_path = e.path();
+            let has_memories_db = persona_path.join("memories.db").is_file();
+            let last_opened_at = std::fs::read_to_string(persona_path.join("persona_config.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("last_opened_at")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                });
+            Some(PersonaSummary {
+                name,
+                last_opened_at,
+                has_memories_db,
+            })
+        })
         .collect();
-    names.sort();
-    Ok(names)
+    // Recency desc, then name asc. ISO8601 strings sort lexically = chronologically.
+    out.sort_by(|a, b| match (&a.last_opened_at, &b.last_opened_at) {
+        (Some(av), Some(bv)) => bv.cmp(av), // later timestamp first
+        (Some(_), None) => std::cmp::Ordering::Less, // has timestamp → before one without
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    });
+    Ok(out)
 }
 
 #[tauri::command]
-fn list_personas() -> Result<Vec<String>, String> {
+fn list_personas() -> Result<Vec<PersonaSummary>, String> {
     list_personas_at(&nellbrain_home()?.join("personas"))
 }
 
@@ -1549,7 +1583,8 @@ mod tests {
         // Stray non-dir file shouldn't show up either.
         write(&personas.join("README.md"), "not a persona");
 
-        let names = list_personas_at(&personas).unwrap();
+        let summaries = list_personas_at(&personas).unwrap();
+        let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, vec!["alice".to_string(), "nell".to_string()]);
     }
 
@@ -1558,6 +1593,42 @@ mod tests {
         let dir = tempdir().unwrap();
         let names = list_personas_at(&dir.path().join("does-not-exist")).unwrap();
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn list_personas_at_reports_memories_db_and_recency_sort() {
+        let dir = tempdir().unwrap();
+        let personas = dir.path().join("personas");
+        // phoebe: has memories.db + a recent last_opened_at
+        fs::create_dir_all(personas.join("phoebe")).unwrap();
+        write(&personas.join("phoebe").join("memories.db"), "");
+        write(
+            &personas.join("phoebe").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
+        );
+        // nell: has memories.db + an older last_opened_at
+        fs::create_dir_all(personas.join("nell")).unwrap();
+        write(&personas.join("nell").join("memories.db"), "");
+        write(
+            &personas.join("nell").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
+        );
+        // broken: no memories.db, no config
+        fs::create_dir_all(personas.join("broken")).unwrap();
+
+        let summaries = list_personas_at(&personas).unwrap();
+        let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
+        // phoebe (most recent) → nell (older) → broken (no timestamp, name asc last)
+        assert_eq!(
+            names,
+            vec!["phoebe".to_string(), "nell".to_string(), "broken".to_string()]
+        );
+        let broken = summaries.iter().find(|s| s.name == "broken").unwrap();
+        assert!(!broken.has_memories_db);
+        assert!(broken.last_opened_at.is_none());
+        let phoebe = summaries.iter().find(|s| s.name == "phoebe").unwrap();
+        assert!(phoebe.has_memories_db);
+        assert_eq!(phoebe.last_opened_at.as_deref(), Some("2026-05-23T09:00:00Z"));
     }
 
     #[test]
