@@ -532,7 +532,7 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
         )
     p.add_argument(
         "--source",
-        choices=["nellbrain", "emergence-kit"],
+        choices=["nellbrain", "emergence-kit", "companion-emergence"],
         default="nellbrain",
         help=(
             "Source format. ``nellbrain`` (default) expects a full OG "
@@ -561,6 +561,15 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
         dest="install_as",
         type=str,
         help="Install migrated data as this persona name.",
+    )
+    g.add_argument(
+        "--preflight",
+        action="store_true",
+        default=False,
+        help=(
+            "Run preflight checks only — inspect source dir and emit JSON report; do NOT copy. "
+            "Only valid for --source companion-emergence."
+        ),
     )
     p.add_argument(
         "--force",
@@ -594,6 +603,32 @@ def _dispatch(args: argparse.Namespace) -> int:
     emit_json = getattr(args, "json", False) or not _sys.stdout.isatty()
 
     source = getattr(args, "source", "nellbrain")
+    if source == "companion-emergence":
+        from brain.migrator.companion_emergence import (
+            CompanionEmergenceMigrateArgs,
+            migrate_companion_emergence,
+            preflight_companion_emergence,
+        )
+        from brain.migrator.report import format_report as _format_report
+
+        if getattr(args, "preflight", False):
+            result = preflight_companion_emergence(args.input_dir)
+            print(json.dumps(result, default=str))
+            return 0
+        if not args.install_as:
+            import sys as _sys2
+            _sys2.exit("--install-as is required for a non-preflight companion-emergence migrate")
+        report = migrate_companion_emergence(CompanionEmergenceMigrateArgs(
+            input_dir=args.input_dir,
+            install_as=args.install_as,
+            force=args.force,
+        ))
+        if emit_json:
+            print(report.to_json())
+        else:
+            print(_format_report(report))
+        return 0
+
     if source == "emergence-kit":
         from brain.migrator.emergence_kit import (
             EmergenceKitMigrateArgs,
