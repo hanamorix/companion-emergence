@@ -62,7 +62,7 @@ app/src-tauri/target/
 app/dist/
 app/.vite/
 
-# ── ML artifacts (huge, reproducible from recipe) ────────
+# ── ML artefacts (huge, reproducible from recipe) ────────
 models/
 training/datasets/
 training/checkpoints/
@@ -105,5 +105,9 @@ mock-ups/
 tmp/
 .coverage
 
-# Visual-companion brainstorming session artifacts.
+# Visual-companion brainstorming session artefacts.
 .superpowers/
+
+# TDD Guard captures pytest results to .claude/tdd-guard/data/test.json for
+# its PreToolUse hook. Hook artefact, not source.
+.claude/tdd-guard/

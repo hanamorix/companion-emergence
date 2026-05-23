@@ -63,6 +63,7 @@ exclude = [
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["."]
+tdd_guard_project_root = "the project root"
 markers = [
     "unit: unit tests",
     "integration: integration tests",
@@ -78,3 +79,8 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["N802"]
+
+[dependency-groups]
+dev = [
+    "tdd-guard-pytest>=0.1.2",
+]
