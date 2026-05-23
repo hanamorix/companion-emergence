@@ -18,6 +18,7 @@ import { StepMigrate } from "./steps/StepMigrate";
 import { StepReview } from "./steps/StepReview";
 import { StepInstalling } from "./steps/StepInstalling";
 import { StepReady } from "./steps/StepReady";
+import { errString } from "../lib/errString";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
@@ -182,7 +183,7 @@ export function Wizard({ onDone }: Props) {
             : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
         } catch (e) {
           serviceTrailer =
-            `\n\n[service] could not install launchd agent: ${(e as Error).message}` +
+            `\n\n[service] could not install launchd agent: ${errString(e)}` +
             " — supervisor will fall back to the .app's lifecycle.";
         }
       } else {
@@ -199,7 +200,7 @@ export function Wizard({ onDone }: Props) {
             ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
             : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
         } catch (e) {
-          cliTrailer = `\n\n[cli] could not install nell symlink: ${(e as Error).message}`;
+          cliTrailer = `\n\n[cli] could not install nell symlink: ${errString(e)}`;
         }
       } else {
         cliTrailer = `\n\n[cli] bundled CLI shortcut install is macOS-only; no action is needed for normal app use on ${currentPlatformLabel}.`;
@@ -214,7 +215,7 @@ export function Wizard({ onDone }: Props) {
       // brain is fully alive.
       setTimeout(() => setStep("ready"), 1200);
     } catch (e) {
-      setInstallResult({ ok: false, output: "", error: (e as Error).message });
+      setInstallResult({ ok: false, output: "", error: errString(e) });
     }
   }
 

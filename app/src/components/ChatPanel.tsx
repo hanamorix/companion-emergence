@@ -4,6 +4,7 @@ import { closeSession, fetchActiveSession, fetchChatHistory, getBridgeCredential
 import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
 import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { streamChat } from "../streamChat";
+import { errString } from "../lib/errString";
 
 // Tauri invocation is best-effort here: browser dev or older Tauri builds
 // may not have the notification command registered yet.
@@ -88,7 +89,7 @@ const formatTime = () =>
   new Date().toLocaleTimeString("en", { hour: "numeric", minute: "2-digit" });
 
 // Persona names match [A-Za-z0-9_-]{1,40}; render them human:
-// underscores → spaces, then capitalize. ``my_companion`` -> "My companion".
+// underscores → spaces, then capitalise. ``my_companion`` -> "My companion".
 const capitalize = (s: string) => {
   if (!s) return s;
   const cleaned = s.replace(/_/g, " ");
@@ -191,7 +192,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             // silently discarding the user's expectation that memory was saved.
             if (!keepalive && mountedRef.current) {
               setMemorySaveWarning(
-                `Memory save pending for the previous chat: ${(e as Error).message}`,
+                `Memory save pending for the previous chat: ${errString(e)}`,
               );
             }
           });
@@ -212,7 +213,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   // ── Mount-time history hydration (Phase 3B, v0.0.15-alpha.2) ──────────
   // When the user reopens the app, the bridge's session JSONL is still on
-  // disk and /sessions/active will hand back the previous sid. Replay the
+  // disc and /sessions/active will hand back the previous sid. Replay the
   // turn log so the conversation doesn't appear to have evaporated. Lazy
   // session creation (deferred until first send) stays the default when
   // no active session exists — we don't eagerly mint an empty one.
@@ -404,7 +405,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     } catch (e) {
       setStagedImage((prev) =>
         prev && prev.previewUrl === previewUrl
-          ? { ...prev, status: "error", error: (e as Error).message }
+          ? { ...prev, status: "error", error: errString(e) }
           : prev,
       );
     }
@@ -444,7 +445,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     let sessionId = sessionRef.current;
     if (!sessionId) {
       // Phase B sticky-session reattach (F-201): if the bridge has a
-      // recent session for this persona (younger than the finalize
+      // recent session for this persona (younger than the finalise
       // threshold), pick up where we left off instead of creating a
       // fresh one. A transient /sessions/active failure (network flake,
       // older bridge build without the endpoint) shouldn't block the
@@ -458,7 +459,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
-          setErrorSafe(`Bridge unreachable: ${(e as Error).message}`);
+          setErrorSafe(`Bridge unreachable: ${errString(e)}`);
           return;
         }
       }
@@ -550,7 +551,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
                   sessionRef.current = fresh;
                   await runStream(fresh, /* isRetry */ true);
                 } catch (e) {
-                  setErrorSafe(`Bridge unreachable: ${(e as Error).message}`);
+                  setErrorSafe(`Bridge unreachable: ${errString(e)}`);
                   setStreaming(false);
                   setMessages((m) =>
                     m.map((b) =>
@@ -603,7 +604,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     try {
       await runStream(sessionId, /* isRetry */ false);
     } catch (e) {
-      setErrorSafe((e as Error).message);
+      setErrorSafe(errString(e));
       setStreaming(false);
       // Same defense for synchronous failures before streamChat returns.
       setMessages((m) =>
@@ -1146,7 +1147,7 @@ function Bubble({ msg }: { msg: Message }) {
 
 /**
  * Inline rendering for chat bubble text:
- *   - Normalizes literal ``\n`` / ``\r\n`` escape sequences (some
+ *   - Normalises literal ``\n`` / ``\r\n`` escape sequences (some
  *     models emit those as text rather than real newlines) into
  *     actual newlines so ``white-space: pre-wrap`` can show them
  *     as paragraph breaks.
@@ -1161,9 +1162,9 @@ function Bubble({ msg }: { msg: Message }) {
  */
 function renderBubbleText(text: string): React.ReactNode {
   if (!text) return text;
-  // Normalize escaped newlines (``\\n``, ``\\r\\n``) to real ones.
+  // Normalise escaped newlines (``\\n``, ``\\r\\n``) to real ones.
   // Some Claude outputs interleave escape sequences with prose when
-  // the model is reasoning about its own format — normalize before
+  // the model is reasoning about its own format — normalise before
   // splitting so the italic pass sees clean line content.
   const normalized = text.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
 

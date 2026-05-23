@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { checkClaudeCli, type ClaudeCliCheck } from "../../appConfig";
 import { Divider, SectionLabel, WButton, WizardShell } from "../components";
+import { errString } from "../../lib/errString";
 
 interface Props {
   step: number;
@@ -32,7 +33,7 @@ export function StepPrerequisites({ step, totalSteps, onNext, onBack, avatar }: 
       const result = await checkClaudeCli();
       setCheck(result);
     } catch (e) {
-      setError((e as Error).message);
+      setError(errString(e));
       setCheck(null);
     } finally {
       setChecking(false);

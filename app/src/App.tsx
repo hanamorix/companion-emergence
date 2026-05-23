@@ -18,6 +18,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { Wizard } from "./wizard/Wizard";
+import { errString } from "./lib/errString";
 
 const STATE_POLL_MS = 5000;
 
@@ -45,7 +46,7 @@ export default function App() {
       await ensureBridgeRunning(persona);
       setPhase({ kind: "ready", persona });
     } catch (e) {
-      setPhase({ kind: "starting-bridge", persona, error: (e as Error).message });
+      setPhase({ kind: "starting-bridge", persona, error: errString(e) });
     }
   }
 
@@ -255,7 +256,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           setStateError(null);
         }
       } catch (e) {
-        if (!cancelled) setStateError((e as Error).message);
+        if (!cancelled) setStateError(errString(e));
       }
     }
     tick();
