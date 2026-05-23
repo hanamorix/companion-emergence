@@ -3,7 +3,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ensureBridgeRunning,
   listPersonas,
+  nellbrainHomePath,
   readAppConfig,
+  revealInFileManager,
   setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
@@ -148,6 +150,14 @@ function BridgeErrorScreen({
   onRunSetup: () => void;
 }) {
   const diagnostics = `persona=${persona}\nbridge_start_error=${error}`;
+  const [logPath, setLogPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    nellbrainHomePath().then((home) => {
+      if (home) setLogPath(`${home}/launch-failures.log`);
+    });
+  }, []);
+
   async function copyDiagnostics() {
     try {
       await navigator.clipboard.writeText(diagnostics);
@@ -202,6 +212,16 @@ function BridgeErrorScreen({
           <BootButton onClick={onRunSetup}>Re-run setup</BootButton>
           <BootButton onClick={() => void copyDiagnostics()}>Copy diagnostics</BootButton>
         </div>
+        {logPath && (
+          <div style={{ marginTop: 16, fontSize: 11, color: "var(--mauve)", textAlign: "left", maxWidth: 460 }}>
+            <div style={{ marginBottom: 6 }}>
+              More detail: <code style={{ fontSize: 10.5, wordBreak: "break-all" }}>{logPath}</code>
+            </div>
+            <BootButton onClick={() => void revealInFileManager(logPath)}>
+              Open log folder
+            </BootButton>
+          </div>
+        )}
       </div>
     </>
   );
