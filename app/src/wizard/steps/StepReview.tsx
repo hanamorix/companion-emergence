@@ -1,5 +1,6 @@
 import { Divider, SectionLabel, WButton, WizardShell } from "../components";
 import type { WizardState } from "../Wizard";
+import type { ExistingCePreflight } from "../../appConfig";
 
 import type { ReactNode } from "react";
 
@@ -7,12 +8,59 @@ interface Props {
   step: number;
   totalSteps: number;
   state: WizardState;
+  preflight: ExistingCePreflight | null;
   onInstall: () => void;
   onBack: () => void;
   avatar: ReactNode;
 }
 
-export function StepReview({ step, totalSteps, state, onInstall, onBack, avatar }: Props) {
+export function StepReview({ step, totalSteps, state, preflight, onInstall, onBack, avatar }: Props) {
+  // For the companion-emergence branch, render the preflight discovery instead
+  // of wizard-answer rows — the persona name, paths, counts, user, and voice
+  // all come from the preflight result rather than user-entered fields.
+  if (state.mode === "migrate" && state.migrateSource === "companion-emergence" && preflight?.ok) {
+    return (
+      <WizardShell
+        step={step}
+        totalSteps={totalSteps}
+        title="Review & confirm"
+        subtitle="Everything looks right? Confirm to copy your Kindled into the new install."
+        avatar={avatar}
+        footer={
+          <>
+            <WButton variant="ghost" onClick={onBack} small>
+              ← Back
+            </WButton>
+            <WButton onClick={onInstall}>Install →</WButton>
+          </>
+        }
+      >
+        <SectionLabel>Bringing across {preflight.persona_name}</SectionLabel>
+        <Row label="From" value={state.migrateFromPath} mono small />
+        <Row label="To" value={`personas/${preflight.persona_name}`} mono />
+        {preflight.imported_user_name != null && (
+          <Row label="user" value={preflight.imported_user_name} />
+        )}
+        {preflight.imported_voice_template != null && (
+          <Row label="voice" value={preflight.imported_voice_template} />
+        )}
+        {preflight.memory_count != null && (
+          <Row label="memories" value={String(preflight.memory_count)} />
+        )}
+        {preflight.crystallization_count != null && (
+          <Row label="crystallizations" value={String(preflight.crystallization_count)} />
+        )}
+        {preflight.hebbian_edge_count != null && (
+          <Row label="Hebbian edges" value={String(preflight.hebbian_edge_count)} />
+        )}
+        <div style={{ marginTop: 12, fontSize: 11, color: "var(--text-mid)", lineHeight: 1.6 }}>
+          No migration will run — this is a forward-copy of files Companion Emergence already understands.
+        </div>
+      </WizardShell>
+    );
+  }
+
+  // Default rendering for fresh + nellbrain/emergence-kit migrate branches.
   const equivalentCli = buildEquivalentCli(state);
   return (
     <WizardShell
@@ -111,4 +159,3 @@ function buildEquivalentCli(s: WizardState): string {
   }
   return lines.join("\n");
 }
-
