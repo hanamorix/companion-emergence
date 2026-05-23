@@ -11,7 +11,7 @@
 //! Everything else (state polling, chat) is plain HTTP from the frontend
 //! and goes via the bridge daemon (see brain/bridge/server.py).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -346,6 +346,57 @@ fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// Last `n` bytes of a string (UTF-8-safe at the char boundary).
+fn tail(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let start = s.len() - n;
+    // Walk forward to the next char boundary so we never split a UTF-8 codepoint.
+    let start = (start..s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len());
+    s[start..].to_string()
+}
+
+/// Append a structured entry to `$KINDLED_HOME/launch-failures.log` for a
+/// failed CLI spawn. Best-effort: any error here is swallowed so a logging
+/// problem never masks the real spawn failure the caller is reporting.
+fn record_spawn_failure(
+    app: &tauri::AppHandle,
+    command: &str,
+    output: Option<&std::process::Output>,
+    error_msg: Option<&str>,
+    started: std::time::Instant,
+) {
+    let home = match nellbrain_home() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let (exit_code, stdout_tail, stderr_tail) = match output {
+        Some(o) => (
+            o.status.code(),
+            tail(&String::from_utf8_lossy(&o.stdout), 2048),
+            tail(&String::from_utf8_lossy(&o.stderr), 2048),
+        ),
+        None => (None, String::new(), error_msg.unwrap_or("").to_string()),
+    };
+    let runtime = bundled_nell_path(app).ok().flatten();
+    let runtime_path_exists = runtime.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let failure = launch_log::LaunchFailure {
+        command: command.to_string(),
+        exit_code,
+        stdout_tail,
+        stderr_tail,
+        platform: std::env::consts::OS.to_string(),
+        platform_version: std::env::consts::ARCH.to_string(),
+        bundled_runtime_path: runtime.map(|p| p.to_string_lossy().into_owned()),
+        runtime_path_exists,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    let _ = launch_log::append_failure(&home, &failure);
+}
+
 fn unstable_macos_app_path_reason(path: &std::path::Path) -> Option<String> {
     let text = path.to_string_lossy();
     if text.starts_with("/Volumes/") {
@@ -399,6 +450,7 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     // through `await ensureBridgeRunning(...)` indefinitely. 60s is
     // generous against typical 5-15s startup; if it triggers, the
     // user gets `supervisor_start_timeout` instead of a stuck UI.
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args(["supervisor", "start", "--persona", &persona])
@@ -409,12 +461,24 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell supervisor start: {}", e)),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell supervisor start: {}", e);
+            record_spawn_failure(&app, "nell supervisor start", None, Some(&msg), started);
+            return Err(msg);
+        }
         Err(_) => {
+            record_spawn_failure(
+                &app,
+                "nell supervisor start",
+                None,
+                Some("supervisor_start_timeout"),
+                started,
+            );
             return Err("supervisor_start_timeout".to_string());
         }
     };
     if !output.status.success() {
+        record_spawn_failure(&app, "nell supervisor start", Some(&output), None, started);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "supervisor start failed (exit {}): {}",
@@ -503,6 +567,7 @@ async fn run_migrate(
             KNOWN_MIGRATE_SOURCES.join(" | ")
         ));
     }
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args([
@@ -532,9 +597,19 @@ async fn run_migrate(
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell migrate: {}", e)),
-        Err(_) => return Err("migrate_timeout".to_string()),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell migrate: {}", e);
+            record_spawn_failure(&app, "nell migrate", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(&app, "nell migrate", None, Some("migrate_timeout"), started);
+            return Err("migrate_timeout".to_string());
+        }
     };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell migrate", Some(&output), None, started);
+    }
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -579,6 +654,7 @@ async fn preflight_existing_ce(
     app: tauri::AppHandle,
     input_dir: String,
 ) -> Result<ExistingCePreflight, String> {
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args([
@@ -601,10 +677,24 @@ async fn preflight_existing_ce(
     .await
     {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("spawn nell migrate --preflight: {}", e)),
-        Err(_) => return Err("preflight_timeout".to_string()),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell migrate --preflight: {}", e);
+            record_spawn_failure(&app, "nell migrate --preflight", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(
+                &app,
+                "nell migrate --preflight",
+                None,
+                Some("preflight_timeout"),
+                started,
+            );
+            return Err("preflight_timeout".to_string());
+        }
     };
     if !output.status.success() {
+        record_spawn_failure(&app, "nell migrate --preflight", Some(&output), None, started);
         return Err(format!(
             "preflight exit {}: {}",
             output.status.code().unwrap_or(-1),
@@ -616,6 +706,47 @@ async fn preflight_existing_ce(
     serde_json::from_str(last_line).map_err(|e| format!("parse preflight json: {}", e))
 }
 
+/// Resolve $KINDLED_HOME as a string for the frontend (e.g. to show the
+/// launch-failures.log path in the bridge-error screen).
+#[tauri::command]
+fn nellbrain_home_path() -> Result<String, String> {
+    Ok(nellbrain_home()?.to_string_lossy().into_owned())
+}
+
+/// Open the OS file manager at `path`'s containing folder (or the folder
+/// itself if `path` is a directory). Best-effort; surfaces spawn errors.
+#[tauri::command]
+async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    let target = if p.is_file() {
+        p.parent().map(Path::to_path_buf).unwrap_or(p)
+    } else {
+        p
+    };
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("explorer: {e}"))?;
+    }
+    Ok(())
+}
+
 const INIT_TIMEOUT_SECS: u64 = 30;
 const MIGRATING_INIT_TIMEOUT_SECS: u64 = 300;
 const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
@@ -623,6 +754,7 @@ const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
+    let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.arg("init");
@@ -659,9 +791,19 @@ async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, S
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("spawn nell init: {}", e)),
-        Err(_) => return Err("init_timeout".to_string()),
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell init: {}", e);
+            record_spawn_failure(&app, "nell init", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(&app, "nell init", None, Some("init_timeout"), started);
+            return Err("init_timeout".to_string());
+        }
     };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell init", Some(&output), None, started);
+    }
     Ok(InitResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1191,6 +1333,8 @@ pub fn run() {
             run_init,
             run_migrate,
             preflight_existing_ce,
+            nellbrain_home_path,
+            reveal_in_file_manager,
             install_supervisor_service,
             install_nell_cli_symlink,
             check_claude_cli,
