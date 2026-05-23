@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 mod install_shape;
+pub mod launch_log;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeCredentials {
