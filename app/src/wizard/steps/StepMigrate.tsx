@@ -8,8 +8,7 @@ import {
   WInput,
   WizardShell,
 } from "../components";
-
-export type MigrateSource = "nellbrain" | "emergence-kit";
+import type { MigrateSource } from "../../appConfig";
 
 interface Props {
   step: number;

@@ -6,6 +6,7 @@ import {
   runMigrate,
   writeAppConfig,
   type InitArgs,
+  type MigrateSource,
 } from "../appConfig";
 import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../platform";
 import { WizardAvatar } from "./Avatar";
@@ -22,7 +23,9 @@ import { errString } from "../lib/errString";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
-export type MigrateSource = "nellbrain" | "emergence-kit";
+// MigrateSource is now canonical in appConfig.ts — imported above.
+// Re-export for consumers that import from Wizard.tsx directly.
+export type { MigrateSource };
 
 export interface WizardState {
   mode: WizardMode;

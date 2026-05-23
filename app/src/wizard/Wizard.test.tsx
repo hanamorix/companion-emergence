@@ -1,6 +1,9 @@
 // Vitest smoke test for the wizard's runInit args shape — pins the
 // audit-2026-05-07 P1-1 fix so the wizard can't regress to sending a
 // `provider:` field the CLI parser doesn't accept.
+//
+// Bundle 8 additions: step routing and step counter tests for the three
+// migrate source branches (nellbrain, emergence-kit, companion-emergence).
 
 import { describe, it, expect, vi } from "vitest";
 import type { InitArgs } from "../appConfig";
