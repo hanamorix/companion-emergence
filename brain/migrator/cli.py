@@ -417,6 +417,8 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         soul_candidates_skipped_reason=soul_candidates_skipped_reason,
         reflex_log_fires_migrated=reflex_log_fires_migrated,
         reflex_log_skipped_reason=reflex_log_skipped_reason,
+        bytes_copied=0,
+        source_kind="nellbrain",
     )
     write_source_manifest(work_dir / "source-manifest.json", manifest)
     report_text = format_report(report)
