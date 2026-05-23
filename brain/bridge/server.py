@@ -711,6 +711,16 @@ def build_app(
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
 
+        # Touch last_opened_at so PersonaPicker can sort by recency (v0.0.18+)
+        try:
+            cfg_path = persona_dir / "persona_config.json"
+            _cfg = PersonaConfig.load(cfg_path)
+            _cfg.touch_last_opened()
+            _cfg.save(cfg_path)
+            logger.debug("last_opened_at touched persona=%s", persona_dir.name)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("could not touch last_opened_at: %s", _exc)
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
