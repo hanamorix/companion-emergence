@@ -42,6 +42,7 @@ vi.mock("../streamChat", () => ({
 import { ChatPanel } from "./ChatPanel";
 import { fetchActiveSession, newSession } from "../bridge";
 import { streamChat } from "../streamChat";
+import { invoke } from "@tauri-apps/api/core";
 
 // jsdom doesn't implement Element.scrollTo; stub it so ChatPanel's
 // auto-scroll effect doesn't throw during render.
@@ -356,6 +357,34 @@ describe("ChatPanel — initiate banner integration (Task 26)", () => {
     });
 
     expect(screen.queryByTestId("initiate-banner-list")).toBeNull();
+  });
+
+  it("notify-urgency desktop notification uses the persona name, not hardcoded 'Nell'", async () => {
+    vi.mocked(invoke).mockClear();
+    const stream = makeStream();
+    render(<ChatPanel persona="phoebe" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_notify",
+        body: "you up?",
+        urgency: "notify",
+        state: "delivered",
+        timestamp: "2026-05-11T14:32:00+00:00",
+      });
+    });
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "show_initiate_notification",
+        expect.objectContaining({ title: "Phoebe", body: "you up?" }),
+      );
+    });
+    expect(invoke).not.toHaveBeenCalledWith(
+      "show_initiate_notification",
+      expect.objectContaining({ title: "Nell" }),
+    );
   });
 
   it("posts /initiate/state with new_state=read after the banner is on-screen ~2s", async () => {
