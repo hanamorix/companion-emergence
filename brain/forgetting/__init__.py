@@ -145,7 +145,9 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                     felt_time_state=felt_state,
                     soul_linked_ids=soul_linked,
                 )
-                # Graveyard write BEFORE hard_delete (spec §4 order).
+                neighbors_at_drop = hebbian.neighbors(memory_id)
+                # Graveyard write BEFORE hard_delete (spec §4 order), now also
+                # tombstoning the link structure so recovery can rebuild it.
                 graveyard.append(
                     persona_dir,
                     memory=memory,
@@ -153,19 +155,17 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                     inputs=inputs,
                     lived_age_hours=felt_state.lived_age_hours,
                     reason=f"salience<{policy.LOST_THRESHOLD} for {next_low} consecutive passes",
+                    hebbian_neighbors=neighbors_at_drop,
                 )
                 store.hard_delete(memory_id)
+                # Remove orphaned edges BEFORE grief so a grief failure can
+                # never strand a dangling edge.
+                hebbian.remove_memory(memory_id)
                 summary["lost"] += 1
                 try:
-                    from brain import grief  # lazy — avoids circular import with brain.memory
+                    from brain import grief
 
-                    # handle_drop is internally fault-isolated; this outer try guards only
-                    # against import-time failures or attribute errors on brain.grief.
-                    grief.handle_drop(
-                        memory=memory,
-                        persona_dir=persona_dir,
-                        store=store,
-                    )
+                    grief.handle_drop(memory=memory, persona_dir=persona_dir, store=store)
                 except Exception:
                     log.exception(
                         "grief.handle_drop failed inside forgetting pass for memory_id=%s",
