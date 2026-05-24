@@ -131,6 +131,20 @@ class HebbianMatrix:
         self._conn.commit()
         return cursor.rowcount
 
+    def remove_memory(self, memory_id: str) -> int:
+        """Delete every edge incident on memory_id. Returns rows removed.
+
+        Called by the forgetting pass after a memory is hard-deleted, so no
+        dangling edge survives — edge endpoints must always resolve to a row
+        in memories.db. Idempotent: a memory with no edges removes 0.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM hebbian_edges WHERE memory_a = ? OR memory_b = ?",
+            (memory_id, memory_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def activation_count(self, memory_id: str) -> int:
         """Return the count of edges incident on this memory id."""
         row = self._conn.execute(
