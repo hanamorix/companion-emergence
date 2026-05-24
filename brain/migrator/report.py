@@ -195,10 +195,18 @@ def format_report(report: MigrationReport) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_source_manifest(path: Path, manifest: list[FileManifest]) -> None:
+def write_source_manifest(
+    path: Path,
+    manifest: list[FileManifest],
+    *,
+    migrated_at_utc: str | None = None,
+    lived_age_hours_at_migration: float = 0.0,
+) -> None:
     """Write source-manifest.json with every FileManifest entry + a generation timestamp."""
     payload = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "migrated_at_utc": migrated_at_utc or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "lived_age_hours_at_migration": lived_age_hours_at_migration,
         "files": [
             {
                 "relative_path": m.relative_path,

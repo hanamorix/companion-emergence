@@ -70,6 +70,19 @@ def _count_rows(db: Path, table: str) -> int:
         return 0
 
 
+def _read_source_lived_age(input_dir: Path) -> float:
+    """Read lived_age_hours from the source's felt_time_state.json without
+    mutating it. 0.0 if absent or unreadable (fresh-brain default)."""
+    p = input_dir / "felt_time_state.json"
+    if not p.is_file():
+        return 0.0
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return float(data.get("lived_age_hours", 0.0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0.0
+
+
 def preflight_companion_emergence(input_dir: Path) -> dict[str, Any]:
     """Inspect input_dir. Pure read. Returns ExistingCePreflight-shaped dict."""
     result: dict[str, Any] = {
@@ -165,12 +178,14 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
 
     manifest = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "migrated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source_kind": "companion-emergence",
         "source_input_dir": str(args.input_dir),
         "source_size_bytes": preflight["source_size_bytes"],
         "memory_count": preflight["memory_count"],
         "crystallization_count": preflight["crystallization_count"],
         "hebbian_edge_count": preflight["hebbian_edge_count"],
+        "lived_age_hours_at_migration": _read_source_lived_age(args.input_dir),
     }
     (target_dir / "source-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
