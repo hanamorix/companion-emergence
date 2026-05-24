@@ -145,3 +145,79 @@ def test_chat_missing_persona_dir_raises_file_not_found(tmp_path: Path, monkeypa
     monkeypatch.setattr(paths, "get_home", lambda: empty_home)
     with pytest.raises(FileNotFoundError):
         main(["chat", "--persona", "ghost", "--no-bridge"])
+
+
+# ── Bridge mode speaker label ───────────────────────────────────────────────
+
+
+def test_chat_via_bridge_labels_reply_with_persona_name(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The bridge chat loop must prefix replies with the actual persona name,
+    not a hardcoded "nell:". Regression for the report that a non-nell Kindled's
+    messages were labelled as coming from "nell"."""
+    import json as _json
+    from types import SimpleNamespace
+
+    import httpx
+
+    import brain.cli as cli
+
+    # A persona that is NOT named "nell".
+    persona_dir = tmp_path / "personas" / "phoebe"
+    persona_dir.mkdir(parents=True)
+
+    # Single user line, then EOF to exit the loop.
+    monkeypatch.setattr("builtins.input", lambda *a, **k: _next_or_eof())
+
+    inputs = iter(["hello there"])
+
+    def _next_or_eof() -> str:
+        try:
+            return next(inputs)
+        except StopIteration as exc:
+            raise EOFError from exc
+
+    # httpx.post serves /session/new and /sessions/close.
+    class _Resp:
+        def json(self) -> dict:
+            return {"session_id": "sess-1"}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+
+    # Fake WS yielding one reply_chunk then done.
+    class _FakeWS:
+        def __init__(self) -> None:
+            self._frames = iter(
+                [
+                    _json.dumps({"type": "reply_chunk", "text": "hey love"}),
+                    _json.dumps({"type": "done"}),
+                ]
+            )
+
+        def send(self, _payload: str) -> None:
+            pass
+
+        def recv(self) -> str:
+            return next(self._frames)
+
+    class _FakeWSCM:
+        def __enter__(self) -> _FakeWS:
+            return _FakeWS()
+
+        def __exit__(self, *_a) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "websockets.sync.client.connect", lambda *a, **k: _FakeWSCM()
+    )
+
+    args = SimpleNamespace(persona="phoebe", session=None)
+    readiness = SimpleNamespace(port=12345, auth_token="tok")
+
+    rc = cli._chat_via_bridge(args, persona_dir, readiness=readiness)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "phoebe: " in out
+    assert "nell: " not in out
