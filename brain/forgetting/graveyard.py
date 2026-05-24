@@ -31,6 +31,7 @@ def append(
     inputs: SalienceInputs,
     lived_age_hours: float,
     reason: str,
+    hebbian_neighbors: list[tuple[str, float]] | None = None,
 ) -> None:
     """Atomic append to forgotten_memories.jsonl.
 
@@ -54,6 +55,7 @@ def append(
         "salience_at_drop": salience_at_drop,
         "salience_inputs_at_drop": asdict(inputs),
         "graveyard_reason": reason,
+        "hebbian_neighbors": [[nid, float(w)] for nid, w in (hebbian_neighbors or [])],
     }
     path = persona_dir / GRAVEYARD_FILENAME
     line = (json.dumps(entry) + "\n").encode("utf-8")
