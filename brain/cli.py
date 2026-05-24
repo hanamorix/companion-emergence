@@ -1747,7 +1747,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
             return 1
         with ws_cm as ws:
             ws.send(json.dumps({"message": line}))
-            print("nell: ", end="", flush=True)
+            print(f"{args.persona}: ", end="", flush=True)
             while True:
                 msg = json.loads(ws.recv())
                 if msg.get("type") == "reply_chunk":
