@@ -7,6 +7,14 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.19 — 2026-05-24
+
+**Patch: persona name labelling.** User-reported — a non-nell Kindled's messages were labelled as from "nell".
+
+- `brain/cli.py` `_chat_via_bridge` hardcoded `"nell: "` as the reply speaker prefix → now `f"{args.persona}: "`. Only the bridge chat path (the default; auto-spawns the bridge) was affected; `--no-bridge` direct mode prints no label. Platform-independent string bug. Regression test mocks WS + httpx + input.
+- `app/src/components/ChatPanel.tsx` `show_initiate_notification` title was hardcoded `"Nell"` → now `capitalize(persona)` (same helper already used for the input placeholder + error messages). Vitest drives a notify-urgency initiate event and asserts the title is the persona name. Same bug class, found while going deep on the CLI report.
+- `from: "nell"` in ChatPanel is an internal bubble-side discriminator (never rendered) — left as-is.
+
 ## 0.0.18 — 2026-05-24
 
 **Installer & transfer resilience.** Three user-reported issues resolved in one cycle.
