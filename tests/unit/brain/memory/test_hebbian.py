@@ -202,3 +202,17 @@ def test_remove_memory_no_edges_is_zero(tmp_path):
         assert h.remove_memory("ghost") == 0
     finally:
         h.close()
+
+
+def test_ensure_edge_inserts_once_no_weight_inflation(tmp_path):
+    from brain.memory.hebbian import HebbianMatrix
+    h = HebbianMatrix(tmp_path / "h.db")
+    try:
+        assert h.ensure_edge("a", "b", 0.4) is True
+        assert h.ensure_edge("a", "b", 0.9) is False   # already exists; no change
+        assert h.weight("a", "b") == 0.4
+        assert h.ensure_edge("b", "a", 0.1) is False    # canonical: same edge
+        assert h.ensure_edge("x", "x", 0.5) is False     # self-edge ignored
+        assert h.neighbors("x") == []
+    finally:
+        h.close()
