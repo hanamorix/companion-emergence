@@ -23,6 +23,7 @@ FADE_THRESHOLD = 0.25
 LOST_THRESHOLD = 0.10
 LOST_PASS_COUNT = 2
 RECENT_LIVED_HOURS = 24.0
+IMPORT_GRACE_LIVED_HOURS = 168.0  # 7 lived-days — settling window for migrated memories
 
 
 class Transition(StrEnum):
@@ -57,6 +58,29 @@ def next_state(
         return Transition.NONE
     # state == "lost" is impossible — lost memories have rows deleted.
     return Transition.NONE
+
+
+def is_within_import_grace(
+    memory: Memory,
+    *,
+    migrated_at_utc: datetime | None,
+    lived_age_hours_at_migration: float,
+    current_lived_age_hours: float,
+) -> bool:
+    """True if `memory` was imported by a migration and is still inside its
+    settling window.
+
+    A migrated memory carries an old created_at and zero recall history, so it
+    looks maximally stale on arrival. We exempt memories created before the
+    migration until the install has accrued IMPORT_GRACE_LIVED_HOURS of
+    *engaged* (lived) time since import, giving real recalls a chance to accrue.
+    """
+    if migrated_at_utc is None or memory.created_at is None:
+        return False
+    if memory.created_at >= migrated_at_utc:
+        return False  # native to this install — normal recent-buffer rule applies
+    elapsed = max(0.0, current_lived_age_hours - lived_age_hours_at_migration)
+    return elapsed < IMPORT_GRACE_LIVED_HOURS
 
 
 def is_exempt(

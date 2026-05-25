@@ -346,8 +346,10 @@ def _write_kit_source_manifest(
     """Forensic record of the import: which kit, which dir, what landed."""
     payload = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "migrated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source_kit": "emergence-kit",
         "source_input_dir": str(input_dir),
+        "lived_age_hours_at_migration": 0.0,
         "summary": {
             "memories_imported": memories_imported,
             "memories_skipped": memories_skipped,

@@ -2146,6 +2146,8 @@ def _build_parser() -> argparse.ArgumentParser:
     memory_show.set_defaults(func=_memory_show_handler)
 
     _build_migrate_parser(subparsers)
+    from brain.recovery.cli import build_parser as _build_recover_parser
+    _build_recover_parser(subparsers)
 
     dream_sub = subparsers.add_parser(
         "dream",

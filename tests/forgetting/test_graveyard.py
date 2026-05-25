@@ -100,3 +100,36 @@ def test_search_tolerates_corrupt_jsonl_line(tmp_path):
     )
     hits = search(tmp_path, "good")
     assert len(hits) == 2
+
+
+def test_append_records_hebbian_neighbors(tmp_path):
+    from datetime import UTC, datetime
+
+    from brain.forgetting import graveyard
+    from brain.forgetting.salience import SalienceInputs
+    from brain.memory.store import Memory
+
+    mem = Memory(id="m1", content="summary text", memory_type="conversation",
+                 domain="us", created_at=datetime.now(UTC))
+    inputs = SalienceInputs(emotion=0.0, recall=0.0, hebbian=0.0, soul=0.0, freshness=0.0)
+    graveyard.append(
+        tmp_path, memory=mem, salience_at_drop=0.05, inputs=inputs,
+        lived_age_hours=10.0, reason="test",
+        hebbian_neighbors=[("n1", 0.8), ("n2", 0.3)],
+    )
+    assert graveyard.read_all(tmp_path)[0]["hebbian_neighbors"] == [["n1", 0.8], ["n2", 0.3]]
+
+
+def test_append_without_neighbors_defaults_empty(tmp_path):
+    from datetime import UTC, datetime
+
+    from brain.forgetting import graveyard
+    from brain.forgetting.salience import SalienceInputs
+    from brain.memory.store import Memory
+
+    mem = Memory(id="m2", content="x", memory_type="conversation", domain="us",
+                 created_at=datetime.now(UTC))
+    inputs = SalienceInputs(emotion=0.0, recall=0.0, hebbian=0.0, soul=0.0, freshness=0.0)
+    graveyard.append(tmp_path, memory=mem, salience_at_drop=0.05, inputs=inputs,
+                     lived_age_hours=1.0, reason="test")
+    assert graveyard.read_all(tmp_path)[0]["hebbian_neighbors"] == []

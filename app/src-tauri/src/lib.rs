@@ -706,6 +706,103 @@ async fn preflight_existing_ce(
     serde_json::from_str(last_line).map_err(|e| format!("parse preflight json: {}", e))
 }
 
+/// Summary returned by `preflight_recover` (dry-run pass of `nell recover`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecoverPreflight {
+    pub mode: String,
+    pub missing: i64,
+    pub unfade: i64,
+}
+
+/// Arguments forwarded to `nell recover` by `run_recover`.
+#[derive(Debug, Deserialize)]
+pub struct RecoverArgs {
+    pub persona: String,
+    pub source_dir: Option<String>,
+    pub force: bool,
+    pub dry_run: bool,
+}
+
+/// Dry-run `nell recover --persona <p> [--from <src>] --dry-run --json` and
+/// return a lightweight summary so the frontend can show what will happen
+/// before the user commits.
+#[tauri::command]
+async fn preflight_recover(
+    app: tauri::AppHandle,
+    persona: String,
+    source_dir: Option<String>,
+) -> Result<RecoverPreflight, String> {
+    validate_persona_name(&persona)?;
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["recover", "--persona", &persona, "--dry-run", "--json"]);
+    if let Some(src) = &source_dir {
+        cmd.args(["--from", src]);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+        .await
+        .map_err(|_| "recover_preflight_timeout".to_string())?
+        .map_err(|e| format!("spawn nell recover --dry-run: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout.lines().last().unwrap_or("").trim();
+    let v: serde_json::Value = serde_json::from_str(last)
+        .map_err(|e| format!("parse recover preflight json: {} (got: {})", e, last))?;
+    Ok(RecoverPreflight {
+        mode: v["mode"].as_str().unwrap_or("source").to_string(),
+        missing: v["memories_restored_full"].as_i64().unwrap_or(0)
+            + v["memories_restored_summary"].as_i64().unwrap_or(0),
+        unfade: v["memories_unfaded"].as_i64().unwrap_or(0),
+    })
+}
+
+/// Run `nell recover --persona <p> [--from <src>] [--force] [--dry-run] --json`
+/// and surface the raw `InitResult` to the frontend.
+#[tauri::command]
+async fn run_recover(app: tauri::AppHandle, args: RecoverArgs) -> Result<InitResult, String> {
+    validate_persona_name(&args.persona)?;
+    let started = std::time::Instant::now();
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["recover", "--persona", &args.persona, "--json"]);
+    if let Some(src) = &args.source_dir {
+        cmd.args(["--from", src]);
+    }
+    if args.force {
+        cmd.arg("--force");
+    }
+    if args.dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            let msg = format!("spawn nell recover: {}", e);
+            record_spawn_failure(&app, "nell recover", None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            record_spawn_failure(&app, "nell recover", None, Some("recover_timeout"), started);
+            return Err("recover_timeout".to_string());
+        }
+    };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell recover", Some(&output), None, started);
+    }
+    Ok(InitResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
+}
+
 /// Resolve $KINDLED_HOME as a string for the frontend (e.g. to show the
 /// launch-failures.log path in the bridge-error screen).
 #[tauri::command]
@@ -1333,6 +1430,8 @@ pub fn run() {
             run_init,
             run_migrate,
             preflight_existing_ce,
+            preflight_recover,
+            run_recover,
             nellbrain_home_path,
             reveal_in_file_manager,
             install_supervisor_service,

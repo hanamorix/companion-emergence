@@ -26,6 +26,7 @@ interface Props {
   onPreflightChange: (p: ExistingCePreflight | null) => void;
   onNext: () => void;
   onBack: () => void;
+  onRecover?: () => void;
   avatar: ReactNode;
 }
 
@@ -40,6 +41,7 @@ export function StepMigrate({
   onPreflightChange,
   onNext,
   onBack,
+  onRecover,
   avatar,
 }: Props) {
   // For companion-emergence, the preflight must be ok before we can proceed.
@@ -99,6 +101,25 @@ export function StepMigrate({
           preflight={preflight}
           onPreflightChange={onPreflightChange}
         />
+      )}
+
+      {onRecover && (
+        <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-subtle, rgba(128,128,128,0.2))" }}>
+          <button
+            onClick={onRecover}
+            style={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              cursor: "pointer",
+              fontSize: 11,
+              color: "var(--text-mute)",
+              textDecoration: "underline",
+            }}
+          >
+            Something missing after a transfer? Recover
+          </button>
+        </div>
       )}
     </WizardShell>
   );

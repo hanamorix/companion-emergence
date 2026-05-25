@@ -131,6 +131,41 @@ class HebbianMatrix:
         self._conn.commit()
         return cursor.rowcount
 
+    def remove_memory(self, memory_id: str) -> int:
+        """Delete every edge incident on memory_id. Returns rows removed.
+
+        Called by the forgetting pass after a memory is hard-deleted, so no
+        dangling edge survives — edge endpoints must always resolve to a row
+        in memories.db. Idempotent: a memory with no edges removes 0.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM hebbian_edges WHERE memory_a = ? OR memory_b = ?",
+            (memory_id, memory_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def ensure_edge(self, a: str, b: str, weight: float) -> bool:
+        """Create edge (a, b) at `weight` only if it does not already exist.
+
+        Returns True if inserted, False if it already existed (or is a
+        self-edge). Unlike strengthen(), never inflates an existing weight —
+        safe for idempotent recovery re-runs.
+        """
+        if a == b:
+            return False
+        lo, hi = _canonical(a, b)
+        cur = self._conn.execute(
+            """
+            INSERT INTO hebbian_edges (memory_a, memory_b, weight)
+            VALUES (?, ?, ?)
+            ON CONFLICT(memory_a, memory_b) DO NOTHING
+            """,
+            (lo, hi, weight),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def activation_count(self, memory_id: str) -> int:
         """Return the count of edges incident on this memory id."""
         row = self._conn.execute(

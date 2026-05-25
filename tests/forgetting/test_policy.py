@@ -109,3 +109,57 @@ def test_not_exempt_when_old():
         under_review_ids=set(),
         now_lived_age_hours=500.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# is_within_import_grace — migration settling window
+# ---------------------------------------------------------------------------
+
+
+def _mem(created):
+    return Memory(id="m", content="c", memory_type="conversation", domain="us",
+                  created_at=created)
+
+
+def test_pre_migration_memory_within_grace_is_exempt():
+    from brain.forgetting import policy
+    mig = datetime(2026, 5, 1, tzinfo=UTC)
+    mem = _mem(datetime(2026, 4, 1, tzinfo=UTC))
+    assert policy.is_within_import_grace(
+        mem, migrated_at_utc=mig, lived_age_hours_at_migration=100.0,
+        current_lived_age_hours=150.0) is True
+
+
+def test_grace_lapsed_not_exempt():
+    from brain.forgetting import policy
+    mig = datetime(2026, 5, 1, tzinfo=UTC)
+    mem = _mem(datetime(2026, 4, 1, tzinfo=UTC))
+    assert policy.is_within_import_grace(
+        mem, migrated_at_utc=mig, lived_age_hours_at_migration=100.0,
+        current_lived_age_hours=300.0) is False
+
+
+def test_post_migration_memory_not_import_exempt():
+    from brain.forgetting import policy
+    mig = datetime(2026, 5, 1, tzinfo=UTC)
+    mem = _mem(datetime(2026, 5, 2, tzinfo=UTC))
+    assert policy.is_within_import_grace(
+        mem, migrated_at_utc=mig, lived_age_hours_at_migration=0.0,
+        current_lived_age_hours=1.0) is False
+
+
+def test_no_manifest_means_no_grace():
+    from brain.forgetting import policy
+    mem = _mem(datetime(2026, 4, 1, tzinfo=UTC))
+    assert policy.is_within_import_grace(
+        mem, migrated_at_utc=None, lived_age_hours_at_migration=0.0,
+        current_lived_age_hours=1.0) is False
+
+
+def test_clock_skew_clamped():
+    from brain.forgetting import policy
+    mig = datetime(2026, 5, 1, tzinfo=UTC)
+    mem = _mem(datetime(2026, 4, 1, tzinfo=UTC))
+    assert policy.is_within_import_grace(
+        mem, migrated_at_utc=mig, lived_age_hours_at_migration=100.0,
+        current_lived_age_hours=50.0) is True

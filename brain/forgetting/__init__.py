@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,31 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
     return crystallised, under_review
 
 
+def _load_migration_grace(persona_dir: Path) -> tuple[datetime | None, float]:
+    """Return (migrated_at_utc, lived_age_hours_at_migration) from source-manifest.json.
+    (None, 0.0) when no manifest or fields absent — i.e. no grace (back-compat)."""
+    p = persona_dir / "source-manifest.json"
+    if not p.exists():
+        return None, 0.0
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, 0.0
+    raw = data.get("migrated_at_utc") or data.get("generated_at_utc")
+    mig: datetime | None = None
+    if isinstance(raw, str):
+        try:
+            mig = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            mig = None
+    lived = data.get("lived_age_hours_at_migration", 0.0)
+    try:
+        lived = float(lived)
+    except (TypeError, ValueError):
+        lived = 0.0
+    return mig, lived
+
+
 def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
     """Run one forgetting pass over all active+fading memories.
 
@@ -77,6 +103,7 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
     felt_state, _recovered = load_felt_time(persona_dir)
     crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
     soul_linked = crystallised_ids | under_review_ids
+    migrated_at_utc, lived_at_migration = _load_migration_grace(persona_dir)
 
     summary: dict[str, int] = {"faded": 0, "unfaded": 0, "lost": 0, "exempt": 0, "total": 0}
 
@@ -115,6 +142,15 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                 summary["exempt"] += 1
                 continue
 
+            if policy.is_within_import_grace(
+                memory,
+                migrated_at_utc=migrated_at_utc,
+                lived_age_hours_at_migration=lived_at_migration,
+                current_lived_age_hours=felt_state.lived_age_hours,
+            ):
+                summary["exempt"] += 1
+                continue
+
             s = salience.score(
                 memory,
                 store=store,
@@ -145,7 +181,9 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                     felt_time_state=felt_state,
                     soul_linked_ids=soul_linked,
                 )
-                # Graveyard write BEFORE hard_delete (spec §4 order).
+                neighbors_at_drop = hebbian.neighbors(memory_id)
+                # Graveyard write BEFORE hard_delete (spec §4 order), now also
+                # tombstoning the link structure so recovery can rebuild it.
                 graveyard.append(
                     persona_dir,
                     memory=memory,
@@ -153,19 +191,17 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                     inputs=inputs,
                     lived_age_hours=felt_state.lived_age_hours,
                     reason=f"salience<{policy.LOST_THRESHOLD} for {next_low} consecutive passes",
+                    hebbian_neighbors=neighbors_at_drop,
                 )
                 store.hard_delete(memory_id)
+                # Remove orphaned edges BEFORE grief so a grief failure can
+                # never strand a dangling edge.
+                hebbian.remove_memory(memory_id)
                 summary["lost"] += 1
                 try:
-                    from brain import grief  # lazy — avoids circular import with brain.memory
+                    from brain import grief
 
-                    # handle_drop is internally fault-isolated; this outer try guards only
-                    # against import-time failures or attribute errors on brain.grief.
-                    grief.handle_drop(
-                        memory=memory,
-                        persona_dir=persona_dir,
-                        store=store,
-                    )
+                    grief.handle_drop(memory=memory, persona_dir=persona_dir, store=store)
                 except Exception:
                     log.exception(
                         "grief.handle_drop failed inside forgetting pass for memory_id=%s",

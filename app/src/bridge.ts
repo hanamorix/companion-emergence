@@ -485,3 +485,32 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
   );
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
 }
+
+// ── Memory recovery (forgetting-edge-cascade) ──────────────────────────
+
+export interface RecoverPreflight {
+  mode: string;
+  missing: number;
+  unfade: number;
+}
+
+export interface RecoverResult {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+}
+
+export async function invokeRecoverPreflight(
+  persona: string, sourceDir: string | null,
+): Promise<RecoverPreflight> {
+  return invoke<RecoverPreflight>("preflight_recover", { persona, sourceDir });
+}
+
+export async function invokeRunRecover(
+  persona: string, sourceDir: string | null, force: boolean, dryRun: boolean,
+): Promise<RecoverResult> {
+  return invoke<RecoverResult>("run_recover", {
+    args: { persona, source_dir: sourceDir, force, dry_run: dryRun },
+  });
+}

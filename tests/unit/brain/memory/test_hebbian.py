@@ -178,3 +178,41 @@ def test_spreading_activation_zero_decay_blocks_propagation(
     act = matrix.spreading_activation(["a"], depth=2, decay_per_hop=0.0)
     assert "b" not in act
     assert act["a"] == pytest.approx(1.0)
+
+
+def test_remove_memory_deletes_all_incident_edges(tmp_path):
+    from brain.memory.hebbian import HebbianMatrix
+    h = HebbianMatrix(tmp_path / "h.db")
+    try:
+        h.strengthen("a", "b", delta=0.5)
+        h.strengthen("a", "c", delta=0.7)
+        h.strengthen("b", "c", delta=0.3)
+        removed = h.remove_memory("a")
+        assert removed == 2
+        assert h.neighbors("a") == []
+        assert h.weight("b", "c") == 0.3
+    finally:
+        h.close()
+
+
+def test_remove_memory_no_edges_is_zero(tmp_path):
+    from brain.memory.hebbian import HebbianMatrix
+    h = HebbianMatrix(tmp_path / "h.db")
+    try:
+        assert h.remove_memory("ghost") == 0
+    finally:
+        h.close()
+
+
+def test_ensure_edge_inserts_once_no_weight_inflation(tmp_path):
+    from brain.memory.hebbian import HebbianMatrix
+    h = HebbianMatrix(tmp_path / "h.db")
+    try:
+        assert h.ensure_edge("a", "b", 0.4) is True
+        assert h.ensure_edge("a", "b", 0.9) is False   # already exists; no change
+        assert h.weight("a", "b") == 0.4
+        assert h.ensure_edge("b", "a", 0.1) is False    # canonical: same edge
+        assert h.ensure_edge("x", "x", 0.5) is False     # self-edge ignored
+        assert h.neighbors("x") == []
+    finally:
+        h.close()
