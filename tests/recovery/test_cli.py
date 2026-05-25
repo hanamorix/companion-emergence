@@ -1,21 +1,23 @@
 import json
 from datetime import UTC, datetime
 
-from brain.memory.store import Memory, MemoryStore
 from brain.memory.hebbian import HebbianMatrix
-from brain.recovery.cli import run_recover_cli, RecoverArgs
+from brain.memory.store import Memory, MemoryStore
+from brain.recovery.cli import RecoverArgs, run_recover_cli
 
 
 def _persona_and_source(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     from brain.paths import get_persona_dir
-    p = get_persona_dir("Phoebe"); p.mkdir(parents=True)
+    p = get_persona_dir("Phoebe")
+    p.mkdir(parents=True)
     s = MemoryStore(p / "memories.db")
     s.create(Memory(id="S", content="s", memory_type="conversation", domain="us",
                     created_at=datetime(2026, 4, 1, tzinfo=UTC)))
     s.close()
     HebbianMatrix(p / "hebbian.db").close()
-    src = tmp_path / "src"; src.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
     ss = MemoryStore(src / "memories.db")
     ss.create(Memory(id="S", content="s", memory_type="conversation", domain="us",
                      created_at=datetime(2026, 4, 1, tzinfo=UTC)))
@@ -45,6 +47,7 @@ def test_cli_unknown_persona_exits(tmp_path, monkeypatch):
 
 def test_cli_refuses_live_bridge_without_force(tmp_path, monkeypatch):
     import os
+
     import pytest
     p, src = _persona_and_source(tmp_path, monkeypatch)
     # A bridge.json pointing at THIS (alive) process simulates a live bridge.
@@ -56,6 +59,7 @@ def test_cli_refuses_live_bridge_without_force(tmp_path, monkeypatch):
 
 def test_build_parser_registers_recover_subcommand():
     import argparse
+
     from brain.recovery.cli import build_parser
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")

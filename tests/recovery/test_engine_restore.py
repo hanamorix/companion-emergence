@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.memory.store import Memory, MemoryStore
-from brain.recovery.engine import _build_restore_plan, _apply_memory_restores
+from brain.recovery.engine import _apply_memory_restores, _build_restore_plan
 
 
 def _seed_current(persona: Path):
@@ -31,8 +31,10 @@ def _seed_source(src: Path):
 
 
 def test_source_mode_restores_missing_and_unfades(tmp_path):
-    persona = tmp_path / "Phoebe"; _seed_current(persona)
-    src = tmp_path / "src"; _seed_source(src)
+    persona = tmp_path / "Phoebe"
+    _seed_current(persona)
+    src = tmp_path / "src"
+    _seed_source(src)
 
     plan = _build_restore_plan(persona, source_dir=src)
     assert set(plan.missing) == {"lost"}
@@ -53,7 +55,8 @@ def test_source_mode_restores_missing_and_unfades(tmp_path):
 
 def test_graveyard_mode_restores_from_summary(tmp_path):
     import json
-    persona = tmp_path / "Nova"; persona.mkdir(parents=True)
+    persona = tmp_path / "Nova"
+    persona.mkdir(parents=True)
     s = MemoryStore(persona / "memories.db")
     s.create(Memory(id="alive", content="alive", memory_type="conversation",
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
