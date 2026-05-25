@@ -178,7 +178,7 @@ echo "[build] wheel: $(basename "$WHEEL")"
 # release builds from the same commit could ship different dependency versions.
 echo "[build] exporting locked runtime requirements"
 uv export \
-  --format requirements.txt \
+  --format requirements-txt \
   --no-dev \
   --no-emit-project \
   --locked \
