@@ -43,6 +43,17 @@ def test_cli_unknown_persona_exits(tmp_path, monkeypatch):
                                     force=True, dry_run=True, json_out=True))
 
 
+def test_cli_refuses_live_bridge_without_force(tmp_path, monkeypatch):
+    import os
+    import pytest
+    p, src = _persona_and_source(tmp_path, monkeypatch)
+    # A bridge.json pointing at THIS (alive) process simulates a live bridge.
+    (p / "bridge.json").write_text(json.dumps({"pid": os.getpid()}))
+    with pytest.raises(SystemExit):
+        run_recover_cli(RecoverArgs(persona="Phoebe", source_dir=src,
+                                    force=False, dry_run=False, json_out=True))
+
+
 def test_build_parser_registers_recover_subcommand():
     import argparse
     from brain.recovery.cli import build_parser
