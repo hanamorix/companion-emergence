@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import UTC, datetime
 
-from brain.recovery.source_reader import read_source_memories, read_source_edges
+from brain.recovery.source_reader import read_source_edges, read_source_memories
 
 
 def _mk_old_schema_source(tmp_path):
