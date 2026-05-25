@@ -1,9 +1,9 @@
 import json
 from datetime import UTC, datetime, timedelta
 
-from brain.forgetting import run_pass, FORGETTING_STATE_FILENAME
-from brain.memory.store import Memory, MemoryStore
+from brain.forgetting import FORGETTING_STATE_FILENAME, run_pass
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.store import Memory, MemoryStore
 
 
 class _Bus:

@@ -104,6 +104,7 @@ def test_search_tolerates_corrupt_jsonl_line(tmp_path):
 
 def test_append_records_hebbian_neighbors(tmp_path):
     from datetime import UTC, datetime
+
     from brain.forgetting import graveyard
     from brain.forgetting.salience import SalienceInputs
     from brain.memory.store import Memory
@@ -121,6 +122,7 @@ def test_append_records_hebbian_neighbors(tmp_path):
 
 def test_append_without_neighbors_defaults_empty(tmp_path):
     from datetime import UTC, datetime
+
     from brain.forgetting import graveyard
     from brain.forgetting.salience import SalienceInputs
     from brain.memory.store import Memory

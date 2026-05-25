@@ -12,7 +12,7 @@ from brain.forgetting import graveyard
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.report import RecoveryReport
-from brain.recovery.source_reader import read_source_memories
+from brain.recovery.source_reader import read_source_edges, read_source_memories
 
 
 @dataclass
@@ -63,6 +63,7 @@ def _build_restore_plan(persona_dir: Path, *, source_dir: Path | None) -> Restor
             ]
         return plan
     plan = RestorePlan(mode="source")
+    plan.source_edges = read_source_edges(source_dir)
     for mid, mem in read_source_memories(source_dir).items():
         if mid not in current_ids:
             plan.missing[mid] = mem
