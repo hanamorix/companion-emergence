@@ -4,9 +4,10 @@ from datetime import datetime
 from pathlib import Path
 
 from brain.migrator.companion_emergence import (
-    CompanionEmergenceMigrateArgs, migrate_companion_emergence)
+    CompanionEmergenceMigrateArgs,
+    migrate_companion_emergence,
+)
 from brain.migrator.emergence_kit import EmergenceKitMigrateArgs, migrate_emergence_kit
-from brain.migrator.og import FileManifest
 from brain.migrator.report import write_source_manifest
 
 
@@ -36,10 +37,12 @@ def test_ce_manifest_records_source_lived_age(tmp_path, monkeypatch):
 
 def test_ce_manifest_lived_age_defaults_zero_when_no_felt_time(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
-    src = tmp_path / "src2"; src.mkdir()
+    src = tmp_path / "src2"
+    src.mkdir()
     conn = sqlite3.connect(src / "memories.db")
     conn.execute("CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT)")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     (src / "persona_config.json").write_text(json.dumps({"user_name": "Z"}))
     migrate_companion_emergence(CompanionEmergenceMigrateArgs(
         input_dir=src, install_as="Nova", force=False))
