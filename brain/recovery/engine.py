@@ -1,6 +1,9 @@
 """Recovery engine."""
 from __future__ import annotations
 
+import json
+import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +11,7 @@ from pathlib import Path
 from brain.forgetting import graveyard
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.recovery.report import RecoveryReport
 from brain.recovery.source_reader import read_source_memories
 
 
@@ -132,3 +136,74 @@ def _apply_memory_restores(persona_dir: Path, plan: RestorePlan) -> dict[str, in
     finally:
         store.close()
     return counts
+
+
+def run_recovery(
+    persona_dir: Path,
+    *,
+    source_dir: Path | None,
+    dry_run: bool = False,
+) -> RecoveryReport:
+    """Backup → restore → repair → grace-refresh → report."""
+    started = time.monotonic()
+    if source_dir is not None and source_dir.resolve() == persona_dir.resolve():
+        raise ValueError("--from must not be the persona being recovered")
+    plan = _build_restore_plan(persona_dir, source_dir=source_dir)
+    if dry_run:
+        return RecoveryReport(
+            persona=persona_dir.name, mode=plan.mode,
+            source_dir=str(source_dir) if source_dir else None,
+            memories_restored_full=len(plan.missing),
+            memories_restored_summary=len(plan.missing_summaries),
+            memories_unfaded=len(plan.unfade),
+            edges_repaired=0, edges_pruned_unrecoverable=0,
+            backup_path=None, elapsed_seconds=time.monotonic() - started, dry_run=True,
+        )
+    # backup
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    backup_dir = persona_dir / f"recover-backup-{ts}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("memories.db", "hebbian.db"):
+        src_file = persona_dir / name
+        if src_file.is_file():
+            shutil.copy2(src_file, backup_dir / name)
+    backup = str(backup_dir)
+
+    counts = _apply_memory_restores(persona_dir, plan)
+    repaired, pruned = _repair_edges(persona_dir, plan)
+
+    # grace-refresh
+    from brain.felt_time.state import load_or_recover
+    p_manifest = persona_dir / "source-manifest.json"
+    mdata: dict = {}
+    if p_manifest.exists():
+        try:
+            mdata = json.loads(p_manifest.read_text())
+        except (OSError, json.JSONDecodeError):
+            mdata = {}
+    state, _ = load_or_recover(persona_dir)
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    mdata["migrated_at_utc"] = now_iso
+    mdata["lived_age_hours_at_migration"] = float(state.lived_age_hours)
+    mdata["recovered_at"] = now_iso
+    p_manifest.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
+
+    return RecoveryReport(
+        persona=persona_dir.name, mode=plan.mode,
+        source_dir=str(source_dir) if source_dir else None,
+        memories_restored_full=counts["restored_full"],
+        memories_restored_summary=counts["restored_summary"],
+        memories_unfaded=counts["unfaded"],
+        edges_repaired=repaired, edges_pruned_unrecoverable=pruned,
+        backup_path=backup, elapsed_seconds=time.monotonic() - started, dry_run=False,
+    )
+
+
+def preflight_recovery(persona_dir: Path, *, source_dir: Path | None) -> dict:
+    """Pure read — what recovery WOULD do. Used by the wizard preflight."""
+    plan = _build_restore_plan(persona_dir, source_dir=source_dir)
+    return {
+        "mode": plan.mode,
+        "missing": len(plan.missing) + len(plan.missing_summaries),
+        "unfade": len(plan.unfade),
+    }
