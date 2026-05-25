@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.forgetting import graveyard
+from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.source_reader import read_source_memories
 
@@ -64,6 +65,47 @@ def _build_restore_plan(persona_dir: Path, *, source_dir: Path | None) -> Restor
         elif mid in faded_ids:
             plan.unfade[mid] = mem.content
     return plan
+
+
+def _repair_edges(persona_dir: Path, plan: RestorePlan) -> tuple[int, int]:
+    """Restore recoverable edges, then prune any edge still dangling.
+
+    Returns (edges_repaired, edges_pruned_unrecoverable). Runs AFTER memory
+    restores so endpoints exist; the final prune is the only place we delete
+    dangling edges, and only once restoration can no longer save them.
+    """
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        valid = {r["id"] for r in store._conn.execute("SELECT id FROM memories")}
+    finally:
+        store.close()
+
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    repaired = 0
+    pruned = 0
+    try:
+        if plan.mode == "source":
+            for a, b, w in plan.source_edges:
+                if a in valid and b in valid and hebbian.ensure_edge(a, b, w):
+                    repaired += 1
+        else:
+            for mid, neighbours in plan.graveyard_neighbors.items():
+                if mid not in valid:
+                    continue
+                for nid, w in neighbours:
+                    if nid in valid and hebbian.ensure_edge(mid, nid, w):
+                        repaired += 1
+
+        rows = hebbian._conn.execute(
+            "SELECT DISTINCT memory_a FROM hebbian_edges "
+            "UNION SELECT DISTINCT memory_b FROM hebbian_edges"
+        ).fetchall()
+        referenced = {r[0] for r in rows}
+        for mid in referenced - valid:
+            pruned += hebbian.remove_memory(mid)
+    finally:
+        hebbian.close()
+    return repaired, pruned
 
 
 def _apply_memory_restores(persona_dir: Path, plan: RestorePlan) -> dict[str, int]:
