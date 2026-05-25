@@ -7,6 +7,7 @@ import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
+import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
 import { errString } from "../../lib/errString";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -153,6 +154,9 @@ export function ConnectionPanel({
       <Row label="Privacy" value="Local-only" accent />
 
       <StatusBanner mode={mode} stateError={stateError} persona={persona} />
+
+      <Divider />
+      <RecoverLauncher persona={persona} />
 
       <Divider />
       <SectionLabel>Supervisor</SectionLabel>
