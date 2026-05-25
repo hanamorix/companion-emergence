@@ -18,6 +18,7 @@ import { StepPersonaName } from "./steps/StepPersonaName";
 import { StepUserName } from "./steps/StepUserName";
 import { StepVoiceTemplate } from "./steps/StepVoiceTemplate";
 import { StepMigrate } from "./steps/StepMigrate";
+import { StepRecover } from "./steps/StepRecover";
 import { StepReview } from "./steps/StepReview";
 import { StepInstalling } from "./steps/StepInstalling";
 import { StepReady } from "./steps/StepReady";
@@ -59,6 +60,7 @@ type Step =
   | "user"
   | "voice"
   | "migrate"
+  | "recover"
   | "review"
   | "installing"
   | "ready";
@@ -96,6 +98,7 @@ export function Wizard({ onDone }: Props) {
     user: "user",
     voice: "voice",
     migrate: "migrate",
+    recover: "migrate",
     review: "review",
     installing: "installing",
     ready: "review",
@@ -354,7 +357,20 @@ export function Wizard({ onDone }: Props) {
               : setStep("name")
           }
           onBack={() => setStep("prereq")}
+          onRecover={() => setStep("recover")}
           avatar={avatar}
+        />
+      );
+    case "recover":
+      return (
+        <StepRecover
+          persona={
+            isCeMigrate && preflight?.persona_name
+              ? preflight.persona_name
+              : state.personaName
+          }
+          sourceDir={state.migrateFromPath || null}
+          onDone={() => setStep("ready")}
         />
       );
     case "review":
