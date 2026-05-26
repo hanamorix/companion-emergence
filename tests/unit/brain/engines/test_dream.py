@@ -583,3 +583,26 @@ def test_select_seed_explicit_id_unchanged(
     m = _mem("x", importance=1.0)
     store.create(m)
     assert engine._select_seed(seed_id=m.id, lookback_hours=24).id == m.id
+
+
+def test_build_prompt_grief_seed_uses_processing_framing(engine: DreamEngine) -> None:
+    grief = Memory.create_new(
+        content="the morning we stopped talking about it",
+        memory_type="grief_event",
+        domain="grief",
+        emotions={"memory_grief": 8.0},
+    )
+    _system, user_prompt = engine._build_prompt(grief, [])
+    assert "sit with" in user_prompt.lower()
+    assert "thread" not in user_prompt.lower()  # not the association framing
+
+
+def test_build_prompt_normal_seed_uses_association_framing(engine: DreamEngine) -> None:
+    mem = Memory.create_new(
+        content="a normal recollection",
+        memory_type="meta",
+        domain="us",
+        emotions={},
+    )
+    _system, user_prompt = engine._build_prompt(mem, [])
+    assert "Seed memory" in user_prompt

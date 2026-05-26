@@ -208,11 +208,21 @@ class DreamEngine:
     def _build_prompt(
         self, seed: Memory, neighbours: list[tuple[Memory, float]]
     ) -> tuple[str, str]:
-        parts = [
-            f"Seed memory (domain={seed.domain}):",
-            f"  {seed.content}",
-            "",
-        ]
+        if seed.memory_type == "grief_event":
+            parts = [
+                "This is a grief memory — a loss. Do not weave it together with "
+                "other experiences. Sit with it: what it meant, and what is "
+                "different now in its absence.",
+                "",
+                f"  {seed.content}",
+                "",
+            ]
+        else:
+            parts = [
+                f"Seed memory (domain={seed.domain}):",
+                f"  {seed.content}",
+                "",
+            ]
         if neighbours:
             parts.append("Also present:")
             for mem, _ in neighbours:
