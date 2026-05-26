@@ -606,3 +606,35 @@ def test_build_prompt_normal_seed_uses_association_framing(engine: DreamEngine) 
     )
     _system, user_prompt = engine._build_prompt(mem, [])
     assert "Seed memory" in user_prompt
+
+
+def test_strengthen_edges_skips_fading_neighbour(engine: DreamEngine) -> None:
+    seed = _mem("seed", importance=5.0)
+    active_n = _mem("active_n", importance=5.0)
+    fading_n = _mem("fading_n", importance=5.0)
+    fading_n.state = "fading"
+    count = engine._strengthen_edges(seed, [(active_n, 1.0), (fading_n, 1.0)], 0.1)
+    assert count == 1
+    assert engine.hebbian.weight(seed.id, active_n.id) > 0.0
+    assert engine.hebbian.weight(seed.id, fading_n.id) == 0.0
+
+
+def test_strengthen_edges_skips_all_when_seed_fading(engine: DreamEngine) -> None:
+    seed = _mem("seed", importance=5.0)
+    seed.state = "fading"
+    n1 = _mem("n1", importance=5.0)
+    n2 = _mem("n2", importance=5.0)
+    count = engine._strengthen_edges(seed, [(n1, 1.0), (n2, 1.0)], 0.1)
+    assert count == 0
+    assert engine.hebbian.weight(seed.id, n1.id) == 0.0
+    assert engine.hebbian.weight(seed.id, n2.id) == 0.0
+
+
+def test_strengthen_edges_all_active_unchanged(engine: DreamEngine) -> None:
+    seed = _mem("seed", importance=5.0)
+    n1 = _mem("n1", importance=5.0)
+    n2 = _mem("n2", importance=5.0)
+    count = engine._strengthen_edges(seed, [(n1, 1.0), (n2, 1.0)], 0.1)
+    assert count == 2
+    assert engine.hebbian.weight(seed.id, n1.id) > 0.0
+    assert engine.hebbian.weight(seed.id, n2.id) > 0.0
