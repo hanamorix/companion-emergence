@@ -81,3 +81,37 @@ def identity_congruence(
         if weighted > best:
             best = weighted
     return best
+
+
+def grief_pull(memory: Memory) -> float:
+    """Normalized bonus for actual grief breadcrumbs so loss gets reached
+    within a grief-congruent pool. Fires only for grief_event memories."""
+    if memory.memory_type != "grief_event":
+        return 0.0
+    return memory.emotions.get("memory_grief", 0.0) / 10.0
+
+
+def refractory_penalty(memory_id: str, recent_seed_ids: list[str]) -> float:
+    """1.0 if this memory was a seed within the refractory window, else 0.0.
+    A deterministic novelty pressure read from the dream log — not random."""
+    return 1.0 if memory_id in recent_seed_ids else 0.0
+
+
+def composite_score(
+    memory: Memory,
+    mood: EmotionalState,
+    crystallizations: list[Crystallization],
+    *,
+    recent_seed_ids: list[str],
+    w_identity: float = W_IDENTITY,
+    w_grief: float = W_GRIEF,
+    w_refractory: float = W_REFRACTORY,
+) -> float:
+    """Rank score inside the mood-gated pool. Emotional congruence is NOT a
+    term here — it already acted as the gate. importance is normalized 0..1."""
+    return (
+        memory.importance / 10.0
+        + w_identity * identity_congruence(memory, crystallizations)
+        + w_grief * grief_pull(memory)
+        - w_refractory * refractory_penalty(memory.id, recent_seed_ids)
+    )
