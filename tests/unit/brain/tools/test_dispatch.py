@@ -170,19 +170,30 @@ def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> No
 
 
 def _seed_active_buffer(persona_dir: Path, *, hours_old: float) -> None:
-    """Plant an active_conversations buffer whose first entry is `hours_old` ago."""
+    """Plant an active_conversations buffer that started `hours_old` ago with
+    recent activity so it passes the 5-minute idle threshold."""
     import json
     from datetime import UTC, datetime, timedelta
 
     conv_dir = persona_dir / "active_conversations"
     conv_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(UTC) - timedelta(hours=hours_old)
-    entry = {
-        "timestamp": started_at.isoformat(),
-        "role": "user",
-        "content": "session opener",
+    first_entry = {
+        "ts": started_at.isoformat(),
+        "speaker": "user",
+        "text": "session opener",
     }
-    (conv_dir / "test-session.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    # Recent turn within the idle window so compute_active_session_hours
+    # treats the buffer as live (not stale).
+    recent_entry = {
+        "ts": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        "speaker": "nell",
+        "text": "still here",
+    }
+    (conv_dir / "test-session.jsonl").write_text(
+        json.dumps(first_entry) + "\n" + json.dumps(recent_entry) + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_get_body_state_dispatcher_injects_session_hours_from_active_buffer(
