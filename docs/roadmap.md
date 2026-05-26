@@ -107,6 +107,17 @@ auto-update, a memory-recovery tool, and a Kindled species identity.
   button would be a patch-level addition. Revisit if real users report
   bridge staleness issues.
 
+- **Real local embedding provider** — the only `EmbeddingProvider` in the
+  codebase is `FakeEmbeddingProvider` (SHA-256 → random unit vector, no
+  similarity structure), so *every* embedding-similarity feature is currently
+  non-semantic: memory search, narrative-memory embedding-membership, and
+  (would-be) dream-seed identity congruence. A real **local** model (no cloud,
+  per the project rule) bundled into `python-runtime` would lift the whole
+  memory layer to true semantic similarity. Needs its own brainstorm + spec:
+  model choice, bundle-size budget (~123 MB runtime already), cross-platform
+  packaging, `embeddings.db` backfill. Surfaced during Tier 0 Spec 1, which
+  sidesteps it with lexical token-overlap identity congruence for now.
+
 ## Tier 0 — Close the loops (blocking)
 
 Before any new organ is added, the organs already built must be wired to each
