@@ -97,3 +97,45 @@ def test_identity_congruence_ignores_age():
     old = [_cryst("c1", moment="writing desk", resonance=10, age_days=900)]
     # No time decay: an ancient high-resonance crystallization still boosts fully.
     assert dream_seeds.identity_congruence(mem, old) == 1.0
+
+
+def test_grief_pull_zero_for_non_grief_memory():
+    mem = _mem("a", emotions={"memory_grief": 9.0}, mtype="meta")
+    assert dream_seeds.grief_pull(mem) == 0.0
+
+
+def test_grief_pull_normalizes_grief_event_intensity():
+    mem = _mem("g", emotions={"memory_grief": 8.0}, mtype="grief_event")
+    assert dream_seeds.grief_pull(mem) == 0.8
+
+
+def test_grief_pull_zero_when_no_grief_emotion():
+    mem = _mem("g", emotions={}, mtype="grief_event")
+    assert dream_seeds.grief_pull(mem) == 0.0
+
+
+def test_refractory_penalty_one_when_recently_seeded():
+    assert dream_seeds.refractory_penalty("a", ["x", "a", "y"]) == 1.0
+
+
+def test_refractory_penalty_zero_when_not_recently_seeded():
+    assert dream_seeds.refractory_penalty("a", ["x", "y"]) == 0.0
+
+
+def test_refractory_penalty_zero_with_empty_history():
+    assert dream_seeds.refractory_penalty("a", []) == 0.0
+
+
+def test_composite_score_blends_terms():
+    # importance 5.0/10 = 0.5; no crysts -> identity 0; grief_event 6.0 -> 0.6;
+    # not recently seeded -> refractory 0. Total = 0.5 + 0.6 = 1.1
+    mem = _mem("g", emotions={"memory_grief": 6.0}, importance=5.0, mtype="grief_event")
+    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=[])
+    assert score == 1.1
+
+
+def test_composite_score_applies_refractory_penalty():
+    mem = _mem("a", importance=10.0)  # 1.0 baseline
+    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=["a"])
+    # 1.0 - W_REFRACTORY(2.0) * 1.0 = -1.0
+    assert score == -1.0
