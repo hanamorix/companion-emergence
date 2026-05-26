@@ -8,6 +8,7 @@ See docs/superpowers/specs/2026-05-26-multi-signal-dream-seeds-design.md.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from brain.emotion.state import EmotionalState
 from brain.memory.store import Memory
@@ -115,3 +116,34 @@ def composite_score(
         + w_grief * grief_pull(memory)
         - w_refractory * refractory_penalty(memory.id, recent_seed_ids)
     )
+
+
+def select_seed(
+    candidates: list[Memory],
+    mood: EmotionalState,
+    crystallizations: list[Crystallization],
+    *,
+    recent_seed_ids: list[str],
+    mood_floor: float = MOOD_FLOOR,
+    min_congruent: int = MIN_CONGRUENT,
+    w_identity: float = W_IDENTITY,
+    w_grief: float = W_GRIEF,
+    w_refractory: float = W_REFRACTORY,
+) -> Memory:
+    """Mood-gated multi-signal seed selection. `candidates` must be non-empty
+    (the engine raises NoSeedAvailable before calling)."""
+    pool = candidates
+    if mood_is_active(mood, floor=mood_floor):
+        congruent = [m for m in candidates if emotional_congruence(m, mood) > 0.0]
+        if len(congruent) >= min_congruent:
+            pool = congruent
+
+    def _key(m: Memory) -> tuple[float, datetime, str]:
+        score = composite_score(
+            m, mood, crystallizations,
+            recent_seed_ids=recent_seed_ids,
+            w_identity=w_identity, w_grief=w_grief, w_refractory=w_refractory,
+        )
+        return (score, m.created_at, m.id)
+
+    return sorted(pool, key=_key, reverse=True)[0]
