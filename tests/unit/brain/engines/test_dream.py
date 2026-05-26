@@ -545,3 +545,41 @@ def test_dream_engine_empty_persona_raises() -> None:
     finally:
         store.close()
         hm.close()
+
+
+def test_select_seed_neutral_mood_matches_importance(
+    engine: DreamEngine, store: MemoryStore
+) -> None:
+    # No emotional signal -> gate skipped -> highest importance wins (unchanged).
+    store.create(_mem("low", importance=2.0))
+    store.create(_mem("high", importance=8.0))
+    seed = engine._select_seed(seed_id=None, lookback_hours=24)
+    assert seed.content == "high"
+
+
+def test_select_seed_includes_grief_events_in_pool(
+    engine: DreamEngine, store: MemoryStore
+) -> None:
+    # Grief-toned conversation residue makes the mood read grief; the gated pool
+    # then includes the grief_event breadcrumb, which grief_pull lifts to the top.
+    store.create(_mem("sad one", importance=1.0, emotions={"grief": 6.0}))
+    store.create(_mem("sad two", importance=1.0, emotions={"grief": 6.0}))
+    store.create(_mem("sad three", importance=1.0, emotions={"grief": 6.0}))
+    bc = _mem(
+        "the loss",
+        importance=1.0,
+        emotions={"memory_grief": 6.0, "grief": 5.0},
+        memory_type="grief_event",
+        domain="grief",
+    )
+    store.create(bc)
+    seed = engine._select_seed(seed_id=None, lookback_hours=24)
+    assert seed.id == bc.id
+
+
+def test_select_seed_explicit_id_unchanged(
+    engine: DreamEngine, store: MemoryStore
+) -> None:
+    m = _mem("x", importance=1.0)
+    store.create(m)
+    assert engine._select_seed(seed_id=m.id, lookback_hours=24).id == m.id

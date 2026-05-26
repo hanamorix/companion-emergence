@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from brain.bridge.provider import LLMProvider
+from brain.emotion.aggregate import aggregate_state
+from brain.engines import dream_seeds
 from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.soul.store import SoulStore
 from brain.utils.memory import list_conversation_memories
 
 logger = logging.getLogger(__name__)
@@ -63,6 +66,13 @@ class DreamEngine:
     decay_per_hop: float = 0.5
     neighbour_limit: int = 8
     strengthen_delta: float = 0.1
+    soul_store: SoulStore | None = None
+    mood_floor: float = dream_seeds.MOOD_FLOOR
+    min_congruent: int = dream_seeds.MIN_CONGRUENT
+    refractory_window: int = dream_seeds.REFRACTORY_WINDOW
+    w_identity: float = dream_seeds.W_IDENTITY
+    w_grief: float = dream_seeds.W_GRIEF
+    w_refractory: float = dream_seeds.W_REFRACTORY
 
     def __post_init__(self) -> None:
         if not self.persona_name:
@@ -127,14 +137,57 @@ class DreamEngine:
             return mem
 
         cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
-        candidates = list_conversation_memories(self.store, active_only=True)
-        in_window = [m for m in candidates if m.created_at >= cutoff]
-        if not in_window:
+        convo = [
+            m
+            for m in list_conversation_memories(self.store, active_only=True)
+            if m.created_at >= cutoff
+        ]
+        grief = [
+            m
+            for m in self.store.list_by_type("grief_event", active_only=True)
+            if m.created_at >= cutoff
+        ]
+        candidates = convo + grief
+        if not candidates:
             raise NoSeedAvailable(
                 f"No conversation memories within the last {lookback_hours} hours."
             )
-        in_window.sort(key=lambda m: m.importance, reverse=True)
-        return in_window[0]
+
+        # Mood from conversation residue only (not grief breadcrumbs) so a
+        # breadcrumb cannot self-set the mood that retrieves it.
+        mood = aggregate_state(convo)
+        crystallizations = self.soul_store.list_active() if self.soul_store else []
+        recent = self._recent_seed_ids(self.refractory_window)
+
+        return dream_seeds.select_seed(
+            candidates,
+            mood,
+            crystallizations,
+            recent_seed_ids=recent,
+            mood_floor=self.mood_floor,
+            min_congruent=self.min_congruent,
+            w_identity=self.w_identity,
+            w_grief=self.w_grief,
+            w_refractory=self.w_refractory,
+        )
+
+    def _recent_seed_ids(self, window: int) -> list[str]:
+        """Seed ids from the last `window` dream-log entries (deterministic)."""
+        if self.log_path is None or not self.log_path.exists():
+            return []
+        ids: list[str] = []
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sid = json.loads(line).get("seed_id")
+                except json.JSONDecodeError:
+                    continue
+                if sid:
+                    ids.append(sid)
+        return ids[-window:]
 
     def _spread_activate(
         self, seed: Memory, *, depth: int, decay_per_hop: float, limit: int
