@@ -136,3 +136,49 @@ def test_supervisor_felt_time_tick_fault_isolated(
         f"Loop should have run ≥2 heartbeat ticks despite exploding felt-time; "
         f"got {len(heartbeat_calls)}"
     )
+
+
+def _open_arc(arc_id: str, *, lived_age_at_open: float, emotion: float):
+    from brain.narrative_memory.arc import Arc
+
+    return Arc(
+        id=arc_id,
+        state="open",
+        seed_anchor_type="dream",
+        seed_anchor_ref="dreams.log.jsonl:1",
+        seed_memory_ids=("m1",),
+        title="an open thread",
+        opened_at_iso="2026-05-20T10:00:00+00:00",
+        lived_age_at_open=lived_age_at_open,
+        last_extended_at_iso="2026-05-20T10:00:00+00:00",
+        closed_at_iso=None,
+        lived_age_at_close=None,
+        members=(),
+        max_member_emotion_normalised=emotion,
+    )
+
+
+def test_derive_intensity_drivers_sets_narrative_weight(tmp_path: Path) -> None:
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.felt_time.state import FeltTimeState, persist
+    from brain.narrative_memory.state import ArcsState, save_state
+
+    # lived age 200h; arc opened at 0h => 200 open lived-hours (> horizon),
+    # emotion 0.8 => narrative_weight 0.8.
+    persist(FeltTimeState(lived_age_hours=200.0), tmp_path)
+    save_state(tmp_path, ArcsState(open={"a1": _open_arc("a1", lived_age_at_open=0.0, emotion=0.8)}))
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=3600.0)
+    assert drivers.narrative_weight == pytest.approx(0.8, abs=1e-9)
+
+
+def test_derive_intensity_drivers_no_open_arcs_zero_weight(tmp_path: Path) -> None:
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.felt_time.state import FeltTimeState, persist
+    from brain.narrative_memory.state import ArcsState, save_state
+
+    persist(FeltTimeState(lived_age_hours=200.0), tmp_path)
+    save_state(tmp_path, ArcsState(open={}))
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=3600.0)
+    assert drivers.narrative_weight == 0.0
