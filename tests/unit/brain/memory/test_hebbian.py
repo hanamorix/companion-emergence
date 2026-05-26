@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import pytest
 
-from brain.memory.hebbian import HebbianMatrix
+from brain.memory.hebbian import MAX_WEIGHT, HebbianMatrix
 
 
 @pytest.fixture
 def matrix() -> HebbianMatrix:
     return HebbianMatrix(db_path=":memory:")
+
+
+def test_strengthen_caps_single_large_delta_at_max(matrix: HebbianMatrix) -> None:
+    matrix.strengthen("a", "b", delta=MAX_WEIGHT + 5.0)
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+
+
+def test_strengthen_repeated_plateaus_at_max(matrix: HebbianMatrix) -> None:
+    # 25 * 0.5 = 12.5 uncapped; must plateau at the ceiling.
+    for _ in range(25):
+        matrix.strengthen("a", "b", delta=0.5)
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+
+
+def test_strengthen_below_cap_adds_exact_delta(matrix: HebbianMatrix) -> None:
+    matrix.strengthen("a", "b", delta=0.5)
+    matrix.strengthen("a", "b", delta=0.25)
+    # Well below MAX_WEIGHT — exact sum, no behavior change.
+    assert matrix.weight("a", "b") == 0.75
 
 
 def test_matrix_init_creates_schema(matrix: HebbianMatrix) -> None:

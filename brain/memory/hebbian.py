@@ -20,6 +20,14 @@ import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
+# Ceiling on any single edge weight. strengthen() saturates at this value so
+# no edge can grow unbounded, which would let a sustained reinforcement loop
+# (e.g. emotion->seed->dream->reinforce->retrieval->emotion) calcify a cluster
+# into a permanent attractor. Set well above typical bond strengths
+# (co-activation reinforces at 0.5/event; strong bonds reach low single digits
+# even before decay), so the cap only ever bites a pathological edge.
+MAX_WEIGHT = 10.0
+
 
 class HebbianMatrix:
     """SQLite-backed sparse weighted graph between memory ids."""
@@ -67,26 +75,32 @@ class HebbianMatrix:
         self._conn.close()
 
     def strengthen(self, a: str, b: str, delta: float = 0.1) -> None:
-        """Add `delta` to the weight of edge (a, b). Creates the edge if new.
+        """Add `delta` to the weight of edge (a, b), capped at MAX_WEIGHT.
 
         `delta` must be positive — the module contract is that weights are
         non-negative. Callers that want to weaken an edge use `decay_all`
-        or `garbage_collect`. Negative delta raises ValueError.
+        or `garbage_collect`. Negative delta raises ValueError. The resulting
+        weight saturates at MAX_WEIGHT so no edge can grow unbounded; edges
+        below the cap still receive the exact `delta`.
         """
         if a == b:
             return  # self-edges not tracked
         if delta <= 0.0:
             raise ValueError(f"delta must be positive, got {delta!r}")
         lo, hi = _canonical(a, b)
+        # Cap in both UPSERT branches. The INSERT stores min(delta, MAX_WEIGHT);
+        # on conflict excluded.weight is that same capped value, and
+        # MIN(weight + excluded.weight, MAX_WEIGHT) == MIN(weight + delta,
+        # MAX_WEIGHT) for all delta >= 0.
         self._conn.execute(
             """
             INSERT INTO hebbian_edges (memory_a, memory_b, weight)
-            VALUES (?, ?, ?)
+            VALUES (?, ?, MIN(?, ?))
             ON CONFLICT(memory_a, memory_b)
-                DO UPDATE SET weight = weight + excluded.weight,
+                DO UPDATE SET weight = MIN(weight + excluded.weight, ?),
                               last_strengthened_at = CURRENT_TIMESTAMP
             """,
-            (lo, hi, delta),
+            (lo, hi, delta, MAX_WEIGHT, MAX_WEIGHT),
         )
         self._conn.commit()
 
