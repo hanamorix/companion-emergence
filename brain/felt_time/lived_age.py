@@ -16,26 +16,48 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Coefficients:
-    """Intensity driver weights (α, β, γ)."""
+    """Intensity driver weights (α, β, γ, δ)."""
 
     alpha: float  # emotional_intensity weight
     beta: float  # body_strain weight
     gamma: float  # chat_activity weight
+    delta: float  # narrative_weight weight
 
 
-DEFAULTS = Coefficients(alpha=0.5, beta=0.4, gamma=0.3)
+DEFAULTS = Coefficients(alpha=0.5, beta=0.4, gamma=0.3, delta=0.5)
 
 
 @dataclass(frozen=True)
 class IntensityDrivers:
-    """Three named intensity drivers, all normalized to [0, 1]."""
+    """Named intensity drivers, all normalized to [0, 1]."""
 
     emotional_intensity: float = 0.0
     body_strain: float = 0.0
     chat_activity: float = 0.0
+    narrative_weight: float = 0.0
 
 
 MAX_FORWARD_DT_S = 6 * 3600.0  # 6 hours
+
+# Lived-hours over which an open arc reaches full age-weight in narrative_weight().
+NARRATIVE_WEIGHT_HORIZON_HOURS = 168.0
+
+
+def narrative_weight(arc_inputs: list[tuple[float, float]], *, horizon: float) -> float:
+    """Felt weight of the heaviest open arc, in [0, 1].
+
+    arc_inputs: list of (open_lived_hours, emotion_normalised) per open arc.
+    Each arc's weight = age_factor * emotion, where
+    age_factor = clamp(open_lived_hours / horizon). Returns the max across
+    arcs (the single most-weighing arc sets the felt heaviness); 0.0 when empty.
+    """
+    best = 0.0
+    for open_lived_hours, emotion in arc_inputs:
+        age_factor = _clamp(open_lived_hours / horizon)
+        w = age_factor * _clamp(emotion)
+        if w > best:
+            best = w
+    return _clamp(best)
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -61,8 +83,15 @@ def rate_per_hour(drivers: IntensityDrivers, *, coef: Coefficients = DEFAULTS) -
     intensity = _clamp(drivers.emotional_intensity)
     strain = _clamp(drivers.body_strain)
     activity = _clamp(drivers.chat_activity)
+    narrative = _clamp(drivers.narrative_weight)
 
-    return 1.0 + coef.alpha * intensity + coef.beta * strain + coef.gamma * activity
+    return (
+        1.0
+        + coef.alpha * intensity
+        + coef.beta * strain
+        + coef.gamma * activity
+        + coef.delta * narrative
+    )
 
 
 def advance(

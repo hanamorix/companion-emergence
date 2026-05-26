@@ -4,8 +4,10 @@ import pytest
 
 from brain.felt_time.lived_age import (
     DEFAULTS,
+    NARRATIVE_WEIGHT_HORIZON_HOURS,
     IntensityDrivers,
     advance,
+    narrative_weight,
     rate_per_hour,
 )
 
@@ -65,3 +67,47 @@ def test_advance_clamps_large_forward_jump_to_pause():
 
     # Should return prev unchanged (paused during sleep)
     assert new_lived == prev_lived
+
+
+def test_narrative_weight_empty_is_zero():
+    assert narrative_weight([], horizon=NARRATIVE_WEIGHT_HORIZON_HOURS) == 0.0
+
+
+def test_narrative_weight_heavy_long_open_is_high():
+    w = narrative_weight([(NARRATIVE_WEIGHT_HORIZON_HOURS, 1.0)], horizon=NARRATIVE_WEIGHT_HORIZON_HOURS)
+    assert w == 1.0
+
+
+def test_narrative_weight_trivial_long_open_is_low():
+    w = narrative_weight([(NARRATIVE_WEIGHT_HORIZON_HOURS, 0.1)], horizon=NARRATIVE_WEIGHT_HORIZON_HOURS)
+    assert w == pytest.approx(0.1, abs=1e-9)
+
+
+def test_narrative_weight_just_opened_is_low():
+    w = narrative_weight([(1.0, 1.0)], horizon=NARRATIVE_WEIGHT_HORIZON_HOURS)
+    assert w == pytest.approx(1.0 / NARRATIVE_WEIGHT_HORIZON_HOURS, abs=1e-9)
+
+
+def test_narrative_weight_takes_max_across_arcs():
+    w = narrative_weight(
+        [(10.0, 0.2), (NARRATIVE_WEIGHT_HORIZON_HOURS, 0.9)],
+        horizon=NARRATIVE_WEIGHT_HORIZON_HOURS,
+    )
+    assert w == pytest.approx(0.9, abs=1e-9)
+
+
+def test_narrative_weight_clamps_overlong():
+    w = narrative_weight(
+        [(NARRATIVE_WEIGHT_HORIZON_HOURS * 5, 0.5)], horizon=NARRATIVE_WEIGHT_HORIZON_HOURS
+    )
+    assert w == pytest.approx(0.5, abs=1e-9)
+
+
+def test_rate_increases_with_narrative_weight():
+    base = rate_per_hour(IntensityDrivers())
+    weighted = rate_per_hour(IntensityDrivers(narrative_weight=1.0))
+    assert weighted == pytest.approx(base + DEFAULTS.delta, abs=1e-9)
+
+
+def test_rate_unchanged_when_narrative_weight_zero():
+    assert rate_per_hour(IntensityDrivers()) == pytest.approx(1.0, abs=1e-9)
