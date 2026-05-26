@@ -640,8 +640,11 @@ def _dream_handler(args: argparse.Namespace) -> int:
     result = None
     skipped_reason: str | None = None
     try:
+        from brain.soul.store import SoulStore
+
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         try:
             provider = get_provider(provider_name)
             engine = DreamEngine(
@@ -657,6 +660,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
                     "interconnected memories. Reflect in first person, 2-3 sentences, "
                     "starting with 'DREAM: '. Be honest and specific, not abstract."
                 ),
+                soul_store=soul_store,
             )
             try:
                 result = engine.run_cycle(dry_run=args.dry_run)
@@ -667,6 +671,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
                 skipped_reason = str(exc)
         finally:
             hebbian.close()
+            soul_store.close()
     finally:
         store.close()
 

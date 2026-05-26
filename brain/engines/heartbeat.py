@@ -680,14 +680,17 @@ class HeartbeatEngine:
         """Run one DreamEngine cycle; return the new dream memory id or None."""
         # Lazy import to avoid module-level circular dependency with dream.py
         from brain.engines.dream import DreamEngine, NoSeedAvailable
+        from brain.soul.store import SoulStore
 
+        persona_dir = self.dream_log_path.parent
+        soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         dream_engine = DreamEngine(
             store=self.store,
             hebbian=self.hebbian,
             embeddings=None,
             provider=self.provider,
             log_path=self.dream_log_path,
-            persona_dir=self.dream_log_path.parent,
+            persona_dir=persona_dir,
             persona_name=self.persona_name,
             persona_system_prompt=(
                 f"You are {self.persona_name}. You just woke from a dream "
@@ -698,11 +701,14 @@ class HeartbeatEngine:
             # lookback_hours=100000 ≈ "any conversation memory ever" — heartbeat
             # picks dream seeds by importance, not recency.
             lookback_hours=100000,
+            soul_store=soul_store,
         )
         try:
             dream_result = dream_engine.run_cycle()
         except NoSeedAvailable:
             return None
+        finally:
+            soul_store.close()
         return dream_result.memory.id if dream_result.memory is not None else None
 
     def _try_fire_reflex(
