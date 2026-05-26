@@ -365,6 +365,7 @@ def run_pass(
                 {
                     "event": "arc_closed",
                     "arc_id": arc_id,
+                    "title": closed.title,
                     "ts_iso": closed.closed_at_iso,
                     "lived_age_hours": lived_age_now if lived_age_now is not None else 0.0,
                     "reason": reason,
