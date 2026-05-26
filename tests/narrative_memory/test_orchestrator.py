@@ -208,6 +208,11 @@ def test_orchestrator_adds_candidate_via_hebbian(tmp_path: Path):
     assert any(e["memory_id"] == "mem_c" and e["via"] == "hebbian" for e in added_events)
 
 
+def _read_arc_events(persona_dir: Path) -> list[dict]:
+    lines = (persona_dir / "arcs.log.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
 def test_orchestrator_closes_stale_arc(tmp_path: Path):
     bus = _StubEventBus()
     # Pre-seed an arc whose last_extended is 100 lived-hours ago
@@ -242,6 +247,9 @@ def test_orchestrator_closes_stale_arc(tmp_path: Path):
     assert state.open == {}
     assert len(state.recently_closed) == 1
     assert state.recently_closed[0].state == "closed"
+    closed_events = [e for e in _read_arc_events(tmp_path) if e["event"] == "arc_closed"]
+    assert closed_events, "expected an arc_closed event in arcs.log.jsonl"
+    assert closed_events[0].get("title"), "arc_closed event must carry the arc title"
 
 
 def test_orchestrator_member_cap_evicts_lowest_salience(tmp_path: Path):
