@@ -111,3 +111,12 @@ tmp/
 # TDD Guard captures pytest results to .claude/tdd-guard/data/test.json for
 # its PreToolUse hook. Hook artefact, not source.
 .claude/tdd-guard/
+
+# ── Local tooling / analysis output ───────────────────────
+# Root node_modules (stray local installs; app deps live under app/).
+# Lanes board + visual-inspect are local task/tool state.
+# graphify-out is knowledge-graph analysis output (regenerable).
+/node_modules/
+.lanes/
+.visual-inspect/
+graphify-out/
