@@ -81,3 +81,36 @@ def test_scan_since_returns_only_newer_anchors(tmp_path):
 
     # since_ts=None returns all
     assert len(scan_since(tmp_path, None)) == 2
+
+
+def test_arc_anchor_from_open_and_close_events(tmp_path):
+    _write_jsonl(
+        tmp_path / "arcs.log.jsonl",
+        [
+            {"event": "arc_opened", "title": "the move", "ts_iso": "2026-05-20T10:00:00+00:00"},
+            {"event": "member_added", "title": "ignored", "ts_iso": "2026-05-21T10:00:00+00:00"},
+            {"event": "arc_closed", "title": "the move", "ts_iso": "2026-05-22T10:00:00+00:00"},
+        ],
+    )
+    arc_anchors = [a for a in extract_all(tmp_path) if a.type == "arc"]
+    assert len(arc_anchors) == 2
+    assert {a.label for a in arc_anchors} == {"the move"}
+    assert {a.ts for a in arc_anchors} == {
+        "2026-05-20T10:00:00+00:00",
+        "2026-05-22T10:00:00+00:00",
+    }
+
+
+def test_arc_anchor_ignores_member_events(tmp_path):
+    _write_jsonl(
+        tmp_path / "arcs.log.jsonl",
+        [
+            {"event": "member_added", "title": "x", "ts_iso": "2026-05-21T10:00:00+00:00"},
+            {"event": "member_evicted", "title": "x", "ts_iso": "2026-05-21T11:00:00+00:00"},
+        ],
+    )
+    assert [a for a in extract_all(tmp_path) if a.type == "arc"] == []
+
+
+def test_arc_anchor_absent_log_is_graceful(tmp_path):
+    assert [a for a in extract_all(tmp_path) if a.type == "arc"] == []

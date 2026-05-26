@@ -12,7 +12,7 @@ from pathlib import Path
 from brain.health.attempt_heal import save_with_backup
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
-ANCHOR_TYPES = ("dream", "growth", "soul", "weather_shift")
+ANCHOR_TYPES = ("dream", "growth", "soul", "weather_shift", "arc")
 
 
 @dataclass(frozen=True)

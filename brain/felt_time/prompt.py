@@ -24,6 +24,7 @@ _ANCHOR_SHORT_NAME = {
     "growth": "crystallization",
     "soul": "soul moment",
     "weather_shift": "weather shift",
+    "arc": "arc",
 }
 
 

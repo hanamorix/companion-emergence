@@ -12,31 +12,52 @@ source_ref as an audit-trail string, not a seek offset, so this is fine.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from brain.felt_time.state import Anchor
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
-# source-type -> (filename, label_key)
-# label_key names the field in each JSONL entry that carries the anchor text.
-_SOURCES: dict[str, tuple[str, str]] = {
-    "dream": ("dreams.log.jsonl", "summary"),
-    "growth": ("growth.log.jsonl", "title"),
-    "soul": ("soul.log.jsonl", "moment_label"),
-    "weather_shift": ("weather_shifts.log.jsonl", "label"),
+
+@dataclass(frozen=True)
+class _Source:
+    """One anchor source. label_key names the field carrying the anchor text;
+    ts_key names the timestamp field; events (if set) restricts which entries
+    count as anchors via their "event" field."""
+
+    filename: str
+    label_key: str
+    ts_key: str = "ts"
+    events: frozenset[str] | None = None  # None → all entries
+
+
+# source-type -> _Source
+_SOURCES: dict[str, _Source] = {
+    "dream": _Source("dreams.log.jsonl", "summary"),
+    "growth": _Source("growth.log.jsonl", "title"),
+    "soul": _Source("soul.log.jsonl", "moment_label"),
+    "weather_shift": _Source("weather_shifts.log.jsonl", "label"),
+    "arc": _Source(
+        "arcs.log.jsonl",
+        "title",
+        ts_key="ts_iso",
+        events=frozenset({"arc_opened", "arc_closed"}),
+    ),
 }
 
 
 def extract_all(persona_dir: Path) -> list[Anchor]:
     """Return every anchor across all sources, sorted by ts ascending."""
     anchors: list[Anchor] = []
-    for type_, (filename, label_key) in _SOURCES.items():
-        path = persona_dir / filename
+    for type_, src in _SOURCES.items():
+        path = persona_dir / src.filename
         # enumerate wraps the canonical reader to produce a valid-entry-index
         # for source_ref (1-based, contiguous over non-corrupt dicts).
         for entry_idx, entry in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
-            ts = entry.get("ts")
-            label = entry.get(label_key)
+            if src.events is not None and entry.get("event") not in src.events:
+                continue
+            ts = entry.get(src.ts_key)
+            label = entry.get(src.label_key)
             if not ts or not label:
                 continue
             anchors.append(
@@ -44,7 +65,7 @@ def extract_all(persona_dir: Path) -> list[Anchor]:
                     type=type_,
                     ts=ts,
                     label=str(label),
-                    source_ref=f"{filename}:{entry_idx}",
+                    source_ref=f"{src.filename}:{entry_idx}",
                 )
             )
     anchors.sort(key=lambda a: a.ts)
