@@ -400,10 +400,41 @@ def _derive_intensity_drivers(
     baseline_per_tick = max(0.1, 6.0 * (wall_clock_s_in_tick / 3600.0))
     chat_activity = min(1.0, float(chat_turns_in_tick) / baseline_per_tick)
 
+    # Narrative weight — a long, emotionally-heavy open arc makes time heavier.
+    narrative_weight_val = 0.0
+    try:
+        from brain.felt_time.lived_age import (
+            NARRATIVE_WEIGHT_HORIZON_HOURS,
+        )
+        from brain.felt_time.lived_age import (
+            narrative_weight as _narrative_weight,
+        )
+        from brain.felt_time.state import load_or_recover as _load_felt_time
+        from brain.narrative_memory.state import load_or_recover as _load_arcs
+
+        felt_state, _ = _load_felt_time(persona_dir)
+        arcs_state = _load_arcs(persona_dir)
+        current_lived = felt_state.lived_age_hours
+        arc_inputs = [
+            (
+                max(0.0, current_lived - arc.lived_age_at_open),
+                arc.max_member_emotion_normalised,
+            )
+            for arc in arcs_state.open.values()
+        ]
+        narrative_weight_val = _narrative_weight(
+            arc_inputs, horizon=NARRATIVE_WEIGHT_HORIZON_HOURS
+        )
+    except Exception:
+        logger.debug(
+            "supervisor felt-time: narrative weight read failed; using 0.0", exc_info=True
+        )
+
     return IntensityDrivers(
         emotional_intensity=emotional_intensity,
         body_strain=body_strain,
         chat_activity=chat_activity,
+        narrative_weight=narrative_weight_val,
     )
 
 
