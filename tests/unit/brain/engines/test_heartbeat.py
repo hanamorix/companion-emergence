@@ -2099,3 +2099,24 @@ def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
     finally:
         engine.store.close()
         engine.hebbian.close()
+
+
+def test_try_fire_dream_passes_soul_store(live_engine: HeartbeatEngine) -> None:
+    """The heartbeat's dream tick constructs DreamEngine with a SoulStore so
+    crystallization identity congruence can fire in production."""
+    import brain.engines.dream as dream_mod
+
+    _seed_conversation(live_engine.store, "a memory worth dreaming about")
+
+    captured: dict[str, object] = {}
+    real_init = dream_mod.DreamEngine.__post_init__
+
+    def spy(self: dream_mod.DreamEngine) -> None:
+        captured["soul_store"] = self.soul_store
+        real_init(self)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dream_mod.DreamEngine, "__post_init__", spy)
+        live_engine._try_fire_dream()
+
+    assert captured["soul_store"] is not None
