@@ -267,8 +267,14 @@ class DreamEngine:
         neighbours: list[tuple[Memory, float]],
         delta: float,
     ) -> int:
+        # Respect forgetting: never reinforce an edge that touches a memory
+        # marked for release. A fading seed → reinforce nothing this cycle.
+        if seed.state == "fading":
+            return 0
         count = 0
         for mem, activation in neighbours:
+            if mem.state == "fading":
+                continue
             weighted = delta * activation
             if weighted <= 0.0:
                 continue
