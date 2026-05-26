@@ -139,3 +139,73 @@ def test_composite_score_applies_refractory_penalty():
     score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=["a"])
     # 1.0 - W_REFRACTORY(2.0) * 1.0 = -1.0
     assert score == -1.0
+
+
+def test_select_seed_calm_night_is_importance_only():
+    # Neutral mood -> gate skipped -> highest importance wins.
+    cands = [
+        _mem("low", importance=2.0, emotions={"joy": 5.0}),
+        _mem("high", importance=9.0, emotions={"calm": 1.0}),
+    ]
+    seed = dream_seeds.select_seed(cands, EmotionalState(), [], recent_seed_ids=[])
+    assert seed.id == "high"
+
+
+def test_select_seed_mood_gate_recolors_pool():
+    # Grief mood -> pool gated to grief-congruent; the high-importance joyful
+    # memory is filtered out even though it scores higher on importance.
+    mood = EmotionalState(emotions={"grief": 6.0})
+    cands = [
+        _mem("joyful", importance=9.0, emotions={"joy": 8.0}),
+        _mem("g1", importance=1.0, emotions={"grief": 5.0}),
+        _mem("g2", importance=2.0, emotions={"grief": 5.0}),
+        _mem("g3", importance=3.0, emotions={"grief": 5.0}),
+    ]
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    assert seed.id == "g3"  # highest importance within the grief-congruent pool
+
+
+def test_select_seed_thin_pool_widens_to_full_window():
+    # Only one grief-congruent candidate (< MIN_CONGRUENT=3) -> gate abandoned,
+    # full pool ranked by importance.
+    mood = EmotionalState(emotions={"grief": 6.0})
+    cands = [
+        _mem("joyful", importance=9.0, emotions={"joy": 8.0}),
+        _mem("g1", importance=1.0, emotions={"grief": 5.0}),
+    ]
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    assert seed.id == "joyful"
+
+
+def test_select_seed_grief_event_is_eligible():
+    # A grief breadcrumb can be the seed within a grief pool (impossible before).
+    mood = EmotionalState(emotions={"memory_grief": 6.0})
+    cands = [
+        _mem("g1", importance=1.0, emotions={"memory_grief": 5.0}),
+        _mem("g2", importance=1.0, emotions={"memory_grief": 5.0}),
+        _mem("bc", importance=1.0, emotions={"memory_grief": 9.0}, mtype="grief_event"),
+    ]
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    # All importance 1.0; grief_pull lifts the breadcrumb above the others.
+    assert seed.id == "bc"
+
+
+def test_select_seed_is_deterministic_tiebreak():
+    # Identical scores -> tiebreak by created_at desc then id desc.
+    older = _mem("a", importance=5.0)
+    newer = _mem("b", importance=5.0)
+    object.__setattr__(newer, "created_at", datetime(2026, 5, 27, tzinfo=UTC))
+    seed = dream_seeds.select_seed([older, newer], EmotionalState(), [], recent_seed_ids=[])
+    assert seed.id == "b"  # newer wins the tie
+
+
+def test_select_seed_refractory_pushes_to_breadth():
+    # Two equal grief memories; the one seeded last cycle is penalized.
+    mood = EmotionalState(emotions={"grief": 6.0})
+    cands = [
+        _mem("g1", importance=5.0, emotions={"grief": 5.0}),
+        _mem("g2", importance=5.0, emotions={"grief": 5.0}),
+        _mem("g3", importance=5.0, emotions={"grief": 5.0}),
+    ]
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=["g3"])
+    assert seed.id in {"g1", "g2"}  # g3 demoted by the refractory penalty
