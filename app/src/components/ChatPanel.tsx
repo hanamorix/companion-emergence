@@ -678,6 +678,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       className="chat-panel"
       style={{
         position: "relative",
+        height: "380px",
         outline: dragOver ? "2px dashed var(--accent)" : "none",
         outlineOffset: 4,
         borderRadius: 8,

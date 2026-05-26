@@ -24,6 +24,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+_IDLE_THRESHOLD_MINUTES = 5.0
+
 
 def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
     """How long the current chat session has been live, in hours.
@@ -31,8 +33,8 @@ def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
     Reads the earliest entry timestamp from any active conversation
     buffer in ``<persona_dir>/active_conversations/*.jsonl``. If multiple
     buffers exist (rare; concurrent sessions), takes the earliest.
-    Returns 0.0 when no buffer is open or no timestamp could be parsed,
-    matching the panel's "fresh session" expectation.
+    Returns 0.0 when no buffer is open, no timestamp could be parsed,
+    or the buffer's last activity was more than 5 minutes ago (stale/orphan).
     """
     conv_dir = persona_dir / "active_conversations"
     if not conv_dir.exists():
@@ -41,22 +43,42 @@ def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
     try:
         for buffer in conv_dir.glob("*.jsonl"):
             try:
+                first_line = ""
+                last_line = ""
                 with buffer.open("r", encoding="utf-8") as fh:
-                    first = fh.readline().strip()
-                if not first:
+                    for raw in fh:
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        if not first_line:
+                            first_line = stripped
+                        last_line = stripped
+                if not first_line:
                     continue
-                entry = json.loads(first)
+
+                # Idle threshold: skip buffers with no activity in the last 5 min.
+                last_entry = json.loads(last_line)
+                last_ts_raw = last_entry.get("ts") or last_entry.get("timestamp")
+                if not last_ts_raw or not isinstance(last_ts_raw, str):
+                    continue
+                if last_ts_raw.endswith("Z"):
+                    last_ts_raw = last_ts_raw[:-1] + "+00:00"
+                last_ts = datetime.fromisoformat(last_ts_raw)
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=UTC)
+                idle_minutes = (now - last_ts).total_seconds() / 60.0
+                if idle_minutes >= _IDLE_THRESHOLD_MINUTES:
+                    continue
+
+                entry = json.loads(first_line)
                 ts_raw = entry.get("timestamp") or entry.get("ts")
-                if not ts_raw:
+                if not ts_raw or not isinstance(ts_raw, str):
                     continue
-                if isinstance(ts_raw, str):
-                    if ts_raw.endswith("Z"):
-                        ts_raw = ts_raw[:-1] + "+00:00"
-                    ts = datetime.fromisoformat(ts_raw)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=UTC)
-                else:
-                    continue
+                if ts_raw.endswith("Z"):
+                    ts_raw = ts_raw[:-1] + "+00:00"
+                ts = datetime.fromisoformat(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
                 if earliest_ts is None or ts < earliest_ts:
                     earliest_ts = ts
             except (json.JSONDecodeError, OSError, ValueError):

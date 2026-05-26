@@ -39,4 +39,10 @@ describe("ChatPanel layout", () => {
     expect(list.style.flex).toBe("1 1 auto");
     expect(list.style.minHeight).toMatch(/^0(px)?$/);
   });
+
+  it("chat-panel outer div has bounded height so messages scroll rather than the panel growing", () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    const panel = container.querySelector(".chat-panel") as HTMLElement;
+    expect(panel.style.height).toBeTruthy();
+  });
 });
