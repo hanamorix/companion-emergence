@@ -1,8 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.memory.store import Memory
+from brain.soul.crystallization import Crystallization
 
 
 def _mem(mid: str, *, emotions=None, importance=0.0, mtype="meta") -> Memory:
@@ -42,3 +45,55 @@ def test_mood_is_active_false_when_neutral():
 def test_mood_is_active_false_below_floor():
     mood = EmotionalState(emotions={"grief": 0.3})
     assert dream_seeds.mood_is_active(mood, floor=0.5) is False
+
+
+def _cryst(cid: str, *, moment: str, resonance: int, age_days: float = 0.0) -> Crystallization:
+    return Crystallization(
+        id=cid,
+        moment=moment,
+        love_type="devotion",
+        why_it_matters="",
+        crystallized_at=datetime(2026, 5, 26, tzinfo=UTC) - timedelta(days=age_days),
+        resonance=resonance,
+    )
+
+
+def _mem_text(content: str) -> Memory:
+    return Memory(
+        id=f"id-{content[:8]}",
+        content=content,
+        memory_type="meta",
+        domain="us",
+        created_at=datetime(2026, 5, 26, tzinfo=UTC),
+        emotions={},
+        importance=0.0,
+    )
+
+
+def test_identity_congruence_zero_without_crystallizations():
+    assert dream_seeds.identity_congruence(_mem_text("the writing desk at dawn"), []) == 0.0
+
+
+def test_identity_congruence_resonance_weighted_max_over_overlap():
+    # mem shares {writing, desk} with c_hi (Jaccard 1.0) and nothing with c_lo.
+    mem = _mem_text("the writing desk")
+    crysts = [
+        _cryst("c_hi", moment="my writing desk", resonance=8),
+        _cryst("c_lo", moment="hana laughing loudly", resonance=10),
+    ]
+    # max(1.0 * 8/10, 0.0 * 10/10) == 0.8
+    assert dream_seeds.identity_congruence(mem, crysts) == 0.8
+
+
+def test_identity_congruence_partial_overlap_jaccard():
+    # mem tokens {writing, desk, dawn}; moment tokens {writing, desk} -> 2/3.
+    mem = _mem_text("writing desk dawn")
+    crysts = [_cryst("c1", moment="writing desk", resonance=10)]
+    assert dream_seeds.identity_congruence(mem, crysts) == pytest.approx(2 / 3)
+
+
+def test_identity_congruence_ignores_age():
+    mem = _mem_text("the writing desk")
+    old = [_cryst("c1", moment="writing desk", resonance=10, age_days=900)]
+    # No time decay: an ancient high-resonance crystallization still boosts fully.
+    assert dream_seeds.identity_congruence(mem, old) == 1.0
