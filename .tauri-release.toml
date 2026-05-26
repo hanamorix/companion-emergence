@@ -1,0 +1,31 @@
+# companion-emergence is NOT released by the generic tauri-release script.
+#
+# Canonical release = the manual four-file version-pin flow documented in
+# CLAUDE.md ("Releases — four-file version pin"):
+#   1. Bump pyproject.toml + app/src-tauri/Cargo.toml +
+#      app/src-tauri/tauri.conf.json, then run `uv lock` to update uv.lock.
+#      (Also align app/package.json, which is not part of the official pin.)
+#   2. Commit.
+#   3. `bash .public-sync/sync-to-public.sh` — scrubs private data and
+#      force-pushes the public mirror. NEVER `git push` to origin directly.
+#   4. Tag via `gh api` on the public repo, which triggers the GitHub
+#      Actions release build.
+#
+# The generic script does NOT understand pyproject.toml or uv.lock, and
+# `origin` here is the PUBLIC repo (hanamorix/companion-emergence). The
+# push and gh_release stages are DISABLED below so an accidental invocation
+# can never push unscrubbed content to the public mirror. This file exists
+# to make the routed `nell-tools:tauri-release` skill safe, not to automate
+# this repo's release.
+
+[project]
+name = "companion-emergence"
+
+[files]
+package_json = "app/package.json"
+cargo_toml = "app/src-tauri/Cargo.toml"
+tauri_conf = "app/src-tauri/tauri.conf.json"
+
+[stages]
+push = false        # never push directly to origin (public) — use sync-to-public.sh
+gh_release = false  # release bundles are built by GitHub Actions on the public tag
