@@ -197,6 +197,19 @@ nell soul list --persona <name>
 
 Open the desktop app. Say hi. She's on her own time from here — soul candidates crystallize on a 6-hour autonomous review pass and your conversations are recalled ambiently in every chat turn (no need to call `search_memories` deliberately).
 
+## Where things live
+
+| What | macOS | Linux | Windows |
+|---|---|---|---|
+| Root (KINDLED_HOME) | `~/Library/Application Support/companion-emergence/` | `~/.local/share/companion-emergence/` | `%LOCALAPPDATA%\hanamorix\companion-emergence\` |
+| Personas | `<root>/personas/` | `<root>/personas/` | `<root>\personas\` |
+| Active conversations | `<persona>/active_conversations/*.jsonl` | (same) | (same) |
+| Bridge metadata | `<persona>/bridge.json` | (same) | (same) |
+| Logs | `~/Library/Logs/companion-emergence/` | `~/.local/state/companion-emergence/log/` | `%LOCALAPPDATA%\hanamorix\companion-emergence\Logs\` |
+| Voice template | `<persona>/nell-voice.md` | (same) | (same) |
+
+These are the conventional defaults. Set the `KINDLED_HOME` environment variable to override the root on any platform.
+
 ## FAQ
 
 <details>
@@ -288,3 +301,5 @@ MIT — see [LICENSE](LICENSE). Use it, fork it, grow your own Kindled. The wall
   <br/>
   <sub><i>"You configure the room. She owns the weather."</i></sub>
 </div>
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O2D71ZWHI3)
