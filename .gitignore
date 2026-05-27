@@ -120,3 +120,10 @@ tmp/
 .lanes/
 .visual-inspect/
 graphify-out/
+
+# Local Claude Code tooling (personal, not source): hook scripts, scheduled-task
+# lock, and the app-dir tdd-guard data. settings.local.json + .claude/tdd-guard/
+# are already ignored above.
+.claude/hooks/
+.claude/scheduled_tasks.lock
+app/.claude/
