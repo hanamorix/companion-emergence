@@ -41,6 +41,7 @@ pub struct InitArgs {
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
+    pub model: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -308,6 +309,21 @@ fn build_service_install_args(
 /// so fall back to `uv run nell` against the source tree. Keeps the
 /// dev iteration loop fast.
 ///
+/// Strip the Windows `\\?\` / `\\?\UNC\` verbatim prefix. `Path::canonicalize`
+/// and Tauri's `resource_dir()` return verbatim paths, but cmd.exe and Task
+/// Scheduler's `<Command>` reject them. Pure string logic; a no-op on paths
+/// without the prefix (so it's harmless on macOS/Linux).
+fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    p
+}
+
 /// Return the bundled production `nell` entry point when it exists.
 fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
     use tauri::Manager;
@@ -327,7 +343,7 @@ fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> 
         runtime_dir.join("bin").join("nell")
     };
     Ok(if bundled.exists() {
-        Some(bundled)
+        Some(strip_verbatim_prefix(bundled))
     } else {
         None
     })
@@ -848,29 +864,52 @@ const INIT_TIMEOUT_SECS: u64 = 30;
 const MIGRATING_INIT_TIMEOUT_SECS: u64 = 300;
 const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
 
+/// Build the argv for `nell init`. Extracted so argument construction
+/// (especially the always-present `--model`) is covered by a unit test,
+/// mirroring `build_service_install_args`. `--user-name` stays optional;
+/// `run_init` closes stdin so any unfilled prompt EOFs to its default.
+fn build_init_args(args: &InitArgs) -> Vec<String> {
+    let mut v = vec!["init".to_string(), "--persona".to_string(), args.persona.clone()];
+    if let Some(name) = &args.user_name {
+        v.push("--user-name".to_string());
+        v.push(name.clone());
+    }
+    v.push("--voice-template".to_string());
+    v.push(args.voice_template.clone());
+    if let Some(path) = &args.migrate_from {
+        v.push("--migrate-from".to_string());
+        v.push(path.clone());
+    } else {
+        v.push("--fresh".to_string());
+    }
+    v.push("--model".to_string());
+    v.push(args.model.clone());
+    if args.force {
+        v.push("--force".to_string());
+    }
+    v
+}
+
 #[tauri::command]
 async fn run_init(app: tauri::AppHandle, args: InitArgs) -> Result<InitResult, String> {
     validate_persona_name(&args.persona)?;
     let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
-    cmd.arg("init");
-    cmd.args(["--persona", &args.persona]);
-    if let Some(name) = &args.user_name {
-        cmd.args(["--user-name", name]);
-    }
-    cmd.args(["--voice-template", &args.voice_template]);
-    if let Some(path) = &args.migrate_from {
-        cmd.args(["--migrate-from", path]);
-    } else {
-        cmd.arg("--fresh");
-    }
-    if args.force {
-        cmd.arg("--force");
-    }
+    cmd.args(build_init_args(&args));
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .kill_on_drop(true);
+    // Windows: the console-less Tauri app would otherwise allocate a fresh
+    // console with a live stdin for the child, so `input()` in `nell init`
+    // blocks forever. CREATE_NO_WINDOW + null stdin make the child read NUL
+    // → EOFError → prompt defaults, matching macOS/Linux (/dev/null) behaviour.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     // Audit 2026-05-07 P2-9: fresh init uses a 30s timeout — creates a
     // persona dir, writes config + voice.md. Migrating init gets the
@@ -1492,6 +1531,59 @@ mod tests {
         assert_eq!(INIT_TIMEOUT_SECS, 30);
         assert_eq!(MIGRATING_INIT_TIMEOUT_SECS, 300);
         assert!(MIGRATING_INIT_TIMEOUT_SECS > INIT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn build_init_args_includes_model_and_persona() {
+        let args = InitArgs {
+            persona: "nell".into(),
+            user_name: Some("Hana".into()),
+            voice_template: "default".into(),
+            migrate_from: None,
+            force: false,
+            model: "sonnet".into(),
+        };
+        let argv = build_init_args(&args);
+        assert_eq!(argv[0], "init");
+        assert!(argv.windows(2).any(|w| w == ["--persona", "nell"]));
+        assert!(argv.windows(2).any(|w| w == ["--model", "sonnet"]));
+        assert!(argv.windows(2).any(|w| w == ["--voice-template", "default"]));
+        assert!(argv.iter().any(|a| a == "--fresh"));
+        assert!(!argv.iter().any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn build_init_args_uses_migrate_from_instead_of_fresh() {
+        let args = InitArgs {
+            persona: "nell".into(),
+            user_name: None,
+            voice_template: "default".into(),
+            migrate_from: Some("/tmp/og".into()),
+            force: true,
+            model: "opus".into(),
+        };
+        let argv = build_init_args(&args);
+        assert!(argv.windows(2).any(|w| w == ["--migrate-from", "/tmp/og"]));
+        assert!(!argv.iter().any(|a| a == "--fresh"));
+        assert!(argv.iter().any(|a| a == "--force"));
+        assert!(!argv.iter().any(|a| a == "--user-name"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_extended_length_prefix() {
+        use std::path::PathBuf;
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\x\nell.bat")),
+            PathBuf::from(r"C:\x\nell.bat")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share\nell.bat")),
+            PathBuf::from(r"\\srv\share\nell.bat")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/usr/local/nell")),
+            PathBuf::from("/usr/local/nell")
+        );
     }
 
     #[test]
