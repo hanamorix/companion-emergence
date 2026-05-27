@@ -24,10 +24,12 @@ reasons:
      elevation needed for install or uninstall — matches launchd's
      gui/<uid>/ and systemd's --user model.
 
-Status: **scaffolded for v0.0.1**. The XML generation and CLI
-shape are exercised by unit tests, but live ``schtasks`` runs against
-a real Windows session are pending — flagged in the wizard as
-"compiles cleanly but not validated on real hardware yet".
+Status: the XML is now Task Scheduler **schema-1.3-correct** (version
+bumped to 1.3 so the ``DisallowStartOnRemoteAppSession`` /
+``UseUnifiedSchedulingEngine`` nodes are legal, and ``Context`` lives
+on ``<Actions>`` where the schema requires it). The XML generation and
+CLI shape are exercised by unit tests; a live ``schtasks /Create`` run
+against a real Windows session is pending validation by a Windows user.
 """
 
 from __future__ import annotations
@@ -163,7 +165,7 @@ def build_task_xml(
 ) -> str:
     """Render a Task Scheduler XML for the persona's supervisor task.
 
-    The XML follows Windows Task Scheduler 1.2 schema:
+    The XML follows Windows Task Scheduler 1.3 schema:
       * ``<LogonTrigger>`` — start at login (matches RunAtLoad / WantedBy=default.target).
       * ``<RegistrationInfo><Author>`` — for diagnostic tracing.
       * ``<Settings><RestartOnFailure>`` — restart on crash with a
@@ -215,7 +217,7 @@ def build_task_xml(
 
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
-        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
         "  <RegistrationInfo>\n"
         f"    <Description>companion-emergence supervisor ({_xml_escape(persona)})</Description>\n"
         "    <Author>companion-emergence</Author>\n"
@@ -256,8 +258,8 @@ def build_task_xml(
         "      <Count>3</Count>\n"
         "    </RestartOnFailure>\n"
         "  </Settings>\n"
-        "  <Actions>\n"
-        '    <Exec Context="Author">\n'
+        '  <Actions Context="Author">\n'
+        "    <Exec>\n"
         f"      <Command>{_xml_escape(nell_path_str)}</Command>\n"
         f"      <Arguments>{_xml_escape(args)}</Arguments>\n"
         f"{env_block}"
