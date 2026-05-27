@@ -111,25 +111,27 @@ export function Wizard({ onDone }: Props) {
     const platform = getClientPlatform();
     const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
     const currentPlatformLabel = platformLabel(platform);
+    const supervisorWizardInstall = platform === "macos" || platform === "windows";
 
-    // Plan C — install the launchd LaunchAgent so the supervisor
-    // outlives the .app from the very first run. macOS-only; on
-    // Windows/Linux we skip quietly so the ready pane doesn't make
-    // unsupported platform work look like a failure.
+    // Plan C — install the persistent supervisor service so it outlives
+    // the app from the very first run. macOS (launchd) and Windows (Task
+    // Scheduler) both have a real backend arm; on Linux/other we skip
+    // quietly so the ready pane doesn't make unsupported platform work
+    // look like a failure.
     let serviceTrailer = "";
-    if (macInstallActionsSupported) {
+    if (supervisorWizardInstall) {
       try {
         const svc = await installSupervisorService(personaName);
         serviceTrailer = svc.success
-          ? `\n\n[service] launchd agent installed`
-          : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the .app's lifecycle. Stderr:\n${svc.stderr}`;
+          ? `\n\n[service] supervisor installed`
+          : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the app's lifecycle. Stderr:\n${svc.stderr}`;
       } catch (e) {
         serviceTrailer =
-          `\n\n[service] could not install launchd agent: ${errString(e)}` +
-          " — supervisor will fall back to the .app's lifecycle.";
+          `\n\n[service] could not install supervisor: ${errString(e)}` +
+          " — supervisor will fall back to the app's lifecycle.";
       }
     } else {
-      serviceTrailer = `\n\n[service] persistent service install is macOS-only; on ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle.`;
+      serviceTrailer = `\n\n[service] persistent supervisor install is available from the Connection panel on ${currentPlatformLabel}.`;
     }
 
     // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
