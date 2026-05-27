@@ -58,7 +58,7 @@ export function ConnectionPanel({
   const conn = state?.connection;
   const mode = state?.mode ?? "live";
   const platform = getClientPlatform();
-  const supervisorSupported = platform === "macos" || platform === "linux";
+  const supervisorSupported = platform === "macos" || platform === "linux" || platform === "windows";
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
@@ -171,13 +171,20 @@ export function ConnectionPanel({
       >
         {platform === "macos" && "Install the brain as a launchd LaunchAgent so it stays alive when you close the app. Idempotent — safe to click again."}
         {platform === "linux" && "Install the brain as a systemd --user service so it stays alive when you close the app. Idempotent — safe to click again."}
+        {platform === "windows" && "Install the brain as a per-user Task Scheduler task so it stays alive when you close the app. Idempotent — safe to click again."}
         {!supervisorSupported && `Persistent supervisor installation from the app is macOS-only right now. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
       </div>
       {supervisorSupported ? (
         <InstallActionButton
           state={install}
           onClick={onInstallSupervisor}
-          idleLabel={platform === "linux" ? "install systemd supervisor" : "install launchd supervisor"}
+          idleLabel={
+            platform === "linux"
+              ? "install systemd supervisor"
+              : platform === "windows"
+                ? "install Task Scheduler supervisor"
+                : "install launchd supervisor"
+          }
           runningLabel="installing…"
           successLabel="✓ supervisor installed"
           errorLabel="retry install"

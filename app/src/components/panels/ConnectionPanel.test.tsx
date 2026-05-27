@@ -133,14 +133,17 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows calm unsupported notes instead of macOS install buttons on Windows", () => {
+  it("shows the Task Scheduler supervisor button (not launchd) and a calm Terminal unsupported note on Windows", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
 
+    // Supervisor is now supported on Windows via Task Scheduler — launchd button stays macOS-only,
+    // but the Windows supervisor button IS present.
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /install Task Scheduler supervisor/i })).toBeInTheDocument();
+    // Terminal shortcut installer is still macOS-only.
     expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
     expect(screen.getAllByText(/macOS-only right now/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/nothing is broken/i)).toBeInTheDocument();
   });
 
   it("shows calm unsupported notes instead of macOS install buttons on Linux (supervisor now supported on Linux — this test updated in Phase 3.2)", () => {
@@ -399,5 +402,11 @@ describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
     const btn = screen.getByRole("button", { name: /install launchd supervisor/i });
     expect(btn).toBeInTheDocument();
     expect(btn).toBeEnabled();
+  });
+
+  it("shows the Task Scheduler supervisor button on Windows", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("windows");
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.getByText(/install Task Scheduler supervisor/i)).toBeInTheDocument();
   });
 });
