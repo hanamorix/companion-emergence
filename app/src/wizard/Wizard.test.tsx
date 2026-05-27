@@ -19,6 +19,7 @@ describe("Wizard InitArgs shape", () => {
       voice_template: "default",
       migrate_from: null,
       force: false,
+      model: "sonnet",
     };
     expect("provider" in args).toBe(false);
     // If a future contributor re-adds `provider:`, this object literal
@@ -53,6 +54,7 @@ describe("Wizard InitArgs shape", () => {
       voice_template: "default",
       migrate_from: null,
       force: false,
+      model: "sonnet",
     };
     await runInit(args);
     expect(invoke).toHaveBeenCalledWith("run_init", { args });

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  DEFAULT_INIT_MODEL,
   installNellCliSymlink,
   installSupervisorService,
   runInit,
@@ -207,6 +208,7 @@ export function Wizard({ onDone }: Props) {
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
         force: false,
+        model: DEFAULT_INIT_MODEL,
       };
 
       if (useEmergenceKitMigrator) {

@@ -139,7 +139,12 @@ export interface InitArgs {
   voice_template: "default" | "nell-example" | "skip";
   migrate_from: string | null;
   force: boolean;
+  model: string;
 }
+
+/** Wizard installs with the framework default model; users change it later
+ *  via the Connection panel ModelPicker. Mirrors brain.persona_config.DEFAULT_MODEL. */
+export const DEFAULT_INIT_MODEL = "sonnet";
 
 export interface InitResult {
   success: boolean;
