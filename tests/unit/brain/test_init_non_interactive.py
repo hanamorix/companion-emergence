@@ -14,8 +14,8 @@ import argparse
 from pathlib import Path
 
 from brain import cli
-from brain.persona_config import DEFAULT_MODEL, PersonaConfig
 from brain.paths import get_persona_dir
+from brain.persona_config import DEFAULT_MODEL, PersonaConfig
 
 
 def test_init_handler_non_interactive_under_eof(tmp_path: Path, monkeypatch) -> None:
