@@ -2341,7 +2341,7 @@ def _build_parser() -> argparse.ArgumentParser:
             raise argparse.ArgumentTypeError("must be a non-negative integer")
         return iv
 
-    client_origin_choices = ["cli", "tauri", "tests", "launchd"]
+    client_origin_choices = ["cli", "tauri", "tests", "launchd", "systemd", "task-scheduler"]
 
     s_start = s_actions.add_parser("start", help="Start the bridge daemon.")
     _add_persona_arg(s_start)

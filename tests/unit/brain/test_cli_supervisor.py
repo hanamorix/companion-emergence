@@ -4,6 +4,8 @@ is covered by tests/unit/brain/bridge/test_daemon_extras.py."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from brain import cli
@@ -140,3 +142,59 @@ def test_supervisor_help_lists_all_seven_actions(capsys: pytest.CaptureFixture[s
     out = capsys.readouterr().out
     for action in ("start", "run", "stop", "status", "restart", "tail-events", "tail-log"):
         assert action in out
+
+
+# ---------------------------------------------------------------------------
+# client-origin acceptance — every origin a service-manager generator can emit
+# must be accepted by the supervisor parser. The Windows port shipped
+# `--client-origin task-scheduler` in the Task Scheduler XML while the parser
+# enum only knew cli/tauri/tests/launchd, so the registered task died with
+# `invalid choice: 'task-scheduler'` (Last Result: 2). systemd had the same
+# latent gap with `systemd`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["cli", "tauri", "tests", "launchd", "systemd", "task-scheduler"],
+)
+def test_supervisor_run_accepts_service_manager_origins(origin: str) -> None:
+    rc = cli.main(["supervisor", "run", "--persona", "nell", "--client-origin", origin])
+    assert rc == 0
+
+
+def _origin_in_service_text(text: str) -> str:
+    """Extract the value passed to --client-origin in a generated service file.
+
+    launchd uses a plist ProgramArguments array (flag and value in separate
+    <string> elements); systemd units and Windows task XML pass it inline.
+    """
+    m = re.search(r"--client-origin</string>\s*<string>([^<]+)</string>", text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"--client-origin\s+(\S+)", text)
+    assert m is not None, f"no --client-origin token found in:\n{text}"
+    return m.group(1)
+
+
+def test_generated_service_files_use_origins_the_parser_accepts(tmp_path) -> None:
+    """Contract test: whatever origin each platform's service-file generator
+    emits, the supervisor CLI must accept it. Guards the generator↔parser seam
+    that let `task-scheduler` ship unparseable."""
+    from brain.service import launchd, systemd, windows_service
+
+    nell = tmp_path / "nell"
+    nell.write_text("#!/bin/sh\n")
+    nell.chmod(0o755)
+    nell_abs = nell.resolve()
+
+    generated = [
+        launchd.build_launchd_plist_xml(persona="nell", nell_path=nell_abs),
+        systemd.build_systemd_unit_text(persona="nell", nell_path=nell_abs),
+        windows_service.build_task_xml(persona="nell", nell_path=nell_abs),
+    ]
+
+    for text in generated:
+        origin = _origin_in_service_text(text)
+        rc = cli.main(["supervisor", "run", "--persona", "nell", "--client-origin", origin])
+        assert rc == 0, f"parser rejected origin {origin!r} emitted by a service generator"
