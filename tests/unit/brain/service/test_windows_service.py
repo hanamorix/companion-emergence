@@ -95,11 +95,11 @@ def test_build_task_xml_contains_required_sections(tmp_path: Path, monkeypatch) 
     body = windows_service.build_task_xml(persona="nell", nell_path=nell)
 
     # Standard Task Scheduler XML structure
-    assert '<Task version="1.2"' in body
+    assert '<Task version="1.3"' in body
     assert "<RegistrationInfo>" in body
     assert "<LogonTrigger>" in body
     assert "<Settings>" in body
-    assert "<Actions>" in body
+    assert '<Actions Context="Author">' in body
     # ExecStart equivalent: nell.exe + arguments
     assert str(nell.resolve()) in body
     assert "supervisor run --persona nell" in body
@@ -151,6 +151,47 @@ def test_build_task_xml_logon_trigger_with_hidden_window(tmp_path: Path, monkeyp
     assert "<Hidden>true</Hidden>" in body
 
 
+def test_build_task_xml_is_schema_1_3_with_context_on_actions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    nell = tmp_path / "nell.bat"
+    nell.write_text("@echo off\n")
+    body = windows_service.build_task_xml(persona="nell", nell_path=nell)
+
+    assert '<Task version="1.3"' in body
+    assert '<Actions Context="Author">' in body
+    assert '<Exec Context="Author">' not in body
+    assert "<Exec>" in body
+
+    # The 1.3-only nodes that schtasks rejected under 1.2 must still be present.
+    assert "<DisallowStartOnRemoteAppSession>" in body
+    assert "<UseUnifiedSchedulingEngine>" in body
+
+    # Pin the canonical Settings child order (already export-correct) so a
+    # future "helpful" reorder can't silently break schtasks parsing.
+    order = [
+        "MultipleInstancesPolicy",
+        "DisallowStartIfOnBatteries",
+        "StopIfGoingOnBatteries",
+        "AllowHardTerminate",
+        "StartWhenAvailable",
+        "RunOnlyIfNetworkAvailable",
+        "IdleSettings",
+        "AllowStartOnDemand",
+        "Enabled",
+        "Hidden",
+        "RunOnlyIfIdle",
+        "DisallowStartOnRemoteAppSession",
+        "UseUnifiedSchedulingEngine",
+        "WakeToRun",
+        "ExecutionTimeLimit",
+        "Priority",
+        "RestartOnFailure",
+    ]
+    settings = body[body.index("<Settings>") : body.index("</Settings>")]
+    positions = [settings.index(f"<{tag}") for tag in order]
+    assert positions == sorted(positions), "Settings child order drifted"
+
+
 # ---------------------------------------------------------------------------
 # write_task_xml
 # ---------------------------------------------------------------------------
@@ -186,7 +227,7 @@ def test_build_launchd_plist_xml_alias_returns_task_xml_on_windows(
     nell = _make_executable(tmp_path / "nell.exe")
 
     out = windows_service.build_launchd_plist_xml(persona="nell", nell_path=nell)
-    assert '<Task version="1.2"' in out
+    assert '<Task version="1.3"' in out
     # not a real launchd plist
     assert "DOCTYPE plist" not in out
 
