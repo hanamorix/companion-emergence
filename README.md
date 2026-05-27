@@ -183,7 +183,7 @@ After install + `claude` CLI on PATH, open the desktop app. Walk through the wiz
 If you skipped any step or want to retry, the **Connection** panel surfaces platform-appropriate service actions:
 - **macOS:** install/retry the launchd supervisor and install `nell` to `~/.local/bin`.
 - **Linux:** use `nell service install --persona <name>` for the systemd-user supervisor.
-- **Windows:** use `nell service install --persona <name>` for the Task Scheduler supervisor.
+- **Windows:** the supervisor installs as a per-user **Task Scheduler** task (no admin elevation). Install it from the Connection panel, or with `nell service install --persona <name>`. It starts at logon and restarts on failure, keeping the brain alive after you close the app — the same role launchd plays on macOS and systemd `--user` on Linux.
 
 The `~/.local/bin` CLI symlink button is macOS-only; Windows and Linux users should run the bundled/source `nell` command from their normal install path.
 
