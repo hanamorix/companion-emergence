@@ -984,11 +984,24 @@ async fn install_supervisor_service(
     install_supervisor_service_impl(app, persona, "systemd").await
 }
 
-/// Fallback (Windows + others): persistent supervisor service install is not
-/// yet supported on this platform. Returns a structured unsupported result so
-/// the UI can avoid implying that a service was installed.
+/// Windows: install the per-user Task Scheduler supervisor task for a persona.
+///
+/// Runs `nell service install --persona <name>` which writes a Task Scheduler
+/// XML (schema 1.3) and registers it via `schtasks /Create /XML`. Idempotent.
+/// Same return shape as macOS/Linux; non-zero exit is surfaced but does not
+/// block the wizard.
 #[tauri::command]
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+async fn install_supervisor_service(
+    app: tauri::AppHandle,
+    persona: String,
+) -> Result<InitResult, String> {
+    install_supervisor_service_impl(app, persona, "task-scheduler").await
+}
+
+/// Fallback for any platform without a supervisor backend.
+#[tauri::command]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[allow(unused_variables)]
 async fn install_supervisor_service(
     _app: tauri::AppHandle,
@@ -997,7 +1010,8 @@ async fn install_supervisor_service(
     Ok(InitResult {
         success: false,
         stdout: String::new(),
-        stderr: "persistent supervisor service install is currently macOS + Linux only".to_string(),
+        stderr: "persistent supervisor service install is not supported on this platform"
+            .to_string(),
         exit_code: 78,
     })
 }
@@ -1064,7 +1078,13 @@ async fn install_supervisor_service_impl(
     cmd.args(build_service_install_args(&persona, bundled.as_deref(), client_origin));
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     // 30s budget — install writes a service config (cheap) + bootstraps via
     // launchctl / systemctl (~1-3s). The hard cap prevents a wedged tool
