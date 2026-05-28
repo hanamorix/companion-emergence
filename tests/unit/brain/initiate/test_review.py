@@ -549,7 +549,7 @@ def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkey
 
     captured_kwargs: list[dict] = []
 
-    def fake_compose_tone(provider, *, subject, candidate, voice_template, user_name="my user"):
+    def fake_compose_tone(provider, *, subject, candidate, voice_template, user_name="my user", companion_name="Nell"):
         captured_kwargs.append({"user_name": user_name})
         return "rendered"
 

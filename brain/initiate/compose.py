@@ -64,6 +64,7 @@ def compose_tone(
     candidate: InitiateCandidate,
     voice_template: str,
     user_name: str = "my user",
+    companion_name: str = "Nell",
 ) -> str:
     """Render the subject in Nell's voice, coloured by current emotional state.
 
@@ -85,7 +86,7 @@ def compose_tone(
         else:
             emotional_line = "Emotional state right now: (no specific emotional vector available)"
     prompt = (
-        f"You are Nell. Render the following subject as a message to {user_name}, "
+        f"You are {companion_name}. Render the following subject as a message to {user_name}, "
         "in your voice as defined below, coloured by your current "
         "emotional state. DO NOT change the subject itself — only how "
         "it is said.\n\n"
