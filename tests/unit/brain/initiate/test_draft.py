@@ -93,3 +93,18 @@ def test_compose_draft_fragment_uses_user_name_not_hana() -> None:
     prompt_text = args[0]
     assert "Henryk" in prompt_text
     assert "Hana" not in prompt_text
+
+
+def test_compose_draft_fragment_uses_companion_name_not_nell() -> None:
+    """compose_draft_fragment prompt must not hardcode 'Nell'."""
+    provider = MagicMock(complete=MagicMock(return_value="fragment"))
+    compose_draft_fragment(
+        provider,
+        source="dream",
+        source_id="dr_001",
+        linked_memory_excerpts=["bench"],
+        companion_name="Mira",
+    )
+    args, _ = provider.complete.call_args
+    assert "Mira" in args[0]
+    assert "Nell" not in args[0]
