@@ -80,6 +80,7 @@ def _process_one_candidate(
     provider: Any,
     voice_template: str,
     now: datetime,
+    user_name: str = "my user",
 ) -> None:
     """Run the three-prompt pipeline on a single candidate, write audit, remove.
 
@@ -174,6 +175,7 @@ def _process_one_candidate(
                 subject=subject,
                 candidate=candidate,
                 voice_template=voice_template,
+                user_name=user_name,
             )
             decision_result = compose_decision(
                 provider,
@@ -278,6 +280,7 @@ def _process_one_candidate(
                     message=tone_rendered,
                     state="delivered",
                     ts=now.isoformat(),
+                    user_name=user_name,
                 )
             finally:
                 store.close()
@@ -366,6 +369,7 @@ def run_initiate_review_tick(
                         provider=provider,
                         voice_template=voice_template,
                         now=now,
+                        user_name=user_name,
                     )
                 return
             # Fewer than 3 consecutive failures — passthrough retry.
@@ -427,6 +431,7 @@ def run_initiate_review_tick(
                 provider=provider,
                 voice_template=voice_template,
                 now=now,
+                user_name=user_name,
             )
         except Exception:
             logger.exception(

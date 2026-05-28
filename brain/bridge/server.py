@@ -346,6 +346,13 @@ def _apply_replied_explicit_transition(
         update_audit_state,
     )
     from brain.initiate.memory import update_initiate_memory_for_state
+    from brain.persona_config import PersonaConfig
+
+    try:
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        user_name = cfg.user_name or "my user"
+    except Exception:
+        user_name = "my user"
 
     now = datetime.now(UTC).isoformat()
     update_audit_state(
@@ -369,6 +376,7 @@ def _apply_replied_explicit_transition(
             message=matched.tone_rendered,
             new_state="replied_explicit",
             ts=now,
+            user_name=user_name,
         )
     finally:
         store.close()
@@ -1174,8 +1182,15 @@ def build_app(
             update_audit_state,
         )
         from brain.initiate.memory import update_initiate_memory_for_state
+        from brain.persona_config import PersonaConfig
 
         s: BridgeAppState = app.state.bridge
+        try:
+            _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
+            _user_name = _cfg.user_name or "my user"
+        except Exception:
+            _user_name = "my user"
+
         audit_id = req.get("audit_id")
         new_state = req.get("new_state")
         if (
@@ -1213,6 +1228,7 @@ def build_app(
                         message=matched.tone_rendered,
                         new_state=new_state,
                         ts=now,
+                        user_name=_user_name,
                     )
                 finally:
                     store.close()
@@ -1244,9 +1260,16 @@ def build_app(
             update_audit_state,
         )
         from brain.initiate.memory import update_initiate_memory_for_state
+        from brain.persona_config import PersonaConfig
         from brain.soul.store import SoulStore, VoiceEvolution
 
         s: BridgeAppState = app.state.bridge
+        try:
+            _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
+            _user_name = _cfg.user_name or "my user"
+        except Exception:
+            _user_name = "my user"
+
         audit_id = req.get("audit_id")
         with_edits = req.get("with_edits")
         if not isinstance(audit_id, str):
@@ -1355,6 +1378,7 @@ def build_app(
                     message=matched.tone_rendered,
                     new_state="replied_explicit",
                     ts=now_iso,
+                    user_name=_user_name,
                 )
             finally:
                 store.close()
@@ -1378,8 +1402,15 @@ def build_app(
             update_audit_state,
         )
         from brain.initiate.memory import update_initiate_memory_for_state
+        from brain.persona_config import PersonaConfig
 
         s: BridgeAppState = app.state.bridge
+        try:
+            _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
+            _user_name = _cfg.user_name or "my user"
+        except Exception:
+            _user_name = "my user"
+
         audit_id = req.get("audit_id")
         if not isinstance(audit_id, str):
             raise HTTPException(status_code=422, detail="audit_id required (string)")
@@ -1410,6 +1441,7 @@ def build_app(
                         message=matched.tone_rendered,
                         new_state="dismissed",
                         ts=now_iso,
+                        user_name=_user_name,
                     )
                 finally:
                     store.close()
