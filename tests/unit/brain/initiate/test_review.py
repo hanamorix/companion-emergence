@@ -646,3 +646,33 @@ def test_process_one_candidate_passes_companion_name_to_compose_subject(tmp_path
 
     assert captured, "compose_subject was not called"
     assert captured[0]["companion_name"] == "Mira"
+
+
+def test_run_initiate_review_tick_threads_companion_name_to_process_one(tmp_path, monkeypatch):
+    """run_initiate_review_tick must pass persona_dir.name as companion_name."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    captured: list[dict] = []
+
+    def fake_process(persona_dir, candidate, *, provider, voice_template, now,
+                     user_name="my user", companion_name="Nell"):
+        captured.append({"companion_name": companion_name})
+
+    monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process)
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
+
+    persona = tmp_path / "Mira"
+    persona.mkdir()
+    emit_initiate_candidate(
+        persona,
+        kind="message",
+        source="dream",
+        source_id="dr_001",
+        emotional_snapshot=_snap(),
+        semantic_context=_ctx(),
+    )
+
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x")
+
+    assert captured, "_process_one_candidate was not called"
+    assert captured[0]["companion_name"] == "Mira"

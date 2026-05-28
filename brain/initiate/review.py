@@ -374,6 +374,7 @@ def run_initiate_review_tick(
                         voice_template=voice_template,
                         now=now,
                         user_name=user_name,
+                        companion_name=companion_name,
                     )
                 return
             # Fewer than 3 consecutive failures — passthrough retry.
@@ -436,6 +437,7 @@ def run_initiate_review_tick(
                 voice_template=voice_template,
                 now=now,
                 user_name=user_name,
+                companion_name=companion_name,
             )
         except Exception:
             logger.exception(
