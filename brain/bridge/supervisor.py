@@ -888,6 +888,7 @@ def _run_voice_reflection_tick(
         crystallizations=crystallizations,
         dreams=dreams,
         recent_tones=recent_tones,
+        companion_name=persona_dir.name,
     )
     event_bus.publish(
         {

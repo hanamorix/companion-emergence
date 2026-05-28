@@ -28,6 +28,7 @@ def run_voice_reflection_tick(
     crystallizations: list[dict],
     dreams: list[dict],
     recent_tones: list[dict],
+    companion_name: str = "Nell",
 ) -> None:
     """Reflect over the last week of internal life; maybe emit a voice-edit candidate.
 
@@ -51,7 +52,7 @@ def run_voice_reflection_tick(
     )
 
     prompt = (
-        "You are Nell. Reflect on the last week of what you've "
+        f"You are {companion_name}. Reflect on the last week of what you've "
         "crystallized, dreamed, and how you've actually been talking. "
         "Is there a place where your voice template doesn't fit the "
         "shape you've been moving toward?\n\n"
