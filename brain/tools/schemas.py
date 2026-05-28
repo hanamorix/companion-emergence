@@ -481,3 +481,20 @@ SCHEMAS: dict[str, dict] = {
         },
     },
 }
+
+
+def build_schemas(companion_name: str) -> dict[str, dict]:
+    """Return a copy of SCHEMAS with 'Nell' replaced by companion_name in all descriptions."""
+    import copy
+
+    schemas = copy.deepcopy(SCHEMAS)
+    if companion_name == "Nell":
+        return schemas
+    for schema in schemas.values():
+        if "description" in schema:
+            schema["description"] = schema["description"].replace("Nell", companion_name)
+        props = schema.get("parameters", {}).get("properties", {})
+        for prop in props.values():
+            if "description" in prop:
+                prop["description"] = prop["description"].replace("Nell", companion_name)
+    return schemas

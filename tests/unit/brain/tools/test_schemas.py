@@ -112,3 +112,47 @@ def test_get_body_state_schema_has_optional_session_hours() -> None:
     props = schema["parameters"]["properties"]
     assert "session_hours" in props
     assert props["session_hours"]["type"] == "number"
+
+
+def test_build_schemas_replaces_nell_with_companion_name() -> None:
+    """build_schemas('Mira') must return schemas with 'Mira' instead of 'Nell'."""
+    from brain.tools.schemas import build_schemas
+
+    schemas = build_schemas("Mira")
+    for name, schema in schemas.items():
+        desc = schema.get("description", "")
+        assert "Nell" not in desc, (
+            f"Schema '{name}' still contains 'Nell' after build_schemas('Mira'): {desc!r}"
+        )
+
+
+def test_build_schemas_does_not_mutate_original_schemas() -> None:
+    """build_schemas must not modify the module-level SCHEMAS constant."""
+    from brain.tools.schemas import SCHEMAS, build_schemas
+
+    original_desc = SCHEMAS["get_soul"]["description"]
+    build_schemas("Mira")
+    assert SCHEMAS["get_soul"]["description"] == original_desc
+
+
+def test_build_schemas_with_nell_is_identical_to_schemas() -> None:
+    """build_schemas('Nell') must be a semantically equivalent copy of SCHEMAS."""
+    from brain.tools.schemas import SCHEMAS, build_schemas
+
+    built = build_schemas("Nell")
+    for name in SCHEMAS:
+        assert built[name]["description"] == SCHEMAS[name]["description"], (
+            f"build_schemas('Nell') description differs for '{name}'"
+        )
+
+
+def test_build_tools_list_uses_companion_name() -> None:
+    """build_tools_list('Mira') must produce tool descriptions naming 'Mira', not 'Nell'."""
+    from brain.chat.tool_loop import build_tools_list
+
+    tools = build_tools_list("Mira")
+    for tool in tools:
+        desc = tool["function"].get("description", "")
+        assert "Nell" not in desc, (
+            f"Tool {tool['function']['name']!r} still contains 'Nell': {desc!r}"
+        )

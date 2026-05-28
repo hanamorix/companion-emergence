@@ -20,7 +20,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
-from brain.tools.schemas import SCHEMAS
+from brain.tools.schemas import build_schemas
 
 # Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both
 # files truncate at the same boundary so the audit log preview length
@@ -42,16 +42,19 @@ def register_tools(
     the function returns None.
     """
 
+    companion_name = persona_dir.name
+    schemas = build_schemas(companion_name)
+
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
         return [
             Tool(
                 name=name,
-                description=SCHEMAS[name].get("description", ""),
-                inputSchema=SCHEMAS[name].get("parameters", {"type": "object"}),
+                description=schemas[name].get("description", ""),
+                inputSchema=schemas[name].get("parameters", {"type": "object"}),
             )
             for name in NELL_TOOL_NAMES
-            if name in SCHEMAS
+            if name in schemas
         ]
 
     @server.call_tool()
