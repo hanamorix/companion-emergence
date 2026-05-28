@@ -224,6 +224,27 @@ def test_search_memories_limit_caps_results(tmp_path: Path) -> None:
     assert len(result["memories"]) <= 3
 
 
+def test_search_memories_emotion_partition_uses_id_not_object_identity(tmp_path: Path) -> None:
+    """Emotion boosting must partition by memory id, not Python object identity.
+
+    If two Memory objects have the same id but differ on any field (e.g.
+    last_accessed_at updates between fetches), object-identity dedup would
+    include the same memory in both boosted and rest. The correct partition
+    checks m.id membership in a set.
+    """
+    from brain.tools.impls.search_memories import search_memories
+
+    store = _make_store()
+    hebbian = _make_hebbian()
+    _seed_memory(store, content="quiet morning grief memory", emotions={"grief": 9.0})
+
+    result = search_memories(
+        "quiet", emotion="grief", store=store, hebbian=hebbian, persona_dir=tmp_path
+    )
+
+    assert result["count"] == 1, "same memory must not appear twice via partition bug"
+
+
 def test_search_memories_multiword_query_matches_individual_tokens(tmp_path: Path) -> None:
     """Multi-word query should match memories containing any token, not require
     the full phrase as an exact substring.
@@ -475,6 +496,47 @@ def test_boot_emotional_state_nested(tmp_path: Path) -> None:
     es = result["emotional_state"]
     assert isinstance(es, dict)
     assert "dominant" in es
+
+
+def test_boot_context_prose_uses_user_name_not_hana(tmp_path: Path) -> None:
+    """boot() context_prose must never say 'Hana' when user_name is configured
+    as a different name. The preamble already names the user; boot contradicting
+    it creates direct confusion for the LLM on turn one.
+
+    Regression: boot.py:66 had a hardcoded 'Hana' string.
+    """
+    import json
+
+    from brain.tools.impls.boot import boot
+
+    (tmp_path / "persona_config.json").write_text(
+        json.dumps({"user_name": "Henryk", "model": "claude-sonnet-4-6"})
+    )
+    ctx = _ctx(tmp_path)
+    result = boot(**ctx)
+
+    assert "Hana" not in result["context_prose"], (
+        "context_prose must not hardcode 'Hana' when user_name is 'Henryk'"
+    )
+
+
+def test_boot_context_prose_names_configured_user(tmp_path: Path) -> None:
+    """boot() context_prose must include the configured user_name so the LLM
+    has an affirmative confirmation of who it is speaking with.
+    """
+    import json
+
+    from brain.tools.impls.boot import boot
+
+    (tmp_path / "persona_config.json").write_text(
+        json.dumps({"user_name": "Henryk", "model": "claude-sonnet-4-6"})
+    )
+    ctx = _ctx(tmp_path)
+    result = boot(**ctx)
+
+    assert "Henryk" in result["context_prose"], (
+        "context_prose must include the user's name from persona_config"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

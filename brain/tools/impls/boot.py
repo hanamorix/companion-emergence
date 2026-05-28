@@ -57,13 +57,23 @@ def boot(
         # the daemon_residue field for the LLM to read in detail.
         residue_summary = daemon_residue.splitlines()[0]
 
+    user_name: str | None = None
+    try:
+        from brain.persona_config import PersonaConfig
+
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        user_name = cfg.user_name or None
+    except Exception:  # noqa: BLE001
+        pass
+
     prose_parts = [
         f"I'm in a state of {dominant}, feeling: {top_3_str}.",
     ]
     if residue_summary:
         prose_parts.append(f"The residue from my recent engines still hums: '{residue_summary}'.")
     if days_away > 1:
-        prose_parts.append(f"Hana's been away {days_away:.1f} days.")
+        away_label = user_name or "my user"
+        prose_parts.append(f"{away_label}'s been away {days_away:.1f} days.")
     prose_parts.append("Reading the room before I speak.")
 
     context_prose = " ".join(prose_parts)

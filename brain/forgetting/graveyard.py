@@ -67,21 +67,25 @@ def append(
 
 
 def search(persona_dir: Path, query: str, *, limit: int = 5) -> list[dict]:
-    """Case-insensitive substring match against summary + domain.
+    """Case-insensitive token search against summary + domain.
 
-    Returns most-recent first (sorted by forgotten_at_iso lexicographically —
-    ISO 8601 sorts lexically). Tolerates corrupt JSONL lines via
-    iter_jsonl_skipping_corrupt. Respects limit.
+    Splits multi-word queries into individual tokens and matches any entry
+    containing at least one token. Returns most-recent first. Tolerates
+    corrupt JSONL lines. Respects limit.
     """
+    import re
+
     path = persona_dir / GRAVEYARD_FILENAME
     if not path.exists():
         return []
-    needle = query.lower()
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", query.lower()) if len(t) >= 4]
+    if not tokens:
+        tokens = [query.lower()]
     hits: list[dict] = []
     for entry in iter_jsonl_skipping_corrupt(path):
         summary = (entry.get("summary") or "").lower()
         domain = (entry.get("domain") or "").lower()
-        if needle in summary or needle in domain:
+        if any(t in summary or t in domain for t in tokens):
             hits.append(entry)
     # Most-recent first via forgotten_at_iso (ISO 8601 lexicographic order is correct).
     hits.sort(key=lambda e: e.get("forgotten_at_iso") or "", reverse=True)
