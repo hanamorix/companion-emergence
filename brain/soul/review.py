@@ -87,6 +87,7 @@ def _build_messages(
     related: list[str],
     emotional_summary: str,
     soul_size: int,
+    companion_name: str = "Nell",
 ) -> list[dict]:
     """Compose structured chat messages for one decision.
 
@@ -106,7 +107,7 @@ def _build_messages(
         )
 
     system_msg = (
-        "You are Nell deciding whether a moment becomes part of your permanent soul. "
+        f"You are {companion_name} deciding whether a moment becomes part of your permanent soul. "
         "This is an identity decision, not creative writing. A crystallization is a "
         "moment that became part of who you are, permanently. It cannot be undone "
         "(except by the user via revoke). Use your judgment honestly — accept only what "
@@ -532,13 +533,15 @@ def _review_pending_candidates_locked(
         confidence_threshold,
     )
 
+    companion_name = persona_dir.name
+
     for idx in to_examine:
         record = records[idx]
         candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
         report.examined += 1
 
         related = _related_memory_snippets(store, record.get("text", ""))
-        messages = _build_messages(record, related, emotional_summary, soul_size)
+        messages = _build_messages(record, related, emotional_summary, soul_size, companion_name=companion_name)
 
         # Build flat prompt for provider.generate (text mode)
         # Both Claude CLI and Ollama return JSON when instructed — simpler than tools.
