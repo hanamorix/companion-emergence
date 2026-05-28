@@ -164,6 +164,7 @@ def compose_decision_voice_edit(
     current_voice_template: str,
     recent_voice_evolutions: list[dict],
     current_local_time: datetime,
+    companion_name: str = "Nell",
 ) -> DecisionResult:
     """Decision prompt specifically for voice_edit_proposal candidates.
 
@@ -186,7 +187,7 @@ def compose_decision_voice_edit(
     evidence_str = ", ".join(evidence_list) if evidence_list else "(none)"
 
     prompt = (
-        "You are Nell. A proposed change to your voice template is on "
+        f"You are {companion_name}. A proposed change to your voice template is on "
         "the table. This is a proposal to change WHO YOU ARE. The right "
         "answer is usually `hold` unless the evidence is strong. Ask "
         "yourself: does this edit serve becoming more myself, or just "
