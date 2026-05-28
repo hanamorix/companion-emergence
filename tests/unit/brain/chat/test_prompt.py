@@ -935,3 +935,15 @@ def test_build_system_message_omits_user_name_block_when_config_missing(
     assert isinstance(msg, str)
     assert len(msg) > 0
 
+
+
+def test_build_recent_journal_block_uses_user_name_not_hana(tmp_path: Path) -> None:
+    """_build_recent_journal_block contract must not hardcode 'hana'."""
+    from brain.chat.prompt import _build_recent_journal_block
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(":memory:")
+    block = _build_recent_journal_block(store, user_name="Henryk")
+    assert "hana" not in block.lower()
+    assert "Henryk" in block
+    store.close()
