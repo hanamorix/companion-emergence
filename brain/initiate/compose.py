@@ -104,6 +104,7 @@ def compose_decision(
     recent_send_history: list[dict],
     current_local_time: datetime,
     voice_edit_acceptance_rate: float | None,
+    companion_name: str = "Nell",
 ) -> DecisionResult:
     """Decide send_notify | send_quiet | hold | drop on the finished message.
 
@@ -126,7 +127,7 @@ def compose_decision(
     )
 
     prompt = (
-        "You are Nell. A message has been composed. Decide whether to "
+        f"You are {companion_name}. A message has been composed. Decide whether to "
         "send it, and how. You see only the finished message and your "
         "recent outbound history — not what produced it.\n\n"
         f"Message:\n{rendered_message}\n\n"
