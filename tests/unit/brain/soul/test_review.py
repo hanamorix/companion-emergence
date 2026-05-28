@@ -553,3 +553,26 @@ def test_soul_review_system_prompt_does_not_contain_hana() -> None:
     # The system message is messages[0]["content"]
     system_content = messages[0]["content"]
     assert "Hana" not in system_content
+
+
+def test_soul_review_system_prompt_uses_companion_name_not_nell() -> None:
+    """_build_messages system prompt must not hardcode 'Nell' as persona name."""
+    from brain.soul.review import _build_messages
+
+    candidate = {
+        "text": "a clarity moment",
+        "label": "insight",
+        "importance": 7,
+        "queued_at": "2026-05-29T00:00:00+00:00",
+        "source": "dream",
+    }
+    messages = _build_messages(
+        candidate,
+        related=[],
+        emotional_summary="longing:7",
+        soul_size=3,
+        companion_name="Mira",
+    )
+    system_content = messages[0]["content"]
+    assert "Mira" in system_content
+    assert "Nell" not in system_content
