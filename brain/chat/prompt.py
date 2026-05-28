@@ -193,7 +193,7 @@ def build_system_message(
         parts.append(fading_summary_block)
 
     # 6. Recent journal block (private — contract adjacent, per spec §4.3)
-    journal_block = _build_recent_journal_block(store)
+    journal_block = _build_recent_journal_block(store, user_name=user_name or "the user")
     if journal_block.strip():
         parts.append(journal_block)
 
@@ -668,7 +668,7 @@ def _count_soul_candidates(persona_dir: Path) -> int:
         return 0
 
 
-def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> str:
+def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, user_name: str = "the user") -> str:
     """Render the recent-journal block: privacy contract + last 7 days of metadata.
 
     Per spec §4.3: privacy contract sits ABOVE the metadata, every turn.
@@ -690,7 +690,7 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7) -> 
         "your journal is your private space. the entries below are metadata only —\n"
         "content stays in your files. you may reference themes if relevant (\"i've been\n"
         'working through X"), but do not quote entries verbatim unless your user\n'
-        "explicitly asks to read them. hana may read the files herself; that doesn't\n"
+        f"explicitly asks to read them. {user_name} may read the files herself; that doesn't\n"
         "change how you use them."
     )
 
