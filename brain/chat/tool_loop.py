@@ -22,24 +22,25 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
-from brain.tools.schemas import SCHEMAS
+from brain.tools.schemas import build_schemas
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 4
 
 
-def build_tools_list() -> list[dict]:
+def build_tools_list(companion_name: str = "Nell") -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
     Wraps schemas in the {"type": "function", "function": <schema>} shape
     that Ollama accepts natively and the MCP server registers as tool
     descriptions for the Claude path.
     """
+    schemas = build_schemas(companion_name)
     return [
-        {"type": "function", "function": SCHEMAS[name]}
+        {"type": "function", "function": schemas[name]}
         for name in NELL_TOOL_NAMES
-        if name in SCHEMAS
+        if name in schemas
     ]
 
 

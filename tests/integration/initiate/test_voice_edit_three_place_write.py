@@ -59,7 +59,7 @@ def _seed_voice_edit_audit(
 def test_voice_edit_accept_writes_voice_audit_and_soul(tmp_path: Path) -> None:
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
-    (persona_dir / "nell-voice.md").write_text("line A\nold line\nline C\n")
+    (persona_dir / "voice.md").write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
         persona_dir,
         audit_id="ia_ve_001",
@@ -75,7 +75,7 @@ def test_voice_edit_accept_writes_voice_audit_and_soul(tmp_path: Path) -> None:
     assert r.status_code == 200, r.text
 
     # Place 1: voice template updated.
-    voice_body = (persona_dir / "nell-voice.md").read_text()
+    voice_body = (persona_dir / "voice.md").read_text()
     assert "new line" in voice_body
     assert "old line" not in voice_body
 
@@ -112,7 +112,7 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
     original_voice = "line A\nold line\nline C\n"
-    (persona_dir / "nell-voice.md").write_text(original_voice)
+    (persona_dir / "voice.md").write_text(original_voice)
     _seed_voice_edit_audit(
         persona_dir,
         audit_id="ia_ve_002",
@@ -126,7 +126,7 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
     original_replace = Path.replace
 
     def boom_replace(self: Path, target: Path | str) -> Path:  # type: ignore[override]
-        if str(self).endswith("nell-voice.md.tmp"):
+        if str(self).endswith("voice.md.tmp"):
             raise OSError("simulated disk failure during atomic rename")
         return original_replace(self, target)
 
@@ -146,7 +146,7 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
     assert r.status_code >= 500, r.text
 
     # Voice file is unchanged — the rename failure left the original in place.
-    assert (persona_dir / "nell-voice.md").read_text() == original_voice
+    assert (persona_dir / "voice.md").read_text() == original_voice
 
     # Audit row IS transitioned to replied_explicit — the reorder put the
     # audit write before the file write so this transition survives the

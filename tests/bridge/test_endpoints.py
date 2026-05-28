@@ -788,8 +788,8 @@ def _seed_voice_edit_audit(
 def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
     persona_dir: Path,
 ) -> None:
-    """Accept writes audit + memory + voice_evolution AND modifies nell-voice.md."""
-    voice_path = persona_dir / "nell-voice.md"
+    """Accept writes audit + memory + voice_evolution AND modifies voice.md."""
+    voice_path = persona_dir / "voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
         persona_dir,
@@ -823,7 +823,7 @@ def test_post_voice_edit_accept_applies_diff_and_writes_three_places(
 def test_post_voice_edit_accept_with_edits_records_user_modified(
     persona_dir: Path,
 ) -> None:
-    voice_path = persona_dir / "nell-voice.md"
+    voice_path = persona_dir / "voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
         persona_dir,
@@ -856,7 +856,7 @@ def test_post_voice_edit_accept_with_edits_records_user_modified(
 def test_post_voice_edit_reject_records_dismissed_no_voice_write(
     persona_dir: Path,
 ) -> None:
-    voice_path = persona_dir / "nell-voice.md"
+    voice_path = persona_dir / "voice.md"
     voice_path.write_text("line A\nold line\nline C\n")
     _seed_voice_edit_audit(
         persona_dir,

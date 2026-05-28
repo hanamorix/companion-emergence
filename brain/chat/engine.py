@@ -191,7 +191,7 @@ def respond(
     )
 
     # 7. Tool loop
-    tools = build_tools_list()
+    tools = build_tools_list(companion_name=persona_dir.name)
     response, invocations = run_tool_loop(
         messages,
         provider=provider,
