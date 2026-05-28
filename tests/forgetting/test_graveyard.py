@@ -120,6 +120,27 @@ def test_append_records_hebbian_neighbors(tmp_path):
     assert graveyard.read_all(tmp_path)[0]["hebbian_neighbors"] == [["n1", 0.8], ["n2", 0.3]]
 
 
+def test_search_multiword_query_matches_any_token(tmp_path):
+    """Multi-word query must match entries containing any of the tokens.
+
+    Regression: graveyard.search() did a single full-string substring check
+    ('needle in summary'), so 'Henryk preferences personality identity'
+    matched nothing even when entries about 'Henryk' existed in the graveyard.
+    """
+    for content in ["Henryk enjoys morning coffee", "unrelated entry about weather"]:
+        append(
+            tmp_path,
+            memory=_make_memory(id=content[:8].replace(" ", "_"), content=content),
+            salience_at_drop=0.05,
+            inputs=SalienceInputs(emotion=0, hebbian=0, recall=0, soul=0, freshness=0),
+            lived_age_hours=100.0,
+            reason="x",
+        )
+    hits = search(tmp_path, "Henryk preferences personality identity")
+    assert len(hits) == 1
+    assert hits[0]["summary"] == "Henryk enjoys morning coffee"
+
+
 def test_append_without_neighbors_defaults_empty(tmp_path):
     from datetime import UTC, datetime
 

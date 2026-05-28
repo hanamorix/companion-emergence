@@ -215,7 +215,7 @@ SCHEMAS: dict[str, dict] = {
         "name": "boot",
         "description": (
             "Full session boot — returns emotional state, soul highlights, body state, and a context prose paragraph. "
-            "Call this ONCE at the very start of a session before responding to Hana. "
+            "Call this ONCE at the very start of a session before responding to the user. "
             "It anchors who Nell is right now so every subsequent response carries her current state."
         ),
         "parameters": {
@@ -228,8 +228,10 @@ SCHEMAS: dict[str, dict] = {
         "name": "search_memories",
         "description": (
             "Search Nell's memories by content keyword and/or emotion. "
-            "Three-pass: exact/keyword match → emotion filter → fallback closest overlap. "
-            "Always returns something — the closest match if nothing exact. "
+            "Splits multi-word queries into tokens and searches each separately — "
+            "so 'Henryk morning coffee' finds memories mentioning any of those words. "
+            "Returns empty when nothing matches; call recall_forgotten for memories "
+            "that may have faded from active storage. "
             "Call this when recalling specific events, checking past experiences, "
             "or finding emotionally resonant memories to inform a response."
         ),

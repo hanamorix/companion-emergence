@@ -9,7 +9,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
-_TOKEN_MIN_LEN = 3
+_TOKEN_MIN_LEN = 4  # matches _RECALL_TOKEN_MIN_LEN in brain/chat/prompt.py
 _TOKEN_LIMIT = 6
 
 
@@ -74,8 +74,10 @@ def search_memories(
     if emotion is not None:
         emotion_lower = emotion.lower().strip()
         # Partition: emotion-matching memories first, then the rest.
+        # Use id-set membership (O(n)) rather than object identity (O(n²)).
         boosted = [m for m in candidates if emotion_lower in {k.lower() for k in m.emotions}]
-        rest = [m for m in candidates if m not in boosted]
+        boosted_ids = {m.id for m in boosted}
+        rest = [m for m in candidates if m.id not in boosted_ids]
         ordered = boosted + rest
     else:
         ordered = candidates

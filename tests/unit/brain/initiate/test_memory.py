@@ -70,6 +70,27 @@ def test_render_memory_truncates_long_message() -> None:
     assert "a" * 500 not in text
 
 
+def test_write_initiate_memory_uses_user_name_in_stored_content(tmp_path) -> None:
+    """write_initiate_memory must store content containing user_name, not 'Hana'."""
+    store = MemoryStore(str(tmp_path / "m.db"))
+    try:
+        write_initiate_memory(
+            store,
+            audit_id="ia_user",
+            subject="the morning light",
+            message="it felt like something worth sharing",
+            state="delivered",
+            ts="2026-05-28T10:00:00+00:00",
+            user_name="Henryk",
+        )
+        rows = store.list_by_type("initiate_outbound")
+        assert len(rows) == 1
+        assert "Henryk" in rows[0].content
+        assert "Hana" not in rows[0].content
+    finally:
+        store.close()
+
+
 def test_write_initiate_memory_calls_store_create() -> None:
     """A mock store records a Memory dataclass on send."""
     mock_store = MagicMock()
@@ -138,6 +159,33 @@ def test_write_then_update_against_real_store(tmp_path) -> None:
         assert rows[0].metadata["initiate_state"] == "read"
     finally:
         store.close()
+
+
+def test_render_memory_for_state_uses_user_name_not_hana() -> None:
+    """render_memory_for_state must use user_name instead of the hardcoded 'Hana'.
+
+    Regression: all seven _TEMPLATES hardcoded 'Hana', so every initiate
+    memory written to the store contained the wrong user name for non-Hana
+    users. When recalled via ambient search or search_memories, these entries
+    actively misled the LLM about who it was talking to.
+    """
+    text = render_memory_for_state(
+        subject="the dream",
+        message="the dream landed somewhere",
+        state="delivered",
+        user_name="Henryk",
+    )
+    assert "Hana" not in text
+    assert "Henryk" in text
+
+
+def test_render_memory_for_state_falls_back_gracefully_without_user_name() -> None:
+    """When user_name is omitted, render_memory_for_state must still work
+    (default is 'my user', not 'Hana')."""
+    text = render_memory_for_state(subject="the dream", message="x", state="delivered")
+    assert "Hana" not in text
+    assert isinstance(text, str)
+    assert len(text) > 0
 
 
 def test_update_with_no_prior_memory_writes_fresh(tmp_path) -> None:
