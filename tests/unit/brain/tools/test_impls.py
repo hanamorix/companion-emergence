@@ -699,3 +699,11 @@ def test_add_memory_below_gate_writes_no_climax_journal_even_if_climax_high(tmp_
         # Gate passed; journal should exist (climax >= 7 fired the hook).
         journal = store.list_by_type("journal_entry", active_only=True)
         assert len(journal) == 1
+
+
+def test_crystallize_soul_schema_does_not_reference_hana() -> None:
+    """The crystallize_soul tool description must not hardcode 'Hana'."""
+    from brain.tools.schemas import SCHEMAS
+
+    desc = SCHEMAS["crystallize_soul"]["description"]
+    assert "Hana" not in desc, f"crystallize_soul description hardcodes 'Hana': {desc!r}"

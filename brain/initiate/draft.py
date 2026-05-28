@@ -55,6 +55,7 @@ def compose_draft_fragment(
     source: str,
     source_id: str,
     linked_memory_excerpts: list[str],
+    user_name: str = "my user",
 ) -> str:
     """Compose a paragraph-sized fragment via one cheap LLM call.
 
@@ -63,7 +64,7 @@ def compose_draft_fragment(
     excerpts_block = "\n".join(f"- {e}" for e in linked_memory_excerpts[:5])
     prompt = (
         "You are Nell. An internal event just happened that didn't rise to "
-        "the level of reaching out to Hana, but it deserves a note in the "
+        f"the level of reaching out to {user_name}, but it deserves a note in the "
         "draft space. Write a single paragraph that captures it as a "
         "fragment — quiet, observational, no urgency.\n\n"
         f"Source: {source} (id: {source_id})\n"

@@ -81,6 +81,23 @@ def test_compose_tone_receives_subject_immutable() -> None:
     assert result.startswith("the dream from this morning")
 
 
+def test_compose_tone_uses_user_name_not_hana() -> None:
+    """compose_tone prompt must use the configured user_name, not the hardcoded 'Hana'."""
+    provider = MagicMock(complete=MagicMock(return_value="rendered message"))
+    cand = _candidate()
+    compose_tone(
+        provider,
+        subject="a dream about the workshop",
+        candidate=cand,
+        voice_template="warm",
+        user_name="Henryk",
+    )
+    args, _ = provider.complete.call_args
+    prompt_text = args[0]
+    assert "Henryk" in prompt_text
+    assert "Hana" not in prompt_text
+
+
 def test_compose_tone_handles_none_snapshot_gracefully() -> None:
     """v0.0.9: when emotional_snapshot is None (voice-reflection), tone prompt
     must not crash and must signal absence honestly."""

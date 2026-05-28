@@ -677,7 +677,7 @@ def _validate_pruning_proposal(
     if target.created_by != "brain_emergence":
         return False, (
             f"gate P2: arc {name!r} is created_by={target.created_by!r} — "
-            "protected; only Hana removes those"
+            "protected; only the user removes those"
         )
 
     # Gate P3: active floor 4

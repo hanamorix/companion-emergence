@@ -77,3 +77,19 @@ def test_has_new_drafts_since_returns_true_when_file_newer(tmp_path: Path) -> No
 def test_has_new_drafts_since_returns_false_when_no_changes(tmp_path: Path) -> None:
     """If draft_space.md hasn't been modified since last_seen, return False."""
     assert has_new_drafts_since(tmp_path, "2024-01-01T00:00:00+00:00") is False
+
+
+def test_compose_draft_fragment_uses_user_name_not_hana() -> None:
+    """compose_draft_fragment prompt must not contain 'Hana' when user_name is set."""
+    provider = MagicMock(complete=MagicMock(return_value="a quiet fragment"))
+    compose_draft_fragment(
+        provider,
+        source="dream",
+        source_id="dr_001",
+        linked_memory_excerpts=["the workshop bench"],
+        user_name="Henryk",
+    )
+    args, _ = provider.complete.call_args
+    prompt_text = args[0]
+    assert "Henryk" in prompt_text
+    assert "Hana" not in prompt_text

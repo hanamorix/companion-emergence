@@ -339,7 +339,7 @@ def test_run_initiate_review_tick_demotes_filtered_to_draft(tmp_path: Path, monk
 
     compose_called: list = []
 
-    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now):
+    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now, user_name="my user"):
         compose_called.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -401,7 +401,7 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
 
     compose_calls: list[str] = []
 
-    def fake_compose(persona_dir, candidate, *, provider, voice_template, now):
+    def fake_compose(persona_dir, candidate, *, provider, voice_template, now, user_name="my user"):
         compose_calls.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -537,3 +537,56 @@ def test_run_initiate_review_tick_calls_resonance_tick(tmp_path, monkeypatch):
     run_initiate_review_tick(persona, provider=MagicMock(), voice_template="test")
     assert len(resonance_calls) == 1
     assert resonance_calls[0] == persona
+
+
+def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkeypatch):
+    """_process_one_candidate must pass user_name to compose_tone, not hardcode 'Hana'."""
+    import json
+    from dataclasses import asdict
+
+    from brain.initiate.review import _process_one_candidate
+    from brain.initiate.schemas import EmotionalSnapshot, InitiateCandidate, SemanticContext
+
+    captured_kwargs: list[dict] = []
+
+    def fake_compose_tone(provider, *, subject, candidate, voice_template, user_name="my user"):
+        captured_kwargs.append({"user_name": user_name})
+        return "rendered"
+
+    monkeypatch.setattr("brain.initiate.review.compose_tone", fake_compose_tone)
+    monkeypatch.setattr("brain.initiate.review.compose_subject", lambda *a, **kw: "the subject")
+    monkeypatch.setattr(
+        "brain.initiate.review.compose_decision",
+        lambda *a, **kw: MagicMock(decision="hold", reasoning="test"),
+    )
+
+    cand = InitiateCandidate(
+        candidate_id="ic_test",
+        ts="2026-05-28T00:00:00+00:00",
+        kind="message",
+        source="dream",
+        source_id="dr_001",
+        emotional_snapshot=EmotionalSnapshot(
+            vector={"longing": 5},
+            rolling_baseline_mean=4.0,
+            rolling_baseline_stdev=1.0,
+            current_resonance=6.0,
+            delta_sigma=2.0,
+        ),
+        semantic_context=SemanticContext(linked_memory_ids=[], topic_tags=[]),
+    )
+    # Write the candidate to the queue so remove_candidate doesn't error.
+    queue_path = tmp_path / "initiate_queue.jsonl"
+    queue_path.write_text(json.dumps(asdict(cand)) + "\n")
+
+    _process_one_candidate(
+        tmp_path,
+        cand,
+        provider=MagicMock(),
+        voice_template="warm",
+        now=datetime(2026, 5, 28, 0, 0, tzinfo=UTC),
+        user_name="Henryk",
+    )
+
+    assert captured_kwargs, "compose_tone was not called"
+    assert captured_kwargs[0]["user_name"] == "Henryk"

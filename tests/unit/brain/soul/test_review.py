@@ -536,3 +536,20 @@ def test_current_emotional_summary_uses_emotions_attr_not_all_method() -> None:
     )
     # When emotions are present we expect a "name:value" formatted summary
     assert ":" in summary, f"expected formatted summary, got {summary!r}"
+
+
+def test_soul_review_system_prompt_does_not_contain_hana() -> None:
+    """The soul review system prompt must not hardcode 'Hana' — permissioned by 'the user'."""
+    from brain.soul.review import _build_messages
+
+    candidate = {
+        "text": "a moment of clarity",
+        "label": "insight",
+        "importance": 7,
+        "queued_at": "2026-05-28T00:00:00+00:00",
+        "source": "dream",
+    }
+    messages = _build_messages(candidate, related=[], emotional_summary="longing:7", soul_size=3)
+    # The system message is messages[0]["content"]
+    system_content = messages[0]["content"]
+    assert "Hana" not in system_content
