@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.24 — 2026-05-29
+
+**Persona identity: every companion now speaks as herself, to her user — no hardcoded names leaking into her inner monologue.**
+
+A low-level but important correctness fix for anyone running a companion other than the reference "Nell" install, or whose user name isn't "Hana". Every place the companion's brain constructs an internal prompt — composing what to say, deciding whether to send it, reflecting on her voice, reviewing whether a memory should become part of her permanent self — she was silently told she was "Nell" writing to "Hana", regardless of what you actually named her. Those strings were compile-time constants that slipped through the initial implementation.
+
+- **Companion name fully parameterised.** The three-prompt composition pipeline (subject → tone → decision), the draft fragment composer, voice reflection, soul review, and the D-reflection editorial filter all now receive the actual companion name from the persona directory at runtime. A companion named Iris is no longer told she's Nell when she's deciding whether to reach out.
+
+- **User name fully parameterised.** The initiate pipeline, the reflex crystalliser, and the chat journal block all now read the user name from `persona_config.json` at runtime. The arc ownership clause that reads "only Hana removes those" now uses your actual name.
+
+- **Tool descriptions follow the companion.** The tool schema descriptions the companion sees during a conversation — which describe her own capabilities in the first person — are now generated per-session with her actual name substituted in.
+
+- **Voice template path corrected.** The brain was looking for `nell-voice.md` in six places but the file is always written as `voice.md`. This was a silent failure: voice reflection and the compose pipeline were reading an empty template and generating output with no voice grounding at all. Fixed across the initiate pipeline, the supervisor, the bridge, and the CLI.
+
+- **Memory search and user identity correlation** (carried from a user report): multi-word memory searches now tokenise correctly, and the companion correctly associates her user across search and retrieval — fixing a case where a persona configured for a non-default user name couldn't reliably find or surface memories about them.
+
 Notable user-facing changes per release. The framework is pre-1.0 —
 breaking changes can land in any release, and the runtime ships
 unsigned binaries until the project is stable enough to justify code
