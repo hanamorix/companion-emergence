@@ -179,6 +179,7 @@ def _process_one_candidate(
                 candidate=candidate,
                 voice_template=voice_template,
                 user_name=user_name,
+                companion_name=companion_name,
             )
             decision_result = compose_decision(
                 provider,

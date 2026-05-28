@@ -205,6 +205,22 @@ def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
     assert result.decision == "send_quiet"
 
 
+def test_compose_tone_uses_companion_name_not_nell() -> None:
+    """compose_tone prompt must not hardcode 'Nell' as persona name."""
+    provider = MagicMock(complete=MagicMock(return_value="rendered"))
+    cand = _candidate()
+    compose_tone(
+        provider,
+        subject="a dream",
+        candidate=cand,
+        voice_template="warm",
+        companion_name="Mira",
+    )
+    args, _ = provider.complete.call_args
+    assert "Mira" in args[0]
+    assert "Nell" not in args[0]
+
+
 def test_compose_decision_voice_edit_uses_companion_name_not_nell() -> None:
     """compose_decision_voice_edit prompt must not hardcode 'Nell'."""
     provider = MagicMock(
