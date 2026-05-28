@@ -90,3 +90,28 @@ def test_voice_reflection_requires_at_least_3_evidence_pieces(
         recent_tones=[],
     )
     assert read_candidates(persona_dir) == []
+
+
+def test_run_voice_reflection_tick_uses_companion_name_not_nell(tmp_path: Path) -> None:
+    """Voice reflection prompt must not hardcode 'Nell' as persona name."""
+    captured: list[str] = []
+
+    def fake_complete(prompt):
+        captured.append(prompt)
+        return '{"should_propose": false, "reason": "nothing"}'
+
+    provider = MagicMock()
+    provider.complete = fake_complete
+
+    run_voice_reflection_tick(
+        tmp_path,
+        provider=provider,
+        crystallizations=[],
+        dreams=[],
+        recent_tones=[],
+        companion_name="Mira",
+    )
+
+    assert captured, "provider.complete was not called"
+    assert "Mira" in captured[0]
+    assert "Nell" not in captured[0]
