@@ -224,6 +224,33 @@ def test_search_memories_limit_caps_results(tmp_path: Path) -> None:
     assert len(result["memories"]) <= 3
 
 
+def test_search_memories_multiword_query_matches_individual_tokens(tmp_path: Path) -> None:
+    """Multi-word query should match memories containing any token, not require
+    the full phrase as an exact substring.
+
+    Regression: previously search_memories passed the full query string to
+    LIKE '%full query string%', so 'Henryk preferences personality identity'
+    would find nothing even though ~400 memories mentioned 'Henryk'.
+    """
+    from brain.tools.impls.search_memories import search_memories
+
+    store = _make_store()
+    hebbian = _make_hebbian()
+    _seed_memory(store, content="Henryk enjoys morning coffee and reading")
+
+    result = search_memories(
+        "Henryk preferences personality identity",
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+    )
+
+    assert result["count"] > 0, (
+        "multi-word query must find memories containing any of the tokens; "
+        "got zero results even though memory contains 'Henryk'"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # add_journal
 # ─────────────────────────────────────────────────────────────────────────────

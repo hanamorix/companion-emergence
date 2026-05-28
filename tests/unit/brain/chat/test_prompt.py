@@ -885,3 +885,53 @@ def test_build_emotion_summary_survives_heartbeat_flood(store: MemoryStore) -> N
     )
     assert "tenderness" in summary
     assert "awe" in summary
+
+
+# ── User identity (persona_config.user_name) ──────────────────────────────────
+
+
+def test_build_system_message_includes_user_name_from_persona_config(
+    tmp_path: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """When persona_config.json has user_name set, the system message must
+    include that name so the LLM knows who it's speaking with.
+
+    Regression: previously user_name was read by the ingest extractor but
+    never surfaced in the system prompt, so the LLM had no correlation
+    between 'the person talking to me' and names appearing in memories.
+    """
+    import json
+
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({"user_name": "Henryk", "model": "claude-sonnet-4-6"})
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+
+    assert "Henryk" in msg, (
+        "system message must name the user explicitly so the LLM knows who it is talking to"
+    )
+
+
+def test_build_system_message_omits_user_name_block_when_config_missing(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Missing persona_config.json must not crash build_system_message."""
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert isinstance(msg, str)
+    assert len(msg) > 0
+
