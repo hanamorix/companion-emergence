@@ -35,7 +35,7 @@ def run_voice_reflection_tick(
     Emission gate: the reflection must produce a proposal with >=3 evidence
     items. Anything weaker is dropped silently.
     """
-    voice_path = persona_dir / "nell-voice.md"
+    voice_path = persona_dir / "voice.md"
     voice_template = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
 
     evidence_block = "\n".join(

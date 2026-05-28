@@ -844,7 +844,7 @@ def _run_initiate_review_tick(
     and ``initiate_review_cap_per_tick`` from PersonaConfig (default 3).
     Publishes an ``initiate_review_tick`` event on success.
     """
-    voice_path = persona_dir / "nell-voice.md"
+    voice_path = persona_dir / "voice.md"
     voice_template = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
     try:
         config = PersonaConfig.load(persona_dir / "persona_config.json")
