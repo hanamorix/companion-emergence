@@ -676,3 +676,31 @@ def test_run_initiate_review_tick_threads_companion_name_to_process_one(tmp_path
 
     assert captured, "_process_one_candidate was not called"
     assert captured[0]["companion_name"] == "Mira"
+
+
+def test_run_initiate_review_tick_reads_voice_md_not_nell_voice_md(tmp_path, monkeypatch):
+    """run_initiate_review_tick must load voice.md (canonical), not nell-voice.md."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    (tmp_path / "voice.md").write_text("canonical voice", encoding="utf-8")
+
+    templates_seen: list[str] = []
+
+    def fake_process(persona_dir, candidate, *, provider, voice_template, now,
+                     user_name="my user", companion_name="Nell"):
+        templates_seen.append(voice_template)
+
+    monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process)
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
+
+    emit_initiate_candidate(
+        tmp_path, kind="message", source="dream", source_id="dr_v",
+        emotional_snapshot=_snap(), semantic_context=_ctx(),
+    )
+
+    run_initiate_review_tick(tmp_path, provider=MagicMock(), voice_template="")
+
+    assert templates_seen, "_process_one_candidate was not called"
+    assert templates_seen[0] == "canonical voice", (
+        f"Expected 'canonical voice' from voice.md, got {templates_seen[0]!r}"
+    )

@@ -1470,7 +1470,7 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "crystallizations_db": pd / "crystallizations.db",
         "soul_candidates": pd / "soul_candidates.jsonl",
         "active_conversations": pd / "active_conversations",
-        "voice_template": pd / "nell-voice.md",
+        "voice_template": pd / "voice.md",
         "persona_config": pd / "persona_config.json",
         "felt_time_state": pd / "felt_time_state.json",
         "d_mode": pd / "d_mode.json",

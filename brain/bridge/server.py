@@ -1304,9 +1304,9 @@ def build_app(
         # validated BEFORE the audit transition so we don't record a
         # transition we can't honour. The actual file write happens after
         # the audit update — see comment below.
-        voice_path = s.persona_dir / "nell-voice.md"
+        voice_path = s.persona_dir / "voice.md"
         if not voice_path.exists():
-            raise HTTPException(status_code=409, detail="nell-voice.md not found")
+            raise HTTPException(status_code=409, detail="voice.md not found")
         current = voice_path.read_text(encoding="utf-8")
         if old_text not in current:
             raise HTTPException(

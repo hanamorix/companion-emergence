@@ -129,7 +129,7 @@ def _process_one_candidate(
                     "voice-edit review: SoulStore read failed for %s",
                     candidate.candidate_id,
                 )
-            voice_path = persona_dir / "nell-voice.md"
+            voice_path = persona_dir / "voice.md"
             current_voice = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
             decision_result = compose_decision_voice_edit(
                 provider,
@@ -332,7 +332,9 @@ def run_initiate_review_tick(
         user_name = "you"
 
     outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
-    voice_template_path = persona_dir / "nell-voice.md"
+    voice_template_path = persona_dir / "voice.md"
+    if voice_template_path.exists():
+        voice_template = voice_template_path.read_text(encoding="utf-8")
     tick_id = f"t_{now.strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(2)}"
 
     deps = ReflectionDeps(
