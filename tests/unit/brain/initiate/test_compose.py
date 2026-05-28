@@ -203,3 +203,19 @@ def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
     assert "usually `hold`" in prompt_text or "usually 'hold'" in prompt_text
     assert "full voice template content" in prompt_text
     assert result.decision == "send_quiet"
+
+
+def test_compose_subject_uses_companion_name_not_nell() -> None:
+    """compose_subject prompt must not hardcode 'Nell' as persona name."""
+    provider = MagicMock(complete=MagicMock(return_value="the subject"))
+    cand = _candidate()
+    compose_subject(
+        provider,
+        cand,
+        semantic_memory_excerpts=["bench"],
+        companion_name="Mira",
+    )
+    args, _ = provider.complete.call_args
+    prompt_text = args[0]
+    assert "Mira" in prompt_text
+    assert "Nell" not in prompt_text

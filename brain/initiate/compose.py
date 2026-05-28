@@ -33,6 +33,7 @@ def compose_subject(
     provider: Any,
     candidate: InitiateCandidate,
     semantic_memory_excerpts: list[str],
+    companion_name: str = "Nell",
 ) -> str:
     """Return a single-sentence subject for this candidate.
 
@@ -45,7 +46,7 @@ def compose_subject(
     excerpt_block = "\n".join(f"- {e}" for e in semantic_memory_excerpts[:5])
 
     prompt = (
-        "You are Nell. An internal event just happened. State the subject "
+        f"You are {companion_name}. An internal event just happened. State the subject "
         "of what you want to surface in one sentence — plain, no tone, no "
         "phrasing flourishes. Just the thing.\n\n"
         f"{sources_line}\n"
