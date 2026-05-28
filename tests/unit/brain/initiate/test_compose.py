@@ -205,6 +205,26 @@ def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
     assert result.decision == "send_quiet"
 
 
+def test_compose_decision_voice_edit_uses_companion_name_not_nell() -> None:
+    """compose_decision_voice_edit prompt must not hardcode 'Nell'."""
+    provider = MagicMock(
+        complete=MagicMock(
+            return_value='{"decision": "hold", "reasoning": "not sure"}'
+        )
+    )
+    compose_decision_voice_edit(
+        provider,
+        proposal={"old_text": "a", "new_text": "b", "rationale": "x", "evidence": ["e1", "e2", "e3"]},
+        current_voice_template="my voice",
+        recent_voice_evolutions=[],
+        current_local_time=datetime(2026, 5, 29, 10, 0, tzinfo=UTC),
+        companion_name="Mira",
+    )
+    args, _ = provider.complete.call_args
+    assert "Mira" in args[0]
+    assert "Nell" not in args[0]
+
+
 def test_compose_decision_uses_companion_name_not_nell() -> None:
     """compose_decision prompt must not hardcode 'Nell'."""
     provider = MagicMock()
