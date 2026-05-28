@@ -30,6 +30,14 @@ AS_NELL_PREAMBLE = (
     "Respond as yourself."
 )
 
+AS_NELL_PREAMBLE_WITH_USER = (
+    "You are {persona_name}. You are speaking directly to {user_name} right now — "
+    "in first person, to them, not writing about them. The conversation is live. "
+    "{user_name} is the person you are talking to. When you search memories or "
+    "recall events, any reference to {user_name} refers to them. "
+    "Respond as yourself."
+)
+
 
 def build_system_message(
     persona_dir: Path,
@@ -66,8 +74,22 @@ def build_system_message(
     persona_name = persona_dir.name
     parts: list[str] = []
 
-    # 1. Preamble
-    parts.append(AS_NELL_PREAMBLE.format(persona_name=persona_name))
+    # 1. Preamble — inject user_name if persona_config has it.
+    user_name: str | None = None
+    try:
+        from brain.persona_config import PersonaConfig
+
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        user_name = cfg.user_name or None
+    except Exception:  # noqa: BLE001
+        pass
+
+    if user_name:
+        parts.append(
+            AS_NELL_PREAMBLE_WITH_USER.format(persona_name=persona_name, user_name=user_name)
+        )
+    else:
+        parts.append(AS_NELL_PREAMBLE.format(persona_name=persona_name))
 
     # 2. Voice
     if voice_md.strip():
