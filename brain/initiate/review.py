@@ -81,6 +81,7 @@ def _process_one_candidate(
     voice_template: str,
     now: datetime,
     user_name: str = "my user",
+    companion_name: str = "Nell",
 ) -> None:
     """Run the three-prompt pipeline on a single candidate, write audit, remove.
 
@@ -136,6 +137,7 @@ def _process_one_candidate(
                 current_voice_template=current_voice,
                 recent_voice_evolutions=recent_evolutions,
                 current_local_time=now,
+                companion_name=companion_name,
             )
         else:
             # Hydrate semantic memory IDs into content excerpts. The compose
@@ -169,6 +171,7 @@ def _process_one_candidate(
                 provider,
                 candidate,
                 semantic_memory_excerpts=excerpts,
+                companion_name=companion_name,
             )
             tone_rendered = compose_tone(
                 provider,
@@ -183,6 +186,7 @@ def _process_one_candidate(
                 recent_send_history=_build_send_history(persona_dir, now),
                 current_local_time=now,
                 voice_edit_acceptance_rate=None,
+                companion_name=companion_name,
             )
     except Exception as exc:
         logger.exception("initiate composition failed for candidate %s", candidate.candidate_id)

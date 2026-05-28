@@ -339,7 +339,7 @@ def test_run_initiate_review_tick_demotes_filtered_to_draft(tmp_path: Path, monk
 
     compose_called: list = []
 
-    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now, user_name="my user"):
+    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell"):
         compose_called.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -401,7 +401,7 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
 
     compose_calls: list[str] = []
 
-    def fake_compose(persona_dir, candidate, *, provider, voice_template, now, user_name="my user"):
+    def fake_compose(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell"):
         compose_calls.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -590,3 +590,59 @@ def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkey
 
     assert captured_kwargs, "compose_tone was not called"
     assert captured_kwargs[0]["user_name"] == "Henryk"
+
+
+def test_process_one_candidate_passes_companion_name_to_compose_subject(tmp_path, monkeypatch):
+    """_process_one_candidate must pass companion_name to compose_subject."""
+    import json
+    from dataclasses import asdict
+
+    from brain.initiate.review import _process_one_candidate
+    from brain.initiate.schemas import EmotionalSnapshot, InitiateCandidate, SemanticContext
+
+    captured: list[dict] = []
+
+    def fake_compose_subject(provider, candidate, semantic_memory_excerpts, companion_name="Nell"):
+        captured.append({"companion_name": companion_name})
+        return "the subject"
+
+    monkeypatch.setattr("brain.initiate.review.compose_subject", fake_compose_subject)
+    monkeypatch.setattr(
+        "brain.initiate.review.compose_tone",
+        lambda *a, **kw: "rendered",
+    )
+    monkeypatch.setattr(
+        "brain.initiate.review.compose_decision",
+        lambda *a, **kw: MagicMock(decision="hold", reasoning="test"),
+    )
+
+    cand = InitiateCandidate(
+        candidate_id="ic_test2",
+        ts="2026-05-29T00:00:00+00:00",
+        kind="message",
+        source="dream",
+        source_id="dr_002",
+        emotional_snapshot=EmotionalSnapshot(
+            vector={"longing": 5},
+            rolling_baseline_mean=4.0,
+            rolling_baseline_stdev=1.0,
+            current_resonance=6.0,
+            delta_sigma=2.0,
+        ),
+        semantic_context=SemanticContext(linked_memory_ids=[], topic_tags=[]),
+    )
+    queue_path = tmp_path / "initiate_queue.jsonl"
+    queue_path.write_text(json.dumps(asdict(cand)) + "\n")
+
+    _process_one_candidate(
+        tmp_path,
+        cand,
+        provider=MagicMock(),
+        voice_template="warm",
+        now=datetime(2026, 5, 29, 0, 0, tzinfo=UTC),
+        user_name="Henryk",
+        companion_name="Mira",
+    )
+
+    assert captured, "compose_subject was not called"
+    assert captured[0]["companion_name"] == "Mira"
