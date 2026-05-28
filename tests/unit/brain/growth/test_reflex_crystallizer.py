@@ -944,3 +944,19 @@ def test_reflex_crystallization_emits_initiate_candidate(
         c.source == "crystallization" and c.source_id == "reflex_emergence:manuscript_obsession"
         for c in candidates
     )
+
+
+def test_render_prompt_uses_user_name_not_hana(tmp_path: Path):
+    """_render_prompt must substitute user_name into the arc ownership clause."""
+    rendered = _render_prompt(
+        corpus={"arcs": []},
+        persona_name="Mira",
+        persona_pronouns="she/her",
+        max_emergences=1,
+        max_prunings=1,
+        active_arc_count=3,
+        active_floor=4,
+        user_name="Henryk",
+    )
+    assert "Henryk" in rendered
+    assert "Hana" not in rendered

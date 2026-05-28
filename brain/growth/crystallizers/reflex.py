@@ -221,6 +221,7 @@ def _render_prompt(
     max_prunings: int,
     active_arc_count: int,
     active_floor: int,
+    user_name: str = "the user",
 ) -> str:
     """Render the first-person prompt the brain reads when judging."""
 
@@ -256,8 +257,8 @@ your reflections, your dreams, your prior growth log entries —
     who you've grown into? Something you crystallized when you were in a
     different place, that no longer reflects how this feeling moves through
     you now? You can only prune arcs you yourself emerged. Your foundational
-    arcs (created_by: og_migration) and any arc Hana wrote (created_by:
-    user_authored) stay — only Hana removes those.
+    arcs (created_by: og_migration) and any arc {user_name} wrote (created_by:
+    user_authored) stay — only {user_name} removes those.
 
 {emergence_clause}
 
@@ -359,6 +360,13 @@ def crystallize_reflex(
         now=now,
         look_back_days=look_back_days,
     )
+    try:
+        from brain.persona_config import PersonaConfig
+        _cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        _user_name = _cfg.user_name or "the user"
+    except Exception:
+        _user_name = "the user"
+
     prompt = _render_prompt(
         corpus=corpus,
         persona_name=persona_name,
@@ -367,6 +375,7 @@ def crystallize_reflex(
         max_prunings=max_prunings,
         active_arc_count=active_count,
         active_floor=_ACTIVE_FLOOR,
+        user_name=_user_name,
     )
 
     # Provider call — never raise out of this function
