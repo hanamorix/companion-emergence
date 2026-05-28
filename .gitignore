@@ -127,3 +127,4 @@ graphify-out/
 .claude/hooks/
 .claude/scheduled_tasks.lock
 app/.claude/
+.tauri-release/
