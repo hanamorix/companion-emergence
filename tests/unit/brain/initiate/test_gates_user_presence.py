@@ -154,3 +154,86 @@ def test_response_lag_above_4h_raises_gap(tmp_path: Path) -> None:
     )
     assert allowed is False
     assert reason == "notify_min_gap_not_met"
+
+
+def test_lag_below_600_is_no_op(tmp_path: Path) -> None:
+    """lag_p50 < 600s must not affect gap at all — including not undoing silence loosening.
+
+    silence_days=3.5 + streak=0 halves the notify gap to 2h.
+    A send 3h ago is outside the 2h silence-loosened gap → allowed.
+    lag=300 (< 600) must NOT push the gap back to 4h (which would block it).
+    """
+    # Last send was 3h ago — passes the 2h silence-loosened gap but would fail the
+    # default 4h gap that the buggy else-branch restores.
+    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=UTC)  # 3h before noon
+    append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
+
+    from brain.initiate.gates import check_send_allowed
+
+    allowed, reason = check_send_allowed(
+        tmp_path,
+        urgency="notify",
+        now=_SAFE_NOW,
+        user_presence=_presence(silence_days=3.5, ignore_streak=0, response_lag_p50=300.0),
+    )
+    assert allowed is True  # silence loosening preserved — lag<600 is a no-op
+
+
+def test_silence_streak_conflict_backoff_wins(tmp_path: Path) -> None:
+    """silence_days >= 3 AND ignore_streak >= 3 → backoff wins, not silence loosening."""
+    # Last send was 5h ago — would pass 2h silence-gap but blocked by 8h backoff gap.
+    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=UTC)
+    append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
+
+    from brain.initiate.gates import check_send_allowed
+
+    allowed, reason = check_send_allowed(
+        tmp_path,
+        urgency="notify",
+        now=_SAFE_NOW,
+        user_presence=_presence(silence_days=4.0, ignore_streak=3),
+    )
+    # ignore-backoff wins: gap is 8h, only 5h elapsed → blocked
+    assert allowed is False
+    assert reason == "notify_min_gap_not_met"
+
+
+def test_lag_none_is_no_op(tmp_path: Path) -> None:
+    """response_lag_p50=None must not affect gap — silence loosening preserved.
+
+    silence_days=3.5 + streak=0 halves the gap to 2h.
+    A send 3h ago is outside 2h → allowed. lag=None must not raise the gap.
+    """
+    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=UTC)  # 3h before noon
+    append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
+
+    from brain.initiate.gates import check_send_allowed
+
+    allowed, reason = check_send_allowed(
+        tmp_path,
+        urgency="notify",
+        now=_SAFE_NOW,
+        user_presence=_presence(silence_days=3.5, ignore_streak=0, response_lag_p50=None),
+    )
+    assert allowed is True
+
+
+def test_lag_proportional_band_raises_gap(tmp_path: Path) -> None:
+    """600 <= lag_p50 < 14400 raises gap proportionally; 3600s lag → 1.5h gap.
+
+    lag_p50=3600s (1h) → lag_hours = 1h * 1.5 = 1.5h.
+    Last send 1h12min ago (1.2h) < 1.5h gap → blocked.
+    """
+    last_send = datetime(2026, 5, 29, 10, 48, 0, tzinfo=UTC)  # 1h12min before noon
+    append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
+
+    from brain.initiate.gates import check_send_allowed
+
+    allowed, reason = check_send_allowed(
+        tmp_path,
+        urgency="notify",
+        now=_SAFE_NOW,
+        user_presence=_presence(response_lag_p50=3600.0),  # 1h lag → 1.5h gap
+    )
+    assert allowed is False
+    assert reason == "notify_min_gap_not_met"

@@ -129,17 +129,14 @@ def check_send_allowed(
             quiet_cap = quiet_cap + 1
 
         # Response-rhythm: take max of streak-based and lag-based adjustment.
-        if p.response_lag_p50 is not None:
+        # lag_p50 < 600s → spec §2 Adjustment 3: "No adjustment."
+        if p.response_lag_p50 is not None and p.response_lag_p50 >= 600:
             if p.response_lag_p50 >= 14400:
-                lag_notify = 8.0
-                lag_quiet = 2.0
-            elif p.response_lag_p50 >= 600:
+                lag_notify, lag_quiet = 8.0, 2.0
+            else:
                 lag_hours = min(p.response_lag_p50 * 1.5 / 3600.0, 12.0)
                 lag_notify = lag_hours
                 lag_quiet = min(lag_hours * 0.25, 3.0)
-            else:
-                lag_notify = DEFAULT_NOTIFY_MIN_GAP_HOURS
-                lag_quiet = DEFAULT_QUIET_MIN_GAP_HOURS
             notify_min_gap_hours = max(notify_min_gap_hours, lag_notify)
             quiet_min_gap_hours = max(quiet_min_gap_hours, lag_quiet)
 
