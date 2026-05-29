@@ -55,6 +55,7 @@ from brain.initiate.reflection import (
 )
 from brain.initiate.resonance import run_resonance_tick
 from brain.initiate.schemas import AuditRow, InitiateCandidate, make_audit_id
+from brain.initiate.user_pattern import UserPresence
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ def _process_one_candidate(
     now: datetime,
     user_name: str = "my user",
     companion_name: str = "Nell",
+    user_presence: UserPresence | None = None,
 ) -> None:
     """Run the three-prompt pipeline on a single candidate, write audit, remove.
 
@@ -215,7 +217,9 @@ def _process_one_candidate(
     # cap gate — the daily reflection tick is the rate limiter (Task 14).
     if candidate.kind != "voice_edit_proposal" and final_decision in ("send_notify", "send_quiet"):
         urgency = "notify" if final_decision == "send_notify" else "quiet"
-        allowed, reason = check_send_allowed(persona_dir, urgency=urgency, now=now)
+        allowed, reason = check_send_allowed(
+            persona_dir, urgency=urgency, now=now, user_presence=user_presence
+        )
         gate_check = {"allowed": allowed, "reason": reason}
         if not allowed:
             final_decision = "hold"
@@ -302,6 +306,7 @@ def run_initiate_review_tick(
     voice_template: str,
     cap_per_tick: int = 3,
     now: datetime | None = None,
+    user_presence: UserPresence | None = None,
 ) -> None:
     """Process up to cap_per_tick queued candidates through the pipeline.
 
@@ -378,6 +383,7 @@ def run_initiate_review_tick(
                         now=now,
                         user_name=user_name,
                         companion_name=companion_name,
+                        user_presence=user_presence,
                     )
                 return
             # Fewer than 3 consecutive failures — passthrough retry.
@@ -441,6 +447,7 @@ def run_initiate_review_tick(
                 now=now,
                 user_name=user_name,
                 companion_name=companion_name,
+                user_presence=user_presence,
             )
         except Exception:
             logger.exception(
