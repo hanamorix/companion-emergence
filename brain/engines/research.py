@@ -162,6 +162,9 @@ class ResearchEngine:
         log = ResearchLog.load(self.research_log_path)
 
         if not interests.interests:
+            if self._seed_interests_from_voice():
+                interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+        if not interests.interests:
             return ResearchResult(
                 fired=None,
                 would_fire=None,
@@ -315,6 +318,62 @@ class ResearchEngine:
         )
 
     # ---- private helpers ----
+
+    def _seed_interests_from_voice(self) -> bool:
+        """Bootstrap starter interests from voice.md when interests.json is empty.
+
+        Reads voice.md (capped at 2000 chars), calls the provider to extract 5
+        topic strings as a JSON array, writes them as Interest records to
+        interests_path.
+
+        Returns True if at least one interest was written, False on any failure
+        (missing file, LLM error, parse error).  Never raises.
+        """
+        voice_path = self.interests_path.parent / "voice.md"
+        if not voice_path.exists():
+            return False
+        voice_text = voice_path.read_text(encoding="utf-8").strip()
+        if not voice_text:
+            return False
+        prompt = (
+            "Based on this companion's personality and voice, suggest 5 specific "
+            "topics they would genuinely find fascinating to research. Return ONLY "
+            "a JSON array of 5 short topic strings (2-5 words each), no explanation."
+            f"\n\n{voice_text[:2000]}"
+        )
+        try:
+            raw = self.provider.generate(prompt, system=None)
+            topics = json.loads(raw)
+            if not isinstance(topics, list):
+                return False
+            str_topics = [str(t).strip() for t in topics if str(t).strip()]
+            if not str_topics:
+                return False
+            now = datetime.now(UTC)
+            new_interests = [
+                Interest(
+                    id=f"boot-{abs(hash(t)):016x}",
+                    topic=t,
+                    pull_score=6.0,
+                    scope="either",
+                    related_keywords=(),
+                    notes="bootstrapped from voice template",
+                    first_seen=now,
+                    last_fed=now,
+                    last_researched_at=None,
+                    feed_count=0,
+                    source_types=("bootstrap",),
+                )
+                for t in str_topics
+            ]
+            InterestSet(interests=tuple(new_interests)).save(self.interests_path)
+            logger.info(
+                "research bootstrap: seeded %d interests from voice.md", len(new_interests)
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("research bootstrap: failed: %s", exc)
+            return False
 
     def _build_memory_context(self, interest: Interest) -> str:
         """Keyword-seeded memory sweep. Returns formatted string.
