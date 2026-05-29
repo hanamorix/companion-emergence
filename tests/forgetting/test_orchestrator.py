@@ -108,6 +108,48 @@ def test_run_pass_cold_start_no_memories(tmp_path):
     assert summary["lost"] == 0
 
 
+def test_run_pass_intensity_drivers_protects_borderline_memory(tmp_path):
+    """intensity_drivers.narrative_weight threads to policy and protects memories from fading."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from brain.felt_time.lived_age import IntensityDrivers
+    from brain.forgetting import policy
+
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        tmp_path,
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="arc memory", memory_type="episodic", domain="chat", emotions={})
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=10))
+    store.create(m)
+    store.close()
+
+    # Pin salience to just below baseline FADE_THRESHOLD but above the arc-adjusted threshold.
+    # effective_fade at narrative_weight=1.0 → FADE_THRESHOLD / 2 = 0.125
+    borderline_salience = 0.20  # 0.125 < 0.20 < 0.25
+
+    event_bus = MagicMock()
+    with patch("brain.forgetting.salience.score", return_value=borderline_salience):
+        # Without arc pressure: salience 0.20 < FADE_THRESHOLD 0.25 → should fade
+        summary_no_arc = run_pass(tmp_path, event_bus=event_bus)
+        assert summary_no_arc["faded"] >= 1, "baseline: borderline memory should fade without arc"
+
+    # Reload memory to active state
+    store = MemoryStore(tmp_path / "memories.db")
+    store._conn.execute("UPDATE memories SET state = 'active' WHERE id = ?", (m.id,))
+    store._conn.commit()
+    store.close()
+
+    event_bus2 = MagicMock()
+    drivers = IntensityDrivers(narrative_weight=1.0)
+    with patch("brain.forgetting.salience.score", return_value=borderline_salience):
+        # With full arc pressure: effective_fade = 0.125, 0.20 >= 0.125 → should NOT fade
+        summary_arc = run_pass(tmp_path, event_bus=event_bus2, intensity_drivers=drivers)
+        assert summary_arc["faded"] == 0, "arc pressure: borderline memory should be protected"
+
+
 def test_run_pass_recovers_from_corrupt_forgetting_state(persona_with_low_salience_memory):
     persona_dir, _mem_id = persona_with_low_salience_memory
     # Pre-corrupt the state file.

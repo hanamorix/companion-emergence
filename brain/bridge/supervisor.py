@@ -112,6 +112,7 @@ def run_folded(
     )
     last_heartbeat_at = time.monotonic() if heartbeat_interval_s is not None else None
     last_soul_review_at = time.monotonic() if soul_review_interval_s is not None else None
+    _last_intensity_drivers: IntensityDrivers | None = None
     last_finalize_at = time.monotonic() if finalize_interval_s is not None else None
     last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
     last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
@@ -191,7 +192,7 @@ def run_folded(
                 # accessor is identified.
                 # TODO(v0.0.15): replace 0 chat_turns + 0 reflex_firings with
                 # real counters from the event bus or engine state.
-                _run_felt_time_tick(
+                _last_intensity_drivers = _run_felt_time_tick(
                     persona_dir,
                     wall_clock_s_since_last=wall_s,
                     heartbeats_since_last=1,
@@ -215,7 +216,11 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor soul-review tick raised")
             try:
-                forgetting_run_pass(persona_dir, event_bus=event_bus)
+                forgetting_run_pass(
+                    persona_dir,
+                    event_bus=event_bus,
+                    intensity_drivers=_last_intensity_drivers,
+                )
             except Exception:
                 logger.exception("supervisor forgetting pass raised")
             # Narrative-memory arc-update runs AFTER forgetting in the same
@@ -302,12 +307,15 @@ def _run_felt_time_tick(
     heartbeats_since_last: int,
     chat_turns_since_last: int,
     reflex_firings_since_last: int,
-) -> None:
+) -> IntensityDrivers:
     """Fold one supervisor heartbeat cycle into felt-time state.
 
     drivers values are derived from existing body + emotion accessors;
     cold-start cases (no body state, no emotion vector) collapse all
     drivers to 0.0 so lived-age advances at baseline.
+
+    Returns the computed IntensityDrivers so the caller can cache them for
+    the next forgetting pass (arc pressure modulates the fade threshold).
 
     Fault-isolated upstream: caller wraps in try/except so a raise here
     cannot cascade into bridge shutdown or take down the heartbeat loop.
@@ -324,6 +332,7 @@ def _run_felt_time_tick(
             drivers=drivers,
         )
     )
+    return drivers
 
 
 def _derive_intensity_drivers(
