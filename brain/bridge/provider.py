@@ -68,13 +68,15 @@ def _write_thinking_log(
             "call_site": call_site,
             "thinking": thinking,
             "budget_tokens": budget_tokens,
-            "thinking_tokens": thinking_tokens,
+            "thinking_tokens": thinking_tokens,  # 0 until CLI exposes this field
         }
         log_path = persona_dir / "thinking_log.jsonl"
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         logger.warning("thinking log write failed — reply unaffected", exc_info=True)
+
+
 _PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
@@ -484,7 +486,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
-        if budget := (options or {}).get("thinking_budget_tokens"):
+        if (budget := (options or {}).get("thinking_budget_tokens")) and isinstance(budget, int) and budget > 0:
             cmd.extend(["--thinking", "enabled", "--budget-tokens", str(budget)])
 
         with _system_prompt_tempfile(system_prompt) as sp_path:
@@ -634,7 +636,7 @@ class ClaudeCliProvider(LLMProvider):
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
 
-        if budget := (options or {}).get("thinking_budget_tokens"):
+        if (budget := (options or {}).get("thinking_budget_tokens")) and isinstance(budget, int) and budget > 0:
             cmd.extend(["--thinking", "enabled", "--budget-tokens", str(budget)])
 
         try:

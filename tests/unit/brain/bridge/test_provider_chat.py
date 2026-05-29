@@ -1342,7 +1342,7 @@ def test_thinking_block_written_to_log(tmp_path: Path):
     assert "ts" in entry
 
 
-def test_thinking_log_failure_does_not_break_reply(tmp_path: Path, monkeypatch):
+def test_thinking_log_failure_does_not_break_reply(tmp_path: Path):
     provider = ClaudeCliProvider(model="sonnet")
 
     with patch("brain.bridge.provider.subprocess.run", return_value=_fake_run_ok(thinking="thoughts")):
