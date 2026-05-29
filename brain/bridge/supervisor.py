@@ -885,7 +885,7 @@ def _run_initiate_review_tick(
     """Build voice template + invoke run_initiate_review_tick.
 
     Mirrors _run_soul_review_tick's per-tick store-ownership pattern.
-    Reads ``nell-voice.md`` from the persona dir (empty string if absent)
+    Reads ``voice.md`` from the persona dir (empty string if absent)
     and ``initiate_review_cap_per_tick`` from PersonaConfig (default 3).
     Publishes an ``initiate_review_tick`` event on success.
     """
