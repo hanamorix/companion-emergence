@@ -564,6 +564,10 @@ class ModelConfigReq(BaseModel):
     model: str
 
 
+class ThinkingConfigReq(BaseModel):
+    thinking_budget_tokens: int | None = None
+
+
 class NewSessionReq(BaseModel):
     client: Literal["cli", "tauri", "tests"] = "cli"
 
@@ -1128,6 +1132,40 @@ def build_app(
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
         return {"ok": True, "model": req.model}
+
+    # ── POST /persona/config/thinking — extended-thinking budget ────────────
+    @app.post("/persona/config/thinking", dependencies=[Depends(require_http_auth)])
+    async def set_thinking_config(req: ThinkingConfigReq) -> dict:
+        """Set or clear the extended-thinking token budget.
+
+        thinking_budget_tokens: positive int to enable, null/None to disable.
+
+        Returns: {ok: true, thinking_budget_tokens: <value|null>}
+        Errors:  422 for non-positive or non-integer values
+        """
+        from dataclasses import replace as dc_replace
+
+        from brain.persona_config import PersonaConfig
+
+        budget = req.thinking_budget_tokens
+        if budget is not None and (
+            not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "ok": False,
+                    "error": "invalid_thinking_budget",
+                    "detail": "must be a positive integer or null",
+                },
+            )
+
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        current = PersonaConfig.load(config_path)
+        updated = dc_replace(current, thinking_budget_tokens=budget)
+        updated.save(config_path)
+        return {"ok": True, "thinking_budget_tokens": budget}
 
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])

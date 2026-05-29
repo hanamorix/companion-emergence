@@ -171,6 +171,7 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     out: dict[str, Any] = {
         "provider": None,
         "model": None,
+        "thinking_budget_tokens": None,
         "last_heartbeat_at": None,
     }
     try:
@@ -179,6 +180,7 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         out["provider"] = cfg.provider
         out["model"] = cfg.model
+        out["thinking_budget_tokens"] = cfg.thinking_budget_tokens
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: persona_config read failed", exc_info=True)
     try:
