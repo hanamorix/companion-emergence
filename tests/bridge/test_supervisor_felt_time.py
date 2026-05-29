@@ -236,3 +236,74 @@ def test_derive_intensity_drivers_chat_activity_fallback_without_log(tmp_path: P
     # 3 turns → chat_activity = min(1.0, 3/1.5) = 1.0
     drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=3, wall_clock_s_in_tick=900.0)
     assert drivers.chat_activity == pytest.approx(1.0)
+
+
+def _make_emotion_memory(store, *, channel: str, value: float, days_ago: float):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.memory.store import Memory
+
+    m = Memory.create_new(
+        content="x", memory_type="episodic", domain="chat", emotions={channel: value}
+    )
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=days_ago))
+    store.create(m)
+
+
+def test_derive_intensity_drivers_emotional_intensity_high_deviation(tmp_path: Path) -> None:
+    """A memory with sorrow far above the 15-memory baseline saturates the driver."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.felt_time.state import FeltTimeState, persist
+    from brain.memory.store import MemoryStore
+
+    persist(FeltTimeState(lived_age_hours=200.0), tmp_path)
+    store = MemoryStore(tmp_path / "memories.db")
+    # 15 memories at sorrow=1.0 establish baseline mean ≈ 1.0
+    for i in range(15):
+        _make_emotion_memory(store, channel="sorrow", value=1.0, days_ago=20 + i)
+    # 1 recent memory at sorrow=9.0 drives aggregate max high
+    _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=0.1)
+    store.close()
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    # deviation >> 3σ → clipped to 1.0
+    assert drivers.emotional_intensity == pytest.approx(1.0)
+
+
+def test_derive_intensity_drivers_emotional_intensity_zero_when_no_memories(tmp_path: Path) -> None:
+    """No memories.db → emotional_intensity falls back to 0.0."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    assert drivers.emotional_intensity == 0.0
+
+
+def test_derive_intensity_drivers_emotional_intensity_zero_below_sample_threshold(
+    tmp_path: Path,
+) -> None:
+    """Fewer than 10 samples per channel → no baseline → emotional_intensity stays 0.0."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    for i in range(5):  # only 5 — below the 10-sample minimum
+        _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=20 + i)
+    store.close()
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    assert drivers.emotional_intensity == 0.0
+
+
+def test_derive_intensity_drivers_emotional_intensity_zero_when_at_baseline(tmp_path: Path) -> None:
+    """When all memories share the same emotion value, sigma=0 → intensity stays 0."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    # All memories at exactly sorrow=3.0 — mean=3.0, sigma=0, deviation undefined
+    for i in range(15):
+        _make_emotion_memory(store, channel="sorrow", value=3.0, days_ago=20 + i)
+    store.close()
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    assert drivers.emotional_intensity == 0.0

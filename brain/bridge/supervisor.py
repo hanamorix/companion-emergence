@@ -360,8 +360,9 @@ def _derive_intensity_drivers(
     tick window. Phase 9.2 follow-up will tighten to a rolling baseline
     once weather_shift per-channel baselines are proven stable.
     """
-    # Best-effort body strain from exhaustion / energy.
+    # Best-effort body strain + emotional intensity from exhaustion / energy.
     body_strain = 0.0
+    emotional_intensity = 0.0
     try:
         from brain.body.state import compute_body_state
         from brain.body.words import count_words_in_session
@@ -397,14 +398,12 @@ def _derive_intensity_drivers(
             raw_exhaustion = float(body.exhaustion) / 9.0
             raw_energy_lack = 1.0 - float(body.energy) / 10.0
             body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
+            from brain.felt_time.emotion_intensity import compute as _compute_ei
+            emotional_intensity = _compute_ei(memories)
         finally:
             store.close()
     except Exception:
         logger.debug("supervisor felt-time: body strain read failed; using 0.0", exc_info=True)
-
-    # Emotional intensity — best-effort, 0.0 fallback.
-    # TODO(v0.0.15): wire to brain.emotion once a clean normalized accessor exists.
-    emotional_intensity = 0.0
 
     # Chat activity: rolling 7-day mean from chat_turns.log.jsonl.
     # Falls back to fixed 6 turns/h when log is absent or below cold-start threshold.
