@@ -51,6 +51,30 @@ from brain.bridge.chat import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300
+
+
+def _write_thinking_log(
+    *,
+    persona_dir: Path,
+    call_site: str,
+    thinking: str,
+    budget_tokens: int,
+    thinking_tokens: int,
+) -> None:
+    """Append one entry to <persona_dir>/thinking_log.jsonl. Never raises."""
+    try:
+        entry = {
+            "ts": datetime.now(UTC).isoformat(),
+            "call_site": call_site,
+            "thinking": thinking,
+            "budget_tokens": budget_tokens,
+            "thinking_tokens": thinking_tokens,
+        }
+        log_path = persona_dir / "thinking_log.jsonl"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        logger.warning("thinking log write failed — reply unaffected", exc_info=True)
 _PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
@@ -460,6 +484,9 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        if budget := (options or {}).get("thinking_budget_tokens"):
+            cmd.extend(["--thinking", "enabled", "--budget-tokens", str(budget)])
+
         with _system_prompt_tempfile(system_prompt) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -495,6 +522,18 @@ class ClaudeCliProvider(LLMProvider):
                 "claude_cli_parse",
                 f"unexpected output format: {result.stdout[:200]!r}",
             ) from exc
+
+        thinking_text = payload.get("thinking")
+        if thinking_text and isinstance(thinking_text, str) and thinking_text.strip():
+            _persona_dir_str = (options or {}).get("persona_dir", "")
+            if _persona_dir_str:
+                _write_thinking_log(
+                    persona_dir=Path(_persona_dir_str),
+                    call_site=(options or {}).get("thinking_call_site", "chat"),
+                    thinking=thinking_text,
+                    budget_tokens=int((options or {}).get("thinking_budget_tokens", 0)),
+                    thinking_tokens=int(payload.get("thinking_tokens", 0)),
+                )
 
         return ChatResponse(
             content=_truncate_at_role_leak(content),
@@ -594,6 +633,9 @@ class ClaudeCliProvider(LLMProvider):
                 return
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
+
+        if budget := (options or {}).get("thinking_budget_tokens"):
+            cmd.extend(["--thinking", "enabled", "--budget-tokens", str(budget)])
 
         try:
             yield from self._run_chat_stream(
