@@ -16,6 +16,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from brain.initiate.schemas import Decision, InitiateCandidate
@@ -65,6 +66,7 @@ def compose_tone(
     voice_template: str,
     user_name: str = "my user",
     companion_name: str = "Nell",
+    persona_dir: Path | None = None,
 ) -> str:
     """Render the subject in Nell's voice, coloured by current emotional state.
 
@@ -95,6 +97,23 @@ def compose_tone(
         f"{emotional_line}\n\n"
         "Message (one paragraph):"
     )
+    if persona_dir is not None:
+        try:
+            from brain.bridge.provider import ChatMessage
+            from brain.persona_config import PersonaConfig
+
+            cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+            if cfg.thinking_budget_tokens:
+                return provider.chat(
+                    [ChatMessage(role="user", content=prompt)],
+                    options={
+                        "thinking_budget_tokens": cfg.thinking_budget_tokens,
+                        "thinking_call_site": "compose",
+                        "persona_dir": str(persona_dir),
+                    },
+                ).content.strip()
+        except Exception:
+            pass
     return provider.complete(prompt).strip()
 
 
