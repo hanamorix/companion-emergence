@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
@@ -92,3 +92,38 @@ def _compute_ignore_streak(persona_dir: Path) -> int:
         elif state in _RESET_STATES:
             break
     return streak
+
+
+def _compute_likely_active(  # noqa: PLR0912
+    persona_dir: Path, *, _now: datetime | None = None
+) -> bool:
+    """Return True if current hour is within the user's inferred active window."""
+    conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
+    if not conversations_dir.exists():
+        return True
+    now = _now or datetime.now(UTC)
+    cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
+    hour_counts: list[int] = [0] * 24
+    total = 0
+    for jsonl_file in conversations_dir.glob("*.jsonl"):
+        for row in read_jsonl_skipping_corrupt(jsonl_file):
+            if str(row.get("speaker", "")).lower() == persona_dir.name.lower():
+                continue
+            ts_str = row.get("ts")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                if ts < cutoff:
+                    continue
+                hour_counts[ts.astimezone().hour] += 1
+                total += 1
+            except (ValueError, TypeError):
+                continue
+    if total < _SCHEDULE_MIN_TURNS:
+        return True
+    sorted_counts = sorted(hour_counts)
+    threshold = sorted_counts[int(len(sorted_counts) * _SCHEDULE_ACTIVE_PERCENTILE)]
+    return hour_counts[now.astimezone().hour] > threshold
