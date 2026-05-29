@@ -69,8 +69,11 @@ body,
 }
 
 .chat-input::placeholder {
-  color: var(--mauve);
-  opacity: 0.85;
+  /* --mauve (#998888) at 0.85 opacity on --panel-bg gives ~2.6:1 contrast,
+   * below WCAG AA (4.5:1). Using --text-mid (#4a3535) at full opacity
+   * gives ≈ 7:1 — comfortably readable without altering the palette. */
+  color: var(--text-mid);
+  opacity: 1;
 }
 
 #root {

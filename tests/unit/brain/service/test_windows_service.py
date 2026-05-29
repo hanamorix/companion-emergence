@@ -102,7 +102,7 @@ def test_build_task_xml_contains_required_sections(tmp_path: Path, monkeypatch) 
     assert '<Actions Context="Author">' in body
     # ExecStart equivalent: nell.exe + arguments
     assert str(nell.resolve()) in body
-    assert "supervisor run --persona nell" in body
+    assert 'supervisor run --persona &quot;nell&quot;' in body
     assert "--client-origin task-scheduler" in body
     assert "--idle-shutdown 0" in body
     # Restart-on-failure (the launchd KeepAlive analog)
@@ -190,6 +190,28 @@ def test_build_task_xml_is_schema_1_3_with_context_on_actions(tmp_path: Path, mo
     settings = body[body.index("<Settings>") : body.index("</Settings>")]
     positions = [settings.index(f"<{tag}") for tag in order]
     assert positions == sorted(positions), "Settings child order drifted"
+
+
+def test_render_task_xml_quotes_persona_in_arguments(tmp_path: Path, monkeypatch) -> None:
+    """Arguments string must double-quote the persona name.
+
+    Task Scheduler passes Arguments as a single string to CreateProcess.
+    If the persona name (or a future path value embedded in arguments)
+    contains a space it would be split into two tokens, causing the
+    supervisor to receive an incorrect persona name."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NELLBRAIN_HOME", str(home / "data"))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData/Local"))
+    nell = _make_executable(tmp_path / "nell.exe")
+
+    body = windows_service.build_task_xml(persona="nell", nell_path=nell)
+
+    # The Arguments element must wrap the persona name in double-quotes.
+    # _xml_escape converts " → &quot; so Task Scheduler receives the
+    # literal double-quote when it invokes CreateProcess.
+    assert '<Arguments>supervisor run --persona &quot;nell&quot;' in body
 
 
 # ---------------------------------------------------------------------------

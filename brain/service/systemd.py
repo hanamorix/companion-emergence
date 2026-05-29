@@ -165,7 +165,7 @@ def build_systemd_unit_text(
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart={nell_path} supervisor run --persona {persona} "
+        f'ExecStart="{nell_path}" supervisor run --persona "{persona}" '
         "--client-origin systemd --idle-shutdown 0\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
