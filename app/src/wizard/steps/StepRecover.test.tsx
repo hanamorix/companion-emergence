@@ -14,4 +14,11 @@ describe("StepRecover", () => {
     expect(await screen.findByText(/3 memories to restore/i)).toBeInTheDocument();
     expect(await screen.findByText(/1 to un-fade/i)).toBeInTheDocument();
   });
+
+  it("renders inside WizardShell with title 'Recover memories'", async () => {
+    render(<StepRecover persona="Phoebe" sourceDir="/src" onDone={() => {}} />);
+    // WizardShell always renders the title in the header
+    const matches = await screen.findAllByText("Recover memories");
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+  });
 });

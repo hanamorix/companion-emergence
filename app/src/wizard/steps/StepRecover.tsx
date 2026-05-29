@@ -1,15 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   invokeRecoverPreflight, invokeRunRecover, type RecoverPreflight,
 } from "../../bridge";
 import { errString } from "../../lib/errString";
+import { WizardShell } from "../components";
 
 export function StepRecover({
-  persona, sourceDir, onDone,
+  persona, sourceDir, onDone, avatar,
 }: {
   persona: string;
   sourceDir: string | null;
   onDone: () => void;
+  avatar?: ReactNode;
 }) {
   const [preflight, setPreflight] = useState<RecoverPreflight | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,16 +39,20 @@ export function StepRecover({
     }
   }
 
-  if (error) return <div role="alert">Recovery problem: {error}</div>;
-  if (!preflight) return <div>Checking what can be restored…</div>;
-
   return (
-    <div>
-      <h2>Recover {persona}</h2>
-      <p>{preflight.missing} memories to restore, {preflight.unfade} to un-fade.</p>
-      <button disabled={running} onClick={run}>
-        {running ? "Restoring…" : "Restore now"}
-      </button>
-    </div>
+    <WizardShell title="Recover memories" avatar={avatar}>
+      {error ? (
+        <div role="alert">Recovery problem: {error}</div>
+      ) : !preflight ? (
+        <div>Checking what can be restored…</div>
+      ) : (
+        <div>
+          <p>{preflight.missing} memories to restore, {preflight.unfade} to un-fade.</p>
+          <button disabled={running} onClick={run}>
+            {running ? "Restoring…" : "Restore now"}
+          </button>
+        </div>
+      )}
+    </WizardShell>
   );
 }
