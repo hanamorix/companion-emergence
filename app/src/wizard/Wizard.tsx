@@ -375,6 +375,7 @@ export function Wizard({ onDone }: Props) {
           }
           sourceDir={state.migrateFromPath || null}
           onDone={() => setStep("ready")}
+          avatar={avatar}
         />
       );
     case "review":
