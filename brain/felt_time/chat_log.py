@@ -10,6 +10,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+
 log = logging.getLogger(__name__)
 
 CHAT_TURNS_LOG_FILENAME = "chat_turns.log.jsonl"
@@ -59,15 +61,11 @@ def load_recent_samples(
 
     all_entries: list[dict] = []
     try:
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        for raw in iter_jsonl_skipping_corrupt(log_path):
             try:
-                raw = json.loads(line)
                 ts = datetime.fromisoformat(raw["ts"])
                 all_entries.append({"ts": ts, "turns": float(raw.get("turns", 0))})
-            except (json.JSONDecodeError, KeyError, ValueError):
+            except (KeyError, ValueError, TypeError):
                 pass
     except OSError:
         return None
