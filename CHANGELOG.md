@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.25 — 2026-05-29
+
+### Epistemic gap recall
+
+When a memory search returns nothing for a name or entity, the recall block now says so explicitly — a `not recognised (searched; no memory found):` section lists the names that were looked up and found absent. A standing epistemic instruction is injected alongside it so the companion distinguishes "I never knew this" from "I don't remember", and doesn't invent familiarity.
+
+A B→A capital-initial fallback filters out low-signal lowercase tokens when the unfamiliar list exceeds five entries, keeping the section focused on proper nouns.
+
+### Extended reasoning toggle
+
+A new `thinking_budget_tokens` field in `PersonaConfig` lets you enable Claude's extended thinking mode for a persona. When set, the brain injects `--thinking enabled --budget-tokens N` into every `chat()` call and logs the thinking block to `thinking_log.jsonl` in the persona directory. The initiate compose path also routes through `chat()` instead of `complete()` when thinking is active.
+
+The Connection panel now shows an **Extended reasoning** checkbox under the Window section. Toggling it on sets a default budget of 8 000 tokens; toggling it off clears it. The toggle is optimistic — it reverts automatically if the bridge call fails.
+
+`POST /persona/config/thinking` is the new bridge endpoint; `GET /persona/state` exposes `thinking_budget_tokens` in the connection block.
+
 ## v0.0.24 — 2026-05-29
 
 **Persona identity: every companion now speaks as herself, to her user — no hardcoded names leaking into her inner monologue.**
