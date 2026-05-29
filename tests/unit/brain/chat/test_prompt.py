@@ -1060,3 +1060,63 @@ def test_build_recall_block_no_not_recognised_when_all_found(tmp_path: Path):
             block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
 
     assert "not recognised" not in block
+
+
+# ---------------------------------------------------------------------------
+# Epistemic instruction injection
+# ---------------------------------------------------------------------------
+
+
+def test_build_system_message_includes_epistemic_instruction(tmp_path: Path):
+    """Epistemic instruction is present in system message when user_input is provided."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _EPISTEMIC_INSTRUCTION, build_system_message
+    from brain.engines.daemon_state import DaemonState
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MagicMock(spec=MemoryStore)
+    store.search_text.return_value = []
+    soul_store = MagicMock(spec=SoulStore)
+    soul_store.list_active.return_value = []
+    daemon_state = MagicMock(spec=DaemonState)
+
+    with patch("brain.chat.prompt._build_recall_block", return_value=""), \
+         patch("brain.initiate.ambient.build_outbound_recall_block", return_value=None):
+        msg = build_system_message(
+            tmp_path,
+            voice_md="",
+            daemon_state=daemon_state,
+            soul_store=soul_store,
+            store=store,
+            user_input="Tell me about Marcus",
+        )
+
+    assert _EPISTEMIC_INSTRUCTION in msg
+
+
+def test_build_system_message_no_epistemic_instruction_without_user_input(tmp_path: Path):
+    """Epistemic instruction is absent when user_input is None."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _EPISTEMIC_INSTRUCTION, build_system_message
+    from brain.engines.daemon_state import DaemonState
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MagicMock(spec=MemoryStore)
+    soul_store = MagicMock(spec=SoulStore)
+    soul_store.list_active.return_value = []
+    daemon_state = MagicMock(spec=DaemonState)
+
+    msg = build_system_message(
+        tmp_path,
+        voice_md="",
+        daemon_state=daemon_state,
+        soul_store=soul_store,
+        store=store,
+        user_input=None,
+    )
+
+    assert _EPISTEMIC_INSTRUCTION not in msg

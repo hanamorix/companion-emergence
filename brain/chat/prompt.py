@@ -38,6 +38,12 @@ AS_NELL_PREAMBLE_WITH_USER = (
     "Respond as yourself."
 )
 
+_EPISTEMIC_INSTRUCTION = (
+    'When names or entities appear under "not recognised (searched; no memory found)", '
+    'acknowledge the gap honestly. Distinguish "I never knew this" from "I don\'t '
+    'remember". Do not invent familiarity.'
+)
+
 
 def build_system_message(
     persona_dir: Path,
@@ -142,6 +148,12 @@ def build_system_message(
         # journal / growth blocks): a failure here must never break chat
         # composition. Audit-layer issues should surface elsewhere.
         pass
+
+    # Epistemic instruction — injected when recall infrastructure is active so
+    # the model knows how to handle "not recognised" entities honestly.
+    # Condition: user_input is not None (same gate as _build_recall_block call below).
+    if user_input is not None:
+        parts.append(_EPISTEMIC_INSTRUCTION)
 
     # 4b. Recall block — memories matching the current user input.
     # Passes persona_dir so the forgetting-aware path can partition into
