@@ -2,8 +2,6 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 
 def test_append_chat_tick_creates_file(tmp_path: Path) -> None:
     from brain.felt_time.chat_log import CHAT_TURNS_LOG_FILENAME, append_chat_tick
@@ -99,7 +97,11 @@ def test_load_recent_samples_excludes_entries_outside_window(tmp_path: Path) -> 
 
 
 def test_load_recent_samples_lazy_trim_removes_old_from_file(tmp_path: Path) -> None:
-    from brain.felt_time.chat_log import CHAT_TURNS_LOG_FILENAME, append_chat_tick, load_recent_samples
+    from brain.felt_time.chat_log import (
+        CHAT_TURNS_LOG_FILENAME,
+        append_chat_tick,
+        load_recent_samples,
+    )
 
     now = datetime.now(UTC)
     # Write 15 entries older than _RETAIN_DAYS=30 (triggers rewrite threshold >10)

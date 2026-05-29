@@ -114,7 +114,6 @@ def test_run_pass_intensity_drivers_protects_borderline_memory(tmp_path):
     from unittest.mock import patch
 
     from brain.felt_time.lived_age import IntensityDrivers
-    from brain.forgetting import policy
 
     persist_felt_time(
         FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
