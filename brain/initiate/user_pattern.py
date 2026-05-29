@@ -79,8 +79,8 @@ def _compute_ignore_streak(persona_dir: Path) -> int:
     if not audit_path.exists():
         return 0
 
-    rows = list(read_jsonl_skipping_corrupt(audit_path))
-    rows_desc = sorted(rows, key=lambda r: r.get("ts", ""), reverse=True)
+    rows = [r for r in read_jsonl_skipping_corrupt(audit_path) if r.get("ts")]
+    rows_desc = sorted(rows, key=lambda r: r["ts"], reverse=True)
 
     streak = 0
     for row in rows_desc:
@@ -125,8 +125,8 @@ def _compute_likely_active(  # noqa: PLR0912
     if total < _SCHEDULE_MIN_TURNS:
         return True
     sorted_counts = sorted(hour_counts)
-    threshold = sorted_counts[int(len(sorted_counts) * _SCHEDULE_ACTIVE_PERCENTILE)]
-    return hour_counts[now.astimezone().hour] > threshold
+    threshold = max(sorted_counts[int(len(sorted_counts) * _SCHEDULE_ACTIVE_PERCENTILE)], 1)
+    return hour_counts[now.astimezone().hour] >= threshold
 
 
 def _compute_response_lag_p50(persona_dir: Path) -> float | None:

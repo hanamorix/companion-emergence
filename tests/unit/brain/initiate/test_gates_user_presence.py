@@ -1,7 +1,7 @@
 """Tests for UserPresence adjustments in check_send_allowed."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.initiate.audit import append_audit_row
@@ -236,4 +236,17 @@ def test_lag_proportional_band_raises_gap(tmp_path: Path) -> None:
         user_presence=_presence(response_lag_p50=3600.0),  # 1h lag → 1.5h gap
     )
     assert allowed is False
-    assert reason == "notify_min_gap_not_met"
+
+
+def test_likely_inactive_overrides_silence_loosening(tmp_path: Path) -> None:
+    """Soft blackout (likely_active=False) must win even when silence would loosen gates."""
+    from brain.initiate.gates import check_send_allowed
+
+    allowed, reason = check_send_allowed(
+        tmp_path,
+        urgency="notify",
+        now=_SAFE_NOW,
+        user_presence=_presence(silence_days=5.0, likely_active=False),
+    )
+    assert allowed is False
+    assert reason == "user_likely_inactive"
