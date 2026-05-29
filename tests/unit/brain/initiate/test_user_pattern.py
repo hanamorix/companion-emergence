@@ -127,3 +127,78 @@ def test_compute_likely_active_peak_hour_true_offpeak_false(tmp_path: Path) -> N
     # Guard: confirm these map to different local hours (always true since 12h apart)
     if now_off.astimezone().hour != now_peak.astimezone().hour:
         assert _compute_likely_active(tmp_path, _now=now_off) is False
+
+
+def test_compute_response_lag_p50_no_file_returns_none(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_response_lag_p50
+
+    assert _compute_response_lag_p50(tmp_path) is None
+
+
+def test_compute_response_lag_p50_below_cold_start_returns_none(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_response_lag_p50
+
+    # Only 2 replied_explicit rows — below cold-start minimum of 3
+    rows = [
+        {"audit_id": str(i), "ts": f"2026-05-29T10:0{i}:00+00:00",
+         "decision": "send_notify",
+         "delivery": {"current_state": "replied_explicit",
+                      "state_transitions": [{"to": "replied_explicit",
+                                             "at": f"2026-05-29T10:0{i}:30+00:00"}]}}
+        for i in range(2)
+    ]
+    _write_audit_rows(tmp_path, rows)
+    assert _compute_response_lag_p50(tmp_path) is None
+
+
+def test_compute_response_lag_p50_computes_median(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_response_lag_p50
+
+    # Three sends, lags = 60s, 120s, 300s → median = 120s
+    rows = [
+        {"audit_id": "1", "ts": "2026-05-29T09:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "replied_explicit",
+                      "state_transitions": [{"to": "replied_explicit",
+                                             "at": "2026-05-29T09:01:00+00:00"}]}},  # 60s
+        {"audit_id": "2", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "replied_explicit",
+                      "state_transitions": [{"to": "replied_explicit",
+                                             "at": "2026-05-29T10:02:00+00:00"}]}},  # 120s
+        {"audit_id": "3", "ts": "2026-05-29T11:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "replied_explicit",
+                      "state_transitions": [{"to": "replied_explicit",
+                                             "at": "2026-05-29T11:05:00+00:00"}]}},  # 300s
+    ]
+    _write_audit_rows(tmp_path, rows)
+    assert _compute_response_lag_p50(tmp_path) == pytest.approx(120.0)
+
+
+def test_compute_user_presence_cold_start_defaults(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import UserPresence, compute_user_presence
+
+    presence = compute_user_presence(tmp_path)
+    assert isinstance(presence, UserPresence)
+    assert presence.silence_days == pytest.approx(0.0)
+    assert presence.ignore_streak == 0
+    assert presence.likely_active is True
+    assert presence.response_lag_p50 is None
+
+
+def test_compute_user_presence_assembles_all_signals(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    # Write one unanswered send to create a streak of 1
+    _write_audit_rows(tmp_path, [
+        {"audit_id": "1", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "unanswered"}}
+    ])
+    # Write a recent user turn (1 hour ago) → silence_days ~ 0.04
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=1))
+
+    presence = compute_user_presence(tmp_path)
+    assert presence.ignore_streak == 1
+    assert presence.silence_days < 0.1
+    assert presence.likely_active is True  # < 50 turns → permissive
+    assert presence.response_lag_p50 is None  # < 3 replied rows
