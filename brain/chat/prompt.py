@@ -487,12 +487,16 @@ def _build_recall_block(
     active_hits: list = []
     fading_hits: list = []
     lost_hits: list = []
+    unfamiliar: list[str] = []
 
     for token in tokens:
         try:
             result = search_with_loss(persona_dir, store, token, limit=limit * 2)
         except Exception:  # noqa: BLE001
             continue
+        found = bool(result.active or result.fading or result.lost)
+        if not found:
+            unfamiliar.append(token)
         for mem in result.active:
             if mem.id not in seen_active:
                 seen_active.add(mem.id)
@@ -507,7 +511,11 @@ def _build_recall_block(
                 seen_lost.add(mid)
                 lost_hits.append(entry)
 
-    if not active_hits and not fading_hits and not lost_hits:
+    # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
+    if len(unfamiliar) > 5:
+        unfamiliar = [t for t in unfamiliar if t and t[0].isupper()]
+
+    if not active_hits and not fading_hits and not lost_hits and not unfamiliar:
         return ""
 
     # Fire recall-touch grief breadcrumbs for any graveyard hits.
@@ -574,6 +582,11 @@ def _build_recall_block(
                 summary = summary[: max_chars - 1].rstrip() + "…"
             reason = entry.get("graveyard_reason", "forgotten")
             lines.append(f'    - "{summary}"  [forgotten — {reason}]')
+
+    if unfamiliar:
+        lines.append("  not recognised (searched; no memory found):")
+        for token in unfamiliar:
+            lines.append(f"    - {token}")
 
     return "\n".join(lines)
 

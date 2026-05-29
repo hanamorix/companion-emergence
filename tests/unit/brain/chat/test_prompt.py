@@ -391,10 +391,12 @@ def test_recall_block_caps_at_limit(
     # New forgetting-aware format renders bullets under "  active:" indented with "    - "
     assert "recall" in msg
     assert "active:" in msg
-    # Each active result is a "    - " bullet line — cap is still 5 per bucket
+    # Each active result is a '    - "…"' bullet — cap is still 5 per bucket.
+    # Count quoted bullets (active/fading entries use quoted content) excluding the
+    # unquoted "not recognised" token bullets which have no surrounding quotes.
     recall_section = msg.split("recall\n")[1]
-    bullet_count = recall_section.count("\n    - ")
-    assert bullet_count == 5, f"expected 5 recall bullets, got {bullet_count}"
+    quoted_bullet_count = recall_section.count('    - "')
+    assert quoted_bullet_count == 5, f"expected 5 recall bullets, got {quoted_bullet_count}"
 
 
 def test_recall_block_truncates_long_content(
@@ -947,3 +949,114 @@ def test_build_recent_journal_block_uses_user_name_not_hana(tmp_path: Path) -> N
     assert "hana" not in block.lower()
     assert "Henryk" in block
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# _build_recall_block — unfamiliar token tracking
+# ---------------------------------------------------------------------------
+
+
+def _nr_empty_result():
+    """search_with_loss result with nothing in any bucket."""
+    from unittest.mock import MagicMock
+
+    r = MagicMock()
+    r.active = []
+    r.fading = []
+    r.lost = []
+    return r
+
+
+def _nr_hit_result(content: str):
+    """search_with_loss result with one active hit."""
+    from unittest.mock import MagicMock
+
+    mem = MagicMock()
+    mem.id = "m1"
+    mem.content = content
+    mem.importance = 5
+    mem.created_at = None
+    r = MagicMock()
+    r.active = [mem]
+    r.fading = []
+    r.lost = []
+    return r
+
+
+def test_build_recall_block_not_recognised_section(tmp_path: Path):
+    """Unfamiliar token appears in 'not recognised' section."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _build_recall_block
+
+    store = MagicMock()
+
+    def fake_search(persona_dir, store_, token, *, limit):
+        if token == "Lisbon":
+            return _nr_hit_result("we talked about a trip to Lisbon")
+        return _nr_empty_result()
+
+    with patch("brain.forgetting.recall.search_with_loss", side_effect=fake_search):
+        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus", "Lisbon"]):
+            block = _build_recall_block(store, "Tell me about Marcus and Lisbon", persona_dir=tmp_path)
+
+    assert "not recognised" in block
+    assert "Marcus" in block
+    # Lisbon must NOT appear under the not-recognised section
+    not_rec_idx = block.index("not recognised")
+    assert "Lisbon" not in block[not_rec_idx:]
+
+
+def test_build_recall_block_not_recognised_only_emits_block(tmp_path: Path):
+    """Block is still emitted when only unfamiliar tokens exist (no active/fading/lost hits)."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _build_recall_block
+
+    store = MagicMock()
+
+    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
+        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+
+    assert block.strip() != ""
+    assert "not recognised" in block
+    assert "Marcus" in block
+
+
+def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
+    """When >5 unfamiliar tokens, only capitalised ones survive."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _build_recall_block
+
+    store = MagicMock()
+    tokens = ["antique", "yesterday", "slowly", "Marcus", "Kellerman", "Lisbon", "quiet"]
+
+    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
+        with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
+            block = _build_recall_block(store, "query", persona_dir=tmp_path)
+
+    # 7 tokens, all unfamiliar → B→A: keep only initial-caps
+    assert "Marcus" in block
+    assert "Kellerman" in block
+    assert "Lisbon" in block
+    # lowercase ones must not appear under not-recognised
+    not_rec_idx = block.index("not recognised")
+    for low in ["antique", "yesterday", "slowly", "quiet"]:
+        assert low not in block[not_rec_idx:]
+
+
+def test_build_recall_block_no_not_recognised_when_all_found(tmp_path: Path):
+    """No 'not recognised' section when all tokens return memory hits."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _build_recall_block
+
+    store = MagicMock()
+
+    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_hit_result("some memory")):
+        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+
+    assert "not recognised" not in block
