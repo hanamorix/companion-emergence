@@ -332,6 +332,8 @@ def _run_felt_time_tick(
             drivers=drivers,
         )
     )
+    from brain.felt_time.chat_log import append_chat_tick
+    append_chat_tick(persona_dir, ts=datetime.now(UTC), turns=chat_turns_since_last)
     return drivers
 
 
