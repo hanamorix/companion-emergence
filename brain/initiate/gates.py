@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain.initiate.audit import read_recent_audit
+from brain.initiate.user_pattern import UserPresence
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +102,47 @@ def check_send_allowed(
     quiet_min_gap_hours: float = DEFAULT_QUIET_MIN_GAP_HOURS,
     blackout_start_hour: int = DEFAULT_BLACKOUT_START_HOUR,
     blackout_end_hour: int = DEFAULT_BLACKOUT_END_HOUR,
+    user_presence: UserPresence | None = None,
 ) -> tuple[bool, str | None]:
     """Return (allowed, reason_if_denied). Reason is structured tag for audit."""
     now = now or datetime.now(UTC)
+
+    # Apply user-presence adjustments to local threshold copies.
+    if user_presence is not None:
+        p = user_presence
+
+        # Soft blackout: inferred unavailable — same code path as time blackout.
+        if not p.likely_active:
+            return False, "user_likely_inactive"
+
+        # Gap and quota adjustments (ignore-backoff beats silence loosening).
+        if p.ignore_streak >= 6:
+            notify_min_gap_hours = 24.0
+            quiet_min_gap_hours = 6.0
+        elif p.ignore_streak >= 3:
+            notify_min_gap_hours = 8.0
+            quiet_min_gap_hours = 2.0
+        elif p.silence_days >= 3 and p.ignore_streak == 0:
+            notify_min_gap_hours = DEFAULT_NOTIFY_MIN_GAP_HOURS / 2.0  # 2h
+            quiet_min_gap_hours = DEFAULT_QUIET_MIN_GAP_HOURS / 2.0  # 0.5h
+            notify_cap = notify_cap + 1
+            quiet_cap = quiet_cap + 1
+
+        # Response-rhythm: take max of streak-based and lag-based adjustment.
+        if p.response_lag_p50 is not None:
+            if p.response_lag_p50 >= 14400:
+                lag_notify = 8.0
+                lag_quiet = 2.0
+            elif p.response_lag_p50 >= 600:
+                lag_hours = min(p.response_lag_p50 * 1.5 / 3600.0, 12.0)
+                lag_notify = lag_hours
+                lag_quiet = min(lag_hours * 0.25, 3.0)
+            else:
+                lag_notify = DEFAULT_NOTIFY_MIN_GAP_HOURS
+                lag_quiet = DEFAULT_QUIET_MIN_GAP_HOURS
+            notify_min_gap_hours = max(notify_min_gap_hours, lag_notify)
+            quiet_min_gap_hours = max(quiet_min_gap_hours, lag_quiet)
+
     # If caller supplied a tz-aware datetime in a non-UTC zone, treat its
     # wall-clock as user-local (tests inject LA-zoned datetimes). For UTC
     # or naive inputs, convert to the OS's local zone — the production path.
