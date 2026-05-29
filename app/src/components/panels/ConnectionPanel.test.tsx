@@ -143,7 +143,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(screen.getByRole("button", { name: /install Task Scheduler supervisor/i })).toBeInTheDocument();
     // Terminal shortcut installer is still macOS-only.
     expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
-    expect(screen.getAllByText(/macOS-only right now/i).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/macOS-only right now/i)).not.toBeInTheDocument();
   });
 
   it("shows calm unsupported notes instead of macOS install buttons on Linux (supervisor now supported on Linux — this test updated in Phase 3.2)", () => {
@@ -192,6 +192,12 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(
       screen.queryByText(/end conversation and restart/i),
     ).not.toBeInTheDocument();
+  });
+
+  it('does not say "macOS-only" for unsupported platform', () => {
+    vi.mocked(getClientPlatform).mockReturnValue("other" as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.queryByText(/macOS-only/i)).not.toBeInTheDocument();
   });
 });
 

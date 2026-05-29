@@ -172,7 +172,7 @@ export function ConnectionPanel({
         {platform === "macos" && "Install the brain as a launchd LaunchAgent so it stays alive when you close the app. Idempotent — safe to click again."}
         {platform === "linux" && "Install the brain as a systemd --user service so it stays alive when you close the app. Idempotent — safe to click again."}
         {platform === "windows" && "Install the brain as a per-user Task Scheduler task so it stays alive when you close the app. Idempotent — safe to click again."}
-        {!supervisorSupported && `Persistent supervisor installation from the app is macOS-only right now. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
+        {!supervisorSupported && `Persistent supervisor installation is not supported on this platform. On ${currentPlatformLabel}, Companion will use the app-managed supervisor lifecycle instead.`}
       </div>
       {supervisorSupported ? (
         <InstallActionButton
@@ -208,7 +208,7 @@ export function ConnectionPanel({
       >
         {platform === "macos"
           ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
-          : `The bundled Terminal shortcut installer is macOS-only right now. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
+          : `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
       {platform === "macos" ? (
         <InstallActionButton
