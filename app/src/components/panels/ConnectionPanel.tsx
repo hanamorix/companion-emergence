@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState, ChatModel } from "../../bridge";
+import { getBridgeCredentials, setPersonaThinking } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
@@ -14,6 +15,8 @@ import type { Update } from "@tauri-apps/plugin-updater";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
 
+const DEFAULT_THINKING_BUDGET = 8000;
+
 interface Props {
   state: PersonaState | null;
   /** Active persona — needed by the supervisor install button. */
@@ -25,6 +28,8 @@ interface Props {
   reducedMotion?: boolean;
   onAlwaysOnTopChange?: (next: boolean) => void;
   onReducedMotionChange?: (next: boolean) => void;
+  /** Display name for the companion — used in toggle copy. */
+  companionName?: string;
 }
 
 type InstallState =
@@ -54,6 +59,7 @@ export function ConnectionPanel({
   reducedMotion = false,
   onAlwaysOnTopChange,
   onReducedMotionChange,
+  companionName,
 }: Props) {
   const conn = state?.connection;
   const mode = state?.mode ?? "live";
@@ -69,6 +75,10 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
+  // Extended reasoning toggle — optimistic with revert on failure.
+  const [thinkingOn, setThinkingOn] = useState<boolean>(
+    (conn?.thinking_budget_tokens ?? null) !== null,
+  );
   useEffect(() => {
     let cancelled = false;
     void detectInstallShape().then((s) => {
@@ -141,6 +151,16 @@ export function ConnectionPanel({
       }
     } catch (e) {
       setCliInstall({ kind: "error", detail: errString(e) });
+    }
+  }
+
+  async function handleThinkingToggle() {
+    const next = !thinkingOn;
+    setThinkingOn(next);
+    try {
+      await setPersonaThinking(persona, next ? DEFAULT_THINKING_BUDGET : null);
+    } catch {
+      setThinkingOn(!next);
     }
   }
 
@@ -237,6 +257,19 @@ export function ConnectionPanel({
         label="Reduced motion"
         onChange={onReducedMotionChange}
       />
+      <div style={{ padding: "4px 0" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: "11.5px", color: "var(--text)" }}>
+          <input
+            type="checkbox"
+            aria-label="Extended reasoning"
+            checked={thinkingOn}
+            onChange={handleThinkingToggle}
+          />
+          <span style={{ marginLeft: 4 }}>
+            {companionName ?? "She"} thinks before she replies. Slower, but more careful.
+          </span>
+        </label>
+      </div>
 
       <Divider />
       <SectionLabel>Model</SectionLabel>

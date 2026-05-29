@@ -7,5 +7,6 @@ export default defineConfig({
     environment: "jsdom",
     globals: false,
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    reporters: ["default", ["tdd-guard-vitest"]],
   },
 });

@@ -119,6 +119,10 @@ export interface PersonaState {
     provider: string | null;
     model: string | null;
     last_heartbeat_at: string | null;
+    /** Tokens budget for extended reasoning (Claude extended thinking).
+     *  null means disabled; a positive integer (typically 8000) means on.
+     *  Optional so older bridge builds without the field degrade gracefully. */
+    thinking_budget_tokens?: number | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
   /** True iff orphan session buffers from a previous shutdown are still
@@ -484,6 +488,20 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
     }),
   );
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
+}
+
+export async function setPersonaThinking(
+  persona: string,
+  budget: number | null,
+): Promise<void> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/config/thinking`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ thinking_budget_tokens: budget }),
+    }),
+  );
+  if (!r.ok) throw new Error(`setPersonaThinking failed: ${r.status}`);
 }
 
 // ── Memory recovery (forgetting-edge-cascade) ──────────────────────────
