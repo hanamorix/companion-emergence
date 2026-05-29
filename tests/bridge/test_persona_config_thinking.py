@@ -54,8 +54,9 @@ def test_post_thinking_config_rejects_invalid(tmp_path: Path):
 
 def test_persona_state_includes_thinking_budget(tmp_path: Path):
     """GET /persona/state must expose thinking_budget_tokens from config."""
-    from brain.persona_config import PersonaConfig
     from dataclasses import replace
+
+    from brain.persona_config import PersonaConfig
 
     client, persona_dir = _make_client(tmp_path)
     cfg = PersonaConfig.load(persona_dir / "persona_config.json")
