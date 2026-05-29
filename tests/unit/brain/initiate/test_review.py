@@ -339,7 +339,7 @@ def test_run_initiate_review_tick_demotes_filtered_to_draft(tmp_path: Path, monk
 
     compose_called: list = []
 
-    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell"):
+    def fake_process_one(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell", user_presence=None):
         compose_called.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -401,7 +401,7 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
 
     compose_calls: list[str] = []
 
-    def fake_compose(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell"):
+    def fake_compose(persona_dir, candidate, *, provider, voice_template, now, user_name="my user", companion_name="Nell", user_presence=None):
         compose_calls.append(candidate.candidate_id)
 
     monkeypatch.setattr("brain.initiate.review.reflection_run", fake_reflection_run)
@@ -655,7 +655,7 @@ def test_run_initiate_review_tick_threads_companion_name_to_process_one(tmp_path
     captured: list[dict] = []
 
     def fake_process(persona_dir, candidate, *, provider, voice_template, now,
-                     user_name="my user", companion_name="Nell"):
+                     user_name="my user", companion_name="Nell", user_presence=None):
         captured.append({"companion_name": companion_name})
 
     monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process)
@@ -687,7 +687,7 @@ def test_run_initiate_review_tick_reads_voice_md_not_nell_voice_md(tmp_path, mon
     templates_seen: list[str] = []
 
     def fake_process(persona_dir, candidate, *, provider, voice_template, now,
-                     user_name="my user", companion_name="Nell"):
+                     user_name="my user", companion_name="Nell", user_presence=None):
         templates_seen.append(voice_template)
 
     monkeypatch.setattr("brain.initiate.review._process_one_candidate", fake_process)
