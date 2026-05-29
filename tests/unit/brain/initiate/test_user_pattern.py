@@ -87,3 +87,43 @@ def test_compute_ignore_streak_filters_non_send_decisions(tmp_path: Path) -> Non
     ])
     # filtered_pre_compose does not count; only the send_notify row counts
     assert _compute_ignore_streak(tmp_path) == 1
+
+
+def test_compute_likely_active_no_buffer_returns_true(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_likely_active
+
+    assert _compute_likely_active(tmp_path) is True
+
+
+def test_compute_likely_active_insufficient_history_returns_true(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_likely_active
+
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    # Write only 10 turns — below _SCHEDULE_MIN_TURNS = 50
+    for i in range(10):
+        _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=i))
+    assert _compute_likely_active(tmp_path) is True
+
+
+def test_compute_likely_active_peak_hour_true_offpeak_false(tmp_path: Path) -> None:
+    """60 turns concentrated at UTC 14:00 → peak hour True, 12 hours away False."""
+    from brain.initiate.user_pattern import _compute_likely_active
+
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+
+    # Write 60 turns all at UTC 14:00, spread over 30 days
+    for i in range(60):
+        ts = datetime(2026, 1, 15, 14, 0, 0, tzinfo=UTC) - timedelta(days=i % 30)
+        _write_turn(conv_dir, speaker="user", ts=ts)
+
+    # Inject _now at UTC 14:00 — same local bucket as the turns
+    now_peak = datetime(2026, 1, 15, 14, 0, 0, tzinfo=UTC)
+    assert _compute_likely_active(tmp_path, _now=now_peak) is True
+
+    # Inject _now at UTC 02:00 — 12 hours away, that bucket has 0 turns
+    now_off = datetime(2026, 1, 15, 2, 0, 0, tzinfo=UTC)
+    # Guard: confirm these map to different local hours (always true since 12h apart)
+    if now_off.astimezone().hour != now_peak.astimezone().hour:
+        assert _compute_likely_active(tmp_path, _now=now_off) is False
