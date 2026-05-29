@@ -1098,7 +1098,7 @@ def test_build_system_message_includes_epistemic_instruction(tmp_path: Path):
 
 def test_build_system_message_no_epistemic_instruction_without_user_input(tmp_path: Path):
     """Epistemic instruction is absent when user_input is None."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
 
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION, build_system_message
     from brain.engines.daemon_state import DaemonState
