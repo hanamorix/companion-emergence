@@ -127,3 +127,87 @@ def _compute_likely_active(  # noqa: PLR0912
     sorted_counts = sorted(hour_counts)
     threshold = sorted_counts[int(len(sorted_counts) * _SCHEDULE_ACTIVE_PERCENTILE)]
     return hour_counts[now.astimezone().hour] > threshold
+
+
+def _compute_response_lag_p50(persona_dir: Path) -> float | None:
+    """Return median response lag in seconds from replied_explicit audit rows.
+
+    Returns None when fewer than _COLD_START_LAG_MIN rows with confirmed
+    replies exist (cold-start guard).
+    """
+    audit_path = persona_dir / _COLD_START_STREAK_AUDIT_FILENAME
+    if not audit_path.exists():
+        return None
+
+    lags: list[float] = []
+    for row in read_jsonl_skipping_corrupt(audit_path):
+        if row.get("decision") not in _SEND_DECISIONS:
+            continue
+        delivery = row.get("delivery") or {}
+        if delivery.get("current_state") != "replied_explicit":
+            continue
+        send_ts_str = row.get("ts", "")
+        transitions = delivery.get("state_transitions", [])
+        reply_ts_str = next(
+            (t["at"] for t in reversed(transitions) if t.get("to") == "replied_explicit"),
+            None,
+        )
+        if not reply_ts_str or not send_ts_str:
+            continue
+        try:
+            send_ts = datetime.fromisoformat(send_ts_str)
+            reply_ts = datetime.fromisoformat(reply_ts_str)
+            if send_ts.tzinfo is None:
+                send_ts = send_ts.replace(tzinfo=UTC)
+            if reply_ts.tzinfo is None:
+                reply_ts = reply_ts.replace(tzinfo=UTC)
+            lag = (reply_ts - send_ts).total_seconds()
+            if lag >= 0:
+                lags.append(lag)
+        except (ValueError, TypeError):
+            continue
+
+    if len(lags) < _COLD_START_LAG_MIN:
+        return None
+
+    lags.sort()
+    mid = len(lags) // 2
+    return lags[mid] if len(lags) % 2 == 1 else (lags[mid - 1] + lags[mid]) / 2.0
+
+
+def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) -> UserPresence:
+    """Compute current UserPresence from audit log and chat buffer.
+
+    All four signals default to permissive values on failure — uncertainty
+    never tightens gates.
+    """
+    try:
+        silence_days = _compute_silence_days(persona_dir, _now=_now)
+    except Exception:
+        log.debug("user_pattern: _compute_silence_days failed", exc_info=True)
+        silence_days = 0.0
+
+    try:
+        ignore_streak = _compute_ignore_streak(persona_dir)
+    except Exception:
+        log.debug("user_pattern: _compute_ignore_streak failed", exc_info=True)
+        ignore_streak = 0
+
+    try:
+        likely_active = _compute_likely_active(persona_dir, _now=_now)
+    except Exception:
+        log.debug("user_pattern: _compute_likely_active failed", exc_info=True)
+        likely_active = True
+
+    try:
+        response_lag_p50 = _compute_response_lag_p50(persona_dir)
+    except Exception:
+        log.debug("user_pattern: _compute_response_lag_p50 failed", exc_info=True)
+        response_lag_p50 = None
+
+    return UserPresence(
+        silence_days=silence_days,
+        ignore_streak=ignore_streak,
+        likely_active=likely_active,
+        response_lag_p50=response_lag_p50,
+    )
