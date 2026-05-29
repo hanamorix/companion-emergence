@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState, ChatModel } from "../../bridge";
-import { getBridgeCredentials, setPersonaThinking } from "../../bridge";
+import { setPersonaThinking } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
