@@ -182,6 +182,7 @@ def _process_one_candidate(
                 voice_template=voice_template,
                 user_name=user_name,
                 companion_name=companion_name,
+                persona_dir=persona_dir,
             )
             decision_result = compose_decision(
                 provider,
