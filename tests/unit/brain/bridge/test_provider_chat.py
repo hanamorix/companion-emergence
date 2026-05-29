@@ -1243,3 +1243,117 @@ def test_chat_without_tools_unchanged(persona_dir: Path) -> None:
     assert response.content == "plain reply"
     cmd = mock_run.call_args.args[0]
     assert "--mcp-config" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCliProvider — extended thinking flags + thinking_log.jsonl
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_ok(thinking: str | None = None):
+    """Return a mock subprocess.CompletedProcess with a valid claude json response."""
+    payload: dict = {"result": "hello"}
+    if thinking:
+        payload["thinking"] = thinking
+    result = MagicMock()
+    result.returncode = 0
+    result.stdout = json.dumps(payload)
+    result.stderr = ""
+    return result
+
+
+def test_chat_passes_thinking_flags_when_budget_set(tmp_path: Path):
+    provider = ClaudeCliProvider(model="sonnet")
+    captured: list = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _fake_run_ok()
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=fake_run):
+        provider.chat(
+            [MagicMock(role="user", content="hi", content_text=lambda: "hi")],
+            options={
+                "persona_dir": str(tmp_path),
+                "thinking_budget_tokens": 8000,
+                "thinking_call_site": "chat",
+            },
+        )
+
+    cmd = captured[0]
+    assert "--thinking" in cmd
+    assert "enabled" in cmd
+    assert "--budget-tokens" in cmd
+    assert "8000" in cmd
+
+
+def test_chat_omits_thinking_flags_when_budget_none(tmp_path: Path):
+    provider = ClaudeCliProvider(model="sonnet")
+    captured: list = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _fake_run_ok()
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=fake_run):
+        provider.chat(
+            [MagicMock(role="user", content="hi", content_text=lambda: "hi")],
+            options={"persona_dir": str(tmp_path)},
+        )
+
+    cmd = captured[0]
+    assert "--thinking" not in cmd
+
+
+def test_generate_never_passes_thinking_flags(tmp_path: Path):
+    provider = ClaudeCliProvider(model="sonnet")
+    captured: list = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _fake_run_ok()
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=fake_run):
+        provider.generate("prompt", system="sys")
+
+    cmd = captured[0]
+    assert "--thinking" not in cmd
+
+
+def test_thinking_block_written_to_log(tmp_path: Path):
+    provider = ClaudeCliProvider(model="sonnet")
+
+    with patch("brain.bridge.provider.subprocess.run", return_value=_fake_run_ok(thinking="I reasoned about this...")):
+        provider.chat(
+            [MagicMock(role="user", content="hi", content_text=lambda: "hi")],
+            options={
+                "persona_dir": str(tmp_path),
+                "thinking_budget_tokens": 8000,
+                "thinking_call_site": "chat",
+            },
+        )
+
+    log_path = tmp_path / "thinking_log.jsonl"
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text().strip())
+    assert entry["call_site"] == "chat"
+    assert entry["thinking"] == "I reasoned about this..."
+    assert entry["budget_tokens"] == 8000
+    assert "ts" in entry
+
+
+def test_thinking_log_failure_does_not_break_reply(tmp_path: Path, monkeypatch):
+    provider = ClaudeCliProvider(model="sonnet")
+
+    with patch("brain.bridge.provider.subprocess.run", return_value=_fake_run_ok(thinking="thoughts")):
+        with patch("builtins.open", side_effect=PermissionError("no write")):
+            resp = provider.chat(
+                [MagicMock(role="user", content="hi", content_text=lambda: "hi")],
+                options={
+                    "persona_dir": str(tmp_path),
+                    "thinking_budget_tokens": 8000,
+                    "thinking_call_site": "chat",
+                },
+            )
+
+    assert resp.content == "hello"
