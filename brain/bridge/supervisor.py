@@ -398,8 +398,35 @@ def _derive_intensity_drivers(
             raw_exhaustion = float(body.exhaustion) / 9.0
             raw_energy_lack = 1.0 - float(body.energy) / 10.0
             body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
-            from brain.felt_time.emotion_intensity import compute as _compute_ei
-            emotional_intensity = _compute_ei(memories)
+            # emotional_intensity: max positive sigma-deviation from per-channel baseline.
+            # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
+            from collections import defaultdict
+
+            from brain.felt_time.weather_shift import update_baseline as _update_baseline_emo
+            _channel_samples: dict[str, list] = defaultdict(list)
+            for _mem in memories:
+                if _mem.created_at is None:
+                    continue
+                for _ch, _val in _mem.emotions.items():
+                    try:
+                        _fval = float(_val)
+                    except (TypeError, ValueError):
+                        continue
+                    if _fval > 0.0:
+                        _channel_samples[_ch].append((_mem.created_at, _fval))
+            _positive_devs: list[float] = []
+            for _ch, _ch_samps in _channel_samples.items():
+                if len(_ch_samps) < 10:
+                    continue
+                _bl = _update_baseline_emo(None, _ch_samps)
+                if _bl.sigma <= 0.0:
+                    continue
+                _current_val = max(v for _, v in _ch_samps)  # max-pool mirrors aggregate_state behaviour
+                _dev = (_current_val - _bl.mean) / max(_bl.sigma, 0.1)
+                if _dev > 0.0:
+                    _positive_devs.append(_dev)
+            if _positive_devs:
+                emotional_intensity = min(1.0, max(_positive_devs) / 3.0)
         finally:
             store.close()
     except Exception:
