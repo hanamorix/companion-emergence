@@ -489,6 +489,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
     setMessages((m) => [...m, userMsg, replyStub]);
     setInput("");
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
     // If the user invoked "↩ reply" on an initiate banner, capture the
     // audit_id for this turn so streamChat can pass it on the WS frame.
     // The server records the ``replied_explicit`` transition + memory
@@ -847,8 +850,12 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKey}
+          onInput={(e) => {
+            const ta = e.currentTarget;
+            ta.style.height = "auto";
+            ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
+          }}
           placeholder={`Write to ${capitalize(persona)}…`}
-          rows={1}
           className="chat-input"
           style={{
             flex: 1,
@@ -860,7 +867,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             fontSize: 12,
             resize: "none",
             minHeight: 32,
-            maxHeight: 120,
+            maxHeight: 192,
+            overflow: "hidden",
             outline: "none",
           }}
         />
@@ -908,7 +916,7 @@ function IconButton({
         justifyContent: "center",
         color: "var(--text-mid)",
         cursor: rest.disabled ? "default" : "pointer",
-        opacity: rest.disabled ? 0.35 : 0.85,
+        opacity: rest.disabled ? 0.35 : 1,
         transition: "background 0.15s, opacity 0.15s",
         flexShrink: 0,
       }}

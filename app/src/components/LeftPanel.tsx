@@ -52,30 +52,16 @@ export function LeftPanel({
     <div
       style={{
         position: "relative",
-        // panel (220) + gap (24) + rail (≈38) — gap 24 (was 12) so the
-        // panel's right edge is visibly clear of the rail icons.
+        // rail (38px) + gap (6px) + panel (238px) = 282px reserved width.
+        // Rail anchors to the left edge; panel expands rightward so toggle
+        // icons never sit on top of stats content in small windows.
         width: 282,
         display: "flex",
-        justifyContent: "flex-end",
+        justifyContent: "flex-start",
         alignItems: "flex-start",
       }}
     >
-      {tab !== null && (
-        // The panel pops out to the left of the rail. zIndex < the rail's
-        // explicit zIndex so the rail icons always paint on top — without
-        // this the absolute-positioned panel was covering the rail in
-        // document order even though they didn't overlap horizontally.
-        <div style={{ position: "absolute", left: 0, top: 0, zIndex: 1 }}>
-          {renderPanel(tab, state, {
-            persona,
-            stateError,
-            alwaysOnTop,
-            reducedMotion,
-            onAlwaysOnTopChange,
-            onReducedMotionChange,
-          })}
-        </div>
-      )}
+      {/* Rail — anchored to left edge, always painted on top */}
       <div
         style={{
           position: "relative",
@@ -89,6 +75,7 @@ export function LeftPanel({
           borderRadius: 10,
           boxShadow:
             "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+          flexShrink: 0,
         }}
       >
         {TABS.map((t) => {
@@ -121,6 +108,19 @@ export function LeftPanel({
           );
         })}
       </div>
+      {/* Panel — opens to the right of the rail (rail=38px + 6px gap) */}
+      {tab !== null && (
+        <div style={{ position: "absolute", left: 44, top: 0, zIndex: 1 }}>
+          {renderPanel(tab, state, {
+            persona,
+            stateError,
+            alwaysOnTop,
+            reducedMotion,
+            onAlwaysOnTopChange,
+            onReducedMotionChange,
+          })}
+        </div>
+      )}
     </div>
   );
 }

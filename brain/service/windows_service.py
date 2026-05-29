@@ -196,7 +196,7 @@ def build_task_xml(
     # tokenize it the way argv does. Wrap any path with spaces in
     # double quotes so claude --print can find its image attachments
     # later when the path includes ``Documents``-style folders.
-    args = f"supervisor run --persona {persona} --client-origin task-scheduler --idle-shutdown 0"
+    args = f'supervisor run --persona "{persona}" --client-origin task-scheduler --idle-shutdown 0'
 
     # Working directory and stdout/stderr can't be set per-task in
     # Task Scheduler the way launchd / systemd do — we let the runner

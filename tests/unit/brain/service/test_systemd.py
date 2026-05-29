@@ -111,9 +111,10 @@ def test_build_systemd_unit_text_contains_required_sections(tmp_path: Path, monk
     assert "[Unit]" in body
     assert "[Service]" in body
     assert "[Install]" in body
-    # Service uses the foreground-supervisor entry point
+    # Service uses the foreground-supervisor entry point — path and persona
+    # must be double-quoted so systemd doesn't split on spaces.
     assert (
-        f"ExecStart={nell.resolve()} supervisor run --persona nell "
+        f'ExecStart="{nell.resolve()}" supervisor run --persona "nell" '
         "--client-origin systemd --idle-shutdown 0"
     ) in body
     # KeepAlive equivalent
@@ -190,6 +191,38 @@ def test_build_systemd_unit_text_rejects_missing_nell_binary(tmp_path: Path) -> 
     missing = tmp_path / "nope" / "nell"
     with pytest.raises(systemd.SystemdConfigError, match="not found"):
         systemd.build_systemd_unit_text(persona="nell", nell_path=missing)
+
+
+def test_build_systemd_unit_text_quotes_paths_with_spaces(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """ExecStart must double-quote nell_path when the path contains spaces.
+
+    Without quotes, systemd splits ExecStart on whitespace and passes
+    the second token as a flag rather than part of the executable path,
+    causing 'persona directory not found' on any install where the
+    executable lives under a directory like '/home/my user/...'."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # Directory name contains a space — the exact scenario that breaks
+    # an unquoted ExecStart line.
+    nell = _make_executable(tmp_path / "my apps" / "nell")
+
+    body = systemd.build_systemd_unit_text(persona="nell", nell_path=nell)
+
+    exec_line = next(
+        (line for line in body.splitlines() if line.startswith("ExecStart=")), None
+    )
+    assert exec_line is not None, "ExecStart line missing from unit text"
+    # The full path must appear inside double-quotes.
+    assert f'"{nell.resolve()}"' in exec_line, (
+        f"nell_path not double-quoted in ExecStart: {exec_line!r}"
+    )
+    # Persona name must also be quoted.
+    assert '"nell"' in exec_line, (
+        f"persona not double-quoted in ExecStart: {exec_line!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
