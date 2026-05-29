@@ -19,8 +19,9 @@ def _make_candidate():
 
 def test_compose_tone_passes_thinking_budget_to_provider(tmp_path: Path):
     from dataclasses import replace
-    from brain.persona_config import PersonaConfig
+
     from brain.initiate.compose import compose_tone
+    from brain.persona_config import PersonaConfig
 
     # Write config with thinking budget
     cfg = PersonaConfig.load(tmp_path / "persona_config.json")

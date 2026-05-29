@@ -1,8 +1,8 @@
 """run_tool_loop passes thinking_budget_tokens to provider when config has it set."""
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from brain.bridge.provider import ChatResponse
@@ -19,10 +19,10 @@ def _make_messages():
 
 
 def test_run_tool_loop_passes_thinking_budget(tmp_path: Path):
-    from brain.persona_config import PersonaConfig
     from brain.chat.tool_loop import run_tool_loop
-    from brain.memory.store import MemoryStore
     from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+    from brain.persona_config import PersonaConfig
 
     # Write config with thinking budget
     cfg = PersonaConfig.load(tmp_path / "persona_config.json")
@@ -55,8 +55,8 @@ def test_run_tool_loop_passes_thinking_budget(tmp_path: Path):
 
 def test_run_tool_loop_no_thinking_when_budget_none(tmp_path: Path):
     from brain.chat.tool_loop import run_tool_loop
-    from brain.memory.store import MemoryStore
     from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
 
     captured_options: list = []
 

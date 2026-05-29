@@ -40,8 +40,8 @@ def test_run_initiate_review_tick_passes_user_presence_to_process(
     )
     monkeypatch.setattr("brain.initiate.review.read_candidates", lambda *a, **k: [fake_candidate])
 
-    from brain.initiate.reflection import DReflectionResult, DDecision
     from brain.initiate.d_call_schema import DCallRow
+    from brain.initiate.reflection import DDecision, DReflectionResult
     fake_decision = DDecision(
         candidate_index=0, decision="send_notify", reason="ok", confidence="high"
     )
