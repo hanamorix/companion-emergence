@@ -9,10 +9,7 @@ When interests.json is empty and voice.md exists, the engine should:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from brain.bridge.provider import FakeProvider
 from brain.engines._interests import InterestSet
@@ -53,7 +50,7 @@ class _BootstrapProvider(FakeProvider):
         return "bootstrap_test"
 
 
-def _build_engine(tmp_path: Path, provider: LLMProvider) -> ResearchEngine:
+def _build_engine(tmp_path: Path, provider: FakeProvider) -> ResearchEngine:
     return ResearchEngine(
         store=MemoryStore(":memory:"),
         provider=provider,
