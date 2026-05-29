@@ -36,7 +36,7 @@ _DEFAULTS: dict[str, dict] = {
 #     voicecraft.md that exist only when the persona's author chose to write
 #     them.
 _AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
-_OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
+_OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md", "thinking_log.jsonl")
 
 
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
