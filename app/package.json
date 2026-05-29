@@ -29,6 +29,7 @@
     "jsdom": "^29.1.1",
     "typescript": "~5.6.2",
     "vite": "^6",
+    "tdd-guard-vitest": "^0.2.0",
     "vitest": "^4.1.5"
   }
 }
