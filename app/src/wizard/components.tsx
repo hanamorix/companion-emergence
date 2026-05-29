@@ -11,14 +11,15 @@ export function WizardShell({
   footer,
   avatar,
 }: {
-  step: number;
-  totalSteps: number;
+  step?: number;
+  totalSteps?: number;
   title: string;
   subtitle?: string;
   children: ReactNode;
   footer?: ReactNode;
-  avatar: ReactNode;
+  avatar?: ReactNode;
 }) {
+  const showLeftPanel = avatar != null || (step != null && totalSteps != null);
   return (
     <div
       style={{
@@ -30,35 +31,39 @@ export function WizardShell({
         gap: 48,
       }}
     >
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
-        {avatar}
-        <div
-          style={{
-            width: 220,
-            padding: "10px 14px",
-            borderRadius: 9,
-            background: "var(--panel-bg)",
-            border: "1px solid var(--border)",
-            boxShadow:
-              "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
-          }}
-        >
-          <ProgressBar current={step} total={totalSteps} />
-          <div
-            style={{
-              textAlign: "center",
-              marginTop: 6,
-              fontSize: 10.5,
-              color: "var(--text-mid)",
-              fontFamily: "var(--font-disp)",
-              letterSpacing: "0.08em",
-              fontWeight: 500,
-            }}
-          >
-            Step {step} of {totalSteps}
-          </div>
+      {showLeftPanel && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+          {avatar}
+          {step != null && totalSteps != null && (
+            <div
+              style={{
+                width: 220,
+                padding: "10px 14px",
+                borderRadius: 9,
+                background: "var(--panel-bg)",
+                border: "1px solid var(--border)",
+                boxShadow:
+                  "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+              }}
+            >
+              <ProgressBar current={step} total={totalSteps} />
+              <div
+                style={{
+                  textAlign: "center",
+                  marginTop: 6,
+                  fontSize: 10.5,
+                  color: "var(--text-mid)",
+                  fontFamily: "var(--font-disp)",
+                  letterSpacing: "0.08em",
+                  fontWeight: 500,
+                }}
+              >
+                Step {step} of {totalSteps}
+              </div>
+            </div>
+          )}
         </div>
-      </div>
+      )}
       <div
         style={{
           width: 380,
