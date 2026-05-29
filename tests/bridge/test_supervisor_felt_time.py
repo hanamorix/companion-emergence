@@ -204,3 +204,35 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
     import json as _json
     row = _json.loads(log_path.read_text().strip())
     assert row["turns"] == 4
+
+
+def test_derive_intensity_drivers_chat_activity_uses_rolling_baseline(tmp_path: Path) -> None:
+    """When chat_turns.log.jsonl has enough data, rolling mean is used as baseline.
+
+    Uses values that produce different results under fixed vs rolling baseline:
+      wall_clock_s = 3600s → fixed baseline = max(0.1, 6.0*1.0) = 6.0
+      5 ticks at 10 turns → rolling mean = 10.0
+      5 turns in tick → fixed gives min(1.0, 5/6)≈0.833; rolling gives min(1.0, 5/10)=0.5
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.felt_time.chat_log import append_chat_tick
+
+    now = datetime.now(UTC)
+    for i in range(5):
+        append_chat_tick(tmp_path, ts=now - timedelta(hours=i + 1), turns=10)
+
+    # Rolling mean = 10 → 5 turns gives chat_activity = 0.5
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=5, wall_clock_s_in_tick=3600.0)
+    assert drivers.chat_activity == pytest.approx(0.5)
+
+
+def test_derive_intensity_drivers_chat_activity_fallback_without_log(tmp_path: Path) -> None:
+    """Without chat_turns.log.jsonl the fixed 6-turns/h baseline is used."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+
+    # 900s tick, fixed baseline = 6 * (900/3600) = 1.5 turns/tick
+    # 3 turns → chat_activity = min(1.0, 3/1.5) = 1.0
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=3, wall_clock_s_in_tick=900.0)
+    assert drivers.chat_activity == pytest.approx(1.0)
