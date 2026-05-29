@@ -163,3 +163,42 @@ def test_clock_skew_clamped():
     assert policy.is_within_import_grace(
         mem, migrated_at_utc=mig, lived_age_hours_at_migration=100.0,
         current_lived_age_hours=50.0) is True
+
+
+# ---------------------------------------------------------------------------
+# narrative_weight — arc pressure lowers the effective fade threshold
+# ---------------------------------------------------------------------------
+
+
+def test_narrative_weight_protects_borderline_active_memory():
+    """Arc pressure lowers effective fade threshold → memory held that would otherwise fade."""
+    m = _make_memory(state="active")
+    # Just below the baseline threshold — fades without arc pressure
+    borderline = FADE_THRESHOLD - 0.01  # 0.24
+    assert next_state(m, salience=borderline, consecutive_low_passes=0) == Transition.FADE
+    # Strong arc pressure halves the threshold → 0.24 is now safely above it
+    assert next_state(
+        m, salience=borderline, consecutive_low_passes=0, narrative_weight=0.8
+    ) == Transition.NONE
+
+
+def test_narrative_weight_eases_unfade_for_fading_memory():
+    """Under arc pressure the reduced threshold makes it easier to recover a fading memory."""
+    m = _make_memory(state="fading")
+    # salience between effective threshold (arc) and baseline threshold
+    low_salience = 0.18
+    # Without arc pressure: 0.18 < 0.25 → stays fading
+    assert next_state(m, salience=low_salience, consecutive_low_passes=0) == Transition.NONE
+    # With arc pressure: effective_fade ≈ 0.139 → 0.18 >= 0.139 → unfades
+    assert next_state(
+        m, salience=low_salience, consecutive_low_passes=0, narrative_weight=0.8
+    ) == Transition.UNFADE
+
+
+def test_zero_narrative_weight_is_baseline():
+    """narrative_weight=0.0 behaves identically to omitting the argument."""
+    m = _make_memory(state="active")
+    assert (
+        next_state(m, salience=0.20, consecutive_low_passes=0, narrative_weight=0.0)
+        == next_state(m, salience=0.20, consecutive_low_passes=0)
+    )

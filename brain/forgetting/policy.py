@@ -38,6 +38,7 @@ def next_state(
     *,
     salience: float,
     consecutive_low_passes: int,
+    narrative_weight: float = 0.0,
 ) -> Transition:
     """Compute the transition for one memory in one forgetting pass.
 
@@ -45,13 +46,21 @@ def next_state(
     tracking how many recent passes saw salience < LOST_THRESHOLD for this
     memory. The orchestrator increments/resets this counter; this function
     just reads it.
+
+    narrative_weight: open-arc pressure in [0, 1] from IntensityDrivers.
+    A heavy open arc lowers the effective fade threshold so memories resist
+    fading during intense narrative periods. LOST_THRESHOLD is unchanged —
+    arc pressure only delays the fade gate, not the final deletion gate.
     """
+    # Arc pressure lowers the effective threshold proportionally.
+    # narrative_weight=0 → baseline; narrative_weight=1 → threshold halved.
+    effective_fade = FADE_THRESHOLD / (1.0 + narrative_weight)
     if memory.state == "active":
-        if salience < FADE_THRESHOLD:
+        if salience < effective_fade:
             return Transition.FADE
         return Transition.NONE
     if memory.state == "fading":
-        if salience >= FADE_THRESHOLD:
+        if salience >= effective_fade:
             return Transition.UNFADE
         if salience < LOST_THRESHOLD and consecutive_low_passes >= LOST_PASS_COUNT:
             return Transition.LOSE

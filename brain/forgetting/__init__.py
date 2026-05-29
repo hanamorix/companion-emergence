@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain.felt_time.lived_age import IntensityDrivers
 from brain.felt_time.state import load_or_recover as load_felt_time
 from brain.forgetting import graveyard, policy, salience, tombstone
 from brain.forgetting.policy import Transition
@@ -92,7 +93,12 @@ def _load_migration_grace(persona_dir: Path) -> tuple[datetime | None, float]:
     return mig, lived
 
 
-def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
+def run_pass(
+    persona_dir: Path,
+    *,
+    event_bus: Any,
+    intensity_drivers: IntensityDrivers | None = None,
+) -> dict[str, int]:
     """Run one forgetting pass over all active+fading memories.
 
     Returns an aggregate summary dict with counts; also publishes a
@@ -164,7 +170,13 @@ def run_pass(persona_dir: Path, *, event_bus: Any) -> dict[str, int]:
                 next_low = prev_low + 1
             else:
                 next_low = 0
-            transition = policy.next_state(memory, salience=s, consecutive_low_passes=next_low)
+            nw = intensity_drivers.narrative_weight if intensity_drivers else 0.0
+            transition = policy.next_state(
+                memory,
+                salience=s,
+                consecutive_low_passes=next_low,
+                narrative_weight=nw,
+            )
             if transition == Transition.FADE:
                 summary_text = tombstone.summarise(memory.content)
                 store.fade(memory_id, summary=summary_text)
