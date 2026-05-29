@@ -182,3 +182,25 @@ def test_derive_intensity_drivers_no_open_arcs_zero_weight(tmp_path: Path) -> No
 
     drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=3600.0)
     assert drivers.narrative_weight == 0.0
+
+
+def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_run_felt_time_tick must write a chat_turns.log.jsonl row after each tick."""
+    from brain.bridge.supervisor import _run_felt_time_tick
+    from brain.felt_time.chat_log import CHAT_TURNS_LOG_FILENAME
+
+    monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=4,
+        reflex_firings_since_last=0,
+    )
+
+    log_path = tmp_path / CHAT_TURNS_LOG_FILENAME
+    assert log_path.exists(), "chat_turns.log.jsonl should be written after tick"
+    import json as _json
+    row = _json.loads(log_path.read_text().strip())
+    assert row["turns"] == 4
