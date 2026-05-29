@@ -2,19 +2,25 @@
 
 ## v0.0.25 — 2026-05-29
 
-### Epistemic gap recall
+### Added
 
-When a memory search returns nothing for a name or entity, the recall block now says so explicitly — a `not recognised (searched; no memory found):` section lists the names that were looked up and found absent. A standing epistemic instruction is injected alongside it so the companion distinguishes "I never knew this" from "I don't remember", and doesn't invent familiarity.
+**Epistemic gap recall.** When a memory search returns nothing for a name or entity, the recall block now says so explicitly — a `not recognised (searched; no memory found):` section lists the names that were looked up and found absent. A standing epistemic instruction is injected alongside it so the companion distinguishes "I never knew this" from "I don't remember", and doesn't invent familiarity.
 
 A B→A capital-initial fallback filters out low-signal lowercase tokens when the unfamiliar list exceeds five entries, keeping the section focused on proper nouns.
 
-### Extended reasoning toggle
-
-A new `thinking_budget_tokens` field in `PersonaConfig` lets you enable Claude's extended thinking mode for a persona. When set, the brain injects `--thinking enabled --budget-tokens N` into every `chat()` call and logs the thinking block to `thinking_log.jsonl` in the persona directory. The initiate compose path also routes through `chat()` instead of `complete()` when thinking is active.
+**Extended thinking.** A new `thinking_budget_tokens` field in `PersonaConfig` enables Claude's extended thinking mode per persona. When set, the brain injects `--thinking enabled --budget-tokens N` into every `chat()` call and logs the thinking block to `thinking_log.jsonl` in the persona directory. The initiate compose path routes through `chat()` instead of `complete()` when a budget is active.
 
 The Connection panel now shows an **Extended reasoning** checkbox under the Window section. Toggling it on sets a default budget of 8 000 tokens; toggling it off clears it. The toggle is optimistic — it reverts automatically if the bridge call fails.
 
-`POST /persona/config/thinking` is the new bridge endpoint; `GET /persona/state` exposes `thinking_budget_tokens` in the connection block.
+- `POST /persona/config/thinking` — new bridge endpoint to set or clear the budget
+- `GET /persona/state` — exposes `thinking_budget_tokens` in the connection block
+
+### Fixed
+
+- **`tauri-build` version clobbered by version bump**: `Cargo.toml` `[build-dependencies.tauri-build]` was overwritten as `"0.0.25"` instead of `"2"`, breaking `cargo check` on CI.
+- **Unused import in `ConnectionPanel.tsx`**: `getBridgeCredentials` remained on the import line after the thinking-toggle refactor, causing TS6133 and a blocked frontend build on CI.
+- **`tdd-guard-vitest` missing from devDependencies**: the vitest reporter was wired into `vitest.config.ts` but not declared in `package.json`, so CI couldn't resolve it on the frontend test step.
+- **Ruff linting violations** (F401 unused imports, I001 import ordering) in several test files — pre-existing violations and ones introduced by the extended-thinking test work, caught by the CI lint step.
 
 ## v0.0.24 — 2026-05-29
 
