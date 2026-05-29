@@ -406,9 +406,16 @@ def _derive_intensity_drivers(
     # TODO(v0.0.15): wire to brain.emotion once a clean normalized accessor exists.
     emotional_intensity = 0.0
 
-    # Chat activity normalized against a fixed 6 turns/h baseline.
-    # TODO(v0.0.15): replace with rolling per-tick baseline from weather_shift.
-    baseline_per_tick = max(0.1, 6.0 * (wall_clock_s_in_tick / 3600.0))
+    # Chat activity: rolling 7-day mean from chat_turns.log.jsonl.
+    # Falls back to fixed 6 turns/h when log is absent or below cold-start threshold.
+    from brain.felt_time.chat_log import load_recent_samples as _load_chat_samples
+    from brain.felt_time.weather_shift import update_baseline as _update_baseline_chat
+    _chat_samples = _load_chat_samples(persona_dir)
+    if _chat_samples is not None:
+        _chat_bl = _update_baseline_chat(None, _chat_samples)
+        baseline_per_tick = max(0.1, _chat_bl.mean)
+    else:
+        baseline_per_tick = max(0.1, 6.0 * (wall_clock_s_in_tick / 3600.0))
     chat_activity = min(1.0, float(chat_turns_in_tick) / baseline_per_tick)
 
     # Narrative weight — a long, emotionally-heavy open arc makes time heavier.
