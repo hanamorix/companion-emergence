@@ -54,6 +54,7 @@ from brain.ingest.pipeline import (
     snapshot_stale_sessions,
 )
 from brain.initiate.review import run_initiate_review_tick
+from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -895,11 +896,17 @@ def _run_initiate_review_tick(
         cap_per_tick = getattr(config, "initiate_review_cap_per_tick", 3) or 3
     except Exception:
         cap_per_tick = 3
+    try:
+        _user_presence = compute_user_presence(persona_dir)
+    except Exception:
+        logger.debug("_run_initiate_review_tick: compute_user_presence failed", exc_info=True)
+        _user_presence = None
     run_initiate_review_tick(
         persona_dir,
         provider=provider,
         voice_template=voice_template,
         cap_per_tick=cap_per_tick,
+        user_presence=_user_presence,
     )
     event_bus.publish(
         {
