@@ -45,3 +45,45 @@ def test_compute_silence_days_skips_companion_turns(tmp_path: Path) -> None:
 
     result = _compute_silence_days(tmp_path)
     assert result > 2.9  # ~3 days — companion turn ignored
+
+
+def _write_audit_rows(persona_dir: Path, rows: list[dict]) -> None:
+    """Write rows to initiate_audit.jsonl."""
+    path = persona_dir / "initiate_audit.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def test_compute_ignore_streak_no_file_returns_zero(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_ignore_streak
+
+    assert _compute_ignore_streak(tmp_path) == 0
+
+
+def test_compute_ignore_streak_consecutive_unanswered(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_ignore_streak
+
+    _write_audit_rows(tmp_path, [
+        {"audit_id": "3", "ts": "2026-05-29T08:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "replied_explicit"}},
+        {"audit_id": "2", "ts": "2026-05-29T09:00:00+00:00", "decision": "send_quiet",
+         "delivery": {"current_state": "dismissed"}},
+        {"audit_id": "1", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "unanswered"}},
+    ])
+    # Walking newest-first: unanswered (1), dismissed (1) = streak 2, then replied_explicit -> stop
+    assert _compute_ignore_streak(tmp_path) == 2
+
+
+def test_compute_ignore_streak_filters_non_send_decisions(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_ignore_streak
+
+    _write_audit_rows(tmp_path, [
+        {"audit_id": "2", "ts": "2026-05-29T09:00:00+00:00", "decision": "filtered_pre_compose",
+         "delivery": {"current_state": "unanswered"}},
+        {"audit_id": "1", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "unanswered"}},
+    ])
+    # filtered_pre_compose does not count; only the send_notify row counts
+    assert _compute_ignore_streak(tmp_path) == 1

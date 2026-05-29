@@ -66,3 +66,29 @@ def _compute_silence_days(persona_dir: Path, *, _now: datetime | None = None) ->
     if latest_ts is None:
         return 0.0
     return max(0.0, (now - latest_ts).total_seconds() / 86400.0)
+
+
+def _compute_ignore_streak(persona_dir: Path) -> int:
+    """Count consecutive unanswered/dismissed proactive sends, most recent first.
+
+    Stops and returns the current count when it hits a replied_explicit or
+    acknowledged_unclear row. Only send_notify/send_quiet rows count.
+    Returns 0 when no audit file exists.
+    """
+    audit_path = persona_dir / _COLD_START_STREAK_AUDIT_FILENAME
+    if not audit_path.exists():
+        return 0
+
+    rows = list(read_jsonl_skipping_corrupt(audit_path))
+    rows_desc = sorted(rows, key=lambda r: r.get("ts", ""), reverse=True)
+
+    streak = 0
+    for row in rows_desc:
+        if row.get("decision") not in _SEND_DECISIONS:
+            continue
+        state = (row.get("delivery") or {}).get("current_state", "")
+        if state in _STREAK_STATES:
+            streak += 1
+        elif state in _RESET_STATES:
+            break
+    return streak
