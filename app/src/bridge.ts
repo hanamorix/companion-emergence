@@ -153,7 +153,13 @@ export interface SoulHighlight {
   why_it_matters: string | null;
 }
 
-export type FeedEntryType = "dream" | "research" | "soul" | "outreach" | "voice_edit";
+export type FeedEntryType =
+  | "dream"
+  | "research"
+  | "soul"
+  | "outreach"
+  | "voice_edit"
+  | "monologue";
 
 export interface FeedEntry {
   type: FeedEntryType;
