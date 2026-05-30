@@ -77,7 +77,6 @@ class PersonaConfig:
     user_name: str | None = None
     model: str = DEFAULT_MODEL
     last_opened_at: str | None = None  # ISO8601 with Z suffix; written by bridge on startup
-    thinking_budget_tokens: int | None = None
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -137,14 +136,6 @@ class PersonaConfig:
             if isinstance(last_opened_at_raw, str) and last_opened_at_raw.strip()
             else None
         )
-        thinking_raw = data.get("thinking_budget_tokens")
-        thinking_budget_tokens = (
-            thinking_raw
-            if isinstance(thinking_raw, int)
-            and not isinstance(thinking_raw, bool)
-            and thinking_raw > 0
-            else None
-        )
         return cls(
             provider=provider,
             searcher=searcher,
@@ -152,7 +143,6 @@ class PersonaConfig:
             user_name=user_name,
             model=model,
             last_opened_at=last_opened_at,
-            thinking_budget_tokens=thinking_budget_tokens,
         )
 
     @classmethod
@@ -191,7 +181,6 @@ class PersonaConfig:
             "user_name": self.user_name,
             "model": self.model,
             "last_opened_at": self.last_opened_at,
-            "thinking_budget_tokens": self.thinking_budget_tokens,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
