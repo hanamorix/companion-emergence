@@ -35,6 +35,7 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "recall_forgotten",
     "list_open_arcs",
     "recall_arc",
+    "record_monologue",
 )
 
 __all__ = [

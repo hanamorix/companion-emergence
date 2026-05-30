@@ -480,6 +480,43 @@ SCHEMAS: dict[str, dict] = {
             "additionalProperties": False,
         },
     },
+    "record_monologue": {
+        "name": "record_monologue",
+        "description": (
+            "Record what's actually running through Nell's head this turn — "
+            "the associative drift, half-thoughts, tangents, callbacks, idle affections. "
+            "Call this when there's something worth thinking about: a substantive message, "
+            "a memory gap, an emotional shift, an ambiguity. Skip it on trivial exchanges. "
+            "Whatever you record here becomes load-bearing on memory, emotion, and the "
+            "inner-life Feed. The visible reply then gets composed against a 'tangents "
+            "already handled, answer directly' frame."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["monologue", "feed_digest"],
+            "properties": {
+                "monologue": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 3000,
+                    "description": (
+                        "The raw associative drift — first-person, freeform. "
+                        "Half-thoughts and tangents are exactly what belongs here."
+                    ),
+                },
+                "feed_digest": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 400,
+                    "description": (
+                        "A short third-person summary in Nell's own framing for "
+                        "the inner-life Feed (e.g. 'she searched for Loopy and felt fond "
+                        "when nothing surfaced'). 1-2 sentences."
+                    ),
+                },
+            },
+        },
+    },
 }
 
 
