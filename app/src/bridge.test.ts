@@ -28,7 +28,6 @@ import {
   newSession,
   resetBridgeCredentialCache,
   setPersonaModel,
-  setPersonaThinking,
   uploadImage,
 } from "./bridge";
 
@@ -272,52 +271,5 @@ describe("setPersonaModel", () => {
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
-  });
-});
-
-describe("setPersonaThinking", () => {
-  beforeEach(() => {
-    resetBridgeCredentialCache();
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("POSTs thinking_budget_tokens to /persona/config/thinking", async () => {
-    let capturedUrl: string | undefined;
-    let capturedInit: RequestInit | undefined;
-    vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string, init: RequestInit) => {
-      capturedUrl = url;
-      capturedInit = init;
-      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    }));
-
-    await setPersonaThinking("alice", 8000);
-
-    expect(capturedUrl).toContain("/persona/config/thinking");
-    expect((capturedInit!.method)?.toUpperCase()).toBe("POST");
-    expect(capturedInit!.body).toBe(JSON.stringify({ thinking_budget_tokens: 8000 }));
-  });
-
-  it("POSTs null to clear thinking budget", async () => {
-    let capturedBody: string | undefined;
-    vi.stubGlobal("fetch", vi.fn().mockImplementation((_url: string, init: RequestInit) => {
-      capturedBody = init.body as string;
-      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    }));
-
-    await setPersonaThinking("alice", null);
-
-    expect(capturedBody).toBe(JSON.stringify({ thinking_budget_tokens: null }));
-  });
-
-  it("throws on a non-2xx response", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: false }), { status: 422 }),
-    ));
-
-    await expect(setPersonaThinking("alice", 8000)).rejects.toThrow("setPersonaThinking failed: 422");
   });
 });
