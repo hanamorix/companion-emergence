@@ -97,23 +97,6 @@ def compose_tone(
         f"{emotional_line}\n\n"
         "Message (one paragraph):"
     )
-    if persona_dir is not None:
-        try:
-            from brain.bridge.provider import ChatMessage
-            from brain.persona_config import PersonaConfig
-
-            cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-            if cfg.thinking_budget_tokens:
-                return provider.chat(
-                    [ChatMessage(role="user", content=prompt)],
-                    options={
-                        "thinking_budget_tokens": cfg.thinking_budget_tokens,
-                        "thinking_call_site": "compose",
-                        "persona_dir": str(persona_dir),
-                    },
-                ).content.strip()
-        except Exception:
-            pass
     return provider.complete(prompt).strip()
 
 
