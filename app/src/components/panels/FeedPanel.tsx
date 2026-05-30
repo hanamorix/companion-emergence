@@ -13,6 +13,7 @@ const TYPE_LABEL: Record<FeedEntryType, string> = {
   soul: "Soul",
   outreach: "Outreach",
   voice_edit: "Voice edit",
+  monologue: "Monologue",
 };
 
 const TYPE_DOT: Record<FeedEntryType, string> = {
@@ -21,6 +22,7 @@ const TYPE_DOT: Record<FeedEntryType, string> = {
   soul: "#b87fa3",
   outreach: "#823329",   // project accent
   voice_edit: "#7fa37f",
+  monologue: "#9b8ab8",  // soft violet — inner thought
 };
 
 /**
