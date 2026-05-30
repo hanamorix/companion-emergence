@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.chat.extractor import apply_side_effects, extract_from_thinking
 from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -28,6 +30,43 @@ from brain.tools.schemas import build_schemas
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 4
+
+
+def _spawn_pass2(
+    *,
+    provider: LLMProvider,
+    monologue_text: str,
+    visible_reply: str,
+    recent_user_msgs: tuple[str, ...],
+    persona_dir: Path,
+) -> None:
+    """Fire-and-forget pass 2: Haiku reads the monologue, writes memory/emotion/soul/reflex_audit."""
+
+    def _run() -> None:
+        try:
+            out = extract_from_thinking(
+                provider=provider,
+                thinking_blocks=(monologue_text,),
+                visible_reply=visible_reply,
+                recent_turn_context=recent_user_msgs,
+            )
+            apply_side_effects(out, persona_dir=persona_dir)
+        except Exception:  # noqa: BLE001
+            logger.exception("pass-2 monologue extraction failed")
+
+    threading.Thread(target=_run, daemon=True, name="monologue-extractor").start()
+
+
+def _find_monologue_text(invocations: list[dict]) -> str | None:
+    """Scan invocations for a captured record_monologue entry."""
+    return next(
+        (
+            inv.get("monologue_text")
+            for inv in invocations
+            if inv.get("name") == "record_monologue" and inv.get("monologue_text")
+        ),
+        None,
+    )
 
 
 def build_tools_list(companion_name: str = "Nell") -> list[dict]:
@@ -95,6 +134,17 @@ def run_tool_loop(
         if last_response.dispatched_invocations:
             invocations.extend(last_response.dispatched_invocations)
         if not last_response.tool_calls:
+            monologue_text = _find_monologue_text(invocations)
+            if monologue_text:
+                _spawn_pass2(
+                    provider=provider,
+                    monologue_text=monologue_text,
+                    visible_reply=last_response.content or "",
+                    recent_user_msgs=tuple(
+                        m.content_text() for m in messages if m.role == "user"
+                    )[-2:],
+                    persona_dir=persona_dir,
+                )
             return last_response, invocations
 
         # Append the assistant turn that contained the tool_calls so the
@@ -164,6 +214,17 @@ def run_tool_loop(
     # is obligated to produce a content response (per OG pattern).
     logger.warning("tool loop hit max_iterations=%d", max_iterations)
     last_response = provider.chat(messages, tools=None)
+    monologue_text = _find_monologue_text(invocations)
+    if monologue_text:
+        _spawn_pass2(
+            provider=provider,
+            monologue_text=monologue_text,
+            visible_reply=last_response.content or "",
+            recent_user_msgs=tuple(
+                m.content_text() for m in messages if m.role == "user"
+            )[-2:],
+            persona_dir=persona_dir,
+        )
     return last_response, invocations
 
 
