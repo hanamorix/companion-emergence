@@ -119,10 +119,6 @@ export interface PersonaState {
     provider: string | null;
     model: string | null;
     last_heartbeat_at: string | null;
-    /** Tokens budget for extended reasoning (Claude extended thinking).
-     *  null means disabled; a positive integer (typically 8000) means on.
-     *  Optional so older bridge builds without the field degrade gracefully. */
-    thinking_budget_tokens?: number | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
   /** True iff orphan session buffers from a previous shutdown are still

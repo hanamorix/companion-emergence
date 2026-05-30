@@ -44,7 +44,6 @@ function makeState() {
       provider: "claude-cli",
       model: "sonnet",
       last_heartbeat_at: null,
-      thinking_budget_tokens: null,
     },
     mode: "live" as const,
   };
