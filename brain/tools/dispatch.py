@@ -115,6 +115,10 @@ _DISPATCH: dict[str, Any] = {
     "recall_forgotten": _recall_forgotten_wrapper,
     "list_open_arcs": _list_open_arcs_wrapper,
     "recall_arc": _recall_arc_wrapper,
+    # Noop at dispatch — args are captured in tool_loop's record_monologue
+    # interception (brain/chat/monologue_capture.py writes the digest
+    # synchronously and queues the monologue text for pass-2 extractor).
+    "record_monologue": lambda **_: {"ok": True},
 }
 
 

@@ -292,6 +292,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "recall_forgotten": {"query": "test"},
         "list_open_arcs": {},
         "recall_arc": {"query": ""},
+        "record_monologue": {"monologue": "test thought", "feed_digest": "she searched"},
     }
 
     for tool_name in _DISPATCH:
