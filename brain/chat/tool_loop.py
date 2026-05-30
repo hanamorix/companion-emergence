@@ -18,6 +18,7 @@ from typing import Any
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -110,6 +111,30 @@ def run_tool_loop(
                 "name": tc.name,
                 "arguments": tc.arguments,
             }
+            if tc.name == "record_monologue":
+                try:
+                    monologue_text = capture_monologue(
+                        persona_dir=persona_dir,
+                        monologue=tc.arguments.get("monologue", ""),
+                        feed_digest=tc.arguments.get("feed_digest", ""),
+                    )
+                    record["result_summary"] = "captured"
+                    record["monologue_text"] = monologue_text
+                    tool_content = json.dumps({"ok": True})
+                    invocations.append(record)
+                    messages.append(
+                        ChatMessage(role="tool", content=tool_content, tool_call_id=tc.id)
+                    )
+                    continue
+                except CaptureRejected as exc:
+                    record["error"] = str(exc)
+                    record["result_summary"] = f"rejected: {exc}"
+                    tool_content = json.dumps({"error": str(exc)})
+                    invocations.append(record)
+                    messages.append(
+                        ChatMessage(role="tool", content=tool_content, tool_call_id=tc.id)
+                    )
+                    continue
             try:
                 result = dispatch(
                     tc.name,
