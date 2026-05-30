@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -213,6 +214,23 @@ def build_system_message(
     growth_block = _build_recent_growth_block(persona_dir)
     if growth_block.strip():
         parts.append(growth_block)
+
+    # 8. Inner monologue framing — names the record_monologue tool, articulates
+    # situational trigger criteria. Per spec 2026-05-30 §2.
+    soul_hints = _collect_soul_hints(soul_store, limit=3)
+    narrative_hints = _collect_narrative_hints(persona_dir, limit=3)
+    parts.append(
+        build_monologue_frame(
+            persona_name=persona_name,
+            emotion_summary=emotion_summary,
+            voice_excerpt=voice_md[:300],
+            soul_hints=soul_hints,
+            narrative_hints=narrative_hints,
+        )
+    )
+
+    # 9. Reply framing — last so the model treats it as the immediate context.
+    parts.append(build_reply_frame(persona_name=persona_name))
 
     return "\n\n".join(parts)
 
@@ -805,6 +823,30 @@ def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
     except Exception:  # noqa: BLE001
         log.exception("grief.render_grief_block failed — falling back to silent block")
         return "memory · loss: still."
+
+
+def _collect_soul_hints(soul_store: SoulStore, limit: int) -> tuple[str, ...]:
+    """Pull recent crystallisation love_types for monologue framing. Best-effort."""
+    try:
+        crystallisations = soul_store.list_active()
+        recent = crystallisations[-limit:]
+        return tuple(c.love_type for c in reversed(recent) if getattr(c, "love_type", None))
+    except Exception:  # noqa: BLE001
+        log.exception("soul-hint collection failed; continuing without")
+        return ()
+
+
+def _collect_narrative_hints(persona_dir: Path, limit: int) -> tuple[str, ...]:
+    """Pull recent open-arc titles for monologue framing. Best-effort."""
+    try:
+        from brain.narrative_memory.state import load_or_recover
+
+        state = load_or_recover(persona_dir=persona_dir)
+        arcs = list(state.open.values())[:limit]
+        return tuple(a.title for a in arcs if getattr(a, "title", None))
+    except Exception:  # noqa: BLE001
+        log.exception("narrative-hint collection failed; continuing without")
+        return ()
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:
