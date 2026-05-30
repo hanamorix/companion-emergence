@@ -490,20 +490,6 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
 }
 
-export async function setPersonaThinking(
-  persona: string,
-  budget: number | null,
-): Promise<void> {
-  const r = await bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/persona/config/thinking`, {
-      method: "POST",
-      headers: authHeaders(creds),
-      body: JSON.stringify({ thinking_budget_tokens: budget }),
-    }),
-  );
-  if (!r.ok) throw new Error(`setPersonaThinking failed: ${r.status}`);
-}
-
 // ── Memory recovery (forgetting-edge-cascade) ──────────────────────────
 
 export interface RecoverPreflight {
