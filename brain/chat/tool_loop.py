@@ -82,23 +82,11 @@ def run_tool_loop(
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
 
-    _thinking_opts: dict = {}
-    try:
-        from brain.persona_config import PersonaConfig
-        _cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-        if _cfg.thinking_budget_tokens:
-            _thinking_opts = {
-                "thinking_budget_tokens": _cfg.thinking_budget_tokens,
-                "thinking_call_site": "chat",
-            }
-    except Exception:
-        pass
-
     for _iteration in range(max_iterations):
         last_response = provider.chat(
             messages,
             tools=tools,
-            options={"persona_dir": str(persona_dir), **_thinking_opts},
+            options={"persona_dir": str(persona_dir)},
         )
         # Provider-dispatched invocations (claude-cli MCP path): tools
         # already ran inside the subprocess. Surface them for telemetry
