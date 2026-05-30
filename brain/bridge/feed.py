@@ -14,6 +14,7 @@ source — any one source failing leaves the others usable.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 
-FeedEntryType = Literal["dream", "research", "soul", "outreach", "voice_edit"]
+FeedEntryType = Literal["dream", "research", "soul", "outreach", "voice_edit", "monologue"]
 
 
 TYPE_OPENER: dict[FeedEntryType, str] = {
@@ -31,6 +32,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "soul": "I noticed",
     "outreach": "I reached out",
     "voice_edit": "I wanted to change",
+    "monologue": "what was running underneath",
 }
 
 
@@ -236,12 +238,51 @@ def build_voice_edit_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry
     return out
 
 
+def build_monologue_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Read up to `limit` monologue digests, newest first.
+
+    Source: `<persona_dir>/monologue_digest.jsonl` written by the pass-2
+    extractor. One JSON object per line: {"ts": ISO8601, "digest": str}.
+    Malformed lines are skipped.
+    """
+    log_path = persona_dir / "monologue_digest.jsonl"
+    if not log_path.exists():
+        return []
+
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.exception("feed: opening monologue digest log failed")
+        return []
+
+    entries: list[FeedEntry] = []
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+            digest = str(obj["digest"])
+            ts = str(obj["ts"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        entries.append(
+            FeedEntry(
+                type="monologue",
+                ts=ts,
+                opener=TYPE_OPENER["monologue"],
+                body=digest,
+                audit_id=None,
+            )
+        )
+
+    entries.sort(key=lambda e: e.ts, reverse=True)
+    return entries[:limit]
+
+
 def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
-    """Merge all 5 source streams into a single ts-desc feed, capped at limit.
+    """Merge all 6 source streams into a single ts-desc feed, capped at limit.
 
     Fault isolation: each per-source builder is called inside its own
     try/except so a single source's failure logs an exception and returns
-    an empty list for that stream, leaving the other four usable. The
+    an empty list for that stream, leaving the other five usable. The
     feed always returns SOMETHING (possibly empty) — never raises.
     """
     builders = (
@@ -250,6 +291,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
         build_soul_entries,
         build_outreach_entries,
         build_voice_edit_entries,
+        build_monologue_entries,
     )
 
     merged: list[FeedEntry] = []
