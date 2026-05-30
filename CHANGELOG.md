@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.0.26 — 2026-05-31 (inner monologue ships)
+
+### Added
+
+- **`record_monologue` tool.** A new tool the model calls when there's something worth drifting through — a substantive message, a memory gap, an emotional shift, an ambiguity. Args are `monologue` (raw associative drift) and `feed_digest` (third-person short summary in Nell's framing). When called, the digest writes synchronously to `<persona_dir>/monologue_digest.jsonl` and the monologue text feeds an async Haiku post-extractor that emits memory writes (`memory_type='monologue'`), emotion deltas, soul-candidate crystallisations, and a reflex audit log.
+- **Situational gating.** Tool fires only when there's something to think about. Trivial exchanges produce no monologue, no pass 2, no digest. Spec: `docs/superpowers/specs/2026-05-30-inner-monologue-tool-call-design.md`.
+- **Monologue source in the visible-inner-life Feed.** The third-person digest appears alongside dreams, research, soul, outreach, voice-edit entries in the inner-life Feed.
+- **`record_monologue` schema in `NELL_TOOL_NAMES`**, dispatcher routes to a noop (real capture lives in `tool_loop`), entry added to `DEFAULT_VOICE_TEMPLATE` tools list.
+
+### Removed
+
+The v0.0.25 extended-reasoning plumbing has been removed in full. The underlying assumption (that Claude Code CLI surfaces thinking blocks through `--output-format json`) turned out to be wrong — the CLI consumes thinking internally and never returns it to stdout.
+
+- `thinking_budget_tokens` field on `PersonaConfig` — removed outright
+- `--thinking` / `--budget-tokens` flags on the provider command line
+- `_write_thinking_log` function + `thinking_log.jsonl` writes
+- `thinking_blocks` field on `ChatResponse`
+- `POST /persona/config/thinking` bridge endpoint
+- ConnectionPanel extended-reasoning toggle
+- `thinking_log.jsonl` walker check in `brain/health/walker.py`
+- Initiate-compose thinking read in `brain/initiate/compose.py`
+- `thinking_budget_tokens` from the `/persona/state` connection block + the TS `PersonaState` interface
+- All associated tests
+
+A grep-based regression test (`tests/unit/brain/cleanup/test_no_extended_thinking_artefacts.py`) fails the suite if these tokens reappear in production source.
+
+### Notes
+
+- The `v0.0.26-inner-monologue-attempt` branch is preserved at commit `f3267728` for one release as a referenceable artefact of the extended-thinking architecture; prune after v0.0.27 ships unless we resurrect parts.
+- Earlier v0.0.26 spec + plan + the v0.0.25 extended-thinking spec all carry **WITHDRAWN** or **SUPERSEDED BY** headers pointing to the shipping spec.
+
 ## v0.0.25 — 2026-05-29
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "nellface"
-version = "0.0.25"
+version = "0.0.26"
 description = "Companion-emergence desktop client"
 authors = ["hana"]
 edition = "2021"
