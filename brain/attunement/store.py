@@ -1,11 +1,49 @@
 """Persistence + grounding gate for the attunement subsystem."""
 from __future__ import annotations
 
+import json
+import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
-from brain.attunement.schemas import PatternCandidate
+from brain.attunement.schemas import CurrentRead, PatternCandidate
+
+log = logging.getLogger(__name__)
+
+_ATTUNEMENT_DIR = "attunement"
+_CURRENT_READ_FILE = "current_read.json"
+
+
+def _attunement_dir(persona_dir: Path) -> Path:
+    return persona_dir / _ATTUNEMENT_DIR
+
+
+def _current_read_path(persona_dir: Path) -> Path:
+    return _attunement_dir(persona_dir) / _CURRENT_READ_FILE
+
+
+def write_current_read(persona_dir: Path, read: CurrentRead) -> None:
+    """Overwrite the current-read snapshot file. Atomic via .tmp + rename."""
+    target = _current_read_path(persona_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(asdict(read), indent=2, sort_keys=True))
+    tmp.replace(target)
+
+
+def read_current_read(persona_dir: Path) -> CurrentRead | None:
+    """Return the latest current-read snapshot, or None if missing/corrupt."""
+    target = _current_read_path(persona_dir)
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text())
+        return CurrentRead(**payload)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        log.warning("attunement: corrupt current_read.json — treating as missing: %s", exc)
+        return None
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
