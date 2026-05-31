@@ -14,10 +14,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import traceback
+from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 from typing import Any
 
+from brain.attunement.budget import consume_call as _attunement_consume_call
+from brain.attunement.crystallise import check_crystallisations
+from brain.attunement.detector import run_detector, should_run_detector
+from brain.attunement.store import BufferTurn, merge_into_learned, write_current_read
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
@@ -30,6 +36,7 @@ from brain.tools.schemas import build_schemas
 logger = logging.getLogger(__name__)
 
 _pass2_counter = count(1)
+_attunement_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
 
@@ -61,6 +68,79 @@ def _spawn_pass2(
         daemon=True,
         name=f"monologue-extractor-{next(_pass2_counter)}",
     ).start()
+
+
+def _attunement_now_iso() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _log_attunement_error(persona_dir: Path, turn_id: str, exc: BaseException) -> None:
+    path = persona_dir / "attunement_errors.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": _attunement_now_iso(),
+        "turn_id": turn_id,
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+    with path.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _run_attunement_pass2(
+    persona_dir: Path,
+    turn_id: str,
+    user_message: str,
+    reply_text: str,
+    buffer_slice: list[BufferTurn],
+) -> None:
+    try:
+        if not _attunement_consume_call(persona_dir, now=datetime.now(UTC)):
+            return  # budget exhausted; defer silently
+        output = run_detector(buffer_slice=buffer_slice, reply_text=reply_text)
+        write_current_read(persona_dir, output.current_read)
+        merge_into_learned(
+            persona_dir,
+            output.pattern_candidates,
+            buffer_slice,
+            now_iso=_attunement_now_iso(),
+        )
+        check_crystallisations(persona_dir, now_iso=_attunement_now_iso())
+    except Exception as exc:  # noqa: BLE001 — error isolation by design
+        _log_attunement_error(persona_dir, turn_id, exc)
+
+
+def _spawn_pass2_attunement(
+    persona_dir: Path,
+    turn_id: str,
+    user_message: str,
+    reply_text: str,
+    buffer_slice: list[BufferTurn],
+) -> None:
+    """Spawn the async attunement pass-2 daemon (mirrors monologue _spawn_pass2)."""
+    if not should_run_detector(buffer_slice, user_message, reply_text):
+        return
+    thread = threading.Thread(
+        target=_run_attunement_pass2,
+        args=(persona_dir, turn_id, user_message, reply_text, buffer_slice),
+        name=f"attunement-extractor-{next(_attunement_counter)}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _buffer_slice_from_messages(messages: list[ChatMessage]) -> list[BufferTurn]:
+    """Build a BufferTurn slice from the user messages in the conversation.
+
+    Uses the message index as a stable turn id — suitable for grounding validation
+    within this call (the ids only need to match within the buffer_slice passed to
+    the same run_detector call).
+    """
+    return [
+        BufferTurn(id=f"msg-{i}", content=m.content_text())
+        for i, m in enumerate(messages)
+        if m.role == "user" and m.content_text().strip()
+    ]
 
 
 def _find_monologue_text(invocations: list[dict]) -> str | None:
@@ -151,6 +231,15 @@ def run_tool_loop(
                     )[-2:],
                     persona_dir=persona_dir,
                 )
+            _spawn_pass2_attunement(
+                persona_dir,
+                turn_id=f"turn-{len(messages)}",
+                user_message=next(
+                    (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+                ),
+                reply_text=last_response.content or "",
+                buffer_slice=_buffer_slice_from_messages(messages),
+            )
             return last_response, invocations
 
         # Append the assistant turn that contained the tool_calls so the
@@ -211,6 +300,15 @@ def run_tool_loop(
             )[-2:],
             persona_dir=persona_dir,
         )
+    _spawn_pass2_attunement(
+        persona_dir,
+        turn_id=f"turn-{len(messages)}-cap",
+        user_message=next(
+            (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+        ),
+        reply_text=last_response.content or "",
+        buffer_slice=_buffer_slice_from_messages(messages),
+    )
     return last_response, invocations
 
 
