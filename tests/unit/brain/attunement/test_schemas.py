@@ -71,6 +71,7 @@ def test_learned_pattern_constructs_with_all_fields() -> None:
         schema_version=SCHEMA_VERSION,
     )
     assert pattern.maturity == "forming"
+    assert pattern.examples == ["example 1", "example 2"]
 
 
 def test_pattern_candidate_requires_evidence_quote_and_turn_id() -> None:
@@ -138,4 +139,42 @@ def test_invalid_category_raises() -> None:
             description="y",
             evidence_quote="z",
             evidence_turn_id="t",
+        )
+
+
+def test_invalid_category_raises_for_learned_pattern() -> None:
+    with pytest.raises(ValueError, match="invalid category"):
+        LearnedPattern(
+            id="x",
+            category="not-a-real-category",
+            canonical_key="k",
+            description="d",
+            evidence_count=0,
+            maturity="immature",
+            first_seen_at="2026-05-31T12:00:00Z",
+            last_confirmed_at="2026-05-31T12:00:00Z",
+            last_addressed_at=None,
+            crystallised_at=None,
+            falsified_at=None,
+            examples=[],
+            schema_version=SCHEMA_VERSION,
+        )
+
+
+def test_invalid_maturity_raises_for_learned_pattern() -> None:
+    with pytest.raises(ValueError, match="invalid maturity"):
+        LearnedPattern(
+            id="x",
+            category="tone",
+            canonical_key="k",
+            description="d",
+            evidence_count=0,
+            maturity="not-a-real-maturity",
+            first_seen_at="2026-05-31T12:00:00Z",
+            last_confirmed_at="2026-05-31T12:00:00Z",
+            last_addressed_at=None,
+            crystallised_at=None,
+            falsified_at=None,
+            examples=[],
+            schema_version=SCHEMA_VERSION,
         )
