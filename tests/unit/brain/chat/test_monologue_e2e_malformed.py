@@ -62,7 +62,7 @@ def test_malformed_args_rejected_no_digest_no_pass2(tmp_path: Path):
         assert not (persona_dir / "monologue_digest.jsonl").exists()
         assert provider.generate_calls == 0
         rec = next(inv for inv in invocations if inv["name"] == "record_monologue")
-        assert "error" in rec
+        assert "error" in rec.get("result_summary", rec)
     finally:
         store.close()
         hebbian.close()

@@ -115,11 +115,41 @@ _DISPATCH: dict[str, Any] = {
     "recall_forgotten": _recall_forgotten_wrapper,
     "list_open_arcs": _list_open_arcs_wrapper,
     "recall_arc": _recall_arc_wrapper,
-    # Noop at dispatch — args are captured in tool_loop's record_monologue
-    # interception (brain/chat/monologue_capture.py writes the digest
-    # synchronously and queues the monologue text for pass-2 extractor).
-    "record_monologue": lambda **_: {"ok": True},
+    "record_monologue": None,  # replaced below after function definition
 }
+
+
+def _dispatch_record_monologue(
+    *,
+    monologue: str = "",
+    feed_digest: str = "",
+    persona_dir: Path,
+    **_unused: Any,
+) -> dict[str, Any]:
+    """Real handler for record_monologue (MCP and direct-dispatch paths).
+
+    Calls capture_monologue() synchronously. On success returns a dict
+    carrying the monologue text — downstream code (tool_loop._find_monologue_text
+    and the MCP audit pass-through in provider._read_audit_lines_since) reads
+    ``monologue_text`` to decide whether to spawn pass 2.
+
+    On CaptureRejected, returns an error dict without raising — the tool
+    result is surfaced as a normal (soft) error rather than a crash.
+    """
+    from brain.chat.monologue_capture import CaptureRejected, capture_monologue
+
+    try:
+        captured = capture_monologue(
+            persona_dir=persona_dir,
+            monologue=monologue,
+            feed_digest=feed_digest,
+        )
+        return {"ok": True, "monologue_text": captured}
+    except CaptureRejected as exc:
+        return {"error": str(exc)}
+
+
+_DISPATCH["record_monologue"] = _dispatch_record_monologue
 
 
 _WORKS_TOOLS = frozenset({"save_work", "list_works", "search_works", "read_work"})

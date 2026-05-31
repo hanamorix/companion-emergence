@@ -33,7 +33,6 @@ EXCLUDE_SUBSTRINGS = (
     "__pycache__",
     "app/src-tauri/target",
     "app/src-tauri/python-runtime",
-    ".claude/worktrees",
     "docs/",
     "CHANGELOG",
     ".public-sync",

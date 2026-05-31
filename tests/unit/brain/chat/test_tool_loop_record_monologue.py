@@ -116,7 +116,7 @@ def test_tool_loop_rejects_malformed_record_monologue(tmp_path: Path):
         assert not (persona_dir / "monologue_digest.jsonl").exists()
         # Invocation records the rejection.
         rec = next(inv for inv in invocations if inv["name"] == "record_monologue")
-        assert "error" in rec
+        assert "error" in rec.get("result_summary", rec)
     finally:
         store.close()
         hebbian.close()

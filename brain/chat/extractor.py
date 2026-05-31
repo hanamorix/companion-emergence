@@ -142,7 +142,7 @@ Return ONLY the JSON object. No commentary.
 
 
 def _build_user_prompt(
-    thinking_blocks: tuple[str, ...],
+    monologue_blocks: tuple[str, ...],
     visible_reply: str,
     recent_turn_context: tuple[str, ...],
 ) -> str:
@@ -154,7 +154,7 @@ def _build_user_prompt(
         parts.append("</recent_user_messages>")
         parts.append("")
     parts.append("<inner_monologue>")
-    for i, block in enumerate(thinking_blocks, start=1):
+    for i, block in enumerate(monologue_blocks, start=1):
         parts.append(f'<block n="{i}">')
         parts.append(block)
         parts.append("</block>")
@@ -169,18 +169,18 @@ def _build_user_prompt(
 def extract_from_thinking(
     *,
     provider: LLMProvider,
-    thinking_blocks: tuple[str, ...],
+    monologue_blocks: tuple[str, ...],
     visible_reply: str,
     recent_turn_context: tuple[str, ...],
 ) -> ExtractorOutput:
     """Run the pass-2 extraction call. Returns empty output on any failure.
 
-    Empty `thinking_blocks` short-circuits without an LLM call.
+    Empty `monologue_blocks` short-circuits without an LLM call.
     """
-    if not thinking_blocks:
+    if not monologue_blocks:
         return ExtractorOutput()
 
-    prompt = _build_user_prompt(thinking_blocks, visible_reply, recent_turn_context)
+    prompt = _build_user_prompt(monologue_blocks, visible_reply, recent_turn_context)
     try:
         raw = provider.generate(prompt, system=_SYSTEM_PROMPT)
     except Exception as exc:  # noqa: BLE001
