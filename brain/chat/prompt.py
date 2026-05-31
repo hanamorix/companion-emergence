@@ -205,6 +205,14 @@ def build_system_message(
     if fading_summary_block.strip():
         parts.append(fading_summary_block)
 
+    # 5d. Attunement block — what Nell senses about the user right now:
+    # current tone/cadence read + learned patterns (spec §14, attunement design).
+    # Failure-safe: empty on fresh installs or any disk/parse error. The block
+    # returns "" when no state exists (Task 10) — no conditional needed here.
+    attunement_block = _build_attunement_block(persona_dir)
+    if attunement_block.strip():
+        parts.append(attunement_block)
+
     # 6. Recent journal block (private — contract adjacent, per spec §4.3)
     journal_block = _build_recent_journal_block(store, user_name=user_name or "the user")
     if journal_block.strip():
@@ -847,6 +855,24 @@ def _collect_narrative_hints(persona_dir: Path, limit: int) -> tuple[str, ...]:
     except Exception:  # noqa: BLE001
         log.exception("narrative-hint collection failed; continuing without")
         return ()
+
+
+def _build_attunement_block(persona_dir: Path) -> str:
+    """Return the attunement ambient block or empty string on any error.
+
+    Renders the current tone/cadence read plus learned patterns (spec §14,
+    attunement design). Slot: after fading-summary (5c), before journal (6)
+    — Nell's own body state first, then what she perceives about the user.
+
+    Failure-safe: if read/patterns files are missing or corrupt, returns ""
+    so a cold install never breaks chat composition.
+    """
+    try:
+        from brain.attunement.ambient import build_attunement_block
+
+        return build_attunement_block(persona_dir)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:
