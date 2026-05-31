@@ -33,9 +33,29 @@ def _default_launchd_path() -> str:
     ``~/.local/bin/claude`` by default, which isn't on any system path.
     Resolving the user's home means the agent can find ``claude``
     without manual ``--env-path`` overrides on first install.
+
+    Node.js installed via nvm lives under a version-specific path
+    (e.g. ``~/.nvm/versions/node/v25.8.2/bin``) that is NOT on any of
+    the standard system directories above.  Claude Code's ``SessionEnd``
+    hook (``~/.pixel-agents/hooks/claude-hook.js``) invokes ``node``
+    directly, so without the nvm bin dir the hook fails with
+    ``/bin/sh: node: command not found`` on every Claude-CLI call.
+    Probing ``shutil.which("node")`` here bakes the current node bin dir
+    into the plist PATH at install time so the launchd agent can find it.
     """
     user_local = str(Path("~/.local/bin").expanduser())
-    return f"{user_local}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    base = f"{user_local}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # Probe for node at plist-generation time.  If it's on the current
+    # shell PATH (e.g. via nvm), prepend its containing directory so the
+    # launchd agent can invoke it too.  Skip if already covered by base.
+    node_path = shutil.which("node")
+    if node_path:
+        node_bin_dir = str(Path(node_path).parent)
+        if node_bin_dir not in base.split(":"):
+            base = f"{node_bin_dir}:{base}"
+
+    return base
 
 
 DEFAULT_LAUNCHD_PATH = _default_launchd_path()

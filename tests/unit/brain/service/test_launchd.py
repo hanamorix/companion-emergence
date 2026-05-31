@@ -320,6 +320,44 @@ def test_uninstall_service_boots_out_and_removes_plist(
     assert calls == [["bootout", launchd.launchctl_target("nell")]]
 
 
+def test_default_launchd_path_includes_nvm_node_when_node_is_nvm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_default_launchd_path must include the node bin dir when node lives under ~/.nvm.
+
+    launchd agents inherit only EnvironmentVariables, not the user's shell PATH.
+    If node is installed via nvm its bin dir won't be on the standard PATH
+    components, causing Claude Code's SessionEnd hook to fail with
+    'node: command not found'.  The generator probes shutil.which("node") at
+    plist-build time so the resolved dir is baked in.
+    """
+    # Fake a node binary under a synthetic nvm-style path.
+    node_bin = tmp_path / ".nvm" / "versions" / "node" / "v25.8.2" / "bin"
+    node_bin.mkdir(parents=True)
+    (node_bin / "node").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (node_bin / "node").chmod(0o755)
+
+    monkeypatch.setattr(
+        launchd.shutil,
+        "which",
+        lambda name, **_kw: str(node_bin / name) if name == "node" else None,
+    )
+
+    path_str = launchd._default_launchd_path()
+    assert str(node_bin) in path_str.split(":")
+
+
+def test_default_launchd_path_unchanged_when_node_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When node is not on PATH at plist-build time, the default path stays as-is."""
+    monkeypatch.setattr(launchd.shutil, "which", lambda name, **_kw: None)
+    path_str = launchd._default_launchd_path()
+    # nvm-style dirs must not appear when node is absent
+    assert ".nvm" not in path_str
+
+
 def test_service_status_combines_plist_and_launchctl_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
