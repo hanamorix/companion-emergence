@@ -58,6 +58,22 @@ def test_normalisation_handles_case() -> None:
     assert validate_grounded(candidate, buffer) is True
 
 
+def test_normalisation_handles_precomposed_vs_decomposed_unicode() -> None:
+    # Buffer holds NFC (precomposed é, U+00E9); candidate holds NFD
+    # (e + combining acute U+0301). Visually identical but byte-distinct.
+    # NFC normalisation in _normalise() makes them compare equal.
+    buffer = [_turn("t1", "café au lait")]
+    candidate = _candidate("café au lait", "t1")
+    assert validate_grounded(candidate, buffer) is True
+
+
+def test_normalisation_handles_german_eszett() -> None:
+    # casefold() maps ß → ss; .lower() would leave ß.
+    buffer = [_turn("t1", "Straße ist breit")]
+    candidate = _candidate("strasse ist breit", "t1")
+    assert validate_grounded(candidate, buffer) is True
+
+
 def test_validate_grounded_rejects_when_turn_id_not_in_buffer() -> None:
     buffer = [_turn("t1", "Hello")]
     candidate = _candidate("Hello", "t99")
