@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.0.27 — 2026-05-31 (hygiene release)
+
+### Added
+
+- **Streaming-path regression gate** (`tests/unit/brain/bridge/test_streaming_proxy_dispatched_invocations.py`). The v0.0.26 monologue feature was silently dead on the production WS streaming path because `_StreamingProxy.chat()` dropped MCP audit-log entries. This test pins the audit-log read so no future change can silently regress.
+- **`The trigger to drift.` rule** in `DEFAULT_VOICE_TEMPLATE` mirroring the existing `The trigger to reach.` pattern. New personas now get behavioural guidance for `record_monologue` directly in their voice template.
+
+### Changed
+
+- **Six-file version pin** now documented in CLAUDE.md (was four — `app/package.json` and `Cargo.lock` were always required but undocumented). The `.public-sync/sync-to-public.sh` preflight now verifies all six files agree before any push.
+- **Pass-2 daemon thread names** now unique per call (`monologue-extractor-1`, `monologue-extractor-2`, …). Eliminates log-correlation ambiguity when concurrent chat turns complete.
+
+### Fixed
+
+- **launchd plist generator** now prepends `node`'s install bin dir (`~/.nvm/versions/node/<v>/bin` or wherever `shutil.which` resolves it) to the PATH. Without this the Claude Code SessionEnd hook fails with `node: command not found` on every chat call, spamming stderr. Existing installs need a `nell service reinstall` to pick up the new PATH.
+
+### Notes
+
+- The `v0.0.26-inner-monologue-attempt` branch was pruned in this release; recovery is via `git reflog` if anyone wants the failed extended-thinking implementation back.
+
+---
+
 ## v0.0.26 — 2026-05-31 (inner monologue ships)
 
 ### Added
