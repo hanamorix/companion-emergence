@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from brain.attunement.schemas import (
+    MATURITY_FORMING_MIN,
+    MATURITY_KNOWN_MIN,
     SCHEMA_VERSION,
     CurrentRead,
     LearnedPattern,
@@ -139,9 +141,9 @@ def _append_pattern(persona_dir: Path, pattern: LearnedPattern) -> None:
 
 
 def _maturity_for_count(count: int) -> str:
-    if count >= 10:
+    if count >= MATURITY_KNOWN_MIN:
         return "known"
-    if count >= 3:
+    if count >= MATURITY_FORMING_MIN:
         return "forming"
     return "immature"
 
