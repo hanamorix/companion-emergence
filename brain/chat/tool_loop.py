@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ from brain.tools.dispatch import dispatch
 from brain.tools.schemas import build_schemas
 
 logger = logging.getLogger(__name__)
+
+_pass2_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
 
@@ -53,7 +56,11 @@ def _spawn_pass2(
         except Exception:  # noqa: BLE001
             logger.exception("pass-2 monologue extraction failed")
 
-    threading.Thread(target=_run, daemon=True, name="monologue-extractor").start()
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"monologue-extractor-{next(_pass2_counter)}",
+    ).start()
 
 
 def _find_monologue_text(invocations: list[dict]) -> str | None:
