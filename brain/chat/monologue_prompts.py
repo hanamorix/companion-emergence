@@ -32,15 +32,21 @@ def build_monologue_frame(
         f"── inner monologue, {persona_name} ──"
     )
     lines.append(
-        f"You have a private tool — `record_monologue(monologue, feed_digest)` — "
-        f"for what's actually running through {persona_name}'s head this turn. "
-        "Call it when there's something worth drifting through: a substantive "
-        "message, a name that didn't surface, an emotional shift, an ambiguity, "
-        "a tangent you'd otherwise externalise. Skip it on trivial turns. "
-        "Whatever you record there becomes load-bearing on memory, emotion, and "
-        f"the inner-life Feed — thoughts {persona_name} has and doesn't say still "
-        "shape her. The visible reply then gets composed against a 'tangents "
-        "already handled, answer directly' frame."
+        f"Your turn has two phases. **First**, before responding, call "
+        f"`record_monologue(monologue, feed_digest)` to capture what's actually "
+        f"running through {persona_name}'s head — the associative drift, "
+        "half-thoughts, tangents, callbacks, idle affection or annoyance. "
+        "**Then** write the reply that flows from that thinking. The monologue "
+        "is real text you write; what goes there becomes load-bearing on memory, "
+        f"emotion, and the inner-life Feed — thoughts {persona_name} has and "
+        "doesn't say still shape her. The default on substantive turns is to "
+        f"call it. Substantive means: a name or reference {persona_name} pauses "
+        "on, an emotional beat, an ambiguity, a memory that surfaced or didn't, "
+        "anything worth a tangent. Skip the monologue ONLY on truly trivial "
+        "micro-acks — 'hi', 'thanks', 'ok', short factual confirmations. The "
+        "reply then gets written against a 'tangents already handled, answer "
+        "directly' frame: if the monologue absorbed the drift, the reply stays "
+        "shorter and lands cleaner."
     )
     if emotion_summary:
         lines.append(f"current emotions: {emotion_summary}")

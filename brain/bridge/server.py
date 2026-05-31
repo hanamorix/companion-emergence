@@ -293,6 +293,20 @@ class _StreamingProxy:
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
+        # Capture the MCP audit-log offset BEFORE the stream so we can read
+        # dispatched_invocations after — without this the streaming path
+        # drops all tool-call audit entries on the floor and run_tool_loop's
+        # pass-2 monologue spawn never fires (v0.0.26 bug).
+        persona_dir_str = (options or {}).get("persona_dir")
+        audit_log_path: Path | None = None
+        audit_offset_before = 0
+        if persona_dir_str:
+            audit_log_path = Path(persona_dir_str) / "tool_invocations.log.jsonl"
+            try:
+                audit_offset_before = audit_log_path.stat().st_size
+            except OSError:
+                audit_offset_before = 0
+
         chat_stream = getattr(self._real, "chat_stream", None)
         if chat_stream is None:
             # Provider has no streaming support; call chat() and forward the
@@ -309,20 +323,31 @@ class _StreamingProxy:
                 self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
             elif isinstance(ev, StreamDone):
                 if ev.content and not chunks:
-                    # No per-token deltas arrived (extended-thinking mode,
-                    # result-frame-only path, or EOF assistant-snapshot
-                    # fallback). Queue the content so the WS still emits at
-                    # least one reply_chunk frame — otherwise the chat
-                    # bubble renders empty until reopen. Bug surfaced in
+                    # No per-token deltas arrived (result-frame-only path
+                    # or EOF assistant-snapshot fallback). Queue the
+                    # content so the WS still emits at least one
+                    # reply_chunk frame — otherwise the chat bubble
+                    # renders empty until reopen. Bug surfaced in
                     # v0.0.15-alpha.2; fix landed v0.0.16.1.
                     chunks = [ev.content]
                     self._loop.call_soon_threadsafe(self._q.put_nowait, ev.content)
             elif isinstance(ev, StreamError):
                 raise ProviderError(ev.stage, ev.detail)
+
+        # Read MCP audit lines appended during the stream so dispatched
+        # invocations (including record_monologue captures) reach run_tool_loop.
+        dispatched: tuple[dict[str, Any], ...] = ()
+        if audit_log_path is not None:
+            from brain.bridge.provider import _read_audit_lines_since
+            dispatched = tuple(
+                _read_audit_lines_since(audit_log_path, audit_offset_before)
+            )
+
         return ChatResponse(
             content="".join(chunks),
             tool_calls=(),
             raw=None,
+            dispatched_invocations=dispatched,
         )
 
 
