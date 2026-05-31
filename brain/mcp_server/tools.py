@@ -68,11 +68,15 @@ def register_tools(
                 persona_dir=persona_dir,
             )
             payload = json.dumps(result, default=str, ensure_ascii=False)
+            monologue_text: str | None = (
+                result.get("monologue_text") if isinstance(result, dict) else None
+            )
             log_invocation(
                 persona_dir,
                 name=name,
                 arguments=arguments,
                 result_summary=_summarize(payload),
+                monologue_text=monologue_text,
             )
             return [TextContent(type="text", text=payload)]
         except Exception as exc:  # noqa: BLE001 — broad catch is intentional

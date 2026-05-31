@@ -20,7 +20,6 @@ from typing import Any
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
-from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -46,7 +45,7 @@ def _spawn_pass2(
         try:
             out = extract_from_thinking(
                 provider=provider,
-                thinking_blocks=(monologue_text,),
+                monologue_blocks=(monologue_text,),
                 visible_reply=visible_reply,
                 recent_turn_context=recent_user_msgs,
             )
@@ -161,30 +160,6 @@ def run_tool_loop(
                 "name": tc.name,
                 "arguments": tc.arguments,
             }
-            if tc.name == "record_monologue":
-                try:
-                    monologue_text = capture_monologue(
-                        persona_dir=persona_dir,
-                        monologue=tc.arguments.get("monologue", ""),
-                        feed_digest=tc.arguments.get("feed_digest", ""),
-                    )
-                    record["result_summary"] = "captured"
-                    record["monologue_text"] = monologue_text
-                    tool_content = json.dumps({"ok": True})
-                    invocations.append(record)
-                    messages.append(
-                        ChatMessage(role="tool", content=tool_content, tool_call_id=tc.id)
-                    )
-                    continue
-                except CaptureRejected as exc:
-                    record["error"] = str(exc)
-                    record["result_summary"] = f"rejected: {exc}"
-                    tool_content = json.dumps({"error": str(exc)})
-                    invocations.append(record)
-                    messages.append(
-                        ChatMessage(role="tool", content=tool_content, tool_call_id=tc.id)
-                    )
-                    continue
             try:
                 result = dispatch(
                     tc.name,
@@ -194,6 +169,10 @@ def run_tool_loop(
                     persona_dir=persona_dir,
                 )
                 record["result_summary"] = _summarize_result(result)
+                # record_monologue returns {"ok": True, "monologue_text": ...} on
+                # success so _find_monologue_text can locate it and spawn pass 2.
+                if isinstance(result, dict) and result.get("monologue_text"):
+                    record["monologue_text"] = result["monologue_text"]
                 tool_content = json.dumps(result, default=str, ensure_ascii=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("tool dispatch error: %s — %s", tc.name, exc)

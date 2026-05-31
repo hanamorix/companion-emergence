@@ -101,6 +101,7 @@ def log_invocation(
     arguments: dict[str, Any],
     result_summary: str,
     error: str | None = None,
+    monologue_text: str | None = None,
 ) -> None:
     """Append one invocation record to <persona_dir>/tool_invocations.log.jsonl.
 
@@ -147,6 +148,8 @@ def log_invocation(
         "result_summary": truncated,
         "error": error,
     }
+    if monologue_text:
+        record["monologue_text"] = monologue_text
     request_id = os.environ.get("NELL_MCP_AUDIT_REQUEST_ID")
     if request_id:
         record["request_id"] = request_id

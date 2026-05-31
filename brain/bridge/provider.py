@@ -1119,6 +1119,8 @@ def _read_audit_lines_since(
         }
         if entry.get("error"):
             record["error"] = entry["error"]
+        if entry.get("monologue_text"):
+            record["monologue_text"] = entry["monologue_text"]
         records.append(record)
     if malformed:
         logger.warning(

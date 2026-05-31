@@ -32,7 +32,7 @@ def test_returns_extractor_output_on_valid_json():
     )
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=("thinking about Loopy",),
+        monologue_blocks=("thinking about Loopy",),
         visible_reply="I don't think I know Loopy.",
         recent_turn_context=("who's Loopy again?",),
     )
@@ -46,7 +46,7 @@ def test_returns_empty_output_on_empty_thinking_blocks():
     provider = _FakeProvider("should not be called")
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=(),
+        monologue_blocks=(),
         visible_reply="hi",
         recent_turn_context=(),
     )
@@ -66,7 +66,7 @@ def test_returns_empty_output_when_provider_raises():
 
     out = extract_from_thinking(
         provider=_BrokenProvider(),
-        thinking_blocks=("anything",),
+        monologue_blocks=("anything",),
         visible_reply="hi",
         recent_turn_context=(),
     )
@@ -77,7 +77,7 @@ def test_returns_empty_output_on_malformed_json():
     provider = _FakeProvider("not json at all")
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=("something",),
+        monologue_blocks=("something",),
         visible_reply="hi",
         recent_turn_context=(),
     )
@@ -90,7 +90,7 @@ def test_returns_empty_output_on_schema_violation():
     )
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=("something",),
+        monologue_blocks=("something",),
         visible_reply="hi",
         recent_turn_context=(),
     )
@@ -102,7 +102,7 @@ def test_system_prompt_names_the_schema():
     provider = _FakeProvider(json.dumps({}))
     extract_from_thinking(
         provider=provider,
-        thinking_blocks=("x",),
+        monologue_blocks=("x",),
         visible_reply="y",
         recent_turn_context=("z",),
     )
@@ -121,7 +121,7 @@ def test_strips_json_code_fence():
     )
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=("x",),
+        monologue_blocks=("x",),
         visible_reply="y",
         recent_turn_context=(),
     )
@@ -134,7 +134,7 @@ def test_strips_bare_code_fence():
     provider = _FakeProvider("```\n{}\n```")
     out = extract_from_thinking(
         provider=provider,
-        thinking_blocks=("x",),
+        monologue_blocks=("x",),
         visible_reply="y",
         recent_turn_context=(),
     )
@@ -146,7 +146,7 @@ def test_user_prompt_uses_xml_delimiters():
     provider = _FakeProvider("{}")
     extract_from_thinking(
         provider=provider,
-        thinking_blocks=("first block\n\nwith blank line", "second block"),
+        monologue_blocks=("first block\n\nwith blank line", "second block"),
         visible_reply="visible",
         recent_turn_context=("user said hi",),
     )
