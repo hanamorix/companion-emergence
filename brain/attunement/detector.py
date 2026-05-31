@@ -145,6 +145,33 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
     )
 
 
+def should_run_detector(
+    buffer_slice: list[BufferTurn],
+    user_message: str,
+    reply_text: str,
+    *,
+    min_words: int = 5,
+) -> bool:
+    """Decide whether this turn warrants an attunement pass-2 run.
+
+    Skip rules (any one → skip):
+    - Buffer slice is empty
+    - User message is empty / whitespace-only (tool-only turn)
+    - User message has fewer than min_words tokens
+
+    The `reply_text` parameter is accepted for symmetry with the pass-2
+    spawn signature (Task 12) but is not currently a gating criterion —
+    the detector reads the buffer slice, not Nell's reply.
+    """
+    if not buffer_slice:
+        return False
+    if not user_message.strip():
+        return False
+    if len(user_message.split()) < min_words:
+        return False
+    return True
+
+
 def run_detector(buffer_slice: list[BufferTurn], reply_text: str) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
 
