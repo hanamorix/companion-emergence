@@ -5,8 +5,6 @@ import json
 import time
 from pathlib import Path
 
-import pytest
-
 from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 
 
