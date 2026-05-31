@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from brain.attunement.schemas import (
+    MATURITY_FALSIFIED_MAX,
     MATURITY_FORMING_MIN,
     MATURITY_KNOWN_MIN,
     SCHEMA_VERSION,
@@ -215,6 +216,54 @@ def merge_into_learned(
 
         _append_pattern(persona_dir, updated)
         existing[pid] = updated
+
+
+def apply_contradiction(
+    persona_dir: Path, pattern_id_value: str, *, now_iso: str | None = None
+) -> None:
+    """Decrement evidence_count on a pattern in response to contradicting evidence.
+
+    Drops below MATURITY_FALSIFIED_MAX (3) → marks `falsified` with
+    `falsified_at`. A single contradiction cannot erase a well-confirmed
+    pattern, but sustained contradiction can falsify it. Confirmation
+    later via merge_into_learned clears falsified_at and lets the pattern
+    recover its maturity per count — contradiction is not permanent erasure.
+    """
+    now = now_iso or _now_iso()
+    by_id = {p.id: p for p in read_learned_patterns(persona_dir)}
+    prev = by_id.get(pattern_id_value)
+    if prev is None:
+        return
+
+    new_count = max(0, prev.evidence_count - 1)
+    new_maturity = (
+        "falsified"
+        if new_count < MATURITY_FALSIFIED_MAX
+        else _maturity_for_count(new_count)
+    )
+    # Only stamp falsified_at on the transition into falsified; keep existing
+    # timestamp if already falsified (to preserve the original falsification time).
+    if new_maturity == "falsified" and prev.maturity != "falsified":
+        new_falsified_at: str | None = now
+    else:
+        new_falsified_at = prev.falsified_at
+
+    updated = LearnedPattern(
+        id=prev.id,
+        category=prev.category,
+        canonical_key=prev.canonical_key,
+        description=prev.description,
+        evidence_count=new_count,
+        maturity=new_maturity,
+        first_seen_at=prev.first_seen_at,
+        last_confirmed_at=prev.last_confirmed_at,
+        last_addressed_at=prev.last_addressed_at,
+        crystallised_at=prev.crystallised_at,
+        falsified_at=new_falsified_at,
+        examples=prev.examples,
+        schema_version=SCHEMA_VERSION,
+    )
+    _append_pattern(persona_dir, updated)
 
 
 def validate_grounded(
