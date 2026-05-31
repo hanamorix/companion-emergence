@@ -198,3 +198,14 @@ def test_attempt_heal_text_all_baks_empty_resets(tmp_path: Path) -> None:
     assert content == "RESET"
     assert anomaly is not None
     assert anomaly.action == "reset_to_default"
+
+
+def test_default_voice_template_has_drift_trigger_rule() -> None:
+    """Mirrors 'trigger to reach'; gives record_monologue behavioural weight."""
+    from brain.chat.voice import DEFAULT_VOICE_TEMPLATE
+    assert "**The trigger to drift.**" in DEFAULT_VOICE_TEMPLATE
+    # Body should mention record_monologue + substantive turns
+    drift_section = DEFAULT_VOICE_TEMPLATE.split("**The trigger to drift.**")[1]
+    drift_section_head = drift_section[:600]
+    assert "record_monologue" in drift_section_head
+    assert "substantive" in drift_section_head.lower() or "two phases" in drift_section_head.lower()
