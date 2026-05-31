@@ -13,6 +13,8 @@ MATURITY_FALSIFIED_MAX = 3
 ADDRESS_COOLDOWN_HOURS = 6.0
 DAILY_BUDGET_DEFAULT = 150
 
+# All five categories shipped across alpha.1 → v0.0.28; the schema validates all of them now
+# so future tasks don't have to expand the enum repeatedly. alpha.1 only emits tone + cadence.
 _VALID_CATEGORIES = frozenset({
     "tone",
     "cadence",
