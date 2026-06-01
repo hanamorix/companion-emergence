@@ -261,28 +261,31 @@ def test_load_corrupt_no_bak_no_store_falls_back_to_empty(tmp_path: Path):
     assert count == 0
 
 
-def test_load_with_store_warns_on_missing_emotion(tmp_path: Path, caplog):
-    """Store has memory referencing 'body_grief' but vocab file missing →
-    one warning per missing emotion pointing at nell migrate.
+def test_missing_file_with_store_reconstructs_referenced_emotion(tmp_path: Path, caplog):
+    """Missing vocab file + a memory referencing a non-baseline emotion now
+    RECONSTRUCTS from memories (the recover-dropped-vocab self-heal) instead of
+    the old behavior (return 0 + warn pointing at the OG `nell migrate` command,
+    which cannot help a native persona).
     """
     store = MemoryStore(":memory:")
     try:
-        # Seed a memory with an emotion that's not in baseline + not in
-        # any (missing) vocab file
-        mem = Memory.create_new(
-            content="x",
-            memory_type="conversation",
-            domain="us",
-            emotions={"body_grief": 5.0},
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"body_grief": 5.0},
+            )
         )
-        store.create(mem)
+        _cleanup_emotion("body_grief")  # clean registry for a meaningful assertion
 
         with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
             result = load_persona_vocabulary(tmp_path / "missing.json", store=store)
 
-        assert result == 0
-        assert any(
-            "body_grief" in r.message and "nell migrate" in r.message for r in caplog.records
-        )
+        assert result >= 1
+        assert vocabulary.get("body_grief") is not None
+        # The misdirecting OG-migrate remediation no longer fires for this path.
+        assert not any("nell migrate" in r.message for r in caplog.records)
     finally:
         store.close()
+        _cleanup_emotion("body_grief")
