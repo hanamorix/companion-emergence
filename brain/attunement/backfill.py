@@ -177,6 +177,24 @@ def _cursor_index(windows: list[Window], cursor: str) -> int:
     return 0
 
 
+_MIN_TURNS_FOR_BACKFILL = 10
+
+
+def should_run_backfill(persona_dir: Path) -> bool:
+    """Detect whether backfill should run at startup.
+
+    Returns True iff: persona has >= 10 inbound user turns AND no
+    completed backfill_state.json exists (missing OR status != 'complete').
+    """
+    turns = _read_buffer_turns(persona_dir)
+    if len(turns) < _MIN_TURNS_FOR_BACKFILL:
+        return False
+    existing = _load_state(persona_dir)
+    if existing is not None and existing.status == "complete":
+        return False
+    return True
+
+
 def run_backfill(
     persona_dir: Path,
     *,
