@@ -75,6 +75,23 @@ def test_build_system_message_includes_preamble_with_persona_name(
     assert "first person" in msg or "You are nell" in msg
 
 
+def test_build_system_message_includes_interior_continuity(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    from brain.monologue.trace import write_trace_memory
+
+    write_trace_memory(store, "i was turning over what she said about leaving")
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "interior continuity" in msg.lower()
+    assert "turning over what she said about leaving" in msg
+
+
 def test_build_system_message_preamble_persona_name_substituted(
     tmp_path: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
