@@ -294,3 +294,89 @@ def test_chat_stream_mcp_tools_argv():
         assert "--allowedTools" in argv
         assert "--output-format" in argv
         assert "stream-json" in argv
+
+
+# ---- Stream idle-timeout instrumentation (spec 2026-06-01) ----
+
+
+def _assistant_tool_use_line(tool_name: str) -> str:
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": tool_name, "input": {}}],
+                },
+            }
+        )
+        + "\n"
+    )
+
+
+class _StallAfter:
+    """Yield the given lines, then block forever so the idle watchdog fires."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._i = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i < len(self._lines):
+            line = self._lines[self._i]
+            self._i += 1
+            return line
+        import time as _t
+
+        _t.sleep(5)
+        raise StopIteration
+
+
+def _stall_proc(lines):
+    proc = MagicMock()
+    proc.stdout = _StallAfter(lines)
+    proc.stdin = MagicMock()
+    proc.poll.return_value = None
+    proc.wait.return_value = 0
+    proc.returncode = 0
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.stderr = MagicMock()
+    proc.stderr.read.return_value = ""
+    return proc
+
+
+def test_idle_timeout_records_tool_in_flight(tmp_path, monkeypatch):
+    """A tool_use frame then silence → stream_timeouts.jsonl names the tool and
+    the per-event budget that fired."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
+
+    proc = _stall_proc([_assistant_tool_use_line("mcp__brain-tools__recall_arc")])
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        events = list(
+            provider.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "noop"}],
+                options={"persona_dir": str(persona)},
+            )
+        )
+
+    errs = [e for e in events if isinstance(e, StreamError)]
+    assert errs and errs[0].stage == "claude_cli_idle_timeout"
+    assert "recall_arc" in errs[0].detail
+
+    log = persona / "stream_timeouts.jsonl"
+    assert log.is_file()
+    row = json.loads(log.read_text().splitlines()[-1])
+    assert row["tool_in_flight"] is True
+    assert row["tool_name"] == "mcp__brain-tools__recall_arc"
+    assert row["last_frame_type"] == "assistant"
+    assert row["budget_s"] == 0.2  # per-event budget fired (a frame arrived first)
+    assert row["frames_seen"] == 1
