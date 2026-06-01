@@ -4,7 +4,7 @@
  * Covers:
  *   - MigrateSource includes "companion-emergence"
  *   - listPersonas() returns PersonaSummary[] (not string[])
- *   - runPreflightExistingCE passes input_dir as snake_case key
+ *   - runPreflightExistingCE passes inputDir as camelCase key (Tauri 2 default)
  *   - revealInFileManager swallows errors
  *   - nellbrainHomePath returns null on failure
  *   - MigrationReport and SkippedMemory shapes compile and hold correct values
@@ -84,7 +84,7 @@ describe("listPersonas", () => {
 // runPreflightExistingCE
 // ---------------------------------------------------------------------------
 describe("runPreflightExistingCE", () => {
-  it("invokes preflight_existing_ce with snake_case input_dir key", async () => {
+  it("invokes preflight_existing_ce with camelCase inputDir key (Tauri 2 default)", async () => {
     const preflight: ExistingCePreflight = {
       ok: true,
       persona_name: "nell",
@@ -100,7 +100,7 @@ describe("runPreflightExistingCE", () => {
     mockInvoke.mockResolvedValueOnce(preflight);
 
     const result = await runPreflightExistingCE("/some/path");
-    expect(mockInvoke).toHaveBeenCalledWith("preflight_existing_ce", { input_dir: "/some/path" });
+    expect(mockInvoke).toHaveBeenCalledWith("preflight_existing_ce", { inputDir: "/some/path" });
     expect(result.ok).toBe(true);
     expect(result.persona_name).toBe("nell");
     expect(result.memory_count).toBe(42);
