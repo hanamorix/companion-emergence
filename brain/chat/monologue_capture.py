@@ -15,6 +15,9 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.memory.store import MemoryStore
+from brain.monologue.trace import write_trace_memory
+
 logger = logging.getLogger(__name__)
 
 MONOLOGUE_DIGEST_LOG = "monologue_digest.jsonl"
@@ -41,14 +44,17 @@ def _append_jsonl(path: Path, entry: dict) -> None:
 def capture_monologue(
     *,
     persona_dir: Path,
+    store: MemoryStore,
     monologue: str,
     feed_digest: str,
+    surface: bool = True,
 ) -> str:
-    """Validate + persist the digest synchronously. Returns the monologue text.
+    """Validate, persist the Tier-2 trace memory + the gated Tier-3 digest line.
 
-    Raises CaptureRejected on validation failure (whitespace-only or too-long
-    or non-string). Digest-write failure is logged to extractor_errors.jsonl
-    but does NOT raise.
+    Returns the monologue text. Raises CaptureRejected on validation failure
+    (whitespace-only or too-long or non-string). Trace-write and digest-write
+    failures are logged to extractor_errors.jsonl best-effort, never raised
+    (the reply must still ship).
     """
     if not isinstance(monologue, str) or not monologue.strip():
         raise CaptureRejected("monologue must be a non-whitespace string")
@@ -59,10 +65,25 @@ def capture_monologue(
     if len(feed_digest) > MAX_FEED_DIGEST_LEN:
         raise CaptureRejected(f"feed_digest exceeds {MAX_FEED_DIGEST_LEN} chars")
 
+    # Tier 2 — persist the verbatim trace FIRST (most important; never lose her
+    # thought). Best-effort: a failure logs but does not block the reply.
+    try:
+        write_trace_memory(store, monologue)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("monologue trace memory write failed: %s", exc)
+        try:
+            _append_jsonl(
+                persona_dir / EXTRACTOR_ERROR_LOG,
+                {"ts": _utcnow_iso_z(), "step": "monologue_trace_write", "error": str(exc)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Tier 3 — gated digest line (surfaced controls Feed visibility).
     try:
         _append_jsonl(
             persona_dir / MONOLOGUE_DIGEST_LOG,
-            {"ts": _utcnow_iso_z(), "digest": feed_digest},
+            {"ts": _utcnow_iso_z(), "digest": feed_digest, "surfaced": bool(surface)},
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("monologue digest write failed: %s", exc)
