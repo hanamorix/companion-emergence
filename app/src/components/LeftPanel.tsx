@@ -6,8 +6,9 @@ import { FeedPanel } from "./panels/FeedPanel";
 import { SoulPanel } from "./panels/SoulPanel";
 import { ConnectionPanel } from "./panels/ConnectionPanel";
 import { GalleryPanel } from "./panels/GalleryPanel";
+import { AttunementPanel } from "./panels/AttunementPanel";
 
-type Tab = "weather" | "body" | "interior" | "soul" | "connection" | "gallery";
+type Tab = "weather" | "body" | "interior" | "soul" | "connection" | "gallery" | "attunement";
 
 interface Props {
   state: PersonaState | null;
@@ -24,6 +25,7 @@ const TABS: Array<{ id: Tab; label: string; icon: string }> = [
   { id: "body", label: "Body", icon: "○" },
   { id: "interior", label: "Inner Life", icon: "✦" },
   { id: "soul", label: "Soul", icon: "❀" },
+  { id: "attunement", label: "Attunement", icon: "∿" },
   { id: "connection", label: "Connection", icon: "≡" },
   { id: "gallery", label: "Gallery", icon: "◫" },
 ];
@@ -144,6 +146,8 @@ function renderPanel(tab: Tab, state: PersonaState | null, opts: PanelOpts) {
       return <FeedPanel state={state} />;
     case "soul":
       return <SoulPanel state={state} />;
+    case "attunement":
+      return <AttunementPanel persona={opts.persona} />;
     case "connection":
       return (
         <ConnectionPanel
