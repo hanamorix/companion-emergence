@@ -16,6 +16,7 @@ from brain.felt_time.tool import pressure_since as _pressure_since_impl
 from brain.forgetting.tool import recall_forgotten as _recall_forgotten_impl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.monologue.recall import recall_monologue
 from brain.narrative_memory.tool import list_open_arcs as _list_open_arcs_impl
 from brain.narrative_memory.tool import recall_arc as _recall_arc_impl
 from brain.tools.impls.add_journal import add_journal
@@ -115,6 +116,7 @@ _DISPATCH: dict[str, Any] = {
     "recall_forgotten": _recall_forgotten_wrapper,
     "list_open_arcs": _list_open_arcs_wrapper,
     "recall_arc": _recall_arc_wrapper,
+    "recall_monologue": recall_monologue,
     "record_monologue": None,  # replaced below after function definition
 }
 
@@ -123,15 +125,18 @@ def _dispatch_record_monologue(
     *,
     monologue: str = "",
     feed_digest: str = "",
+    surface: bool = True,
+    store: MemoryStore,
     persona_dir: Path,
     **_unused: Any,
 ) -> dict[str, Any]:
     """Real handler for record_monologue (MCP and direct-dispatch paths).
 
-    Calls capture_monologue() synchronously. On success returns a dict
-    carrying the monologue text — downstream code (tool_loop._find_monologue_text
-    and the MCP audit pass-through in provider._read_audit_lines_since) reads
-    ``monologue_text`` to decide whether to spawn pass 2.
+    Calls capture_monologue() synchronously: persists the Tier-2 trace memory
+    + the gated Tier-3 digest. On success returns a dict carrying the monologue
+    text — downstream code (tool_loop._find_monologue_text and the MCP audit
+    pass-through in provider._read_audit_lines_since) reads ``monologue_text``
+    to decide whether to spawn pass 2.
 
     On CaptureRejected, returns an error dict without raising — the tool
     result is surfaced as a normal (soft) error rather than a crash.
@@ -141,8 +146,10 @@ def _dispatch_record_monologue(
     try:
         captured = capture_monologue(
             persona_dir=persona_dir,
+            store=store,
             monologue=monologue,
             feed_digest=feed_digest,
+            surface=surface,
         )
         return {"ok": True, "monologue_text": captured}
     except CaptureRejected as exc:

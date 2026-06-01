@@ -6,12 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from brain.memory.store import MemoryStore
+
+
+def _store(tmp_path: Path) -> MemoryStore:
+    return MemoryStore(tmp_path / "memories.db")
+
 
 def test_capture_writes_digest_synchronously(tmp_path: Path):
     from brain.chat.monologue_capture import capture_monologue
 
     monologue_text = capture_monologue(
         persona_dir=tmp_path,
+        store=_store(tmp_path),
         monologue="I was thinking about Loopy.",
         feed_digest="she searched for Loopy and felt fond when nothing surfaced",
     )
@@ -28,37 +35,46 @@ def test_capture_rejects_whitespace_monologue(tmp_path: Path):
     from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue="   ", feed_digest="digest")
+        capture_monologue(
+            persona_dir=tmp_path, store=_store(tmp_path), monologue="   ", feed_digest="digest"
+        )
 
 
 def test_capture_rejects_whitespace_feed_digest(tmp_path: Path):
     from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue="thought", feed_digest="   ")
+        capture_monologue(
+            persona_dir=tmp_path, store=_store(tmp_path), monologue="thought", feed_digest="   "
+        )
 
 
 def test_capture_rejects_too_long_monologue(tmp_path: Path):
     from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue="x" * 3001, feed_digest="digest")
+        capture_monologue(
+            persona_dir=tmp_path, store=_store(tmp_path), monologue="x" * 3001, feed_digest="digest"
+        )
 
 
 def test_capture_rejects_too_long_feed_digest(tmp_path: Path):
     from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue="thought", feed_digest="x" * 401)
+        capture_monologue(
+            persona_dir=tmp_path, store=_store(tmp_path), monologue="thought", feed_digest="x" * 401
+        )
 
 
 def test_capture_rejects_non_string_args(tmp_path: Path):
     from brain.chat.monologue_capture import CaptureRejected, capture_monologue
 
+    store = _store(tmp_path)
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue=None, feed_digest="d")  # type: ignore[arg-type]
+        capture_monologue(persona_dir=tmp_path, store=store, monologue=None, feed_digest="d")  # type: ignore[arg-type]
     with pytest.raises(CaptureRejected):
-        capture_monologue(persona_dir=tmp_path, monologue="t", feed_digest=42)  # type: ignore[arg-type]
+        capture_monologue(persona_dir=tmp_path, store=store, monologue="t", feed_digest=42)  # type: ignore[arg-type]
 
 
 def test_capture_write_failure_logged_to_extractor_errors(tmp_path: Path):
@@ -70,6 +86,7 @@ def test_capture_write_failure_logged_to_extractor_errors(tmp_path: Path):
 
     text = capture_monologue(
         persona_dir=tmp_path,
+        store=_store(tmp_path),
         monologue="thought",
         feed_digest="digest",
     )
