@@ -526,6 +526,26 @@ SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "recall_monologue": {
+        "name": "recall_monologue",
+        "description": (
+            "Reach back into your own past interior — search your retained "
+            "monologue traces for an earlier thought. Recent thoughts come back "
+            "verbatim; older ones return blurred (you kept the gist, not the "
+            "words). Reaching for a thought keeps it vivid."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "What you're trying to recall from your own prior interior.",
+                },
+            },
+        },
+    },
 }
 
 

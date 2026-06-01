@@ -16,6 +16,7 @@ from brain.felt_time.tool import pressure_since as _pressure_since_impl
 from brain.forgetting.tool import recall_forgotten as _recall_forgotten_impl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.monologue.recall import recall_monologue
 from brain.narrative_memory.tool import list_open_arcs as _list_open_arcs_impl
 from brain.narrative_memory.tool import recall_arc as _recall_arc_impl
 from brain.tools.impls.add_journal import add_journal
@@ -115,6 +116,7 @@ _DISPATCH: dict[str, Any] = {
     "recall_forgotten": _recall_forgotten_wrapper,
     "list_open_arcs": _list_open_arcs_wrapper,
     "recall_arc": _recall_arc_wrapper,
+    "recall_monologue": recall_monologue,
     "record_monologue": None,  # replaced below after function definition
 }
 
