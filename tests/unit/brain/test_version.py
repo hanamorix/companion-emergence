@@ -41,17 +41,40 @@ def test_brain_version_matches_package_metadata():
     )
 
 
+def _normalize_pep440(v: str) -> str:
+    """Normalise a PEP 440 version string to canonical form.
+
+    importlib.metadata normalises pre-release separators — e.g.
+    "0.0.28-alpha.1" becomes "0.0.28a1". The raw pyproject.toml string
+    uses the human-readable form. Normalise both before comparing so
+    alpha-cycle bumps don't false-positive here.
+    """
+    import re as _re
+
+    # Strip separating hyphens/dots between the numeric part and pre-release label.
+    # "0.0.28-alpha.1" → "0.0.28alpha1" → "0.0.28a1"
+    v = _re.sub(r"[-.]?(alpha)[-.]?", r"a", v)
+    v = _re.sub(r"[-.]?(beta)[-.]?", r"b", v)
+    v = _re.sub(r"[-.]?(rc)[-.]?", r"rc", v)
+    return v
+
+
 def test_brain_version_matches_pyproject():
     """brain.__version__ must equal what pyproject.toml declares.
 
     The wheel install during `uv sync` writes pyproject's version into
     importlib.metadata, so an import-time mismatch here means the env
-    is stale (uv sync wasn't re-run after a version bump)."""
+    is stale (uv sync wasn't re-run after a version bump).
+
+    importlib.metadata normalises PEP 440 pre-release identifiers
+    (e.g. "0.0.28-alpha.1" → "0.0.28a1"), so we compare normalised
+    forms to avoid false-positives on alpha-cycle bumps."""
     import brain
 
-    assert brain.__version__ == _read_pyproject_version(), (
+    pyproject_raw = _read_pyproject_version()
+    assert _normalize_pep440(brain.__version__) == _normalize_pep440(pyproject_raw), (
         f"brain.__version__={brain.__version__!r} but "
-        f"pyproject says {_read_pyproject_version()!r} — "
+        f"pyproject says {pyproject_raw!r} — "
         "did you forget `uv sync` after the version bump?"
     )
 

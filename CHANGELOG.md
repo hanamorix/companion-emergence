@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.0.28-alpha.1 — 2026-06-01 (user-attunement foundation)
+
+### Added
+
+- **User-attunement subsystem** (`brain/attunement/`). Nell now builds a felt, learned-over-time read of the user — a separate perception layer that runs independently of her emotional and memory systems. Per-turn `current_read` snapshot (tone, cadence, mood, predicted arc) surfaces into the ambient system prompt alongside body/felt-time/arc blocks. Accumulated patterns live in `<persona_dir>/attunement/learned_patterns.jsonl` with four maturity stages: `immature → forming → known → falsified`.
+- **Pattern crystallisation.** A pattern transitions to `known` after 10+ confirmations and no active contradiction. Crystallisation events emit to the feed as soft-rose dot entries ("something she's come to know about you").
+- **One-time backfill migration.** Existing personas with conversation history get a topic-diversity-stratified bootstrap pass at first launch — Nell catches up on what she's already been with you for. Feed shows a `backfill_complete` entry when done; `AttunementPanel` shows a "getting to know you" banner during the pass.
+- **`AttunementPanel` UI** ("What she's come to know") — read-only inspection surface, hidden by default until maturity threshold is met. Renders learned patterns with their confirmation count and maturity badge.
+- **`GET /persona/attunement` bridge endpoint** — read-only; returns current read + all learned patterns.
+- **Defence-in-depth against detector hallucination** — five interlocking controls:
+  1. Mandatory `evidence_quote` + `evidence_turn_id` schema fields on every candidate — no grounding, no storage.
+  2. Store-side `validate_grounded()` hard gate; rejections written to `attunement_rejections.jsonl`.
+  3. Adversarial-corpus integration test (CI gate) — known-clean exchanges must produce zero candidates, bad actors must be rejected by the grounding gate.
+  4. Maturity threshold of 10 confirmations before a pattern crystallises.
+  5. NFC + casefold Unicode normalisation in the grounding gate to prevent homoglyph bypass.
+- **Contradiction handling.** Negative evidence (a pattern that doesn't hold on a turn) decrements maturity rather than deleting the pattern; it can recover on re-confirmation.
+- **Daily Haiku-call budget tracker** — 150 detector calls/day cap, midnight reset, fail-safe-permissive (runs if budget file missing/corrupt rather than blocking).
+- **Feed source: attunement** — `backfill_complete` (one-shot) + per-crystallisation events. Soft-rose dot in the inner-life feed.
+
+### Changed
+
+- **`brain/chat/tool_loop.py`** — substantive turns now spawn two pass-2 daemons: `monologue-extractor-N` (v0.0.26) and `attunement-detector-N` (new). The attunement daemon is architecturally identical to the monologue daemon and reuses the same thread-naming counter.
+- **`brain/chat/prompt.py:build_system_message`** — attunement block (`current_read` + most-mature learned patterns) included alongside body/felt-time/arc/fading blocks.
+
+### Internal
+
+- `tdd-guard` enforced one-test-per-edit throughout — discipline preserved end-to-end across all 24 tasks.
+- 24-task subagent-driven plan executed in a worktree (`v0.0.28-alpha.1-attunement`), ~120 commits.
+- `sync-to-public.sh:verify_version_pin()` now handles PEP 440 normalisation: uv stores `0.0.28a1` for `0.0.28-alpha.1`; the preflight normalises both sides before comparing so alpha-cycle bumps don't false-positive.
+- Spec: `docs/superpowers/specs/2026-05-31-user-attunement-design.md`
+
+---
+
 ## v0.0.27 — 2026-05-31 (hygiene release)
 
 ### Added
