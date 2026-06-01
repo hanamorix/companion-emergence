@@ -123,15 +123,18 @@ def _dispatch_record_monologue(
     *,
     monologue: str = "",
     feed_digest: str = "",
+    surface: bool = True,
+    store: MemoryStore,
     persona_dir: Path,
     **_unused: Any,
 ) -> dict[str, Any]:
     """Real handler for record_monologue (MCP and direct-dispatch paths).
 
-    Calls capture_monologue() synchronously. On success returns a dict
-    carrying the monologue text — downstream code (tool_loop._find_monologue_text
-    and the MCP audit pass-through in provider._read_audit_lines_since) reads
-    ``monologue_text`` to decide whether to spawn pass 2.
+    Calls capture_monologue() synchronously: persists the Tier-2 trace memory
+    + the gated Tier-3 digest. On success returns a dict carrying the monologue
+    text — downstream code (tool_loop._find_monologue_text and the MCP audit
+    pass-through in provider._read_audit_lines_since) reads ``monologue_text``
+    to decide whether to spawn pass 2.
 
     On CaptureRejected, returns an error dict without raising — the tool
     result is surfaced as a normal (soft) error rather than a crash.
@@ -141,8 +144,10 @@ def _dispatch_record_monologue(
     try:
         captured = capture_monologue(
             persona_dir=persona_dir,
+            store=store,
             monologue=monologue,
             feed_digest=feed_digest,
+            surface=surface,
         )
         return {"ok": True, "monologue_text": captured}
     except CaptureRejected as exc:
