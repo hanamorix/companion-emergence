@@ -1,7 +1,7 @@
 {
   "name": "nellface",
   "private": true,
-  "version": "0.0.28-alpha.1",
+  "version": "0.0.28",
   "type": "module",
   "scripts": {
     "dev": "vite",
