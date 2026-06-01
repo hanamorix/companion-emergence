@@ -522,3 +522,75 @@ export async function invokeRunRecover(
     args: { persona, source_dir: sourceDir, force, dry_run: dryRun },
   });
 }
+
+// ── User attunement (v0.0.28-alpha.1) ──────────────────────────────────
+
+/** A single real-time read of the user's tone, cadence, and mood from
+ *  the most recent chat turn. Null when no read has been produced yet
+ *  (fresh persona, or attunement extractor not yet active). */
+export interface CurrentRead {
+  ts: string;
+  source_turn_id: string;
+  tone_label: string;
+  tone_justification: string;
+  cadence_label: string;
+  cadence_justification: string;
+  mood_valence: number;
+  mood_intensity: number;
+  predicted_arc_shape: string;
+  schema_version: string;
+}
+
+/** A durable learned pattern about the user, extracted from backfill or
+ *  from a sequence of consistent real-time reads. */
+export interface LearnedPattern {
+  id: string;
+  category: "tone" | "cadence" | "topic_affinity" | "response_shape" | "relational";
+  canonical_key: string;
+  description: string;
+  evidence_count: number;
+  maturity: "immature" | "forming" | "known" | "falsified";
+  first_seen_at: string;
+  last_confirmed_at: string;
+  last_addressed_at: string | null;
+  crystallised_at: string | null;
+  falsified_at: string | null;
+  examples: string[];
+  schema_version: string;
+}
+
+/** Summary of the most recent (or currently-running) backfill pass over
+ *  historical chat windows. Null when no backfill has been attempted. */
+export interface AttunementBackfill {
+  started_at: string;
+  total_windows: number;
+  sampled_windows: number;
+  processed_windows: number;
+  patterns_emitted: number;
+  status: "complete" | "running" | "interrupted" | "deferred_to_next_day";
+  last_cursor: string;
+  schema_version: string;
+}
+
+/** Full payload returned by GET /persona/attunement. */
+export interface AttunementPayload {
+  current_read: CurrentRead | null;
+  learned_patterns: LearnedPattern[];
+  backfill: AttunementBackfill | null;
+}
+
+/**
+ * Fetch the attunement snapshot for a persona — current real-time read,
+ * all learned patterns, and the last backfill summary.
+ *
+ * Returns null fields for a fresh persona that has not yet produced any
+ * attunement data. Throws on non-2xx so the caller can decide whether
+ * to surface an error or silently skip the panel.
+ */
+export async function fetchAttunement(persona: string): Promise<AttunementPayload> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/attunement`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/persona/attunement ${r.status}`);
+  return (await r.json()) as AttunementPayload;
+}
