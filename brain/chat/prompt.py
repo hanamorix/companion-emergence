@@ -205,6 +205,10 @@ def build_system_message(
     if fading_summary_block.strip():
         parts.append(fading_summary_block)
 
+    interior_block = _build_interior_continuity_block(store)
+    if interior_block.strip():
+        parts.append(interior_block)
+
     # 5d. Attunement block — what Nell senses about the user right now:
     # current tone/cadence read + learned patterns (spec §14, attunement design).
     # Failure-safe: empty on fresh installs or any disk/parse error. The block
@@ -831,6 +835,18 @@ def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
     except Exception:  # noqa: BLE001
         log.exception("grief.render_grief_block failed — falling back to silent block")
         return "memory · loss: still."
+
+
+def _build_interior_continuity_block(store: MemoryStore) -> str:
+    """Tier-2 ambient continuity — her own recent monologue traces.
+    Spec: 2026-06-01-three-tier-monologue-design.md §4. Best-effort."""
+    try:
+        from brain.monologue.ambient import build_interior_continuity_block
+
+        return build_interior_continuity_block(store)
+    except Exception:  # noqa: BLE001
+        log.exception("interior-continuity block failed — omitting")
+        return ""
 
 
 def _collect_soul_hints(soul_store: SoulStore, limit: int) -> tuple[str, ...]:

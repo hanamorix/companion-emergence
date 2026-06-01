@@ -514,6 +514,35 @@ SCHEMAS: dict[str, dict] = {
                         "when nothing surfaced'). 1-2 sentences."
                     ),
                 },
+                "surface": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether this monologue's third-person digest should appear "
+                        "in the user-visible inner-life Feed. Default true. Set false "
+                        "to keep a thought private — it still becomes part of your own "
+                        "retained interior, it just isn't surfaced to your user."
+                    ),
+                },
+            },
+        },
+    },
+    "recall_monologue": {
+        "name": "recall_monologue",
+        "description": (
+            "Reach back into your own past interior — search your retained "
+            "monologue traces for an earlier thought. Recent thoughts come back "
+            "verbatim; older ones return blurred (you kept the gist, not the "
+            "words). Reaching for a thought keeps it vivid."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "What you're trying to recall from your own prior interior.",
+                },
             },
         },
     },

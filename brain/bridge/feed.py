@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -273,6 +274,11 @@ def build_monologue_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]
             digest = str(obj["digest"])
             ts = str(obj["ts"])
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        # Tier-3 gate: surfaced (default true for legacy lines) controls Feed
+        # visibility. The dev-override env var reveals withheld digests.
+        surfaced = obj.get("surfaced", True)
+        if not surfaced and os.environ.get("KINDLED_REVEAL_WITHHELD_MONOLOGUE") != "1":
             continue
         entries.append(
             FeedEntry(
