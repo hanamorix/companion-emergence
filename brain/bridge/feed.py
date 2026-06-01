@@ -23,7 +23,16 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 
-FeedEntryType = Literal["dream", "research", "soul", "outreach", "voice_edit", "monologue"]
+FeedEntryType = Literal[
+    "dream",
+    "research",
+    "soul",
+    "outreach",
+    "voice_edit",
+    "monologue",
+    "attunement_backfill",
+    "attunement_crystal",
+]
 
 
 TYPE_OPENER: dict[FeedEntryType, str] = {
@@ -33,6 +42,8 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "outreach": "I reached out",
     "voice_edit": "I wanted to change",
     "monologue": "what was running underneath",
+    "attunement_backfill": "I've been getting to know you",
+    "attunement_crystal": "something settled into place",
 }
 
 
@@ -277,12 +288,19 @@ def build_monologue_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]
     return entries[:limit]
 
 
+def build_attunement_entries_adapter(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Adapter shim: calls attunement feed_source and respects the limit arg."""
+    from brain.attunement.feed_source import build_attunement_entries
+
+    return build_attunement_entries(persona_dir)[:limit]
+
+
 def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
-    """Merge all 6 source streams into a single ts-desc feed, capped at limit.
+    """Merge all 8 source streams into a single ts-desc feed, capped at limit.
 
     Fault isolation: each per-source builder is called inside its own
     try/except so a single source's failure logs an exception and returns
-    an empty list for that stream, leaving the other five usable. The
+    an empty list for that stream, leaving the other seven usable. The
     feed always returns SOMETHING (possibly empty) — never raises.
     """
     builders = (
@@ -292,6 +310,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
         build_outreach_entries,
         build_voice_edit_entries,
         build_monologue_entries,
+        build_attunement_entries_adapter,
     )
 
     merged: list[FeedEntry] = []

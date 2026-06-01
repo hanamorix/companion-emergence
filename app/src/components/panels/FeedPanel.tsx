@@ -14,15 +14,19 @@ const TYPE_LABEL: Record<FeedEntryType, string> = {
   outreach: "Outreach",
   voice_edit: "Voice edit",
   monologue: "Monologue",
+  attunement_backfill: "Attunement",
+  attunement_crystal: "Pattern",
 };
 
 const TYPE_DOT: Record<FeedEntryType, string> = {
   dream: "#6b95b8",
   research: "#b89c6b",
   soul: "#b87fa3",
-  outreach: "#823329",   // project accent
+  outreach: "#823329",         // project accent
   voice_edit: "#7fa37f",
-  monologue: "#9b8ab8",  // soft violet — inner thought
+  monologue: "#9b8ab8",        // soft violet — inner thought
+  attunement_backfill: "#c89890",  // soft rose — attunement
+  attunement_crystal: "#c89890",   // soft rose — attunement
 };
 
 /**
