@@ -1118,6 +1118,30 @@ def build_app(
         entries = build_feed(persona_dir, limit=50)
         return {"entries": [e.to_dict() for e in entries]}
 
+    # ── /persona/attunement — attunement state inspection ───────────────────
+    @app.get("/persona/attunement", dependencies=[Depends(require_http_auth)])
+    def get_attunement() -> dict[str, Any]:
+        """Return current attunement state for the inspection panel (spec §10)."""
+        from dataclasses import asdict
+
+        from brain.attunement.store import read_current_read, read_learned_patterns
+        current = read_current_read(persona_dir)
+        patterns = read_learned_patterns(persona_dir)
+        _maturity_order = {"known": 0, "forming": 1, "immature": 2, "falsified": 3}
+        patterns_sorted = sorted(patterns, key=lambda p: _maturity_order.get(p.maturity, 99))
+        backfill = None
+        bf_path = persona_dir / "attunement" / "backfill_state.json"
+        if bf_path.exists():
+            try:
+                backfill = json.loads(bf_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                backfill = None
+        return {
+            "current_read": asdict(current) if current else None,
+            "learned_patterns": [asdict(p) for p in patterns_sorted],
+            "backfill": backfill,
+        }
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
