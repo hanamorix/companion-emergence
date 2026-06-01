@@ -39,6 +39,12 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.attunement.backfill import (
+    run_backfill as _attunement_run_backfill,
+)
+from brain.attunement.backfill import (
+    should_run_backfill as _attunement_should_run_backfill,
+)
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
@@ -118,6 +124,17 @@ def run_folded(
     last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
     last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
     last_voice_reflection_at = time.monotonic() if voice_reflection_interval_s is not None else None
+
+    # One-shot startup: run the attunement backfill if this is a first-launch
+    # (≥10 user turns + no completed backfill_state.json). Wrapped in
+    # try/except so a misbehaving backfill never crashes supervisor startup —
+    # autonomous-behaviour recipe item 3 (defer cleanly, don't fail loudly).
+    try:
+        if _attunement_should_run_backfill(persona_dir):
+            _attunement_run_backfill(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("attunement backfill failed during startup: %s", exc)
+
     while not stop_event.is_set():
         try:
             with ExitStack() as stack:
