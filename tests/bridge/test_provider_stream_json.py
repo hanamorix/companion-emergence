@@ -294,3 +294,176 @@ def test_chat_stream_mcp_tools_argv():
         assert "--allowedTools" in argv
         assert "--output-format" in argv
         assert "stream-json" in argv
+
+
+# ---- Stream idle-timeout instrumentation (spec 2026-06-01) ----
+
+
+def _assistant_tool_use_line(tool_name: str) -> str:
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": tool_name, "input": {}}],
+                },
+            }
+        )
+        + "\n"
+    )
+
+
+class _StallAfter:
+    """Yield the given lines, then block forever so the idle watchdog fires."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._i = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i < len(self._lines):
+            line = self._lines[self._i]
+            self._i += 1
+            return line
+        import time as _t
+
+        _t.sleep(5)
+        raise StopIteration
+
+
+def _stall_proc(lines):
+    proc = MagicMock()
+    proc.stdout = _StallAfter(lines)
+    proc.stdin = MagicMock()
+    proc.poll.return_value = None
+    proc.wait.return_value = 0
+    proc.returncode = 0
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.stderr = MagicMock()
+    proc.stderr.read.return_value = ""
+    return proc
+
+
+def test_idle_timeout_records_tool_in_flight(tmp_path, monkeypatch):
+    """A tool_use frame then silence → stream_timeouts.jsonl names the tool and
+    the per-event budget that fired."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
+
+    proc = _stall_proc([_assistant_tool_use_line("mcp__brain-tools__recall_arc")])
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        events = list(
+            provider.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "noop"}],
+                options={"persona_dir": str(persona)},
+            )
+        )
+
+    errs = [e for e in events if isinstance(e, StreamError)]
+    assert errs and errs[0].stage == "claude_cli_idle_timeout"
+    assert "recall_arc" in errs[0].detail
+
+    log = persona / "stream_timeouts.jsonl"
+    assert log.is_file()
+    row = json.loads(log.read_text().splitlines()[-1])
+    assert row["tool_in_flight"] is True
+    assert row["tool_name"] == "mcp__brain-tools__recall_arc"
+    assert row["last_frame_type"] == "assistant"
+    assert row["budget_s"] == 0.2  # per-event budget fired (a frame arrived first)
+    assert row["frames_seen"] == 1
+
+
+def test_idle_timeout_cold_start_records_no_frame(tmp_path, monkeypatch):
+    """No frame ever arrives → first-event budget fired, last_frame_type null,
+    frames_seen 0, tool_in_flight false."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
+
+    proc = _stall_proc([])  # emits nothing, then blocks
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        list(
+            provider.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "noop"}],
+                options={"persona_dir": str(persona)},
+            )
+        )
+
+    row = json.loads((persona / "stream_timeouts.jsonl").read_text().splitlines()[-1])
+    assert row["last_frame_type"] is None
+    assert row["frames_seen"] == 0
+    assert row["tool_in_flight"] is False
+    assert row["budget_s"] == 0.1  # first-event budget fired
+
+
+def test_idle_timeout_mid_generation_records_stream_event(tmp_path, monkeypatch):
+    """A text delta then silence → last_frame_type 'stream_event', no tool."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
+
+    proc = _stall_proc([_delta_line("partial")])
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        list(
+            provider.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "noop"}],
+                options={"persona_dir": str(persona)},
+            )
+        )
+
+    row = json.loads((persona / "stream_timeouts.jsonl").read_text().splitlines()[-1])
+    assert row["last_frame_type"] == "stream_event"
+    assert row["tool_in_flight"] is False
+    assert row["tool_name"] is None
+    assert row["budget_s"] == 0.2
+
+
+def test_idle_timeout_without_persona_dir_only_logs(monkeypatch, caplog):
+    """No persona_dir (non-tool stream) → no file write, no exception, still
+    logger.warning."""
+    import logging
+
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
+
+    proc = _stall_proc([])
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        with caplog.at_level(logging.WARNING, logger="brain.bridge.provider"):
+            events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+
+    assert any(isinstance(e, StreamError) for e in events)
+    assert any("stream idle timeout" in r.message for r in caplog.records)
+
+
+def test_normal_stream_writes_no_timeout_log(tmp_path):
+    """A normal stream (frames then result) must not create stream_timeouts.jsonl."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    lines = [_delta_line("ok"), _result_line("ok")]
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=_fake_popen(lines)):
+        events = list(
+            provider.chat_stream(
+                [ChatMessage(role="user", content="hi")],
+                tools=[{"name": "noop"}],
+                options={"persona_dir": str(persona)},
+            )
+        )
+    assert any(isinstance(e, StreamDone) for e in events)
+    assert not (persona / "stream_timeouts.jsonl").exists()
