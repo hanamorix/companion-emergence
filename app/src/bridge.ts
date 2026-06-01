@@ -159,7 +159,9 @@ export type FeedEntryType =
   | "soul"
   | "outreach"
   | "voice_edit"
-  | "monologue";
+  | "monologue"
+  | "attunement_backfill"
+  | "attunement_crystal";
 
 export interface FeedEntry {
   type: FeedEntryType;

@@ -15,7 +15,16 @@ from brain.bridge.feed import (
 
 def test_type_opener_covers_all_types() -> None:
     """Every FeedEntry.type must have an opener phrase mapped."""
-    expected = {"dream", "research", "soul", "outreach", "voice_edit", "monologue"}
+    expected = {
+        "dream",
+        "research",
+        "soul",
+        "outreach",
+        "voice_edit",
+        "monologue",
+        "attunement_backfill",
+        "attunement_crystal",
+    }
     assert set(TYPE_OPENER.keys()) == expected
     for key, opener in TYPE_OPENER.items():
         assert isinstance(opener, str) and opener, f"opener for {key!r} must be a non-empty string"
