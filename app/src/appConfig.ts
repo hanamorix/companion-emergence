@@ -185,8 +185,13 @@ export async function runMigrate(args: MigrateArgs): Promise<InitResult> {
  * directory. Returns counts, detected persona name, and any errors or
  * warnings the Rust layer found — all without modifying the source.
  */
-export async function runPreflightExistingCE(input_dir: string): Promise<ExistingCePreflight> {
-  return await invoke<ExistingCePreflight>("preflight_existing_ce", { input_dir });
+export async function runPreflightExistingCE(inputDir: string): Promise<ExistingCePreflight> {
+  // Tauri 2 default arg deserialisation expects camelCase keys from JS for direct
+  // command parameters (snake_case Rust params auto-rename to camelCase on the wire).
+  // The earlier `input_dir` key was rejected at runtime — fix shipped after the
+  // Windows wizard report (the previous tests asserted the wrong contract because
+  // they mock invoke() and never round-trip through Tauri's deserialiser).
+  return await invoke<ExistingCePreflight>("preflight_existing_ce", { inputDir });
 }
 
 /**
