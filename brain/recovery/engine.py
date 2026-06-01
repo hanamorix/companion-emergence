@@ -164,7 +164,10 @@ def run_recovery(
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     backup_dir = persona_dir / f"recover-backup-{ts}"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("memories.db", "hebbian.db"):
+    # emotion_vocabulary.json is grown state, not derivable from memories.db
+    # alone — back it up alongside the dbs so recover never silently drops a
+    # persona's learned vocabulary (the warmth/crystallization bug).
+    for name in ("memories.db", "hebbian.db", "emotion_vocabulary.json"):
         src_file = persona_dir / name
         if src_file.is_file():
             shutil.copy2(src_file, backup_dir / name)

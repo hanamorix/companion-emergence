@@ -51,7 +51,35 @@ def load_persona_vocabulary_with_anomaly(
 
     if not path.exists():
         if store is not None:
-            _warn_on_referenced_but_unregistered(store)
+            # Recover-dropped-vocab self-heal: `nell recover` backs up only
+            # memories.db + hebbian.db, so a grown emotion_vocabulary.json is
+            # lost. If memories reference non-baseline emotions, reconstruct the
+            # vocabulary from them rather than orphaning the emotions (which
+            # broke soul crystallization) and misdirecting the user to the OG
+            # migrate path. A missing file is not an integrity anomaly → no
+            # BrainAnomaly. A persona referencing only baseline emotions writes
+            # nothing (fresh-persona behavior preserved).
+            from brain.health.reconstruct import reconstruct_vocabulary_from_memories
+
+            recon_data = reconstruct_vocabulary_from_memories(store)
+            extensions = [
+                e for e in recon_data["emotions"] if e["category"] == "persona_extension"
+            ]
+            if extensions:
+                from brain.health.attempt_heal import save_with_backup
+
+                save_with_backup(path, recon_data)
+                registered = _register_from_data(recon_data)
+                logger.warning(
+                    "emotion_vocabulary.json was missing but memories reference "
+                    "persona emotions %s — reconstructed %d entries from memories "
+                    "and wrote %s. (If this followed `nell recover`, the recover "
+                    "backup omitted the vocabulary file.)",
+                    sorted(e["name"] for e in extensions),
+                    len(recon_data["emotions"]),
+                    path.name,
+                )
+                return registered, None
         return 0, None
 
     data, anomaly = attempt_heal(

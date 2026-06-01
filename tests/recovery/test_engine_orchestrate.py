@@ -62,6 +62,26 @@ def test_real_run_restores_links_and_preserves_source(tmp_path):
     assert hashlib.sha256((src / "memories.db").read_bytes()).hexdigest() == src_before
 
 
+def test_recover_backup_includes_emotion_vocabulary(tmp_path):
+    """The recover backup must preserve emotion_vocabulary.json, not just
+    memories.db + hebbian.db. Omitting it is how `nell recover` silently dropped
+    a persona's grown vocabulary (root cause of the warmth/crystallization bug)."""
+    from pathlib import Path
+
+    p = _persona_with_dangling(tmp_path)
+    src = _source_with_v(tmp_path)
+    (p / "emotion_vocabulary.json").write_text(
+        '{"version": 1, "emotions": [{"name": "warmth", "description": "x", '
+        '"category": "persona_extension", "decay_half_life_days": 45.0, '
+        '"intensity_clamp": 10.0}]}'
+    )
+
+    report = run_recovery(p, source_dir=src, dry_run=False)
+
+    backup = Path(report.backup_path)
+    assert (backup / "emotion_vocabulary.json").is_file()
+
+
 def test_dry_run_changes_nothing(tmp_path):
     p = _persona_with_dangling(tmp_path)
     src = _source_with_v(tmp_path)
