@@ -9,9 +9,18 @@ add the sampling, state-resume, trigger, and orchestration logic.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC
+from datetime import datetime as _datetime
+from pathlib import Path
 
 from brain.attunement.store import BufferTurn
+from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+_log = logging.getLogger(__name__)
+_STATE_FILE = "backfill_state.json"
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,162 @@ def select_sample(windows: list[Window], *, rate: float = 0.2) -> list[Window]:
             round_idx += 1
 
     return sample
+
+
+# ---------------------------------------------------------------------------
+# run_backfill orchestrator (Task 16)
+# ---------------------------------------------------------------------------
+
+def _state_path(persona_dir: Path) -> Path:
+    return persona_dir / "attunement" / _STATE_FILE
+
+
+def _now_iso_str(now: _datetime) -> str:
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_state(persona_dir: Path):  # -> BackfillState | None
+    from brain.attunement.schemas import BackfillState
+
+    p = _state_path(persona_dir)
+    if not p.exists():
+        return None
+    try:
+        return BackfillState(**json.loads(p.read_text()))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        _log.warning("attunement backfill: corrupt state file: %s", exc)
+        return None
+
+
+def _save_state(persona_dir: Path, state) -> None:  # state: BackfillState
+    p = _state_path(persona_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
+    """Collect all user-role turns from active_conversations/*.jsonl, sorted by ts."""
+    convs = persona_dir / "active_conversations"
+    if not convs.exists():
+        return []
+    rows: list[tuple[str, BufferTurn]] = []
+    for jsonl_file in sorted(convs.glob("*.jsonl")):
+        for row in read_jsonl_skipping_corrupt(jsonl_file):
+            if row.get("role") != "user":
+                continue
+            tid = str(row.get("id") or row.get("ts") or "")
+            content = str(row.get("content") or "")
+            ts = str(row.get("ts") or "")
+            if tid and content:
+                rows.append((ts, BufferTurn(id=tid, content=content)))
+    rows.sort(key=lambda r: r[0])
+    return [t for _, t in rows]
+
+
+def _cursor_index(windows: list[Window], cursor: str) -> int:
+    """Return the index AFTER the cursor window. 0 if cursor empty or not found."""
+    if not cursor:
+        return 0
+    for i, w in enumerate(windows):
+        if w.id == cursor:
+            return i + 1
+    return 0
+
+
+def run_backfill(
+    persona_dir: Path,
+    *,
+    detector_fn=None,
+    now_dt: _datetime | None = None,
+    cap: int | None = None,
+):
+    """Run (or resume) the one-time backfill migration.
+
+    Reads existing backfill_state.json if present; resumes from last_cursor.
+    Halts at daily cap with status='deferred_to_next_day'.
+    Returns the final BackfillState.
+    """
+    from brain.attunement.budget import consume_call as _attunement_consume_call
+    from brain.attunement.crystallise import check_crystallisations
+    from brain.attunement.schemas import (
+        DAILY_BUDGET_DEFAULT,
+        SCHEMA_VERSION,
+        BackfillState,
+    )
+    from brain.attunement.store import merge_into_learned
+
+    if cap is None:
+        cap = DAILY_BUDGET_DEFAULT
+
+    if detector_fn is None:
+        from brain.attunement.detector import run_detector as _default_detector
+        detector_fn = _default_detector
+
+    now_dt = now_dt or _datetime.now(UTC)
+    now_iso = _now_iso_str(now_dt)
+
+    existing = _load_state(persona_dir)
+    if existing is not None and existing.status == "complete":
+        return existing
+
+    turns = _read_buffer_turns(persona_dir)
+    all_windows = window_buffer(turns)
+    sampled = select_sample(all_windows)
+
+    start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
+    processed_so_far = existing.processed_windows if existing else 0
+    started_at = existing.started_at if existing else now_iso
+    patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+
+    state = BackfillState(
+        started_at=started_at,
+        total_windows=len(all_windows),
+        sampled_windows=len(sampled),
+        processed_windows=processed_so_far,
+        patterns_emitted=patterns_emitted_so_far,
+        status="running",
+        last_cursor=existing.last_cursor if existing else "",
+        schema_version=SCHEMA_VERSION,
+    )
+    _save_state(persona_dir, state)
+
+    for i in range(start_idx, len(sampled)):
+        window = sampled[i]
+        if not _attunement_consume_call(persona_dir, now=now_dt, cap=cap):
+            state = replace(state, status="deferred_to_next_day")
+            _save_state(persona_dir, state)
+            return state
+
+        try:
+            output = detector_fn(buffer_slice=list(window.turns), reply_text="")
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "attunement backfill: detector error on %s: %s", window.id, exc
+            )
+            continue
+
+        merge_into_learned(
+            persona_dir,
+            output.pattern_candidates,
+            list(window.turns),
+            now_iso=now_iso,
+        )
+        patterns_emitted_so_far += len(output.pattern_candidates)
+        processed_so_far += 1
+        state = replace(
+            state,
+            processed_windows=processed_so_far,
+            patterns_emitted=patterns_emitted_so_far,
+            last_cursor=window.id,
+        )
+        _save_state(persona_dir, state)
+
+    check_crystallisations(persona_dir, now_iso=now_iso)
+    state = replace(state, status="complete")
+    _save_state(persona_dir, state)
+    return state
 
 
 def window_buffer(
