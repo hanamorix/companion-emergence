@@ -120,7 +120,7 @@ describe("runPreflightExistingCE dispatches preflight_existing_ce", () => {
       "/home/user/.local/share/companion-emergence/personas/nell"
     );
     expect(invoke).toHaveBeenCalledWith("preflight_existing_ce", {
-      input_dir: "/home/user/.local/share/companion-emergence/personas/nell",
+      inputDir: "/home/user/.local/share/companion-emergence/personas/nell",
     });
     expect(result.ok).toBe(true);
     expect(result.persona_name).toBe("nell");
