@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -49,6 +50,23 @@ from brain.bridge.chat import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> None:
+    """Record a stream idle-timeout for later diagnosis (spec
+    2026-06-01-stream-timeout-instrumentation). logger.warning always; best-effort
+    append to <persona_dir>/stream_timeouts.jsonl when persona_dir is known.
+    Never raises — runs inside stream teardown."""
+    logger.warning("stream idle timeout: %s", payload)
+    if persona_dir is None:
+        return
+    try:
+        path = persona_dir / "stream_timeouts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 _DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -533,6 +551,9 @@ class ClaudeCliProvider(LLMProvider):
             else:
                 conversation_messages.append(msg)
 
+        _pd = (options or {}).get("persona_dir")
+        log_persona_dir: Path | None = Path(_pd) if _pd else None
+
         flat_prompt = _format_claude_print_prompt(conversation_messages)
 
         cmd = [
@@ -602,6 +623,7 @@ class ClaudeCliProvider(LLMProvider):
                 cmd=cmd,
                 flat_prompt=flat_prompt,
                 system_prompt=system_prompt,
+                persona_dir=log_persona_dir,
             )
         finally:
             if tmp_mcp_path is not None:
@@ -615,6 +637,7 @@ class ClaudeCliProvider(LLMProvider):
         cmd: list[str],
         flat_prompt: str,
         system_prompt: str | None,
+        persona_dir: Path | None = None,
     ) -> Iterator[ChatStreamEvent]:
         """Core Popen + queue-based streaming loop.
 
@@ -667,15 +690,39 @@ class ClaudeCliProvider(LLMProvider):
             done_emitted = False
             timeout = _STREAM_FIRST_EVENT_SECONDS
 
+            # Idle-timeout instrumentation (spec 2026-06-01). Recomputed per
+            # frame so they reflect the last frame seen when a gap trips the
+            # watchdog. Initialised for the cold-start case (timeout on first get).
+            start = time.monotonic()
+            last_frame_type: str | None = None
+            tool_in_flight = False
+            tool_name: str | None = None
+            frames_seen = 0
+
             try:
                 while True:
                     try:
                         item = q.get(timeout=timeout)
                     except _queue_mod.Empty:
                         proc.terminate()
+                        _log_stream_timeout(
+                            persona_dir,
+                            {
+                                "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                                "budget_s": timeout,
+                                "last_frame_type": last_frame_type,
+                                "tool_in_flight": tool_in_flight,
+                                "tool_name": tool_name,
+                                "frames_seen": frames_seen,
+                                "elapsed_s": round(time.monotonic() - start, 3),
+                            },
+                        )
                         yield StreamError(
                             stage="claude_cli_idle_timeout",
-                            detail=f"no stdout line after {timeout:.1f}s",
+                            detail=(
+                                f"no stdout line after {timeout:.1f}s "
+                                f"(last_frame={last_frame_type}, tool={tool_name})"
+                            ),
                         )
                         return
 
@@ -693,6 +740,10 @@ class ClaudeCliProvider(LLMProvider):
                         continue
 
                     t = obj.get("type")
+                    last_frame_type = t
+                    frames_seen += 1
+                    tool_in_flight = False
+                    tool_name = None
                     if t == "stream_event":
                         event = obj.get("event", {})
                         if event.get("type") == "content_block_delta":
@@ -705,6 +756,11 @@ class ClaudeCliProvider(LLMProvider):
                         # Snapshot frame — fallback content when result frame absent.
                         msg_content = obj.get("message", {}).get("content", [])
                         if isinstance(msg_content, list):
+                            for blk in msg_content:
+                                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                                    tool_in_flight = True
+                                    tool_name = str(blk.get("name") or "") or None
+                                    break
                             parts = [
                                 blk.get("text", "")
                                 for blk in msg_content
