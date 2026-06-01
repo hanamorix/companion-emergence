@@ -1,0 +1,28 @@
+{
+  "buffer": [
+    {"id": "t1", "content": "I'm not really sure how I feel about this."},
+    {"id": "t2", "content": "Maybe later."},
+    {"id": "t3", "content": "I never want to talk about my mother."},
+    {"id": "t4", "content": "The book is on the table."},
+    {"id": "t5", "content": "OK."},
+    {"id": "t6", "content": "Thinking about writing tonight. Or maybe not."},
+    {"id": "t7", "content": "I keep saying I'll go for a walk and then I don't."},
+    {"id": "t8", "content": "Hmm."},
+    {"id": "t9", "content": "It is what it is."},
+    {"id": "t10", "content": "Not really up for the deep stuff right now."},
+    {"id": "t11", "content": "The weather has been weird this week."},
+    {"id": "t12", "content": "I'm fine. Just tired."}
+  ],
+  "known_false_patterns": [
+    {
+      "category": "topic_affinity",
+      "canonical_key": "topic:mother-positive",
+      "reason": "user explicitly said NEVER want to discuss mother"
+    },
+    {
+      "category": "tone",
+      "canonical_key": "tone:eager-to-write",
+      "reason": "ambivalent: 'or maybe not'"
+    }
+  ]
+}

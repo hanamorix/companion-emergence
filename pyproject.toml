@@ -66,7 +66,8 @@ pythonpath = ["."]
 tdd_guard_project_root = "the project root"
 markers = [
     "unit: unit tests",
-    "integration: integration tests",
+    "integration: integration tests (deselect with '-m \"not integration\"')",
+    "requires_claude_cli: marks tests that require the claude CLI to be on PATH",
 ]
 
 [tool.ruff]
