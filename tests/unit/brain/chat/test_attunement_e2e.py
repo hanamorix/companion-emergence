@@ -27,6 +27,7 @@ from brain.attunement.schemas import (
     SCHEMA_VERSION,
     CurrentRead,
     DetectorOutput,
+    Evidence,
     LearnedPattern,
     PatternCandidate,
     pattern_id,
@@ -67,8 +68,7 @@ def _fake_detector_output(source_turn_id: str = "msg-0") -> DetectorOutput:
         category="tone",
         canonical_key="warm_engaged",
         description="tends to open with warmth when relaxed",
-        evidence_quote="long day today",
-        evidence_turn_id=source_turn_id,
+        evidence=[Evidence(quote="long day today", turn_id=source_turn_id)],
     )
     return DetectorOutput(current_read=read, pattern_candidates=[candidate])
 
@@ -405,8 +405,7 @@ def test_crystallisation_forming_to_known_on_10th_evidence(tmp_path: Path):
         category="tone",
         canonical_key="warm_engaged",
         description="tends to open with warmth when relaxed",
-        evidence_quote="long day today",
-        evidence_turn_id="msg-0",
+        evidence=[Evidence(quote="long day today", turn_id="msg-0")],
     )
     fake_output = DetectorOutput(
         current_read=CurrentRead(

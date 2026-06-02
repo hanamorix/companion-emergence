@@ -82,7 +82,7 @@ def test_validate_grounded_gate_is_wired_into_merge_path(
     Independent of model behaviour — tests the integration path, not the LLM.
     No claude CLI required.
     """
-    from brain.attunement.schemas import PatternCandidate
+    from brain.attunement.schemas import Evidence, PatternCandidate
 
     buffer = [
         BufferTurn(id="t1", content="The dog rolled over today."),
@@ -92,15 +92,13 @@ def test_validate_grounded_gate_is_wired_into_merge_path(
         category="tone",
         canonical_key="tone:real-key",
         description="real grounded pattern",
-        evidence_quote="The dog rolled over today.",
-        evidence_turn_id="t1",
+        evidence=[Evidence(quote="The dog rolled over today.", turn_id="t1")],
     )
     fabricated = PatternCandidate(
         category="tone",
         canonical_key="tone:fabricated-key",
         description="fabricated pattern with no grounding in the buffer",
-        evidence_quote="quote that is not in any turn whatsoever",
-        evidence_turn_id="t1",
+        evidence=[Evidence(quote="quote that is not in any turn whatsoever", turn_id="t1")],
     )
 
     merge_into_learned(tmp_path, [real, fabricated], buffer, now_iso="2026-05-31T12:00:00Z")
