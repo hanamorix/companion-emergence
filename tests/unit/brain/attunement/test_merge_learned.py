@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from brain.attunement.schemas import PatternCandidate
+from brain.attunement.schemas import Evidence, PatternCandidate
 from brain.attunement.store import (
     BufferTurn,
     merge_into_learned,
@@ -16,8 +16,7 @@ def _candidate(category: str, key: str, quote: str, turn_id: str) -> PatternCand
         category=category,
         canonical_key=key,
         description=f"desc for {key}",
-        evidence_quote=quote,
-        evidence_turn_id=turn_id,
+        evidence=[Evidence(quote=quote, turn_id=turn_id)],
     )
 
 
@@ -105,6 +104,15 @@ def test_evidence_examples_accumulate_capped_at_five(tmp_path: Path) -> None:
     patterns = read_learned_patterns(tmp_path)
     assert len(patterns) == 1
     assert len(patterns[0].examples) == 5  # truncated to cap
+
+
+def test_new_pattern_examples_contains_evidence_quote(tmp_path: Path) -> None:
+    """examples list is populated from evidence.quote, not a removed flat field."""
+    buffer = [_turn("t1", "hello world")]
+    cand = _candidate("tone", "key-1", "hello", "t1")
+    merge_into_learned(tmp_path, [cand], buffer, now_iso="2026-05-31T12:00:00Z")
+    patterns = read_learned_patterns(tmp_path)
+    assert patterns[0].examples == ["hello"]
 
 
 def test_last_entry_per_id_wins_on_read(tmp_path: Path) -> None:
