@@ -179,6 +179,11 @@ def _cursor_index(windows: list[Window], cursor: str) -> int:
 
 _MIN_TURNS_FOR_BACKFILL = 10
 
+# Categories added in schema v0.0.28-alpha.2 that need a supplementary bootstrap
+# when an existing persona's backfill completed at an older schema version.
+# tone + cadence are already learned and must NOT be double-counted.
+_NEW_CATEGORIES: frozenset[str] = frozenset({"topic_affinity", "response_shape", "relational"})
+
 
 def should_run_backfill(persona_dir: Path) -> bool:
     """Detect whether backfill should run at startup.
@@ -195,18 +200,44 @@ def should_run_backfill(persona_dir: Path) -> bool:
     return True
 
 
+def should_run_supplementary_backfill(persona_dir: Path) -> bool:
+    """True iff a prior backfill completed at an OLDER schema version.
+
+    The new category dimensions (topic_affinity, response_shape, relational)
+    need a supplementary bootstrap from history.  Returns False when there is
+    no prior completed state or when the completed state is already at the
+    current SCHEMA_VERSION.
+    """
+    from brain.attunement.schemas import SCHEMA_VERSION
+
+    existing = _load_state(persona_dir)
+    if existing is None or existing.status != "complete":
+        return False
+    return existing.schema_version != SCHEMA_VERSION
+
+
 def run_backfill(
     persona_dir: Path,
     *,
     detector_fn=None,
     now_dt: _datetime | None = None,
     cap: int | None = None,
+    only_categories: frozenset[str] | None = None,
+    supplementary: bool = False,
 ):
     """Run (or resume) the one-time backfill migration.
 
     Reads existing backfill_state.json if present; resumes from last_cursor.
     Halts at daily cap with status='deferred_to_next_day'.
     Returns the final BackfillState.
+
+    When *supplementary=True* the existing completed state is bypassed and a
+    fresh pass is started from the beginning (used by run_supplementary_backfill
+    to bootstrap new category dimensions after a schema upgrade).
+
+    When *only_categories* is set and *detector_fn* is None, the default
+    detector is wrapped to restrict extraction to those categories so existing
+    tone/cadence patterns are not double-counted.
     """
     from brain.attunement.budget import consume_call as _attunement_consume_call
     from brain.attunement.crystallise import check_crystallisations
@@ -222,23 +253,43 @@ def run_backfill(
 
     if detector_fn is None:
         from brain.attunement.detector import run_detector as _default_detector
-        detector_fn = _default_detector
+        if only_categories is not None:
+            _cats = only_categories  # capture for closure
+
+            def detector_fn(*, buffer_slice, reply_text):  # noqa: ANN001
+                return _default_detector(
+                    buffer_slice=buffer_slice,
+                    reply_text=reply_text,
+                    only_categories=_cats,
+                )
+        else:
+            detector_fn = _default_detector
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = _now_iso_str(now_dt)
 
     existing = _load_state(persona_dir)
-    if existing is not None and existing.status == "complete":
+    # Normal path: short-circuit if already complete.
+    # Supplementary path: bypass the early-return — the whole point is to
+    # re-run after a prior completion, starting fresh at cursor=0.
+    if not supplementary and existing is not None and existing.status == "complete":
         return existing
 
     turns = _read_buffer_turns(persona_dir)
     all_windows = window_buffer(turns)
     sampled = select_sample(all_windows)
 
-    start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
-    processed_so_far = existing.processed_windows if existing else 0
-    started_at = existing.started_at if existing else now_iso
-    patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+    if supplementary:
+        # Always start fresh — ignore any cursor from the previous completed state
+        start_idx = 0
+        processed_so_far = 0
+        started_at = now_iso
+        patterns_emitted_so_far = 0
+    else:
+        start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
+        processed_so_far = existing.processed_windows if existing else 0
+        started_at = existing.started_at if existing else now_iso
+        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
 
     state = BackfillState(
         started_at=started_at,
@@ -287,6 +338,30 @@ def run_backfill(
     state = replace(state, status="complete")
     _save_state(persona_dir, state)
     return state
+
+
+def run_supplementary_backfill(
+    persona_dir: Path,
+    *,
+    detector_fn=None,
+    now_dt: _datetime | None = None,
+    cap: int | None = None,
+):
+    """One-time supplementary pass after a schema upgrade.
+
+    Extracts ONLY the new category dimensions (topic_affinity, response_shape,
+    relational) from history. tone + cadence are already learned — no
+    double-counting. Writes a fresh state at the current SCHEMA_VERSION so the
+    feed-source will not fire another backfill_complete for the same completion.
+    """
+    return run_backfill(
+        persona_dir,
+        detector_fn=detector_fn,
+        now_dt=now_dt,
+        cap=cap,
+        only_categories=_NEW_CATEGORIES,
+        supplementary=True,
+    )
 
 
 def window_buffer(
