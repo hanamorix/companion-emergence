@@ -145,6 +145,60 @@ def test_supplementary_resets_cursor_not_inheriting_stale_completed_cursor(tmp_p
     )
 
 
+def test_supplementary_preserves_prior_completion_record(tmp_path):
+    """A supplementary pass augments the prior backfill — it must NOT clobber
+    the original started_at or reset patterns_emitted. The completed record
+    (what the attunement endpoint reports) survives the upgrade; the new pass
+    accumulates onto it."""
+    from datetime import UTC, datetime
+
+    from brain.attunement.backfill import run_supplementary_backfill
+    from brain.attunement.schemas import (
+        CurrentRead,
+        DetectorOutput,
+        Evidence,
+        PatternCandidate,
+    )
+
+    rows = _make_buffer_file(tmp_path, n_turns=15)
+    original_started_at = "2026-05-31T08:00:00+00:00"
+    d = tmp_path / "attunement"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "backfill_state.json").write_text(json.dumps({
+        "started_at": original_started_at, "total_windows": 20, "sampled_windows": 10,
+        "processed_windows": 10, "patterns_emitted": 3, "status": "complete",
+        "last_cursor": "turn_xyz", "schema_version": "0.0.28-alpha.1",
+    }))
+
+    first_content, first_id = rows[0]["content"], rows[0]["id"]
+
+    def stub_detector(*, buffer_slice, reply_text):
+        return DetectorOutput(
+            current_read=CurrentRead(
+                ts="2026-06-01T12:00:00Z", source_turn_id=first_id,
+                tone_label="unknown", tone_justification="",
+                cadence_label="unknown", cadence_justification="",
+                mood_valence=0.0, mood_intensity=0.0, predicted_arc_shape="",
+                schema_version=SCHEMA_VERSION,
+            ),
+            pattern_candidates=[PatternCandidate(
+                category="topic_affinity", canonical_key="topic_affinity:various-topics",
+                description="drawn to various topics",
+                evidence=[Evidence(quote=first_content, turn_id=first_id)],
+            )],
+        )
+
+    state = run_supplementary_backfill(
+        tmp_path, detector_fn=stub_detector,
+        now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+    )
+
+    # Original journey-start preserved (not reset to now); new patterns accumulate.
+    assert state.started_at == original_started_at
+    assert state.patterns_emitted >= 3
+    assert state.schema_version == SCHEMA_VERSION
+
+
 # ---------------------------------------------------------------------------
 # Part 4 — supervisor wiring test
 # ---------------------------------------------------------------------------
