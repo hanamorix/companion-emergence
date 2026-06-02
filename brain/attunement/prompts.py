@@ -16,26 +16,37 @@ Your output is a JSON object matching this schema:
   },
   "pattern_candidates": [
     {
-      "category": "tone" | "cadence",
+      "category": "tone" | "cadence" | "topic_affinity" | "response_shape" | "relational",
       "canonical_key": "stable identifier",
       "description": "one-sentence natural language",
-      "evidence_quote": "VERBATIM substring from one of the turns below",
-      "evidence_turn_id": "the id of the turn the quote came from"
+      "evidence": [{"quote": "VERBATIM substring of a turn", "turn_id": "that turn's id"}]
     }
-  ]
+  ],
+  "addressed_pattern_ids": ["id of any learned pattern you named in your reply"]
 }
 
 CRITICAL RULES:
 
-1. Every pattern_candidate MUST include `evidence_quote` — verbatim text
-   copied from one of the user's turns. If you cannot quote, OMIT the
-   candidate. Do not paraphrase. Do not fabricate.
+1. Every pattern_candidate MUST include an `evidence` list — each entry
+   is a verbatim quote copied from one of the user's turns plus the
+   turn_id it came from. If you cannot quote, OMIT the candidate.
+   Do not paraphrase. Do not fabricate.
 
-2. Every pattern_candidate MUST include `evidence_turn_id` — the id of
-   the turn the quote came from. If you can't identify the turn, OMIT.
+2. Every entry in `evidence` MUST include `turn_id` — the id of the
+   turn the quote came from. If you can't identify the turn, OMIT
+   that evidence entry (and omit the whole candidate if no entries remain).
 
-3. Categories in this release: only "tone" and "cadence". Do not emit
-   topic_affinity, response_shape, or relational candidates.
+3. Categories:
+   - "tone": her emotional colouring (warm, frayed, guarded…)
+   - "cadence": her rhythm/timing/pacing (terse, measured, expansive)
+   - "topic_affinity": subjects she's drawn to / returns to with energy
+   - "response_shape": HOW she engages structurally — asks-back vs declares,
+     elaborates vs clips, deflects, front-loads-then-qualifies. Not her emotion
+     (tone) or rhythm (cadence) — the shape of her engagement.
+   - "relational": cross-turn behaviour — returning to / avoiding a subject,
+     conversational sequences ("circles back to her brother whenever work comes up").
+     A relational candidate MUST cite >=2 evidence quotes from DIFFERENT turns
+     that show the link. If you can only ground one side, OMIT it.
 
 4. When the input is empty, ambiguous, or too short to read:
    - Return `tone_label`: "unknown" and `cadence_label`: "unknown"
@@ -46,6 +57,10 @@ CRITICAL RULES:
    if you observe "warm tone when discussing the dog" twice, both runs
    should produce the same canonical_key. Use kebab-case descriptive
    keys like "tone:warm-when-dog".
+
+6. If you named a learned pattern in your reply, list its id in
+   addressed_pattern_ids — only if its phrasing genuinely appears
+   in your reply. If you addressed no patterns, return an empty list.
 
 Your output is consumed by code that re-validates every quote against
 the source. Fabricated quotes are silently rejected and logged. You
