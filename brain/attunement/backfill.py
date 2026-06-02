@@ -298,7 +298,7 @@ def run_backfill(
         processed_windows=processed_so_far,
         patterns_emitted=patterns_emitted_so_far,
         status="running",
-        last_cursor=existing.last_cursor if existing else "",
+        last_cursor=("" if supplementary else (existing.last_cursor if existing else "")),
         schema_version=SCHEMA_VERSION,
     )
     _save_state(persona_dir, state)

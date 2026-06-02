@@ -110,6 +110,41 @@ def test_run_supplementary_backfill_completes_at_current_schema_version(tmp_path
     assert len(topic_patterns) >= 1
 
 
+def test_supplementary_resets_cursor_not_inheriting_stale_completed_cursor(tmp_path):
+    """A supplementary pass must start from an EMPTY cursor, not inherit the
+    prior completed full-backfill's end-of-list cursor. Otherwise, if the daily
+    cap is exhausted before the first window, it defers with a stale end cursor
+    and on resume skips every window — bootstrapping zero new-category patterns."""
+    from datetime import UTC, datetime
+
+    from brain.attunement.backfill import run_supplementary_backfill
+
+    _make_buffer_file(tmp_path, n_turns=15)
+    # Completed alpha.1 state whose cursor points at the LAST turn.
+    d = tmp_path / "attunement"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "backfill_state.json").write_text(json.dumps({
+        "started_at": "x", "total_windows": 5, "sampled_windows": 5,
+        "processed_windows": 5, "patterns_emitted": 3, "status": "complete",
+        "last_cursor": "m-14", "schema_version": "0.0.28-alpha.1",
+    }))
+
+    # cap=0 → budget exhausted at the first window → defers immediately, before
+    # any window updates the cursor. The persisted cursor is whatever the fresh
+    # state was initialised with — which must be "" for a supplementary pass.
+    state = run_supplementary_backfill(
+        tmp_path,
+        detector_fn=lambda *, buffer_slice, reply_text: None,  # never called (cap=0)
+        now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+        cap=0,
+    )
+
+    assert state.status == "deferred_to_next_day"
+    assert state.last_cursor == "", (
+        f"supplementary pass inherited stale cursor {state.last_cursor!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Part 4 — supervisor wiring test
 # ---------------------------------------------------------------------------
