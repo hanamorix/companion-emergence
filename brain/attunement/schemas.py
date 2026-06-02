@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-SCHEMA_VERSION = "0.0.28-alpha.2"
+SCHEMA_VERSION = "0.0.29"
 
 MATURITY_FORMING_MIN = 3
 MATURITY_KNOWN_MIN = 10

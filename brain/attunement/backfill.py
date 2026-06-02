@@ -179,7 +179,7 @@ def _cursor_index(windows: list[Window], cursor: str) -> int:
 
 _MIN_TURNS_FOR_BACKFILL = 10
 
-# Categories added in schema v0.0.28-alpha.2 that need a supplementary bootstrap
+# Categories added in schema v0.0.29 that need a supplementary bootstrap
 # when an existing persona's backfill completed at an older schema version.
 # tone + cadence are already learned and must NOT be double-counted.
 _NEW_CATEGORIES: frozenset[str] = frozenset({"topic_affinity", "response_shape", "relational"})
