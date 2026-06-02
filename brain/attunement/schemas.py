@@ -64,20 +64,31 @@ class LearnedPattern:
 
 
 @dataclass(frozen=True)
+class Evidence:
+    quote: str        # VERBATIM substring of the named turn
+    turn_id: str
+
+    def __post_init__(self) -> None:
+        if not self.quote:
+            raise ValueError("evidence quote is required")
+        if not self.turn_id:
+            raise ValueError("evidence turn_id is required")
+
+
+@dataclass(frozen=True)
 class PatternCandidate:
     category: str
     canonical_key: str
     description: str
-    evidence_quote: str
-    evidence_turn_id: str
+    evidence: list[Evidence]
 
     def __post_init__(self) -> None:
         if self.category not in _VALID_CATEGORIES:
             raise ValueError(f"invalid category: {self.category}")
-        if not self.evidence_quote:
-            raise ValueError("evidence_quote is required")
-        if not self.evidence_turn_id:
-            raise ValueError("evidence_turn_id is required")
+        if not self.evidence:
+            raise ValueError("at least one evidence entry is required")
+        if self.category == "relational" and len(self.evidence) < 2:
+            raise ValueError("relational patterns require >=2 evidence entries")
 
 
 @dataclass(frozen=True)
