@@ -269,15 +269,17 @@ def apply_contradiction(
 def validate_grounded(
     candidate: PatternCandidate, buffer_slice: list[BufferTurn]
 ) -> bool:
-    """Reject candidates whose evidence_quote can't be located in the named turn.
-
-    Hard gate: candidate is dropped when False is returned. Load-bearing
-    hallucination control per spec §13 Risk 1.
-
-    Normalisation: whitespace collapsed, NFC Unicode normalisation, and
-    casefold applied before substring match.
+    """Every Evidence quote must be a normalised-substring of its named turn.
+    Relational additionally requires >=2 evidence entries. Load-bearing
+    hallucination control; the strictest gate falls on the most inferential category.
     """
-    turn = next((t for t in buffer_slice if t.id == candidate.evidence_turn_id), None)
-    if turn is None:
+    if candidate.category == "relational" and len(candidate.evidence) < 2:
         return False
-    return _normalise(candidate.evidence_quote) in _normalise(turn.content)
+    if not candidate.evidence:
+        return False
+    by_id = {t.id: t for t in buffer_slice}
+    for ev in candidate.evidence:
+        turn = by_id.get(ev.turn_id)
+        if turn is None or _normalise(ev.quote) not in _normalise(turn.content):
+            return False
+    return True

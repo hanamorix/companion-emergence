@@ -1,22 +1,30 @@
 """Tests for the validate_grounded hallucination-control gate."""
 from __future__ import annotations
 
-from brain.attunement.schemas import PatternCandidate
+from brain.attunement.schemas import Evidence, PatternCandidate
 from brain.attunement.store import BufferTurn, validate_grounded
 
 
-def _candidate(quote: str, turn_id: str) -> PatternCandidate:
+def _candidate(quote: str, turn_id: str, category: str = "tone") -> PatternCandidate:
     return PatternCandidate(
-        category="tone",
+        category=category,
         canonical_key="key-x",
         description="some pattern",
-        evidence_quote=quote,
-        evidence_turn_id=turn_id,
+        evidence=[Evidence(quote=quote, turn_id=turn_id)],
     )
 
 
 def _turn(turn_id: str, content: str) -> BufferTurn:
     return BufferTurn(id=turn_id, content=content)
+
+
+def _relational(pairs: list[tuple[str, str]]) -> PatternCandidate:
+    return PatternCandidate(
+        category="relational",
+        canonical_key="rk",
+        description="returns to X when Y",
+        evidence=[Evidence(quote=q, turn_id=t) for q, t in pairs],
+    )
 
 
 def test_candidate_with_verified_quote_is_accepted() -> None:
@@ -63,7 +71,7 @@ def test_normalisation_handles_precomposed_vs_decomposed_unicode() -> None:
     # (e + combining acute U+0301). Visually identical but byte-distinct.
     # NFC normalisation in _normalise() makes them compare equal.
     buffer = [_turn("t1", "café au lait")]
-    candidate = _candidate("café au lait", "t1")
+    candidate = _candidate("café au lait", "t1")
     assert validate_grounded(candidate, buffer) is True
 
 
@@ -83,3 +91,15 @@ def test_validate_grounded_rejects_when_turn_id_not_in_buffer() -> None:
 def test_validate_grounded_handles_empty_buffer() -> None:
     candidate = _candidate("anything", "t1")
     assert validate_grounded(candidate, []) is False
+
+
+def test_relational_with_two_grounded_quotes_accepted() -> None:
+    buffer = [_turn("t1", "work has been brutal"), _turn("t2", "anyway, my brother called")]
+    cand = _relational([("work has been brutal", "t1"), ("my brother called", "t2")])
+    assert validate_grounded(cand, buffer) is True
+
+
+def test_relational_with_fabricated_second_turn_rejected() -> None:
+    buffer = [_turn("t1", "work has been brutal"), _turn("t2", "anyway, my brother called")]
+    cand = _relational([("work has been brutal", "t1"), ("invented quote", "t2")])
+    assert validate_grounded(cand, buffer) is False
