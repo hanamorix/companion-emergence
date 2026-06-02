@@ -111,8 +111,7 @@ def _log_rejection(persona_dir: Path, candidate: PatternCandidate, reason: str) 
         "ts": _now_iso(),
         "category": candidate.category,
         "canonical_key": candidate.canonical_key,
-        "evidence_quote": candidate.evidence_quote,
-        "evidence_turn_id": candidate.evidence_turn_id,
+        "evidence": [{"quote": ev.quote, "turn_id": ev.turn_id} for ev in candidate.evidence],
         "reason": reason,
     }
     with path.open("a") as f:
@@ -181,7 +180,7 @@ def merge_into_learned(
         if pid in existing:
             prev = existing[pid]
             new_count = prev.evidence_count + 1
-            new_examples = (prev.examples + [candidate.evidence_quote])[-_EXAMPLES_CAP:]
+            new_examples = (prev.examples + [ev.quote for ev in candidate.evidence])[-_EXAMPLES_CAP:]
             updated = LearnedPattern(
                 id=pid,
                 category=prev.category,
@@ -210,7 +209,7 @@ def merge_into_learned(
                 last_addressed_at=None,
                 crystallised_at=None,
                 falsified_at=None,
-                examples=[candidate.evidence_quote],
+                examples=[ev.quote for ev in candidate.evidence],
                 schema_version=SCHEMA_VERSION,
             )
 
