@@ -1,8 +1,8 @@
 """Render the attunement block for Nell's ambient prompt context.
 
-alpha.1 form: tone + cadence current read + learned tone/cadence patterns.
-The addressability directive ("Don't force it") is reserved for v0.0.28
-final.
+Renders the current read (all five categories) plus learned patterns by
+maturity, and — once mature (forming/known) patterns exist and aren't on
+cooldown — the addressability directive ("Don't force it"). Activated v0.0.29.
 """
 from __future__ import annotations
 
@@ -66,5 +66,7 @@ def build_attunement_block(persona_dir: Path) -> str:
                 lines.append(f"- {p.description}")
             else:
                 lines.append(f"- You seem to {p.description.lower()}")
+        lines.append("")
+        lines.append("If a pattern feels load-bearing for this turn, you can name it. Don't force it.")
 
     return "\n".join(lines)
