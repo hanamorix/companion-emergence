@@ -118,3 +118,45 @@ def test_spawn_skips_when_message_too_short(tmp_path: Path):
         )
         _wait_for_attunement_threads()
         mock_detector.assert_not_called()
+
+
+def test_run_attunement_pass2_calls_mark_addressed(tmp_path: Path):
+    """_run_attunement_pass2 calls mark_addressed with addressed_pattern_ids from DetectorOutput."""
+    from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead, DetectorOutput
+    from brain.chat.tool_loop import _run_attunement_pass2
+
+    fake_read = CurrentRead(
+        ts="2026-06-02T10:00:00Z",
+        source_turn_id="t1",
+        tone_label="warm",
+        tone_justification="open",
+        cadence_label="flowing",
+        cadence_justification="long",
+        mood_valence=0.5,
+        mood_intensity=0.5,
+        predicted_arc_shape="steady",
+        schema_version=SCHEMA_VERSION,
+    )
+    fake_output = DetectorOutput(
+        current_read=fake_read,
+        pattern_candidates=[],
+        addressed_pattern_ids=["abc"],
+    )
+
+    with (
+        patch("brain.chat.tool_loop.run_detector", return_value=fake_output),
+        patch("brain.chat.tool_loop.merge_into_learned"),
+        patch("brain.chat.tool_loop.write_current_read"),
+        patch("brain.chat.tool_loop.check_crystallisations"),
+        patch("brain.chat.tool_loop._attunement_consume_call", return_value=True),
+        patch("brain.chat.tool_loop.mark_addressed") as mock_mark,
+    ):
+        _run_attunement_pass2(
+            tmp_path,
+            turn_id="t1",
+            user_message="I had a long day today, love.",
+            reply_text="Tell me about it.",
+            buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
+        )
+
+    mock_mark.assert_called_once_with(tmp_path, ["abc"], now_iso=mock_mark.call_args[1]["now_iso"])

@@ -265,6 +265,40 @@ def apply_contradiction(
     _append_pattern(persona_dir, updated)
 
 
+def mark_addressed(
+    persona_dir: Path, pattern_ids: list[str], *, now_iso: str | None = None
+) -> None:
+    """Stamp last_addressed_at=now on each named pattern (reply-side naming).
+
+    Patterns named in Nell's reply get their cooldown clock reset so the
+    ambient block stops re-surfacing them for ADDRESS_COOLDOWN_HOURS. Unknown
+    ids (a pattern since forgotten) are ignored — never raises (spec §9)."""
+    if not pattern_ids:
+        return
+    now = now_iso or _now_iso()
+    by_id = {p.id: p for p in read_learned_patterns(persona_dir)}
+    for pid in pattern_ids:
+        prev = by_id.get(pid)
+        if prev is None:
+            continue
+        updated = LearnedPattern(
+            id=prev.id,
+            category=prev.category,
+            canonical_key=prev.canonical_key,
+            description=prev.description,
+            evidence_count=prev.evidence_count,
+            maturity=prev.maturity,
+            first_seen_at=prev.first_seen_at,
+            last_confirmed_at=prev.last_confirmed_at,
+            last_addressed_at=now,
+            crystallised_at=prev.crystallised_at,
+            falsified_at=prev.falsified_at,
+            examples=prev.examples,
+            schema_version=SCHEMA_VERSION,
+        )
+        _append_pattern(persona_dir, updated)
+
+
 def validate_grounded(
     candidate: PatternCandidate, buffer_slice: list[BufferTurn]
 ) -> bool:
