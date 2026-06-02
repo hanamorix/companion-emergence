@@ -23,7 +23,12 @@ from typing import Any
 from brain.attunement.budget import consume_call as _attunement_consume_call
 from brain.attunement.crystallise import check_crystallisations
 from brain.attunement.detector import run_detector, should_run_detector
-from brain.attunement.store import BufferTurn, merge_into_learned, write_current_read
+from brain.attunement.store import (
+    BufferTurn,
+    mark_addressed,
+    merge_into_learned,
+    write_current_read,
+)
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
@@ -105,6 +110,7 @@ def _run_attunement_pass2(
             buffer_slice,
             now_iso=_attunement_now_iso(),
         )
+        mark_addressed(persona_dir, output.addressed_pattern_ids, now_iso=_attunement_now_iso())
         check_crystallisations(persona_dir, now_iso=_attunement_now_iso())
     except Exception as exc:  # noqa: BLE001 — error isolation by design
         _log_attunement_error(persona_dir, turn_id, exc)
