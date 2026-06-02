@@ -52,3 +52,34 @@ def test_missing_file_with_store_reconstructs_persona_extensions(tmp_path: Path)
     finally:
         store.close()
         _cleanup_emotion("warmth")
+
+
+def test_existing_file_heals_referenced_unregistered_emotion(tmp_path: Path):
+    """File EXISTS but a memory references a non-baseline emotion absent from it
+    (an extractor-minted 'warmth') → the loader registers it as a
+    persona_extension and appends it to the file, instead of warning + pointing
+    at the OG migrate path. Closes the file-exists residual of the recover bug."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="[monologue emotion influence: warmth:1.20]",
+                memory_type="monologue_emotion",
+                domain="monologue",
+                emotions={"warmth": 8.0},
+            )
+        )
+        _cleanup_emotion("warmth")
+
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        # 'warmth' is healed: registered + persisted to the existing file.
+        assert vocabulary.get("warmth") is not None
+        names = {e["name"] for e in json.loads(vocab_path.read_text())["emotions"]}
+        assert "warmth" in names
+    finally:
+        store.close()
+        _cleanup_emotion("warmth")
