@@ -74,16 +74,17 @@ def test_learned_pattern_constructs_with_all_fields() -> None:
     assert pattern.examples == ["example 1", "example 2"]
 
 
-def test_pattern_candidate_requires_evidence_quote_and_turn_id() -> None:
+def test_pattern_candidate_requires_evidence_list() -> None:
+    from brain.attunement.schemas import Evidence
     candidate = PatternCandidate(
         category="tone",
         canonical_key="tone:warm-when-dog",
         description="Softens when discussing the dog",
-        evidence_quote="The dog rolled over today and I cried a little",
-        evidence_turn_id="turn-042",
+        evidence=[Evidence(quote="The dog rolled over today and I cried a little", turn_id="turn-042")],
     )
-    assert candidate.evidence_quote
-    assert candidate.evidence_turn_id
+    assert len(candidate.evidence) == 1
+    assert candidate.evidence[0].quote
+    assert candidate.evidence[0].turn_id
 
 
 def test_detector_output_carries_current_read_and_candidates() -> None:
@@ -132,13 +133,13 @@ def test_pattern_id_is_stable_hash_of_category_and_key() -> None:
 
 
 def test_invalid_category_raises() -> None:
+    from brain.attunement.schemas import Evidence
     with pytest.raises(ValueError, match="invalid category"):
         PatternCandidate(
             category="not-a-real-category",
             canonical_key="x",
             description="y",
-            evidence_quote="z",
-            evidence_turn_id="t",
+            evidence=[Evidence(quote="z", turn_id="t")],
         )
 
 

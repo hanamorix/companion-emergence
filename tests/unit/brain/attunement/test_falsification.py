@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from brain.attunement.schemas import PatternCandidate
+from brain.attunement.schemas import Evidence, PatternCandidate
 from brain.attunement.store import (
     BufferTurn,
     apply_contradiction,
@@ -21,8 +21,7 @@ def _seed_known_pattern(tmp_path: Path) -> None:
                 category="tone",
                 canonical_key="key-1",
                 description="warm when greeting",
-                evidence_quote=f"hello {i}",
-                evidence_turn_id=f"t{i}",
+                evidence=[Evidence(quote=f"hello {i}", turn_id=f"t{i}")],
             )],
             buffer,
             now_iso=f"2026-05-01T10:{i:02d}:00Z",
@@ -72,8 +71,7 @@ def test_falsified_pattern_can_recover_with_confirmation(tmp_path: Path) -> None
             category="tone",
             canonical_key="key-1",
             description="warm when greeting",
-            evidence_quote="hello again",
-            evidence_turn_id="t-new",
+            evidence=[Evidence(quote="hello again", turn_id="t-new")],
         )],
         buffer,
         now_iso="2026-06-01T10:00:00Z",
@@ -92,8 +90,7 @@ def test_contradiction_does_not_go_below_zero(tmp_path: Path) -> None:
             category="tone",
             canonical_key="key-1",
             description="x",
-            evidence_quote="hello",
-            evidence_turn_id="t1",
+            evidence=[Evidence(quote="hello", turn_id="t1")],
         )],
         buffer,
         now_iso="2026-05-31T10:00:00Z",
