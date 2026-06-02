@@ -17,6 +17,7 @@ from brain.attunement.schemas import (
     SCHEMA_VERSION,
     CurrentRead,
     DetectorOutput,
+    Evidence,
     PatternCandidate,
 )
 from brain.attunement.store import BufferTurn
@@ -126,13 +127,16 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
     rejections: list[str] = []
     for raw_cand in payload.get("pattern_candidates", []):
         try:
+            evidence = [
+                Evidence(quote=str(e.get("quote", "")), turn_id=str(e.get("turn_id", "")))
+                for e in raw_cand.get("evidence", [])
+            ]
             candidates.append(
                 PatternCandidate(
                     category=str(raw_cand.get("category", "")),
                     canonical_key=str(raw_cand.get("canonical_key", "")),
                     description=str(raw_cand.get("description", "")),
-                    evidence_quote=str(raw_cand.get("evidence_quote", "")),
-                    evidence_turn_id=str(raw_cand.get("evidence_turn_id", "")),
+                    evidence=evidence,
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -141,6 +145,7 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
     return DetectorOutput(
         current_read=current_read,
         pattern_candidates=candidates,
+        addressed_pattern_ids=[str(i) for i in payload.get("addressed_pattern_ids", [])],
         rejection_notes=rejections,
     )
 
