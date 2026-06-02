@@ -280,11 +280,15 @@ def run_backfill(
     sampled = select_sample(all_windows)
 
     if supplementary:
-        # Always start fresh — ignore any cursor from the previous completed state
+        # Reprocess every window for the new categories (fresh cursor at index 0),
+        # but PRESERVE the prior completed record — a supplementary pass augments
+        # an existing backfill, it must not clobber the original started_at or
+        # reset patterns_emitted. Counts accumulate; only the cursor resets (the
+        # cursor itself is cleared in the BackfillState construction below).
         start_idx = 0
-        processed_so_far = 0
-        started_at = now_iso
-        patterns_emitted_so_far = 0
+        processed_so_far = existing.processed_windows if existing else 0
+        started_at = existing.started_at if existing else now_iso
+        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
     else:
         start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
         processed_so_far = existing.processed_windows if existing else 0

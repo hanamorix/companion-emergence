@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from brain.attunement.schemas import SCHEMA_VERSION
 from brain.bridge.server import build_app
 
 
@@ -136,6 +137,10 @@ def test_endpoint_returns_backfill_state_when_present(tmp_path: Path) -> None:
     # Seed a backfill_state.json
     attunement_dir = persona_dir / "attunement"
     attunement_dir.mkdir(exist_ok=True)
+    # Seed at the CURRENT schema_version: this test exercises endpoint
+    # serialization, not backfill execution. An older schema_version would make
+    # the server's startup run_folded thread fire a supplementary backfill that
+    # races the endpoint read (it legitimately flips status complete→running).
     backfill_data = {
         "started_at": "2026-05-31T08:00:00+00:00",
         "total_windows": 20,
@@ -144,7 +149,7 @@ def test_endpoint_returns_backfill_state_when_present(tmp_path: Path) -> None:
         "patterns_emitted": 3,
         "status": "complete",
         "last_cursor": "turn_xyz",
-        "schema_version": "0.0.28-alpha.1",
+        "schema_version": SCHEMA_VERSION,
     }
     (attunement_dir / "backfill_state.json").write_text(
         json.dumps(backfill_data), encoding="utf-8"
