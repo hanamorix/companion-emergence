@@ -177,23 +177,23 @@ def _seed_active_buffer(persona_dir: Path, *, hours_old: float) -> None:
 
     conv_dir = persona_dir / "active_conversations"
     conv_dir.mkdir(parents=True, exist_ok=True)
-    started_at = datetime.now(UTC) - timedelta(hours=hours_old)
-    first_entry = {
-        "ts": started_at.isoformat(),
-        "speaker": "user",
-        "text": "session opener",
-    }
-    # Recent turn within the idle window so compute_active_session_hours
-    # treats the buffer as live (not stale).
-    recent_entry = {
-        "ts": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
-        "speaker": "nell",
-        "text": "still here",
-    }
-    (conv_dir / "test-session.jsonl").write_text(
-        json.dumps(first_entry) + "\n" + json.dumps(recent_entry) + "\n",
-        encoding="utf-8",
+    now = datetime.now(UTC)
+    started_at = now - timedelta(hours=hours_old)
+    # A genuinely continuous session: turns every 20 min (< the 30-min
+    # session-gap boundary) from started_at up to ~now, so the buffer is live
+    # AND its current contiguous run spans the full hours_old. (A two-turn
+    # buffer with a multi-hour gap would now correctly read as a fresh session,
+    # not hours_old — that gap-spanning case was the 69.7h session-hours bug.)
+    lines: list[str] = []
+    t = started_at
+    while t < now - timedelta(minutes=1):
+        lines.append(json.dumps({"ts": t.isoformat(), "speaker": "user", "text": "turn"}))
+        t += timedelta(minutes=20)
+    # Final turn within the 5-min idle window so the buffer reads as live.
+    lines.append(
+        json.dumps({"ts": (now - timedelta(minutes=1)).isoformat(), "speaker": "nell", "text": "still here"})
     )
+    (conv_dir / "test-session.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_get_body_state_dispatcher_injects_session_hours_from_active_buffer(
