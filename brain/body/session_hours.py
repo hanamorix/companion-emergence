@@ -24,68 +24,100 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+# No activity in the last 5 minutes → the session isn't currently live (0.0).
+# Guards the wholly-idle / orphan-buffer case.
 _IDLE_THRESHOLD_MINUTES = 5.0
+# A gap of this size or larger BETWEEN turns is a session boundary: the turns
+# before it belong to an earlier sitting, not the current one. Without this, a
+# buffer that sat idle for hours/days and then got one fresh turn would report
+# its entire wall-clock span as session age (the 69.7h energy-collapse bug).
+_SESSION_GAP_MINUTES = 30.0
+
+
+def _parse_ts(raw: object) -> datetime | None:
+    """Parse an ISO-8601 ts (with optional ``Z``) into a tz-aware datetime."""
+    if not raw or not isinstance(raw, str):
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _entry_timestamps(buffer: Path) -> list[datetime]:
+    """Parsed, tz-aware timestamps for every turn in a buffer, in file (turn)
+    order. Unparseable / malformed lines are skipped."""
+    stamps: list[datetime] = []
+    with buffer.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            dt = _parse_ts(entry.get("ts") or entry.get("timestamp"))
+            if dt is not None:
+                stamps.append(dt)
+    return stamps
 
 
 def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
-    """How long the current chat session has been live, in hours.
+    """How long the *current continuous* chat session has been live, in hours.
 
-    Reads the earliest entry timestamp from any active conversation
-    buffer in ``<persona_dir>/active_conversations/*.jsonl``. If multiple
-    buffers exist (rare; concurrent sessions), takes the earliest.
-    Returns 0.0 when no buffer is open, no timestamp could be parsed,
-    or the buffer's last activity was more than 5 minutes ago (stale/orphan).
+    For each active conversation buffer in
+    ``<persona_dir>/active_conversations/*.jsonl``:
+
+    - If the last turn was more than ``_IDLE_THRESHOLD_MINUTES`` (5 min) ago,
+      the session isn't currently live — the buffer contributes 0.0 (stale /
+      orphan guard).
+    - Otherwise the session started at the head of the *latest contiguous run*
+      of turns: walking back from the most recent turn, the run ends at the
+      first gap >= ``_SESSION_GAP_MINUTES`` (30 min). A buffer that spans an
+      idle gap (e.g. a 3-day-old turn plus a fresh reply) therefore counts only
+      the current sitting, never the whole wall-clock span.
+
+    Across multiple buffers (rare; concurrent sessions) the earliest current
+    session start wins. Returns 0.0 when no buffer is open or live.
     """
     conv_dir = persona_dir / "active_conversations"
     if not conv_dir.exists():
         return 0.0
-    earliest_ts: datetime | None = None
+    earliest_start: datetime | None = None
     try:
         for buffer in conv_dir.glob("*.jsonl"):
             try:
-                first_line = ""
-                last_line = ""
-                with buffer.open("r", encoding="utf-8") as fh:
-                    for raw in fh:
-                        stripped = raw.strip()
-                        if not stripped:
-                            continue
-                        if not first_line:
-                            first_line = stripped
-                        last_line = stripped
-                if not first_line:
-                    continue
-
-                # Idle threshold: skip buffers with no activity in the last 5 min.
-                last_entry = json.loads(last_line)
-                last_ts_raw = last_entry.get("ts") or last_entry.get("timestamp")
-                if not last_ts_raw or not isinstance(last_ts_raw, str):
-                    continue
-                if last_ts_raw.endswith("Z"):
-                    last_ts_raw = last_ts_raw[:-1] + "+00:00"
-                last_ts = datetime.fromisoformat(last_ts_raw)
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=UTC)
-                idle_minutes = (now - last_ts).total_seconds() / 60.0
-                if idle_minutes >= _IDLE_THRESHOLD_MINUTES:
-                    continue
-
-                entry = json.loads(first_line)
-                ts_raw = entry.get("timestamp") or entry.get("ts")
-                if not ts_raw or not isinstance(ts_raw, str):
-                    continue
-                if ts_raw.endswith("Z"):
-                    ts_raw = ts_raw[:-1] + "+00:00"
-                ts = datetime.fromisoformat(ts_raw)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                if earliest_ts is None or ts < earliest_ts:
-                    earliest_ts = ts
-            except (json.JSONDecodeError, OSError, ValueError):
+                stamps = _entry_timestamps(buffer)
+            except OSError:
                 continue
+            if not stamps:
+                continue
+
+            # Liveness gate: no activity in the last 5 min → not currently live.
+            last_ts = stamps[-1]
+            if (now - last_ts).total_seconds() / 60.0 >= _IDLE_THRESHOLD_MINUTES:
+                continue
+
+            # Session start = head of the latest contiguous run. Walk back from
+            # the last turn; a gap >= 30 min is where the current sitting began.
+            session_start = last_ts
+            for i in range(len(stamps) - 1, 0, -1):
+                gap_minutes = (stamps[i] - stamps[i - 1]).total_seconds() / 60.0
+                if gap_minutes >= _SESSION_GAP_MINUTES:
+                    break
+                session_start = stamps[i - 1]
+
+            if earliest_start is None or session_start < earliest_start:
+                earliest_start = session_start
     except OSError:
         return 0.0
-    if earliest_ts is None:
+    if earliest_start is None:
         return 0.0
-    elapsed = (now - earliest_ts).total_seconds() / 3600.0
+    elapsed = (now - earliest_start).total_seconds() / 3600.0
     return max(0.0, elapsed)
