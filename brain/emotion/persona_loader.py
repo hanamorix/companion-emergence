@@ -128,7 +128,7 @@ def load_persona_vocabulary_with_anomaly(
     registered = _register_from_data(data)
 
     if store is not None:
-        _warn_on_referenced_but_unregistered(store)
+        registered += _heal_referenced_but_unregistered(path, data, store)
 
     return registered, anomaly
 
@@ -149,9 +149,9 @@ def load_persona_vocabulary(
     Per-entry validation failure → that entry skipped + warning,
     other entries proceed.
 
-    If `store` is provided, after registration the loader scans memories
-    for emotion names not in the registry and logs a one-time warning
-    per missing name pointing the user at `nell migrate --force`.
+    If `store` is provided, after registration the loader heals any emotion
+    names referenced in memories but absent from the vocabulary — registering
+    each as a persona_extension and persisting — rather than warning.
     """
     count, _anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
     return count
@@ -199,24 +199,48 @@ def _entry_to_emotion(entry: dict) -> Emotion:
     )
 
 
-def _warn_on_referenced_but_unregistered(store: MemoryStore) -> None:
-    """Scan all active memories for emotion names not in the registry.
+def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore) -> int:
+    """Register + persist emotions referenced in active memories but absent from
+    the vocabulary — e.g. extractor-minted channel names the growth crystallizer
+    never added. Returns the count healed.
 
-    Logs one warning per unique missing name, pointing the user at the
-    upgrade migration command. Used to detect the in-flight upgrade case
-    where a pre-split persona is running on the post-split framework
-    without re-migration yet.
+    Replaces the old misdirecting "run nell migrate" warning. Those orphaned
+    emotions broke aggregate_state + soul crystallization (the names were
+    silently skipped). Healing them as persona_extension entries works for
+    native and OG personas alike, and persists so the next load is clean.
     """
-    seen_missing: set[str] = set()
+    from brain.health.attempt_heal import save_with_backup
+    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
+
+    seen: set[str] = set()
+    new_entries: list[dict] = []
     for mem in store.list_active(limit=None):
         for name in mem.emotions:
-            if name in seen_missing:
+            if name in seen or vocabulary.get(name) is not None:
                 continue
-            if vocabulary.get(name) is None:
-                seen_missing.add(name)
-                logger.warning(
-                    "persona memories reference emotion %r which is not in "
-                    "this persona's vocabulary. Run `nell migrate --input "
-                    "<og-source> --install-as <persona> --force` to upgrade.",
-                    name,
-                )
+            seen.add(name)
+            new_entries.append(
+                {
+                    "name": name,
+                    "description": PLACEHOLDER_DESCRIPTION,
+                    "category": "persona_extension",
+                    "decay_half_life_days": PLACEHOLDER_DECAY_DAYS,
+                    "intensity_clamp": 10.0,
+                }
+            )
+
+    if not new_entries:
+        return 0
+
+    healed = _register_from_data({"emotions": new_entries})
+    data.setdefault("emotions", []).extend(new_entries)
+    save_with_backup(path, data)
+    logger.warning(
+        "emotion_vocabulary.json was missing %d referenced emotion(s) %s — "
+        "registered them as persona_extension and appended to %s (extractor-"
+        "minted emotions the vocabulary crystallizer hadn't added yet).",
+        len(new_entries),
+        sorted(e["name"] for e in new_entries),
+        path.name,
+    )
+    return healed
