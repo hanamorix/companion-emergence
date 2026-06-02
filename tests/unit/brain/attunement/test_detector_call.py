@@ -58,8 +58,7 @@ def test_detector_handles_pattern_candidates(buffer):
                 "category": "cadence",
                 "canonical_key": "cadence:terse-at-night",
                 "description": "Cadence shortens late at night",
-                "evidence_quote": "I'm okay, just tired.",
-                "evidence_turn_id": "t2"
+                "evidence": [{"quote": "I'm okay, just tired.", "turn_id": "t2"}]
             }
         ]
     }"""
@@ -67,6 +66,8 @@ def test_detector_handles_pattern_candidates(buffer):
         output = run_detector(buffer_slice=buffer, reply_text="goodnight")
     assert len(output.pattern_candidates) == 1
     assert output.pattern_candidates[0].canonical_key == "cadence:terse-at-night"
+    assert output.pattern_candidates[0].evidence[0].quote == "I'm okay, just tired."
+    assert output.pattern_candidates[0].evidence[0].turn_id == "t2"
 
 
 def test_detector_returns_decline_output_on_malformed_json(buffer):
@@ -91,8 +92,7 @@ def test_detector_returns_decline_output_on_invalid_category(buffer):
                 "category": "made-up-category",
                 "canonical_key": "k",
                 "description": "d",
-                "evidence_quote": "Hi there!",
-                "evidence_turn_id": "t1"
+                "evidence": [{"quote": "Hi there!", "turn_id": "t1"}]
             }
         ]
     }"""
@@ -100,6 +100,23 @@ def test_detector_returns_decline_output_on_invalid_category(buffer):
         output = run_detector(buffer_slice=buffer, reply_text="hi")
     assert output.pattern_candidates == []
     assert output.rejection_notes  # the invalid candidate is noted
+
+
+def test_detector_parses_addressed_pattern_ids(buffer):
+    """addressed_pattern_ids from the top-level payload flows through to DetectorOutput."""
+    fake_response = """{
+        "current_read": {
+            "tone_label": "warm", "tone_justification": "x",
+            "cadence_label": "measured", "cadence_justification": "y",
+            "mood_valence": 0.1, "mood_intensity": 0.3,
+            "predicted_arc_shape": "steady"
+        },
+        "pattern_candidates": [],
+        "addressed_pattern_ids": ["abc", "def"]
+    }"""
+    with patch("brain.attunement.detector._call_haiku", return_value=fake_response):
+        output = run_detector(buffer_slice=buffer, reply_text="I noticed you mentioned that")
+    assert output.addressed_pattern_ids == ["abc", "def"]
 
 
 def test_detector_returns_decline_on_empty_buffer():
