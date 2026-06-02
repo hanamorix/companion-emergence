@@ -1,36 +1,33 @@
 """Snapshot test on the assembled detector system prompt.
 
 Catches prompt-rot during future edits — every load-bearing instruction
-(grounding requirement, evidence_quote mandate, category enum, decline-
+(grounding requirement, evidence list mandate, category enum, decline-
 if-uncertain) must remain literally present. Spec §13 Risk 7.
 """
 from brain.attunement.prompts import build_detector_system_prompt
 
 
-def test_prompt_requires_evidence_quote() -> None:
+def test_prompt_requires_evidence_list() -> None:
+    """evidence is now a list of {quote, turn_id} objects, not flat fields."""
     prompt = build_detector_system_prompt()
-    assert "evidence_quote" in prompt
+    assert '"evidence"' in prompt          # list field name in schema
+    assert "quote" in prompt               # entry field
+    assert "turn_id" in prompt             # entry field
     assert "verbatim" in prompt.lower()
 
 
 def test_prompt_requires_evidence_turn_id() -> None:
     prompt = build_detector_system_prompt()
-    assert "evidence_turn_id" in prompt
+    assert "turn_id" in prompt
 
 
-def test_prompt_lists_category_enum_for_alpha_1() -> None:
+def test_prompt_lists_all_five_categories() -> None:
+    """All five categories are now first-class in the schema (not exclusions)."""
     prompt = build_detector_system_prompt()
-    # alpha.1 positive enum: tone + cadence
-    assert "tone" in prompt
-    assert "cadence" in prompt
-    # The prompt may reference future categories ONLY as exclusions ("do not emit").
-    # Verify the schema's allowed list does NOT include future ones — they only
-    # appear in negative-instruction contexts.
-    schema_block_end = prompt.find("CRITICAL RULES")
-    schema_block = prompt[:schema_block_end]
-    assert "topic_affinity" not in schema_block
-    assert "relational" not in schema_block
-    assert "response_shape" not in schema_block
+    for cat in ("tone", "cadence", "topic_affinity", "response_shape", "relational"):
+        assert cat in prompt
+    # The alpha.1 restriction is gone
+    assert 'only "tone" and "cadence"' not in prompt
 
 
 def test_prompt_includes_decline_on_uncertainty_instruction() -> None:
