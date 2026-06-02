@@ -43,7 +43,13 @@ from brain.attunement.backfill import (
     run_backfill as _attunement_run_backfill,
 )
 from brain.attunement.backfill import (
+    run_supplementary_backfill as _attunement_run_supplementary_backfill,
+)
+from brain.attunement.backfill import (
     should_run_backfill as _attunement_should_run_backfill,
+)
+from brain.attunement.backfill import (
+    should_run_supplementary_backfill as _attunement_should_run_supplementary_backfill,
 )
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
@@ -129,9 +135,17 @@ def run_folded(
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
     # try/except so a misbehaving backfill never crashes supervisor startup —
     # autonomous-behaviour recipe item 3 (defer cleanly, don't fail loudly).
+    #
+    # The two branches are mutually exclusive:
+    #   - Fresh install → full backfill (should_run_backfill=True only when no
+    #     completed state exists, so supplementary can never also fire)
+    #   - Upgraded install → supplementary pass for new categories only
+    #     (completed state exists at an older schema version)
     try:
         if _attunement_should_run_backfill(persona_dir):
             _attunement_run_backfill(persona_dir)
+        elif _attunement_should_run_supplementary_backfill(persona_dir):
+            _attunement_run_supplementary_backfill(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("attunement backfill failed during startup: %s", exc)
 

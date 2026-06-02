@@ -67,6 +67,24 @@ the source. Fabricated quotes are silently rejected and logged. You
 gain nothing by claiming what you cannot ground."""
 
 
-def build_detector_system_prompt() -> str:
-    """Return the detector system prompt. Deterministic; tests pin its content."""
-    return _DETECTOR_SYSTEM_PROMPT
+def build_detector_system_prompt(
+    only_categories: frozenset[str] | None = None,
+) -> str:
+    """Return the detector system prompt.
+
+    When *only_categories* is provided, appends a restriction instruction
+    telling the model to extract candidates for those categories only — used
+    by the supplementary backfill pass so existing tone/cadence patterns are
+    not double-counted. When None, returns the base prompt unchanged
+    (preserves existing behaviour for normal per-turn detector calls).
+
+    Deterministic; tests pin its content.
+    """
+    if only_categories is None:
+        return _DETECTOR_SYSTEM_PROMPT
+    cats_str = ", ".join(sorted(only_categories))
+    restriction = (
+        f"\n\nFOR THIS PASS ONLY: extract candidates for these categories: "
+        f"{cats_str}. Do NOT emit candidates for any other category."
+    )
+    return _DETECTOR_SYSTEM_PROMPT + restriction

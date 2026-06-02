@@ -19,8 +19,8 @@ from brain.attunement.schemas import (
 )
 
 
-def test_schema_version_matches_alpha_1() -> None:
-    assert SCHEMA_VERSION == "0.0.28-alpha.1"
+def test_schema_version_matches_alpha_2() -> None:
+    assert SCHEMA_VERSION == "0.0.28-alpha.2"
 
 
 def test_maturity_thresholds_have_expected_values() -> None:

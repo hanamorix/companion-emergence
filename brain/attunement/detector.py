@@ -177,8 +177,18 @@ def should_run_detector(
     return True
 
 
-def run_detector(buffer_slice: list[BufferTurn], reply_text: str) -> DetectorOutput:
+def run_detector(
+    buffer_slice: list[BufferTurn],
+    reply_text: str,
+    *,
+    only_categories: frozenset[str] | None = None,
+) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
+
+    When *only_categories* is provided, appends a restriction instruction to
+    the system prompt so the model only emits candidates for those categories.
+    Used by the supplementary backfill pass to avoid double-counting tone/cadence
+    patterns that are already learned.
 
     Returns a decline output (unknown labels, empty candidates) when:
     - buffer_slice is empty
@@ -194,7 +204,7 @@ def run_detector(buffer_slice: list[BufferTurn], reply_text: str) -> DetectorOut
         return _decline_output(source_turn_id="")
 
     source_turn_id = buffer_slice[-1].id
-    system_prompt = build_detector_system_prompt()
+    system_prompt = build_detector_system_prompt(only_categories=only_categories)
     user_message = _build_user_message(buffer_slice, reply_text)
 
     raw = _call_haiku(system_prompt, user_message)
