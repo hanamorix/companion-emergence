@@ -185,6 +185,12 @@ def close_session(
         report.committed += 1
         report.memory_ids.append(mem_id)
 
+        # Back-fill the committed memory's vector into the dedupe cache so that
+        # a held-buffer retry (and any future pass) recognises it as a duplicate
+        # and skips it — closes the retry-double-commit gap (A1).
+        if embeddings is not None:
+            embeddings.get_or_compute(item.text)
+
         # SOUL
         if item.importance >= crystallize_threshold:
             queued = queue_soul_candidate(
@@ -349,6 +355,13 @@ def extract_session_snapshot(
             continue
         report.committed += 1
         report.memory_ids.append(mem_id)
+
+        # Back-fill the committed memory's vector into the dedupe cache so that
+        # a held-buffer retry (and any future pass) recognises it as a duplicate
+        # and skips it — closes the retry-double-commit gap (A1).
+        if embeddings is not None:
+            embeddings.get_or_compute(item.text)
+
         if item.importance >= crystallize_threshold:
             queued = queue_soul_candidate(
                 persona_dir,

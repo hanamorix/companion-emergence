@@ -369,3 +369,101 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
     poison_buf = persona_dir / "active_conversations" / "poison" / f"{sid}.jsonl"
     assert not original_buf.exists(), "original buffer must be moved out of active_conversations/"
     assert poison_buf.exists(), "dead-lettered buffer must appear in poison/"
+
+
+# ---------------------------------------------------------------------------
+# A1 — held-buffer retry must be idempotent: no double-commit for items that
+#      succeeded in pass 1 but whose vectors were never back-filled.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
+    """Partial-commit + retry round-trip with embeddings ON.
+
+    Pass 1: item 1 (index 1) raises on store.create; items 0 and 2 commit OK.
+    Pass 2: all store.create calls succeed.
+
+    Expected final state: exactly 3 distinct memories in the store — items 0
+    and 2 are recognised as duplicates (via their back-filled vectors) and
+    skipped; item 1 commits fresh. No text appears twice.
+
+    Without the back-fill fix, pass 2 re-commits items 0 and 2 because the
+    embedding cache is cold for their texts → 5 memories total, 2 duplicated.
+    """
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+    sid = _seed(persona_dir, 3)
+
+    texts = [f"distinct memory alpha {i}" for i in range(3)]
+    items = [ExtractedItem(text=t, label="fact", importance=5) for t in texts]
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
+
+    real_create = store.create
+    pass1_call: list[int] = [0]
+
+    def flaky_create_pass1(mem):
+        pass1_call[0] += 1
+        if pass1_call[0] == 2:
+            raise RuntimeError("database is locked")
+        return real_create(mem)
+
+    try:
+        # ── Pass 1: item at index 1 fails ─────────────────────────────────
+        with patch(
+            "brain.ingest.pipeline.extract_items_with_status",
+            return_value=ExtractionOutcome(items=items, failed=False, error=None),
+        ), patch.object(store, "create", side_effect=flaky_create_pass1):
+            report1 = extract_session_snapshot(
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=_NoopProvider(),
+                embeddings=embeddings,
+            )
+
+        assert report1.commit_failures >= 1, "pass 1 must record a commit failure"
+        cursor_after_pass1 = read_cursor(persona_dir, sid)
+        assert cursor_after_pass1 is None, "cursor must NOT advance when a commit failed"
+
+        # Items 0 and 2 committed in pass 1.
+        active_after_pass1 = store.list_active()
+        committed_texts = {m.content for m in active_after_pass1}
+        assert texts[0] in committed_texts, "item 0 must have committed in pass 1"
+        assert texts[2] in committed_texts, "item 2 must have committed in pass 1"
+        assert texts[1] not in committed_texts, "item 1 must NOT have committed in pass 1"
+
+        # ── Pass 2: all commits succeed ────────────────────────────────────
+        with patch(
+            "brain.ingest.pipeline.extract_items_with_status",
+            return_value=ExtractionOutcome(items=items, failed=False, error=None),
+        ):
+            report2 = extract_session_snapshot(
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=_NoopProvider(),
+                embeddings=embeddings,
+            )
+
+        assert report2.committed >= 1, "pass 2 must commit at least item 1"
+        assert report2.commit_failures == 0, "pass 2 must have no commit failures"
+
+        # Final assertion: exactly 3 distinct memories, no duplicates.
+        all_active = store.list_active()
+        final_texts = [m.content for m in all_active if m.content in texts]
+        assert len(final_texts) == 3, (
+            f"expected exactly 3 distinct memories, got {len(final_texts)}: {final_texts}"
+        )
+        for t in texts:
+            count = final_texts.count(t)
+            assert count == 1, f"text {t!r} appears {count} times — double-commit detected"
+
+    finally:
+        store.close()
+        hebbian.close()
+        embeddings.close()
