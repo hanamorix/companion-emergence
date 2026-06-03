@@ -61,6 +61,12 @@ from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
 )
+from brain.ingest.emotion_backfill import (
+    run_emotion_backfill as _emotion_backfill_run,
+)
+from brain.ingest.emotion_backfill import (
+    should_run_emotion_backfill as _emotion_backfill_should_run,
+)
 from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
@@ -162,6 +168,16 @@ def run_folded(
             _attunement_run_supplementary_backfill(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("attunement backfill failed during startup: %s", exc)
+
+    # One-shot startup: re-tag emotion-less memories so existing personas
+    # benefit from the A2 forward-only emotion seeding.  Independent of the
+    # attunement backfill (separate if, not elif) — both can fire on the same
+    # startup if needed.  Fault-isolated per autonomous-behaviour recipe item 3.
+    try:
+        if _emotion_backfill_should_run(persona_dir):
+            _emotion_backfill_run(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("emotion backfill failed during startup: %s", exc)
 
     while not stop_event.is_set():
         try:
