@@ -46,6 +46,8 @@ from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
+logger = logging.getLogger(__name__)
+
 
 def _load_emotion_vocab() -> tuple[set[str], str]:
     """Return (names_set, comma_separated_sorted_string) for all registered emotions.
@@ -66,7 +68,6 @@ def _load_emotion_vocab() -> tuple[set[str], str]:
         logger.warning("_load_emotion_vocab: failed to load vocabulary; emotions will be empty")
         return set(), ""
 
-logger = logging.getLogger(__name__)
 
 # F-011 — extraction backoff knobs. After this many consecutive
 # `conversation_snapshot_failed` events for a given session, pause
