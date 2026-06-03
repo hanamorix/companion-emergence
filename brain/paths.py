@@ -3,8 +3,8 @@
 All user-facing paths route through this module so we never hard-code
 OS-specific locations. Uses platformdirs for the OS-appropriate default
 with KINDLED_HOME env var for full override. NELLBRAIN_HOME is
-honored as a backwards-compat fallback through the v0.0.13 series
-(removed in v0.0.14).
+honored as a backwards-compat fallback (deprecated; back-compat
+fallback retained).
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def _resolve_home_override() -> str | None:
     Priority (v0.0.13 transition):
       1. KINDLED_HOME — the canonical var as of v0.0.13.
       2. NELLBRAIN_HOME — backwards-compat fallback, emits
-         DeprecationWarning. Removed in v0.0.14.
+         DeprecationWarning. Deprecated; back-compat fallback retained.
       3. None — caller uses platformdirs default.
     """
     if v := os.environ.get("KINDLED_HOME"):
@@ -60,7 +60,7 @@ def _resolve_home_override() -> str | None:
     if v := os.environ.get("NELLBRAIN_HOME"):
         warnings.warn(
             "NELLBRAIN_HOME is deprecated; use KINDLED_HOME. "
-            "Backwards-compat fallback will be removed in v0.0.14.",
+            "Backwards-compat fallback is retained but may be removed in a future release.",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -73,7 +73,7 @@ def get_home() -> Path:
 
     Resolution order:
     1. KINDLED_HOME env var if set (supports ~ expansion)
-    2. NELLBRAIN_HOME env var (deprecated, warns; removed in v0.0.14)
+    2. NELLBRAIN_HOME env var (deprecated, warns; back-compat fallback retained)
     3. platformdirs user_data_path for the current OS
     """
     override = _resolve_home_override()

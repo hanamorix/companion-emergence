@@ -43,7 +43,7 @@ def recall_monologue(
         results.append(
             {
                 "content": mem.content,
-                "state": mem.state,  # 'active' = verbatim, 'fading' = blurred
+                "state": mem.state,  # always 'active' (active_only=True; fading traces not fetched)
                 "ts": mem.created_at.isoformat(),
             }
         )

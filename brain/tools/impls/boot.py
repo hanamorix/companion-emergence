@@ -29,9 +29,9 @@ def boot(
     -------
     dict with keys:
         emotional_state  — get_emotional_state result
-        personality      — get_personality result (stub for now)
-        soul             — get_soul result (stub for now)
-        body_state       — get_body_state result (stub for now)
+        personality      — get_personality result
+        soul             — get_soul result
+        body_state       — get_body_state result
         daemon_residue   — str from get_residue_context
         context_prose    — 2-4 sentence prose for LLM session anchor
     """

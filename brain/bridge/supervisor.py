@@ -438,10 +438,9 @@ def _derive_intensity_drivers(
     compute_body_state pass (opens its own MemoryStore per-call,
     thread-local, same pattern as _run_heartbeat_tick).
 
-    Emotional intensity — TODO(v0.0.15): wire to brain.emotion once a
-    clean normalized accessor exists (current aggregate_state returns
-    raw channel scores, not a single normalized deviation scalar).
-    For now returns 0.0 (baseline lived-age rate; no false inflation).
+    Emotional intensity — computed as the max positive sigma-deviation
+    across emotion channels (capped at 1.0), using aggregate_state over
+    the 200 most recent active memories. Falls back to 0.0 on any error.
 
     Chat activity uses a fixed 6 turns/h baseline for the supervisor
     tick window. Phase 9.2 follow-up will tighten to a rolling baseline
