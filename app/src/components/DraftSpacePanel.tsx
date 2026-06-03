@@ -1,8 +1,11 @@
+const capitalize = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
 type Props = {
   markdown: string;
+  persona: string;
 };
 
-export function DraftSpacePanel({ markdown }: Props) {
+export function DraftSpacePanel({ markdown, persona }: Props) {
   if (!markdown.trim()) {
     return (
       <aside className="draft-space-panel" role="region">
@@ -15,7 +18,7 @@ export function DraftSpacePanel({ markdown }: Props) {
   // settled.
   return (
     <aside className="draft-space-panel" role="region" aria-label="Draft space">
-      <h2>Fragments Nell left while you were away</h2>
+      <h2>Fragments {capitalize(persona)} left while you were away</h2>
       <pre className="draft-space-panel__content">{markdown}</pre>
     </aside>
   );

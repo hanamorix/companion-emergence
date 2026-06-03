@@ -9,13 +9,16 @@ export type VoiceEditProposal = {
   voiceTemplate: string;
 };
 
+const capitalize = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
 type Props = {
   proposal: VoiceEditProposal;
+  persona: string;
   onAccept: (auditId: string, withEdits: string | null) => void;
   onReject: (auditId: string) => void;
 };
 
-export function VoiceEditPanel({ proposal, onAccept, onReject }: Props) {
+export function VoiceEditPanel({ proposal, persona, onAccept, onReject }: Props) {
   const [editMode, setEditMode] = useState(false);
   const [editedText, setEditedText] = useState(proposal.newText);
 
@@ -24,7 +27,7 @@ export function VoiceEditPanel({ proposal, onAccept, onReject }: Props) {
 
   return (
     <aside className="voice-edit-panel" role="dialog" aria-label="Voice edit proposal">
-      <h2>Nell proposed an edit to her voice</h2>
+      <h2>{capitalize(persona)} proposed an edit to her voice</h2>
       <p className="voice-edit-panel__rationale">{proposal.rationale}</p>
       <p className="voice-edit-panel__evidence">
         Evidence: {proposal.evidence.join(", ")}

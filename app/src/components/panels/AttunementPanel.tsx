@@ -14,6 +14,8 @@ const MATURITY_ORDER: Record<string, number> = {
   falsified: 2,
 };
 
+const capitalize = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
 export function AttunementPanel({ persona }: Props) {
   const [payload, setPayload] = useState<AttunementPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +78,7 @@ export function AttunementPanel({ persona }: Props) {
 
       {!hasContent && (
         <div style={{ fontSize: 11, color: "var(--text-mute)", fontStyle: "italic" }}>
-          Nothing yet — Nell is just getting started with you.
+          Nothing yet — {capitalize(persona)} is just getting started with you.
         </div>
       )}
 
@@ -158,7 +160,7 @@ export function AttunementPanel({ persona }: Props) {
             lineHeight: 1.5,
           }}
         >
-          Nell is getting to know you.{" "}
+          {capitalize(persona)} is getting to know you.{" "}
           <span>
             {backfill.sampled_windows ?? 0} / {backfill.total_windows ?? 0}
           </span>{" "}
