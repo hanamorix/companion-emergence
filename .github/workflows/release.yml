@@ -50,8 +50,81 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  verify-version:
+    name: verify version pin (tag == pyproject == all six files)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Assert tag matches all six version-pin files
+        shell: bash
+        run: |
+          TAG="${{ env.RELEASE_TAG }}"
+          # Strip leading 'v'; also strip any pre-release suffix so
+          # v0.0.28-alpha.1 → 0.0.28 for comparison against the six
+          # files (which stay at the base minor for alpha cycles).
+          TAG_BASE="${TAG#v}"
+          TAG_BASE="${TAG_BASE%%-*}"   # e.g. 0.0.28-alpha.1 → 0.0.28
+
+          # Extract versions from each of the six pin files.
+          v_py=$(grep -E '^version = "[0-9]' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          v_cargo=$(grep -E '^version = "[0-9]' app/src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          v_tauri=$(grep '"version"' app/src-tauri/tauri.conf.json | head -1 | sed 's/.*"\([0-9][^"]*\)".*/\1/')
+          v_pkg=$(grep '"version"' app/package.json | head -1 | sed 's/.*"\([0-9][^"]*\)".*/\1/')
+          v_lock_uv=$(awk '/name = "companion-emergence"/ {getline; print}' uv.lock | sed 's/.*"\(.*\)".*/\1/')
+          v_lock_cargo=$(awk '/^name = "nellface"$/ {getline; print}' app/src-tauri/Cargo.lock | sed 's/.*"\(.*\)".*/\1/')
+
+          # uv normalises pre-release identifiers (0.0.28-alpha.1 → 0.0.28a1).
+          # Normalise for comparison: strip separators, map alpha→a, beta→b.
+          normalize() { echo "$1" | sed 's/[-.]//g; s/alpha/a/g; s/beta/b/g'; }
+          v_py_norm=$(normalize "$v_py")
+          v_lock_uv_norm=$(normalize "$v_lock_uv")
+          tag_norm=$(normalize "$TAG_BASE")
+
+          echo "Tag (base):        $TAG_BASE  (normalised: $tag_norm)"
+          echo "pyproject.toml:    $v_py      (normalised: $v_py_norm)"
+          echo "Cargo.toml:        $v_cargo"
+          echo "tauri.conf.json:   $v_tauri"
+          echo "package.json:      $v_pkg"
+          echo "uv.lock:           $v_lock_uv (normalised: $v_lock_uv_norm)"
+          echo "Cargo.lock:        $v_lock_cargo"
+
+          fail=0
+
+          # (a) tag base must equal pyproject version (normalised for alpha cycles).
+          if [[ "$tag_norm" != "$v_py_norm" ]]; then
+            echo "ERROR: tag $TAG_BASE does not match pyproject.toml version $v_py" >&2
+            fail=1
+          fi
+
+          # (b) all six files must agree with each other.
+          for label_ver in "Cargo.toml:$v_cargo" "tauri.conf.json:$v_tauri" "package.json:$v_pkg" "Cargo.lock:$v_lock_cargo"; do
+            label="${label_ver%%:*}"
+            ver="${label_ver#*:}"
+            if [[ "$v_py" != "$ver" ]]; then
+              echo "ERROR: $label ($ver) disagrees with pyproject.toml ($v_py)" >&2
+              fail=1
+            fi
+          done
+          # uv.lock compared normalised.
+          if [[ "$v_py_norm" != "$v_lock_uv_norm" ]]; then
+            echo "ERROR: uv.lock ($v_lock_uv, normalised $v_lock_uv_norm) disagrees with pyproject.toml ($v_py, normalised $v_py_norm)" >&2
+            fail=1
+          fi
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo ""
+            echo "Six-file version pin check FAILED. Fix all six files before tagging." >&2
+            exit 1
+          fi
+          echo "Version pin OK — tag $TAG matches all six files at $v_py"
+
   validate:
     name: validate (tests + lint + frontend + cargo)
+    needs: verify-version
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
