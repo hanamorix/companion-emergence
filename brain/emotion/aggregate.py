@@ -15,11 +15,19 @@ After max-pooling, _apply_climax_reset is called: when aggregated
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 from brain.emotion.state import EmotionalState
 from brain.emotion.vocabulary import get as _get_emotion
 from brain.memory.store import Memory
+
+logger = logging.getLogger(__name__)
+
+# Tracks emotion names we've already warned about so each unregistered name
+# produces at most ONE warning for the life of the process — aggregate_state
+# is a hot path and a persona may have many old memories with retired names.
+_warned_unregistered: set[str] = set()
 
 _CLIMAX_THRESHOLD = 7.0
 _AROUSAL_DAMPEN = 0.2
@@ -50,6 +58,14 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
             if value <= 0.0:
                 continue
             if _get_emotion(name) is None:
+                if name not in _warned_unregistered:
+                    _warned_unregistered.add(name)
+                    logger.warning(
+                        "aggregate_state: dropped unregistered emotion %r (value=%.1f) — "
+                        "persona vocabulary may not be loaded for the active persona",
+                        name,
+                        value,
+                    )
                 continue
             if value > pooled.get(name, 0.0):
                 pooled[name] = value
