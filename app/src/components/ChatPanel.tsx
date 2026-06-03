@@ -301,8 +301,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           ? prev
           : [...prev, { auditId, body, urgency, state, timestamp }],
       );
-      // Task 27 will register show_initiate_notification; until then this
-      // is a graceful no-op via tryInvoke's silent catch.
+      // show_initiate_notification is registered (Task 27 done). tryInvoke
+      // still provides a silent catch for forward-compat safety.
       if (urgency === "notify") {
         void tryInvoke("show_initiate_notification", { title: capitalize(persona), body });
       }
