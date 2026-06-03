@@ -174,6 +174,12 @@ def close_session(
         if mem_id is None:
             report.errors += 1
             report.commit_failures += 1
+            # Evict the candidate's vector from the embedding cache so the
+            # retry pass doesn't self-match at cosine 1.0 and discard it as a
+            # duplicate. (is_duplicate persists the vector via get_or_compute
+            # before we know whether the commit will succeed.)
+            if embeddings is not None:
+                embeddings.evict(item.text)
             continue
 
         report.committed += 1
@@ -334,6 +340,9 @@ def extract_session_snapshot(
         if mem_id is None:
             report.errors += 1
             report.commit_failures += 1
+            # Evict so retry doesn't self-dedup (mirrors close_session logic above).
+            if embeddings is not None:
+                embeddings.evict(item.text)
             continue
         report.committed += 1
         report.memory_ids.append(mem_id)
@@ -349,9 +358,32 @@ def extract_session_snapshot(
             else:
                 report.soul_queue_errors += 1
 
-    # F-011 — success clears any prior backoff state so the next failure
-    # starts a fresh window. The wedge (if there was one) is past.
-    delete_backoff(persona_dir, session_id)
+    # F-011 — backoff accounting at end of pass.
+    # Commit failures: bump the sidecar so finalize_stale_sessions can
+    # dead-letter after _BACKOFF_FAILURE_THRESHOLD repeated failures. Mirrors
+    # the extraction-failure backoff above — first failure anchors
+    # first_failure_at; subsequent failures increment without moving the anchor.
+    # Success: clear any prior backoff state so the next failure starts fresh.
+    if report.commit_failures > 0:
+        existing = read_backoff(persona_dir, session_id)
+        if existing is None:
+            write_backoff(
+                persona_dir,
+                session_id,
+                failures=1,
+                first_failure_at=datetime.now(UTC).isoformat(),
+            )
+        else:
+            write_backoff(
+                persona_dir,
+                session_id,
+                failures=existing["failures"] + 1,
+                first_failure_at=existing["first_failure_at"],
+            )
+    else:
+        # F-011 — success clears any prior backoff state so the next failure
+        # starts a fresh window. The wedge (if there was one) is past.
+        delete_backoff(persona_dir, session_id)
 
     # Advance cursor only when all commits succeeded. If any commit failed,
     # the buffer is held for retry — advancing the cursor would cause the
@@ -500,6 +532,10 @@ def finalize_stale_sessions(
         elif at_threshold:
             # Buffer has failed >= threshold times — move to poison queue so it
             # doesn't block the finalize loop indefinitely.
+            # Accepted narrow window: an extraction-wedged buffer hit by the 24h
+            # finalize tick while still inside its 10-min backoff window may be
+            # dead-lettered before a post-window recovery attempt. Recoverable
+            # (moved to poison/, not deleted); window is narrow in practice.
             src = persona_dir / "active_conversations" / f"{sid}.jsonl"
             poison_dir = persona_dir / "active_conversations" / "poison"
             poison_dir.mkdir(parents=True, exist_ok=True)

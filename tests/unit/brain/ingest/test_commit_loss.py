@@ -9,12 +9,11 @@ committed items hit is_duplicate on the next pass and cursor still advances.
 """
 from __future__ import annotations
 
-import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from brain.bridge.provider import LLMProvider
-from brain.ingest.buffer import ingest_turn, read_cursor, write_backoff
+from brain.ingest.buffer import ingest_turn, read_cursor
 from brain.ingest.extract import ExtractionOutcome
 from brain.ingest.pipeline import (
     _BACKOFF_FAILURE_THRESHOLD,
@@ -23,6 +22,7 @@ from brain.ingest.pipeline import (
     finalize_stale_sessions,
 )
 from brain.ingest.types import ExtractedItem
+from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
@@ -223,11 +223,99 @@ def test_finalize_holds_buffer_when_commit_fails(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# STEP 4b — finalize dead-letters after max retry threshold
+# Finding #3 — embeddings-ON retry must not self-dedup after commit failure
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
+    """Pass 1: store.create raises → commit_failures >= 1, cursor held, AND the
+    candidate's vector is evicted from the embedding cache so pass 2 doesn't
+    self-match at cosine 1.0 and silently discard the memory.
+
+    Pass 2: store.create succeeds → memory committed, found in store.
+
+    The bug only triggers when the cache has at least one existing entry before
+    pass 1 — if the cache is empty, is_duplicate returns False early without
+    ever calling get_or_compute, so the vector is never cached and no evict is
+    needed. We seed the cache with one unrelated entry so existing_rows is
+    non-empty, which forces is_duplicate to call get_or_compute(item_text) and
+    persist its vector before the commit fails.
+    """
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+    sid = _seed(persona_dir, 1)
+    item_text = "durable fact 0"
+    items = [ExtractedItem(text=item_text, label="fact", importance=5)]
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
+
+    try:
+        # Seed cache with one unrelated entry so existing_rows is non-empty in
+        # pass 1 — this forces is_duplicate to reach the get_or_compute call
+        # and persist item_text's vector before the commit fails.
+        embeddings.get_or_compute("unrelated prior memory")
+        assert embeddings.count() == 1
+
+        # ── Pass 1: commit raises ──────────────────────────────────────────
+        def always_raise(mem):
+            raise RuntimeError("database is locked")
+
+        with patch(
+            "brain.ingest.pipeline.extract_items_with_status",
+            return_value=ExtractionOutcome(items=items, failed=False, error=None),
+        ), patch.object(store, "create", side_effect=always_raise):
+            report1 = extract_session_snapshot(
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=_NoopProvider(),
+                embeddings=embeddings,
+            )
+
+        assert report1.commit_failures >= 1, "pass 1 must record a commit failure"
+        # After eviction the candidate's vector must be gone; the unrelated seed stays.
+        assert embeddings.count() == 1, (
+            "evict() must remove item_text's vector (count back to 1 — only seed remains)"
+        )
+
+        # ── Pass 2: commit succeeds ────────────────────────────────────────
+        with patch(
+            "brain.ingest.pipeline.extract_items_with_status",
+            return_value=ExtractionOutcome(items=items, failed=False, error=None),
+        ):
+            report2 = extract_session_snapshot(
+                persona_dir,
+                sid,
+                store=store,
+                hebbian=hebbian,
+                provider=_NoopProvider(),
+                embeddings=embeddings,
+            )
+
+        assert report2.committed >= 1, "pass 2 must commit the memory (not dedup it away)"
+        mems = store.search_text(item_text, limit=5)
+        assert any(item_text in (m.content or "") for m in mems), (
+            "memory must be findable in the store after pass 2"
+        )
+    finally:
+        store.close()
+        hebbian.close()
+        embeddings.close()
+
+
+# ---------------------------------------------------------------------------
+# STEP 4b — finalize dead-letters after max retry (driven by REAL failures)
 # ---------------------------------------------------------------------------
 
 
 def test_finalize_deadletters_after_max_retry(tmp_path: Path):
+    """finalize_stale_sessions must dead-letter a buffer after
+    _BACKOFF_FAILURE_THRESHOLD consecutive snapshot calls all fail with
+    commit errors.  The sidecar must climb naturally — no pre-seeding.
+    """
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
     sid = _seed(persona_dir, 3)
@@ -238,19 +326,26 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
 
-    # Pre-write a backoff sidecar at the failure threshold
-    now_iso = datetime.datetime.now(datetime.UTC).isoformat()
-    write_backoff(
-        persona_dir,
-        sid,
-        failures=_BACKOFF_FAILURE_THRESHOLD,
-        first_failure_at=now_iso,
-    )
-
     def always_raise(mem):
         raise RuntimeError("database is locked")
 
     try:
+        # Drive _BACKOFF_FAILURE_THRESHOLD snapshot passes so the sidecar
+        # climbs naturally to the threshold.
+        for _ in range(_BACKOFF_FAILURE_THRESHOLD):
+            with patch(
+                "brain.ingest.pipeline.extract_items_with_status",
+                return_value=ExtractionOutcome(items=items, failed=False, error=None),
+            ), patch.object(store, "create", side_effect=always_raise):
+                extract_session_snapshot(
+                    persona_dir,
+                    sid,
+                    store=store,
+                    hebbian=hebbian,
+                    provider=_NoopProvider(),
+                )
+
+        # Now finalize (still failing) — must dead-letter because sidecar >= threshold.
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
