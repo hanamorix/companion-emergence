@@ -36,7 +36,7 @@ def test_supervisor_invokes_forgetting_pass_on_soul_review_cadence(
         return {"faded": 0, "lost": 0, "total": 0, "exempt": 0, "unfaded": 0, "duration_ms": 0}
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _fake_forgetting_pass)
-    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: None)
+    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
 
@@ -78,6 +78,7 @@ def test_supervisor_forgetting_pass_fault_isolated(
         soul_review_calls[0] += 1
         if soul_review_calls[0] >= 2:
             stop_event.set()
+        return 0, 0  # _run_soul_review_tick now returns (model_failures, eligible)
 
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", _soul_review_counter)
 
@@ -123,7 +124,7 @@ def test_supervisor_passes_intensity_drivers_to_forgetting(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_felt_time_tick", _fake_felt_time_tick)
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _fake_forgetting_pass)
-    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: None)
+    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
 

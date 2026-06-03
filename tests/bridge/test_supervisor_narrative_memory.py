@@ -46,7 +46,7 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _fake_forgetting)
     monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", _fake_arc_update)
-    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: None)
+    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
 
@@ -106,6 +106,7 @@ def test_supervisor_arc_update_failure_is_isolated(
         soul_review_calls[0] += 1
         if soul_review_calls[0] >= 2:
             stop_event.set()
+        return 0, 0  # _run_soul_review_tick now returns (model_failures, eligible)
 
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", _soul_review_counter)
 

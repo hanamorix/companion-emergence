@@ -77,6 +77,10 @@ class ReviewReport:
     decisions: list[Decision] = field(default_factory=list)
     dry_run: bool = False
     audit_failures: int = 0
+    # Distinct from parse_failures: a model CALL that raised (e.g. 429 session
+    # limit), not a malformed response. Drives the supervisor's catch-up /
+    # failure-backoff cadence so a transient outage retries fast post-limit.
+    model_failures: int = 0
 
 
 # ── Prompt construction ───────────────────────────────────────────────────────
@@ -422,6 +426,20 @@ def _within_defer_cooldown(candidate: dict, cooldown_hours: float) -> bool:
     return elapsed.total_seconds() < cooldown_hours * 3600.0
 
 
+def count_eligible_pending(
+    persona_dir: Path, *, defer_cooldown_hours: float = DEFAULT_DEFER_COOLDOWN_HOURS
+) -> int:
+    """Number of ``auto_pending`` candidates not currently in defer-cooldown —
+    how many the next review pass could actually act on. Drives the supervisor's
+    backlog-aware drain (raise max_decisions) and catch-up cadence."""
+    return sum(
+        1
+        for r in _load_soul_candidates(persona_dir)
+        if r.get("status", "auto_pending") == "auto_pending"
+        and not _within_defer_cooldown(r, defer_cooldown_hours)
+    )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
@@ -564,12 +582,17 @@ def _review_pending_candidates_locked(
                 parse_error=f"model call failed: {exc}",
             )
             report.parse_failures += 1
+            report.model_failures += 1
             report.decisions.append(decision)
             if not append_audit_entry(
                 persona_dir, decision, record, related, emotional_summary, None, dry_run
             ):
                 report.audit_failures += 1
             report.deferred += 1
+            # NOTE: deliberately does NOT _apply_defer — a transient model
+            # failure must not stamp last_deferred_at (which would put the
+            # candidate in the 24h cooldown). It stays auto_pending, eligible
+            # the moment the limit lifts.
             continue
 
         decision = parse_decision(raw, candidate_id)

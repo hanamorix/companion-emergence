@@ -576,3 +576,56 @@ def test_soul_review_system_prompt_uses_companion_name_not_nell() -> None:
     system_content = messages[0]["content"]
     assert "Mira" in system_content
     assert "Nell" not in system_content
+
+
+def test_count_eligible_pending_excludes_cooldown_and_nonpending(tmp_path: Path) -> None:
+    """count_eligible_pending = auto_pending candidates not in defer-cooldown —
+    how many the next review pass could actually act on (drives backlog-aware
+    drain + the catch-up cadence)."""
+    from brain.soul.review import count_eligible_pending
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir(parents=True)
+    in_cooldown = _make_candidate()
+    in_cooldown["last_deferred_at"] = datetime.now(UTC).isoformat()
+    accepted = _make_candidate(status="accepted")
+    eligible_a = _make_candidate()
+    eligible_b = _make_candidate()
+    _write_candidates(persona_dir, [in_cooldown, accepted, eligible_a, eligible_b])
+
+    assert count_eligible_pending(persona_dir) == 2
+
+
+def test_model_call_failure_counted_and_leaves_candidate_eligible(tmp_path: Path) -> None:
+    """A model-call failure (e.g. 429 session limit) is counted in
+    report.model_failures AND must NOT stamp last_deferred_at — the candidate
+    stays auto_pending and immediately eligible once the limit lifts (no 24h
+    cooldown on a transient failure)."""
+
+    class _RaisingProvider(LLMProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            raise RuntimeError("ClaudeCliProvider failed (exit 1): api_error_status=429")
+
+        def name(self) -> str:
+            return "raising-fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            raise NotImplementedError
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir(parents=True)
+    _write_candidates(persona_dir, [_make_candidate()])
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+    try:
+        report = review_pending_candidates(
+            persona_dir, store=store, soul_store=soul_store, provider=_RaisingProvider()
+        )
+    finally:
+        store.close()
+        soul_store.close()
+
+    assert report.model_failures == 1
+    rec = json.loads((persona_dir / "soul_candidates.jsonl").read_text().strip())
+    assert rec["status"] == "auto_pending"
+    assert "last_deferred_at" not in rec
