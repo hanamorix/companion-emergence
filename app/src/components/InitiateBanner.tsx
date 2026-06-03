@@ -17,6 +17,7 @@ export type InitiateMessage = {
 
 type Props = {
   message: InitiateMessage;
+  companionName: string;
   onReply: (auditId: string) => void;
   onDismiss: (auditId: string) => void;
   onMounted: (auditId: string) => void;
@@ -32,7 +33,7 @@ const STATE_LABEL: Record<InitiateMessage["state"], string> = {
   dismissed: "dismissed",
 };
 
-export function InitiateBanner({ message, onReply, onDismiss, onMounted }: Props) {
+export function InitiateBanner({ message, companionName, onReply, onDismiss, onMounted }: Props) {
   const firedRef = useRef(false);
   useEffect(() => {
     // 2-second on-screen timer that respects document visibility:
@@ -78,7 +79,7 @@ export function InitiateBanner({ message, onReply, onDismiss, onMounted }: Props
   }, [message.auditId, onMounted]);
 
   return (
-    <div className="initiate-banner" role="region" aria-label="Nell reached out">
+    <div className="initiate-banner" role="region" aria-label={`${companionName} reached out`}>
       <div className="initiate-banner__body">{message.body}</div>
       <div className="initiate-banner__meta">
         <span className="initiate-banner__urgency">{message.urgency}</span>

@@ -54,11 +54,20 @@ def _format_buffer(buffer_slice: list[BufferTurn]) -> str:
     return "\n".join(f"[turn id={t.id}] {t.content}" for t in buffer_slice)
 
 
-def _build_user_message(buffer_slice: list[BufferTurn], reply_text: str) -> str:
+def _build_user_message(
+    buffer_slice: list[BufferTurn],
+    reply_text: str,
+    *,
+    companion_name: str = "",
+) -> str:
+    if companion_name:
+        reply_label = f"{companion_name.upper()}'S LATEST REPLY"
+    else:
+        reply_label = "LATEST REPLY"
     return (
         "USER'S RECENT TURNS:\n"
         f"{_format_buffer(buffer_slice)}\n\n"
-        "NELL'S LATEST REPLY (for context only, do not extract patterns from it):\n"
+        f"{reply_label} (for context only, do not extract patterns from it):\n"
         f"{reply_text}\n\n"
         "Return JSON only. No prose."
     )
@@ -182,6 +191,7 @@ def run_detector(
     reply_text: str,
     *,
     only_categories: frozenset[str] | None = None,
+    companion_name: str = "",
 ) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
 
@@ -205,7 +215,7 @@ def run_detector(
 
     source_turn_id = buffer_slice[-1].id
     system_prompt = build_detector_system_prompt(only_categories=only_categories)
-    user_message = _build_user_message(buffer_slice, reply_text)
+    user_message = _build_user_message(buffer_slice, reply_text, companion_name=companion_name)
 
     raw = _call_haiku(system_prompt, user_message)
     if not raw:

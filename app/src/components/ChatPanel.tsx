@@ -755,6 +755,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             <InitiateBanner
               key={b.auditId}
               message={b}
+              companionName={capitalize(persona)}
               onReply={onBannerReply}
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}

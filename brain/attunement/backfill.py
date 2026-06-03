@@ -253,6 +253,7 @@ def run_backfill(
 
     if detector_fn is None:
         from brain.attunement.detector import run_detector as _default_detector
+        _cname = persona_dir.name  # capture for closure
         if only_categories is not None:
             _cats = only_categories  # capture for closure
 
@@ -261,9 +262,15 @@ def run_backfill(
                     buffer_slice=buffer_slice,
                     reply_text=reply_text,
                     only_categories=_cats,
+                    companion_name=_cname,
                 )
         else:
-            detector_fn = _default_detector
+            def detector_fn(*, buffer_slice, reply_text):  # noqa: ANN001
+                return _default_detector(
+                    buffer_slice=buffer_slice,
+                    reply_text=reply_text,
+                    companion_name=_cname,
+                )
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = _now_iso_str(now_dt)

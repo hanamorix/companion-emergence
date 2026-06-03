@@ -87,6 +87,21 @@ describe("InitiateBanner", () => {
     vi.useRealTimers();
   });
 
+  it("aria-label uses companionName prop, not hardcoded 'Nell'", () => {
+    render(
+      <InitiateBanner
+        message={baseMessage}
+        companionName="Mira"
+        onReply={vi.fn()}
+        onDismiss={vi.fn()}
+        onMounted={vi.fn()}
+      />,
+    );
+    const region = screen.getByRole("region");
+    expect(region).toHaveAttribute("aria-label", "Mira reached out");
+    expect(region.getAttribute("aria-label")).not.toContain("Nell");
+  });
+
   it("does not fire onMounted twice across multiple visibility cycles", () => {
     vi.useFakeTimers();
     const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
