@@ -21,6 +21,7 @@ class RecoveryReport:
     backup_path: str | None
     elapsed_seconds: float
     dry_run: bool
+    memories_skipped_no_timestamp: int = 0
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -38,6 +39,11 @@ def format_report(r: RecoveryReport) -> str:
         f"  edges repaired:              {r.edges_repaired}",
         f"  edges pruned (unrecoverable):{r.edges_pruned_unrecoverable}",
     ]
+    if r.memories_skipped_no_timestamp:
+        lines.append(
+            f"  memories skipped (missing/invalid original timestamp): "
+            f"{r.memories_skipped_no_timestamp}"
+        )
     if r.backup_path:
         lines.append(f"  backup: {r.backup_path}")
     return "\n".join(lines)

@@ -26,3 +26,28 @@ def test_format_report_mentions_persona_and_counts():
     text = format_report(r)
     assert "Phoebe" in text
     assert "graveyard" in text
+
+
+def test_format_report_shows_skipped_line_when_nonzero():
+    r = RecoveryReport(
+        persona="Nova", mode="graveyard", source_dir=None,
+        memories_restored_full=0, memories_restored_summary=1,
+        memories_unfaded=0, memories_skipped_no_timestamp=3,
+        edges_repaired=0, edges_pruned_unrecoverable=0,
+        backup_path=None, elapsed_seconds=0.05, dry_run=False,
+    )
+    text = format_report(r)
+    assert "skipped" in text
+    assert "3" in text
+
+
+def test_format_report_omits_skipped_line_when_zero():
+    r = RecoveryReport(
+        persona="Nova", mode="graveyard", source_dir=None,
+        memories_restored_full=0, memories_restored_summary=1,
+        memories_unfaded=0, memories_skipped_no_timestamp=0,
+        edges_repaired=0, edges_pruned_unrecoverable=0,
+        backup_path=None, elapsed_seconds=0.05, dry_run=False,
+    )
+    text = format_report(r)
+    assert "skipped" not in text
