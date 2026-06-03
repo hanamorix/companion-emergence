@@ -58,7 +58,7 @@ These run but aren't fully closed loops. Labelled here so the half-wired state i
 
 ## Coverage gaps (known, accepted this release)
 
-- Stream-keepalive integration test (v0.0.28 idle-timeout area) — see H4 outcome; logged here if the harness was deferred rather than built.
+- **Stream-keepalive end-to-end** (v0.0.28 idle-timeout area): no integration test. The empty skip-stub was **deleted** in v0.0.30 (H4) rather than left as a perpetual skip — a real harness needs a live `bridge_subprocess` + a `fake_streaming` provider emitting deltas over ~90s to outlast the 60s idle window (infra that doesn't exist and is disproportionate for CI timing). The `reply_chunk` keepalive mechanism IS covered at the unit level by `tests/bridge/test_provider_stream_json.py` and `tests/bridge/test_endpoints.py::test_stream_round_trip` (frames arrive + reassemble). Revisit if a `bridge_subprocess`+injectable-provider harness is ever built.
 
 ---
 
