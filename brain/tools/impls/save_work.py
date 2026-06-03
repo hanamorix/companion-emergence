@@ -1,4 +1,9 @@
-"""save_work tool implementation."""
+"""save_work tool implementation.
+
+FENCED (v0.0.30): a tool surface with no autonomous writer/reader/feed —
+kept available but intentionally not wired into the emotional/memory loops
+(pre-Maker). See docs/maturity-manifest.md.
+"""
 
 from __future__ import annotations
 
