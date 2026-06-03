@@ -71,9 +71,13 @@ export function ConnectionPanel({
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
   useEffect(() => {
     let cancelled = false;
-    void detectInstallShape().then((s) => {
-      if (!cancelled) setShape(s);
-    });
+    void detectInstallShape()
+      .then((s) => {
+        if (!cancelled) setShape(s);
+      })
+      .catch(() => {
+        /* detectInstallShape can't reject today (internal try/catch); defensive */
+      });
     return () => {
       cancelled = true;
     };
