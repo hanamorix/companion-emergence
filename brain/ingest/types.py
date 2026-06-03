@@ -66,4 +66,5 @@ class IngestReport:
     soul_candidates: int = 0
     soul_queue_errors: int = 0
     errors: int = 0
+    commit_failures: int = 0
     memory_ids: list[str] = field(default_factory=list)
