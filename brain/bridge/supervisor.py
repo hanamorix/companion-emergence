@@ -175,7 +175,7 @@ def run_folded(
     # startup if needed.  Fault-isolated per autonomous-behaviour recipe item 3.
     try:
         if _emotion_backfill_should_run(persona_dir):
-            _emotion_backfill_run(persona_dir)
+            _emotion_backfill_run(persona_dir, provider=provider)
     except Exception as exc:  # noqa: BLE001
         logger.warning("emotion backfill failed during startup: %s", exc)
 
