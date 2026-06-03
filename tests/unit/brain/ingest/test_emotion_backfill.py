@@ -264,7 +264,10 @@ def test_supervisor_calls_emotion_backfill_when_should_run_true(tmp_path):
         )
 
         mock_should.assert_called_once_with(persona_dir)
-        mock_run.assert_called_once_with(persona_dir)
+        # provider= is now forwarded so the default tagger gets a real provider
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0] == (persona_dir,)
+        assert "provider" in mock_run.call_args[1]
 
 
 def test_supervisor_skips_emotion_backfill_when_should_run_false(tmp_path):
@@ -311,3 +314,144 @@ def test_supervisor_skips_emotion_backfill_when_should_run_false(tmp_path):
 
         mock_should.assert_called_once_with(persona_dir)
         mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — production-seam test: tagger_fn=None uses real default-tagger path
+# ---------------------------------------------------------------------------
+
+class _FakeProviderForTagger:
+    """Minimal LLMProvider-compatible stub — no network calls.
+
+    generate() returns a JSON emotion dict so the default tagger's parse
+    logic succeeds.  The real ClaudeCliProvider signature is:
+        generate(prompt, *, system=None) -> str
+    """
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:  # noqa: ARG002
+        return '{"loneliness": 8.0}'
+
+    def name(self) -> str:
+        return "fake-tagger"
+
+
+def test_default_tagger_path_tags_memories_via_provider(tmp_path):
+    """Production-seam test: tagger_fn=None uses the injected provider, not a bad import.
+
+    Before the fix, _default_tagger imported get_default_provider (which does not
+    exist) and called provider.generate(prompt, model="haiku") (wrong signature).
+    Both errors were swallowed by except Exception → {}, so every memory tagged to
+    nothing and the migration marked 'complete' having healed nothing.
+
+    The new provider= kwarg lets tests inject a stub so we exercise the REAL
+    default-tagger code path without shelling out to the Claude CLI.
+    """
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+    from brain.memory.store import MemoryStore
+
+    store = _make_store(tmp_path)
+    m = _create_memory(store, has_emotions=False)
+    store.close()
+
+    # tagger_fn=None → default tagger path; provider injected so no CLI call
+    state = run_emotion_backfill(
+        tmp_path, tagger_fn=None, provider=_FakeProviderForTagger(), cap=50
+    )
+
+    assert state.status == "complete"
+
+    store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
+    updated = store2.get(m.id)
+    store2.close()
+
+    # The memory must have been tagged — {} means the default tagger silently failed
+    assert updated is not None
+    assert updated.emotions != {}, (
+        "default tagger wrote no emotions — provider.generate likely failed or "
+        "returned unparseable output"
+    )
+    assert updated.emotions.get("loneliness") == 8.0
+
+
+def test_default_tagger_zero_tagged_does_not_mark_complete(tmp_path):
+    """Guard: when every provider call returns garbage, don't mark 'complete'.
+
+    A run that processed candidates but tagged zero memories must leave
+    status != 'complete' so it stays resumable.  Marking complete in this
+    case burns the one-shot idempotency flag having healed nothing.
+    """
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+
+    class _EmptyProvider:
+        """Always returns unparseable text so the tagger produces {}."""
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:  # noqa: ARG002
+            return "not-json-at-all"
+
+        def name(self) -> str:
+            return "empty"
+
+    store = _make_store(tmp_path)
+    _create_memory(store, has_emotions=False)
+    _create_memory(store, has_emotions=False)
+    store.close()
+
+    state = run_emotion_backfill(
+        tmp_path, tagger_fn=None, provider=_EmptyProvider(), cap=50
+    )
+
+    # Must NOT be marked complete when zero memories were actually tagged
+    assert state.status != "complete", (
+        f"run marked 'complete' after tagging zero memories (status={state.status!r}); "
+        "this burns the one-shot flag having healed nothing"
+    )
+
+
+def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
+    """Supervisor must forward its provider arg to _emotion_backfill_run.
+
+    Before the Step 2 wire-up fix, _emotion_backfill_run was called with
+    only (persona_dir,) — the provider never reached the default tagger.
+    """
+    import threading
+    from unittest.mock import patch
+
+    from brain.bridge.events import EventBus
+    from brain.bridge.provider import FakeProvider
+    from brain.bridge.supervisor import run_folded
+
+    persona_dir = tmp_path / "test-persona"
+    persona_dir.mkdir()
+    (persona_dir / "active_conversations").mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "fake", "searcher": "noop"}'
+    )
+
+    stop = threading.Event()
+    stop.set()
+
+    provider = FakeProvider()
+
+    with patch("brain.bridge.supervisor._attunement_should_run_backfill", return_value=False), \
+         patch("brain.bridge.supervisor._attunement_run_backfill"), \
+         patch("brain.bridge.supervisor._attunement_should_run_supplementary_backfill", return_value=False), \
+         patch("brain.bridge.supervisor._attunement_run_supplementary_backfill"), \
+         patch("brain.bridge.supervisor._emotion_backfill_should_run", return_value=True), \
+         patch("brain.bridge.supervisor._emotion_backfill_run") as mock_run:
+
+        run_folded(
+            stop,
+            persona_dir=persona_dir,
+            provider=provider,
+            event_bus=EventBus(),
+            tick_interval_s=0.0,
+            heartbeat_interval_s=None,
+            soul_review_interval_s=None,
+            finalize_interval_s=None,
+            log_rotation_interval_s=None,
+            initiate_review_interval_s=None,
+            voice_reflection_interval_s=None,
+        )
+
+        # Must be called with provider= kwarg so the default tagger gets a real provider
+        mock_run.assert_called_once_with(persona_dir, provider=provider)

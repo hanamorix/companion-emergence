@@ -2,13 +2,13 @@
 
 Re-tags active memories that have ``emotions == {}`` so existing personas
 benefit from the A2 forward-only emotion seeding.  Mirrors the pattern in
-``brain/attunement/backfill.py`` (cursor-resume, daily budget cap, stratified
-sampling, fault-isolated supervisor wiring).
+``brain/attunement/backfill.py`` (cursor-resume, daily budget cap,
+fault-isolated supervisor wiring).
 
 Public surface
 --------------
 should_run_emotion_backfill(persona_dir) -> bool
-run_emotion_backfill(persona_dir, *, tagger_fn, cap, now_dt) -> EmotionBackfillState
+run_emotion_backfill(persona_dir, *, tagger_fn, provider, cap, now_dt) -> EmotionBackfillState
 """
 from __future__ import annotations
 
@@ -19,16 +19,19 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC
 from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "emotion_backfill_state.json"
 _SCHEMA_VERSION = "v1"
 
-# Per-run sample size: tag at most this many memories per invocation so we
-# don't lock the store for a long time on large personas.
-_SAMPLE_BATCH = 50
+# Haiku model constant — mirrors _DETECTOR_MODEL in brain/attunement/detector.py.
+_BACKFILL_MODEL = "claude-haiku-4-5-20251001"
+_BACKFILL_TIMEOUT_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -139,26 +142,47 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
 # Default tagger (one Haiku call per memory)
 # ---------------------------------------------------------------------------
 
-def _default_tagger(memory) -> dict[str, float]:  # noqa: ANN001
-    """Ask Haiku to emit an emotion vector for this memory's content."""
-    try:
-        from brain.bridge.provider import get_default_provider
+_TAGGER_SYSTEM_PROMPT = (
+    "You are an emotion-tagging assistant. "
+    "Return a JSON object mapping emotion names to intensities (0–10). "
+    "Omit emotions with intensity 0. "
+    "Return ONLY the JSON object, no prose, no markdown fences."
+)
 
-        vocab = _load_vocab()
-        vocab_str = ", ".join(sorted(vocab)) if vocab else "(any emotion name)"
-        prompt = (
-            f"Return a JSON object mapping emotion names to intensities (0-10) "
-            f"for the following memory.  Use ONLY names from this list: {vocab_str}. "
-            f"Omit emotions with intensity 0.  Return ONLY the JSON object, no other text.\n\n"
-            f"Memory: {memory.content}"
+
+def _make_default_tagger(provider: LLMProvider | None) -> Callable:
+    """Return a tagger closure that calls ``provider.generate`` for each memory.
+
+    When ``provider`` is None, constructs a ``ClaudeCliProvider`` pointed at
+    the Haiku model — mirroring the ``_call_haiku`` pattern in
+    ``brain/attunement/detector.py``.
+    """
+    if provider is None:
+        from brain.bridge.provider import ClaudeCliProvider
+
+        provider = ClaudeCliProvider(
+            model=_BACKFILL_MODEL,
+            timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
         )
-        provider = get_default_provider()
-        raw_text = provider.generate(prompt, model="haiku")
-        raw = json.loads(raw_text)
-        return _normalize(raw, vocab)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("emotion_backfill: default tagger error: %s", exc)
-        return {}
+
+    def _tagger(memory) -> dict[str, float]:  # noqa: ANN001
+        try:
+            vocab = _load_vocab()
+            vocab_str = ", ".join(sorted(vocab)) if vocab else "(any emotion name)"
+            prompt = (
+                f"Return a JSON object mapping emotion names to intensities (0-10) "
+                f"for the following memory. Use ONLY names from this list: {vocab_str}. "
+                f"Omit emotions with intensity 0. Return ONLY the JSON object, no other text.\n\n"
+                f"Memory: {memory.content}"
+            )
+            raw_text = provider.generate(prompt, system=_TAGGER_SYSTEM_PROMPT)
+            raw = json.loads(raw_text)
+            return _normalize(raw, vocab)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("emotion_backfill: default tagger error: %s", exc)
+            return {}
+
+    return _tagger
 
 
 # ---------------------------------------------------------------------------
@@ -192,23 +216,31 @@ def run_emotion_backfill(
     persona_dir: Path,
     *,
     tagger_fn: Callable | None = None,
+    provider: LLMProvider | None = None,
     cap: int = 200,
     now_dt: _datetime | None = None,
 ) -> EmotionBackfillState:
     """Run (or resume) the one-time emotion backfill.
 
-    - Selects active memories with ``emotions == {}`` ordered by ``created_at``
-      (deterministic cursor).
+    - Selects ALL active memories with ``emotions == {}`` ordered by ``m.id``
+      (stable, deterministic cursor — no sampling).
     - Calls ``tagger_fn(memory)`` → ``dict[str, float]``; filters to registered
-      vocab; writes back via ``store.update(id, emotions=...)``.
+      vocab; writes back via a single ``MemoryStore`` handle.
     - Respects a DAILY BUDGET CAP; persists cursor to resume across ticks.
     - Returns ``EmotionBackfillState`` with ``status`` in
       ``{"complete", "deferred_to_next_day", "running"}``.
+    - Does NOT mark ``status="complete"`` if the run processed candidates but
+      tagged zero memories (guards against a systematic tagger failure burning
+      the one-shot idempotency flag having healed nothing).
+
+    ``tagger_fn`` takes priority over ``provider``.  When ``tagger_fn`` is None
+    the default Haiku tagger is used; ``provider`` (if given) is passed to it so
+    tests can inject a stub without shelling out to the Claude CLI.
 
     Mirrors ``brain.attunement.backfill.run_backfill``.
     """
     if tagger_fn is None:
-        tagger_fn = _default_tagger
+        tagger_fn = _make_default_tagger(provider)
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -222,88 +254,108 @@ def run_emotion_backfill(
 
     db_path = persona_dir / "memories.db"
     from brain.memory.store import MemoryStore
+
+    # Single store handle for the whole run — avoids opening a fresh connection
+    # per write-back (mirrors the attunement backfill's single-handle pattern).
+    # MemoryStore uses WAL + 5s busy_timeout so a long-running backfill does
+    # not block the main chat path.
     store = MemoryStore(str(db_path), integrity_check=False)
     try:
         all_active = store.list_active()
-    finally:
-        store.close()
 
-    # Filter to emotion-less only, sorted deterministically by id (stable cursor).
-    candidates = sorted(
-        [m for m in all_active if not m.emotions],
-        key=lambda m: m.id,
-    )
+        # Filter to emotion-less only, sorted deterministically by id (stable cursor).
+        candidates = sorted(
+            [m for m in all_active if not m.emotions],
+            key=lambda m: m.id,
+        )
 
-    total = len(all_active)
-    tagged_so_far = existing.tagged_memories if existing else 0
-    started_at = existing.started_at if existing else now_iso
-    last_cursor = existing.last_cursor if existing else ""
+        total = len(all_active)
+        candidates_count = len(candidates)
+        tagged_so_far = existing.tagged_memories if existing else 0
+        started_at = existing.started_at if existing else now_iso
+        last_cursor = existing.last_cursor if existing else ""
 
-    # Resume: skip memories we have already tagged (cursor = last-tagged id).
-    if last_cursor:
-        resume_idx = 0
-        for i, m in enumerate(candidates):
-            if m.id == last_cursor:
-                resume_idx = i + 1
-                break
-        candidates = candidates[resume_idx:]
+        # Resume: skip memories we have already tagged (cursor = last-tagged id).
+        if last_cursor:
+            resume_idx = 0
+            for i, m in enumerate(candidates):
+                if m.id == last_cursor:
+                    resume_idx = i + 1
+                    break
+            candidates = candidates[resume_idx:]
 
-    state = EmotionBackfillState(
-        started_at=started_at,
-        total_memories=total,
-        tagged_memories=tagged_so_far,
-        last_cursor=last_cursor,
-        status="running",
-        schema_version=_SCHEMA_VERSION,
-    )
-    _save_state(persona_dir, state)
-
-    for memory in candidates:
-        if not _consume_budget(persona_dir, now=now_dt, cap=cap):
-            state = replace(state, status="deferred_to_next_day")
-            _save_state(persona_dir, state)
-            logger.info(
-                "emotion_backfill: daily cap (%d) reached; deferred. "
-                "tagged_so_far=%d cursor=%s",
-                cap, tagged_so_far, last_cursor,
-            )
-            return state
-
-        try:
-            raw_emotions = tagger_fn(memory)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
-            continue
-
-        filtered = _normalize(raw_emotions, vocab)
-        if not filtered:
-            continue
-
-        try:
-            store2 = MemoryStore(str(db_path), integrity_check=False)
-            try:
-                store2.update(memory.id, emotions=filtered)
-            finally:
-                store2.close()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "emotion_backfill: write-back error on %s: %s", memory.id, exc
-            )
-            continue
-
-        tagged_so_far += 1
-        last_cursor = memory.id
-        state = replace(
-            state,
+        state = EmotionBackfillState(
+            started_at=started_at,
+            total_memories=total,
             tagged_memories=tagged_so_far,
             last_cursor=last_cursor,
+            status="running",
+            schema_version=_SCHEMA_VERSION,
         )
         _save_state(persona_dir, state)
 
-    state = replace(state, status="complete")
-    _save_state(persona_dir, state)
-    logger.info(
-        "emotion_backfill: complete. tagged=%d total_active=%d",
-        tagged_so_far, total,
-    )
-    return state
+        tagged_this_run = 0
+
+        for memory in candidates:
+            if not _consume_budget(persona_dir, now=now_dt, cap=cap):
+                state = replace(state, status="deferred_to_next_day")
+                _save_state(persona_dir, state)
+                logger.info(
+                    "emotion_backfill: daily cap (%d) reached; deferred. "
+                    "tagged_so_far=%d cursor=%s",
+                    cap, tagged_so_far, last_cursor,
+                )
+                return state
+
+            try:
+                raw_emotions = tagger_fn(memory)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
+                continue
+
+            filtered = _normalize(raw_emotions, vocab)
+            if not filtered:
+                continue
+
+            try:
+                store.update(memory.id, emotions=filtered)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "emotion_backfill: write-back error on %s: %s", memory.id, exc
+                )
+                continue
+
+            tagged_so_far += 1
+            tagged_this_run += 1
+            last_cursor = memory.id
+            state = replace(
+                state,
+                tagged_memories=tagged_so_far,
+                last_cursor=last_cursor,
+            )
+            _save_state(persona_dir, state)
+
+        # Zero-tagged guard: if we processed candidates but tagged none, do NOT
+        # mark complete — the tagger may have failed systematically (e.g. bad
+        # provider, parse error).  Leave status="running" so the next startup
+        # retries.  This prevents burning the one-shot idempotency flag having
+        # healed nothing.
+        if candidates_count > 0 and tagged_this_run == 0:
+            logger.warning(
+                "emotion_backfill: processed %d candidates but tagged 0 memories "
+                "(systematic tagger failure?); leaving status=running so next "
+                "startup retries.",
+                candidates_count,
+            )
+            return state
+
+        state = replace(state, status="complete")
+        _save_state(persona_dir, state)
+        logger.info(
+            "emotion_backfill: complete. tagged=%d total_active=%d",
+            tagged_so_far, total,
+        )
+        return state
+
+    finally:
+        store.close()
