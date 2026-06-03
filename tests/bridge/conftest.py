@@ -34,6 +34,23 @@ def _reset_session_registry():
     reset_registry()
 
 
+@pytest.fixture(autouse=True)
+def _reset_events_publisher():
+    """Reset the module-level events._publisher singleton between bridge tests.
+
+    brain.bridge.events._publisher is set to a live EventBus by the bridge
+    lifespan on startup and cleared on teardown. Tests that bring up a full
+    app (via TestClient / httpx.AsyncClient) leave it non-None, which bleeds
+    into subsequent tests and causes order-dependent failures in the streaming
+    proxy gate (test_streaming_proxy_done_only.py).
+    """
+    from brain.bridge import events
+
+    events.set_publisher(None)
+    yield
+    events.set_publisher(None)
+
+
 @pytest.fixture
 def store(persona_dir: Path) -> Iterator[MemoryStore]:
     """An open MemoryStore against an in-tmp SQLite db."""
