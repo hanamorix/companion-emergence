@@ -42,3 +42,24 @@ def test_aggregate_ignores_unknown_emotions_silently():
     result = aggregate_state(memories)
     assert "love" in result.emotions
     assert "not_a_real_emotion" not in result.emotions
+
+
+def test_dropped_unregistered_emotion_warns_once(caplog):
+    import logging
+
+    from brain.emotion.aggregate import _warned_unregistered
+
+    _warned_unregistered.clear()  # isolate from other test runs
+    mem = Memory.create_new(
+        content="x",
+        memory_type="note",
+        domain="us",
+        emotions={"warmth": 8.0},  # warmth = unregistered persona-extension
+    )
+    with caplog.at_level(logging.WARNING):
+        aggregate_state([mem])
+        aggregate_state([mem])  # second call must NOT re-warn
+    warnings = [r for r in caplog.records if "warmth" in r.getMessage()]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning for the dropped stored emotion, got {len(warnings)}"
+    )
