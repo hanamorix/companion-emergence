@@ -325,7 +325,7 @@ describe("AttunementPanel", () => {
     });
     render(<AttunementPanel persona="test" />);
     await waitFor(() =>
-      expect(screen.getByText(/Nell is getting to know you/i)).toBeInTheDocument(),
+      expect(screen.getByText(/is getting to know you/i)).toBeInTheDocument(),
     );
     expect(screen.getByText(/42 \/ 100/i)).toBeInTheDocument();
   });
@@ -347,7 +347,7 @@ describe("AttunementPanel", () => {
     });
     render(<AttunementPanel persona="test" />);
     await waitFor(() => screen.getByText(/Right now/i));
-    expect(screen.queryByText(/Nell is getting to know you/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/is getting to know you/i)).not.toBeInTheDocument();
   });
 
   it("shows backfill banner when backfill.status is 'interrupted'", async () => {
@@ -366,7 +366,7 @@ describe("AttunementPanel", () => {
     });
     render(<AttunementPanel persona="test" />);
     await waitFor(() =>
-      expect(screen.getByText(/Nell is getting to know you/i)).toBeInTheDocument(),
+      expect(screen.getByText(/is getting to know you/i)).toBeInTheDocument(),
     );
   });
 
@@ -378,5 +378,16 @@ describe("AttunementPanel", () => {
     await waitFor(() =>
       expect(screen.getByText(/bridge unavailable/i)).toBeInTheDocument(),
     );
+  });
+
+  // ── persona-name interpolation (SITE 2 & 3) ─────────────────────────────
+
+  it("shows companion name (not 'Nell') in empty-state copy when persona is 'mira'", async () => {
+    fetchAttunement.mockResolvedValue(emptyPayload());
+    render(<AttunementPanel persona="mira" />);
+    await waitFor(() =>
+      expect(screen.getByText(/Mira/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/\bNell\b/)).not.toBeInTheDocument();
   });
 });

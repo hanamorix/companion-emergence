@@ -102,7 +102,11 @@ def _run_attunement_pass2(
     try:
         if not _attunement_consume_call(persona_dir, now=datetime.now(UTC)):
             return  # budget exhausted; defer silently
-        output = run_detector(buffer_slice=buffer_slice, reply_text=reply_text)
+        output = run_detector(
+            buffer_slice=buffer_slice,
+            reply_text=reply_text,
+            companion_name=persona_dir.name,
+        )
         write_current_read(persona_dir, output.current_read)
         merge_into_learned(
             persona_dir,

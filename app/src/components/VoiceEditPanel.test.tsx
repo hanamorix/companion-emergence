@@ -8,6 +8,26 @@ afterEach(() => {
 });
 
 describe("VoiceEditPanel", () => {
+  it("uses companion name in heading, not hardcoded 'Nell'", () => {
+    render(
+      <VoiceEditPanel
+        proposal={{
+          auditId: "ia_ve_001",
+          oldText: "line",
+          newText: "line2",
+          rationale: "r",
+          evidence: [],
+          voiceTemplate: "line\n",
+        }}
+        persona="mira"
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("heading")).toHaveTextContent(/Mira/);
+    expect(screen.getByRole("heading").textContent).not.toContain("Nell");
+  });
+
   const proposal = {
     auditId: "ia_ve_001",
     oldText: "I'm fine when tired",
@@ -18,7 +38,7 @@ describe("VoiceEditPanel", () => {
   };
 
   it("renders the proposed change in context with surrounding lines", () => {
-    render(<VoiceEditPanel proposal={proposal} onAccept={vi.fn()} onReject={vi.fn()} />);
+    render(<VoiceEditPanel proposal={proposal} persona="nell" onAccept={vi.fn()} onReject={vi.fn()} />);
     expect(screen.getByText(/line A/)).toBeInTheDocument();
     expect(screen.getByText(/I'm fine when tired/)).toBeInTheDocument();
     expect(screen.getByText(/I get quieter when tired/)).toBeInTheDocument();
@@ -27,14 +47,14 @@ describe("VoiceEditPanel", () => {
 
   it("calls onAccept with null when Accept clicked", () => {
     const onAccept = vi.fn();
-    render(<VoiceEditPanel proposal={proposal} onAccept={onAccept} onReject={vi.fn()} />);
+    render(<VoiceEditPanel proposal={proposal} persona="nell" onAccept={onAccept} onReject={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
     expect(onAccept).toHaveBeenCalledWith("ia_ve_001", null);
   });
 
   it("calls onAccept with edited text when Accept with edits is used", () => {
     const onAccept = vi.fn();
-    render(<VoiceEditPanel proposal={proposal} onAccept={onAccept} onReject={vi.fn()} />);
+    render(<VoiceEditPanel proposal={proposal} persona="nell" onAccept={onAccept} onReject={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /accept with edits/i }));
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     fireEvent.change(ta, { target: { value: "tweaked line" } });
@@ -44,7 +64,7 @@ describe("VoiceEditPanel", () => {
 
   it("calls onReject when Reject clicked", () => {
     const onReject = vi.fn();
-    render(<VoiceEditPanel proposal={proposal} onAccept={vi.fn()} onReject={onReject} />);
+    render(<VoiceEditPanel proposal={proposal} persona="nell" onAccept={vi.fn()} onReject={onReject} />);
     fireEvent.click(screen.getByRole("button", { name: /reject/i }));
     expect(onReject).toHaveBeenCalledWith("ia_ve_001");
   });

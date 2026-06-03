@@ -5,6 +5,7 @@ The Claude CLI call is mocked; we verify:
 - pattern_candidates are converted into PatternCandidate dataclasses
 - malformed JSON returns a decline output (tone/cadence='unknown', empty candidates)
 - invalid category in a candidate is filtered (rejection_notes records it)
+- companion_name is threaded through to the LLM-facing user message label
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from brain.attunement.detector import run_detector
+from brain.attunement.detector import _build_user_message, run_detector
 from brain.attunement.schemas import SCHEMA_VERSION
 from brain.attunement.store import BufferTurn
 
@@ -123,3 +124,37 @@ def test_detector_returns_decline_on_empty_buffer():
     output = run_detector(buffer_slice=[], reply_text="anything")
     assert output.current_read.tone_label == "unknown"
     assert output.pattern_candidates == []
+
+
+# ── companion_name parameterisation (SITE 1) ─────────────────────────────────
+
+def test_build_user_message_uses_companion_name_in_label():
+    """_build_user_message with companion_name='Mira' emits 'MIRA', not 'NELL'."""
+    turns = [BufferTurn(id="t1", content="hello")]
+    msg = _build_user_message(turns, reply_text="hi there", companion_name="Mira")
+    assert "MIRA" in msg
+    assert "NELL" not in msg
+
+
+def test_build_user_message_empty_companion_name_falls_back_to_generic():
+    """companion_name='' produces a generic label with no persona name."""
+    turns = [BufferTurn(id="t1", content="hello")]
+    msg = _build_user_message(turns, reply_text="hi", companion_name="")
+    assert "NELL" not in msg
+    assert "LATEST REPLY" in msg
+
+
+def test_run_detector_passes_companion_name_to_user_message(buffer):
+    """run_detector with companion_name='Mira' produces a prompt containing 'MIRA'."""
+    captured: list[str] = []
+
+    def fake_haiku(system_prompt: str, user_message: str) -> str:
+        captured.append(user_message)
+        return ""  # decline output — we only care about the message shape
+
+    with patch("brain.attunement.detector._call_haiku", side_effect=fake_haiku):
+        run_detector(buffer_slice=buffer, reply_text="goodnight", companion_name="Mira")
+
+    assert captured, "expected _call_haiku to be called"
+    assert "MIRA" in captured[0]
+    assert "NELL" not in captured[0]
