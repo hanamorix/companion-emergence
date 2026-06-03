@@ -120,6 +120,20 @@ class EmbeddingCache:
         """Return the number of cached embeddings."""
         return int(self._conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0])
 
+    def evict(self, content: str) -> None:
+        """Remove a cached vector (by content hash).
+
+        Used to undo a dedupe-compute when the memory failed to commit, so
+        that a retry pass isn't dropped as a self-duplicate (the vector would
+        otherwise sit in the cache and match at cosine 1.0 on the next call
+        to is_duplicate, which snapshots existing rows before computing the
+        candidate).
+        """
+        self._conn.execute(
+            "DELETE FROM embedding_cache WHERE content_hash = ?", (self._hash(content),)
+        )
+        self._conn.commit()
+
     @staticmethod
     def _hash(content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
