@@ -1,10 +1,14 @@
 """Reflex crystallizer — emergence + pruning judgment via Claude CLI.
 
-Phase 2 of the reflex engine. Public crystallize_reflex(...) entrypoint
-lands in Task 6. This module currently exposes:
+Phase 2 of the reflex engine. Deferred — see
+`docs/superpowers/specs/2026-04-28-reflex-phase-2-emergent-arc-crystallization-design.md`
+§14; chunks 7–8 (apply + acceptance gate) never landed, zero prod callers.
 
-  Internal: _build_corpus(...)                    — Task 5 (this task)
-            _render_prompt(...)                   — Task 5 (this task)
+This module currently exposes:
+
+  Public:   crystallize_reflex(...)               — chunk 6 (shipped, untriggered)
+  Internal: _build_corpus(...)                    — chunk 5
+            _render_prompt(...)                   — chunk 5
 
 Per principle audit 2026-04-25: the brain has agency. No candidate queue,
 no human approval gate. Brain decides; scheduler applies.

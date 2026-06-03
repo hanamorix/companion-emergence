@@ -1,5 +1,9 @@
 """brain.works.store — SQLite index for the works portfolio.
 
+FENCED (v0.0.30): a tool surface with no autonomous writer/reader/feed —
+kept available but intentionally not wired into the emotional/memory loops
+(pre-Maker). See docs/maturity-manifest.md.
+
 Mirrors brain/memory/store.py conventions:
 - Open per-call (no long-lived connection that crosses threads).
 - WAL mode for concurrent readers + single writer.
