@@ -18,14 +18,14 @@ describe("InitiateBanner", () => {
   };
 
   it("renders the message body", () => {
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     expect(screen.getByText(/landed somewhere/)).toBeInTheDocument();
   });
 
   it("calls onMounted exactly once after a brief on-screen delay", async () => {
     vi.useFakeTimers();
     const onMounted = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
     expect(onMounted).not.toHaveBeenCalled();
     vi.advanceTimersByTime(2100);
     expect(onMounted).toHaveBeenCalledTimes(1);
@@ -35,20 +35,20 @@ describe("InitiateBanner", () => {
 
   it("emits onReply when the ↩ button is clicked", () => {
     const onReply = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={onReply} onDismiss={vi.fn()} onMounted={vi.fn()} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={onReply} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /reply|↩/i }));
     expect(onReply).toHaveBeenCalledWith("ia_001");
   });
 
   it("emits onDismiss when the close button is clicked", () => {
     const onDismiss = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={onDismiss} onMounted={vi.fn()} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={onDismiss} onMounted={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /dismiss|close/i }));
     expect(onDismiss).toHaveBeenCalledWith("ia_001");
   });
 
   it("shows state badge reflecting the current state", () => {
-    render(<InitiateBanner message={{ ...baseMessage, state: "acknowledged_unclear" }} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
+    render(<InitiateBanner message={{ ...baseMessage, state: "acknowledged_unclear" }} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     expect(screen.getByText(/unclear/i)).toBeInTheDocument();
   });
 
@@ -56,7 +56,7 @@ describe("InitiateBanner", () => {
     vi.useFakeTimers();
     const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
     const onMounted = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
     vi.advanceTimersByTime(5000);
     expect(onMounted).not.toHaveBeenCalled();
     hiddenSpy.mockRestore();
@@ -67,7 +67,7 @@ describe("InitiateBanner", () => {
     vi.useFakeTimers();
     const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
     const onMounted = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
     // 1 second elapses (not enough to fire).
     vi.advanceTimersByTime(1000);
     expect(onMounted).not.toHaveBeenCalled();
@@ -106,7 +106,7 @@ describe("InitiateBanner", () => {
     vi.useFakeTimers();
     const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
     const onMounted = vi.fn();
-    render(<InitiateBanner message={baseMessage} onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
+    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={vi.fn()} onDismiss={vi.fn()} onMounted={onMounted} />);
     vi.advanceTimersByTime(2100);
     expect(onMounted).toHaveBeenCalledTimes(1);
     // Hide + show again — should not re-fire.
