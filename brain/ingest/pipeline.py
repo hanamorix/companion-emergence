@@ -46,6 +46,26 @@ from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
+
+def _load_emotion_vocab() -> tuple[set[str], str]:
+    """Return (names_set, comma_separated_sorted_string) for all registered emotions.
+
+    Reads the in-process vocabulary registry (baseline + any persona extensions
+    registered at engine startup). Falls back to empty on any error — the
+    pipeline must never fail because of a vocabulary load issue.
+
+    Returns a tuple so callers get both forms cheaply (set for normalize(),
+    string for the prompt).
+    """
+    try:
+        from brain.emotion.vocabulary import list_all
+
+        names = {e.name for e in list_all()}
+        return names, ",".join(sorted(names))
+    except Exception:  # noqa: BLE001
+        logger.warning("_load_emotion_vocab: failed to load vocabulary; emotions will be empty")
+        return set(), ""
+
 logger = logging.getLogger(__name__)
 
 # F-011 — extraction backoff knobs. After this many consecutive
@@ -136,12 +156,14 @@ def close_session(
         user_name=user_name,
         assistant_name=assistant_name,
     )
+    valid_emotions, emotion_vocab = _load_emotion_vocab()
     extraction = extract_items_with_status(
         transcript,
         provider=provider,
         max_retries=int(cfg.get("extraction_max_retries", 1)),
         user_name=user_name,
         assistant_name=assistant_name,
+        emotion_vocab=emotion_vocab,
     )
     if extraction.failed:
         report.errors += 1
@@ -157,7 +179,7 @@ def close_session(
     report.extracted = len(items)
 
     # ── SCORE (normalize at the boundary) ────────────────────────────────────
-    items = [it.normalize() for it in items if it.text]
+    items = [it.normalize(valid_emotions=valid_emotions) for it in items if it.text]
 
     # ── DEDUPE + COMMIT + SOUL ────────────────────────────────────────────────
     dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
@@ -299,12 +321,14 @@ def extract_session_snapshot(
         user_name=user_name,
         assistant_name=assistant_name,
     )
+    valid_emotions, emotion_vocab = _load_emotion_vocab()
     extraction = extract_items_with_status(
         transcript,
         provider=provider,
         max_retries=int(cfg.get("extraction_max_retries", 1)),
         user_name=user_name,
         assistant_name=assistant_name,
+        emotion_vocab=emotion_vocab,
     )
     if extraction.failed:
         report.errors += 1
@@ -335,7 +359,7 @@ def extract_session_snapshot(
             )
         return report
 
-    items = [it.normalize() for it in extraction.items if it.text]
+    items = [it.normalize(valid_emotions=valid_emotions) for it in extraction.items if it.text]
     report.extracted = len(items)
 
     dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))

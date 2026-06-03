@@ -63,6 +63,7 @@ def commit_item(
             domain="brain",
             tags=["auto_ingest", "conversation", item.label],
             importance=float(item.importance),
+            emotions=dict(item.emotions) if item.emotions else {},
             metadata=metadata,
         )
         new_id = store.create(memory)
