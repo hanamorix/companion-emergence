@@ -173,6 +173,7 @@ def close_session(
         mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
         if mem_id is None:
             report.errors += 1
+            report.commit_failures += 1
             continue
 
         report.committed += 1
@@ -206,9 +207,16 @@ def close_session(
     )
 
     # ── DELETE buffer ─────────────────────────────────────────────────────────
-    delete_session_buffer(persona_dir, session_id)
-    delete_cursor(persona_dir, session_id)
-    delete_backoff(persona_dir, session_id)
+    if report.commit_failures == 0:
+        delete_session_buffer(persona_dir, session_id)
+        delete_cursor(persona_dir, session_id)
+        delete_backoff(persona_dir, session_id)
+    else:
+        logger.warning(
+            "conversation_close_held session=%s commit_failures=%d — buffer retained for retry",
+            session_id,
+            report.commit_failures,
+        )
 
     return report
 
@@ -325,6 +333,7 @@ def extract_session_snapshot(
         mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
         if mem_id is None:
             report.errors += 1
+            report.commit_failures += 1
             continue
         report.committed += 1
         report.memory_ids.append(mem_id)
@@ -344,11 +353,11 @@ def extract_session_snapshot(
     # starts a fresh window. The wedge (if there was one) is past.
     delete_backoff(persona_dir, session_id)
 
-    # Advance cursor to the ts of the last turn we included. If the last
-    # turn lacks a ts (defensive — ingest_turn always writes one), leave
-    # cursor unchanged so the next pass retries.
+    # Advance cursor only when all commits succeeded. If any commit failed,
+    # the buffer is held for retry — advancing the cursor would cause the
+    # next pass to skip the un-committed turns permanently.
     last_ts = turns[-1].get("ts")
-    if last_ts:
+    if report.commit_failures == 0 and last_ts:
         try:
             write_cursor(persona_dir, session_id, str(last_ts))
         except (OSError, ValueError):
@@ -475,9 +484,40 @@ def finalize_stale_sessions(
             logger.exception("finalize_stale_sessions: snapshot failed session=%s", sid)
             report = IngestReport(session_id=sid)
             report.errors += 1
-        delete_session_buffer(persona_dir, sid)
-        delete_cursor(persona_dir, sid)
-        delete_backoff(persona_dir, sid)
+            report.commit_failures += 1
+        # Check backoff sidecar for dead-letter threshold regardless of whether
+        # commit_failures was set via the report (the snapshot backoff-guard
+        # returns early with errors>0 but commit_failures=0 when the sidecar
+        # already shows >= threshold — finalize must still dead-letter in that case).
+        backoff = read_backoff(persona_dir, sid)
+        at_threshold = (
+            backoff is not None and backoff["failures"] >= _BACKOFF_FAILURE_THRESHOLD
+        )
+        if report.commit_failures == 0 and not at_threshold:
+            delete_session_buffer(persona_dir, sid)
+            delete_cursor(persona_dir, sid)
+            delete_backoff(persona_dir, sid)
+        elif at_threshold:
+            # Buffer has failed >= threshold times — move to poison queue so it
+            # doesn't block the finalize loop indefinitely.
+            src = persona_dir / "active_conversations" / f"{sid}.jsonl"
+            poison_dir = persona_dir / "active_conversations" / "poison"
+            poison_dir.mkdir(parents=True, exist_ok=True)
+            dst = poison_dir / f"{sid}.jsonl"
+            src.rename(dst)
+            delete_cursor(persona_dir, sid)
+            delete_backoff(persona_dir, sid)
+            logger.warning(
+                "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
+                sid,
+                backoff["failures"],  # type: ignore[index]
+            )
+        else:
+            logger.warning(
+                "conversation_finalize_held session=%s commit_failures=%d — buffer retained for retry",
+                sid,
+                report.commit_failures,
+            )
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "
