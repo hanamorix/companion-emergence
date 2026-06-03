@@ -186,7 +186,7 @@ def test_kindled_home_takes_priority_over_nellbrain_home(tmp_path, monkeypatch):
 
 def test_nellbrain_home_still_honored_with_deprecation_warning(tmp_path, monkeypatch):
     """Backwards-compat fallback: NELLBRAIN_HOME works but warns.
-    Fallback is removed in v0.0.14."""
+    Fallback is retained but deprecated (no fixed removal version)."""
     nell = tmp_path / "nell"
     nell.mkdir()
     monkeypatch.delenv("KINDLED_HOME", raising=False)
@@ -201,7 +201,7 @@ def test_nellbrain_home_still_honored_with_deprecation_warning(tmp_path, monkeyp
     assert len(deprecation_warnings) == 1
     assert "NELLBRAIN_HOME is deprecated" in str(deprecation_warnings[0].message)
     assert "KINDLED_HOME" in str(deprecation_warnings[0].message)
-    assert "v0.0.14" in str(deprecation_warnings[0].message)
+    assert "future release" in str(deprecation_warnings[0].message)
 
 
 def test_neither_env_var_falls_back_to_platformdirs(tmp_path, monkeypatch):
