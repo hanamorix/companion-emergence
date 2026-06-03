@@ -22,7 +22,8 @@ from brain.ingest.types import ExtractedItem
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT_LEGACY = """You are extracting durable memories from a conversation transcript.
-Return ONLY a JSON array. Each item: {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10}}.
+Return ONLY a JSON array. Each item: {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
+For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
 Skip pleasantries. Keep items concrete. No prose, no commentary.
 
 TRANSCRIPT:
@@ -43,7 +44,8 @@ Speakers in this transcript:
   mentioned by name.
 
 Return ONLY a JSON array. Each item:
-{{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10}}.
+{{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
+For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
 Skip pleasantries. Keep items concrete. No prose, no commentary.
 
 TRANSCRIPT:
@@ -170,11 +172,21 @@ def parse_extraction(raw: str | None) -> list[ExtractedItem] | None:
     for entry in data:
         if not isinstance(entry, dict):
             continue
+        # Parse optional emotions field — tolerate missing or malformed.
+        raw_emotions = entry.get("emotions")
+        emotions: dict[str, float] = {}
+        if isinstance(raw_emotions, dict):
+            for k, v in raw_emotions.items():
+                try:
+                    emotions[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    pass
         out.append(
             ExtractedItem(
                 text=str(entry.get("text", "")),
                 label=str(entry.get("label", "observation")),
                 importance=entry.get("importance", 5),
+                emotions=emotions,
             )
         )
     return out
@@ -187,6 +199,7 @@ def extract_items(
     max_retries: int = 1,
     user_name: str | None = None,
     assistant_name: str | None = None,
+    emotion_vocab: str = "",
 ) -> list[ExtractedItem]:
     """Call the provider, parse the JSON array. Retry once on failure.
 
@@ -204,6 +217,7 @@ def extract_items(
         max_retries=max_retries,
         user_name=user_name,
         assistant_name=assistant_name,
+        emotion_vocab=emotion_vocab,
     ).items
 
 
@@ -214,12 +228,19 @@ def extract_items_with_status(
     max_retries: int = 1,
     user_name: str | None = None,
     assistant_name: str | None = None,
+    emotion_vocab: str = "",
 ) -> ExtractionOutcome:
     """Call the provider and distinguish valid-empty from failed-empty.
 
     Backward-compatible ``extract_items`` intentionally keeps returning just a
     list. The ingest pipeline uses this richer outcome so provider/parse
     failures do not look like successful empty extractions.
+
+    emotion_vocab:
+        Comma-separated list of registered emotion names to include in the
+        extraction prompt. When empty, renders as an empty string (harmless
+        but the LLM won't know which names to use). Pipeline wires in the
+        persona's registered vocab at call time.
     """
     if not transcript.strip():
         return ExtractionOutcome(items=[])
@@ -229,9 +250,13 @@ def extract_items_with_status(
             transcript=transcript,
             user_name=user_name,
             assistant_name=assistant_name,
+            emotion_vocab=emotion_vocab,
         )
     else:
-        prompt = EXTRACTION_PROMPT_LEGACY.format(transcript=transcript)
+        prompt = EXTRACTION_PROMPT_LEGACY.format(
+            transcript=transcript,
+            emotion_vocab=emotion_vocab,
+        )
 
     last_error: str | None = None
     for attempt in range(max_retries + 1):
