@@ -1903,8 +1903,14 @@ def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> No
         state_obj.save(engine.state_path)
 
         result = engine.run_tick(trigger="close")
-        if result.dream_id is None:
-            pytest.skip("dream didn't fire (no seed) — skip daemon_state dream check")
+        # dream_id must not be None: the seed is in the store, the time gate
+        # (dream_every_hours=0.001, last_dream_at backdated 1h) is met, and
+        # select_seed is deterministic (no randomness). A None here means the
+        # heartbeat→dream wiring is broken — that is the regression we want to
+        # catch, not skip.
+        assert result.dream_id is not None, (
+            f"dream should have fired but got dream_gated_reason={result.dream_gated_reason!r}"
+        )
 
         daemon_state, anomaly = load_daemon_state(persona_dir)
         assert anomaly is None
