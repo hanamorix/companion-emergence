@@ -218,6 +218,9 @@ def close_session(
         delete_cursor(persona_dir, session_id)
         delete_backoff(persona_dir, session_id)
     else:
+        # close_session only holds + logs. Backoff escalation toward dead-letter
+        # is owned by the extract_session_snapshot sweep (5-min and 24-h cadences),
+        # not by close_session — the supervisor drives retry, not this call site.
         logger.warning(
             "conversation_close_held session=%s commit_failures=%d — buffer retained for retry",
             session_id,
