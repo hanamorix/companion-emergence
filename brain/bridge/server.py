@@ -2098,10 +2098,11 @@ def build_app(
                     soul_queue_errors=report.soul_queue_errors,
                     errors=report.errors,
                 )
-                # Extraction failures deliberately retain the JSONL buffer for
-                # retry. Do not remove the in-memory session or drop its lock
-                # entry, otherwise the retry path turns into 404 while the
-                # client was told nothing actionable.
+                # Extraction failures AND commit failures deliberately retain
+                # the JSONL buffer for retry (close_session gates the delete
+                # on report.commit_failures == 0). Do not remove the in-memory
+                # session or drop its lock entry, otherwise the retry path
+                # turns into 404 while the client was told nothing actionable.
                 raise HTTPException(
                     status_code=502,
                     detail={
