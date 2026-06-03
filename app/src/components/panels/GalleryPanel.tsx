@@ -35,9 +35,13 @@ export function GalleryPanel({ persona }: Props) {
   // the same auth headers because we set VITE_BRIDGE_URL consistently).
   useEffect(() => {
     let cancelled = false;
-    getBridgeCredentials(persona).then((c) => {
-      if (!cancelled) setBridgeUrl(c.url);
-    });
+    getBridgeCredentials(persona)
+      .then((c) => {
+        if (!cancelled) setBridgeUrl(c.url);
+      })
+      .catch(() => {
+        if (!cancelled) setBridgeUrl(null);
+      });
     return () => { cancelled = true; };
   }, [persona]);
 

@@ -76,7 +76,9 @@ export default function App() {
         return;
       }
       setPhase({ kind: "picker", personas: onDisk });
-    })();
+    })().catch((e) => {
+      console.error("[App] boot failed:", e);
+    });
   }, []);
 
   if (phase.kind === "loading") return <BootScreen subtitle="Loading…" />;
