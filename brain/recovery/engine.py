@@ -23,6 +23,7 @@ class RestorePlan:
     missing_summaries: dict[str, Memory] = field(default_factory=dict)
     source_edges: list = field(default_factory=list)
     graveyard_neighbors: dict = field(default_factory=dict)
+    skipped_no_timestamp: int = 0
 
 
 def _build_restore_plan(persona_dir: Path, *, source_dir: Path | None) -> RestorePlan:
@@ -46,10 +47,14 @@ def _build_restore_plan(persona_dir: Path, *, source_dir: Path | None) -> Restor
             if not mid or mid in current_ids:
                 continue
             created_raw = entry.get("created_at_iso")
+            if not created_raw:
+                plan.skipped_no_timestamp += 1
+                continue
             try:
-                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00")) if created_raw else datetime.now(UTC)
-            except (ValueError, AttributeError):
-                created = datetime.now(UTC)
+                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except (ValueError, AttributeError, TypeError):
+                plan.skipped_no_timestamp += 1
+                continue
             plan.missing_summaries[mid] = Memory(
                 id=mid,
                 content=entry.get("summary") or "",
@@ -157,6 +162,7 @@ def run_recovery(
             memories_restored_full=len(plan.missing),
             memories_restored_summary=len(plan.missing_summaries),
             memories_unfaded=len(plan.unfade),
+            memories_skipped_no_timestamp=plan.skipped_no_timestamp,
             edges_repaired=0, edges_pruned_unrecoverable=0,
             backup_path=None, elapsed_seconds=time.monotonic() - started, dry_run=True,
         )
@@ -198,6 +204,7 @@ def run_recovery(
         memories_restored_full=counts["restored_full"],
         memories_restored_summary=counts["restored_summary"],
         memories_unfaded=counts["unfaded"],
+        memories_skipped_no_timestamp=plan.skipped_no_timestamp,
         edges_repaired=repaired, edges_pruned_unrecoverable=pruned,
         backup_path=backup, elapsed_seconds=time.monotonic() - started, dry_run=False,
     )
