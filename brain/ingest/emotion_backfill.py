@@ -59,11 +59,6 @@ _SCHEMA_VERSION = "v1"
 _BACKFILL_MODEL = "claude-haiku-4-5-20251001"
 _BACKFILL_TIMEOUT_SECONDS = 60
 
-# Inter-call pacing: pause between successful tag+write operations so the
-# backfill never bursts all its budget in one sitting and starves interactive
-# chat turns of the Claude CLI.  Tests pass delay_s=0 to skip the wait.
-_INTER_CALL_DELAY_S = 1.5
-
 
 # ---------------------------------------------------------------------------
 # State dataclass
