@@ -34,19 +34,26 @@ export function VoiceEditPanel({ proposal, persona, onAccept, onReject }: Props)
       </p>
 
       <pre className="voice-edit-panel__diff">
-        {lines.map((line, i) => {
-          if (i === targetIdx) {
+        {targetIdx === -1 ? (
+          <div>
+            <div className="diff-line diff-line--remove">- {proposal.oldText}</div>
+            <div className="diff-line diff-line--add">+ {proposal.newText}</div>
+          </div>
+        ) : (
+          lines.map((line, i) => {
+            if (i === targetIdx) {
+              return (
+                <div key={i}>
+                  <div className="diff-line diff-line--remove">- {line}</div>
+                  <div className="diff-line diff-line--add">+ {proposal.newText}</div>
+                </div>
+              );
+            }
             return (
-              <div key={i}>
-                <div className="diff-line diff-line--remove">- {line}</div>
-                <div className="diff-line diff-line--add">+ {proposal.newText}</div>
-              </div>
+              <div key={i} className="diff-line diff-line--context">{"  "}{line}</div>
             );
-          }
-          return (
-            <div key={i} className="diff-line diff-line--context">{"  "}{line}</div>
-          );
-        })}
+          })
+        )}
       </pre>
 
       <div className="voice-edit-panel__actions">
