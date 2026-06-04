@@ -29,6 +29,7 @@ The shippable base. Each fires on a live supervisor/chat path, has ≥1 reader, 
 | soul crystallisation | soul candidates | SoulStore (read by 6 sites) + feed |
 | creative_dna crystallizer | growth signals | identity DNA (prompt framing) |
 | research | interest + topic overlap | research artefacts + feed |
+| **felt_time** | `HeartbeatResult.reflex_fired` + session-buffer chat-turn delta | `chat_activity` driver + reflex tick-context → lived-age rate → forgetting effective-fade. *Promoted to CORE in the Phase-C pass (#2 fix); previously fed hardcoded `0`.* |
 
 ---
 
@@ -40,7 +41,6 @@ These run but aren't fully closed loops. Labelled here so the half-wired state i
 |---|---|---|
 | voice-edit UI (W3) | producer fires daily; the NellFace UI can't accept/reject (server endpoints exist) | EXPERIMENTAL — wire-back deferred to Phase C |
 | draft_space (W1) | producers (D-reflection demote, heartbeat wobble) fire constantly; **no reader**. v0.0.30 amended the false re-ingestion promise in `reflection.py` (B6) so the prompt no longer lies; the reader itself is still unbuilt | EXPERIMENTAL — reader deferred |
-| felt_time chat/reflex drivers (#2) | the tick is live but fed hardcoded `0` for `chat_activity`/`reflex_firings` | EXPERIMENTAL — supervisor-glue fix deferred |
 | recall_resonance (W4) | emits outbound candidates but gates so tight emission is unproven; no recall/hebbian/emotion write-back on the return arc | EXPERIMENTAL — tune / reinforce deferred |
 | body → initiate gating (W10) | body energy/exhaustion is live + read by the prompt, but never **gates** the initiate loop (low energy doesn't suppress dreams/drafts/sends) | EXPERIMENTAL — design call deferred |
 
