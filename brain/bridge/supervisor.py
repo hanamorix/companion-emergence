@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -246,23 +246,9 @@ def run_folded(
             and last_heartbeat_at is not None
             and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
         ):
-            heartbeat_result = None
-            try:
-                heartbeat_result = _run_heartbeat_tick(persona_dir, provider, event_bus)
-            except Exception:
-                logger.exception("supervisor heartbeat tick raised")
-            try:
-                wall_s = time.monotonic() - last_heartbeat_at
-                reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
-                _last_intensity_drivers = _run_felt_time_tick(
-                    persona_dir,
-                    wall_clock_s_since_last=wall_s,
-                    heartbeats_since_last=1,
-                    chat_turns_since_last=0,  # wired in Task 2
-                    reflex_firings_since_last=reflex_n,
-                )
-            except Exception:
-                logger.exception("supervisor felt-time tick raised")
+            _last_intensity_drivers = _heartbeat_and_felt_time(
+                persona_dir, provider, event_bus, last_heartbeat_at
+            )
             last_heartbeat_at = time.monotonic()
 
         # Soul-review cadence — slowest of the three. Each pass is up to
@@ -386,6 +372,43 @@ def run_folded(
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _heartbeat_and_felt_time(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus,
+    last_heartbeat_at: float,
+) -> IntensityDrivers | None:
+    """Run a heartbeat tick then a felt-time tick, wiring real counters.
+
+    Extracted so tests can call this directly and spy on _run_felt_time_tick
+    without driving the full run_folded loop. Fault-isolated: heartbeat
+    errors are caught and reflex_n defaults to 0; felt-time errors are
+    caught and None is returned. The caller updates last_heartbeat_at.
+    """
+    from brain.felt_time.chat_log import count_chat_turns_since
+
+    heartbeat_result = None
+    try:
+        heartbeat_result = _run_heartbeat_tick(persona_dir, provider, event_bus)
+    except Exception:
+        logger.exception("supervisor heartbeat tick raised")
+    try:
+        wall_s = time.monotonic() - last_heartbeat_at
+        since_dt = datetime.now(UTC) - timedelta(seconds=wall_s)
+        chat_n = count_chat_turns_since(persona_dir, since_dt.isoformat())
+        reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
+        return _run_felt_time_tick(
+            persona_dir,
+            wall_clock_s_since_last=wall_s,
+            heartbeats_since_last=1,
+            chat_turns_since_last=chat_n,
+            reflex_firings_since_last=reflex_n,
+        )
+    except Exception:
+        logger.exception("supervisor felt-time tick raised")
+        return None
 
 
 def _run_felt_time_tick(
@@ -1052,8 +1075,6 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
     crystallizations created within the last ``days`` days. Failures
     swallowed — reflection still fires with whatever evidence exists.
     """
-    from datetime import timedelta
-
     from brain.soul.store import SoulStore
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
@@ -1074,8 +1095,6 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
 
 def _read_recent_dreams(persona_dir: Path, days: int) -> list[dict]:
     """Read recent dream entries from ``dreams.log.jsonl``."""
-    from datetime import timedelta
-
     from brain.health.jsonl_reader import iter_jsonl_streaming
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
