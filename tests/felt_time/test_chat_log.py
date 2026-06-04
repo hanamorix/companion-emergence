@@ -179,3 +179,37 @@ def test_count_chat_turns_since_returns_zero_when_no_buffers(tmp_path: Path) -> 
 
     count = count_chat_turns_since(persona_dir, datetime.now(UTC).isoformat())
     assert count == 0
+
+
+def test_count_chat_turns_since_skips_corrupt_buffer(tmp_path: Path) -> None:
+    """A corrupt .jsonl in active_conversations is skipped; good buffers still count."""
+    from brain.felt_time.chat_log import count_chat_turns_since
+    from brain.ingest.buffer import ingest_turn
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=10)
+
+    # Seed one good buffer with 2 turns after the cutoff
+    session_id = "sess_good1234"
+    for i, (speaker, text) in enumerate(
+        [("user", "hello"), ("nell", "hi there")], start=1
+    ):
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": session_id,
+                "speaker": speaker,
+                "text": text,
+                "ts": (now - timedelta(minutes=i)).isoformat(),
+            },
+        )
+
+    # Write a corrupt buffer (non-JSON text) that must not crash the count
+    ac_dir = persona_dir / "active_conversations"
+    (ac_dir / "garbage.jsonl").write_text("this is not json\n{broken", encoding="utf-8")
+
+    count = count_chat_turns_since(persona_dir, cutoff.isoformat())
+    assert count == 2, f"Expected 2 turns from good buffer, got {count}"

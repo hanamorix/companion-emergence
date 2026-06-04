@@ -100,6 +100,8 @@ def count_chat_turns_since(persona_dir: Path, since_iso: str) -> int:
         if not buf_path.is_file() or buf_path.suffix != ".jsonl":
             continue
         session_id = buf_path.stem
+        if not session_id:
+            continue
         try:
             turns = read_session_after(persona_dir, session_id, since_iso)
             total += len(turns)
