@@ -48,6 +48,11 @@ def _user_recently_active(persona_dir: Path, *, now: _datetime | None = None) ->
     return compute_active_session_hours(persona_dir, now=_now) > 0.0
 
 
+# Inter-call pacing: pause between successful tag+write operations so the
+# backfill never bursts all its budget in one sitting and starves interactive
+# chat turns of the Claude CLI.  Tests pass delay_s=0 to skip the wait.
+_INTER_CALL_DELAY_S = 1.5
+
 _SCHEMA_VERSION = "v1"
 
 # Haiku model constant — mirrors _DETECTOR_MODEL in brain/attunement/detector.py.
@@ -254,6 +259,11 @@ def run_emotion_backfill(
     - Calls ``tagger_fn(memory)`` → ``dict[str, float]``; filters to registered
       vocab; writes back via a single ``MemoryStore`` handle.
     - Respects a DAILY BUDGET CAP; persists cursor to resume across ticks.
+    - Yields to active chat: if the user has a live buffer turn in the last 5
+      min, the loop stops immediately (cursor preserved; status stays resumable).
+    - Paces calls: sleeps ``delay_s`` seconds after each successful tag+write to
+      avoid bursting the daily budget in one sitting.  Pass ``delay_s=0`` in
+      tests to skip the wait.
     - Returns ``EmotionBackfillState`` with ``status`` in
       ``{"complete", "deferred_to_next_day", "running"}``.
     - Does NOT mark ``status="complete"`` if the run processed candidates but

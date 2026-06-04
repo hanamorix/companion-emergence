@@ -462,6 +462,14 @@ async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 3
 
 _CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 
+# Stream keepalive: while a chat turn is in flight, the provider can go silent
+# for long stretches — first-token latency on a large persona prompt, or a
+# tool-use round-trip (record_monologue etc.) where no TextDelta is produced.
+# The client (app/src/streamChat.ts) kills the WS after 60s with no frame, so
+# the forward loop emits a `keepalive` frame on each silent interval to reset
+# that idle timer. 15s gives a 4x margin under the client's 60s budget.
+_STREAM_KEEPALIVE_SECONDS = 15.0
+
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     """Fire HeartbeatEngine.run_tick(trigger='close') in-process.
@@ -1906,9 +1914,24 @@ def build_app(
 
             respond_task = asyncio.create_task(_guarded_respond())
 
-            # Forward reply chunks to the client as they arrive from the provider.
+            # Forward reply chunks to the client as they arrive from the
+            # provider. The provider can go silent for long stretches mid-turn
+            # (first-token latency on a large prompt, or a tool-use round-trip
+            # where no TextDelta is produced). The client closes the WS after
+            # 60s with no frame, so on each silent interval we emit a keepalive
+            # frame to reset its idle timer. `respond_task` always puts the
+            # None sentinel in its finally, so the loop still terminates.
             while True:
-                chunk = await chunk_q.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        chunk_q.get(), timeout=_STREAM_KEEPALIVE_SECONDS
+                    )
+                except TimeoutError:
+                    if respond_task.done():
+                        # Turn finished; drain the pending sentinel next pass.
+                        continue
+                    await ws.send_json({"type": "keepalive", "at": _now()})
+                    continue
                 if chunk is None:
                     break
                 await ws.send_json({"type": "reply_chunk", "text": chunk})
