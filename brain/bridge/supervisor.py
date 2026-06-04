@@ -38,6 +38,10 @@ import time
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from brain.engines.heartbeat import HeartbeatResult
 
 from brain.attunement.backfill import (
     run_backfill as _attunement_run_backfill,
@@ -242,24 +246,20 @@ def run_folded(
             and last_heartbeat_at is not None
             and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
         ):
+            heartbeat_result = None
             try:
-                _run_heartbeat_tick(persona_dir, provider, event_bus)
+                heartbeat_result = _run_heartbeat_tick(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor heartbeat tick raised")
             try:
                 wall_s = time.monotonic() - last_heartbeat_at
-                # heartbeats/chat_turns/reflex_firings counter sources are
-                # placeholders (1/0/0) for v1 — Phase 9.2 (follow-up) tightens
-                # these by reading actual engine counters once the right
-                # accessor is identified.
-                # TODO(v0.0.15): replace 0 chat_turns + 0 reflex_firings with
-                # real counters from the event bus or engine state.
+                reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
                 _last_intensity_drivers = _run_felt_time_tick(
                     persona_dir,
                     wall_clock_s_since_last=wall_s,
                     heartbeats_since_last=1,
-                    chat_turns_since_last=0,
-                    reflex_firings_since_last=0,
+                    chat_turns_since_last=0,  # wired in Task 2
+                    reflex_firings_since_last=reflex_n,
                 )
             except Exception:
                 logger.exception("supervisor felt-time tick raised")
@@ -572,8 +572,11 @@ def _run_heartbeat_tick(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
-) -> None:
+) -> HeartbeatResult | None:
     """Build a HeartbeatEngine and run one tick. Publishes a result event.
+
+    Returns the HeartbeatResult so the caller can read reflex_fired and
+    wire it into the felt-time tick as reflex_firings_since_last.
 
     Constructs the engine per-tick (mirrors the per-tick store pattern)
     so SQLite handles + transient state stay thread-local. Reads the
@@ -644,6 +647,7 @@ def _run_heartbeat_tick(
             "at": _now_iso(),
         }
     )
+    return result
 
 
 def _run_soul_review_tick(

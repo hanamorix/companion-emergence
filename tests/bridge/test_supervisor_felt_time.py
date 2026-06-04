@@ -15,6 +15,47 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def test_heartbeat_tick_returns_result_with_reflex_fired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_run_heartbeat_tick must return the HeartbeatResult from engine.run_tick."""
+    from brain.bridge.supervisor import _run_heartbeat_tick
+    from brain.engines.heartbeat import HeartbeatEngine, HeartbeatResult
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text('{"provider": "fake", "searcher": "fake"}')
+
+    fake_result = HeartbeatResult(
+        trigger="background",
+        elapsed_seconds=0.1,
+        memories_decayed=0,
+        edges_pruned=0,
+        dream_id=None,
+        dream_gated_reason=None,
+        research_deferred=False,
+        heartbeat_memory_id=None,
+        initialized=True,
+        reflex_fired=("arc_a", "arc_b"),
+    )
+
+    monkeypatch.setattr(
+        HeartbeatEngine,
+        "run_tick",
+        lambda self, **kwargs: fake_result,
+    )
+
+    provider = MagicMock()
+    event_bus = MagicMock()
+
+    result = _run_heartbeat_tick(persona_dir, provider, event_bus)
+
+    assert result is not None, "_run_heartbeat_tick must return the HeartbeatResult"
+    assert len(result.reflex_fired) == 2, (
+        f"Expected 2 reflex_fired entries, got {len(result.reflex_fired)}"
+    )
+
+
 def test_supervisor_invokes_felt_time_tick_on_heartbeat_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
