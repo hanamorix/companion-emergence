@@ -629,3 +629,57 @@ def test_model_call_failure_counted_and_leaves_candidate_eligible(tmp_path: Path
     rec = json.loads((persona_dir / "soul_candidates.jsonl").read_text().strip())
     assert rec["status"] == "auto_pending"
     assert "last_deferred_at" not in rec
+
+
+# ── draft_fragments in soul review ───────────────────────────────────────────
+
+
+def test_soul_review_includes_recent_draft_block(tmp_path: Path) -> None:
+    """When draft_fragments are supplied, the per-candidate prompt contains a
+    'Recent private fragments' block listing each fragment."""
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+
+    captured_msgs: list[list[dict]] = []
+
+    class _CapturingProvider(LLMProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            # Record the full messages that were built
+            captured_msgs.append([
+                {"role": "system", "content": system or ""},
+                {"role": "user", "content": prompt},
+            ])
+            return json.dumps({
+                "decision": "defer",
+                "love_type": "craft",
+                "resonance": 5,
+                "confidence": 3,
+                "reasoning": "not sure",
+                "why_it_matters": "",
+            })
+
+        def name(self) -> str:
+            return "capturing-fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            raise NotImplementedError
+
+    candidate = _make_candidate("a moment to review")
+    _write_candidates(tmp_path, [candidate])
+
+    review_pending_candidates(
+        tmp_path,
+        store=store,
+        soul_store=soul_store,
+        provider=_CapturingProvider(),
+        draft_fragments=["[d_reflection] An older thought.", "[emotion_spike] A surge."],
+    )
+
+    store.close()
+    soul_store.close()
+
+    assert captured_msgs, "provider.generate was never called"
+    user_content = captured_msgs[0][1]["content"]
+    assert "Recent private fragments" in user_content
+    assert "[d_reflection] An older thought." in user_content
+    assert "[emotion_spike] A surge." in user_content
