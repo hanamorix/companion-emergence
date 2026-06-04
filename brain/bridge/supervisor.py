@@ -398,6 +398,13 @@ def _heartbeat_and_felt_time(
         mono_now = time.monotonic()
         wall_now = datetime.now(UTC)
         wall_s = mono_now - last_heartbeat_at
+        # time.monotonic() does not advance during system sleep, but
+        # datetime.now(UTC) does.  After a suspend, wall_s understates
+        # the elapsed wall time, so since_dt lands in the "future" relative
+        # to the last real activity and count_chat_turns_since undercounts.
+        # This is a deliberately conservative bias: felt-time underweights
+        # activity rather than overweighting it — consistent with the
+        # documented monotonic-cadence behaviour across the supervisor.
         since_dt = wall_now - timedelta(seconds=wall_s)
         chat_n = count_chat_turns_since(persona_dir, since_dt.isoformat())
         reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
