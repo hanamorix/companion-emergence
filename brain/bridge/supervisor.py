@@ -395,8 +395,10 @@ def _heartbeat_and_felt_time(
     except Exception:
         logger.exception("supervisor heartbeat tick raised")
     try:
-        wall_s = time.monotonic() - last_heartbeat_at
-        since_dt = datetime.now(UTC) - timedelta(seconds=wall_s)
+        mono_now = time.monotonic()
+        wall_now = datetime.now(UTC)
+        wall_s = mono_now - last_heartbeat_at
+        since_dt = wall_now - timedelta(seconds=wall_s)
         chat_n = count_chat_turns_since(persona_dir, since_dt.isoformat())
         reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
         return _run_felt_time_tick(
