@@ -493,7 +493,7 @@ def test_user_recently_active_false_when_no_buffer(tmp_path):
     """_user_recently_active returns False when there is no active_conversations buffer."""
     from brain.ingest.emotion_backfill import _user_recently_active
 
-    # No active_conversations dir at all
+    # No active_conversations dir at all — tmp_path is bare
     assert _user_recently_active(tmp_path) is False
 
 
