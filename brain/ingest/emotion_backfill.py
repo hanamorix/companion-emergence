@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC
@@ -27,11 +28,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "emotion_backfill_state.json"
+
+# ---------------------------------------------------------------------------
+# Yield-to-chat helpers
+# ---------------------------------------------------------------------------
+
+_ACTIVE_CHAT_IDLE_MINUTES = 5.0  # if the user chatted within this window, yield
+
+
+def _user_recently_active(persona_dir: Path, *, now: _datetime | None = None) -> bool:
+    """True if the user has an active chat session (a turn in the last 5 min).
+
+    The backfill yields to active chat so it never saturates the Claude CLI
+    subscription out from under an interactive turn.
+    """
+    from brain.body.session_hours import compute_active_session_hours
+
+    _now = now or _datetime.now(UTC)
+    return compute_active_session_hours(persona_dir, now=_now) > 0.0
+
+
 _SCHEMA_VERSION = "v1"
 
 # Haiku model constant — mirrors _DETECTOR_MODEL in brain/attunement/detector.py.
 _BACKFILL_MODEL = "claude-haiku-4-5-20251001"
 _BACKFILL_TIMEOUT_SECONDS = 60
+
+# Inter-call pacing: pause between successful tag+write operations so the
+# backfill never bursts all its budget in one sitting and starves interactive
+# chat turns of the Claude CLI.  Tests pass delay_s=0 to skip the wait.
+_INTER_CALL_DELAY_S = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +245,7 @@ def run_emotion_backfill(
     provider: LLMProvider | None = None,
     cap: int = 200,
     now_dt: _datetime | None = None,
+    delay_s: float = _INTER_CALL_DELAY_S,
 ) -> EmotionBackfillState:
     """Run (or resume) the one-time emotion backfill.
 
@@ -297,6 +324,15 @@ def run_emotion_backfill(
         tagged_this_run = 0
 
         for memory in candidates:
+            # Yield gate: stop if the user is actively chatting so the CLI is free.
+            # The cursor is preserved — the next supervisor pass resumes from here.
+            if _user_recently_active(persona_dir, now=now_dt):
+                logger.info(
+                    "emotion_backfill: yielding — user actively chatting; "
+                    "will resume when idle"
+                )
+                break
+
             if not _consume_budget(persona_dir, now=now_dt, cap=cap):
                 state = replace(state, status="deferred_to_next_day")
                 _save_state(persona_dir, state)
@@ -334,6 +370,11 @@ def run_emotion_backfill(
                 last_cursor=last_cursor,
             )
             _save_state(persona_dir, state)
+
+            # Inter-call pacing: leave the CLI free between tag operations.
+            # Tests pass delay_s=0 to skip the wait.
+            if delay_s > 0:
+                time.sleep(delay_s)
 
         # Zero-tagged guard: if we processed candidates but tagged none, do NOT
         # mark complete — the tagger may have failed systematically (e.g. bad
