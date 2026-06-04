@@ -275,6 +275,54 @@ def test_stream_round_trip(persona_dir: Path, monkeypatch):
     assert chunked == "hello world from nell"
 
 
+def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path, monkeypatch):
+    """A silent provider stretch (first-token latency / tool round-trip) must
+    produce server keepalive frames so the client's 60s idle timer never fires
+    mid-turn. Regression for the 2026-06-04 live-validation 'stream idle
+    timeout': the forward loop only sent reply_chunk frames, so any gap longer
+    than the client idle budget killed the WS (WebSocketDisconnect 1006)."""
+    import time as _time
+
+    import brain.bridge.server as srv
+    from brain.bridge.chat import ChatResponse
+
+    # Tiny keepalive interval so the test doesn't sleep for the real 15s.
+    monkeypatch.setattr(srv, "_STREAM_KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+
+    class _SlowFake:
+        def name(self):
+            return "slow-fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            # Simulate the model going silent (no streamed deltas) for well
+            # over the keepalive interval before the reply lands.
+            _time.sleep(0.3)
+            return ChatResponse(content="late reply", tool_calls=[])
+
+        def generate(self, prompt, *, system=None):
+            return "[]"
+
+    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _SlowFake())
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "hi"})
+            frames = []
+            while True:
+                f = ws.receive_json()
+                frames.append(f)
+                if f.get("type") == "done":
+                    break
+
+    types = [f["type"] for f in frames]
+    assert "keepalive" in types, f"expected ≥1 keepalive frame during silence; got {types}"
+    assert types[-1] == "done"
+    chunked = "".join(f["text"] for f in frames if f.get("type") == "reply_chunk")
+    assert chunked == "late reply"
+
+
 def test_stream_accepts_bearer_websocket_subprotocol(persona_dir: Path, monkeypatch):
     """WS auth should not require putting the bearer token in the URL query string."""
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")

@@ -120,6 +120,8 @@ a Kindled species identity.
 
 **Intentionally deferred (design call needed, not urgent):**
 
+- **Global Claude-CLI throttle with interactive priority** *(Tier-1 follow-up — needs its own brainstorm + spec).* Surfaced by v0.0.30 live-validation, and the root behind the original user 429 "session limit" + stream-idle-timeout reports: many background Haiku consumers (emotion backfill, attunement supplementary backfill, per-turn attunement pass-2, monologue extractor, soul review) share **one** Claude CLI subscription with **no global rate-limiter and no interactive priority**. A bursting background job starves the user's interactive chat turn → stream idle timeout. v0.0.30 mitigates the worst offender (the emotion backfill now yields to active chat + paces its calls — commit `7760813f`), but any future background consumer can still starve chat. The principled fix: a global CLI queue that (a) gives interactive chat absolute priority, (b) bounds concurrent CLI subprocesses, (c) makes background jobs yield/queue behind interactive turns. Subsumes the per-backfill mitigations and the deferred tool-aware stream-idle watchdog — all facets of "interactive turns must never be starved by concurrent work." See deferred-ledger item 26.
+
 - **JSONL bounded-tail retention** — streaming reader shipped (closed the
   memory-spike vector). The retention piece needs a per-log-type design
   call (1 MB? 10 MB? 30 days? 90?) and isn't urgent until any single log
