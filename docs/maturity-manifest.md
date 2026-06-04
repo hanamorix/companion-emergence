@@ -4,7 +4,7 @@
 
 An "organ" is a brain subsystem with a producer and a consumer. The **wire-back invariant** (CLAUDE.md Hard rules): an organ is *done* only when it both **reads from** and **feeds into** the emotional/memory loops. This manifest records where each organ sits on that line.
 
-Last refreshed: **2026-06-03** (v0.0.30 stable-base).
+Last refreshed: **2026-06-05** (Phase-C wire-backs — felt_time, draft_space, voice-edit promoted to CORE-STABLE).
 
 ---
 
