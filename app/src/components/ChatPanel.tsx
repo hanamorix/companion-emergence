@@ -785,14 +785,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           proposal={p}
           persona={persona}
           onAccept={(id, withEdits) => {
-            void acceptVoiceEdit(persona, id, withEdits).catch(() => {}).finally(() => {
-              setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id));
-            });
+            void acceptVoiceEdit(persona, id, withEdits)
+              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+              .catch((e) => console.error("voice-edit accept failed", e));
           }}
           onReject={(id) => {
-            void rejectVoiceEdit(persona, id).catch(() => {}).finally(() => {
-              setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id));
-            });
+            void rejectVoiceEdit(persona, id)
+              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+              .catch((e) => console.error("voice-edit reject failed", e));
           }}
         />
       ))}
