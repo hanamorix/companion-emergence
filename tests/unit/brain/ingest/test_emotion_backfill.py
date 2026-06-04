@@ -103,7 +103,7 @@ def test_run_tags_emotion_less_memories(tmp_path):
     m = _create_memory(store, has_emotions=False)
     store.close()
 
-    run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50, delay_s=0)
+    run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50)
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
@@ -128,7 +128,7 @@ def test_run_does_not_retag_emotion_bearing_memories(tmp_path):
         call_count["n"] += 1
         return {"loneliness": 7.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
 
     assert call_count["n"] == 0
 
@@ -151,7 +151,7 @@ def test_run_drops_unregistered_names_from_tagger(tmp_path):
     def bad_tagger(memory):  # noqa: ANN001
         return {"loneliness": 5.0, "FAKE_UNREGISTERED_XYZ": 9.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=bad_tagger, cap=50, delay_s=0)
+    run_emotion_backfill(tmp_path, tagger_fn=bad_tagger, cap=50)
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
@@ -173,7 +173,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     store.close()
 
     # First run — cap 1
-    state1 = run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=1, delay_s=0)
+    state1 = run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=1)
     assert state1.status == "deferred_to_next_day"
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
@@ -184,7 +184,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     # Second run on tomorrow — cap resets, processes remaining
     tomorrow = datetime.now(UTC) + timedelta(days=1)
     state2 = run_emotion_backfill(
-        tmp_path, tagger_fn=_stub_tagger, cap=10, now_dt=tomorrow, delay_s=0
+        tmp_path, tagger_fn=_stub_tagger, cap=10, now_dt=tomorrow
     )
 
     store3 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
@@ -209,11 +209,11 @@ def test_run_rerun_after_complete_is_noop(tmp_path):
         call_count["n"] += 1
         return {"loneliness": 7.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
     first_calls = call_count["n"]
 
     # Second call — should be a no-op
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
 
     assert call_count["n"] == first_calls  # no additional calls
 
@@ -356,7 +356,7 @@ def test_default_tagger_path_tags_memories_via_provider(tmp_path):
 
     # tagger_fn=None → default tagger path; provider injected so no CLI call
     state = run_emotion_backfill(
-        tmp_path, tagger_fn=None, provider=_FakeProviderForTagger(), cap=50, delay_s=0
+        tmp_path, tagger_fn=None, provider=_FakeProviderForTagger(), cap=50
     )
 
     assert state.status == "complete"
@@ -398,7 +398,7 @@ def test_default_tagger_zero_tagged_does_not_mark_complete(tmp_path):
     store.close()
 
     state = run_emotion_backfill(
-        tmp_path, tagger_fn=None, provider=_EmptyProvider(), cap=50, delay_s=0
+        tmp_path, tagger_fn=None, provider=_EmptyProvider(), cap=50
     )
 
     # Must NOT be marked complete when zero memories were actually tagged
