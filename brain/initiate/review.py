@@ -269,6 +269,8 @@ def _process_one_candidate(
                 urgency="notify" if final_decision == "send_notify" else "quiet",
                 state="delivered",
                 timestamp=now.isoformat(),
+                kind=candidate.kind,
+                diff=diff_payload,
             )
         except Exception:
             logger.exception(

@@ -36,8 +36,12 @@ import logging
 import threading
 import time
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from brain.engines.heartbeat import HeartbeatResult
 
 from brain.attunement.backfill import (
     run_backfill as _attunement_run_backfill,
@@ -242,27 +246,9 @@ def run_folded(
             and last_heartbeat_at is not None
             and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
         ):
-            try:
-                _run_heartbeat_tick(persona_dir, provider, event_bus)
-            except Exception:
-                logger.exception("supervisor heartbeat tick raised")
-            try:
-                wall_s = time.monotonic() - last_heartbeat_at
-                # heartbeats/chat_turns/reflex_firings counter sources are
-                # placeholders (1/0/0) for v1 — Phase 9.2 (follow-up) tightens
-                # these by reading actual engine counters once the right
-                # accessor is identified.
-                # TODO(v0.0.15): replace 0 chat_turns + 0 reflex_firings with
-                # real counters from the event bus or engine state.
-                _last_intensity_drivers = _run_felt_time_tick(
-                    persona_dir,
-                    wall_clock_s_since_last=wall_s,
-                    heartbeats_since_last=1,
-                    chat_turns_since_last=0,
-                    reflex_firings_since_last=0,
-                )
-            except Exception:
-                logger.exception("supervisor felt-time tick raised")
+            _last_intensity_drivers = _heartbeat_and_felt_time(
+                persona_dir, provider, event_bus, last_heartbeat_at
+            )
             last_heartbeat_at = time.monotonic()
 
         # Soul-review cadence — slowest of the three. Each pass is up to
@@ -386,6 +372,52 @@ def run_folded(
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _heartbeat_and_felt_time(
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus,
+    last_heartbeat_at: float,
+) -> IntensityDrivers | None:
+    """Run a heartbeat tick then a felt-time tick, wiring real counters.
+
+    Extracted so tests can call this directly and spy on _run_felt_time_tick
+    without driving the full run_folded loop. Fault-isolated: heartbeat
+    errors are caught and reflex_n defaults to 0; felt-time errors are
+    caught and None is returned. The caller updates last_heartbeat_at.
+    """
+    from brain.felt_time.chat_log import count_chat_turns_since
+
+    heartbeat_result = None
+    try:
+        heartbeat_result = _run_heartbeat_tick(persona_dir, provider, event_bus)
+    except Exception:
+        logger.exception("supervisor heartbeat tick raised")
+    try:
+        mono_now = time.monotonic()
+        wall_now = datetime.now(UTC)
+        wall_s = mono_now - last_heartbeat_at
+        # time.monotonic() does not advance during system sleep, but
+        # datetime.now(UTC) does.  After a suspend, wall_s understates
+        # the elapsed wall time, so since_dt lands in the "future" relative
+        # to the last real activity and count_chat_turns_since undercounts.
+        # This is a deliberately conservative bias: felt-time underweights
+        # activity rather than overweighting it — consistent with the
+        # documented monotonic-cadence behaviour across the supervisor.
+        since_dt = wall_now - timedelta(seconds=wall_s)
+        chat_n = count_chat_turns_since(persona_dir, since_dt.isoformat())
+        reflex_n = len(heartbeat_result.reflex_fired) if heartbeat_result else 0
+        return _run_felt_time_tick(
+            persona_dir,
+            wall_clock_s_since_last=wall_s,
+            heartbeats_since_last=1,
+            chat_turns_since_last=chat_n,
+            reflex_firings_since_last=reflex_n,
+        )
+    except Exception:
+        logger.exception("supervisor felt-time tick raised")
+        return None
 
 
 def _run_felt_time_tick(
@@ -572,8 +604,11 @@ def _run_heartbeat_tick(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
-) -> None:
+) -> HeartbeatResult | None:
     """Build a HeartbeatEngine and run one tick. Publishes a result event.
+
+    Returns the HeartbeatResult so the caller can read reflex_fired and
+    wire it into the felt-time tick as reflex_firings_since_last.
 
     Constructs the engine per-tick (mirrors the per-tick store pattern)
     so SQLite handles + transient state stay thread-local. Reads the
@@ -644,6 +679,7 @@ def _run_heartbeat_tick(
             "at": _now_iso(),
         }
     )
+    return result
 
 
 def _run_soul_review_tick(
@@ -676,7 +712,27 @@ def _run_soul_review_tick(
     if eligible_before == 0:
         # Nothing drainable — skip the pass and the open-store cost. No
         # failures, no backlog → caller schedules the normal interval.
+        # NOTE: draft cursor is intentionally NOT advanced here — drafts
+        # must wait for the next candidate-bearing tick so quiet ticks
+        # don't silently skip un-consumed fragments.
         return 0, 0
+
+    # ── Candidate-gated draft reading ────────────────────────────────────────
+    # Runs only when there are actual candidates to review (past the early-
+    # return above). Reads fragments since the last cursor position and passes
+    # them to the review prompt as interior context.
+    from brain.initiate.draft import (
+        has_new_drafts_since,
+        load_draft_review_cursor,
+        read_drafts_since,
+        save_draft_review_cursor,
+    )
+
+    cursor = load_draft_review_cursor(persona_dir)
+    draft_fragments: list[str] = []
+    if not cursor or has_new_drafts_since(persona_dir, cursor):
+        frags = read_drafts_since(persona_dir, cursor or "0001-01-01T00:00:00")
+        draft_fragments = [f"[{f.source}] {f.body}" for f in frags]
 
     # Backlog-aware drain: clear up to the cap per tick when candidates have
     # piled up, instead of the default 5.
@@ -701,7 +757,12 @@ def _run_soul_review_tick(
             soul_store=soul_store,
             provider=provider,
             max_decisions=max_decisions,
+            draft_fragments=draft_fragments if draft_fragments else None,
         )
+
+    # Advance the draft cursor AFTER the review pass runs — never on early-
+    # return, so a quiet tick doesn't silently skip un-consumed fragments.
+    save_draft_review_cursor(persona_dir, datetime.now(UTC).isoformat())
 
     event_bus.publish(
         {
@@ -1048,8 +1109,6 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
     crystallizations created within the last ``days`` days. Failures
     swallowed — reflection still fires with whatever evidence exists.
     """
-    from datetime import timedelta
-
     from brain.soul.store import SoulStore
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
@@ -1070,8 +1129,6 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
 
 def _read_recent_dreams(persona_dir: Path, days: int) -> list[dict]:
     """Read recent dream entries from ``dreams.log.jsonl``."""
-    from datetime import timedelta
-
     from brain.health.jsonl_reader import iter_jsonl_streaming
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()

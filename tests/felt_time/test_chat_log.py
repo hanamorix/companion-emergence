@@ -116,3 +116,100 @@ def test_load_recent_samples_lazy_trim_removes_old_from_file(tmp_path: Path) -> 
     # After lazy trim, file should only contain recent entries
     lines = (tmp_path / CHAT_TURNS_LOG_FILENAME).read_text().strip().splitlines()
     assert len(lines) == 5
+
+
+# ---------------------------------------------------------------------------
+# count_chat_turns_since — Task 2
+# ---------------------------------------------------------------------------
+
+
+def test_count_chat_turns_since_counts_active_buffer_turns(tmp_path: Path) -> None:
+    """Turns appended after the cutoff are counted; older turns are not."""
+    from brain.felt_time.chat_log import count_chat_turns_since
+    from brain.ingest.buffer import ingest_turn
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=5)
+    session_id = "sess_abc12345"
+
+    # One old turn (before cutoff) — should NOT be counted
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": session_id,
+            "speaker": "user",
+            "text": "old turn",
+            "ts": (now - timedelta(minutes=10)).isoformat(),
+        },
+    )
+    # Two new turns (after cutoff) — should be counted
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": session_id,
+            "speaker": "user",
+            "text": "new turn 1",
+            "ts": (now - timedelta(minutes=2)).isoformat(),
+        },
+    )
+    ingest_turn(
+        persona_dir,
+        {
+            "session_id": session_id,
+            "speaker": "nell",
+            "text": "new turn 2",
+            "ts": (now - timedelta(minutes=1)).isoformat(),
+        },
+    )
+
+    count = count_chat_turns_since(persona_dir, cutoff.isoformat())
+    assert count == 2, f"Expected 2 turns after cutoff, got {count}"
+
+
+def test_count_chat_turns_since_returns_zero_when_no_buffers(tmp_path: Path) -> None:
+    """No active_conversations dir → 0 turns."""
+    from brain.felt_time.chat_log import count_chat_turns_since
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    # No active_conversations directory created — should return 0
+
+    count = count_chat_turns_since(persona_dir, datetime.now(UTC).isoformat())
+    assert count == 0
+
+
+def test_count_chat_turns_since_skips_corrupt_buffer(tmp_path: Path) -> None:
+    """A corrupt .jsonl in active_conversations is skipped; good buffers still count."""
+    from brain.felt_time.chat_log import count_chat_turns_since
+    from brain.ingest.buffer import ingest_turn
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=10)
+
+    # Seed one good buffer with 2 turns after the cutoff
+    session_id = "sess_good1234"
+    for i, (speaker, text) in enumerate(
+        [("user", "hello"), ("nell", "hi there")], start=1
+    ):
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": session_id,
+                "speaker": speaker,
+                "text": text,
+                "ts": (now - timedelta(minutes=i)).isoformat(),
+            },
+        )
+
+    # Write a corrupt buffer (non-JSON text) that must not crash the count
+    ac_dir = persona_dir / "active_conversations"
+    (ac_dir / "garbage.jsonl").write_text("this is not json\n{broken", encoding="utf-8")
+
+    count = count_chat_turns_since(persona_dir, cutoff.isoformat())
+    assert count == 2, f"Expected 2 turns from good buffer, got {count}"

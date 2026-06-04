@@ -429,6 +429,102 @@ def test_three_consecutive_failures_promote_all_fallback(tmp_path, monkeypatch):
     assert "ic_" in compose_calls[0]  # candidate_id is always ic_<timestamp>_<rand>
 
 
+def _fake_voice_edit_provider(decision: str = "send_quiet") -> MagicMock:
+    """Provider for voice_edit_proposal — compose_decision_voice_edit calls
+    provider.complete exactly once, returning the decision JSON directly."""
+    provider = MagicMock()
+    provider.complete = MagicMock(
+        return_value=f'{{"decision": "{decision}", "reasoning": "evidence is strong"}}'
+    )
+    return provider
+
+
+def test_initiate_delivered_event_carries_kind_and_diff(tmp_path: Path, monkeypatch) -> None:
+    """initiate_delivered event must carry kind + diff.
+
+    - voice_edit_proposal candidate → kind='voice_edit_proposal', diff is the
+      diff string from the proposal.
+    - plain message candidate → kind='message', diff is None.
+
+    The frontend ChatPanel branches on event.kind to decide whether to render
+    VoiceEditPanel (inline diff UI) or the generic InitiateBanner.
+    """
+    from brain.bridge import events
+
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
+
+    # Set up persona subdirectory so review.py can look for voice.md / crystallizations.db
+    persona = tmp_path / "persona"
+    persona.mkdir()
+
+    # --- voice_edit_proposal candidate ---
+    emit_initiate_candidate(
+        persona,
+        kind="voice_edit_proposal",
+        source="voice_reflection",
+        source_id="vr_kind_diff_test",
+        semantic_context=_ctx(),
+        proposal={
+            "diff": "- old line\n+ new line",
+            "old_text": "old line",
+            "new_text": "new line",
+            "rationale": "felt too clipped",
+            "evidence": ["e1", "e2", "e3"],
+        },
+    )
+
+    captured: list[dict] = []
+    events.set_publisher(captured.append)
+    try:
+        run_initiate_review_tick(
+            persona,
+            provider=_fake_voice_edit_provider("send_quiet"),
+            voice_template="be warm",
+            cap_per_tick=3,
+            now=daytime,
+        )
+    finally:
+        events.set_publisher(None)
+
+    delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
+    assert len(delivered) == 1, f"expected 1 initiate_delivered, got: {captured}"
+    ve_event = delivered[0]
+    assert ve_event["kind"] == "voice_edit_proposal", f"kind wrong: {ve_event}"
+    assert isinstance(ve_event["diff"], str) and ve_event["diff"], f"diff missing: {ve_event}"
+
+    # --- plain message candidate (fresh persona dir — no prior send so gate passes) ---
+    persona2 = tmp_path / "persona2"
+    persona2.mkdir()
+    emit_initiate_candidate(
+        persona2,
+        kind="message",
+        source="dream",
+        source_id="dream_kind_diff_test",
+        emotional_snapshot=_snap(),
+        semantic_context=_ctx(),
+    )
+
+    captured2: list[dict] = []
+    events.set_publisher(captured2.append)
+    try:
+        run_initiate_review_tick(
+            persona2,
+            provider=_fake_provider("send_quiet"),
+            voice_template="be warm",
+            cap_per_tick=3,
+            now=daytime,
+        )
+    finally:
+        events.set_publisher(None)
+
+    delivered2 = [e for e in captured2 if e.get("type") == "initiate_delivered"]
+    assert len(delivered2) == 1, f"expected 1 initiate_delivered for message, got: {captured2}"
+    msg_event = delivered2[0]
+    assert msg_event["kind"] == "message", f"kind wrong for message: {msg_event}"
+    assert msg_event["diff"] is None, f"diff should be None for message: {msg_event}"
+
+
 def test_run_initiate_review_tick_emits_drift_alert(tmp_path, monkeypatch):
     """When detect_drift returns a DriftAlert, the review tick should
     emit a structured supervisor event."""
