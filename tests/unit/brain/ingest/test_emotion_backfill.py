@@ -5,6 +5,7 @@ TDD — one test at a time per tdd-guard.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -102,7 +103,7 @@ def test_run_tags_emotion_less_memories(tmp_path):
     m = _create_memory(store, has_emotions=False)
     store.close()
 
-    run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50)
+    run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50, delay_s=0)
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
@@ -127,7 +128,7 @@ def test_run_does_not_retag_emotion_bearing_memories(tmp_path):
         call_count["n"] += 1
         return {"loneliness": 7.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
 
     assert call_count["n"] == 0
 
@@ -150,7 +151,7 @@ def test_run_drops_unregistered_names_from_tagger(tmp_path):
     def bad_tagger(memory):  # noqa: ANN001
         return {"loneliness": 5.0, "FAKE_UNREGISTERED_XYZ": 9.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=bad_tagger, cap=50)
+    run_emotion_backfill(tmp_path, tagger_fn=bad_tagger, cap=50, delay_s=0)
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
@@ -172,7 +173,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     store.close()
 
     # First run — cap 1
-    state1 = run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=1)
+    state1 = run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=1, delay_s=0)
     assert state1.status == "deferred_to_next_day"
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
@@ -183,7 +184,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     # Second run on tomorrow — cap resets, processes remaining
     tomorrow = datetime.now(UTC) + timedelta(days=1)
     state2 = run_emotion_backfill(
-        tmp_path, tagger_fn=_stub_tagger, cap=10, now_dt=tomorrow
+        tmp_path, tagger_fn=_stub_tagger, cap=10, now_dt=tomorrow, delay_s=0
     )
 
     store3 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
@@ -208,11 +209,11 @@ def test_run_rerun_after_complete_is_noop(tmp_path):
         call_count["n"] += 1
         return {"loneliness": 7.0}
 
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
     first_calls = call_count["n"]
 
     # Second call — should be a no-op
-    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50)
+    run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
 
     assert call_count["n"] == first_calls  # no additional calls
 
@@ -355,7 +356,7 @@ def test_default_tagger_path_tags_memories_via_provider(tmp_path):
 
     # tagger_fn=None → default tagger path; provider injected so no CLI call
     state = run_emotion_backfill(
-        tmp_path, tagger_fn=None, provider=_FakeProviderForTagger(), cap=50
+        tmp_path, tagger_fn=None, provider=_FakeProviderForTagger(), cap=50, delay_s=0
     )
 
     assert state.status == "complete"
@@ -397,7 +398,7 @@ def test_default_tagger_zero_tagged_does_not_mark_complete(tmp_path):
     store.close()
 
     state = run_emotion_backfill(
-        tmp_path, tagger_fn=None, provider=_EmptyProvider(), cap=50
+        tmp_path, tagger_fn=None, provider=_EmptyProvider(), cap=50, delay_s=0
     )
 
     # Must NOT be marked complete when zero memories were actually tagged
@@ -455,3 +456,82 @@ def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
 
         # Must be called with provider= kwarg so the default tagger gets a real provider
         mock_run.assert_called_once_with(persona_dir, provider=provider)
+
+
+# ---------------------------------------------------------------------------
+# Step YIELD.1 — _user_recently_active helper
+# ---------------------------------------------------------------------------
+
+def _seed_buffer_turn(persona_dir: Path, *, minutes_ago: float) -> None:
+    """Write a single turn into an active_conversations buffer timestamped N minutes ago."""
+    from brain.ingest.buffer import ingest_turn
+
+    ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    (persona_dir / "active_conversations").mkdir(parents=True, exist_ok=True)
+    ingest_turn(persona_dir, {"speaker": "user", "text": "hello", "ts": ts})
+
+
+def test_user_recently_active_true_when_recent_turn(tmp_path):
+    """_user_recently_active returns True when the last buffer turn is < 5 min ago."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
+    assert _user_recently_active(tmp_path) is True
+
+
+def test_user_recently_active_false_when_stale_turn(tmp_path):
+    """_user_recently_active returns False when the last buffer turn is > 5 min ago."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    _seed_buffer_turn(tmp_path, minutes_ago=10.0)
+    assert _user_recently_active(tmp_path) is False
+
+
+def test_user_recently_active_false_when_no_buffer(tmp_path):
+    """_user_recently_active returns False when there is no active_conversations buffer."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    # No active_conversations dir at all
+    assert _user_recently_active(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Step YIELD.2 — run_emotion_backfill yields when user is actively chatting
+# ---------------------------------------------------------------------------
+
+def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
+    """When user is actively chatting, run_emotion_backfill must not call tagger
+    and must leave status as resumable (not 'complete').
+    """
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+    from brain.memory.store import MemoryStore
+
+    # Seed one emotion-less memory
+    store = _make_store(tmp_path)
+    m = _create_memory(store, has_emotions=False)
+    store.close()
+
+    # Seed an active buffer turn (< 5 min ago) → _user_recently_active returns True
+    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
+
+    tagger_calls = {"n": 0}
+
+    def counting_tagger(memory):  # noqa: ANN001
+        tagger_calls["n"] += 1
+        return {"loneliness": 7.0}
+
+    state = run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
+
+    # Tagger must NOT have been called
+    assert tagger_calls["n"] == 0, "tagger was called despite active user session"
+
+    # Status must NOT be 'complete' — the run should be resumable
+    assert state.status != "complete", f"unexpected status={state.status!r} after yield"
+
+    # Memory must still have no emotions
+    store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
+    updated = store2.get(m.id)
+    store2.close()
+    assert updated.emotions == {}, "memory was tagged despite active user session"
