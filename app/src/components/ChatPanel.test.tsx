@@ -23,6 +23,8 @@ vi.mock("../bridge", () => ({
     port: 50000,
     authToken: "test-token",
   })),
+  acceptVoiceEdit: vi.fn(async () => ({ ok: true })),
+  rejectVoiceEdit: vi.fn(async () => ({ ok: true })),
 }));
 
 // bridgeEvents opens a real WebSocket from its own module. Stub it so
@@ -40,7 +42,7 @@ vi.mock("../streamChat", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { fetchActiveSession, newSession } from "../bridge";
+import { acceptVoiceEdit, fetchActiveSession, newSession } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -595,5 +597,68 @@ describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
       },
     );
     expect(repliedExplicitPost).toBeUndefined();
+  });
+});
+
+// ── Task 9: VoiceEditPanel inline rendering ───────────────────────────────
+describe("ChatPanel — VoiceEditPanel inline rendering (Task 9)", () => {
+  const mockedAcceptVoiceEdit = acceptVoiceEdit as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockedAcceptVoiceEdit.mockReset();
+    mockedAcceptVoiceEdit.mockResolvedValue({ ok: true });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("renders VoiceEditPanel for a voice_edit_proposal initiate event", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "a1",
+        kind: "voice_edit_proposal",
+        body: "Proposing a voice change",
+        diff: "- old line\n+ new line",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    // VoiceEditPanel renders as a dialog with aria-label "Voice edit proposal"
+    const dialog = await screen.findByRole("dialog", { name: /voice edit proposal/i });
+    expect(dialog).toBeInTheDocument();
+
+    // Generic InitiateBanner list should NOT be shown for this event
+    expect(screen.queryByTestId("initiate-banner-list")).toBeNull();
+
+    // Clicking Accept calls acceptVoiceEdit
+    const acceptBtn = screen.getByRole("button", { name: /^accept$/i });
+    await act(async () => {
+      fireEvent.click(acceptBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedAcceptVoiceEdit).toHaveBeenCalledWith("nell", "a1", null);
+    });
   });
 });
