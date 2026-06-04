@@ -5,6 +5,7 @@ TDD — one test at a time per tdd-guard.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -455,3 +456,82 @@ def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
 
         # Must be called with provider= kwarg so the default tagger gets a real provider
         mock_run.assert_called_once_with(persona_dir, provider=provider)
+
+
+# ---------------------------------------------------------------------------
+# Step YIELD.1 — _user_recently_active helper
+# ---------------------------------------------------------------------------
+
+def _seed_buffer_turn(persona_dir: Path, *, minutes_ago: float) -> None:
+    """Write a single turn into an active_conversations buffer timestamped N minutes ago."""
+    from brain.ingest.buffer import ingest_turn
+
+    ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    (persona_dir / "active_conversations").mkdir(parents=True, exist_ok=True)
+    ingest_turn(persona_dir, {"speaker": "user", "text": "hello", "ts": ts})
+
+
+def test_user_recently_active_true_when_recent_turn(tmp_path):
+    """_user_recently_active returns True when the last buffer turn is < 5 min ago."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
+    assert _user_recently_active(tmp_path) is True
+
+
+def test_user_recently_active_false_when_stale_turn(tmp_path):
+    """_user_recently_active returns False when the last buffer turn is > 5 min ago."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    _seed_buffer_turn(tmp_path, minutes_ago=10.0)
+    assert _user_recently_active(tmp_path) is False
+
+
+def test_user_recently_active_false_when_no_buffer(tmp_path):
+    """_user_recently_active returns False when there is no active_conversations buffer."""
+    from brain.ingest.emotion_backfill import _user_recently_active
+
+    # No active_conversations dir at all — tmp_path is bare
+    assert _user_recently_active(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Step YIELD.2 — run_emotion_backfill yields when user is actively chatting
+# ---------------------------------------------------------------------------
+
+def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
+    """When user is actively chatting, run_emotion_backfill must not call tagger
+    and must leave status as resumable (not 'complete').
+    """
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+    from brain.memory.store import MemoryStore
+
+    # Seed one emotion-less memory
+    store = _make_store(tmp_path)
+    m = _create_memory(store, has_emotions=False)
+    store.close()
+
+    # Seed an active buffer turn (< 5 min ago) → _user_recently_active returns True
+    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
+
+    tagger_calls = {"n": 0}
+
+    def counting_tagger(memory):  # noqa: ANN001
+        tagger_calls["n"] += 1
+        return {"loneliness": 7.0}
+
+    state = run_emotion_backfill(tmp_path, tagger_fn=counting_tagger, cap=50, delay_s=0)
+
+    # Tagger must NOT have been called
+    assert tagger_calls["n"] == 0, "tagger was called despite active user session"
+
+    # Status must NOT be 'complete' — the run should be resumable
+    assert state.status != "complete", f"unexpected status={state.status!r} after yield"
+
+    # Memory must still have no emotions
+    store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
+    updated = store2.get(m.id)
+    store2.close()
+    assert updated.emotions == {}, "memory was tagged despite active user session"
