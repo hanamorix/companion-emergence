@@ -164,6 +164,12 @@ export async function streamChat(
           break;
         case "tool_result":
           break;
+        case "keepalive":
+          // Server heartbeat during a silent provider stretch (first-token
+          // latency / tool round-trip). resetIdle() already ran above; this
+          // frame carries no content, so it's a deliberate no-op that holds
+          // the connection open past the 60s idle budget.
+          break;
         case "reply_chunk":
           handlers.onChunk((frame.text as string) ?? "");
           break;
