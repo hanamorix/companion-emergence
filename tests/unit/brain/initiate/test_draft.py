@@ -108,3 +108,88 @@ def test_compose_draft_fragment_uses_companion_name_not_nell() -> None:
     args, _ = provider.complete.call_args
     assert "Mira" in args[0]
     assert "Nell" not in args[0]
+
+
+# ── read_drafts_since ─────────────────────────────────────────────────────────
+
+
+def test_read_drafts_since_returns_fragments_after_cursor(tmp_path: Path) -> None:
+    """Fragments strictly after the cutoff timestamp are returned; older ones excluded."""
+    from brain.initiate.draft import read_drafts_since  # noqa: PLC0415
+
+    append_draft_fragment(
+        tmp_path,
+        timestamp="2026-06-01T09:00:00",
+        source="d_reflection",
+        body="An older thought that didn't rise.",
+    )
+    append_draft_fragment(
+        tmp_path,
+        timestamp="2026-06-04T10:00:00",
+        source="emotion_spike",
+        body="A newer surge of feeling.",
+    )
+
+    result = read_drafts_since(tmp_path, "2026-06-02T00:00:00")
+
+    assert len(result) == 1
+    frag = result[0]
+    assert frag.source == "emotion_spike"
+    assert "newer surge" in frag.body
+
+
+def test_read_drafts_since_empty_when_no_file(tmp_path: Path) -> None:
+    """Returns empty list when draft_space.md does not exist."""
+    from brain.initiate.draft import read_drafts_since  # noqa: PLC0415
+
+    result = read_drafts_since(tmp_path, "2026-01-01T00:00:00")
+    assert result == []
+
+
+def test_read_drafts_since_multiline_body(tmp_path: Path) -> None:
+    """Multi-line bodies are captured in full."""
+    from brain.initiate.draft import read_drafts_since  # noqa: PLC0415
+
+    append_draft_fragment(
+        tmp_path,
+        timestamp="2026-06-04T12:00:00",
+        source="dream",
+        body="Line one.\nLine two.\nLine three.",
+    )
+    result = read_drafts_since(tmp_path, "2026-06-01T00:00:00")
+    assert len(result) == 1
+    assert "Line two" in result[0].body
+
+
+def test_read_drafts_since_tz_aware_cutoff(tmp_path: Path) -> None:
+    """Tz-aware cutoff is coerced to naive for comparison without raising."""
+    from brain.initiate.draft import read_drafts_since  # noqa: PLC0415
+
+    append_draft_fragment(
+        tmp_path,
+        timestamp="2026-06-04T10:00:00",
+        source="emotion_spike",
+        body="Should surface.",
+    )
+    # tz-aware cutoff (before the fragment) — must not raise TypeError
+    result = read_drafts_since(tmp_path, "2026-06-01T00:00:00+00:00")
+    assert len(result) == 1
+
+
+def test_load_draft_review_cursor_returns_empty_when_no_file(tmp_path: Path) -> None:
+    """No cursor file → returns empty string."""
+    from brain.initiate.draft import load_draft_review_cursor  # noqa: PLC0415
+
+    assert load_draft_review_cursor(tmp_path) == ""
+
+
+def test_save_and_load_draft_review_cursor_roundtrip(tmp_path: Path) -> None:
+    """save_draft_review_cursor persists; load_draft_review_cursor retrieves it."""
+    from brain.initiate.draft import (  # noqa: PLC0415
+        load_draft_review_cursor,
+        save_draft_review_cursor,
+    )
+
+    iso = "2026-06-04T10:30:00+00:00"
+    save_draft_review_cursor(tmp_path, iso)
+    assert load_draft_review_cursor(tmp_path) == iso

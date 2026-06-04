@@ -92,6 +92,7 @@ def _build_messages(
     emotional_summary: str,
     soul_size: int,
     companion_name: str = "Nell",
+    draft_fragments: list[str] | None = None,
 ) -> list[dict]:
     """Compose structured chat messages for one decision.
 
@@ -108,6 +109,12 @@ def _build_messages(
     if related:
         related_block = "\nRelated memories already in your brain:\n" + "\n".join(
             f"  • {snippet}" for snippet in related
+        )
+
+    draft_block = ""
+    if draft_fragments:
+        draft_block = "\nRecent private fragments (thoughts you set aside, not sent):\n" + "\n".join(
+            f"- {frag}" for frag in draft_fragments
         )
 
     system_msg = (
@@ -138,7 +145,8 @@ def _build_messages(
         f"  text: {candidate_text}\n"
         f"  label: {label}  ·  importance: {importance}  ·  queued: {queued_at}\n"
         f"  source: {source}\n"
-        f"{related_block}\n\n"
+        f"{related_block}"
+        f"{draft_block}\n\n"
         f"Your current state: emotional={emotional_summary}  ·  "
         f"soul size={soul_size} crystallizations.\n\n"
         f"Decide. Return JSON only."
@@ -453,6 +461,7 @@ def review_pending_candidates(
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
     defer_cooldown_hours: float = DEFAULT_DEFER_COOLDOWN_HOURS,
     dry_run: bool = False,
+    draft_fragments: list[str] | None = None,
 ) -> ReviewReport:
     """Read soul_candidates.jsonl, decide on each via the LLM, apply decisions.
 
@@ -501,6 +510,7 @@ def review_pending_candidates(
             confidence_threshold=confidence_threshold,
             defer_cooldown_hours=defer_cooldown_hours,
             dry_run=dry_run,
+            draft_fragments=draft_fragments,
         )
 
 
@@ -514,6 +524,7 @@ def _review_pending_candidates_locked(
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
     defer_cooldown_hours: float = DEFAULT_DEFER_COOLDOWN_HOURS,
     dry_run: bool = False,
+    draft_fragments: list[str] | None = None,
 ) -> ReviewReport:
     """Read-modify-rewrite body of :func:`review_pending_candidates`.
 
@@ -559,7 +570,14 @@ def _review_pending_candidates_locked(
         report.examined += 1
 
         related = _related_memory_snippets(store, record.get("text", ""))
-        messages = _build_messages(record, related, emotional_summary, soul_size, companion_name=companion_name)
+        messages = _build_messages(
+            record,
+            related,
+            emotional_summary,
+            soul_size,
+            companion_name=companion_name,
+            draft_fragments=draft_fragments,
+        )
 
         # Build flat prompt for provider.generate (text mode)
         # Both Claude CLI and Ollama return JSON when instructed — simpler than tools.

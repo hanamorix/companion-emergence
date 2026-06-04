@@ -8,8 +8,10 @@ template fallback.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,95 @@ def compose_draft_fragment(
             f"An internal event ({source}, id {source_id}) didn't quite "
             f"reach the threshold for reaching out, but it stayed with me."
         )
+
+
+@dataclass(frozen=True)
+class DraftFragment:
+    """One parsed draft-space entry."""
+
+    ts: str   # "YYYY-MM-DD HH:MM" — as written in the header
+    source: str
+    body: str
+
+
+def read_drafts_since(persona_dir: Path, last_seen_iso: str) -> list[DraftFragment]:
+    """Return all fragments whose header timestamp is strictly after *last_seen_iso*.
+
+    - Missing file → ``[]``.
+    - Malformed cutoff → treat as ``datetime.min`` (surface all).
+    - Tz-aware cutoff is coerced to naive so the comparison never raises.
+    - Multi-line bodies are captured in full (lines between two headers, stripped
+      of leading/trailing blank lines).
+    """
+    path = persona_dir / "draft_space.md"
+    if not path.exists():
+        return []
+
+    # Parse the cutoff datetime.
+    try:
+        cutoff = datetime.fromisoformat(last_seen_iso)
+    except (ValueError, TypeError):
+        cutoff = datetime.min
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.replace(tzinfo=None)
+
+    # Walk the file collecting header-delimited blocks.
+    fragments: list[DraftFragment] = []
+    current_ts: str | None = None
+    current_source: str | None = None
+    current_body_lines: list[str] = []
+
+    def _flush() -> None:
+        if current_ts is None:
+            return
+        body = "\n".join(current_body_lines).strip()
+        try:
+            hdr_dt = datetime.strptime(current_ts, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return
+        if hdr_dt > cutoff:
+            fragments.append(DraftFragment(ts=current_ts, source=current_source or "", body=body))
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = _HEADER_PATTERN.match(line)
+        if m:
+            _flush()
+            current_ts = m.group(1)
+            current_source = m.group(2)
+            current_body_lines = []
+        elif current_ts is not None:
+            current_body_lines.append(line)
+
+    _flush()
+    return fragments
+
+
+_DRAFT_CURSOR_FILE = "draft_space_review_cursor.json"
+
+
+def load_draft_review_cursor(persona_dir: Path) -> str:
+    """Return the ISO timestamp of the last draft reviewed by the soul-review tick.
+
+    Returns empty string if the cursor file does not exist or is unreadable.
+    """
+    path = persona_dir / _DRAFT_CURSOR_FILE
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return str(data.get("last_seen", ""))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ""
+
+
+def save_draft_review_cursor(persona_dir: Path, iso: str) -> None:
+    """Persist *iso* as the last-seen timestamp for the soul-review draft cursor."""
+    path = persona_dir / _DRAFT_CURSOR_FILE
+    try:
+        persona_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"last_seen": iso}, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("draft review cursor save failed: %s", exc)
 
 
 def has_new_drafts_since(persona_dir: Path, last_seen_iso: str) -> bool:

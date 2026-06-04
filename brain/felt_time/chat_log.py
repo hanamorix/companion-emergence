@@ -81,6 +81,35 @@ def load_recent_samples(
     return window if len(window) >= _COLD_START_MIN else None
 
 
+def count_chat_turns_since(persona_dir: Path, since_iso: str) -> int:
+    """Count chat turns across all active session buffers newer than since_iso.
+
+    Enumerates ``<persona_dir>/active_conversations/*.jsonl`` and for each
+    buffer calls ``read_session_after`` to get only turns after the cutoff.
+    Per-buffer errors are swallowed so a corrupt buffer can't zero-out the
+    count. Returns 0 when the directory doesn't exist.
+    """
+    from brain.ingest.buffer import read_session_after
+
+    ac_dir = persona_dir / "active_conversations"
+    if not ac_dir.exists():
+        return 0
+
+    total = 0
+    for buf_path in ac_dir.iterdir():
+        if not buf_path.is_file() or buf_path.suffix != ".jsonl":
+            continue
+        session_id = buf_path.stem
+        if not session_id:
+            continue
+        try:
+            turns = read_session_after(persona_dir, session_id, since_iso)
+            total += len(turns)
+        except Exception:
+            log.debug("count_chat_turns_since: error reading %s", buf_path, exc_info=True)
+    return total
+
+
 def _rewrite_log(log_path: Path, entries: list[dict]) -> None:
     """Atomically rewrite log with trimmed entries (lazy GC)."""
     try:

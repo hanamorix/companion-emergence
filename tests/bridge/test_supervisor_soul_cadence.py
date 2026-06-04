@@ -72,3 +72,86 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
     state = json.loads((persona_dir / "soul_review_state.json").read_text())
     saved_next = datetime.fromisoformat(state["next_review_at"])
     assert saved_next > datetime.now(UTC) + timedelta(hours=5)
+
+
+def test_draft_cursor_not_advanced_when_no_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When _run_soul_review_tick early-returns because eligible_before == 0,
+    the draft cursor file must NOT be created or advanced — drafts must wait
+    for the next candidate-bearing tick."""
+    from brain.bridge.supervisor import _run_soul_review_tick
+    from brain.initiate.draft import append_draft_fragment
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    # Write a draft fragment so there IS something to potentially cursor-advance on.
+    append_draft_fragment(
+        persona_dir,
+        timestamp="2026-06-04T10:00:00",
+        source="emotion_spike",
+        body="A draft that should not be consumed yet.",
+    )
+
+    # Patch count_eligible_pending at the source — it's imported inside the function body.
+    monkeypatch.setattr(
+        "brain.soul.review.count_eligible_pending",
+        lambda *a, **k: 0,
+    )
+
+    result = _run_soul_review_tick(
+        persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+    )
+
+    assert result == (0, 0), "early-return path must return (0, 0)"
+    cursor_path = persona_dir / "draft_space_review_cursor.json"
+    assert not cursor_path.exists(), (
+        "cursor must NOT be written when there are zero eligible candidates"
+    )
+
+
+def test_draft_cursor_advanced_after_successful_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When _run_soul_review_tick runs a real review pass (eligible > 0),
+    the draft cursor file is written after the pass completes."""
+    import json as _json
+
+    from brain.bridge.supervisor import _run_soul_review_tick
+    from brain.initiate.draft import append_draft_fragment
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    # Write a draft fragment.
+    append_draft_fragment(
+        persona_dir,
+        timestamp="2026-06-04T10:00:00",
+        source="emotion_spike",
+        body="A draft that should be consumed.",
+    )
+
+    # Patch count_eligible_pending to return 1 (has candidates).
+    monkeypatch.setattr("brain.soul.review.count_eligible_pending", lambda *a, **k: 1)
+
+    # Patch review_pending_candidates to return a dummy ReviewReport.
+    from brain.soul.review import ReviewReport
+
+    monkeypatch.setattr(
+        "brain.soul.review.review_pending_candidates",
+        lambda *a, **k: ReviewReport(pending_at_start=1, examined=1, deferred=1),
+    )
+
+    _run_soul_review_tick(
+        persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+    )
+
+    cursor_path = persona_dir / "draft_space_review_cursor.json"
+    assert cursor_path.exists(), "cursor file must be written after a review pass"
+    data = _json.loads(cursor_path.read_text())
+    assert "last_seen" in data, "cursor must contain a last_seen timestamp"

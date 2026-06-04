@@ -23,6 +23,8 @@ vi.mock("../bridge", () => ({
     port: 50000,
     authToken: "test-token",
   })),
+  acceptVoiceEdit: vi.fn(async () => ({ ok: true })),
+  rejectVoiceEdit: vi.fn(async () => ({ ok: true })),
 }));
 
 // bridgeEvents opens a real WebSocket from its own module. Stub it so
@@ -40,7 +42,7 @@ vi.mock("../streamChat", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { fetchActiveSession, newSession } from "../bridge";
+import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -595,5 +597,173 @@ describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
       },
     );
     expect(repliedExplicitPost).toBeUndefined();
+  });
+});
+
+// ── Task 9: VoiceEditPanel inline rendering ───────────────────────────────
+describe("ChatPanel — VoiceEditPanel inline rendering (Task 9)", () => {
+  const mockedAcceptVoiceEdit = acceptVoiceEdit as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockedAcceptVoiceEdit.mockReset();
+    mockedAcceptVoiceEdit.mockResolvedValue({ ok: true });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("renders VoiceEditPanel for a voice_edit_proposal initiate event", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "a1",
+        kind: "voice_edit_proposal",
+        body: "Proposing a voice change",
+        diff: "- old line\n+ new line",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    // VoiceEditPanel renders as a dialog with aria-label "Voice edit proposal"
+    const dialog = await screen.findByRole("dialog", { name: /voice edit proposal/i });
+    expect(dialog).toBeInTheDocument();
+
+    // Generic InitiateBanner list should NOT be shown for this event
+    expect(screen.queryByTestId("initiate-banner-list")).toBeNull();
+
+    // Clicking Accept calls acceptVoiceEdit
+    const acceptBtn = screen.getByRole("button", { name: /^accept$/i });
+    await act(async () => {
+      fireEvent.click(acceptBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockedAcceptVoiceEdit).toHaveBeenCalledWith("nell", "a1", null);
+    });
+  });
+});
+
+// ── Voice-edit accept/reject error handling ────────────────────────────────
+// Ensures the panel disappears only on success, stays mounted on failure,
+// and errors are surfaced via console.error rather than swallowed silently.
+describe("ChatPanel — voice-edit accept/reject error handling", () => {
+  const mockedAcceptVoiceEdit = acceptVoiceEdit as unknown as ReturnType<typeof vi.fn>;
+  const mockedRejectVoiceEdit = rejectVoiceEdit as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  async function renderWithProposal(auditId: string, stream: ReturnType<typeof makeStream>) {
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: auditId,
+        kind: "voice_edit_proposal",
+        body: "Proposing a voice change",
+        diff: "- old line\n+ new line",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: new Date().toISOString(),
+      });
+    });
+    // Wait for the dialog to appear before returning.
+    await screen.findByRole("dialog", { name: /voice edit proposal/i });
+  }
+
+  beforeEach(() => {
+    mockedAcceptVoiceEdit.mockReset();
+    mockedRejectVoiceEdit.mockReset();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("accept success removes the panel", async () => {
+    mockedAcceptVoiceEdit.mockResolvedValue({ ok: true });
+    const stream = makeStream();
+    await renderWithProposal("ve_success", stream);
+
+    const acceptBtn = screen.getByRole("button", { name: /^accept$/i });
+    await act(async () => {
+      fireEvent.click(acceptBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /voice edit proposal/i })).toBeNull();
+    });
+    expect(mockedAcceptVoiceEdit).toHaveBeenCalledWith("nell", "ve_success", null);
+  });
+
+  it("accept failure keeps the panel mounted and logs via console.error", async () => {
+    mockedAcceptVoiceEdit.mockRejectedValue(new Error("network error"));
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const stream = makeStream();
+    await renderWithProposal("ve_fail_accept", stream);
+
+    const acceptBtn = screen.getByRole("button", { name: /^accept$/i });
+    await act(async () => {
+      fireEvent.click(acceptBtn);
+    });
+
+    // Panel must still be present after the rejection.
+    await waitFor(() => {
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "voice-edit accept failed",
+        expect.any(Error),
+      );
+    });
+    expect(screen.getByRole("dialog", { name: /voice edit proposal/i })).toBeInTheDocument();
+
+    consoleSpy.mockRestore();
+  });
+
+  it("reject happy path removes the panel and calls rejectVoiceEdit with correct args", async () => {
+    mockedRejectVoiceEdit.mockResolvedValue({ ok: true });
+    const stream = makeStream();
+    await renderWithProposal("ve_reject_ok", stream);
+
+    const rejectBtn = screen.getByRole("button", { name: /^reject$/i });
+    await act(async () => {
+      fireEvent.click(rejectBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /voice edit proposal/i })).toBeNull();
+    });
+    expect(mockedRejectVoiceEdit).toHaveBeenCalledWith("nell", "ve_reject_ok");
   });
 });

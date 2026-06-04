@@ -15,6 +15,129 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def test_heartbeat_and_felt_time_passes_real_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_heartbeat_and_felt_time must pass real chat_n and reflex_n to _run_felt_time_tick."""
+    import brain.bridge.supervisor as sup_mod
+    from brain.engines.heartbeat import HeartbeatResult
+    from brain.ingest.buffer import ingest_turn
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text('{"provider": "fake", "searcher": "fake"}')
+
+    # Seed two recent turns in an active session buffer
+    import time as _time
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    session_id = "sess_testabcd"
+    for i in range(2):
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": session_id,
+                "speaker": "user",
+                "text": f"turn {i}",
+                "ts": (now - timedelta(seconds=i + 1)).isoformat(),
+            },
+        )
+
+    # Heartbeat result carries two reflex firings
+    fake_result = HeartbeatResult(
+        trigger="background",
+        elapsed_seconds=0.1,
+        memories_decayed=0,
+        edges_pruned=0,
+        dream_id=None,
+        dream_gated_reason=None,
+        research_deferred=False,
+        heartbeat_memory_id=None,
+        initialized=True,
+        reflex_fired=("arc_x", "arc_y"),
+    )
+    monkeypatch.setattr(
+        sup_mod, "_run_heartbeat_tick", lambda *a, **k: fake_result
+    )
+
+    # Capture what _run_felt_time_tick receives
+    felt_time_calls: list[dict] = []
+    real_felt_time_tick = sup_mod._run_felt_time_tick
+
+    def _spy_felt_time_tick(persona_dir, *, wall_clock_s_since_last, heartbeats_since_last,
+                            chat_turns_since_last, reflex_firings_since_last):
+        felt_time_calls.append({
+            "chat_turns": chat_turns_since_last,
+            "reflex_firings": reflex_firings_since_last,
+        })
+        return real_felt_time_tick(
+            persona_dir,
+            wall_clock_s_since_last=wall_clock_s_since_last,
+            heartbeats_since_last=heartbeats_since_last,
+            chat_turns_since_last=chat_turns_since_last,
+            reflex_firings_since_last=reflex_firings_since_last,
+        )
+
+    monkeypatch.setattr(sup_mod, "_run_felt_time_tick", _spy_felt_time_tick)
+
+    provider = MagicMock()
+    event_bus = MagicMock()
+    last_heartbeat_at = _time.monotonic() - 60.0  # 60s ago
+
+    sup_mod._heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at)
+
+    assert len(felt_time_calls) == 1, "Expected exactly one _run_felt_time_tick call"
+    call = felt_time_calls[0]
+    assert call["chat_turns"] == 2, (
+        f"Expected 2 chat turns (the seeded buffer), got {call['chat_turns']}"
+    )
+    assert call["reflex_firings"] == 2, (
+        f"Expected 2 reflex firings (from fake HeartbeatResult), got {call['reflex_firings']}"
+    )
+
+
+def test_heartbeat_tick_returns_result_with_reflex_fired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_run_heartbeat_tick must return the HeartbeatResult from engine.run_tick."""
+    from brain.bridge.supervisor import _run_heartbeat_tick
+    from brain.engines.heartbeat import HeartbeatEngine, HeartbeatResult
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text('{"provider": "fake", "searcher": "fake"}')
+
+    fake_result = HeartbeatResult(
+        trigger="background",
+        elapsed_seconds=0.1,
+        memories_decayed=0,
+        edges_pruned=0,
+        dream_id=None,
+        dream_gated_reason=None,
+        research_deferred=False,
+        heartbeat_memory_id=None,
+        initialized=True,
+        reflex_fired=("arc_a", "arc_b"),
+    )
+
+    monkeypatch.setattr(
+        HeartbeatEngine,
+        "run_tick",
+        lambda self, **kwargs: fake_result,
+    )
+
+    provider = MagicMock()
+    event_bus = MagicMock()
+
+    result = _run_heartbeat_tick(persona_dir, provider, event_bus)
+
+    assert result is not None, "_run_heartbeat_tick must return the HeartbeatResult"
+    assert len(result.reflex_fired) == 2, (
+        f"Expected 2 reflex_fired entries, got {len(result.reflex_fired)}"
+    )
+
+
 def test_supervisor_invokes_felt_time_tick_on_heartbeat_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

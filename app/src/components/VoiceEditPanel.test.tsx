@@ -68,4 +68,25 @@ describe("VoiceEditPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /reject/i }));
     expect(onReject).toHaveBeenCalledWith("ia_ve_001");
   });
+
+  it("renders old→new diff directly when voiceTemplate is empty", () => {
+    const noTemplateProposal = {
+      auditId: "ia_ve_002",
+      oldText: "old line",
+      newText: "new line",
+      rationale: "needed freshening",
+      evidence: [],
+      voiceTemplate: "",
+    };
+    render(
+      <VoiceEditPanel
+        proposal={noTemplateProposal}
+        persona="nell"
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText((_, el) => el?.textContent === "- old line")).toBeInTheDocument();
+    expect(screen.getByText((_, el) => el?.textContent === "+ new line")).toBeInTheDocument();
+  });
 });

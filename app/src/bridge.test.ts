@@ -21,11 +21,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import {
+  acceptVoiceEdit,
   closeSession,
   fetchPersonaFeed,
   fetchPersonaState,
   getBridgeCredentials,
   newSession,
+  rejectVoiceEdit,
   resetBridgeCredentialCache,
   setPersonaModel,
   uploadImage,
@@ -271,5 +273,87 @@ describe("setPersonaModel", () => {
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
+  });
+});
+
+describe("acceptVoiceEdit / rejectVoiceEdit", () => {
+  beforeEach(() => {
+    resetBridgeCredentialCache();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("acceptVoiceEdit POSTs to /initiate/voice-edit/accept with audit_id", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await acceptVoiceEdit("alice", "ia_001");
+
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/initiate/voice-edit/accept");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    const body = JSON.parse(String(init!.body));
+    expect(body).toEqual({ audit_id: "ia_001" });
+  });
+
+  it("acceptVoiceEdit includes with_edits when editedText is provided", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await acceptVoiceEdit("alice", "ia_002", "the edited new text");
+
+    const [, init] = spy.mock.calls[0]!;
+    const body = JSON.parse(String(init!.body));
+    expect(body).toEqual({ audit_id: "ia_002", with_edits: "the edited new text" });
+  });
+
+  it("acceptVoiceEdit omits with_edits when editedText is null", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await acceptVoiceEdit("alice", "ia_003", null);
+
+    const [, init] = spy.mock.calls[0]!;
+    const body = JSON.parse(String(init!.body));
+    expect(body).not.toHaveProperty("with_edits");
+    expect(body.audit_id).toBe("ia_003");
+  });
+
+  it("acceptVoiceEdit throws on non-2xx", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response("bad request", { status: 400 }),
+    ));
+    await expect(acceptVoiceEdit("alice", "ia_bad")).rejects.toThrow("/initiate/voice-edit/accept 400");
+  });
+
+  it("rejectVoiceEdit POSTs to /initiate/voice-edit/reject with audit_id", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await rejectVoiceEdit("alice", "ia_rej");
+
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/initiate/voice-edit/reject");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    const body = JSON.parse(String(init!.body));
+    expect(body).toEqual({ audit_id: "ia_rej" });
+  });
+
+  it("rejectVoiceEdit throws on non-2xx", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response("server error", { status: 500 }),
+    ));
+    await expect(rejectVoiceEdit("alice", "ia_bad")).rejects.toThrow("/initiate/voice-edit/reject 500");
   });
 });
