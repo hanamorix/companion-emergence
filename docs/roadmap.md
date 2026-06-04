@@ -474,7 +474,32 @@ a debug log. Remaining depth (grief-specific defers) tracked in
 
 ## Recently shipped (reverse chronological)
 
-**2026-06-02 — Attunement completion (v0.0.29 — STAGED on main, release pending)**
+**2026-06-04 — Stable base (v0.0.30)**
+
+- The "make it dependable" release. Folds the v0.0.29 attunement completion
+  (below) and a stability pass into one cut (public tag `v0.0.30`).
+- **Streaming reliability — the headline fix.** Long replies and tool
+  round-trips no longer time out mid-stream. The chat socket now sends a
+  keepalive heartbeat during silent stretches (first-token latency on a large
+  persona prompt, or a mid-turn tool call), so the client's idle timer never
+  fires on a reply that's still coming. Root-caused live: the client gave up
+  after 60s with no frame, but the server only sent frames on model text.
+- **Other fixes:** a rare memory-loss path on a database hiccup is closed
+  (held + retried, not dropped); "session hours" is measured as the current
+  continuous sitting, not the whole span since a conversation began (a long
+  gap then one message no longer collapses her energy); the soul-review pass
+  fires reliably across restarts and drains a backlog quickly; the one-time
+  emotion backfill now yields to active chat; persona name shows correctly
+  everywhere; budget/recovery/gallery edge cases hardened.
+- **Internal:** dead code cut, an organ "definition of done" + living maturity
+  manifest so half-finished subsystems can't hide, test-suite hardening, and
+  release-safety CI (version-pin gate + privacy-scrub preflight). Full suite
+  2901 passed.
+- **Known follow-up:** a global Claude-CLI throttle with interactive priority
+  (the shared-subscription root behind occasional rate-limit stalls) — see
+  *Active backlog* above.
+
+**2026-06-02 — Attunement completion (v0.0.29 — shipped folded into v0.0.30)**
 
 - Completes user-attunement from 2 categories (tone + cadence) to the full
   **five**: adds `topic_affinity`, `response_shape`, and the cross-turn
@@ -484,8 +509,8 @@ a debug log. Remaining depth (grief-specific defers) tracked in
   (reply-side `addressed_pattern_ids` detection → `last_addressed_at` → 6h
   ambient cooldown) and a supplementary backfill that bootstraps the three new
   categories from history on schema upgrade (new-categories-only, preserves
-  the prior tone/cadence record). schema_version → 0.0.29; six-file pin
-  bumped. Merged to main (`bab59758`); not yet tagged/synced.
+  the prior tone/cadence record). schema_version → 0.0.29. Merged to main
+  (`bab59758`); shipped under the `v0.0.30` tag (no standalone v0.0.29 tag).
 
 **2026-06-02 — Three-tier inner monologue + targeted fixes (v0.0.28)**
 
