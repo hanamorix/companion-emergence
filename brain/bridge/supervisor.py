@@ -705,7 +705,27 @@ def _run_soul_review_tick(
     if eligible_before == 0:
         # Nothing drainable — skip the pass and the open-store cost. No
         # failures, no backlog → caller schedules the normal interval.
+        # NOTE: draft cursor is intentionally NOT advanced here — drafts
+        # must wait for the next candidate-bearing tick so quiet ticks
+        # don't silently skip un-consumed fragments.
         return 0, 0
+
+    # ── Candidate-gated draft reading ────────────────────────────────────────
+    # Runs only when there are actual candidates to review (past the early-
+    # return above). Reads fragments since the last cursor position and passes
+    # them to the review prompt as interior context.
+    from brain.initiate.draft import (
+        has_new_drafts_since,
+        load_draft_review_cursor,
+        read_drafts_since,
+        save_draft_review_cursor,
+    )
+
+    cursor = load_draft_review_cursor(persona_dir)
+    draft_fragments: list[str] = []
+    if not cursor or has_new_drafts_since(persona_dir, cursor):
+        frags = read_drafts_since(persona_dir, cursor or "0001-01-01T00:00:00")
+        draft_fragments = [f"[{f.source}] {f.body}" for f in frags]
 
     # Backlog-aware drain: clear up to the cap per tick when candidates have
     # piled up, instead of the default 5.
@@ -730,7 +750,12 @@ def _run_soul_review_tick(
             soul_store=soul_store,
             provider=provider,
             max_decisions=max_decisions,
+            draft_fragments=draft_fragments if draft_fragments else None,
         )
+
+    # Advance the draft cursor AFTER the review pass runs — never on early-
+    # return, so a quiet tick doesn't silently skip un-consumed fragments.
+    save_draft_review_cursor(persona_dir, datetime.now(UTC).isoformat())
 
     event_bus.publish(
         {
