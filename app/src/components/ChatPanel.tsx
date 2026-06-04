@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { closeSession, fetchActiveSession, fetchChatHistory, getBridgeCredentials, newSession, uploadImage } from "../bridge";
+import { acceptVoiceEdit, closeSession, fetchActiveSession, fetchChatHistory, getBridgeCredentials, newSession, rejectVoiceEdit, uploadImage } from "../bridge";
 import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
 import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
+import { VoiceEditPanel, type VoiceEditProposal } from "./VoiceEditPanel";
 import { streamChat } from "../streamChat";
 import { errString } from "../lib/errString";
 
@@ -150,6 +151,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
+  const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
   const [activeReplyTarget, setActiveReplyTarget] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
@@ -289,6 +291,20 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       const auditId = event.audit_id;
       const body = event.body;
       if (typeof auditId !== "string" || typeof body !== "string") return;
+
+      // Branch: voice_edit_proposal → inline VoiceEditPanel; all others → InitiateBanner.
+      if (event.kind === "voice_edit_proposal") {
+        const diff = typeof event.diff === "string" ? event.diff : "";
+        const oldText = (diff.match(/^- (.*)$/m)?.[1] ?? "").trim();
+        const newText = (diff.match(/^\+ (.*)$/m)?.[1] ?? "").trim();
+        setActiveVoiceEdits((prev) =>
+          prev.some((v) => v.auditId === auditId)
+            ? prev
+            : [...prev, { auditId, oldText, newText, rationale: body, evidence: [], voiceTemplate: "" }],
+        );
+        return;
+      }
+
       const urgency = event.urgency === "notify" ? "notify" : "quiet";
       const state =
         typeof event.state === "string"
@@ -763,6 +779,23 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           ))}
         </div>
       )}
+      {activeVoiceEdits.map((p) => (
+        <VoiceEditPanel
+          key={p.auditId}
+          proposal={p}
+          persona={persona}
+          onAccept={(id, withEdits) => {
+            void acceptVoiceEdit(persona, id, withEdits)
+              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+              .catch((e) => console.error("voice-edit accept failed", e));
+          }}
+          onReject={(id) => {
+            void rejectVoiceEdit(persona, id)
+              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+              .catch((e) => console.error("voice-edit reject failed", e));
+          }}
+        />
+      ))}
       {activeReplyTarget && (
         <div
           data-testid="reply-target-indicator"
