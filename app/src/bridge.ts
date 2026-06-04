@@ -594,3 +594,47 @@ export async function fetchAttunement(persona: string): Promise<AttunementPayloa
   if (!r.ok) throw new Error(`/persona/attunement ${r.status}`);
   return (await r.json()) as AttunementPayload;
 }
+
+// ── Voice-edit proposal actions (v0.0.31 Phase C) ─────────────────────────
+
+/**
+ * Accept a voice-edit proposal. Pass ``editedText`` to accept with
+ * user-supplied modifications; omit (or pass null) to accept as-is.
+ * Throws on non-2xx.
+ */
+export async function acceptVoiceEdit(
+  persona: string,
+  auditId: string,
+  editedText?: string | null,
+): Promise<unknown> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/initiate/voice-edit/accept`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({
+        audit_id: auditId,
+        ...(editedText ? { with_edits: editedText } : {}),
+      }),
+    }),
+  );
+  if (!r.ok) throw new Error(`/initiate/voice-edit/accept ${r.status}`);
+  return await r.json();
+}
+
+/**
+ * Reject a voice-edit proposal. Throws on non-2xx.
+ */
+export async function rejectVoiceEdit(
+  persona: string,
+  auditId: string,
+): Promise<unknown> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/initiate/voice-edit/reject`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ audit_id: auditId }),
+    }),
+  );
+  if (!r.ok) throw new Error(`/initiate/voice-edit/reject ${r.status}`);
+  return await r.json();
+}
