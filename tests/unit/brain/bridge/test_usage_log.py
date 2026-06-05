@@ -57,6 +57,15 @@ def test_log_usage_none_persona_dir_is_noop(tmp_path):
     log_usage(None, call_type="generate", model="haiku", frame={"usage": {"input_tokens": 1}})  # no crash, no file
 
 
+def test_log_usage_creates_persona_dir_if_missing(tmp_path):
+    missing = tmp_path / "new_persona" / "subdir"
+    # must not exist yet
+    assert not missing.exists()
+    log_usage(missing, call_type="chat", model="haiku",
+              frame={"usage": {"input_tokens": 1}, "total_cost_usd": 0.001})
+    assert (missing / "chat_usage.jsonl").exists()
+
+
 # ---------------------------------------------------------------------------
 # ClaudeCliProvider.generate() integration
 # ---------------------------------------------------------------------------
