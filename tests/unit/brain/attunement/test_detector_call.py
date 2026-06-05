@@ -148,7 +148,7 @@ def test_run_detector_passes_companion_name_to_user_message(buffer):
     """run_detector with companion_name='Mira' produces a prompt containing 'MIRA'."""
     captured: list[str] = []
 
-    def fake_haiku(system_prompt: str, user_message: str) -> str:
+    def fake_haiku(system_prompt: str, user_message: str, **_kwargs: object) -> str:
         captured.append(user_message)
         return ""  # decline output — we only care about the message shape
 
