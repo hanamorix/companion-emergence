@@ -17,3 +17,13 @@ from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED
 def test_builtin_disallow_list_covers_the_costly_tools():
     for t in ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task"):
         assert t in _BUILTIN_TOOLS_DISALLOWED, f"{t!r} missing from _BUILTIN_TOOLS_DISALLOWED"
+
+
+def test_apply_lean_flags_adds_disallowed_and_strict():
+    from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED, _apply_lean_flags
+    cmd: list[str] = []
+    _apply_lean_flags(cmd)
+    assert "--disallowedTools" in cmd
+    assert "--strict-mcp-config" in cmd
+    for t in _BUILTIN_TOOLS_DISALLOWED:
+        assert t in cmd, f"{t!r} not forwarded to cmd by _apply_lean_flags"
