@@ -1162,6 +1162,7 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("heartbeats.log.jsonl", 3),
     ("dreams.log.jsonl", 5),
     ("emotion_growth.log.jsonl", 5),
+    ("chat_usage.jsonl", 5),
 )
 # Yearly-archive logs are kept forever — reader walks active + every archive
 # so every decision / initiation event stays reachable.
