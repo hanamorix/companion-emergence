@@ -48,6 +48,7 @@ from brain.bridge.chat import (
     TextDelta,
     ToolCall,
 )
+from brain.bridge.usage_log import log_usage
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +370,13 @@ class ClaudeCliProvider(LLMProvider):
         self._model = model
         self._timeout = timeout_seconds
 
-    def generate(self, prompt: str, *, system: str | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        persona_dir: Path | None = None,
+    ) -> str:
         # Prompt piped via stdin; system prompt via --system-prompt-file.
         # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
         # limit — WinError 206). See _system_prompt_tempfile for context.
@@ -410,6 +417,7 @@ class ClaudeCliProvider(LLMProvider):
 
         try:
             payload = json.loads(result.stdout)
+            log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
             return str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(
@@ -805,6 +813,7 @@ class ClaudeCliProvider(LLMProvider):
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
                             if k in obj
                         }
+                        log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
                         yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
 
