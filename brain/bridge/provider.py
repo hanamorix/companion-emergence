@@ -91,6 +91,36 @@ _STREAM_FIRST_EVENT_SECONDS: float = 120.0
 # the main generator distinguish "reader hit EOF" from a real line.
 _STREAM_EOF = object()
 
+# ---------------------------------------------------------------------------
+# Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
+# ---------------------------------------------------------------------------
+
+# Claude Code's built-in tools are loaded into every -p invocation even though
+# Nell can't call them (she's restricted to mcp__brain-tools__*). Disallowing
+# them removes the dead-weight definition tokens from cache-creation cost.
+_BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "NotebookEdit",
+    "BashOutput",
+    "KillShell",
+)
+
+
+def _apply_lean_flags(cmd: list[str]) -> None:
+    """Strip the CLI's built-in tool defs (dead weight — Nell only uses MCP tools)
+    and pin to the configured MCP server. Saves ~14K cache-creation tokens/call."""
+    cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
+    cmd.append("--strict-mcp-config")
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -617,6 +647,7 @@ class ClaudeCliProvider(LLMProvider):
                 return
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
+            _apply_lean_flags(cmd)
 
         try:
             yield from self._run_chat_stream(
@@ -923,6 +954,7 @@ class ClaudeCliProvider(LLMProvider):
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
+            _apply_lean_flags(cmd)
             try:
                 audit_offset_before = audit_log_path.stat().st_size
             except FileNotFoundError:
@@ -1072,6 +1104,7 @@ class ClaudeCliProvider(LLMProvider):
             ]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
+            _apply_lean_flags(cmd)
 
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
