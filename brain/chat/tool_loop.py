@@ -32,6 +32,7 @@ from brain.attunement.store import (
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
+from brain.chat.reflection_gate import should_reflect
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -254,6 +255,7 @@ def run_tool_loop(
     companion_name: str = "Nell",
     recruited_allowed: list[str] | None = None,
     max_iterations: int = MAX_TOOL_ITERATIONS,
+    signal=None,
 ) -> tuple[ChatResponse, list[dict]]:
     """Loop: provider.chat() → if tool_calls, dispatch each → retry.
 
@@ -311,8 +313,12 @@ def run_tool_loop(
             if recruited is not None:
                 last_response = recruited
             # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
+            turn_index = sum(1 for m in messages if m.role == "user")
             monologue_text = _find_monologue_text(invocations)
-            if monologue_text:
+            if monologue_text and (
+                signal is None
+                or should_reflect(signal, persona_dir, kind="monologue", turn_index=turn_index)
+            ):
                 _spawn_pass2(
                     provider=provider,
                     monologue_text=monologue_text,
@@ -322,15 +328,18 @@ def run_tool_loop(
                     )[-2:],
                     persona_dir=persona_dir,
                 )
-            _spawn_pass2_attunement(
-                persona_dir,
-                turn_id=f"turn-{len(messages)}",
-                user_message=next(
-                    (m.content_text() for m in reversed(messages) if m.role == "user"), ""
-                ),
-                reply_text=last_response.content or "",
-                buffer_slice=_buffer_slice_from_messages(messages),
-            )
+            if signal is None or should_reflect(
+                signal, persona_dir, kind="attunement", turn_index=turn_index
+            ):
+                _spawn_pass2_attunement(
+                    persona_dir,
+                    turn_id=f"turn-{len(messages)}",
+                    user_message=next(
+                        (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+                    ),
+                    reply_text=last_response.content or "",
+                    buffer_slice=_buffer_slice_from_messages(messages),
+                )
             return last_response, invocations
 
         # Append the assistant turn that contained the tool_calls so the
@@ -380,8 +389,12 @@ def run_tool_loop(
     # is obligated to produce a content response (per OG pattern).
     logger.warning("tool loop hit max_iterations=%d", max_iterations)
     last_response = provider.chat(messages, tools=None)
+    turn_index = sum(1 for m in messages if m.role == "user")
     monologue_text = _find_monologue_text(invocations)
-    if monologue_text:
+    if monologue_text and (
+        signal is None
+        or should_reflect(signal, persona_dir, kind="monologue", turn_index=turn_index)
+    ):
         _spawn_pass2(
             provider=provider,
             monologue_text=monologue_text,
@@ -391,15 +404,18 @@ def run_tool_loop(
             )[-2:],
             persona_dir=persona_dir,
         )
-    _spawn_pass2_attunement(
-        persona_dir,
-        turn_id=f"turn-{len(messages)}-cap",
-        user_message=next(
-            (m.content_text() for m in reversed(messages) if m.role == "user"), ""
-        ),
-        reply_text=last_response.content or "",
-        buffer_slice=_buffer_slice_from_messages(messages),
-    )
+    if signal is None or should_reflect(
+        signal, persona_dir, kind="attunement", turn_index=turn_index
+    ):
+        _spawn_pass2_attunement(
+            persona_dir,
+            turn_id=f"turn-{len(messages)}-cap",
+            user_message=next(
+                (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+            ),
+            reply_text=last_response.content or "",
+            buffer_slice=_buffer_slice_from_messages(messages),
+        )
     return last_response, invocations
 
 
