@@ -18,8 +18,10 @@ from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.engines.dream import DreamEngine, DreamResult
 from brain.engines.reflex import ReflexEngine, ReflexResult
+from brain.engines.research import ResearchEngine, ResearchResult
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.search.base import NoopWebSearcher
 
 
 class _RecordingProvider(LLMProvider):
@@ -177,5 +179,64 @@ def test_reflex_defers_when_chat_active(tmp_path):
         assert provider.call_count == 0, "provider.generate must not be called while chat is active"
         assert isinstance(result, ReflexResult)
         assert result.arcs_fired == ()
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# ResearchEngine
+# ---------------------------------------------------------------------------
+
+_DEFAULT_INTERESTS_PATH = _find_repo_root() / "brain" / "engines" / "default_interests.json"
+
+
+def _write_eligible_interest(path: Path) -> None:
+    interest = {
+        "id": "i1",
+        "topic": "marine bioluminescence",
+        "pull_score": 9.0,
+        "scope": "either",
+        "related_keywords": ["bioluminescence"],
+        "notes": "",
+        "first_seen": "2025-01-01T00:00:00+00:00",
+        "last_fed": "2025-01-01T00:00:00+00:00",
+        "last_researched_at": None,
+        "feed_count": 5,
+        "source_types": ["conversation"],
+    }
+    path.write_text(json.dumps({"version": 1, "interests": [interest]}, indent=2), encoding="utf-8")
+
+
+def test_research_defers_when_chat_active(tmp_path):
+    """ResearchEngine.run_tick must NOT call provider.generate while chat is active."""
+    provider = _RecordingProvider()
+
+    store = MemoryStore(":memory:")
+    try:
+        interests_path = tmp_path / "interests.json"
+        _write_eligible_interest(interests_path)
+
+        engine = ResearchEngine(
+            store=store,
+            provider=provider,
+            searcher=NoopWebSearcher(),
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=_DEFAULT_INTERESTS_PATH,
+        )
+
+        cli_throttle.mark_interactive_active()
+
+        result = engine.run_tick(
+            trigger="manual",
+            dry_run=False,
+            days_since_human_override=2.0,  # satisfy gate: days_since >= 1.5
+        )
+
+        assert provider.call_count == 0, "provider.generate must not be called while chat is active"
+        assert isinstance(result, ResearchResult)
+        assert result.fired is None
     finally:
         store.close()
