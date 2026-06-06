@@ -23,3 +23,4 @@ def test_buffer_slice_skips_empty_and_nonuser():
     ]
     sl = _buffer_slice_from_messages(msgs)
     assert len(sl) == 1 and sl[0].content == "real"
+    assert sl[0].id == "msg-0"
