@@ -7,6 +7,7 @@ Fails open: on any internal error, background is allowed (today's behaviour)
 and the error is logged once. Closes deferred item 26."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -54,9 +55,10 @@ def acquire_background(*, now: float | None = None) -> bool:
             _inflight_background += 1
             return True
     except Exception:  # noqa: BLE001 — fail open
-        if not _warned:
-            log.exception("cli_throttle.acquire_background failed; allowing (fail-open)")
-            _warned = True
+        with _lock:
+            if not _warned:
+                log.exception("cli_throttle.acquire_background failed; allowing (fail-open)")
+                _warned = True
         return True
 
 
@@ -64,3 +66,18 @@ def release_background() -> None:
     global _inflight_background
     with _lock:
         _inflight_background = max(0, _inflight_background - 1)
+
+
+@contextlib.contextmanager
+def background_slot(*, now: float | None = None):
+    """Context manager wrapping acquire/release. Yields True if the slot was
+    acquired (caller should do its CLI work), False if it should defer.
+    Always releases on exit when acquired."""
+    acquired = acquire_background(now=now)
+    if not acquired:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        release_background()
