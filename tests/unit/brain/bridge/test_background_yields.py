@@ -22,6 +22,8 @@ from brain.engines.research import ResearchEngine, ResearchResult
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
+from brain.soul.review import review_pending_candidates
+from brain.soul.store import SoulStore
 
 
 class _RecordingProvider(LLMProvider):
@@ -240,3 +242,57 @@ def test_research_defers_when_chat_active(tmp_path):
         assert result.fired is None
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# soul/review.py  (_run_review_body via review_pending_candidates)
+# ---------------------------------------------------------------------------
+
+
+def _make_soul_candidate(text: str = "a meaningful moment") -> dict:
+    import uuid
+    from datetime import UTC, datetime
+
+    return {
+        "id": str(uuid.uuid4()),
+        "text": text,
+        "label": "test",
+        "importance": 8.0,
+        "queued_at": datetime.now(UTC).isoformat(),
+        "source": "test",
+        "status": "auto_pending",
+    }
+
+
+def test_soul_review_defers_when_chat_active(tmp_path):
+    """soul review loop must NOT call provider.generate while chat is active."""
+    import json
+
+    provider = _RecordingProvider()
+    # Write one pending candidate
+    candidates_path = tmp_path / "soul_candidates.jsonl"
+    candidates_path.write_text(
+        json.dumps(_make_soul_candidate()) + "\n", encoding="utf-8"
+    )
+
+    store = MemoryStore(":memory:")
+    soul_store = SoulStore(":memory:")
+    try:
+        cli_throttle.mark_interactive_active()
+
+        report = review_pending_candidates(
+            tmp_path,
+            store=store,
+            soul_store=soul_store,
+            provider=provider,
+            max_decisions=5,
+        )
+
+        assert provider.call_count == 0, "provider.generate must not be called while chat is active"
+        # examined was incremented before the defer-break, so it may be 0 or 1
+        # depending on exact placement; the key invariant is no model call.
+        assert report.accepted == 0
+        assert report.rejected == 0
+    finally:
+        store.close()
+        soul_store.close()
