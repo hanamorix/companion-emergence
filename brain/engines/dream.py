@@ -111,23 +111,37 @@ class DreamEngine:
                 strengthened_edges=0,
             )
 
-        raw_text = self.provider.generate(user_prompt, system=system_prompt)
-        dream_text = raw_text if raw_text.startswith("DREAM:") else f"DREAM: {raw_text}"
+        from brain.bridge import cli_throttle
 
-        dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
-        edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
-        self._log(seed, neighbours, dream_memory)
-        self._emit_initiate_candidate(seed, neighbours, dream_memory)
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return DreamResult(
+                    seed=seed,
+                    neighbours=neighbours,
+                    system_prompt=system_prompt,
+                    prompt=user_prompt,
+                    dream_text=None,
+                    memory=None,
+                    strengthened_edges=0,
+                )
 
-        return DreamResult(
-            seed=seed,
-            neighbours=neighbours,
-            system_prompt=system_prompt,
-            prompt=user_prompt,
-            dream_text=dream_text,
-            memory=dream_memory,
-            strengthened_edges=edges,
-        )
+            raw_text = self.provider.generate(user_prompt, system=system_prompt)
+            dream_text = raw_text if raw_text.startswith("DREAM:") else f"DREAM: {raw_text}"
+
+            dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
+            edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
+            self._log(seed, neighbours, dream_memory)
+            self._emit_initiate_candidate(seed, neighbours, dream_memory)
+
+            return DreamResult(
+                seed=seed,
+                neighbours=neighbours,
+                system_prompt=system_prompt,
+                prompt=user_prompt,
+                dream_text=dream_text,
+                memory=dream_memory,
+                strengthened_edges=edges,
+            )
 
     def _select_seed(self, *, seed_id: str | None, lookback_hours: int) -> Memory:
         if seed_id is not None:
