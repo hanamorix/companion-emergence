@@ -786,7 +786,7 @@ def build_app(
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.
-        _vocab_store = MemoryStore(persona_dir / "memories.db")
+        _vocab_store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         try:
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
