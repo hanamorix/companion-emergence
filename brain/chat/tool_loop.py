@@ -166,19 +166,69 @@ def _find_monologue_text(invocations: list[dict]) -> str | None:
     )
 
 
-def build_tools_list(companion_name: str = "Nell") -> list[dict]:
+def build_tools_list(
+    companion_name: str = "Nell",
+    *,
+    allowed: list[str] | None = None,
+) -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
     Wraps schemas in the {"type": "function", "function": <schema>} shape
     that Ollama accepts natively and the MCP server registers as tool
     descriptions for the Claude path.
+
+    Parameters
+    ----------
+    companion_name:
+        The companion's name — used to parameterise tool descriptions.
+    allowed:
+        Optional allowlist of tool names.  When provided, only tools whose
+        names appear in *allowed* are included.  ``None`` (default) returns
+        the full suite; existing callers are unaffected.
     """
     schemas = build_schemas(companion_name)
-    return [
-        {"type": "function", "function": schemas[name]}
-        for name in NELL_TOOL_NAMES
-        if name in schemas
-    ]
+    names: tuple[str, ...] | list[str]
+    if allowed is None:
+        names = NELL_TOOL_NAMES
+    else:
+        allowed_set = set(allowed)
+        names = [n for n in NELL_TOOL_NAMES if n in allowed_set]
+    return [{"type": "function", "function": schemas[name]} for name in names if name in schemas]
+
+
+def _maybe_recruit_and_rerun(
+    last_response: ChatResponse,
+    invocations: list[dict],
+    *,
+    messages: list[ChatMessage],
+    provider: LLMProvider,
+    persona_dir: Path,
+    companion_name: str,
+    recruited_allowed: list[str] | None,
+) -> ChatResponse | None:
+    """If the model reached for a withheld faculty, re-invoke ONCE with the full
+    tool suite so it can complete the reach this turn.
+
+    Returns the new ChatResponse, or None to keep the original.
+    Fails safe: errors → None (keep original reply, never crash the turn).
+    The expansion is bounded to one because the re-run result is returned
+    directly — it is NOT fed back into the recruit-check loop.
+    """
+    reached = any(inv.get("name") == "reach_for_capability" for inv in invocations)
+    if not reached or recruited_allowed is None:
+        return None
+    # Only expand if we were actually running a SLIM set (not already the full suite).
+    if set(recruited_allowed) >= set(NELL_TOOL_NAMES):
+        return None
+    try:
+        tools = build_tools_list(companion_name, allowed=list(NELL_TOOL_NAMES))
+        rerun = provider.chat(messages, tools=tools, options={"persona_dir": str(persona_dir)})
+        if rerun.dispatched_invocations:
+            invocations.extend(rerun.dispatched_invocations)
+        return rerun
+    except Exception:  # noqa: BLE001 — fail safe: keep original reply, never crash the turn
+        logger.exception("recruit-on-reach re-invoke failed; keeping original reply")
+        return None
 
 
 def run_tool_loop(
@@ -189,6 +239,8 @@ def run_tool_loop(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     persona_dir: Path,
+    companion_name: str = "Nell",
+    recruited_allowed: list[str] | None = None,
     max_iterations: int = MAX_TOOL_ITERATIONS,
 ) -> tuple[ChatResponse, list[dict]]:
     """Loop: provider.chat() → if tool_calls, dispatch each → retry.
@@ -231,6 +283,22 @@ def run_tool_loop(
         if last_response.dispatched_invocations:
             invocations.extend(last_response.dispatched_invocations)
         if not last_response.tool_calls:
+            # ONE-SHOT recruit-on-reach: if the model called reach_for_capability
+            # while running on a slim tool set, re-invoke once with the full suite
+            # so it can complete the action this turn.  Bounded to one expansion;
+            # fails safe (error → keep original reply, never crash the turn).
+            recruited = _maybe_recruit_and_rerun(
+                last_response,
+                invocations,
+                messages=messages,
+                provider=provider,
+                persona_dir=persona_dir,
+                companion_name=companion_name,
+                recruited_allowed=recruited_allowed,
+            )
+            if recruited is not None:
+                last_response = recruited
+            # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
             monologue_text = _find_monologue_text(invocations)
             if monologue_text:
                 _spawn_pass2(

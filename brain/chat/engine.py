@@ -27,8 +27,10 @@ from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
 from brain.chat.budget import apply_budget
 from brain.chat.prompt import build_system_message
+from brain.chat.salience import assess_salience
 from brain.chat.session import SessionState, create_session
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
+from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
 from brain.images import media_type_for_sha
@@ -190,8 +192,13 @@ def respond(
         provider=provider,
     )
 
-    # 7. Tool loop
-    tools = build_tools_list(companion_name=persona_dir.name)
+    # 7. Tool loop — salience-gated recruitment
+    prior_user_text = next(
+        (m.content_text() for m in reversed(history_msgs) if m.role == "user"), None
+    )
+    signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
+    allowed = select_tools(signal)
+    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
     response, invocations = run_tool_loop(
         messages,
         provider=provider,
@@ -199,6 +206,8 @@ def respond(
         store=store,
         hebbian=hebbian,
         persona_dir=persona_dir,
+        companion_name=persona_dir.name,
+        recruited_allowed=allowed,
     )
     content = response.content or ""
 
