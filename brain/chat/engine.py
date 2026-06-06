@@ -144,6 +144,11 @@ def respond(
     and wall-clock duration.
     """
     t0 = time.monotonic()
+    from brain.bridge import (
+        cli_throttle,  # local to avoid circular-import risk; testable via module patch
+    )
+
+    cli_throttle.mark_interactive_active()
 
     # 1. Session
     if session is None:
