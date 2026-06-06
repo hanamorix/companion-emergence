@@ -114,6 +114,114 @@ def test_recruit_on_reach_expands_and_reruns(tmp_path: Path) -> None:
     assert "reach_for_capability" in inv_names
 
 
+def test_recruit_injects_synthetic_context_turn(tmp_path: Path) -> None:
+    """The re-invoke call must carry a synthetic context turn telling the model
+    the recruited faculty is available and not to reach again."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim_allowed = ["record_monologue", "reach_for_capability"]
+
+    response_1 = ChatResponse(
+        content="I need more tools",
+        tool_calls=(),
+        dispatched_invocations=(
+            {"name": "reach_for_capability", "arguments": {"capability": "memory"}},
+        ),
+        raw=None,
+    )
+    response_2 = ChatResponse(
+        content="Now I can answer properly",
+        tool_calls=(),
+        dispatched_invocations=(),
+        raw=None,
+    )
+
+    provider = ScriptedProvider([response_1, response_2])
+    messages = [
+        ChatMessage(role="system", content="You are Nell."),
+        ChatMessage(role="user", content="Help me remember something."),
+    ]
+    slim_tools = build_tools_list("Nell", allowed=slim_allowed)
+
+    run_tool_loop(
+        messages,
+        provider=provider,
+        tools=slim_tools,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+        companion_name="Nell",
+        recruited_allowed=slim_allowed,
+    )
+
+    assert len(provider.chat_calls) == 2
+    # 2nd call carried one more message than call #1 (the synthetic context turn).
+    call1_msg_count = len(provider.chat_calls[0]["messages"])
+    call2_msg_count = len(provider.chat_calls[1]["messages"])
+    assert call2_msg_count == call1_msg_count + 1, (
+        f"2nd call should have one extra context turn: "
+        f"call1={call1_msg_count}, call2={call2_msg_count}"
+    )
+    last_msg = provider.chat_calls[1]["messages"][-1]
+    assert last_msg.role == "user"
+    assert "reach_for_capability" in last_msg.content_text()
+
+
+def test_one_expansion_bound_under_re_reach(tmp_path: Path) -> None:
+    """Even when the re-invoke call ALSO dispatches reach_for_capability,
+    run_tool_loop must make EXACTLY 2 chat calls (bound holds — no third call /
+    no loop) and return the 2nd call's response."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim_allowed = ["record_monologue", "reach_for_capability"]
+
+    response_1 = ChatResponse(
+        content="Reaching first time",
+        tool_calls=(),
+        dispatched_invocations=(
+            {"name": "reach_for_capability", "arguments": {"capability": "memory"}},
+        ),
+        raw=None,
+    )
+    # The re-invoke ALSO dispatches reach_for_capability — the bound must hold.
+    response_2 = ChatResponse(
+        content="Re-reaching (should still be the final reply)",
+        tool_calls=(),
+        dispatched_invocations=(
+            {"name": "reach_for_capability", "arguments": {"capability": "memory"}},
+        ),
+        raw=None,
+    )
+
+    provider = ScriptedProvider([response_1, response_2])
+    messages = [
+        ChatMessage(role="system", content="You are Nell."),
+        ChatMessage(role="user", content="Help me remember something."),
+    ]
+    slim_tools = build_tools_list("Nell", allowed=slim_allowed)
+
+    final_resp, invocations = run_tool_loop(
+        messages,
+        provider=provider,
+        tools=slim_tools,
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+        companion_name="Nell",
+        recruited_allowed=slim_allowed,
+    )
+
+    # The expansion bound: exactly 2 calls, no third expansion attempted.
+    assert len(provider.chat_calls) == 2, (
+        f"Expected exactly 2 chat calls (bound holds), got {len(provider.chat_calls)}"
+    )
+    # Final response is call #2's.
+    assert final_resp.content == "Re-reaching (should still be the final reply)"
+    # Both reach invocations appear in the returned list (from call #1 + call #2).
+    reach_count = sum(1 for inv in invocations if inv.get("name") == "reach_for_capability")
+    assert reach_count == 2, f"Expected 2 reach invocations, got {reach_count}"
+
+
 def test_no_reach_no_expansion(tmp_path: Path) -> None:
     """When call #1 has NO reach_for_capability, only 1 provider.chat call."""
     store = MemoryStore(":memory:")

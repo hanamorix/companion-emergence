@@ -213,6 +213,9 @@ def _maybe_recruit_and_rerun(
     Fails safe: errors → None (keep original reply, never crash the turn).
     The expansion is bounded to one because the re-run result is returned
     directly — it is NOT fed back into the recruit-check loop.
+
+    Side effect: extends `invocations` in place with any tool calls the
+    re-invoke dispatched.
     """
     reached = any(inv.get("name") == "reach_for_capability" for inv in invocations)
     if not reached or recruited_allowed is None:
@@ -222,7 +225,16 @@ def _maybe_recruit_and_rerun(
         return None
     try:
         tools = build_tools_list(companion_name, allowed=list(NELL_TOOL_NAMES))
-        rerun = provider.chat(messages, tools=tools, options={"persona_dir": str(persona_dir)})
+        # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
+        rerun_messages = list(messages) + [
+            ChatMessage(
+                role="user",
+                content=("[The faculty you reached for is now available to you this turn. "
+                         "Call the specific tool you need now (e.g. search_memories, read_file) — "
+                         "do not call reach_for_capability again.]"),
+            )
+        ]
+        rerun = provider.chat(rerun_messages, tools=tools, options={"persona_dir": str(persona_dir)})
         if rerun.dispatched_invocations:
             invocations.extend(rerun.dispatched_invocations)
         return rerun
