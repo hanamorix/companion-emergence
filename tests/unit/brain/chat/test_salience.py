@@ -23,6 +23,12 @@ def test_topic_shift_detected():
     assert s.topic_shift
 
 
+def test_emotional_density_scores():
+    s = assess_salience("I feel so sad and lonely and afraid")
+    assert s.emotional_density > 0.0
+    assert s.score > 0.25  # density contributes
+
+
 def test_fails_open_on_bad_input(monkeypatch):
     # force the internal scorer to raise; assert maximal signal returned
     import brain.chat.salience as mod
