@@ -35,6 +35,14 @@ def test_read_file_writes_audit_line(tmp_path):
     assert line["tool"] == "read_file" and line["ok"] is True
 
 
+def test_read_file_binary_returns_note_not_bytes(tmp_path):
+    f = tmp_path / "blob.bin"
+    f.write_bytes(b"\xff\xfe\x00\x01\x02\x80\x81")  # invalid UTF-8
+    out = read_file(path=str(f), persona_dir=tmp_path)
+    assert "content" not in out
+    assert "note" in out and "binary" in out["note"].lower()
+
+
 def test_read_file_through_dispatch(tmp_path):
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
