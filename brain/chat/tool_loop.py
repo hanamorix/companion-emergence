@@ -315,10 +315,7 @@ def run_tool_loop(
             # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
             turn_index = sum(1 for m in messages if m.role == "user")
             monologue_text = _find_monologue_text(invocations)
-            if monologue_text and (
-                signal is None
-                or should_reflect(signal, persona_dir, kind="monologue", turn_index=turn_index)
-            ):
+            if monologue_text:
                 _spawn_pass2(
                     provider=provider,
                     monologue_text=monologue_text,
@@ -391,10 +388,7 @@ def run_tool_loop(
     last_response = provider.chat(messages, tools=None)
     turn_index = sum(1 for m in messages if m.role == "user")
     monologue_text = _find_monologue_text(invocations)
-    if monologue_text and (
-        signal is None
-        or should_reflect(signal, persona_dir, kind="monologue", turn_index=turn_index)
-    ):
+    if monologue_text:
         _spawn_pass2(
             provider=provider,
             monologue_text=monologue_text,
