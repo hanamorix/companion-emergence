@@ -1,12 +1,14 @@
 """Representative test: background engines yield to active chat via cli_throttle.
 
-Drives DreamEngine — the simplest engine — to assert:
+Drives DreamEngine and ReflexEngine to assert:
   - when mark_interactive_active() is recent, provider.generate is NOT called
-    and a no-result DreamResult is returned.
+    and a no-result value is returned.
+  - after cli_throttle.reset(), generate IS called and a real result is returned.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from brain.bridge import cli_throttle
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.engines.dream import DreamEngine, DreamResult
+from brain.engines.reflex import ReflexEngine, ReflexResult
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
@@ -106,3 +109,73 @@ def test_dream_fires_when_chat_idle(store, hebbian, tmp_path):
     assert isinstance(result, DreamResult)
     assert result.dream_text is not None
     assert result.memory is not None
+
+
+# ---------------------------------------------------------------------------
+# ReflexEngine
+# ---------------------------------------------------------------------------
+
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError(f"Could not find pyproject.toml above {here}")
+
+
+_DEFAULT_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
+
+
+def _write_triggerable_arc(path: Path) -> None:
+    arc = {
+        "name": "test_arc",
+        "description": "test",
+        "trigger": {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "generate_journal",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": "You are {persona_name}. Write something.",
+    }
+    path.write_text(json.dumps({"version": 1, "arcs": [arc]}, indent=2), encoding="utf-8")
+
+
+def _seed_reflex_emotion(store: MemoryStore) -> None:
+    mem = Memory.create_new(
+        content="seed",
+        memory_type="observation",
+        domain="brain",
+        emotions={"love": 8.0},
+        metadata={"source_summary": "conversation:test_seed"},
+    )
+    store.create(mem)
+
+
+def test_reflex_defers_when_chat_active(tmp_path):
+    """ReflexEngine.run_tick must NOT call provider.generate while chat is active."""
+    provider = _RecordingProvider()
+    arcs_path = tmp_path / "arcs.json"
+    _write_triggerable_arc(arcs_path)
+
+    store = MemoryStore(":memory:")
+    try:
+        _seed_reflex_emotion(store)
+        engine = ReflexEngine(
+            store=store,
+            provider=provider,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=_DEFAULT_ARCS_PATH,
+        )
+
+        cli_throttle.mark_interactive_active()
+
+        result = engine.run_tick(trigger="manual", dry_run=False)
+
+        assert provider.call_count == 0, "provider.generate must not be called while chat is active"
+        assert isinstance(result, ReflexResult)
+        assert result.arcs_fired == ()
+    finally:
+        store.close()
