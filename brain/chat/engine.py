@@ -41,6 +41,19 @@ from brain.soul.store import SoulStore
 
 logger = logging.getLogger(__name__)
 
+# Replayed conversation history is capped to the last _HISTORY_WINDOW_MSGS
+# messages (~40 user+assistant turns) verbatim. The caching spike (2026-06-06)
+# confirmed the Claude CLI re-creates the whole prompt every turn, so an
+# unbounded buffer is re-billed each turn (driver #1). Older turns are dropped
+# from the replay — NOT summarised (re-summarising a growing head every turn is
+# its own cost) — and resurfaced by the per-turn recall block + ingest memories.
+_HISTORY_WINDOW_MSGS = 80
+
+
+def _window_history(history_msgs: list[ChatMessage]) -> list[ChatMessage]:
+    """Keep only the most-recent _HISTORY_WINDOW_MSGS messages of replayed history."""
+    return history_msgs[-_HISTORY_WINDOW_MSGS:]
+
 
 @dataclass
 class ChatResult:
@@ -180,6 +193,7 @@ def respond(
         )
         history_msgs = list(session.history)
 
+    history_msgs = _window_history(history_msgs)
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_msg),
         *history_msgs,
@@ -187,7 +201,7 @@ def respond(
     ]
     messages = apply_budget(
         messages,
-        max_tokens=190_000,
+        max_tokens=80_000,
         preserve_tail_msgs=40,
         provider=provider,
     )
