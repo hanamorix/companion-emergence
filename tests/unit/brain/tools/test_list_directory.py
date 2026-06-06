@@ -26,6 +26,17 @@ def test_writes_audit_line(tmp_path):
     assert line["tool"] == "list_directory"
 
 
+def test_non_dir_writes_failure_audit_line(tmp_path):
+    import json
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    list_directory(path=str(f), persona_dir=persona)
+    line = json.loads((persona / "file_access.jsonl").read_text().strip().splitlines()[-1])
+    assert line["tool"] == "list_directory" and line["ok"] is False
+
+
 def test_through_dispatch(tmp_path):
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
