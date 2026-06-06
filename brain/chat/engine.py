@@ -51,8 +51,14 @@ _HISTORY_WINDOW_MSGS = 80
 
 
 def _window_history(history_msgs: list[ChatMessage]) -> list[ChatMessage]:
-    """Keep only the most-recent _HISTORY_WINDOW_MSGS messages of replayed history."""
-    return history_msgs[-_HISTORY_WINDOW_MSGS:]
+    """Keep only the most-recent _HISTORY_WINDOW_MSGS messages of replayed history.
+
+    Strips any leading non-user message so the window opens on a user turn
+    (avoids an assistant reply to a now-dropped question / user-first ordering)."""
+    windowed = history_msgs[-_HISTORY_WINDOW_MSGS:]
+    while windowed and windowed[0].role != "user":
+        windowed = windowed[1:]
+    return windowed
 
 
 @dataclass
@@ -202,7 +208,8 @@ def respond(
     messages = apply_budget(
         messages,
         max_tokens=80_000,
-        preserve_tail_msgs=40,
+        preserve_tail_msgs=40,  # backstop only — _window_history already caps to 80 msgs;
+                                # apply_budget now fires only for unusually large individual messages
         provider=provider,
     )
 
