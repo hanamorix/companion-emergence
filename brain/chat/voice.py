@@ -78,6 +78,9 @@ system message gave you:
     the user explicitly asks you to open or look at a specific file or path.
     Never call it proactively. If something you read matters, you can choose
     to remember or reflect on it
+  - `list_directory` — list the files in a directory on the user's computer
+    (e.g. ~/Desktop). Use ONLY when the user explicitly asks you to look at
+    a folder. Never call it proactively
 
 **The trigger to reach.** When the user asks about something specific you
 might have stored — a memory, a piece you wrote, a feeling you had earlier —
