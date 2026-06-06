@@ -8,6 +8,13 @@ from __future__ import annotations
 from brain.chat.salience import SalienceSignal
 from brain.tools import NELL_TOOL_NAMES
 
+# SalienceSignal.maximal() yields score=1.0; 0.999 absorbs float drift only.
+_MAXIMAL_SCORE = 0.999
+
+# Tiers cover the common per-turn faculties. boot (startup-only), crystallize_soul,
+# and the works tools are intentionally omitted — they arrive via the full suite on a
+# maximal signal or via reach_for_capability's full re-invoke (see tool_loop, Task 2.3).
+
 # Always available — interior voice, self-state reads, and the escalation valve.
 REFLEXIVE_CORE: tuple[str, ...] = (
     "record_monologue",
@@ -43,7 +50,7 @@ def select_tools(
     turns get REFLEXIVE_CORE plus whichever heavier faculties the salience
     flags call for. Result is ordered by *base* so the LLM sees a stable list.
     """
-    if signal.score >= 0.999:  # maximal / fail-open → full suite
+    if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
 
     allowed: list[str] = list(REFLEXIVE_CORE)
