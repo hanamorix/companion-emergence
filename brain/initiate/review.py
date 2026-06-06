@@ -439,7 +439,9 @@ def run_initiate_review_tick(
 
     # --- Three-prompt composition loop (promoted candidates only) -----------
     # Yield to active chat before any LLM composition work.
-    from brain.bridge import cli_throttle
+    from brain.bridge import (
+        cli_throttle,  # local import: avoids a circular dependency on brain.bridge
+    )
 
     with cli_throttle.background_slot() as slot:
         if not slot:
@@ -466,9 +468,9 @@ def run_initiate_review_tick(
                 )
 
         # --- Drift check — emit operator-tier alert if D's promote-rate drifts ---
-        # Runs after the composition loop so we only call detect_drift on ticks
-        # where D actually processed candidates (early-return paths above skip
-        # this naturally).
+        # Runs only inside the throttle slot — a throttle-deferred tick also
+        # skips drift detection intentionally (no candidates were processed, so
+        # there are no new promote decisions to drift on).
         alert = detect_drift(persona_dir)
         if alert is not None:
             _emit_supervisor_event(

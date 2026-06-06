@@ -349,7 +349,9 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        from brain.bridge import cli_throttle
+        from brain.bridge import (
+            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
+        )
 
         with cli_throttle.background_slot() as slot:
             if not slot:

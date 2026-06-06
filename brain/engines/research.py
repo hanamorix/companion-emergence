@@ -234,6 +234,7 @@ class ResearchEngine:
         web_results: list = []
         if winner.scope != "internal":
             try:
+                # Web fetch runs OUTSIDE the throttle gate — it doesn't touch the Claude CLI subprocess.
                 web_results = self.searcher.search(
                     query=f"{winner.topic} {' '.join(winner.related_keywords[:3])}",
                     limit=5,
@@ -245,7 +246,9 @@ class ResearchEngine:
         web_used = len(web_results) > 0
 
         # Render prompt + call LLM — yield to active chat
-        from brain.bridge import cli_throttle
+        from brain.bridge import (
+            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
+        )
 
         with cli_throttle.background_slot() as slot:
             if not slot:

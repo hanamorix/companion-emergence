@@ -567,7 +567,6 @@ def _review_pending_candidates_locked(
     for idx in to_examine:
         record = records[idx]
         candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
-        report.examined += 1
 
         related = _related_memory_snippets(store, record.get("text", ""))
         messages = _build_messages(
@@ -585,12 +584,15 @@ def _review_pending_candidates_locked(
         user_content = messages[1]["content"]
 
         # Yield to active chat — defer this tick; backlog-drain cadence re-fires.
-        from brain.bridge import cli_throttle
+        from brain.bridge import (
+            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
+        )
 
         with cli_throttle.background_slot() as slot:
             if not slot:
-                report.examined -= 1  # didn't actually examine this one
                 break
+
+            report.examined += 1
 
             try:
                 raw = provider.generate(user_content, system=system_content)
