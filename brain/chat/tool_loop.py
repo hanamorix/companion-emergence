@@ -45,6 +45,9 @@ _pass2_counter = count(1)
 _attunement_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
+# 8 > reflection_gate._MIN_TURNS_BETWEEN (4): successive debounced detector runs
+# always overlap, so no user turn falls in a gap between passes. Keep this window
+# larger than the debounce gap if either is retuned.
 _ATTUNEMENT_WINDOW = 8
 
 
