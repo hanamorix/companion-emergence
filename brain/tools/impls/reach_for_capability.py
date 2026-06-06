@@ -4,8 +4,11 @@ re-runs the turn once with the heavier tools allowed (see chat/tool_loop, Task 2
 The impl only records the intent — the recruitment is the engine's re-invoke."""
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
-def reach_for_capability(capability: str = "", *, persona_dir: Path, **_) -> dict:
+def reach_for_capability(capability: str, *, persona_dir: Path, **_) -> dict:
     return {"ok": True, "recruited": capability}
