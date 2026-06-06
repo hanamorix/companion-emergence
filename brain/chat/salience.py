@@ -5,6 +5,7 @@ Fails open: any exception → SalienceSignal.maximal() so a scorer bug can only
 ever cost MORE (attach tools / reflect), never silently strip agency."""
 from __future__ import annotations
 
+import functools
 import logging
 import re
 from dataclasses import dataclass
@@ -15,8 +16,13 @@ _PAST_CUES = (
     "remember", "last time", "you said", "earlier", "before", "yesterday",
     "the other day", "we talked", "we discussed", "back when", "used to",
 )
+# "/" also matches "yes/no"; "read "/"open " match conversational phrases. This
+# over-detects on purpose — a false-positive recruits a tool that wasn't needed
+# (the safe direction), never the reverse. Consumers gate on this knowing that.
 _FILE_CUES = ("file", "folder", "directory", "desktop", "read ", "open ", "/", "~", ".txt", ".md", ".py")
 _DATE_RE = re.compile(r"\b(\d{1,4}[/-]\d{1,2}([/-]\d{1,4})?|\d{4}|\d{1,2}(am|pm))\b", re.I)
+# Catches proper nouns (names/places) but also emphatic mid-sentence caps.
+# Intentional over-detection; false-positive salience is the safe direction.
 _CAP_MIDSENTENCE_RE = re.compile(r"(?<!^)(?<![.!?]\s)\b[A-Z][a-z]{2,}\b")
 _BASE_AFFECT = frozenset({
     "love", "hate", "afraid", "scared", "angry", "sad", "happy", "anxious",
@@ -25,6 +31,7 @@ _BASE_AFFECT = frozenset({
 })
 
 
+@functools.cache
 def _emotion_names() -> frozenset[str]:
     from brain.emotion import vocabulary
     return frozenset(e.name.lower() for e in vocabulary.list_all())
