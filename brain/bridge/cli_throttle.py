@@ -1,0 +1,66 @@
+"""Process-global CLI throttle. Interactive chat has absolute priority and
+never waits; background CLI consumers (dreams, reflex, research, soul review,
+initiate, voice reflection, the reflection passes, backfills) yield while a
+chat turn is in-flight / recently active, and respect a small concurrency cap.
+
+Fails open: on any internal error, background is allowed (today's behaviour)
+and the error is logged once. Closes deferred item 26."""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+log = logging.getLogger(__name__)
+
+_IDLE_SECONDS = 300.0          # match emotion_backfill _ACTIVE_CHAT_IDLE_MINUTES (5 min)
+_MAX_CONCURRENT_BACKGROUND = 1
+
+_lock = threading.Lock()
+_last_interactive_monotonic: float = -1e9
+_inflight_background = 0
+_warned = False
+
+
+def reset() -> None:  # test helper
+    global _last_interactive_monotonic, _inflight_background, _warned
+    with _lock:
+        _last_interactive_monotonic = -1e9
+        _inflight_background = 0
+        _warned = False
+
+
+def interactive_allowed() -> bool:
+    return True  # interactive is never throttled
+
+
+def mark_interactive_active(at: float | None = None) -> None:
+    global _last_interactive_monotonic
+    with _lock:
+        _last_interactive_monotonic = time.monotonic() if at is None else at
+
+
+def acquire_background(*, now: float | None = None) -> bool:
+    """True → caller may make its background CLI call (and MUST call
+    release_background() after). False → defer to next tick."""
+    global _inflight_background, _warned
+    try:
+        t = time.monotonic() if now is None else now
+        with _lock:
+            if (t - _last_interactive_monotonic) < _IDLE_SECONDS:
+                return False
+            if _inflight_background >= _MAX_CONCURRENT_BACKGROUND:
+                return False
+            _inflight_background += 1
+            return True
+    except Exception:  # noqa: BLE001 — fail open
+        if not _warned:
+            log.exception("cli_throttle.acquire_background failed; allowing (fail-open)")
+            _warned = True
+        return True
+
+
+def release_background() -> None:
+    global _inflight_background
+    with _lock:
+        _inflight_background = max(0, _inflight_background - 1)
