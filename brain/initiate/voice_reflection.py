@@ -67,7 +67,9 @@ def run_voice_reflection_tick(
         '"rationale": "<one sentence>", "evidence": ["<id1>", "<id2>", "<id3>", ...]}'
     )
 
-    from brain.bridge import cli_throttle
+    from brain.bridge import (
+        cli_throttle,  # local import: avoids a circular dependency on brain.bridge
+    )
 
     with cli_throttle.background_slot() as slot:
         if not slot:
