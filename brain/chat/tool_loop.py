@@ -106,6 +106,7 @@ def _run_attunement_pass2(
             buffer_slice=buffer_slice,
             reply_text=reply_text,
             companion_name=persona_dir.name,
+            persona_dir=persona_dir,
         )
         write_current_read(persona_dir, output.current_read)
         merge_into_learned(

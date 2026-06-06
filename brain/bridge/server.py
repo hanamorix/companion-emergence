@@ -114,6 +114,25 @@ def _validate_path_session_id(session_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -> None:
+    """Load the persona emotion vocabulary into the process-global registry at startup.
+
+    Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
+    load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
+    the chat path never aggregates with an empty vocab during the ~15-min window
+    before the first supervisor tick fires.
+
+    Missing file → silent no-op (fresh personas have no vocabulary file yet).
+    Any exception → logged and swallowed so bridge startup is never blocked.
+    """
+    try:
+        from brain.emotion.persona_loader import load_persona_vocabulary
+
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+    except Exception:
+        logger.exception("startup persona-vocabulary load skipped")
+
+
 def _now() -> str:
     """Return current UTC time as ISO-8601 string."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -761,6 +780,17 @@ def build_app(
             logger.debug("last_opened_at touched persona=%s", persona_dir.name)
         except Exception as _exc:  # noqa: BLE001
             logger.warning("could not touch last_opened_at: %s", _exc)
+
+        # Load the persona emotion vocabulary before any chat request can arrive.
+        # Without this, aggregate_state silently drops all persona-extension
+        # emotions for ~15 min after launch (until the supervisor heartbeat tick
+        # fires for the first time). Uses a short-lived store — no persistent
+        # handle held on app.state per HA hardening rule.
+        _vocab_store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
+        finally:
+            _vocab_store.close()
 
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded

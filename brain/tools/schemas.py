@@ -546,6 +546,41 @@ SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "read_file": {
+        "name": "read_file",
+        "description": (
+            "Read a text file from the user's computer. Use ONLY when the user explicitly asks you "
+            "to read, open, or look at a specific file or path — never proactively. If something you "
+            "read matters, you can choose to remember or reflect on it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or ~-relative path to the file.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    "list_directory": {
+        "name": "list_directory",
+        "description": (
+            "List the files in a directory on the user's computer — e.g. ~/Desktop. Use ONLY when the "
+            "user explicitly asks you to look at a folder or their desktop — never proactively."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or ~-relative directory path.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
 }
 
 

@@ -27,7 +27,9 @@ from brain.tools.impls.get_body_state import get_body_state
 from brain.tools.impls.get_emotional_state import get_emotional_state
 from brain.tools.impls.get_personality import get_personality
 from brain.tools.impls.get_soul import get_soul
+from brain.tools.impls.list_directory import list_directory
 from brain.tools.impls.list_works import list_works
+from brain.tools.impls.read_file import read_file
 from brain.tools.impls.read_work import read_work
 from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_memories import search_memories
@@ -118,6 +120,8 @@ _DISPATCH: dict[str, Any] = {
     "recall_arc": _recall_arc_wrapper,
     "recall_monologue": recall_monologue,
     "record_monologue": None,  # replaced below after function definition
+    "read_file": read_file,
+    "list_directory": list_directory,
 }
 
 

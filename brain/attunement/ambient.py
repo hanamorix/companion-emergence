@@ -12,6 +12,8 @@ from pathlib import Path
 from brain.attunement.schemas import ADDRESS_COOLDOWN_HOURS
 from brain.attunement.store import read_current_read, read_learned_patterns
 
+_ATTUNEMENT_RENDER_CAP = 8
+
 
 def _valence_phrase(valence: float, intensity: float) -> str:
     """Map valence + intensity into a short natural-language phrase."""
@@ -57,6 +59,9 @@ def build_attunement_block(persona_dir: Path) -> str:
         if p.maturity in {"forming", "known"}
         and not _is_addressed_recently(p.last_addressed_at)
     ]
+    _maturity_rank = {"known": 0, "forming": 1}
+    surfaceable.sort(key=lambda p: (_maturity_rank.get(p.maturity, 9), -p.evidence_count))
+    surfaceable = surfaceable[:_ATTUNEMENT_RENDER_CAP]
     if surfaceable:
         if lines:
             lines.append("")
