@@ -294,6 +294,8 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "recall_arc": {"query": ""},
         "record_monologue": {"monologue": "test thought", "feed_digest": "she searched"},
         "recall_monologue": {"query": "test"},
+        "read_file": {"path": str(tmp_path / "nonexistent.txt")},
+        "list_directory": {"path": str(tmp_path)},
     }
 
     for tool_name in _DISPATCH:

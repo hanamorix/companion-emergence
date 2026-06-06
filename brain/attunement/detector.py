@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from brain.attunement.prompts import build_detector_system_prompt
@@ -73,7 +74,12 @@ def _build_user_message(
     )
 
 
-def _call_haiku(system_prompt: str, user_message: str) -> str:
+def _call_haiku(
+    system_prompt: str,
+    user_message: str,
+    *,
+    persona_dir: Path | None = None,
+) -> str:
     """Call Haiku via the Claude CLI. Returns raw stdout (expected JSON).
 
     Routes through ClaudeCliProvider.generate() which uses
@@ -88,8 +94,9 @@ def _call_haiku(system_prompt: str, user_message: str) -> str:
         model=_DETECTOR_MODEL,
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
+    pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir
     try:
-        return provider.generate(user_message, system=system_prompt)
+        return provider.generate(user_message, system=system_prompt, persona_dir=pd)
     except Exception as exc:  # noqa: BLE001
         log.warning("attunement detector: claude CLI call failed: %s", exc)
         return ""
@@ -192,6 +199,7 @@ def run_detector(
     *,
     only_categories: frozenset[str] | None = None,
     companion_name: str = "",
+    persona_dir: Path | None = None,
 ) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
 
@@ -217,7 +225,7 @@ def run_detector(
     system_prompt = build_detector_system_prompt(only_categories=only_categories)
     user_message = _build_user_message(buffer_slice, reply_text, companion_name=companion_name)
 
-    raw = _call_haiku(system_prompt, user_message)
+    raw = _call_haiku(system_prompt, user_message, persona_dir=persona_dir)
     if not raw:
         return _decline_output(source_turn_id)
 
