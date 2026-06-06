@@ -28,7 +28,7 @@ def should_reflect(signal, persona_dir: Path, *, kind: str, turn_index: int) -> 
     try:
         state = _load(persona_dir)
         last = state.get(kind, {}).get("last_turn_index")
-        if last is not None and (turn_index - int(last)) < _MIN_TURNS_BETWEEN:
+        if last is not None and (turn_index - last) < _MIN_TURNS_BETWEEN:
             return False
         state.setdefault(kind, {})["last_turn_index"] = turn_index
         persona_dir.mkdir(parents=True, exist_ok=True)
