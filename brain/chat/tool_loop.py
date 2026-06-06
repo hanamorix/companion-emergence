@@ -45,6 +45,7 @@ _pass2_counter = count(1)
 _attunement_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
+_ATTUNEMENT_WINDOW = 8
 
 
 def _spawn_pass2(
@@ -142,17 +143,17 @@ def _spawn_pass2_attunement(
 
 
 def _buffer_slice_from_messages(messages: list[ChatMessage]) -> list[BufferTurn]:
-    """Build a BufferTurn slice from the user messages in the conversation.
+    """Build a recent-window BufferTurn slice from the user messages.
 
-    Uses the message index as a stable turn id — suitable for grounding validation
-    within this call (the ids only need to match within the buffer_slice passed to
-    the same run_detector call).
+    Capped to the last _ATTUNEMENT_WINDOW user turns: the detector reads tone /
+    cadence / mood from recent conversation, so the full multi-day buffer is
+    both unnecessary and the #2 cost driver (a full-history-sized Haiku prompt
+    every pass). The id is the index within the windowed slice — only needs to
+    be stable within the single run_detector call it's passed to.
     """
-    return [
-        BufferTurn(id=f"msg-{i}", content=m.content_text())
-        for i, m in enumerate(messages)
-        if m.role == "user" and m.content_text().strip()
-    ]
+    user_msgs = [m for m in messages if m.role == "user" and m.content_text().strip()]
+    recent = user_msgs[-_ATTUNEMENT_WINDOW:]
+    return [BufferTurn(id=f"msg-{i}", content=m.content_text()) for i, m in enumerate(recent)]
 
 
 def _find_monologue_text(invocations: list[dict]) -> str | None:
