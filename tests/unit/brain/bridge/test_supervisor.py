@@ -12,12 +12,20 @@ from unittest.mock import MagicMock, patch
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
+    _ROLLING_LOG_POLICIES,
     _run_heartbeat_tick,
     _run_initiate_review_tick,  # noqa: F401 — imported to assert symbol exists
     _run_log_rotation_tick,
     _run_voice_reflection_tick,  # noqa: F401 — imported to assert symbol exists
     run_folded,
 )
+
+
+def test_audit_logs_registered_for_rotation() -> None:
+    """The append-only audit logs must be bounded by a rolling policy, not unbounded."""
+    registered = {name for name, _ in _ROLLING_LOG_POLICIES}
+    assert "chat_usage.jsonl" in registered
+    assert "file_access.jsonl" in registered
 
 
 def _persona_dir(tmp_path: Path) -> Path:
