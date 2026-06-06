@@ -19,6 +19,10 @@ from brain.bridge.provider import LLMProvider
 from brain.engines.dream import DreamEngine, DreamResult
 from brain.engines.reflex import ReflexEngine, ReflexResult
 from brain.engines.research import ResearchEngine, ResearchResult
+from brain.initiate.emit import emit_initiate_candidate
+from brain.initiate.review import run_initiate_review_tick
+from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
+from brain.initiate.voice_reflection import run_voice_reflection_tick
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
@@ -296,3 +300,100 @@ def test_soul_review_defers_when_chat_active(tmp_path):
     finally:
         store.close()
         soul_store.close()
+
+
+# ---------------------------------------------------------------------------
+# initiate/review.py  (run_initiate_review_tick)
+# ---------------------------------------------------------------------------
+
+
+def _promote_all(candidates, *, deps):
+    """Stub for reflection_run that promotes every candidate."""
+    from brain.initiate.d_call_schema import DCallRow, make_d_call_id
+    from brain.initiate.reflection import DDecision, DReflectionResult
+
+    decisions = [DDecision(i, "promote", "stub", "high") for i in range(len(candidates))]
+    result = DReflectionResult(decisions=decisions, tick_note=None)
+    dcall = DCallRow(
+        d_call_id=make_d_call_id(deps.now),
+        ts=deps.now.isoformat(),
+        tick_id=deps.tick_id,
+        model_tier_used="haiku",
+        candidates_in=len(candidates),
+        promoted_out=len(candidates),
+        filtered_out=0,
+        latency_ms=0,
+        tokens_input=0,
+        tokens_output=0,
+    )
+    return result, dcall
+
+
+def test_initiate_review_defers_when_chat_active(tmp_path, monkeypatch):
+    """run_initiate_review_tick must NOT call provider.complete while chat is active."""
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all)
+
+    snap = EmotionalSnapshot(
+        vector={"longing": 7},
+        rolling_baseline_mean=5.0,
+        rolling_baseline_stdev=1.0,
+        current_resonance=7.4,
+        delta_sigma=2.4,
+    )
+    emit_initiate_candidate(
+        tmp_path,
+        kind="message",
+        source="dream",
+        source_id="dream_abc",
+        emotional_snapshot=snap,
+        semantic_context=SemanticContext(linked_memory_ids=["m_xyz"], topic_tags=["dream"]),
+    )
+
+    provider = _CompleteRecordingProvider()
+    cli_throttle.mark_interactive_active()
+
+    run_initiate_review_tick(
+        tmp_path,
+        provider=provider,
+        voice_template="be warm",
+        cap_per_tick=3,
+    )
+
+    assert provider.call_count == 0, "provider.complete must not be called while chat is active"
+
+
+# ---------------------------------------------------------------------------
+# initiate/voice_reflection.py
+# ---------------------------------------------------------------------------
+
+
+class _CompleteRecordingProvider:
+    """Records calls to provider.complete (voice_reflection uses complete, not generate)."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete(self, prompt: str) -> str:
+        self.call_count += 1
+        return '{"should_propose": false, "reason": "nothing to change"}'
+
+    def name(self) -> str:
+        return "complete-recording-fake"
+
+
+def test_voice_reflection_defers_when_chat_active(tmp_path):
+    """run_voice_reflection_tick must NOT call provider.complete while chat is active."""
+    provider = _CompleteRecordingProvider()
+
+    cli_throttle.mark_interactive_active()
+
+    run_voice_reflection_tick(
+        tmp_path,
+        provider=provider,
+        crystallizations=[],
+        dreams=[],
+        recent_tones=[],
+        companion_name="Nell",
+    )
+
+    assert provider.call_count == 0, "provider.complete must not be called while chat is active"

@@ -438,41 +438,48 @@ def run_initiate_review_tick(
                 promote_ids.add(c.candidate_id)
 
     # --- Three-prompt composition loop (promoted candidates only) -----------
-    for candidate in candidates:
-        if candidate.candidate_id not in promote_ids:
-            continue
-        try:
-            _process_one_candidate(
-                persona_dir,
-                candidate,
-                provider=provider,
-                voice_template=voice_template,
-                now=now,
-                user_name=user_name,
-                companion_name=companion_name,
-                user_presence=user_presence,
-            )
-        except Exception:
-            logger.exception(
-                "initiate review tick: unrecoverable error on candidate %s",
-                candidate.candidate_id,
-            )
+    # Yield to active chat before any LLM composition work.
+    from brain.bridge import cli_throttle
 
-    # --- Drift check — emit operator-tier alert if D's promote-rate drifts ---
-    # Runs after the composition loop so we only call detect_drift on ticks
-    # where D actually processed candidates (early-return paths above skip
-    # this naturally).
-    alert = detect_drift(persona_dir)
-    if alert is not None:
-        _emit_supervisor_event(
-            {
-                "type": "d_reflection_drift_detected",
-                "ts": datetime.now(UTC).isoformat(),
-                "current_rate": alert.current_rate,
-                "historical_median": alert.historical_median,
-                "delta_sigma": alert.delta_sigma,
-            }
-        )
+    with cli_throttle.background_slot() as slot:
+        if not slot:
+            return  # deferred — cadence re-fires next tick
+
+        for candidate in candidates:
+            if candidate.candidate_id not in promote_ids:
+                continue
+            try:
+                _process_one_candidate(
+                    persona_dir,
+                    candidate,
+                    provider=provider,
+                    voice_template=voice_template,
+                    now=now,
+                    user_name=user_name,
+                    companion_name=companion_name,
+                    user_presence=user_presence,
+                )
+            except Exception:
+                logger.exception(
+                    "initiate review tick: unrecoverable error on candidate %s",
+                    candidate.candidate_id,
+                )
+
+        # --- Drift check — emit operator-tier alert if D's promote-rate drifts ---
+        # Runs after the composition loop so we only call detect_drift on ticks
+        # where D actually processed candidates (early-return paths above skip
+        # this naturally).
+        alert = detect_drift(persona_dir)
+        if alert is not None:
+            _emit_supervisor_event(
+                {
+                    "type": "d_reflection_drift_detected",
+                    "ts": datetime.now(UTC).isoformat(),
+                    "current_rate": alert.current_rate,
+                    "historical_median": alert.historical_median,
+                    "delta_sigma": alert.delta_sigma,
+                }
+            )
 
 
 def _emit_supervisor_event(event: dict) -> None:
