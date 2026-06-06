@@ -17,6 +17,10 @@ def list_directory(path: str, *, persona_dir: Path, **_) -> dict:
         _audit(persona_dir, tool="list_directory", path=raw, resolved="", bytes_=0, ok=False, error=str(exc))
         return {"error": f"bad path: {exc}"}
 
+    if not p.exists():
+        _audit(persona_dir, tool="list_directory", path=raw, resolved=str(p), bytes_=0, ok=False, error="not found")
+        return {"error": f"path does not exist: {p}"}
+
     if not p.is_dir():
         _audit(
             persona_dir,
