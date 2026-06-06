@@ -29,6 +29,7 @@ from brain.tools.impls.get_personality import get_personality
 from brain.tools.impls.get_soul import get_soul
 from brain.tools.impls.list_directory import list_directory
 from brain.tools.impls.list_works import list_works
+from brain.tools.impls.reach_for_capability import reach_for_capability
 from brain.tools.impls.read_file import read_file
 from brain.tools.impls.read_work import read_work
 from brain.tools.impls.save_work import save_work
@@ -122,6 +123,7 @@ _DISPATCH: dict[str, Any] = {
     "record_monologue": None,  # replaced below after function definition
     "read_file": read_file,
     "list_directory": list_directory,
+    "reach_for_capability": reach_for_capability,
 }
 
 
