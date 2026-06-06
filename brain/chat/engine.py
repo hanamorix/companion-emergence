@@ -208,6 +208,7 @@ def respond(
         persona_dir=persona_dir,
         companion_name=persona_dir.name,
         recruited_allowed=allowed,
+        signal=signal,
     )
     content = response.content or ""
 
