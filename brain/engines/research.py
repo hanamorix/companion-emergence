@@ -244,78 +244,90 @@ class ResearchEngine:
 
         web_used = len(web_results) > 0
 
-        # Render prompt + call LLM
-        prompt = self._render_prompt(winner, memory_context, web_results, emo_state)
-        raw = self.provider.generate(prompt, system=self._render_system_prompt(winner))
+        # Render prompt + call LLM — yield to active chat
+        from brain.bridge import cli_throttle
 
-        # Persist memory
-        mem = _create_research_memory(
-            content=raw,
-            interest=winner,
-            web_results=web_results,
-            web_used=web_used,
-            trigger=trigger,
-            provider_name=self.provider.name(),
-            searcher_name=self.searcher.name() if web_used else None,
-        )
-        self.store.create(mem)
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return ResearchResult(
+                    fired=None,
+                    would_fire=None,
+                    reason="deferred_chat_active",
+                    dry_run=dry_run,
+                    evaluated_at=now,
+                )
 
-        # Update interest
-        updated_interest = Interest(
-            id=winner.id,
-            topic=winner.topic,
-            pull_score=winner.pull_score,
-            scope=winner.scope,
-            related_keywords=winner.related_keywords,
-            notes=winner.notes,
-            first_seen=winner.first_seen,
-            last_fed=winner.last_fed,
-            last_researched_at=now,
-            feed_count=winner.feed_count,
-            source_types=winner.source_types,
-        )
-        interests.upsert(updated_interest).save(self.interests_path)
+            prompt = self._render_prompt(winner, memory_context, web_results, emo_state)
+            raw = self.provider.generate(prompt, system=self._render_system_prompt(winner))
 
-        # Append log
-        fire = ResearchFire(
-            interest_id=winner.id,
-            topic=winner.topic,
-            fired_at=now,
-            trigger=trigger,
-            web_used=web_used,
-            web_result_count=len(web_results),
-            output_memory_id=mem.id,
-        )
-        log.appended(fire).save(self.research_log_path)
+            # Persist memory
+            mem = _create_research_memory(
+                content=raw,
+                interest=winner,
+                web_results=web_results,
+                web_used=web_used,
+                trigger=trigger,
+                provider_name=self.provider.name(),
+                searcher_name=self.searcher.name() if web_used else None,
+            )
+            self.store.create(mem)
 
-        # D-reflection Task 18: emit research_completion initiate candidate (gated).
-        # Best-effort: gate/emit failure does NOT prevent the research fire.
-        user_name = "you"
-        try:
-            from brain.persona_config import PersonaConfig
+            # Update interest
+            updated_interest = Interest(
+                id=winner.id,
+                topic=winner.topic,
+                pull_score=winner.pull_score,
+                scope=winner.scope,
+                related_keywords=winner.related_keywords,
+                notes=winner.notes,
+                first_seen=winner.first_seen,
+                last_fed=winner.last_fed,
+                last_researched_at=now,
+                feed_count=winner.feed_count,
+                source_types=winner.source_types,
+            )
+            interests.upsert(updated_interest).save(self.interests_path)
 
-            cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
-            user_name = cfg.user_name or user_name
-        except Exception:
+            # Append log
+            fire = ResearchFire(
+                interest_id=winner.id,
+                topic=winner.topic,
+                fired_at=now,
+                trigger=trigger,
+                web_used=web_used,
+                web_result_count=len(web_results),
+                output_memory_id=mem.id,
+            )
+            log.appended(fire).save(self.research_log_path)
+
+            # D-reflection Task 18: emit research_completion initiate candidate (gated).
+            # Best-effort: gate/emit failure does NOT prevent the research fire.
             user_name = "you"
+            try:
+                from brain.persona_config import PersonaConfig
 
-        _emit_research_candidate(
-            persona_dir=self.interests_path.parent,
-            interest=winner,
-            mem_id=mem.id,
-            summary_excerpt=raw[:1000],
-            provider=self.provider,
-            user_name=user_name,
-            now=now,
-        )
+                cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
+                user_name = cfg.user_name or user_name
+            except Exception:
+                user_name = "you"
 
-        return ResearchResult(
-            fired=fire,
-            would_fire=None,
-            reason=None,
-            dry_run=False,
-            evaluated_at=now,
-        )
+            _emit_research_candidate(
+                persona_dir=self.interests_path.parent,
+                interest=winner,
+                mem_id=mem.id,
+                summary_excerpt=raw[:1000],
+                provider=self.provider,
+                user_name=user_name,
+                now=now,
+            )
+
+            return ResearchResult(
+                fired=fire,
+                would_fire=None,
+                reason=None,
+                dry_run=False,
+                evaluated_at=now,
+            )
 
     # ---- private helpers ----
 
