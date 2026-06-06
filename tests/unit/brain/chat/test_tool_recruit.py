@@ -1,5 +1,6 @@
 from brain.chat.salience import SalienceSignal, assess_salience
 from brain.chat.tool_recruit import REFLEXIVE_CORE, select_tools
+from brain.tools import NELL_TOOL_NAMES
 
 
 def test_trivial_turn_gets_only_core():
@@ -25,5 +26,4 @@ def test_core_always_includes_reach_and_monologue():
 
 def test_maximal_signal_recruits_everything():
     allowed = set(select_tools(SalienceSignal.maximal()))
-    from brain.tools import NELL_TOOL_NAMES
     assert allowed == set(NELL_TOOL_NAMES)
