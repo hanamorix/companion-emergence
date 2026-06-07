@@ -3,6 +3,11 @@ from brain.chat.reflection_gate import _MIN_TURNS_BETWEEN, should_reflect
 from brain.chat.salience import SalienceSignal, assess_salience
 
 
+def test_threshold_is_lowered_to_030():
+    from brain.chat.reflection_gate import _SALIENCE_THRESHOLD
+    assert _SALIENCE_THRESHOLD == 0.30
+
+
 def test_trivial_turn_does_not_reflect(tmp_path):
     assert should_reflect(assess_salience("ok"), tmp_path, kind="attunement", turn_index=10) is False
 
@@ -19,6 +24,12 @@ def test_significant_turn_reflects_when_window_elapsed(tmp_path):
 def test_corrupt_state_fails_open(tmp_path):
     (tmp_path / "reflection_state.json").write_text("{not json")
     assert should_reflect(SalienceSignal.maximal(), tmp_path, kind="attunement", turn_index=1) is True
+
+
+def test_quiet_emotional_turn_reflects(tmp_path):
+    from brain.chat.salience import assess_salience
+    s = assess_salience("Hey love. I'm back — long day of editing, my eyes are sandpaper.")
+    assert should_reflect(s, tmp_path, kind="attunement", turn_index=1) is True
 
 
 def test_per_kind_cursors_are_independent(tmp_path):
