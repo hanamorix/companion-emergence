@@ -349,17 +349,31 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        fire = self._fire(winner, state.emotions, days_since, all_mems, now)
-        new_log = log.appended(fire)
-        new_log.save(self.log_path)
-
-        return ReflexResult(
-            arcs_fired=(fire,),
-            arcs_skipped=tuple(skipped),
-            would_fire=None,
-            dry_run=False,
-            evaluated_at=now,
+        from brain.bridge import (
+            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
         )
+
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return ReflexResult(
+                    arcs_fired=(),
+                    arcs_skipped=tuple(skipped),
+                    would_fire=None,
+                    dry_run=False,
+                    evaluated_at=now,
+                )
+
+            fire = self._fire(winner, state.emotions, days_since, all_mems, now)
+            new_log = log.appended(fire)
+            new_log.save(self.log_path)
+
+            return ReflexResult(
+                arcs_fired=(fire,),
+                arcs_skipped=tuple(skipped),
+                would_fire=None,
+                dry_run=False,
+                evaluated_at=now,
+            )
 
     def _evaluate(
         self,

@@ -581,6 +581,26 @@ SCHEMAS: dict[str, dict] = {
             "required": ["path"],
         },
     },
+    "reach_for_capability": {
+        "name": "reach_for_capability",
+        "description": (
+            "Recruit a faculty you need but don't currently have in hand this turn. "
+            "Call with capability one of: 'memory' (search/recall past), 'files' (read files/folders), "
+            "'works' (your creative artifacts). After you call this, the tools become available so you "
+            "can use them in this same turn. Use it the moment you realise you need to reach."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "capability": {
+                    "type": "string",
+                    "enum": ["memory", "files", "works"],
+                    "description": "Which faculty to recruit.",
+                },
+            },
+            "required": ["capability"],
+        },
+    },
 }
 
 

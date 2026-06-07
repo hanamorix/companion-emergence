@@ -7,6 +7,22 @@ from pathlib import Path
 
 import pytest
 
+from brain.bridge import cli_throttle
+
+
+@pytest.fixture(autouse=True)
+def _reset_cli_throttle() -> Iterator[None]:
+    """Reset cli_throttle global state before each test.
+
+    background_slot() reads process-global monotonic timestamps. Without
+    this reset, a test that calls mark_interactive_active() contaminates
+    subsequent tests in the same process — causing background-engine calls
+    to be gated when the test expects them to fire.
+    """
+    cli_throttle.reset()
+    yield
+    cli_throttle.reset()
+
 
 @pytest.fixture(scope="session")
 def repo_root() -> Path:

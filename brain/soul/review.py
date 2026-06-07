@@ -567,7 +567,6 @@ def _review_pending_candidates_locked(
     for idx in to_examine:
         record = records[idx]
         candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
-        report.examined += 1
 
         related = _related_memory_snippets(store, record.get("text", ""))
         messages = _build_messages(
@@ -584,86 +583,97 @@ def _review_pending_candidates_locked(
         system_content = messages[0]["content"]
         user_content = messages[1]["content"]
 
-        try:
-            raw = provider.generate(user_content, system=system_content)
-        except Exception as exc:
-            logger.warning(
-                "soul review: model call failed for candidate %s: %s",
-                candidate_id,
-                exc,
-            )
-            decision = Decision(
-                candidate_id=candidate_id,
-                decision="defer",
-                confidence=0,
-                reasoning="",
-                parse_error=f"model call failed: {exc}",
-            )
-            report.parse_failures += 1
-            report.model_failures += 1
-            report.decisions.append(decision)
-            if not append_audit_entry(
-                persona_dir, decision, record, related, emotional_summary, None, dry_run
-            ):
-                report.audit_failures += 1
-            report.deferred += 1
-            # NOTE: deliberately does NOT _apply_defer — a transient model
-            # failure must not stamp last_deferred_at (which would put the
-            # candidate in the 24h cooldown). It stays auto_pending, eligible
-            # the moment the limit lifts.
-            continue
-
-        decision = parse_decision(raw, candidate_id)
-        if decision.parse_error:
-            report.parse_failures += 1
-
-        # Confidence rail: low confidence forces defer regardless of decision
-        if decision.confidence < confidence_threshold and decision.decision != "defer":
-            decision.forced_defer_reason = (
-                f"confidence {decision.confidence} < threshold {confidence_threshold}"
-            )
-            decision.decision = "defer"
-
-        crystallization_id: str | None = None
-        planned_crystallization_id: str | None = None
-        if decision.decision == "accept":
-            planned_crystallization_id = _crystallization_id_for_candidate(record)
-
-        audit_ok = append_audit_entry(
-            persona_dir,
-            decision,
-            record,
-            related,
-            emotional_summary,
-            planned_crystallization_id,
-            dry_run,
+        # Yield to active chat — defer this tick; backlog-drain cadence re-fires.
+        from brain.bridge import (
+            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
         )
-        if not audit_ok:
-            report.audit_failures += 1
-            if decision.decision in {"accept", "reject"} and not dry_run:
-                decision.forced_defer_reason = "audit write failed"
+
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                break
+
+            report.examined += 1
+
+            try:
+                raw = provider.generate(user_content, system=system_content)
+            except Exception as exc:
+                logger.warning(
+                    "soul review: model call failed for candidate %s: %s",
+                    candidate_id,
+                    exc,
+                )
+                decision = Decision(
+                    candidate_id=candidate_id,
+                    decision="defer",
+                    confidence=0,
+                    reasoning="",
+                    parse_error=f"model call failed: {exc}",
+                )
+                report.parse_failures += 1
+                report.model_failures += 1
+                report.decisions.append(decision)
+                if not append_audit_entry(
+                    persona_dir, decision, record, related, emotional_summary, None, dry_run
+                ):
+                    report.audit_failures += 1
+                report.deferred += 1
+                # NOTE: deliberately does NOT _apply_defer — a transient model
+                # failure must not stamp last_deferred_at (which would put the
+                # candidate in the 24h cooldown). It stays auto_pending, eligible
+                # the moment the limit lifts.
+                continue
+
+            decision = parse_decision(raw, candidate_id)
+            if decision.parse_error:
+                report.parse_failures += 1
+
+            # Confidence rail: low confidence forces defer regardless of decision
+            if decision.confidence < confidence_threshold and decision.decision != "defer":
+                decision.forced_defer_reason = (
+                    f"confidence {decision.confidence} < threshold {confidence_threshold}"
+                )
                 decision.decision = "defer"
-                planned_crystallization_id = None
 
-        if decision.decision == "accept":
-            crystallization_id = _apply_accept(
-                record,
+            crystallization_id: str | None = None
+            planned_crystallization_id: str | None = None
+            if decision.decision == "accept":
+                planned_crystallization_id = _crystallization_id_for_candidate(record)
+
+            audit_ok = append_audit_entry(
+                persona_dir,
                 decision,
-                soul_store,
+                record,
+                related,
+                emotional_summary,
+                planned_crystallization_id,
                 dry_run,
-                crystallization_id=planned_crystallization_id,
             )
-            report.accepted += 1
-            if crystallization_id:
-                report.crystallization_ids.append(crystallization_id)
-        elif decision.decision == "reject":
-            _apply_reject(record, decision, dry_run)
-            report.rejected += 1
-        else:
-            _apply_defer(record, dry_run)
-            report.deferred += 1
+            if not audit_ok:
+                report.audit_failures += 1
+                if decision.decision in {"accept", "reject"} and not dry_run:
+                    decision.forced_defer_reason = "audit write failed"
+                    decision.decision = "defer"
+                    planned_crystallization_id = None
 
-        report.decisions.append(decision)
+            if decision.decision == "accept":
+                crystallization_id = _apply_accept(
+                    record,
+                    decision,
+                    soul_store,
+                    dry_run,
+                    crystallization_id=planned_crystallization_id,
+                )
+                report.accepted += 1
+                if crystallization_id:
+                    report.crystallization_ids.append(crystallization_id)
+            elif decision.decision == "reject":
+                _apply_reject(record, decision, dry_run)
+                report.rejected += 1
+            else:
+                _apply_defer(record, dry_run)
+                report.deferred += 1
+
+            report.decisions.append(decision)
 
     if not dry_run:
         _save_soul_candidates(persona_dir, records)
