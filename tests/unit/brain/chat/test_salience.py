@@ -47,6 +47,16 @@ def test_pure_trivial_still_low():
         assert assess_salience(t).score < 0.30, f"{t!r} should stay below threshold"
 
 
+def test_craft_talk_does_not_falsely_trip_emotional():
+    # fiction-craft editorial notes should NOT score as emotional turns
+    for t in ("there's too much exposition in this scene",
+              "the pacing sits on edge of melodrama here",
+              "cut this paragraph, it's too much telling"):
+        s = assess_salience(t)
+        # may have mild length/score, but must stay below the 0.30 reflection threshold
+        assert s.score < 0.30, f"{t!r} falsely tripped at {s.score}"
+
+
 def test_fails_open_on_bad_input(monkeypatch):
     # force the internal scorer to raise; assert maximal signal returned
     import brain.chat.salience as mod
