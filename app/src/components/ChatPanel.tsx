@@ -38,6 +38,8 @@ interface Message {
   streaming?: boolean;
   /** Thumbnail data URL for any image attached to this message. */
   imageThumb?: string;
+  /** Initiate reach-out bubble — renders a ✶ marker. */
+  reachedOut?: boolean;
 }
 
 interface StagedImage {
@@ -152,7 +154,6 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
-  const [activeReplyTarget, setActiveReplyTarget] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -354,10 +355,6 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     void postInitiateState(auditId, "dismissed");
     setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
   };
-  const onBannerReply = (auditId: string) => {
-    setActiveReplyTarget(auditId);
-    textareaRef.current?.focus();
-  };
 
   // Paste-from-clipboard: when an image is on the clipboard and the
   // user pastes inside the textarea, stage it instead of dumping the
@@ -450,14 +447,25 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     });
   }
 
-  async function send() {
-    const text = input.trim();
-    const readySha =
-      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
-    if ((!text && !readySha) || streaming) return;
-    if (stagedImage && stagedImage.status === "uploading") return;
-    const outboundText = text || "Please look at this image.";
+  // ── Shared stream core ────────────────────────────────────────────────────
+  // Both the main composer and the card-reply path funnel through here.
+  // opts.prepend: extra Message[] to insert before the hana user bubble
+  //   (used by onCardSendReply to prepend the reach-out body bubble).
+  // opts.replyToAuditId: threaded to streamChat so the server records
+  //   replied_explicit atomically with the chat turn (Bundle A #4).
+  // opts.imageShas: forwarded to streamChat for image turns.
+  // opts.text: the outbound message text.
+  // opts.imageThumb: thumbnail URL for the user bubble (image sends).
+  async function streamTurn(opts: {
+    text: string;
+    replyToAuditId?: string;
+    imageShas?: string[];
+    imageThumb?: string;
+    prepend?: Message[];
+  }): Promise<void> {
+    const { text: outboundText, replyToAuditId, imageShas, imageThumb, prepend = [] } = opts;
 
+    // Session resolve: reattach or create.
     let sessionId = sessionRef.current;
     if (!sessionId) {
       // Phase B sticky-session reattach (F-201): if the bridge has a
@@ -487,13 +495,12 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       from: "hana",
       text: outboundText,
       time: formatTime(),
-      imageThumb: readySha ? stagedImage?.previewUrl : undefined,
+      imageThumb,
     };
     // The bubble holds onto the previewUrl until unmount — track it so
     // the unmount cleanup revokes it. Don't revoke here.
     if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
-    setStagedImage(null);
-    setEmojiOpen(false);
+
     const replyId = Date.now() + 1;
     const replyStub: Message = {
       id: replyId,
@@ -503,23 +510,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       streaming: true,
     };
 
-    setMessages((m) => [...m, userMsg, replyStub]);
-    setInput("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
-    // If the user invoked "↩ reply" on an initiate banner, capture the
-    // audit_id for this turn so streamChat can pass it on the WS frame.
-    // The server records the ``replied_explicit`` transition + memory
-    // re-render atomically with ingesting the chat turn — no renderer-side
-    // POST /initiate/state is needed. Surfacing the audit_id to the chat
-    // engine is what gives the system prompt "you're replying to your
-    // earlier outbound about X" (Bundle A item #4, v0.0.9 review TODO).
-    const replyToAuditId = activeReplyTarget;
-    if (activeReplyTarget) {
-      setActiveBanners((prev) => prev.filter((b) => b.auditId !== activeReplyTarget));
-      setActiveReplyTarget(null);
-    }
+    setMessages((m) => [...m, ...prepend, userMsg, replyStub]);
     setStreaming(true);
     setErrorSafe(null);
     setMemorySaveWarning(null);
@@ -612,10 +603,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           },
         },
         (() => {
-          const opts: { imageShas?: string[]; replyToAuditId?: string } = {};
-          if (readySha) opts.imageShas = [readySha];
-          if (replyToAuditId) opts.replyToAuditId = replyToAuditId;
-          return Object.keys(opts).length > 0 ? opts : undefined;
+          const streamOpts: { imageShas?: string[]; replyToAuditId?: string } = {};
+          if (imageShas?.length) streamOpts.imageShas = imageShas;
+          if (replyToAuditId) streamOpts.replyToAuditId = replyToAuditId;
+          return Object.keys(streamOpts).length > 0 ? streamOpts : undefined;
         })(),
       );
     };
@@ -640,6 +631,42 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       );
     }
   }
+
+  // Main composer submit — validates input, clears UI state, calls streamTurn.
+  async function send() {
+    const text = input.trim();
+    const readySha =
+      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
+    if ((!text && !readySha) || streaming) return;
+    if (stagedImage && stagedImage.status === "uploading") return;
+    const outboundText = text || "Please look at this image.";
+    const imageThumb = readySha ? stagedImage?.previewUrl : undefined;
+
+    setStagedImage(null);
+    setEmojiOpen(false);
+    setInput("");
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
+
+    await streamTurn({
+      text: outboundText,
+      imageShas: readySha ? [readySha] : undefined,
+      imageThumb,
+    });
+  }
+
+  // Card-reply handler — called by InitiateBanner's onSendReply prop.
+  // Prepends the reach-out body as a ✶-marked nell bubble, then sends
+  // the reply through streamTurn with replyToAuditId threaded.
+  const onCardSendReply = (auditId: string, text: string) => {
+    const banner = activeBanners.find((b) => b.auditId === auditId);
+    setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
+    const prepend: Message[] = banner
+      ? [{ id: Date.now() - 1, from: "nell", text: banner.body, time: formatTime(), reachedOut: true }]
+      : [];
+    void streamTurn({ text, replyToAuditId: auditId, prepend });
+  };
 
   function stopStreaming() {
     cancelRef.current?.();
@@ -772,7 +799,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
               key={b.auditId}
               message={b}
               companionName={capitalize(persona)}
-              onReply={onBannerReply}
+              onSendReply={onCardSendReply}
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}
             />
@@ -796,33 +823,6 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           }}
         />
       ))}
-      {activeReplyTarget && (
-        <div
-          data-testid="reply-target-indicator"
-          style={{
-            fontSize: 10,
-            color: "var(--mauve)",
-            padding: "4px 6px",
-            fontStyle: "italic",
-          }}
-        >
-          replying to {activeReplyTarget}{" "}
-          <button
-            type="button"
-            onClick={() => setActiveReplyTarget(null)}
-            aria-label="cancel reply"
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "var(--mauve)",
-              cursor: "pointer",
-              padding: "0 4px",
-            }}
-          >
-            ×
-          </button>
-        </div>
-      )}
       {stagedImage && (
         <StagedImageRow staged={stagedImage} onRemove={clearStagedImage} />
       )}
@@ -1170,6 +1170,9 @@ function Bubble({ msg }: { msg: Message }) {
               marginBottom: msg.text ? 6 : 0,
             }}
           />
+        )}
+        {msg.reachedOut && (
+          <span className="msg-reachedout" title="Nell reached out">✶ </span>
         )}
         {msg.streaming && !msg.text ? <TypingDots /> : renderBubbleText(msg.text)}
       </div>
