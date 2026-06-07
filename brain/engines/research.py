@@ -227,25 +227,10 @@ class ResearchEngine:
                 evaluated_at=now,
             )
 
-        # Memory sweep: keyword-matched seed memories
-        memory_context = self._build_memory_context(winner)
-
-        # Web search (conditional on scope)
-        web_results: list = []
-        if winner.scope != "internal":
-            try:
-                # Web fetch runs OUTSIDE the throttle gate — it doesn't touch the Claude CLI subprocess.
-                web_results = self.searcher.search(
-                    query=f"{winner.topic} {' '.join(winner.related_keywords[:3])}",
-                    limit=5,
-                )
-            except Exception as exc:
-                logger.warning("searcher raised for %r: %s", winner.topic, exc)
-                web_results = []
-
-        web_used = len(web_results) > 0
-
-        # Render prompt + call LLM — yield to active chat
+        # Yield to active chat BEFORE any expensive I/O (web fetch + LLM).
+        # A deferred tick does no work — no fetch, no LLM — and last_researched_at
+        # is intentionally NOT updated so the same interest remains eligible on
+        # the next cadence tick once chat is idle.
         from brain.bridge import (
             cli_throttle,  # local import: avoids a circular dependency on brain.bridge
         )
@@ -259,6 +244,23 @@ class ResearchEngine:
                     dry_run=dry_run,
                     evaluated_at=now,
                 )
+
+            # Memory sweep: keyword-matched seed memories
+            memory_context = self._build_memory_context(winner)
+
+            # Web search (conditional on scope)
+            web_results: list = []
+            if winner.scope != "internal":
+                try:
+                    web_results = self.searcher.search(
+                        query=f"{winner.topic} {' '.join(winner.related_keywords[:3])}",
+                        limit=5,
+                    )
+                except Exception as exc:
+                    logger.warning("searcher raised for %r: %s", winner.topic, exc)
+                    web_results = []
+
+            web_used = len(web_results) > 0
 
             prompt = self._render_prompt(winner, memory_context, web_results, emo_state)
             raw = self.provider.generate(prompt, system=self._render_system_prompt(winner))

@@ -45,9 +45,8 @@ _pass2_counter = count(1)
 _attunement_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
-# 8 > reflection_gate._MIN_TURNS_BETWEEN (4): successive debounced detector runs
-# always overlap, so no user turn falls in a gap between passes. Keep this window
-# larger than the debounce gap if either is retuned.
+# The attunement window caps how many recent user turns the detector sees.
+# It is independent of the time-based reflection debounce in reflection_gate.py.
 _ATTUNEMENT_WINDOW = 8
 
 
@@ -317,7 +316,6 @@ def run_tool_loop(
             if recruited is not None:
                 last_response = recruited
             # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
-            turn_index = sum(1 for m in messages if m.role == "user")
             monologue_text = _find_monologue_text(invocations)
             if monologue_text:
                 _spawn_pass2(
@@ -329,9 +327,7 @@ def run_tool_loop(
                     )[-2:],
                     persona_dir=persona_dir,
                 )
-            if signal is None or should_reflect(
-                signal, persona_dir, kind="attunement", turn_index=turn_index
-            ):
+            if signal is None or should_reflect(signal, persona_dir, kind="attunement"):
                 _spawn_pass2_attunement(
                     persona_dir,
                     turn_id=f"turn-{len(messages)}",
@@ -390,7 +386,6 @@ def run_tool_loop(
     # is obligated to produce a content response (per OG pattern).
     logger.warning("tool loop hit max_iterations=%d", max_iterations)
     last_response = provider.chat(messages, tools=None)
-    turn_index = sum(1 for m in messages if m.role == "user")
     monologue_text = _find_monologue_text(invocations)
     if monologue_text:
         _spawn_pass2(
@@ -402,9 +397,7 @@ def run_tool_loop(
             )[-2:],
             persona_dir=persona_dir,
         )
-    if signal is None or should_reflect(
-        signal, persona_dir, kind="attunement", turn_index=turn_index
-    ):
+    if signal is None or should_reflect(signal, persona_dir, kind="attunement"):
         _spawn_pass2_attunement(
             persona_dir,
             turn_id=f"turn-{len(messages)}-cap",

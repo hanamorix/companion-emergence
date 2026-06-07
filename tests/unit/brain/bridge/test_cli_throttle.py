@@ -34,11 +34,6 @@ def test_release_allows_next_background():
     assert cli_throttle.acquire_background(now=far) is True
 
 
-def test_interactive_never_throttled():
-    cli_throttle.reset()
-    cli_throttle.mark_interactive_active()
-    assert cli_throttle.interactive_allowed() is True
-
 
 def test_background_slot_acquires_and_releases():
     cli_throttle.reset()
@@ -63,3 +58,23 @@ def test_acquire_fails_open_on_internal_error(monkeypatch):
     monkeypatch.setattr(mod.time, "monotonic", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     # now=None path uses time.monotonic() → raises → fail open
     assert cli_throttle.acquire_background() is True
+
+
+def test_should_yield_true_when_chat_recent():
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active(at=0.0)
+    assert cli_throttle.should_yield(now=1.0) is True
+
+
+def test_should_yield_false_when_idle():
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active(at=0.0)
+    assert cli_throttle.should_yield(now=cli_throttle._IDLE_SECONDS + 1.0) is False
+
+
+def test_should_yield_does_not_consume_a_slot():
+    cli_throttle.reset()
+    far = cli_throttle._IDLE_SECONDS + 100.0
+    cli_throttle.should_yield(now=far)  # peeking must not take the slot
+    assert cli_throttle.acquire_background(now=far) is True
+    cli_throttle.release_background()
