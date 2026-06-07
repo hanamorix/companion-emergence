@@ -27,3 +27,23 @@ def test_core_always_includes_reach_and_monologue():
 def test_maximal_signal_recruits_everything():
     allowed = set(select_tools(SalienceSignal.maximal()))
     assert allowed == set(NELL_TOOL_NAMES)
+
+
+def test_select_tools_returns_base_order():
+    """Result must be a subsequence of NELL_TOOL_NAMES in the same relative order.
+
+    This pins the set-refactor: assembling membership via a set must not
+    scramble the output order — base order is what the LLM sees and must
+    be stable. Use a mixed signal (past reference + file path) so several
+    tiers are recruited and the ordering check is non-trivial.
+    """
+    signal = assess_salience("remember ~/notes.txt from last week?")
+    allowed = select_tools(signal)
+    # Verify it is a (strict or non-strict) subsequence of NELL_TOOL_NAMES.
+    base_iter = iter(NELL_TOOL_NAMES)
+    for name in allowed:
+        found = any(b == name for b in base_iter)
+        assert found, f"{name!r} not found in remaining base order"
+    # Also ensure the list is not empty and contains expected tools.
+    assert "search_memories" in allowed
+    assert "read_file" in allowed
