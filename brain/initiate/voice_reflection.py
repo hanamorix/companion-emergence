@@ -67,40 +67,48 @@ def run_voice_reflection_tick(
         '"rationale": "<one sentence>", "evidence": ["<id1>", "<id2>", "<id3>", ...]}'
     )
 
-    try:
-        raw = provider.complete(prompt).strip()
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, Exception) as exc:
-        logger.warning("voice reflection LLM output unparseable: %s", exc)
-        return
-
-    if not parsed.get("should_propose"):
-        return
-
-    evidence = parsed.get("evidence", [])
-    if not isinstance(evidence, list) or len(evidence) < 3:
-        logger.info(
-            "voice reflection skipped — evidence count %d < 3",
-            len(evidence) if isinstance(evidence, list) else 0,
-        )
-        return
-
-    proposal = {
-        "old_text": parsed.get("old_text", ""),
-        "new_text": parsed.get("new_text", ""),
-        "diff": parsed.get("diff", ""),
-        "rationale": parsed.get("rationale", ""),
-        "evidence": evidence,
-    }
-    source_id = f"vr_{datetime.now(UTC).strftime('%Y-%m-%d')}_{secrets.token_hex(2)}"
-    emit_initiate_candidate(
-        persona_dir,
-        kind="voice_edit_proposal",
-        source="voice_reflection",
-        source_id=source_id,
-        # No emotional_snapshot: daily reflection looks back at the last
-        # week of activity — there is no moment-in-time emotion to
-        # capture, so None is more honest than zero-filled fields.
-        semantic_context=SemanticContext(),
-        proposal=proposal,
+    from brain.bridge import (
+        cli_throttle,  # local import: avoids a circular dependency on brain.bridge
     )
+
+    with cli_throttle.background_slot() as slot:
+        if not slot:
+            return  # deferred — daily reflection cadence re-fires next tick
+
+        try:
+            raw = provider.complete(prompt).strip()
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.warning("voice reflection LLM output unparseable: %s", exc)
+            return
+
+        if not parsed.get("should_propose"):
+            return
+
+        evidence = parsed.get("evidence", [])
+        if not isinstance(evidence, list) or len(evidence) < 3:
+            logger.info(
+                "voice reflection skipped — evidence count %d < 3",
+                len(evidence) if isinstance(evidence, list) else 0,
+            )
+            return
+
+        proposal = {
+            "old_text": parsed.get("old_text", ""),
+            "new_text": parsed.get("new_text", ""),
+            "diff": parsed.get("diff", ""),
+            "rationale": parsed.get("rationale", ""),
+            "evidence": evidence,
+        }
+        source_id = f"vr_{datetime.now(UTC).strftime('%Y-%m-%d')}_{secrets.token_hex(2)}"
+        emit_initiate_candidate(
+            persona_dir,
+            kind="voice_edit_proposal",
+            source="voice_reflection",
+            source_id=source_id,
+            # No emotional_snapshot: daily reflection looks back at the last
+            # week of activity — there is no moment-in-time emotion to
+            # capture, so None is more honest than zero-filled fields.
+            semantic_context=SemanticContext(),
+            proposal=proposal,
+        )

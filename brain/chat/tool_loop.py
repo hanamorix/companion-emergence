@@ -32,6 +32,7 @@ from brain.attunement.store import (
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
+from brain.chat.reflection_gate import should_reflect
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -44,6 +45,10 @@ _pass2_counter = count(1)
 _attunement_counter = count(1)
 
 MAX_TOOL_ITERATIONS = 4
+# 8 > reflection_gate._MIN_TURNS_BETWEEN (4): successive debounced detector runs
+# always overlap, so no user turn falls in a gap between passes. Keep this window
+# larger than the debounce gap if either is retuned.
+_ATTUNEMENT_WINDOW = 8
 
 
 def _spawn_pass2(
@@ -141,17 +146,17 @@ def _spawn_pass2_attunement(
 
 
 def _buffer_slice_from_messages(messages: list[ChatMessage]) -> list[BufferTurn]:
-    """Build a BufferTurn slice from the user messages in the conversation.
+    """Build a recent-window BufferTurn slice from the user messages.
 
-    Uses the message index as a stable turn id — suitable for grounding validation
-    within this call (the ids only need to match within the buffer_slice passed to
-    the same run_detector call).
+    Capped to the last _ATTUNEMENT_WINDOW user turns: the detector reads tone /
+    cadence / mood from recent conversation, so the full multi-day buffer is
+    both unnecessary and the #2 cost driver (a full-history-sized Haiku prompt
+    every pass). The id is the index within the windowed slice — only needs to
+    be stable within the single run_detector call it's passed to.
     """
-    return [
-        BufferTurn(id=f"msg-{i}", content=m.content_text())
-        for i, m in enumerate(messages)
-        if m.role == "user" and m.content_text().strip()
-    ]
+    user_msgs = [m for m in messages if m.role == "user" and m.content_text().strip()]
+    recent = user_msgs[-_ATTUNEMENT_WINDOW:]
+    return [BufferTurn(id=f"msg-{i}", content=m.content_text()) for i, m in enumerate(recent)]
 
 
 def _find_monologue_text(invocations: list[dict]) -> str | None:
@@ -166,19 +171,81 @@ def _find_monologue_text(invocations: list[dict]) -> str | None:
     )
 
 
-def build_tools_list(companion_name: str = "Nell") -> list[dict]:
+def build_tools_list(
+    companion_name: str = "Nell",
+    *,
+    allowed: list[str] | None = None,
+) -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
     Wraps schemas in the {"type": "function", "function": <schema>} shape
     that Ollama accepts natively and the MCP server registers as tool
     descriptions for the Claude path.
+
+    Parameters
+    ----------
+    companion_name:
+        The companion's name — used to parameterise tool descriptions.
+    allowed:
+        Optional allowlist of tool names.  When provided, only tools whose
+        names appear in *allowed* are included.  ``None`` (default) returns
+        the full suite; existing callers are unaffected.
     """
     schemas = build_schemas(companion_name)
-    return [
-        {"type": "function", "function": schemas[name]}
-        for name in NELL_TOOL_NAMES
-        if name in schemas
-    ]
+    names: tuple[str, ...] | list[str]
+    if allowed is None:
+        names = NELL_TOOL_NAMES
+    else:
+        allowed_set = set(allowed)
+        names = [n for n in NELL_TOOL_NAMES if n in allowed_set]
+    return [{"type": "function", "function": schemas[name]} for name in names if name in schemas]
+
+
+def _maybe_recruit_and_rerun(
+    last_response: ChatResponse,
+    invocations: list[dict],
+    *,
+    messages: list[ChatMessage],
+    provider: LLMProvider,
+    persona_dir: Path,
+    companion_name: str,
+    recruited_allowed: list[str] | None,
+) -> ChatResponse | None:
+    """If the model reached for a withheld faculty, re-invoke ONCE with the full
+    tool suite so it can complete the reach this turn.
+
+    Returns the new ChatResponse, or None to keep the original.
+    Fails safe: errors → None (keep original reply, never crash the turn).
+    The expansion is bounded to one because the re-run result is returned
+    directly — it is NOT fed back into the recruit-check loop.
+
+    Side effect: extends `invocations` in place with any tool calls the
+    re-invoke dispatched.
+    """
+    reached = any(inv.get("name") == "reach_for_capability" for inv in invocations)
+    if not reached or recruited_allowed is None:
+        return None
+    # Only expand if we were actually running a SLIM set (not already the full suite).
+    if set(recruited_allowed) >= set(NELL_TOOL_NAMES):
+        return None
+    try:
+        tools = build_tools_list(companion_name, allowed=list(NELL_TOOL_NAMES))
+        # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
+        rerun_messages = list(messages) + [
+            ChatMessage(
+                role="user",
+                content=("[The faculty you reached for is now available to you this turn. "
+                         "Call the specific tool you need now (e.g. search_memories, read_file) — "
+                         "do not call reach_for_capability again.]"),
+            )
+        ]
+        rerun = provider.chat(rerun_messages, tools=tools, options={"persona_dir": str(persona_dir)})
+        if rerun.dispatched_invocations:
+            invocations.extend(rerun.dispatched_invocations)
+        return rerun
+    except Exception:  # noqa: BLE001 — fail safe: keep original reply, never crash the turn
+        logger.exception("recruit-on-reach re-invoke failed; keeping original reply")
+        return None
 
 
 def run_tool_loop(
@@ -189,7 +256,10 @@ def run_tool_loop(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     persona_dir: Path,
+    companion_name: str = "Nell",
+    recruited_allowed: list[str] | None = None,
     max_iterations: int = MAX_TOOL_ITERATIONS,
+    signal=None,
 ) -> tuple[ChatResponse, list[dict]]:
     """Loop: provider.chat() → if tool_calls, dispatch each → retry.
 
@@ -231,6 +301,23 @@ def run_tool_loop(
         if last_response.dispatched_invocations:
             invocations.extend(last_response.dispatched_invocations)
         if not last_response.tool_calls:
+            # ONE-SHOT recruit-on-reach: if the model called reach_for_capability
+            # while running on a slim tool set, re-invoke once with the full suite
+            # so it can complete the action this turn.  Bounded to one expansion;
+            # fails safe (error → keep original reply, never crash the turn).
+            recruited = _maybe_recruit_and_rerun(
+                last_response,
+                invocations,
+                messages=messages,
+                provider=provider,
+                persona_dir=persona_dir,
+                companion_name=companion_name,
+                recruited_allowed=recruited_allowed,
+            )
+            if recruited is not None:
+                last_response = recruited
+            # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
+            turn_index = sum(1 for m in messages if m.role == "user")
             monologue_text = _find_monologue_text(invocations)
             if monologue_text:
                 _spawn_pass2(
@@ -242,15 +329,18 @@ def run_tool_loop(
                     )[-2:],
                     persona_dir=persona_dir,
                 )
-            _spawn_pass2_attunement(
-                persona_dir,
-                turn_id=f"turn-{len(messages)}",
-                user_message=next(
-                    (m.content_text() for m in reversed(messages) if m.role == "user"), ""
-                ),
-                reply_text=last_response.content or "",
-                buffer_slice=_buffer_slice_from_messages(messages),
-            )
+            if signal is None or should_reflect(
+                signal, persona_dir, kind="attunement", turn_index=turn_index
+            ):
+                _spawn_pass2_attunement(
+                    persona_dir,
+                    turn_id=f"turn-{len(messages)}",
+                    user_message=next(
+                        (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+                    ),
+                    reply_text=last_response.content or "",
+                    buffer_slice=_buffer_slice_from_messages(messages),
+                )
             return last_response, invocations
 
         # Append the assistant turn that contained the tool_calls so the
@@ -300,6 +390,7 @@ def run_tool_loop(
     # is obligated to produce a content response (per OG pattern).
     logger.warning("tool loop hit max_iterations=%d", max_iterations)
     last_response = provider.chat(messages, tools=None)
+    turn_index = sum(1 for m in messages if m.role == "user")
     monologue_text = _find_monologue_text(invocations)
     if monologue_text:
         _spawn_pass2(
@@ -311,15 +402,18 @@ def run_tool_loop(
             )[-2:],
             persona_dir=persona_dir,
         )
-    _spawn_pass2_attunement(
-        persona_dir,
-        turn_id=f"turn-{len(messages)}-cap",
-        user_message=next(
-            (m.content_text() for m in reversed(messages) if m.role == "user"), ""
-        ),
-        reply_text=last_response.content or "",
-        buffer_slice=_buffer_slice_from_messages(messages),
-    )
+    if signal is None or should_reflect(
+        signal, persona_dir, kind="attunement", turn_index=turn_index
+    ):
+        _spawn_pass2_attunement(
+            persona_dir,
+            turn_id=f"turn-{len(messages)}-cap",
+            user_message=next(
+                (m.content_text() for m in reversed(messages) if m.role == "user"), ""
+            ),
+            reply_text=last_response.content or "",
+            buffer_slice=_buffer_slice_from_messages(messages),
+        )
     return last_response, invocations
 
 
