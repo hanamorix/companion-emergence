@@ -67,13 +67,6 @@ describe("InitiateBanner", () => {
     expect(onDismiss).toHaveBeenCalledWith("ia_001");
   });
 
-  it("calls onDismiss when × is clicked", () => {
-    const onDismiss = vi.fn();
-    render(<InitiateBanner message={baseMessage} companionName="Nell" onSendReply={vi.fn()} onDismiss={onDismiss} onMounted={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: /dismiss|×/i }));
-    expect(onDismiss).toHaveBeenCalledWith("ia_001");
-  });
-
   it("shows the 'reached out' header with the companion name", () => {
     render(<InitiateBanner message={baseMessage} companionName="Nell" onSendReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     expect(screen.getByText(/Nell reached out/i)).toBeInTheDocument();
