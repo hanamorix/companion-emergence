@@ -5,6 +5,7 @@
   --linen: #eadeda;
   --ash: #bfb8ad;
   --mauve: #998888;
+  --rose: #c89890;
   --lacquer: #823329;
   --crimson: #8a3033;
 
@@ -226,4 +227,57 @@ html[data-reduced-motion="true"] *::after {
     max-width: 820px;
     margin-inline: auto;
   }
+}
+
+/* ── InitiateBanner — soft-rose reach-out card ── */
+.initiate-banner {
+  border-left: 3px solid var(--rose);
+  background: rgba(200, 152, 144, 0.12);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.initiate-banner__header {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--rose);
+  letter-spacing: 0.02em;
+}
+.initiate-banner__body {
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+.initiate-banner__reply {
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+}
+.initiate-banner__reply textarea {
+  flex: 1;
+  resize: none;
+  min-height: 32px;
+  max-height: 120px;
+  background: rgba(0, 0, 0, 0.18);
+  color: inherit;
+  border: 1px solid rgba(200, 152, 144, 0.4);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+.initiate-banner__reply button,
+.initiate-banner__actions button {
+  background: transparent;
+  border: 1px solid var(--rose);
+  color: var(--rose);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.initiate-banner__actions {
+  display: flex;
+  justify-content: flex-end;
 }

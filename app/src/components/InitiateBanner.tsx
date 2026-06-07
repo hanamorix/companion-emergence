@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export type InitiateMessage = {
   auditId: string;
@@ -18,7 +18,9 @@ export type InitiateMessage = {
 type Props = {
   message: InitiateMessage;
   companionName: string;
-  onReply: (auditId: string) => void;
+  /** @deprecated — use onSendReply. Will be removed once ChatPanel is updated (Task 2). */
+  onReply?: (auditId: string) => void;
+  onSendReply: (auditId: string, text: string) => void;
   onDismiss: (auditId: string) => void;
   onMounted: (auditId: string) => void;
 };
@@ -33,8 +35,10 @@ const STATE_LABEL: Record<InitiateMessage["state"], string> = {
   dismissed: "dismissed",
 };
 
-export function InitiateBanner({ message, companionName, onReply, onDismiss, onMounted }: Props) {
+export function InitiateBanner({ message, companionName, onReply, onSendReply, onDismiss, onMounted }: Props) {
   const firedRef = useRef(false);
+  const [draft, setDraft] = useState("");
+
   useEffect(() => {
     // 2-second on-screen timer that respects document visibility:
     // if the user minimizes / switches tabs, pause; resume when visible.
@@ -78,21 +82,47 @@ export function InitiateBanner({ message, companionName, onReply, onDismiss, onM
     };
   }, [message.auditId, onMounted]);
 
+  function send() {
+    const t = draft.trim();
+    if (!t) return;
+    onSendReply(message.auditId, t);
+    setDraft("");
+  }
+
   return (
     <div className="initiate-banner" role="region" aria-label={`${companionName} reached out`}>
+      <div className="initiate-banner__header">✶ {companionName} reached out</div>
       <div className="initiate-banner__body">{message.body}</div>
       <div className="initiate-banner__meta">
         <span className="initiate-banner__urgency">{message.urgency}</span>
         <span className="initiate-banner__state">{STATE_LABEL[message.state]}</span>
       </div>
-      <div className="initiate-banner__actions">
-        <button
-          type="button"
-          onClick={() => onReply(message.auditId)}
-          aria-label="Reply (↩)"
-        >
-          ↩ reply
+      <div className="initiate-banner__reply">
+        <textarea
+          placeholder="reply…"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        />
+        <button type="button" onClick={send} aria-label="Send reply">
+          ↵
         </button>
+      </div>
+      <div className="initiate-banner__actions">
+        {onReply && (
+          <button
+            type="button"
+            onClick={() => onReply(message.auditId)}
+            aria-label="Reply (↩)"
+          >
+            ↩ reply
+          </button>
+        )}
         <button
           type="button"
           onClick={() => onDismiss(message.auditId)}
