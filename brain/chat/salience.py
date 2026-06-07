@@ -36,8 +36,8 @@ _BASE_AFFECT = frozenset({
 _AFFECT_PHRASES = frozenset({
     "long day", "rough day", "hard day", "worn out", "burned out", "burnt out",
     "can't sleep", "didn't sleep", "so tired", "exhausting", "running on empty",
-    "eyes are sandpaper", "sandpaper", "too much", "had enough", "falling apart",
-    "on edge", "wiped out", "no energy",
+    "eyes are sandpaper", "had enough", "falling apart",
+    "wiped out", "no energy",
 })
 
 
