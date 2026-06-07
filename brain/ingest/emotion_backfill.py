@@ -328,9 +328,13 @@ def run_emotion_backfill(
 
         tagged_this_run = 0
 
+        # Import once before loop — local import is circular-safe.
+        from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
+
         for memory in candidates:
-            # Yield gate: stop if the user is actively chatting so the CLI is free.
-            # The cursor is preserved — the next supervisor pass resumes from here.
+            # Yield gate (disk-based, restart-robust): stop if the user is
+            # actively chatting so the CLI is free.  The cursor is preserved —
+            # the next supervisor pass resumes from here.
             if _user_recently_active(persona_dir, now=now_dt):
                 logger.info(
                     "emotion_backfill: yielding — user actively chatting; "
@@ -338,45 +342,62 @@ def run_emotion_backfill(
                 )
                 break
 
-            if not _consume_budget(persona_dir, now=now_dt, cap=cap):
-                state = replace(state, status="deferred_to_next_day")
+            # Global concurrency cap: only one background CLI consumer at a time.
+            # Wraps budget-check + Haiku call + write-back so the slot is held for
+            # the full per-memory unit of work and released before the pacing sleep.
+            # Per-iteration acquire/release is safe because the 1.5s inter-call
+            # delay means there is no tight-loop gap concern.
+            # Belt-and-suspenders: _user_recently_active (disk, restart-robust) and
+            # cli_throttle (monotonic clock, resets on restart) both guard the call.
+            with _cli_throttle.background_slot() as _slot:
+                if not _slot:
+                    logger.info(
+                        "emotion_backfill: throttle slot unavailable — "
+                        "deferring; cursor preserved for next pass"
+                    )
+                    break
+
+                if not _consume_budget(persona_dir, now=now_dt, cap=cap):
+                    state = replace(state, status="deferred_to_next_day")
+                    _save_state(persona_dir, state)
+                    logger.info(
+                        "emotion_backfill: daily cap (%d) reached; deferred. "
+                        "tagged_so_far=%d cursor=%s",
+                        cap, tagged_so_far, last_cursor,
+                    )
+                    return state
+
+                try:
+                    raw_emotions = tagger_fn(memory)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
+                    continue
+
+                filtered = _normalize(raw_emotions, vocab)
+                if not filtered:
+                    continue
+
+                try:
+                    store.update(memory.id, emotions=filtered)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "emotion_backfill: write-back error on %s: %s", memory.id, exc
+                    )
+                    continue
+
+                tagged_so_far += 1
+                tagged_this_run += 1
+                last_cursor = memory.id
+                state = replace(
+                    state,
+                    tagged_memories=tagged_so_far,
+                    last_cursor=last_cursor,
+                )
                 _save_state(persona_dir, state)
-                logger.info(
-                    "emotion_backfill: daily cap (%d) reached; deferred. "
-                    "tagged_so_far=%d cursor=%s",
-                    cap, tagged_so_far, last_cursor,
-                )
-                return state
-
-            try:
-                raw_emotions = tagger_fn(memory)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
-                continue
-
-            filtered = _normalize(raw_emotions, vocab)
-            if not filtered:
-                continue
-
-            try:
-                store.update(memory.id, emotions=filtered)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "emotion_backfill: write-back error on %s: %s", memory.id, exc
-                )
-                continue
-
-            tagged_so_far += 1
-            tagged_this_run += 1
-            last_cursor = memory.id
-            state = replace(
-                state,
-                tagged_memories=tagged_so_far,
-                last_cursor=last_cursor,
-            )
-            _save_state(persona_dir, state)
 
             # Inter-call pacing: leave the CLI free between tag operations.
+            # Runs OUTSIDE the slot so the slot is released before the sleep —
+            # other background consumers can acquire while we pace.
             # Tests pass delay_s=0 to skip the wait.
             if delay_s > 0:
                 time.sleep(delay_s)
