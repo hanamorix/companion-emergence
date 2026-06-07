@@ -283,6 +283,8 @@ html[data-reduced-motion="true"] *::after {
   padding: 4px 10px;
   cursor: pointer;
 }
+.initiate-banner__reply textarea:disabled,
+.initiate-banner__reply button:disabled { opacity: 0.5; cursor: not-allowed; }
 .initiate-banner__actions {
   display: flex;
   justify-content: flex-end;

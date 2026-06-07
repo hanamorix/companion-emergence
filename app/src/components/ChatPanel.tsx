@@ -808,6 +808,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
               onSendReply={onCardSendReply}
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}
+              isStreaming={streaming}
             />
           ))}
         </div>
