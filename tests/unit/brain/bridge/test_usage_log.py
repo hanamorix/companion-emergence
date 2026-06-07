@@ -155,6 +155,46 @@ def test_chat_stream_logs_usage_on_result_frame(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# ClaudeCliProvider.chat() non-streaming text path integration
+# ---------------------------------------------------------------------------
+
+
+def test_nonstreaming_chat_logs_usage(tmp_path):
+    """ClaudeCliProvider.chat() (no tools, no images) writes a chat_usage.jsonl row."""
+    payload = {
+        "result": "hi",
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 9,
+            "cache_creation_input_tokens": 1234,
+            "cache_read_input_tokens": 0,
+        },
+        "total_cost_usd": 0.01,
+        "num_turns": 1,
+        "duration_ms": 100,
+        "session_id": "s",
+    }
+    provider = ClaudeCliProvider(model="sonnet")
+    with patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_result(payload),
+    ):
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            options={"persona_dir": str(tmp_path)},
+        )
+
+    rows = (tmp_path / "chat_usage.jsonl").read_text().strip().splitlines()
+    assert len(rows) == 1
+    row = json.loads(rows[0])
+    assert row["call_type"] == "chat"
+    assert row["input_tokens"] == 5
+    assert row["output_tokens"] == 9
+    assert row["cache_creation_input_tokens"] == 1234
+    assert row["total_cost_usd"] == 0.01
+
+
+# ---------------------------------------------------------------------------
 # Attunement detector threading
 # ---------------------------------------------------------------------------
 
