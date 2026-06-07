@@ -531,6 +531,8 @@ def _review_pending_candidates_locked(
     Caller must hold the soul_candidates.jsonl file lock; concurrent
     queue appends would otherwise race the rewrite.
     """
+    # local import: avoids a circular dependency on brain.bridge
+    from brain.bridge import cli_throttle
     from brain.soul.audit import append_audit_entry  # noqa: F401  used below
 
     records = _load_soul_candidates(persona_dir)
@@ -564,33 +566,39 @@ def _review_pending_candidates_locked(
 
     companion_name = persona_dir.name
 
-    for idx in to_examine:
-        record = records[idx]
-        candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
+    # Acquire the throttle slot ONCE for the whole tick (not per-candidate).
+    # This closes the concurrency gap where _inflight_background would drop to 0
+    # between candidates, allowing another background engine to overlap.
+    # Per-candidate, should_yield() is checked to yield early if chat arrives
+    # mid-batch — the slot is still held (no gap), and the cadence re-fires.
+    with cli_throttle.background_slot() as slot:
+        if not slot:
+            # Chat active or cap hit — defer the whole tick; cadence re-fires.
+            return report
 
-        related = _related_memory_snippets(store, record.get("text", ""))
-        messages = _build_messages(
-            record,
-            related,
-            emotional_summary,
-            soul_size,
-            companion_name=companion_name,
-            draft_fragments=draft_fragments,
-        )
-
-        # Build flat prompt for provider.generate (text mode)
-        # Both Claude CLI and Ollama return JSON when instructed — simpler than tools.
-        system_content = messages[0]["content"]
-        user_content = messages[1]["content"]
-
-        # Yield to active chat — defer this tick; backlog-drain cadence re-fires.
-        from brain.bridge import (
-            cli_throttle,  # local import: avoids a circular dependency on brain.bridge
-        )
-
-        with cli_throttle.background_slot() as slot:
-            if not slot:
+        for idx in to_examine:
+            # Peek: if a chat turn arrived mid-batch, stop processing.
+            # The slot remains held (no gap), and the cadence re-fires next tick.
+            if cli_throttle.should_yield():
                 break
+
+            record = records[idx]
+            candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
+
+            related = _related_memory_snippets(store, record.get("text", ""))
+            messages = _build_messages(
+                record,
+                related,
+                emotional_summary,
+                soul_size,
+                companion_name=companion_name,
+                draft_fragments=draft_fragments,
+            )
+
+            # Build flat prompt for provider.generate (text mode)
+            # Both Claude CLI and Ollama return JSON when instructed — simpler than tools.
+            system_content = messages[0]["content"]
+            user_content = messages[1]["content"]
 
             report.examined += 1
 

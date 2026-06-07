@@ -302,6 +302,66 @@ def test_soul_review_defers_when_chat_active(tmp_path):
         soul_store.close()
 
 
+def test_soul_review_mid_batch_yield(tmp_path):
+    """Chat arriving mid-batch stops the loop: candidate 1 is processed,
+    candidate 2 is NOT (provider.generate called exactly once)."""
+    import json
+
+    # Two pending candidates
+    candidates_path = tmp_path / "soul_candidates.jsonl"
+    candidates_path.write_text(
+        json.dumps(_make_soul_candidate("first moment")) + "\n"
+        + json.dumps(_make_soul_candidate("second moment")) + "\n",
+        encoding="utf-8",
+    )
+
+    call_count = 0
+
+    class _ChatArrivesAfterFirst(LLMProvider):
+        """Generates a valid soul JSON for the first call, then marks chat active."""
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            nonlocal call_count
+            call_count += 1
+            # After first call, simulate a chat turn arriving
+            cli_throttle.mark_interactive_active()
+            return json.dumps({
+                "decision": "defer",
+                "love_type": "craft",
+                "resonance": 5,
+                "confidence": 3,
+                "reasoning": "not sure yet",
+                "why_it_matters": "unclear",
+            })
+
+        def name(self) -> str:
+            return "chat-arrives-after-first"
+
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="", tool_calls=())
+
+    store = MemoryStore(":memory:")
+    soul_store = SoulStore(":memory:")
+    try:
+        provider = _ChatArrivesAfterFirst()
+
+        report = review_pending_candidates(
+            tmp_path,
+            store=store,
+            soul_store=soul_store,
+            provider=provider,
+            max_decisions=5,
+        )
+
+        assert call_count == 1, (
+            f"expected exactly 1 model call (candidate 1 processed, candidate 2 mid-batch yielded); got {call_count}"
+        )
+        assert report.examined == 1
+    finally:
+        store.close()
+        soul_store.close()
+
+
 # ---------------------------------------------------------------------------
 # initiate/review.py  (run_initiate_review_tick)
 # ---------------------------------------------------------------------------
