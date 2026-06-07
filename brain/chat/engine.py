@@ -222,8 +222,13 @@ def respond(
     prior_user_text = next(
         (m.content_text() for m in reversed(history_msgs) if m.role == "user"), None
     )
-    signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
-    allowed = select_tools(signal)
+    try:
+        signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
+        allowed = select_tools(signal)
+    except Exception:  # noqa: BLE001 — never let recruitment crash a turn; fall back to full suite
+        logger.warning("salience/recruitment failed; using full tool suite", exc_info=True)
+        signal = None
+        allowed = None
     tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
     response, invocations = run_tool_loop(
         messages,
@@ -249,6 +254,11 @@ def respond(
     session.append_turn(user_input, content)
 
     duration_ms = int((time.monotonic() - t0) * 1000)
+
+    # Re-stamp at turn-END so the idle window is measured from completion,
+    # not from when the turn started. A long LLM call can exhaust the idle
+    # window mid-flight and let a background job fire concurrently otherwise.
+    cli_throttle.mark_interactive_active()
 
     return ChatResult(
         content=content,
