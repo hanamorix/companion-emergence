@@ -69,17 +69,18 @@ def test_pass2_fires_after_record_monologue(tmp_path: Path):
             hebbian=hebbian,
             persona_dir=persona_dir,
         )
+        # Pass 2 now flows through the in-process pass2_queue (single worker, #27);
+        # drain it here (store still open) so the extraction's provider call lands.
+        from brain.bridge import cli_throttle
+        from brain.chat import pass2_queue
+
+        cli_throttle.reset()
+        pass2_queue.drain_pending()
     finally:
         store.close()
         hebbian.close()
 
-    # Pass 2 runs in a daemon thread -- give it 5s.
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        if provider.generate_calls >= 1:
-            break
-        time.sleep(0.05)
-
+    # Pass 2 fired (record_monologue was captured) → one generate call.
     assert provider.generate_calls == 1
 
 
