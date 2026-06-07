@@ -21,9 +21,10 @@ type Props = {
   onSendReply: (auditId: string, text: string) => void;
   onDismiss: (auditId: string) => void;
   onMounted: (auditId: string) => void;
+  isStreaming?: boolean;
 };
 
-export function InitiateBanner({ message, companionName, onSendReply, onDismiss, onMounted }: Props) {
+export function InitiateBanner({ message, companionName, onSendReply, onDismiss, onMounted, isStreaming = false }: Props) {
   const firedRef = useRef(false);
   const [draft, setDraft] = useState("");
 
@@ -71,6 +72,7 @@ export function InitiateBanner({ message, companionName, onSendReply, onDismiss,
   }, [message.auditId, onMounted]);
 
   function send() {
+    if (isStreaming) return;
     const t = draft.trim();
     if (!t) return;
     onSendReply(message.auditId, t);
@@ -85,7 +87,9 @@ export function InitiateBanner({ message, companionName, onSendReply, onDismiss,
         <textarea
           aria-label={`Reply to ${companionName}`}
           placeholder="reply…"
+          rows={1}
           value={draft}
+          disabled={isStreaming}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -94,7 +98,7 @@ export function InitiateBanner({ message, companionName, onSendReply, onDismiss,
             }
           }}
         />
-        <button type="button" onClick={send} aria-label="Send reply">
+        <button type="button" onClick={send} disabled={isStreaming} aria-label="Send reply">
           ↵
         </button>
       </div>

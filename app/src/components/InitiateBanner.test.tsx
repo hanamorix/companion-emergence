@@ -122,6 +122,65 @@ describe("InitiateBanner", () => {
     expect(region.getAttribute("aria-label")).not.toContain("Nell");
   });
 
+  it("disables textarea and send button when isStreaming=true, but dismiss stays enabled", () => {
+    const onSendReply = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <InitiateBanner
+        message={baseMessage}
+        companionName="Nell"
+        onSendReply={onSendReply}
+        onDismiss={onDismiss}
+        onMounted={vi.fn()}
+        isStreaming={true}
+      />,
+    );
+    const textarea = screen.getByPlaceholderText(/reply/i);
+    const sendBtn = screen.getByRole("button", { name: /send reply/i });
+    const dismissBtn = screen.getByRole("button", { name: /dismiss/i });
+
+    expect(textarea).toBeDisabled();
+    expect(sendBtn).toBeDisabled();
+    expect(dismissBtn).not.toBeDisabled();
+  });
+
+  it("does not call onSendReply via Enter or click while isStreaming=true", () => {
+    const onSendReply = vi.fn();
+    render(
+      <InitiateBanner
+        message={baseMessage}
+        companionName="Nell"
+        onSendReply={onSendReply}
+        onDismiss={vi.fn()}
+        onMounted={vi.fn()}
+        isStreaming={true}
+      />,
+    );
+    const textarea = screen.getByPlaceholderText(/reply/i);
+    const sendBtn = screen.getByRole("button", { name: /send reply/i });
+    fireEvent.click(sendBtn);
+    expect(onSendReply).not.toHaveBeenCalled();
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSendReply).not.toHaveBeenCalled();
+  });
+
+  it("calls onDismiss when × is clicked even while isStreaming=true", () => {
+    const onDismiss = vi.fn();
+    render(
+      <InitiateBanner
+        message={baseMessage}
+        companionName="Nell"
+        onSendReply={vi.fn()}
+        onDismiss={onDismiss}
+        onMounted={vi.fn()}
+        isStreaming={true}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(onDismiss).toHaveBeenCalledWith("ia_001");
+  });
+
   it("does not fire onMounted twice across multiple visibility cycles", () => {
     vi.useFakeTimers();
     const hiddenSpy = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
