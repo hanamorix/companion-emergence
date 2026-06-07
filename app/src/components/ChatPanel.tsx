@@ -156,6 +156,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
+  // Monotonic bubble-id counter. Seeded from Date.now() so it starts well
+  // above the small turn-number ids used for history bubbles (id: h.turn).
+  const bubbleIdRef = useRef<number>(Date.now());
+  const nextBubbleId = () => (bubbleIdRef.current += 1);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -491,7 +495,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     }
 
     const userMsg: Message = {
-      id: Date.now(),
+      id: nextBubbleId(),
       from: "hana",
       text: outboundText,
       time: formatTime(),
@@ -501,7 +505,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     // the unmount cleanup revokes it. Don't revoke here.
     if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
 
-    const replyId = Date.now() + 1;
+    const replyId = nextBubbleId();
     const replyStub: Message = {
       id: replyId,
       from: "nell",
@@ -660,11 +664,13 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Prepends the reach-out body as a ✶-marked nell bubble, then sends
   // the reply through streamTurn with replyToAuditId threaded.
   const onCardSendReply = (auditId: string, text: string) => {
+    if (streaming || !text.trim()) return;   // don't double-stream; don't send empty
     const banner = activeBanners.find((b) => b.auditId === auditId);
     setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
     const prepend: Message[] = banner
-      ? [{ id: Date.now() - 1, from: "nell", text: banner.body, time: formatTime(), reachedOut: true }]
+      ? [{ id: nextBubbleId(), from: "nell", text: banner.body, time: formatTime(), reachedOut: true }]
       : [];
+    // fire-and-forget: streamTurn owns its own error surfacing (failure bubble + setErrorSafe)
     void streamTurn({ text, replyToAuditId: auditId, prepend });
   };
 

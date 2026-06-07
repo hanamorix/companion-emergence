@@ -806,6 +806,81 @@ describe("ChatPanel — reach-out card reply merges into transcript (Task 2)", (
     vi.restoreAllMocks();
   });
 
+  it("card reply while streaming is a no-op — banner stays, streamChat not called again", async () => {
+    // Simulate streaming=true by making the first streamChat call not resolve
+    // its cancel (stream stays open) so the component's streaming state remains true.
+    // Use a ref-box so TypeScript doesn't narrow to `never` via control flow.
+    const firstResolveBox: { fn: (() => void) | null } = { fn: null };
+    mockedStreamChat.mockImplementationOnce(
+      () =>
+        new Promise<() => void>((resolve) => {
+          // Resolve with a cancel fn only when the test chooses — streaming
+          // stays true until then because streamChat hasn't returned yet.
+          firstResolveBox.fn = () => resolve(() => undefined);
+        }),
+    );
+
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    // Deliver two banners.
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_first",
+        body: "first reach-out",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-06-07T10:00:00+00:00",
+      });
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_second",
+        body: "second reach-out",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-06-07T10:01:00+00:00",
+      });
+    });
+
+    await screen.findByText(/first reach-out/);
+    await screen.findByText(/second reach-out/);
+
+    // Reply to first card → streamChat called once (returns a never-resolving promise so streaming stays true).
+    const firstCardTextareas = screen.getAllByLabelText(/^Reply to Nell$/i) as HTMLTextAreaElement[];
+    await act(async () => {
+      fireEvent.change(firstCardTextareas[0], { target: { value: "got your first" } });
+    });
+    const sendBtns = screen.getAllByRole("button", { name: /Send reply/i });
+    await act(async () => {
+      fireEvent.click(sendBtns[0]);
+    });
+
+    // Allow the first streamChat call to begin (it returns a pending promise).
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalledTimes(1);
+    });
+
+    // Now streaming === true. Attempt a card reply on the second banner.
+    const secondCardTextareas = screen.getAllByLabelText(/^Reply to Nell$/i) as HTMLTextAreaElement[];
+    await act(async () => {
+      fireEvent.change(secondCardTextareas[0], { target: { value: "got your second" } });
+    });
+    const sendBtns2 = screen.getAllByRole("button", { name: /Send reply/i });
+    await act(async () => {
+      fireEvent.click(sendBtns2[0]);
+    });
+
+    // streamChat must NOT have been called a second time.
+    expect(mockedStreamChat).toHaveBeenCalledTimes(1);
+
+    // The second banner must still be present (guard fired before banner removal).
+    expect(screen.queryByText(/second reach-out/)).not.toBeNull();
+
+    // Cleanup: resolve the first stream so the component can unmount cleanly.
+    firstResolveBox.fn?.();
+  });
+
   it("reply from a reach-out card merges into the transcript with reply_to_audit_id and frees the main input", async () => {
     const stream = makeStream();
     render(<ChatPanel persona="nell" eventStream={stream} />);
