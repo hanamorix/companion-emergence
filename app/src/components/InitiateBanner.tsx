@@ -83,6 +83,7 @@ export function InitiateBanner({ message, companionName, onSendReply, onDismiss,
       <div className="initiate-banner__body">{message.body}</div>
       <div className="initiate-banner__reply">
         <textarea
+          aria-label={`Reply to ${companionName}`}
           placeholder="reply…"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
