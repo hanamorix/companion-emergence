@@ -287,3 +287,5 @@ html[data-reduced-motion="true"] *::after {
   display: flex;
   justify-content: flex-end;
 }
+
+.msg-reachedout { color: var(--rose); }

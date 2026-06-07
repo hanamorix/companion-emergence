@@ -478,6 +478,10 @@ describe("ChatPanel — initiate banner integration (Task 26)", () => {
 // to which initiate the user was replying to. The fix moves the transition
 // server-side by passing reply_to_audit_id in the streamChat payload, so
 // the audit + memory + chat engine all see the link atomically.
+//
+// Task 2 update: the old "click reply → type in main textarea → send" flow is
+// gone. The card now has an inline reply textarea (aria-label "Reply to Nell").
+// Both tests now use the card-reply path.
 describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
   const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
   const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
@@ -523,18 +527,15 @@ describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
         timestamp: "2026-05-12T09:00:00+00:00",
       });
     });
-    const replyBtn = await screen.findByRole("button", { name: /reply/i });
-    await act(async () => {
-      fireEvent.click(replyBtn);
-    });
 
-    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    // Card-reply path: type in the card's inline textarea and send.
+    const cardTextarea = await screen.findByLabelText(/^Reply to Nell$/i) as HTMLTextAreaElement;
     await act(async () => {
-      fireEvent.change(textarea, { target: { value: "yeah I felt it too" } });
+      fireEvent.change(cardTextarea, { target: { value: "yeah I felt it too" } });
     });
-    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    const cardSendBtn = screen.getByRole("button", { name: /Send reply/i });
     await act(async () => {
-      fireEvent.click(sendBtn);
+      fireEvent.click(cardSendBtn);
     });
 
     await waitFor(() => {
@@ -567,17 +568,15 @@ describe("ChatPanel — reply_to_audit_id threading (Bundle A #4)", () => {
         timestamp: "2026-05-12T09:00:00+00:00",
       });
     });
-    const replyBtn = await screen.findByRole("button", { name: /reply/i });
+
+    // Card-reply path: type in the card's inline textarea and send.
+    const cardTextarea = await screen.findByLabelText(/^Reply to Nell$/i) as HTMLTextAreaElement;
     await act(async () => {
-      fireEvent.click(replyBtn);
+      fireEvent.change(cardTextarea, { target: { value: "I see you" } });
     });
-    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    const cardSendBtn = screen.getByRole("button", { name: /Send reply/i });
     await act(async () => {
-      fireEvent.change(textarea, { target: { value: "I see you" } });
-    });
-    const sendBtn = screen.getByRole("button", { name: /^send$/i });
-    await act(async () => {
-      fireEvent.click(sendBtn);
+      fireEvent.click(cardSendBtn);
     });
 
     await waitFor(() => {
@@ -765,5 +764,102 @@ describe("ChatPanel — voice-edit accept/reject error handling", () => {
       expect(screen.queryByRole("dialog", { name: /voice edit proposal/i })).toBeNull();
     });
     expect(mockedRejectVoiceEdit).toHaveBeenCalledWith("nell", "ve_reject_ok");
+  });
+});
+
+// ── Task 2: reach-out card reply merges into transcript ──────────────────
+// Verifies the new onCardSendReply / streamTurn flow:
+//   1. reach-out body prepended to transcript as a ✶-marked nell bubble
+//   2. user reply appended as a hana bubble
+//   3. streamChat called with replyToAuditId
+//   4. card removed from UI
+//   5. main composer textarea untouched
+describe("ChatPanel — reach-out card reply merges into transcript (Task 2)", () => {
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  function makeStream() {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    return {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+      emit(e: Record<string, unknown> & { type: string }) {
+        for (const h of handlers) h(e);
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedFetchActive.mockReset();
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockReset();
+    mockedNewSession.mockResolvedValue("sess-task2");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("reply from a reach-out card merges into the transcript with reply_to_audit_id and frees the main input", async () => {
+    const stream = makeStream();
+    render(<ChatPanel persona="nell" eventStream={stream} />);
+
+    // 1. Emit an initiate_delivered event.
+    await act(async () => {
+      stream.emit({
+        type: "initiate_delivered",
+        audit_id: "ia_x",
+        body: "thinking of you",
+        urgency: "quiet",
+        state: "delivered",
+        timestamp: "2026-06-07T10:00:00+00:00",
+      });
+    });
+
+    // Card must appear.
+    await screen.findByText(/thinking of you/);
+
+    // 2. Type in the card's inline reply textarea and send.
+    const cardTextarea = screen.getByLabelText(/^Reply to Nell$/i) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(cardTextarea, { target: { value: "I'm here" } });
+    });
+    const cardSendBtn = screen.getByRole("button", { name: /Send reply/i });
+    await act(async () => {
+      fireEvent.click(cardSendBtn);
+    });
+
+    // 3. streamChat must be called with replyToAuditId === "ia_x".
+    await waitFor(() => {
+      expect(mockedStreamChat).toHaveBeenCalled();
+    });
+    const args = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+      { replyToAuditId?: string } | undefined,
+    ];
+    expect(args[4]?.replyToAuditId).toBe("ia_x");
+
+    // 4. Transcript shows the reach-out body AND the typed reply.
+    const chatMessages = screen.getByTestId("chat-messages");
+    expect(chatMessages.textContent).toContain("thinking of you");
+    expect(chatMessages.textContent).toContain("I'm here");
+    // The reach-out bubble renders a ✶ marker (msg-reachedout span).
+    expect(chatMessages.querySelector(".msg-reachedout")).not.toBeNull();
+
+    // 5. Card is gone — the header "Nell reached out" is no longer rendered.
+    expect(screen.queryByText(/Nell reached out/)).toBeNull();
+
+    // 6. Main composer textarea is still empty (untouched).
+    const mainTextarea = screen.getByPlaceholderText(/^Write to Nell/i) as HTMLTextAreaElement;
+    expect(mainTextarea.value).toBe("");
   });
 });
