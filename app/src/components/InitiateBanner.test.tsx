@@ -33,13 +33,6 @@ describe("InitiateBanner", () => {
     vi.useRealTimers();
   });
 
-  it("emits onReply when the ↩ button is clicked", () => {
-    const onReply = vi.fn();
-    render(<InitiateBanner message={baseMessage} companionName="Nell" onReply={onReply} onSendReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: /Reply \(↩\)/i }));
-    expect(onReply).toHaveBeenCalledWith("ia_001");
-  });
-
   it("renders a reply textarea and sends its text via onSendReply", () => {
     const onSendReply = vi.fn();
     render(<InitiateBanner message={baseMessage} companionName="Nell" onSendReply={onSendReply} onDismiss={vi.fn()} onMounted={vi.fn()} />);
@@ -84,11 +77,6 @@ describe("InitiateBanner", () => {
   it("shows the 'reached out' header with the companion name", () => {
     render(<InitiateBanner message={baseMessage} companionName="Nell" onSendReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
     expect(screen.getByText(/Nell reached out/i)).toBeInTheDocument();
-  });
-
-  it("shows state badge reflecting the current state", () => {
-    render(<InitiateBanner message={{ ...baseMessage, state: "acknowledged_unclear" }} companionName="Nell" onSendReply={vi.fn()} onDismiss={vi.fn()} onMounted={vi.fn()} />);
-    expect(screen.getByText(/unclear/i)).toBeInTheDocument();
   });
 
   it("does not call onMounted when document is hidden at mount time", () => {

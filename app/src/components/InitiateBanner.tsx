@@ -18,24 +18,12 @@ export type InitiateMessage = {
 type Props = {
   message: InitiateMessage;
   companionName: string;
-  /** @deprecated — use onSendReply. Will be removed once ChatPanel is updated (Task 2). */
-  onReply?: (auditId: string) => void;
   onSendReply: (auditId: string, text: string) => void;
   onDismiss: (auditId: string) => void;
   onMounted: (auditId: string) => void;
 };
 
-const STATE_LABEL: Record<InitiateMessage["state"], string> = {
-  pending: "pending",
-  delivered: "delivered",
-  read: "read",
-  replied_explicit: "replied",
-  acknowledged_unclear: "acknowledged unclear",
-  unanswered: "unanswered",
-  dismissed: "dismissed",
-};
-
-export function InitiateBanner({ message, companionName, onReply, onSendReply, onDismiss, onMounted }: Props) {
+export function InitiateBanner({ message, companionName, onSendReply, onDismiss, onMounted }: Props) {
   const firedRef = useRef(false);
   const [draft, setDraft] = useState("");
 
@@ -93,10 +81,6 @@ export function InitiateBanner({ message, companionName, onReply, onSendReply, o
     <div className="initiate-banner" role="region" aria-label={`${companionName} reached out`}>
       <div className="initiate-banner__header">✶ {companionName} reached out</div>
       <div className="initiate-banner__body">{message.body}</div>
-      <div className="initiate-banner__meta">
-        <span className="initiate-banner__urgency">{message.urgency}</span>
-        <span className="initiate-banner__state">{STATE_LABEL[message.state]}</span>
-      </div>
       <div className="initiate-banner__reply">
         <textarea
           placeholder="reply…"
@@ -114,15 +98,6 @@ export function InitiateBanner({ message, companionName, onReply, onSendReply, o
         </button>
       </div>
       <div className="initiate-banner__actions">
-        {onReply && (
-          <button
-            type="button"
-            onClick={() => onReply(message.auditId)}
-            aria-label="Reply (↩)"
-          >
-            ↩ reply
-          </button>
-        )}
         <button
           type="button"
           onClick={() => onDismiss(message.auditId)}
