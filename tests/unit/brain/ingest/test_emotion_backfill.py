@@ -535,3 +535,53 @@ def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
     updated = store2.get(m.id)
     store2.close()
     assert updated.emotions == {}, "memory was tagged despite active user session"
+
+
+# ---------------------------------------------------------------------------
+# Step THROTTLE.1 — run_emotion_backfill defers when cli_throttle slot unavailable
+# ---------------------------------------------------------------------------
+
+def test_run_defers_when_throttle_slot_unavailable(tmp_path):
+    """When the cli_throttle concurrency cap is exhausted (slot unavailable),
+    run_emotion_backfill must NOT call the tagger and must leave state resumable.
+
+    This test is independent of the disk-based _user_recently_active yield: the
+    buffer dir is absent so that check passes — only the throttle slot is blocked.
+    Belt-and-suspenders: both checks must independently gate the Haiku call.
+    """
+    from unittest.mock import MagicMock
+
+    from brain.bridge import cli_throttle
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+    from brain.memory.store import MemoryStore
+
+    # Seed one emotion-less memory (no buffer dir → _user_recently_active False)
+    store = _make_store(tmp_path)
+    m = _create_memory(store, has_emotions=False)
+    store.close()
+
+    # Mark interactive active so the slot is denied (same mechanism used by
+    # other background-engine tests in test_background_yields.py).
+    cli_throttle.mark_interactive_active()
+
+    # Spy on the tagger — must never be called
+    spy_tagger = MagicMock(return_value={"loneliness": 7.0})
+
+    state = run_emotion_backfill(tmp_path, tagger_fn=spy_tagger, cap=50, delay_s=0)
+
+    # Tagger must NOT have been called — slot was unavailable
+    assert spy_tagger.call_count == 0, (
+        f"tagger called {spy_tagger.call_count} time(s) despite throttle slot being unavailable"
+    )
+
+    # Status must NOT be 'complete' — cursor preserved for next pass
+    assert state.status != "complete", (
+        f"unexpected status={state.status!r} after throttle-slot defer; "
+        "should remain resumable"
+    )
+
+    # Memory must still have no emotions — nothing was written
+    store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
+    updated = store2.get(m.id)
+    store2.close()
+    assert updated.emotions == {}, "memory was tagged despite throttle slot being unavailable"

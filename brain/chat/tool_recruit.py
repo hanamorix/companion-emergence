@@ -53,14 +53,13 @@ def select_tools(
     if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
 
-    allowed: list[str] = list(REFLEXIVE_CORE)
+    keep: set[str] = set(REFLEXIVE_CORE)
 
     if signal.references_past or signal.mentions_entity_or_date or signal.topic_shift:
-        allowed += [t for t in _MEMORY_TOOLS if t not in allowed]
+        keep.update(_MEMORY_TOOLS)
 
     if signal.mentions_file_or_path:
-        allowed += [t for t in _FILE_TOOLS if t not in allowed]
+        keep.update(_FILE_TOOLS)
 
     # Preserve base ordering; drop anything not in base.
-    keep = set(allowed)
     return [t for t in base if t in keep]
