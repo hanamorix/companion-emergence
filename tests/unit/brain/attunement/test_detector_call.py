@@ -128,6 +128,34 @@ def test_detector_returns_decline_on_empty_buffer():
 
 # ── companion_name parameterisation (SITE 1) ─────────────────────────────────
 
+def test_call_haiku_failure_writes_error_row(tmp_path, monkeypatch):
+    """A failing Haiku call must write an audit row to attunement_errors.jsonl."""
+    import json as _json
+
+    import brain.attunement.detector as det
+    from brain.bridge.provider import ClaudeCliProvider
+
+    monkeypatch.setattr(
+        ClaudeCliProvider,
+        "generate",
+        lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("429 boom")),
+    )
+    out = det._call_haiku("sys", "usr", persona_dir=tmp_path)
+    assert out == ""  # still declines gracefully
+
+    error_file = tmp_path / "attunement_errors.jsonl"
+    assert error_file.exists(), "attunement_errors.jsonl must be written on Haiku failure"
+    rows = error_file.read_text().strip().splitlines()
+    assert rows, "expected at least one row"
+    row = _json.loads(rows[-1])
+    assert "429 boom" in row["error"]
+    assert row.get("kind") == "haiku_call_failed"
+    assert "ts" in row
+    assert "traceback" in row
+
+
+# ── companion_name parameterisation (SITE 1) ─────────────────────────────────
+
 def test_build_user_message_uses_companion_name_in_label():
     """_build_user_message with companion_name='Mira' emits 'MIRA', not 'NELL'."""
     turns = [BufferTurn(id="t1", content="hello")]
