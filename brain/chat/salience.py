@@ -5,7 +5,6 @@ Fails open: any exception → SalienceSignal.maximal() so a scorer bug can only
 ever cost MORE (attach tools / reflect), never silently strip agency."""
 from __future__ import annotations
 
-import functools
 import logging
 import re
 from dataclasses import dataclass
@@ -41,14 +40,16 @@ _AFFECT_PHRASES = frozenset({
 })
 
 
-@functools.cache
+_TOKEN_RE = re.compile(r"[a-z']+")
+
+
 def _emotion_names() -> frozenset[str]:
     from brain.emotion import vocabulary
     return frozenset(e.name.lower() for e in vocabulary.list_all())
 
 
 def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z']+", text.lower())
+    return _TOKEN_RE.findall(text.lower())
 
 
 @dataclass(frozen=True)
@@ -123,5 +124,5 @@ def assess_salience(
             word_count=wc,
         )
     except Exception:  # noqa: BLE001 — fail open: never strip agency on a scorer bug
-        log.debug("assess_salience failed; returning maximal signal", exc_info=True)
+        log.warning("assess_salience failed; returning maximal signal", exc_info=True)
         return SalienceSignal.maximal()

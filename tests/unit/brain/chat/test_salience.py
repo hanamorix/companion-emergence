@@ -64,3 +64,34 @@ def test_fails_open_on_bad_input(monkeypatch):
     s = assess_salience("anything")
     assert s == SalienceSignal.maximal()
     assert s.score == 1.0
+
+
+def test_emotion_names_reflects_late_registration(monkeypatch):
+    # vocab registered AFTER first assess_salience call must still be picked up
+    # (i.e. no permanent caching of the vocab snapshot)
+    import brain.chat.salience as mod
+    import brain.emotion.vocabulary as vocab
+    calls = {"n": 0}
+    real = vocab.list_all
+    def counting():
+        calls["n"] += 1
+        return real()
+    monkeypatch.setattr(vocab, "list_all", counting)
+    mod._emotion_names()  # first call
+    n1 = calls["n"]
+    mod._emotion_names()  # second call — must re-read, not return cached result
+    assert calls["n"] > n1, "vocab must be re-read each call, not frozen by a cache"
+
+
+def test_fail_open_logs_warning(monkeypatch, caplog):
+    # a persistent scorer failure must log at WARNING level (not DEBUG)
+    # so a silently-inflating-cost failure is visible in prod
+    import logging
+
+    import brain.chat.salience as mod
+    monkeypatch.setattr(mod, "_emotion_names", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level(logging.WARNING, logger="brain.chat.salience"):
+        s = assess_salience("anything")
+    assert s == SalienceSignal.maximal()
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_records, "assess_salience fail-open must log at WARNING, not DEBUG"
