@@ -264,6 +264,36 @@ def test_run_tick_internal_scope_skips_searcher(tmp_path: Path):
         store.close()
 
 
+def test_research_does_not_fetch_when_chat_active(tmp_path: Path):
+    """Throttle gate fires BEFORE the web search: a deferred tick must not call
+    self.searcher.search at all, and must return reason='deferred_chat_active'."""
+    from brain.bridge import cli_throttle
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+
+    search_calls: list[str] = []
+
+    class SpySearcher(NoopWebSearcher):
+        def search(self, query: str, *, limit: int = 5):
+            search_calls.append(query)
+            return []
+
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active()  # chat is active → slot yields False
+    try:
+        engine = _build_engine(tmp_path, store, searcher=SpySearcher())
+        result = engine.run_tick(days_since_human_override=5.0)
+        assert result.fired is None
+        assert result.reason == "deferred_chat_active"
+        assert search_calls == [], (
+            "searcher.search must NOT be called when the throttle gate defers"
+        )
+    finally:
+        cli_throttle.reset()
+        store.close()
+
+
 def test_run_tick_llm_failure_does_not_touch_files(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
