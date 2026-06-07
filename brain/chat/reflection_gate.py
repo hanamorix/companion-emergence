@@ -11,7 +11,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_SALIENCE_THRESHOLD = 0.35
+_SALIENCE_THRESHOLD = 0.30
 _MIN_TURNS_BETWEEN = 4  # debounce window in turns
 
 

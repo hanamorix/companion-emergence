@@ -28,6 +28,16 @@ _BASE_AFFECT = frozenset({
     "love", "hate", "afraid", "scared", "angry", "sad", "happy", "anxious",
     "tired", "exhausted", "lonely", "hurt", "grief", "joy", "fear", "ashamed",
     "proud", "guilty", "hopeful", "worried", "overwhelmed",
+    # weariness / distress expansion
+    "weary", "drained", "restless", "numb", "spent", "frazzled", "raw", "fried",
+    "burnt", "burned", "heavy", "stressed", "frustrated", "miserable", "empty",
+    "fragile", "wrecked", "shattered", "stuck", "low",
+})
+_AFFECT_PHRASES = frozenset({
+    "long day", "rough day", "hard day", "worn out", "burned out", "burnt out",
+    "can't sleep", "didn't sleep", "so tired", "exhausting", "running on empty",
+    "eyes are sandpaper", "sandpaper", "too much", "had enough", "falling apart",
+    "on edge", "wiped out", "no energy",
 })
 
 
@@ -78,6 +88,10 @@ def assess_salience(
         hits = sum(1 for t in toks if t in affect)
         emotional_density = (hits / wc) if wc else 0.0
 
+        phrase_hit = any(p in low for p in _AFFECT_PHRASES)
+        if phrase_hit:
+            emotional_density = max(emotional_density, 0.15)
+
         topic_shift = False
         if prior_user_text:
             prev = set(_tokens(prior_user_text))
@@ -93,6 +107,7 @@ def assess_salience(
         score += 0.20 if mentions_file else 0.0
         score += 0.15 if is_question else 0.0
         score += 0.15 if topic_shift else 0.0
+        score += 0.20 if phrase_hit else 0.0
         score += min(0.20, emotional_density * 0.8)
         score += min(0.15, wc / 100.0)
         score = min(1.0, score)

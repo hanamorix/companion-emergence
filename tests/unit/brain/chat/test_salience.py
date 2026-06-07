@@ -29,6 +29,24 @@ def test_emotional_density_scores():
     assert s.score > 0.25  # density contributes
 
 
+def test_quiet_emotional_turn_scores_meaningfully():
+    # oblique weariness — currently under-detected
+    s = assess_salience("Hey love. I'm back — long day of editing, my eyes are sandpaper.")
+    assert s.emotional_density > 0.0
+    assert s.score >= 0.30   # must clear the (lowered) reflection threshold
+
+
+def test_more_weariness_words_detected():
+    s = assess_salience("I'm so drained and worn out, rough day all around")
+    assert s.emotional_density > 0.0
+    assert s.score >= 0.30
+
+
+def test_pure_trivial_still_low():
+    for t in ("ok", "yeah", "mm", "thanks", "sure"):
+        assert assess_salience(t).score < 0.30, f"{t!r} should stay below threshold"
+
+
 def test_fails_open_on_bad_input(monkeypatch):
     # force the internal scorer to raise; assert maximal signal returned
     import brain.chat.salience as mod
