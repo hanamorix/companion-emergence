@@ -18,7 +18,6 @@ Scenarios covered:
 from __future__ import annotations
 
 import json
-import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -39,15 +38,15 @@ from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 # ---------------------------------------------------------------------------
 
 def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
-    end = time.time() + timeout
-    while time.time() < end:
-        threads = [t for t in threading.enumerate() if t.name.startswith("attunement-extractor")]
-        if not threads:
-            return
-        for t in threads:
-            t.join(timeout=0.1)
-        if all(not t.is_alive() for t in threads):
-            return
+    # Pass-2 extraction now flows through the in-process pass2_queue (single
+    # worker) rather than a per-turn daemon thread (#27). Drain it synchronously:
+    # cli_throttle is idle in tests (conftest reset), so drain_pending runs the
+    # queued items. Kept the old name so callers are unchanged.
+    from brain.bridge import cli_throttle
+    from brain.chat import pass2_queue
+
+    cli_throttle.reset()
+    pass2_queue.drain_pending()
 
 
 def _fake_detector_output(source_turn_id: str = "msg-0") -> DetectorOutput:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
@@ -85,13 +84,13 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path):
         assert digest_log.exists()
         assert "didn't pretend" in digest_log.read_text()
 
-        # Pass 2 is async — wait for memory write to land.
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            recent = list(store.list_by_type("monologue", active_only=True, limit=10))
-            if recent:
-                break
-            time.sleep(0.05)
+        # Pass 2 now flows through the in-process pass2_queue (single worker, #27).
+        # Drain it synchronously so the memory write lands (cli_throttle idle in tests).
+        from brain.bridge import cli_throttle
+        from brain.chat import pass2_queue
+
+        cli_throttle.reset()
+        pass2_queue.drain_pending()
 
         recent = list(store.list_by_type("monologue", active_only=True, limit=10))
         assert any("Loopy" in m.content for m in recent), (
