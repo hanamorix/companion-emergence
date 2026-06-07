@@ -27,8 +27,10 @@ from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
 from brain.chat.budget import apply_budget
 from brain.chat.prompt import build_system_message
+from brain.chat.salience import assess_salience
 from brain.chat.session import SessionState, create_session
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
+from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
 from brain.images import media_type_for_sha
@@ -38,6 +40,25 @@ from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
 
 logger = logging.getLogger(__name__)
+
+# Replayed conversation history is capped to the last _HISTORY_WINDOW_MSGS
+# messages (~40 user+assistant turns) verbatim. The caching spike (2026-06-06)
+# confirmed the Claude CLI re-creates the whole prompt every turn, so an
+# unbounded buffer is re-billed each turn (driver #1). Older turns are dropped
+# from the replay — NOT summarised (re-summarising a growing head every turn is
+# its own cost) — and resurfaced by the per-turn recall block + ingest memories.
+_HISTORY_WINDOW_MSGS = 80
+
+
+def _window_history(history_msgs: list[ChatMessage]) -> list[ChatMessage]:
+    """Keep only the most-recent _HISTORY_WINDOW_MSGS messages of replayed history.
+
+    Strips any leading non-user message so the window opens on a user turn
+    (avoids an assistant reply to a now-dropped question / user-first ordering)."""
+    windowed = history_msgs[-_HISTORY_WINDOW_MSGS:]
+    while windowed and windowed[0].role != "user":
+        windowed = windowed[1:]
+    return windowed
 
 
 @dataclass
@@ -123,6 +144,11 @@ def respond(
     and wall-clock duration.
     """
     t0 = time.monotonic()
+    from brain.bridge import (
+        cli_throttle,  # local to avoid circular-import risk; testable via module patch
+    )
+
+    cli_throttle.mark_interactive_active()
 
     # 1. Session
     if session is None:
@@ -178,6 +204,7 @@ def respond(
         )
         history_msgs = list(session.history)
 
+    history_msgs = _window_history(history_msgs)
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_msg),
         *history_msgs,
@@ -185,13 +212,19 @@ def respond(
     ]
     messages = apply_budget(
         messages,
-        max_tokens=190_000,
-        preserve_tail_msgs=40,
+        max_tokens=80_000,
+        preserve_tail_msgs=40,  # backstop only — _window_history already caps to 80 msgs;
+                                # apply_budget now fires only for unusually large individual messages
         provider=provider,
     )
 
-    # 7. Tool loop
-    tools = build_tools_list(companion_name=persona_dir.name)
+    # 7. Tool loop — salience-gated recruitment
+    prior_user_text = next(
+        (m.content_text() for m in reversed(history_msgs) if m.role == "user"), None
+    )
+    signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
+    allowed = select_tools(signal)
+    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
     response, invocations = run_tool_loop(
         messages,
         provider=provider,
@@ -199,6 +232,9 @@ def respond(
         store=store,
         hebbian=hebbian,
         persona_dir=persona_dir,
+        companion_name=persona_dir.name,
+        recruited_allowed=allowed,
+        signal=signal,
     )
     content = response.content or ""
 

@@ -296,6 +296,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "recall_monologue": {"query": "test"},
         "read_file": {"path": str(tmp_path / "nonexistent.txt")},
         "list_directory": {"path": str(tmp_path)},
+        "reach_for_capability": {"capability": "memory"},
     }
 
     for tool_name in _DISPATCH:
