@@ -27,5 +27,7 @@ cargo_toml = "app/src-tauri/Cargo.toml"
 tauri_conf = "app/src-tauri/tauri.conf.json"
 
 [stages]
+build = false       # CI builds the release bundles (GitHub Actions on the public tag)
+sign = false        # no local signing; CI builds are signed via the Actions workflow
 push = false        # never push directly to origin (public) — use sync-to-public.sh
 gh_release = false  # release bundles are built by GitHub Actions on the public tag
