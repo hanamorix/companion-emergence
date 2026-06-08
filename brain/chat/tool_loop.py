@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import traceback
 from datetime import UTC, datetime
 from itertools import count
@@ -31,6 +30,7 @@ from brain.attunement.store import (
 )
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.chat import pass2_queue
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
 from brain.chat.reflection_gate import should_reflect
 from brain.memory.hebbian import HebbianMatrix
@@ -72,11 +72,7 @@ def _spawn_pass2(
         except Exception:  # noqa: BLE001
             logger.exception("pass-2 monologue extraction failed")
 
-    threading.Thread(
-        target=_run,
-        daemon=True,
-        name=f"monologue-extractor-{next(_pass2_counter)}",
-    ).start()
+    pass2_queue.enqueue(_run, label=f"monologue-{next(_pass2_counter)}")
 
 
 def _attunement_now_iso() -> str:
@@ -135,13 +131,12 @@ def _spawn_pass2_attunement(
     """Spawn the async attunement pass-2 daemon (mirrors monologue _spawn_pass2)."""
     if not should_run_detector(buffer_slice, user_message, reply_text):
         return
-    thread = threading.Thread(
-        target=_run_attunement_pass2,
-        args=(persona_dir, turn_id, user_message, reply_text, buffer_slice),
-        name=f"attunement-extractor-{next(_attunement_counter)}",
-        daemon=True,
+    pass2_queue.enqueue(
+        lambda: _run_attunement_pass2(
+            persona_dir, turn_id, user_message, reply_text, buffer_slice
+        ),
+        label=f"attunement-{next(_attunement_counter)}",
     )
-    thread.start()
 
 
 def _buffer_slice_from_messages(messages: list[ChatMessage]) -> list[BufferTurn]:

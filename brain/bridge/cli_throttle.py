@@ -48,14 +48,21 @@ def should_yield(*, now: float | None = None) -> bool:
         return (t - _last_interactive_monotonic) < _IDLE_SECONDS
 
 
-def acquire_background(*, now: float | None = None) -> bool:
+def acquire_background(*, now: float | None = None, min_idle: float | None = None) -> bool:
     """True → caller may make its background CLI call (and MUST call
-    release_background() after). False → defer to next tick."""
+    release_background() after). False → defer to next tick.
+
+    ``min_idle`` overrides the chat-idle window (default ``_IDLE_SECONDS``, tuned
+    for the cadence engines). Turn-coupled callers (the pass-2 queue worker) pass
+    a shorter value so they drain soon after a turn finishes rather than waiting
+    the full cadence window — while still respecting the concurrency cap.
+    """
     global _inflight_background
     try:
         t = time.monotonic() if now is None else now
+        idle = _IDLE_SECONDS if min_idle is None else min_idle
         with _lock:
-            if (t - _last_interactive_monotonic) < _IDLE_SECONDS:
+            if (t - _last_interactive_monotonic) < idle:
                 return False
             if _inflight_background >= _MAX_CONCURRENT_BACKGROUND:
                 return False

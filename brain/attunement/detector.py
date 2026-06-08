@@ -99,6 +99,21 @@ def _call_haiku(
         return provider.generate(user_message, system=system_prompt, persona_dir=pd)
     except Exception as exc:  # noqa: BLE001
         log.warning("attunement detector: claude CLI call failed: %s", exc)
+        if pd is not None:
+            try:
+                import traceback as _tb
+
+                pd.mkdir(parents=True, exist_ok=True)
+                entry = {
+                    "ts": _now_iso(),
+                    "error": str(exc),
+                    "kind": "haiku_call_failed",
+                    "traceback": _tb.format_exc(),
+                }
+                with (pd / "attunement_errors.jsonl").open("a") as _f:
+                    _f.write(json.dumps(entry) + "\n")
+            except Exception:  # noqa: BLE001
+                pass  # best-effort — never mask the graceful decline
         return ""
 
 
