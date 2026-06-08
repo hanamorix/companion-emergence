@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.0.31 — 2026-06-08
+
+**She's lighter on her feet — and her reach-outs actually reach you now.**
+
+A heavy turn could exhaust a Claude subscription in just a few messages after v0.0.24; this release closes that regression. Nell now reads the weight of a turn before deciding how much to bring to it — on a light exchange she'll show up with a slim toolset; on something that matters she still has full reach. Background work steps aside while you're talking. And when she reaches out first, the message now lands in a proper card with a reply box that doesn't freeze your conversation.
+
+### Added
+
+- **On-demand file access.** She can now read a file or list a directory when you ask her to look at one — capped in size, read-only, and audited. Previously she had no way to reach your filesystem at all.
+- **A "reach for capability" escape valve.** If a turn turns out to need tools she didn't load, she can request them in a single bounded re-invoke — full agency preserved without loading everything upfront.
+
+### Fixed
+
+- **Per-turn token cost regression (v0.0.24–v0.0.30).** Unconditional full tool-schema recruitment, an ever-widening history window, and undebounced per-turn reflection all stacked. Now: tool schemas load by salience; the history window is bounded; background extraction debounces to every 90 seconds and backs off during idle turns. Heavy turns are materially cheaper; light turns much more so.
+- **Background consumers no longer compete with your conversation.** All background work (dream, reflex, research, soul review, emotion backfill, pass-2 extraction) now yields while a turn is in-flight and respects a shared concurrency cap. Chat always gets first access to the Claude CLI.
+- **Reach-outs render properly.** When Nell initiates — a thought that surfaced, something she wanted to say — the message now appears in a soft-rose card instead of a bare line. The reply box is isolated from the main input, so replying to a reach-out can't stall your ongoing conversation.
+- **Interior traces stay fresh.** Pass-2 extraction (the pass that processes her monologue and attunement after a turn) now runs on a 30-second idle window, not the 5-minute cadence background tasks use — so her interior and your attunement snapshot are ready for the next turn, not stale by minutes.
+- **Attunement failures now surface.** When the attunement detector hit a Haiku error, it failed silently; the error is now recorded to `attunement_errors.jsonl` so it's diagnosable.
+- Token usage is now recorded on the non-streaming chat path too (it was missing); `chat_usage.jsonl` gives a full picture.
+
+### Internal
+
+- `pass2_queue`: single-worker, overflow-safe, turn-coupled 30 s drain — replaces the unthrottled thread-per-turn pattern.
+- `cli_throttle`: process-global interactive-priority gate closes the last path where background CLI calls could contend with chat (closes item 26).
+- Phase-C wire-backs: felt-time now consumes real turn counts and reflex firings; draft fragments fold into soul review; voice-edit proposals render an inline accept/reject diff panel.
+
 ## Unreleased — v0.0.31 candidate (merged to `main` 2026-06-08, NOT tagged)
 
 > Version files deliberately remain `0.0.30` until the release cut. 0.0.30 stays the stable outward base. Metabolic-cost-control cycle — answering a user report that per-turn token use regressed v0.0.24→v0.0.30 (a heavy turn could exhaust a subscription in ~3 messages). Approach A (unified salience-driven attention economy), executed spike-first.
