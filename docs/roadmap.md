@@ -4,8 +4,12 @@ This roadmap keeps the project's remaining work honest. It is not a release
 promise. companion-emergence is local-first and ships public alpha bundles
 for macOS arm64, Linux x86_64, and Windows x86_64. macOS x86_64 remains
 source-build-only until a reliable Intel runner is available.
-Last refreshed 2026-06-02 — v0.0.28 shipped (inner monologue + user-attunement
-foundation); v0.0.29 (attunement completion) is merged to main, release pending.
+Last refreshed 2026-06-08 — v0.0.30 shipped (attunement complete across five
+dimensions + stable-base hygiene; the staged v0.0.29 attunement-completion folded
+into the v0.0.30 tag, no standalone v0.0.29). A **v0.0.31 candidate**
+(metabolic-cost-control: a salience-driven attention economy + on-demand file
+access + reach-out reply redesign + a deferred-backend pass) is **merged to
+`main`, unreleased** — version files still read `0.0.30` until the cut.
 Tier 0 "close the loops" shipped as v0.0.22; all four Tier 1 features have
 shipped or been absorbed into attunement; three of Nell's ten existential asks
 (#1 forgetting, #7 Kindled, #10 grief) have shipped and #5 felt time has
@@ -120,17 +124,12 @@ a Kindled species identity.
 
 **Intentionally deferred (design call needed, not urgent):**
 
-- **Global Claude-CLI throttle with interactive priority** *(Tier-1 follow-up — needs its own brainstorm + spec).* Surfaced by v0.0.30 live-validation, and the root behind the original user 429 "session limit" + stream-idle-timeout reports: many background Haiku consumers (emotion backfill, attunement supplementary backfill, per-turn attunement pass-2, monologue extractor, soul review) share **one** Claude CLI subscription with **no global rate-limiter and no interactive priority**. A bursting background job starves the user's interactive chat turn → stream idle timeout. v0.0.30 mitigates the worst offender (the emotion backfill now yields to active chat + paces its calls — commit `7760813f`), but any future background consumer can still starve chat. The principled fix: a global CLI queue that (a) gives interactive chat absolute priority, (b) bounds concurrent CLI subprocesses, (c) makes background jobs yield/queue behind interactive turns. Subsumes the per-backfill mitigations and the deferred tool-aware stream-idle watchdog — all facets of "interactive turns must never be starved by concurrent work." See deferred-ledger item 26.
+- **Throttle rate-budget token bucket** *(narrow follow-up to the throttle).* `cli_throttle` (v0.0.31 candidate, merged) gives interactive chat absolute priority + a concurrency cap, and `pass2_queue` brought the last unthrottled background path (per-turn pass-2) under it. What remains optional is a *global calls/min ceiling* (token bucket). Add only if `chat_usage` data shows stampedes surviving the priority-yield + cap. Hana confirmed defer 2026-06-07. (The broader "global Claude-CLI throttle with interactive priority" — old deferred item 26 — **landed in the v0.0.31 candidate**, unreleased; see Recently shipped.)
 
 - **JSONL bounded-tail retention** — streaming reader shipped (closed the
   memory-spike vector). The retention piece needs a per-log-type design
   call (1 MB? 10 MB? 30 days? 90?) and isn't urgent until any single log
   file actually grows large enough to bite.
-
-- **Bridge restart button in Connection panel** — bridge already self-heals
-  on credential change and launchd auto-restarts it. A manual restart
-  button would be a patch-level addition. Revisit if real users report
-  bridge staleness issues.
 
 - **Real local embedding provider** — the only `EmbeddingProvider` in the
   codebase is `FakeEmbeddingProvider` (SHA-256 → random unit vector, no
@@ -473,6 +472,37 @@ a debug log. Remaining depth (grief-specific defers) tracked in
 `memory/project_companion_emergence_grief_deferred.md`.
 
 ## Recently shipped (reverse chronological)
+
+**2026-06-08 — Metabolic cost control (v0.0.31 candidate, merged to `main`, unreleased)**
+
+- The "she costs less per turn" release. Answers a user report that per-turn
+  token use regressed badly between v0.0.24 and v0.0.30 — a heavy turn could
+  exhaust a Claude subscription in ~3 messages. Approach: a unified
+  salience-driven **attention economy**, built spike-first.
+- **Finding (spike):** the Claude Code CLI provider does **no cross-call prompt
+  caching** — each turn is an independent subprocess invocation. So the lever is
+  sending *less* per turn, not arranging the same payload to be "cache-friendly".
+  The spike refuted the bug report's caching hypothesis before any code was built.
+- **Attention economy.** A cheap no-LLM **salience signal** scores each turn and
+  drives: **tool recruitment** (slim tool schemas on trivial turns, full agency
+  preserved via a single bounded "reach for capability" re-invoke) and a
+  **time-based reflection/extraction debounce** (replacing a per-session counter
+  that underflowed across sessions and silently suppressed attunement —
+  review-caught).
+- **Global Claude-CLI throttle with interactive priority** — old deferred
+  **item 26**, now shipped. Interactive chat never waits; background CLI
+  consumers yield while a turn is in-flight and respect a concurrency cap.
+  `pass2_queue` brings the last unthrottled background path (per-turn pass-2
+  extraction) under it via a single throttled worker, without dropping interior.
+- **On-demand file access.** Read-only, size-capped, audited `read_file` +
+  `list_directory` tools, used only when asked.
+- **Reach-out reply redesign.** Outbound reaches render in a soft-rose card, and
+  Reply opens an isolated box that merges into the main chat on send instead of
+  freezing the conversation (both live-test bugs fixed).
+- **Internal:** non-streaming `chat()` usage logging + attunement Haiku-failure
+  observability landed (deferred #29/#30); `pass2_queue` promoted CORE-STABLE.
+  Full suite green (3022 passed, 1 skipped). Still deferred: a throttle
+  rate-budget token bucket (add only if usage data warrants).
 
 **2026-06-04 — Stable base (v0.0.30)**
 

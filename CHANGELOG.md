@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased — v0.0.31 candidate (merged to `main` 2026-06-08, NOT tagged)
+
+> Version files deliberately remain `0.0.30` until the release cut. 0.0.30 stays the stable outward base. Metabolic-cost-control cycle — answering a user report that per-turn token use regressed v0.0.24→v0.0.30 (a heavy turn could exhaust a subscription in ~3 messages). Approach A (unified salience-driven attention economy), executed spike-first.
+
+### Finding
+
+- **The Claude Code CLI provider does no cross-call prompt caching** (P0 spike). Tools resolve inside the subprocess; each turn is an independent invocation. The bug report's "isolate what each internal call needs / win the cache" hypothesis was REFUTED — the lever is sending *less* per turn, not arranging the same payload cache-friendlily. The spike prevented building a useless prompt reorder.
+
+### Added
+
+- **On-demand file access.** `read_file` + `list_directory` tools — read-only, size-capped, audited to `file_access.jsonl` (audit-tier), invoked only when asked. Specs `docs/superpowers/specs/2026-06-05-*`.
+- **Salience signal** (`brain/chat/salience.py`). A cheap no-LLM per-turn scorer that fails open to maximal and drives tool recruitment + reflection debounce.
+- **Tool recruitment + recruit-on-reach** (`brain/chat/tool_recruit.py` + the `reach_for_capability` tool). Slim toolset on trivial turns; full agency preserved via one bounded re-invoke.
+- **`cli_throttle`** (`brain/bridge/cli_throttle.py`). Process-global interactive-priority background throttle — interactive chat never waits; background CLI consumers yield while a turn is in-flight and respect a concurrency cap; fail-open. Closes the long-standing shared-subscription contention root (deferred item 26).
+- **`pass2_queue`** (`brain/chat/pass2_queue.py`). Single-worker throttled FIFO queue for per-turn pass-2 extraction (monologue + attunement) — replaces per-turn threads, serialises with the cadence engines via `cli_throttle`, drains on a 30s `min_idle` window so traces stay fresh, never drops interior (overflow = drop-oldest + WARN).
+
+### Changed
+
+- **Reach-out reply redesign** (spec `docs/superpowers/specs/2026-06-07-reach-out-reply-redesign-design.md`). Outbound reaches now render in a soft-rose `.initiate-banner` card, and Reply opens an isolated reply box that merges into the main chat on send instead of freezing the conversation.
+- **Reflection debounce** (`brain/chat/reflection_gate.py`). Per-turn reflection/extraction is now wall-clock-debounced (`_MIN_SECONDS_BETWEEN=90`, atomic write).
+- **Token usage logging** now also fires on the non-streaming `chat()` text path (was only `generate()` + the streaming path). (#29)
+
+### Fixed
+
+- **Cross-session attunement suppression (severe, silent; review-caught).** The first debounce design keyed on a per-session `turn_index` that underflowed across session boundaries and suppressed attunement for whole sessions. Replaced with the time-based gate above.
+- **Attunement Haiku-failure observability.** A failed detector `_call_haiku` now writes `attunement_errors.jsonl` instead of only logging a warning — transient declines under CLI contention are now visible. (#30)
+
+### Internal
+
+- Full suite green at merge (3022 passed, 1 skipped). `pass2_queue` promoted CORE-STABLE in `docs/maturity-manifest.md`; deferred ledger updated (item 26 + #27/#29/#30 resolved). Still deferred: throttle rate-budget token bucket (add only if usage data shows stampedes survive the priority-yield + cap).
+
+---
+
+## v0.0.30 — 2026-06-04 (attunement complete + stable-base hygiene)
+
+> Folded the staged v0.0.29 attunement-completion (the felt read of the user grows from 2 dimensions to the full five — tone, cadence, topic_affinity, response_shape, cross-turn relational — plus addressability) and the stable-base hygiene pass into a single tag. No standalone v0.0.29 tag.
+
+### Added
+
+- **Attunement complete** — five grounded dimensions, maturity-scored, with an addressability surface (`relational` needs ≥2 grounded quotes; she may name a known pattern, with a 6h cooldown). `SCHEMA_VERSION="0.0.29"`.
+- **Forward ingest emotion-seeding** (A2) — bulk-extracted memories carry `emotions=` so conversations colour her felt state, dreams, and what fades vs. stays. **Historical emotion backfill** (A3, `brain/ingest/emotion_backfill.py`).
+
+### Fixed
+
+- **Stream keepalive** (headline) — `brain/bridge/server.py` emits `{"type":"keepalive"}` every 15s during silent provider stretches; `app/src/streamChat.ts` handles it. Root-caused the live "stream idle timeout" to the frontend's 60s idle timer firing against a server that only sent frames on model text.
+- **Session-hours contiguous-run fix** (`brain/body/session_hours.py`) — `now − head-of-latest-contiguous-run`, killing the 69.7h energy-collapse.
+- **Persisted self-pacing soul-review cadence** (`brain/soul/cadence.py`).
+- Ingest commit-loss guard (A1), budget fail-closed on corrupt (A4), recovery timestamp quarantine (A5), persona-name leak (6 sites, G1), emotion-backfill yield-to-active-chat.
+
+### Internal
+
+- Cut dead `MemorySearch` (B1), Organ Definition-of-Done + living `docs/maturity-manifest.md` (B4/B5), test-hygiene (H1–H5), release-safety CI (version-pin gate + scrub-marker preflight, R1/R2). Public-sync `message-callback.py` now scrubs commit messages too.
+
+---
+
+## v0.0.28 — 2026-06-02 (a retained interior)
+
+### Added
+
+- **Three-tier inner monologue** (spec/plan filenamed v0.0.29, shipped here). A monologue persists as a `memory_type='monologue_trace'` MemoryStore memory (verbatim, emotion-seeded at capture), aged by the existing forgetting engine — FADE blurs verbatim→summary, LOSE forgets with grief; recall keeps it vivid. New `brain/monologue/` (`trace`, `ambient`, `recall`): an interior-continuity ambient block + a `recall_monologue` tool. Tier-3 digest gated on a per-call `surface` flag (withheld thoughts stay interior).
+
+### Fixed
+
+- **`nell recover` preserves `emotion_vocabulary.json`** (was dropped, orphaning extractor-minted emotions + breaking crystallisation); `load_persona_vocabulary` self-heals from memories on a MISSING file.
+- **Windows transfer-wizard Tauri fix** — `preflight_existing_ce` arg `input_dir`→`inputDir` + regression gate `app/src/tauri-arg-convention.test.ts`.
+
+### Internal
+
+- Stream idle-timeout instrumentation (`stream_timeouts.jsonl`). Version files stayed `0.0.28` (alpha→final is tag-only).
+
+---
+
 ## v0.0.28-alpha.1 — 2026-06-01 (user-attunement foundation)
 
 ### Added
