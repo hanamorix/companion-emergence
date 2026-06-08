@@ -171,3 +171,34 @@ def test_apply_horizon_tick_fails_open_on_malformed_ts():
     assert "malformed" in str(w[0].message).lower()
     # Buckets returned unchanged (fail open)
     assert result["week"].counters.chat_turns == 3
+
+
+def test_apply_horizon_tick_malformed_period_start_ts_resets():
+    buckets = {
+        "week": HorizonBucket(
+            counters=PressureCounters(chat_turns=5),
+            prev_counters=PressureCounters(),
+            period_start_ts="not-a-date",  # malformed
+        ),
+        "month": HorizonBucket(
+            counters=PressureCounters(chat_turns=10),
+            prev_counters=PressureCounters(),
+            period_start_ts="2026-05-01T00:00:00+00:00",
+        ),
+    }
+    now_ts = "2026-06-08T10:00:00+00:00"
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = apply_horizon_tick(
+            buckets,
+            tick=TickInput(heartbeats=1, chat_turns=2, reflex_firings=0, wall_clock_s_delta=60.0),
+            now_ts=now_ts,
+        )
+    # Warning emitted for the malformed bucket
+    assert any("malformed" in str(warning.message).lower() for warning in w)
+    # Accumulated (not rolled — no prev_counters change)
+    assert result["week"].counters.chat_turns == 7  # 5 + 2
+    assert result["week"].prev_counters.chat_turns == 0  # no rollover
+    # Corrupt timestamp replaced with now_ts
+    assert result["week"].period_start_ts == now_ts
