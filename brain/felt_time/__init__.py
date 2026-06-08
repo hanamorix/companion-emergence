@@ -15,7 +15,7 @@ from pathlib import Path
 
 from brain.felt_time.anchors import scan_since
 from brain.felt_time.lived_age import IntensityDrivers, advance
-from brain.felt_time.pressure import TickInput, apply_tick
+from brain.felt_time.pressure import TickInput, apply_horizon_tick, apply_tick
 from brain.felt_time.state import (
     Anchor,
     FeltTimeState,
@@ -90,6 +90,18 @@ class FeltTime:
             new_anchors=new_anchors,
         )
 
+        # Horizon buckets — accumulate on wall-clock cadence (not anchor-reset).
+        horizon_pressure = apply_horizon_tick(
+            self._state.horizon_pressure,
+            tick=TickInput(
+                heartbeats=ctx.heartbeats_in_tick,
+                chat_turns=ctx.chat_turns_in_tick,
+                reflex_firings=ctx.reflex_firings_in_tick,
+                wall_clock_s_delta=ctx.wall_clock_s_in_tick,
+            ),
+            now_ts=ctx.now_iso,
+        )
+
         # Lived-age advancement.
         # When last_tick_ts is None (cold start or first tick after replay),
         # use wall_clock_s_in_tick as the dt — the supervisor knows the real
@@ -111,6 +123,8 @@ class FeltTime:
             last_tick_ts=ctx.now_iso,
             weather_baselines=self._state.weather_baselines,
             replayed=False,  # first real tick clears the recovery banner
+            horizon_pressure=horizon_pressure,
+            arc_anchors=self._state.arc_anchors,  # preserved; Task 4 updates this
         )
         persist(self._state, self.persona_dir)
 

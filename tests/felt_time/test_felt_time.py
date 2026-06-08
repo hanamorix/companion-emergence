@@ -125,3 +125,47 @@ def test_tick_clears_replayed_flag(tmp_path):
     # Persisted state also has replayed=False so the bridge flag clears.
     data = json.loads((tmp_path / "felt_time_state.json").read_text())
     assert data["replayed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Horizon bucket tests (Task 3)
+# ---------------------------------------------------------------------------
+
+from brain.felt_time.state import PressureCounters  # noqa: E402
+
+
+def _neutral_ctx(now_iso: str, chat_turns: int = 0) -> TickContext:
+    return TickContext(
+        now_iso=now_iso,
+        heartbeats_in_tick=1,
+        chat_turns_in_tick=chat_turns,
+        reflex_firings_in_tick=0,
+        wall_clock_s_in_tick=900.0,
+        drivers=IntensityDrivers(),
+    )
+
+
+def test_tick_populates_horizon_pressure(tmp_path):
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00", chat_turns=3))
+    state = ft.get_state()
+    assert "week" in state.horizon_pressure
+    assert "month" in state.horizon_pressure
+    assert state.horizon_pressure["week"].counters.chat_turns == 3
+    assert state.horizon_pressure["month"].counters.chat_turns == 3
+
+
+def test_tick_horizon_persists_across_reload(tmp_path):
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00", chat_turns=5))
+    ft2 = FeltTime(persona_dir=tmp_path)
+    assert ft2.get_state().horizon_pressure["week"].counters.chat_turns == 5
+
+
+def test_tick_horizon_rollover_after_7_days(tmp_path):
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-01T10:00:00+00:00", chat_turns=10))
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00", chat_turns=2))
+    state = ft.get_state()
+    assert state.horizon_pressure["week"].prev_counters.chat_turns == 10
+    assert state.horizon_pressure["week"].counters.chat_turns == 2
