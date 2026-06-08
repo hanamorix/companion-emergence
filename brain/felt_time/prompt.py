@@ -86,6 +86,49 @@ def _horizon_contrast_line(
     return candidates[0][1]
 
 
+def _open_arc_lines(arc_anchors: list, *, now: datetime) -> list[str]:
+    """Return rendered lines for open arc threads and a recently-closed summary."""
+    if not arc_anchors:
+        return []
+
+    # For each arc title, the most recent event determines its state.
+    latest_per_title: dict[str, object] = {}
+    for a in arc_anchors:
+        existing = latest_per_title.get(a.label)
+        if existing is None or a.ts > existing.ts:
+            latest_per_title[a.label] = a
+
+    open_arcs = sorted(
+        [a for a in latest_per_title.values() if a.event_type == "arc_opened"],
+        key=lambda a: a.ts,
+        reverse=True,
+    )[:2]
+
+    lines: list[str] = []
+    if open_arcs:
+        parts = []
+        for a in open_arcs:
+            h = _hours_ago(a.ts, now=now)
+            ago = f"{h:.0f} hours ago" if h < 72.0 else f"{h / 24.0:.0f} days ago"
+            parts.append(f'"{_truncate_label(a.label)}" since {ago}')
+        if len(open_arcs) == 1:
+            lines.append(f"  open thread: {parts[0]}")
+        else:
+            lines.append(f"  open threads ({len(open_arcs)}): {'; '.join(parts)}")
+
+    # Recently-closed (within 30 days).
+    closed_recent = [
+        a
+        for a in latest_per_title.values()
+        if a.event_type == "arc_closed" and _hours_ago(a.ts, now=now) <= 30 * 24.0
+    ]
+    if closed_recent:
+        n = len(closed_recent)
+        lines.append(f"  {'one thread' if n == 1 else f'{n} threads'} closed recently")
+
+    return lines
+
+
 def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) -> str:
     if not state.anchors and state.lived_age_hours == 0.0:
         return "felt time: too new to have texture yet."
@@ -133,5 +176,10 @@ def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) 
         contrast = _horizon_contrast_line(state.horizon_pressure, now=_now)
         if contrast:
             lines.append(f"  {contrast}")
+
+    # Arc threads — open and recently-closed.
+    if state.arc_anchors:
+        _now_for_arcs = now or datetime.now(UTC)
+        lines.extend(_open_arc_lines(state.arc_anchors, now=_now_for_arcs))
 
     return "\n".join(lines)

@@ -165,3 +165,100 @@ def test_render_no_contrast_when_prev_is_zero():
     result = render_prompt_context(s, now=_NOW)
     assert "denser" not in result
     assert "quieter" not in result
+
+
+def _arc(title: str, ts: str, event_type: str) -> "Anchor":
+    return Anchor(type="arc", ts=ts, label=title,
+                  source_ref="arcs.log.jsonl:1", event_type=event_type)
+
+
+def test_render_two_open_arcs():
+    s = FeltTimeState(
+        lived_age_hours=50.0,
+        arc_anchors=[
+            _arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened"),
+            _arc("Thread B", "2026-06-05T10:00:00+00:00", "arc_opened"),
+        ],
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert "Thread A" in result
+    assert "Thread B" in result
+    assert "open threads" in result
+
+
+def test_render_one_open_arc():
+    s = FeltTimeState(
+        lived_age_hours=50.0,
+        arc_anchors=[_arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened")],
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert "Thread A" in result
+    assert "open thread:" in result
+
+
+def test_render_no_arc_line_when_all_closed():
+    s = FeltTimeState(
+        lived_age_hours=50.0,
+        arc_anchors=[
+            _arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened"),
+            _arc("Thread A", "2026-06-03T10:00:00+00:00", "arc_closed"),
+        ],
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert "open thread" not in result
+
+
+def test_render_arc_max_two_open():
+    s = FeltTimeState(
+        lived_age_hours=50.0,
+        arc_anchors=[
+            _arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened"),
+            _arc("Thread B", "2026-06-03T10:00:00+00:00", "arc_opened"),
+            _arc("Thread C", "2026-06-05T10:00:00+00:00", "arc_opened"),
+        ],
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert "Thread C" in result
+    assert "Thread B" in result
+    assert "Thread A" not in result
+
+
+def test_render_recently_closed_arc_summary():
+    s = FeltTimeState(
+        lived_age_hours=50.0,
+        arc_anchors=[
+            _arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened"),
+            _arc("Thread A", "2026-06-06T10:00:00+00:00", "arc_closed"),  # 2 days ago
+        ],
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert "closed recently" in result
+    assert "open thread" not in result
+
+
+def test_render_token_budget_with_arcs_and_horizons():
+    s = FeltTimeState(
+        lived_age_hours=1000.0,
+        anchors={"dream": Anchor("dream", "2026-06-07T10:00:00+00:00", "x" * 40, "x:1")},
+        pressure=PressureCounters(heartbeats=300, chat_turns=25),
+        horizon_pressure={
+            "week": HorizonBucket(
+                counters=PressureCounters(chat_turns=20),
+                prev_counters=PressureCounters(chat_turns=10),
+                period_start_ts=_WEEK_START,
+            ),
+            "month": HorizonBucket(
+                counters=PressureCounters(chat_turns=80),
+                prev_counters=PressureCounters(chat_turns=40),
+                period_start_ts="2026-05-09T10:00:00+00:00",
+            ),
+        },
+        arc_anchors=[
+            _arc("Thread A", "2026-06-01T10:00:00+00:00", "arc_opened"),
+            _arc("Thread B", "2026-06-05T10:00:00+00:00", "arc_opened"),
+        ],
+        last_tick_ts=_NOW_ISO,
+    )
+    result = render_prompt_context(s, now=_NOW)
+    word_count = len(result.split())
+    assert word_count <= 200
