@@ -19,6 +19,7 @@ from brain.felt_time.pressure import TickInput, apply_tick
 from brain.felt_time.state import (
     Anchor,
     FeltTimeState,
+    HorizonBucket,
     PressureCounters,
     load_or_recover,
     persist,
@@ -140,4 +141,4 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
     )
 
 
-__all__ = ["FeltTime", "TickContext", "IntensityDrivers"]
+__all__ = ["FeltTime", "TickContext", "IntensityDrivers", "HorizonBucket"]

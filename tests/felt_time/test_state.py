@@ -108,3 +108,91 @@ def test_persist_round_trip_replayed_false_round_trips_correctly(tmp_path):
     loaded, recovered = load_or_recover(tmp_path)
     assert recovered is False
     assert loaded.replayed is False
+
+
+def test_felt_time_state_new_field_defaults():
+    s = FeltTimeState()
+    assert s.horizon_pressure == {}
+    assert s.arc_anchors == []
+
+
+def test_anchor_event_type_defaults_to_empty():
+    a = Anchor(type="arc", ts="2026-06-01T00:00:00+00:00", label="X", source_ref="arcs.log.jsonl:1")
+    assert a.event_type == ""
+
+
+def test_anchor_event_type_explicit():
+    a = Anchor(type="arc", ts="2026-06-01T00:00:00+00:00", label="X",
+               source_ref="arcs.log.jsonl:1", event_type="arc_opened")
+    assert a.event_type == "arc_opened"
+
+
+def test_horizon_bucket_defaults():
+    from brain.felt_time.state import HorizonBucket
+    b = HorizonBucket()
+    assert b.counters == PressureCounters()
+    assert b.prev_counters == PressureCounters()
+    assert b.period_start_ts is None
+
+
+def test_persist_roundtrips_new_fields(tmp_path):
+    from brain.felt_time.state import HorizonBucket
+    s = FeltTimeState(
+        lived_age_hours=10.0,
+        last_tick_ts="2026-06-08T09:00:00+00:00",
+        horizon_pressure={
+            "week": HorizonBucket(
+                counters=PressureCounters(chat_turns=5, heartbeats=10),
+                prev_counters=PressureCounters(chat_turns=3),
+                period_start_ts="2026-06-01T00:00:00+00:00",
+            )
+        },
+        arc_anchors=[
+            Anchor(type="arc", ts="2026-06-01T00:00:00+00:00", label="The Long Work",
+                   source_ref="arcs.log.jsonl:1", event_type="arc_opened")
+        ],
+    )
+    persist(s, tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.horizon_pressure["week"].counters.chat_turns == 5
+    assert loaded.horizon_pressure["week"].prev_counters.chat_turns == 3
+    assert loaded.horizon_pressure["week"].period_start_ts == "2026-06-01T00:00:00+00:00"
+    assert len(loaded.arc_anchors) == 1
+    assert loaded.arc_anchors[0].label == "The Long Work"
+    assert loaded.arc_anchors[0].event_type == "arc_opened"
+
+
+def test_load_old_state_missing_new_fields_defaults_gracefully(tmp_path):
+    old_state = {
+        "lived_age_hours": 42.0,
+        "anchors": {},
+        "pressure": {"heartbeats": 0, "chat_turns": 0, "reflex_firings": 0, "wall_clock_s": 0.0},
+        "last_tick_ts": "2026-06-08T09:00:00+00:00",
+        "weather_baselines": {},
+        "replayed": False,
+    }
+    (tmp_path / "felt_time_state.json").write_text(json.dumps(old_state))
+    state, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert state.horizon_pressure == {}
+    assert state.arc_anchors == []
+
+
+def test_load_seeds_arc_anchors_from_existing_arc_anchor(tmp_path):
+    anchor_dict = {
+        "type": "arc", "ts": "2026-06-01T00:00:00+00:00",
+        "label": "The Long Work", "source_ref": "arcs.log.jsonl:1",
+    }
+    old_state = {
+        "lived_age_hours": 10.0,
+        "anchors": {"arc": anchor_dict},
+        "pressure": {"heartbeats": 0, "chat_turns": 0, "reflex_firings": 0, "wall_clock_s": 0.0},
+        "last_tick_ts": "2026-06-08T09:00:00+00:00",
+        "weather_baselines": {},
+        "replayed": False,
+    }
+    (tmp_path / "felt_time_state.json").write_text(json.dumps(old_state))
+    state, _ = load_or_recover(tmp_path)
+    assert len(state.arc_anchors) == 1
+    assert state.arc_anchors[0].label == "The Long Work"
