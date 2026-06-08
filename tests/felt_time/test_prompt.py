@@ -260,5 +260,32 @@ def test_render_token_budget_with_arcs_and_horizons():
         last_tick_ts=_NOW_ISO,
     )
     result = render_prompt_context(s, now=_NOW)
-    word_count = len(result.split())
-    assert word_count <= 200
+    assert len(result) <= 600  # ≈150 tokens at 4 chars/token; consistent with existing budget test
+
+
+def test_render_legacy_state_no_new_fields_unchanged():
+    # Regression gate: a state with no horizon_pressure / arc_anchors must produce
+    # the same output shape as before this feature. Pinned now= for determinism.
+    _pinned_now = datetime(2026, 5, 19, 12, 0, 0, tzinfo=UTC)
+    s = FeltTimeState(
+        lived_age_hours=412.7,
+        anchors={
+            "dream": Anchor("dream", "2026-05-17T20:00:00+00:00", "the boat one", "dreams.log.jsonl:1"),
+            "growth": Anchor("growth", "2026-05-13T18:00:00+00:00", "the way you ask", "growth.log.jsonl:2"),
+        },
+        pressure=PressureCounters(heartbeats=152, chat_turns=0, reflex_firings=3, wall_clock_s=137580.0),
+        last_tick_ts="2026-05-19T10:00:00+00:00",
+        # horizon_pressure and arc_anchors default to {} and [] — the pre-feature state
+    )
+    blob = render_prompt_context(s, now=_pinned_now)
+    # Core legacy lines must still be present
+    assert "felt time" in blob
+    assert "412" in blob
+    assert "the boat one" in blob
+    assert "the way you ask" in blob
+    assert "current stretch (since the" in blob
+    # New lines must NOT appear when fields are empty
+    assert "denser" not in blob
+    assert "quieter" not in blob
+    assert "open thread" not in blob
+    assert "closed recently" not in blob
