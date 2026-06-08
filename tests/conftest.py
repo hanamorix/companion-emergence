@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from brain.bridge import cli_throttle
+from brain.chat import pass2_queue
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +23,24 @@ def _reset_cli_throttle() -> Iterator[None]:
     cli_throttle.reset()
     yield
     cli_throttle.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_pass2_queue() -> Iterator[None]:
+    """Reset pass2_queue global state before and after each test.
+
+    Mirrors _reset_cli_throttle.  Without this, tests that call enqueue()
+    leave items in the queue (or a running worker thread) that contaminate
+    subsequent tests in the same process.
+
+    Also inhibits the daemon worker so enqueue() never spawns a background
+    thread during tests — tests drive drain_pending() synchronously, and a
+    live worker would race those drains.
+    """
+    pass2_queue._worker_inhibited = True
+    pass2_queue.reset()
+    yield
+    pass2_queue.reset()
 
 
 @pytest.fixture(scope="session")
