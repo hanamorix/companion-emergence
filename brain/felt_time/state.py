@@ -23,6 +23,7 @@ class Anchor:
     ts: str  # ISO 8601 UTC
     label: str
     source_ref: str  # e.g. "dreams.log.jsonl:42" or "growth.log.jsonl:128"
+    event_type: str = ""  # populated for arc anchors: "arc_opened" | "arc_closed"
 
 
 @dataclass
@@ -34,6 +35,20 @@ class PressureCounters:
 
 
 @dataclass
+class HorizonBucket:
+    """Pressure counters for a wall-clock horizon window (week or month).
+
+    counters: running totals for the current (incomplete) period.
+    prev_counters: snapshot of the last fully-completed period.
+    period_start_ts: ISO 8601 UTC when the current period began.
+    """
+
+    counters: PressureCounters = field(default_factory=PressureCounters)
+    prev_counters: PressureCounters = field(default_factory=PressureCounters)
+    period_start_ts: str | None = None
+
+
+@dataclass
 class FeltTimeState:
     lived_age_hours: float = 0.0
     anchors: dict[str, Anchor] = field(default_factory=dict)  # type -> most recent
@@ -41,6 +56,8 @@ class FeltTimeState:
     last_tick_ts: str | None = None  # ISO 8601 UTC of last tick()
     weather_baselines: dict[str, dict] = field(default_factory=dict)  # per-channel rolling baseline
     replayed: bool = False  # True iff state was rebuilt from JSONLs, not loaded from state file.
+    horizon_pressure: dict[str, HorizonBucket] = field(default_factory=dict)
+    arc_anchors: list[Anchor] = field(default_factory=list)
 
     @classmethod
     def cold_start(cls) -> FeltTimeState:
@@ -61,6 +78,15 @@ def persist(state: FeltTimeState, persona_dir: Path) -> None:
         "last_tick_ts": state.last_tick_ts,
         "weather_baselines": state.weather_baselines,
         "replayed": state.replayed,
+        "horizon_pressure": {
+            k: {
+                "counters": asdict(v.counters),
+                "prev_counters": asdict(v.prev_counters),
+                "period_start_ts": v.period_start_ts,
+            }
+            for k, v in state.horizon_pressure.items()
+        },
+        "arc_anchors": [asdict(a) for a in state.arc_anchors],
     }
     save_with_backup(target, payload)
 
@@ -104,11 +130,34 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
 
         return _replay_from_logs(persona_dir), True
 
+    # Deserialise horizon_pressure
+    raw_hp = data.get("horizon_pressure") or {}
+    horizon_pressure = {
+        k: HorizonBucket(
+            counters=PressureCounters(**(v.get("counters") or {})),
+            prev_counters=PressureCounters(**(v.get("prev_counters") or {})),
+            period_start_ts=v.get("period_start_ts"),
+        )
+        for k, v in raw_hp.items()
+    }
+
+    # Deserialise arc_anchors
+    raw_arcs = data.get("arc_anchors") or []
+    arc_anchors = [Anchor(**a) for a in raw_arcs]
+
+    anchors = {k: Anchor(**v) for k, v in (data.get("anchors") or {}).items()}
+
+    # Seed arc_anchors from anchors["arc"] when upgrading from old state format.
+    if not arc_anchors and "arc" in anchors:
+        arc_anchors = [anchors["arc"]]
+
     return FeltTimeState(
         lived_age_hours=float(data.get("lived_age_hours", 0.0)),
-        anchors={k: Anchor(**v) for k, v in (data.get("anchors") or {}).items()},
+        anchors=anchors,
         pressure=PressureCounters(**(data.get("pressure") or {})),
         last_tick_ts=data.get("last_tick_ts"),
         weather_baselines=data.get("weather_baselines") or {},
         replayed=bool(data.get("replayed", False)),
+        horizon_pressure=horizon_pressure,
+        arc_anchors=arc_anchors,
     ), False
