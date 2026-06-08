@@ -90,6 +90,17 @@ class FeltTime:
             new_anchors=new_anchors,
         )
 
+        # Arc anchor list — append all new arc-type anchors, cap at 20.
+        _arc_anchor_cap = 20
+        arc_anchors = list(self._state.arc_anchors)
+        new_arc_anchors = [a for a in new_anchors if a.type == "arc"]
+        arc_anchors.extend(new_arc_anchors)
+        if len(arc_anchors) > _arc_anchor_cap:
+            arc_anchors = arc_anchors[-_arc_anchor_cap:]
+        # Keep anchors["arc"] in sync with the most recent arc anchor.
+        if arc_anchors:
+            anchors["arc"] = arc_anchors[-1]
+
         # Horizon buckets — accumulate on wall-clock cadence (not anchor-reset).
         horizon_pressure = apply_horizon_tick(
             self._state.horizon_pressure,
@@ -124,7 +135,7 @@ class FeltTime:
             weather_baselines=self._state.weather_baselines,
             replayed=False,  # first real tick clears the recovery banner
             horizon_pressure=horizon_pressure,
-            arc_anchors=self._state.arc_anchors,  # preserved; Task 4 updates this
+            arc_anchors=arc_anchors,
         )
         persist(self._state, self.persona_dir)
 
@@ -141,6 +152,12 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
         if existing is None or a.ts > existing.ts:
             anchors_by_type[a.type] = a
 
+    # Seed arc_anchors from all arc events found in logs.
+    arc_anchors_from_logs = [a for a in all_anchors if a.type == "arc"]
+    _arc_anchor_cap = 20
+    if len(arc_anchors_from_logs) > _arc_anchor_cap:
+        arc_anchors_from_logs = arc_anchors_from_logs[-_arc_anchor_cap:]
+
     # last_tick_ts stays None so the first real tick after replay will call
     # scan_since(None) and pick up all anchors as "new", giving it a chance
     # to reset pressure counters correctly. _iso_to_seconds_delta handles
@@ -152,6 +169,8 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
         last_tick_ts=None,
         weather_baselines={},
         replayed=True,
+        horizon_pressure={},
+        arc_anchors=arc_anchors_from_logs,
     )
 
 

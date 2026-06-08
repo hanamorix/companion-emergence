@@ -114,3 +114,18 @@ def test_arc_anchor_ignores_member_events(tmp_path):
 
 def test_arc_anchor_absent_log_is_graceful(tmp_path):
     assert [a for a in extract_all(tmp_path) if a.type == "arc"] == []
+
+
+def test_arc_anchor_event_type_populated(tmp_path):
+    import json
+    arc_log = tmp_path / "arcs.log.jsonl"
+    arc_log.write_text(
+        json.dumps({"event": "arc_opened", "ts_iso": "2026-06-01T10:00:00+00:00", "title": "Thread A"}) + "\n" +
+        json.dumps({"event": "arc_closed", "ts_iso": "2026-06-05T10:00:00+00:00", "title": "Thread A"}) + "\n"
+    )
+    from brain.felt_time.anchors import extract_all
+    anchors = extract_all(tmp_path)
+    arc_anchors = [a for a in anchors if a.type == "arc"]
+    assert len(arc_anchors) == 2
+    event_types = {a.event_type for a in arc_anchors}
+    assert event_types == {"arc_opened", "arc_closed"}

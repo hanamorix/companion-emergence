@@ -66,6 +66,7 @@ def extract_all(persona_dir: Path) -> list[Anchor]:
                     ts=ts,
                     label=str(label),
                     source_ref=f"{src.filename}:{entry_idx}",
+                    event_type=entry.get("event", "") if src.events is not None else "",
                 )
             )
     anchors.sort(key=lambda a: a.ts)
