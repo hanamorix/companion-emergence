@@ -31,6 +31,16 @@ def _serialise_state(state) -> dict[str, Any]:
         "lived_age_hours": round(state.lived_age_hours, 2),
         "anchors": anchors,
         "pressure_since_last_anchor": asdict(state.pressure),
+        "arc_anchors": [
+            {
+                "type": a.type,
+                "ts": a.ts,
+                "label": a.label,
+                "source_ref": a.source_ref,
+                "event_type": a.event_type,
+            }
+            for a in state.arc_anchors
+        ],
     }
 
 
