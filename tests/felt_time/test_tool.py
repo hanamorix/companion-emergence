@@ -46,3 +46,25 @@ def test_felt_time_now_cold_start_returns_null_anchors(tmp_path):
     result = felt_time_now(persona_dir=tmp_path)
     assert result["lived_age_hours"] == 0.0
     assert result["anchors"] == {}
+
+
+from brain.felt_time.state import Anchor, FeltTimeState, persist
+
+
+def test_felt_time_now_includes_arc_anchors(tmp_path):
+    state = FeltTimeState(
+        lived_age_hours=10.0,
+        last_tick_ts="2026-06-08T09:00:00+00:00",
+        arc_anchors=[
+            Anchor(type="arc", ts="2026-06-07T10:00:00+00:00",
+                   label="The Long Work", source_ref="arcs.log.jsonl:1",
+                   event_type="arc_opened")
+        ],
+    )
+    persist(state, tmp_path)
+    from brain.felt_time.tool import felt_time_now
+    result = felt_time_now(persona_dir=tmp_path)
+    assert "arc_anchors" in result
+    assert isinstance(result["arc_anchors"], list)
+    assert result["arc_anchors"][0]["label"] == "The Long Work"
+    assert result["arc_anchors"][0]["event_type"] == "arc_opened"
