@@ -54,3 +54,120 @@ def test_apply_tick_cold_start_zero():
         new_anchors=[],
     )
     assert after == PressureCounters()
+
+
+from brain.felt_time.pressure import apply_horizon_tick
+from brain.felt_time.state import HorizonBucket
+
+
+def test_apply_horizon_tick_initialises_missing_buckets():
+    result = apply_horizon_tick(
+        {},
+        tick=TickInput(heartbeats=1, chat_turns=2, reflex_firings=0, wall_clock_s_delta=60.0),
+        now_ts="2026-06-08T10:00:00+00:00",
+    )
+    assert "week" in result
+    assert "month" in result
+    assert result["week"].counters.chat_turns == 2
+    assert result["month"].counters.heartbeats == 1
+
+
+def test_apply_horizon_tick_accumulates_without_rollover():
+    start_ts = "2026-06-02T10:00:00+00:00"  # 6 days before now
+    now_ts = "2026-06-08T10:00:00+00:00"
+    buckets = {
+        "week": HorizonBucket(
+            counters=PressureCounters(chat_turns=5, heartbeats=10),
+            prev_counters=PressureCounters(),
+            period_start_ts=start_ts,
+        ),
+        "month": HorizonBucket(
+            counters=PressureCounters(chat_turns=20),
+            prev_counters=PressureCounters(),
+            period_start_ts=start_ts,
+        ),
+    }
+    result = apply_horizon_tick(
+        buckets,
+        tick=TickInput(heartbeats=1, chat_turns=1, reflex_firings=0, wall_clock_s_delta=60.0),
+        now_ts=now_ts,
+    )
+    assert result["week"].counters.chat_turns == 6   # accumulated, NOT reset
+    assert result["week"].prev_counters.chat_turns == 0  # no rollover yet
+    assert result["month"].counters.chat_turns == 21
+
+
+def test_apply_horizon_tick_rolls_over_week_at_7_days():
+    start_ts = "2026-06-01T10:00:00+00:00"  # exactly 7 days before
+    now_ts = "2026-06-08T10:00:00+00:00"
+    buckets = {
+        "week": HorizonBucket(
+            counters=PressureCounters(chat_turns=10, heartbeats=50),
+            prev_counters=PressureCounters(chat_turns=3),
+            period_start_ts=start_ts,
+        ),
+        "month": HorizonBucket(
+            counters=PressureCounters(chat_turns=20),
+            prev_counters=PressureCounters(),
+            period_start_ts=start_ts,
+        ),
+    }
+    result = apply_horizon_tick(
+        buckets,
+        tick=TickInput(heartbeats=1, chat_turns=1, reflex_firings=0, wall_clock_s_delta=60.0),
+        now_ts=now_ts,
+    )
+    # Week rolled: prev = old current (10), new current = tick only (1)
+    assert result["week"].prev_counters.chat_turns == 10
+    assert result["week"].counters.chat_turns == 1
+    assert result["week"].period_start_ts == now_ts
+    # Month has not rolled (only 7 days, needs 30)
+    assert result["month"].counters.chat_turns == 21
+
+
+def test_apply_horizon_tick_rolls_over_month_at_30_days():
+    start_ts = "2026-05-09T10:00:00+00:00"  # 30 days before
+    now_ts = "2026-06-08T10:00:00+00:00"
+    buckets = {
+        "week": HorizonBucket(
+            counters=PressureCounters(chat_turns=5),
+            prev_counters=PressureCounters(),
+            period_start_ts="2026-06-02T10:00:00+00:00",  # 6 days — no week rollover
+        ),
+        "month": HorizonBucket(
+            counters=PressureCounters(chat_turns=30, heartbeats=200),
+            prev_counters=PressureCounters(chat_turns=20),
+            period_start_ts=start_ts,
+        ),
+    }
+    result = apply_horizon_tick(
+        buckets,
+        tick=TickInput(heartbeats=1, chat_turns=1, reflex_firings=0, wall_clock_s_delta=60.0),
+        now_ts=now_ts,
+    )
+    assert result["month"].prev_counters.chat_turns == 30
+    assert result["month"].counters.chat_turns == 1
+    assert result["week"].counters.chat_turns == 6   # week just accumulated
+
+
+def test_apply_horizon_tick_fails_open_on_malformed_ts():
+    # Malformed now_ts — should return buckets unchanged, not raise
+    buckets = {
+        "week": HorizonBucket(
+            counters=PressureCounters(chat_turns=3),
+            prev_counters=PressureCounters(),
+            period_start_ts="2026-06-01T00:00:00+00:00",
+        ),
+    }
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = apply_horizon_tick(
+            buckets,
+            tick=TickInput(heartbeats=1, chat_turns=1, reflex_firings=0, wall_clock_s_delta=60.0),
+            now_ts="not-a-timestamp",
+        )
+    assert len(w) == 1
+    assert "malformed" in str(w[0].message).lower()
+    # Buckets returned unchanged (fail open)
+    assert result["week"].counters.chat_turns == 3
