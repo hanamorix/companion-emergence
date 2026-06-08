@@ -554,6 +554,14 @@ class ClaudeCliProvider(LLMProvider):
                 f"unexpected output format: {result.stdout[:200]!r}",
             ) from exc
 
+        persona_dir_opt = (options or {}).get("persona_dir")
+        log_usage(
+            Path(persona_dir_opt) if persona_dir_opt else None,
+            call_type="chat",
+            model=self._model,
+            frame=payload,
+        )
+
         return ChatResponse(
             content=_truncate_at_role_leak(content),
             tool_calls=(),

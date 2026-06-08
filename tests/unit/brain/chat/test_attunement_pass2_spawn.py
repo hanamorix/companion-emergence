@@ -8,8 +8,6 @@ Verifies:
 """
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,15 +16,14 @@ from brain.chat.tool_loop import _spawn_pass2_attunement
 
 
 def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
-    end = time.time() + timeout
-    while time.time() < end:
-        threads = [t for t in threading.enumerate() if t.name.startswith("attunement-extractor")]
-        if not threads:
-            return
-        for t in threads:
-            t.join(timeout=0.1)
-        if all(not t.is_alive() for t in threads):
-            return
+    # Pass-2 now flows through the in-process pass2_queue (single worker, #27),
+    # not a per-turn daemon thread. Drain it synchronously (cli_throttle idle in
+    # tests via conftest). Kept the name so callers are unchanged.
+    from brain.bridge import cli_throttle
+    from brain.chat import pass2_queue
+
+    cli_throttle.reset()
+    pass2_queue.drain_pending()
 
 
 def test_spawn_skips_when_buffer_empty(tmp_path: Path):
