@@ -1,7 +1,9 @@
 """Tests for brain.felt_time.prompt — render_prompt_context()."""
 
+from datetime import UTC, datetime
+
 from brain.felt_time.prompt import render_prompt_context
-from brain.felt_time.state import Anchor, FeltTimeState, PressureCounters
+from brain.felt_time.state import Anchor, FeltTimeState, HorizonBucket, PressureCounters
 
 
 def test_render_prompt_context_cold_start():
@@ -83,3 +85,83 @@ def test_render_prompt_context_uses_dense_tag_for_high_activity():
     )
     blob = render_prompt_context(s)
     assert "dense" in blob
+
+
+_NOW = datetime(2026, 6, 8, 10, 0, 0, tzinfo=UTC)
+_NOW_ISO = "2026-06-08T10:00:00+00:00"
+_WEEK_START = "2026-06-02T10:00:00+00:00"  # 6 days before _NOW
+
+
+def _state_with_horizons(current_chat_turns: int, prev_chat_turns: int) -> FeltTimeState:
+    return FeltTimeState(
+        lived_age_hours=100.0,
+        anchors={
+            "dream": Anchor("dream", "2026-06-07T10:00:00+00:00", "the boat one", "x:1"),
+        },
+        pressure=PressureCounters(heartbeats=10, chat_turns=5),
+        last_tick_ts=_NOW_ISO,
+        horizon_pressure={
+            "week": HorizonBucket(
+                counters=PressureCounters(chat_turns=current_chat_turns),
+                prev_counters=PressureCounters(chat_turns=prev_chat_turns),
+                period_start_ts=_WEEK_START,
+            ),
+            "month": HorizonBucket(
+                counters=PressureCounters(chat_turns=current_chat_turns),
+                prev_counters=PressureCounters(chat_turns=prev_chat_turns),
+                period_start_ts="2026-05-09T10:00:00+00:00",
+            ),
+        },
+    )
+
+
+def test_render_contrast_denser_when_40_percent_above():
+    # current week: 14 turns / 6 days = 2.33/day; prev: 7/7 = 1.0/day → ratio 2.33
+    s = _state_with_horizons(current_chat_turns=14, prev_chat_turns=7)
+    result = render_prompt_context(s, now=_NOW)
+    assert "denser" in result
+
+
+def test_render_contrast_quieter_when_40_percent_below():
+    # current: 3/6 = 0.5/day; prev: 7/7 = 1.0/day → ratio 0.5
+    s = _state_with_horizons(current_chat_turns=3, prev_chat_turns=7)
+    result = render_prompt_context(s, now=_NOW)
+    assert "quieter" in result
+
+
+def test_render_no_contrast_within_threshold():
+    # current: 6/6 = 1.0/day; prev: 7/7 = 1.0/day → ratio 1.0 (within 30%)
+    s = _state_with_horizons(current_chat_turns=6, prev_chat_turns=7)
+    result = render_prompt_context(s, now=_NOW)
+    assert "denser" not in result
+    assert "quieter" not in result
+
+
+def test_render_only_most_pronounced_contrast():
+    s = FeltTimeState(
+        lived_age_hours=100.0,
+        anchors={"dream": Anchor("dream", "2026-06-07T10:00:00+00:00", "x", "x:1")},
+        pressure=PressureCounters(heartbeats=10),
+        last_tick_ts=_NOW_ISO,
+        horizon_pressure={
+            "week": HorizonBucket(
+                counters=PressureCounters(chat_turns=9),
+                prev_counters=PressureCounters(chat_turns=7),
+                period_start_ts=_WEEK_START,
+            ),
+            "month": HorizonBucket(
+                counters=PressureCounters(chat_turns=50),
+                prev_counters=PressureCounters(chat_turns=10),
+                period_start_ts="2026-05-10T10:00:00+00:00",
+            ),
+        },
+    )
+    result = render_prompt_context(s, now=_NOW)
+    assert result.count("denser") + result.count("quieter") == 1
+
+
+def test_render_no_contrast_when_prev_is_zero():
+    s = _state_with_horizons(current_chat_turns=10, prev_chat_turns=0)
+    result = render_prompt_context(s, now=_NOW)
+    assert "denser" not in result
+    assert "quieter" not in result

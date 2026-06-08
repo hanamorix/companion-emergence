@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from brain.felt_time.state import FeltTimeState
+from brain.felt_time.state import FeltTimeState, HorizonBucket
 
 _ANCHOR_PRETTY_NAME = {
     "dream": "last dream",
@@ -36,6 +36,54 @@ def _hours_ago(ts_iso: str, *, now: datetime | None = None) -> float:
 
 def _truncate_label(label: str, limit: int = 40) -> str:
     return label if len(label) <= limit else label[: limit - 1] + "…"
+
+
+_HORIZON_CONTRAST_THRESHOLD = 0.30
+_HORIZON_CURRENT_DAYS: dict[str, float] = {"week": 7.0, "month": 30.0}
+
+
+def _horizon_contrast_line(
+    horizon_pressure: dict[str, HorizonBucket],
+    *,
+    now: datetime,
+) -> str | None:
+    """Return a qualitative contrast line or None if nothing meaningful."""
+    candidates: list[tuple[float, str]] = []
+
+    for key in ("week", "month"):
+        bucket = horizon_pressure.get(key)
+        if bucket is None:
+            continue
+        prev_turns = bucket.prev_counters.chat_turns
+        if prev_turns == 0:
+            continue
+
+        try:
+            if bucket.period_start_ts:
+                start = datetime.fromisoformat(bucket.period_start_ts)
+                current_days = max((now - start).total_seconds() / 86400.0, 1.0)
+            else:
+                current_days = _HORIZON_CURRENT_DAYS[key]
+        except ValueError:
+            current_days = _HORIZON_CURRENT_DAYS[key]
+
+        prev_days = _HORIZON_CURRENT_DAYS[key]
+        current_rate = bucket.counters.chat_turns / current_days
+        prev_rate = prev_turns / prev_days
+
+        if prev_rate == 0:
+            continue
+
+        ratio = current_rate / prev_rate
+        if ratio > 1 + _HORIZON_CONTRAST_THRESHOLD:
+            candidates.append((ratio - 1.0, "this stretch has been denser than it was recently"))
+        elif ratio < 1 - _HORIZON_CONTRAST_THRESHOLD:
+            candidates.append((1.0 - ratio, "things have been quieter lately than they were"))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) -> str:
@@ -78,5 +126,12 @@ def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) 
             f"  current stretch (since the {pretty_anchor}): {tag} — "
             f"{p.heartbeats} heartbeats, {p.chat_turns} chat turns, {p.reflex_firings} reflexes"
         )
+
+    # Horizon contrast — qualitative cross-scale temporal texture.
+    if state.horizon_pressure:
+        _now = now or datetime.now(UTC)
+        contrast = _horizon_contrast_line(state.horizon_pressure, now=_now)
+        if contrast:
+            lines.append(f"  {contrast}")
 
     return "\n".join(lines)
