@@ -25,6 +25,8 @@ from brain.felt_time.state import (
     persist,
 )
 
+_ARC_ANCHOR_CAP = 20
+
 
 @dataclass(frozen=True)
 class TickContext:
@@ -90,13 +92,12 @@ class FeltTime:
             new_anchors=new_anchors,
         )
 
-        # Arc anchor list — append all new arc-type anchors, cap at 20.
-        _arc_anchor_cap = 20
+        # Arc anchor list — append all new arc-type anchors, cap at _ARC_ANCHOR_CAP.
         arc_anchors = list(self._state.arc_anchors)
         new_arc_anchors = [a for a in new_anchors if a.type == "arc"]
         arc_anchors.extend(new_arc_anchors)
-        if len(arc_anchors) > _arc_anchor_cap:
-            arc_anchors = arc_anchors[-_arc_anchor_cap:]
+        if len(arc_anchors) > _ARC_ANCHOR_CAP:
+            arc_anchors = arc_anchors[-_ARC_ANCHOR_CAP:]
         # Keep anchors["arc"] in sync with the most recent arc anchor.
         if arc_anchors:
             anchors["arc"] = arc_anchors[-1]
@@ -154,9 +155,8 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
 
     # Seed arc_anchors from all arc events found in logs.
     arc_anchors_from_logs = [a for a in all_anchors if a.type == "arc"]
-    _arc_anchor_cap = 20
-    if len(arc_anchors_from_logs) > _arc_anchor_cap:
-        arc_anchors_from_logs = arc_anchors_from_logs[-_arc_anchor_cap:]
+    if len(arc_anchors_from_logs) > _ARC_ANCHOR_CAP:
+        arc_anchors_from_logs = arc_anchors_from_logs[-_ARC_ANCHOR_CAP:]
 
     # last_tick_ts stays None so the first real tick after replay will call
     # scan_since(None) and pick up all anchors as "new", giving it a chance
