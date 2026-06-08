@@ -78,3 +78,15 @@ def test_should_yield_does_not_consume_a_slot():
     cli_throttle.should_yield(now=far)  # peeking must not take the slot
     assert cli_throttle.acquire_background(now=far) is True
     cli_throttle.release_background()
+
+
+def test_acquire_background_min_idle_override():
+    # A shorter min_idle lets a turn-coupled caller (pass-2) drain sooner than the
+    # cadence default (_IDLE_SECONDS), while still respecting the concurrency cap.
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active(at=0.0)
+    # default cadence window still denies at t=31
+    assert cli_throttle.acquire_background(now=31.0) is False
+    # a 30s override allows it (chat idle long enough for pass-2)
+    assert cli_throttle.acquire_background(now=31.0, min_idle=30.0) is True
+    cli_throttle.release_background()

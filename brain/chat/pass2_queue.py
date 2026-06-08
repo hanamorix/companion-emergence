@@ -44,6 +44,11 @@ log = logging.getLogger(__name__)
 
 _MAX_QUEUE: int = 200
 _POLL_SECONDS: float = 0.5
+# Pass-2 is turn-coupled (feeds the next turn's attunement/interior), so it uses a
+# SHORTER chat-idle window than the cadence engines' cli_throttle default (300s):
+# it waits out the in-flight turn (a reply takes ~15-20s) then drains ~30s after
+# the last turn, keeping attunement/traces fresh without contending mid-turn.
+_PASS2_IDLE_SECONDS: float = 30.0
 
 _lock = threading.Lock()
 _queue: deque[tuple[Callable[[], None], str]] = deque()  # (fn, label)
@@ -80,7 +85,7 @@ def _drain_one() -> bool:
     with _lock:
         if not _queue:
             return False
-    if not cli_throttle.acquire_background():
+    if not cli_throttle.acquire_background(min_idle=_PASS2_IDLE_SECONDS):
         return False  # yield to chat / cap — leave the item queued for later
     try:
         with _lock:
