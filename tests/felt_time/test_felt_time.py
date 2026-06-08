@@ -169,3 +169,65 @@ def test_tick_horizon_rollover_after_7_days(tmp_path):
     state = ft.get_state()
     assert state.horizon_pressure["week"].prev_counters.chat_turns == 10
     assert state.horizon_pressure["week"].counters.chat_turns == 2
+
+
+# ---------------------------------------------------------------------------
+# Arc anchor accumulation tests (Task 4)
+# ---------------------------------------------------------------------------
+
+
+def _write_arc_event(persona_dir: Path, event: str, title: str, ts_iso: str) -> None:
+    arc_log = persona_dir / "arcs.log.jsonl"
+    with arc_log.open("a") as f:
+        f.write(json.dumps({"event": event, "ts_iso": ts_iso, "title": title}) + "\n")
+
+
+def test_tick_appends_arc_anchor(tmp_path):
+    _write_arc_event(tmp_path, "arc_opened", "The Long Work", "2026-06-07T10:00:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    state = ft.get_state()
+    assert len(state.arc_anchors) == 1
+    assert state.arc_anchors[0].label == "The Long Work"
+    assert state.arc_anchors[0].event_type == "arc_opened"
+
+
+def test_tick_arc_anchor_syncs_anchors_dict(tmp_path):
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-06-07T10:00:00+00:00")
+    _write_arc_event(tmp_path, "arc_opened", "Thread B", "2026-06-07T11:00:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    state = ft.get_state()
+    assert len(state.arc_anchors) == 2
+    assert state.anchors["arc"].ts == state.arc_anchors[-1].ts
+
+
+def test_tick_arc_anchor_cap_at_20(tmp_path):
+    for i in range(21):
+        _write_arc_event(
+            tmp_path, "arc_opened", f"Thread {i}",
+            f"2026-06-0{(i % 7) + 1}T{i:02d}:00:00+00:00"
+        )
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    state = ft.get_state()
+    assert len(state.arc_anchors) == 20
+
+
+def test_tick_arc_anchors_not_duplicated_on_second_tick(tmp_path):
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-06-07T10:00:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    ft.tick(_neutral_ctx("2026-06-08T10:15:00+00:00"))  # no new arc events
+    state = ft.get_state()
+    assert len(state.arc_anchors) == 1  # not duplicated
+
+
+def test_replay_seeds_arc_anchors_from_logs(tmp_path):
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-06-07T10:00:00+00:00")
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-06-08T10:00:00+00:00")
+    ft = FeltTime.from_logs(persona_dir=tmp_path)
+    state = ft.get_state()
+    assert len(state.arc_anchors) == 2
+    assert state.arc_anchors[0].event_type == "arc_opened"
+    assert state.arc_anchors[1].event_type == "arc_closed"
