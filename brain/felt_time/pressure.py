@@ -96,7 +96,16 @@ def apply_horizon_tick(
                         period_start_ts=now_ts,
                     )
             except ValueError:
-                pass  # Malformed period_start_ts — accumulate without rolling.
+                warnings.warn(
+                    f"apply_horizon_tick: malformed period_start_ts for {key!r}, resetting",
+                    stacklevel=2,
+                )
+                # Reset so the corrupt timestamp doesn't propagate.
+                bucket = HorizonBucket(
+                    counters=bucket.counters,
+                    prev_counters=bucket.prev_counters,
+                    period_start_ts=now_ts,
+                )
 
         result[key] = HorizonBucket(
             counters=PressureCounters(
