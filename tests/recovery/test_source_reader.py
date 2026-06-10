@@ -55,3 +55,59 @@ def test_missing_dbs_return_empty(tmp_path):
     empty.mkdir()
     assert read_source_memories(empty) == {}
     assert read_source_edges(empty) == []
+
+
+def _mk_v033_schema_source(tmp_path, subdir="src33"):
+    """Source DB with peak_emotion_intensity column (v0.0.33+)."""
+    src = tmp_path / subdir
+    src.mkdir()
+    conn = sqlite3.connect(src / "memories.db")
+    conn.execute(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, memory_type TEXT,"
+        " domain TEXT, emotions_json TEXT, tags_json TEXT, importance REAL, score REAL,"
+        " created_at TEXT, last_accessed_at TEXT, active INTEGER, protected INTEGER,"
+        " metadata_json TEXT, state TEXT, content_snapshot TEXT, recall_count INTEGER,"
+        " peak_emotion_intensity REAL NOT NULL DEFAULT 0.0)"
+    )
+    # Row with historical peak 7.0 but decayed-down current emotions (joy=0.2).
+    # The restored Memory must carry peak=7.0, not re-derive from 0.2.
+    conn.execute(
+        "INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "m2",
+            "a decayed memory",
+            "conversation",
+            "us",
+            '{"joy": 0.2}',
+            "[]",
+            0.7,
+            0.2,
+            datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+            None,
+            1,
+            0,
+            "{}",
+            "active",
+            None,
+            3,
+            7.0,  # persisted historical peak
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return src
+
+
+def test_peak_emotion_intensity_carried_from_v033_source(tmp_path):
+    """read_source_memories must preserve persisted peak_emotion_intensity (v0.0.33+ column)."""
+    src = _mk_v033_schema_source(tmp_path)
+    mems = read_source_memories(src)
+    assert "m2" in mems
+    assert mems["m2"].peak_emotion_intensity == 7.0
+
+
+def test_peak_emotion_intensity_defaults_zero_for_old_schema(tmp_path):
+    """Old-schema source DB (no peak_emotion_intensity column) defaults to 0.0."""
+    src = _mk_old_schema_source(tmp_path)
+    mems = read_source_memories(src)
+    assert mems["m1"].peak_emotion_intensity == 0.0
