@@ -26,6 +26,7 @@ def test_audit_logs_registered_for_rotation() -> None:
     registered = {name for name, _ in _ROLLING_LOG_POLICIES}
     assert "chat_usage.jsonl" in registered
     assert "file_access.jsonl" in registered
+    assert "attunement_errors.jsonl" in registered
 
 
 def _persona_dir(tmp_path: Path) -> Path:
