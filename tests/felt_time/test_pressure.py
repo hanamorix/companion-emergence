@@ -1,7 +1,7 @@
 """Tests for pressure.py tick aggregation."""
 
-from brain.felt_time.pressure import TickInput, apply_tick
-from brain.felt_time.state import Anchor, PressureCounters
+from brain.felt_time.pressure import TickInput, apply_horizon_tick, apply_tick
+from brain.felt_time.state import Anchor, HorizonBucket, PressureCounters
 
 
 def test_apply_tick_increments_when_no_new_anchors():
@@ -54,10 +54,6 @@ def test_apply_tick_cold_start_zero():
         new_anchors=[],
     )
     assert after == PressureCounters()
-
-
-from brain.felt_time.pressure import apply_horizon_tick
-from brain.felt_time.state import HorizonBucket
 
 
 def test_apply_horizon_tick_initialises_missing_buckets():

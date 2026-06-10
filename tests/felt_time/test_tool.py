@@ -2,6 +2,7 @@ import pytest
 
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
+from brain.felt_time.state import Anchor, FeltTimeState, persist
 from brain.felt_time.tool import felt_time_now, pressure_since
 
 
@@ -46,9 +47,6 @@ def test_felt_time_now_cold_start_returns_null_anchors(tmp_path):
     result = felt_time_now(persona_dir=tmp_path)
     assert result["lived_age_hours"] == 0.0
     assert result["anchors"] == {}
-
-
-from brain.felt_time.state import Anchor, FeltTimeState, persist
 
 
 def test_felt_time_now_includes_arc_anchors(tmp_path):
