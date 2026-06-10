@@ -208,7 +208,7 @@ def build_system_message(
     if fading_summary_block.strip():
         parts.append(fading_summary_block)
 
-    interior_block = _build_interior_continuity_block(store)
+    interior_block = _build_interior_continuity_block(store, user_name=user_name or "the user")
     if interior_block.strip():
         parts.append(interior_block)
 
@@ -840,13 +840,14 @@ def _build_fading_summary_block(persona_dir: Path, store: MemoryStore) -> str:
         return "memory · loss: still."
 
 
-def _build_interior_continuity_block(store: MemoryStore) -> str:
+def _build_interior_continuity_block(store: MemoryStore, *, user_name: str = "the user") -> str:
     """Tier-2 ambient continuity — her own recent monologue traces.
-    Spec: 2026-06-01-three-tier-monologue-design.md §4. Best-effort."""
+    Spec: 2026-06-01-three-tier-monologue-design.md §4. Best-effort.
+    user_name is passed through to the privacy footer (v0.0.33 T2)."""
     try:
         from brain.monologue.ambient import build_interior_continuity_block
 
-        return build_interior_continuity_block(store)
+        return build_interior_continuity_block(store, user_name=user_name)
     except Exception:  # noqa: BLE001
         log.exception("interior-continuity block failed — omitting")
         return ""
