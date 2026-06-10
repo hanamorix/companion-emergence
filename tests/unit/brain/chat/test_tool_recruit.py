@@ -6,7 +6,24 @@ from brain.tools import NELL_TOOL_NAMES
 def test_trivial_turn_gets_only_core():
     allowed = select_tools(assess_salience("ok"))
     assert set(allowed) == set(REFLEXIVE_CORE)
-    assert "search_memories" not in allowed and "read_file" not in allowed
+    assert "read_file" not in allowed
+    assert "recall_forgotten" not in allowed
+
+
+def test_low_salience_question_can_still_search():
+    """Regression: the Phoebe dog-name failure (v0.0.33 spec, Track 1).
+
+    'what's my dog's name?' scores ~0.19 salience with no recruitment flags;
+    pre-v0.0.33 the model could not search at all on such turns.
+    search_memories is reflexive-core now — always in hand.
+    """
+    signal = assess_salience("what's my dog's name?")
+    assert signal.score < 0.999  # stays a non-maximal turn — guards the premise
+    allowed = select_tools(signal)
+    assert "search_memories" in allowed
+    # Heavy memory tools stay salience-gated.
+    assert "recall_forgotten" not in allowed
+    assert "add_memory" not in allowed
 
 
 def test_past_reference_recruits_memory():
