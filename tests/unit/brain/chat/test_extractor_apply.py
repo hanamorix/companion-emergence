@@ -258,12 +258,16 @@ def test_emotion_delta_all_unregistered_skips_memory_write(persona_dir: Path):
         store.close()
 
 
-def test_emotion_delta_vocab_failure_passes_through(
+def test_emotion_delta_vocab_failure_never_raises(
     persona_dir: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """When the vocab lookup raises, channels pass through unfiltered (fail-soft).
+    """A raising filter must never propagate out of apply_side_effects.
 
-    Extraction must never break on a vocab read error — the guard is best-effort.
+    Note the actual fail-soft layering: _filter_to_registered itself catches
+    registry errors and passes channels through unfiltered; if the filter
+    function somehow raises anyway (as forced here), _safely() catches it and
+    the emotion write for that turn is skipped. The invariant under test is
+    no-crash/no-corrupt-state, not write-through.
     """
     import brain.chat.extractor as _extractor_module
 
