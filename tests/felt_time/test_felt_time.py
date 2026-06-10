@@ -131,7 +131,6 @@ def test_tick_clears_replayed_flag(tmp_path):
 # Horizon bucket tests (Task 3)
 # ---------------------------------------------------------------------------
 
-from brain.felt_time.state import PressureCounters  # noqa: E402
 
 
 def _neutral_ctx(now_iso: str, chat_turns: int = 0) -> TickContext:

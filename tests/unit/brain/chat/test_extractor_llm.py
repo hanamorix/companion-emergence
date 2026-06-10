@@ -158,3 +158,27 @@ def test_user_prompt_uses_xml_delimiters():
     assert "<visible_reply>" in prompt
     assert "</visible_reply>" in prompt
     assert "<recent_user_messages>" in prompt
+
+
+def test_system_prompt_lists_registered_emotion_channels():
+    """Soft assist: the extractor system prompt enumerates registered names so
+    the LLM is steered toward the vocabulary (the load-bearing guard is the
+    _filter_to_registered apply-time filter)."""
+    from brain.emotion.vocabulary import list_all
+
+    provider = _FakeProvider(
+        json.dumps(
+            {"memory_writes": [], "emotion_delta": {}, "crystallisation": [], "reflex_audit": []}
+        )
+    )
+    extract_from_thinking(
+        provider=provider,
+        monologue_blocks=("a thought",),
+        visible_reply="ok",
+        recent_turn_context=(),
+    )
+    _, system = provider.calls[0]
+    assert system is not None
+    assert "Registered emotion channels" in system
+    sample = sorted(e.name for e in list_all())[0]
+    assert sample in system
