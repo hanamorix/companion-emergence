@@ -1137,3 +1137,14 @@ def test_build_system_message_no_epistemic_instruction_without_user_input(tmp_pa
     )
 
     assert _EPISTEMIC_INSTRUCTION not in msg
+
+
+def test_epistemic_instruction_is_proactive():
+    """v0.0.33 Track 1b: instruction must direct a search BEFORE answering,
+    not only explain how to read results of a search that already happened."""
+    from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
+
+    assert "call search_memories before answering" in _EPISTEMIC_INSTRUCTION
+    assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
+    # The reactive guidance stays.
+    assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
