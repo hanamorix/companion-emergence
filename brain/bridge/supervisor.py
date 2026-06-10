@@ -65,6 +65,12 @@ from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
 )
+from brain.health.vocab_repair import (
+    run_vocab_repair as _vocab_repair_run,
+)
+from brain.health.vocab_repair import (
+    should_run_vocab_repair as _vocab_repair_should_run,
+)
 from brain.ingest.emotion_backfill import (
     run_emotion_backfill as _emotion_backfill_run,
 )
@@ -182,6 +188,24 @@ def run_folded(
             _emotion_backfill_run(persona_dir, provider=provider)
     except Exception as exc:  # noqa: BLE001
         logger.warning("emotion backfill failed during startup: %s", exc)
+
+    # One-shot startup: repair already-stubbed emotion_vocabulary.json entries.
+    # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
+    # provider-free, so it always lands). Step 2 re-derives descriptions via
+    # Haiku (fail-soft — placeholders kept if provider unavailable/fails).
+    # Runs adjacent to emotion backfill; independent of it (separate try/except).
+    try:
+        if _vocab_repair_should_run(persona_dir):
+            from brain.memory.store import MemoryStore as _MemoryStore
+
+            db_path = persona_dir / "memories.db"
+            _store = _MemoryStore(str(db_path), integrity_check=False)
+            try:
+                _vocab_repair_run(persona_dir, store=_store, provider=provider)
+            finally:
+                _store.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vocab repair failed during startup: %s", exc)
 
     while not stop_event.is_set():
         try:
