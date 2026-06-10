@@ -58,7 +58,13 @@ def _spawn_pass2(
     recent_user_msgs: tuple[str, ...],
     persona_dir: Path,
 ) -> None:
-    """Fire-and-forget pass 2: Haiku reads the monologue, writes memory/emotion/soul/reflex_audit."""
+    """Enqueue pass-2 onto the process-global pass2_queue worker.
+
+    The worker drains the queue serially via cli_throttle (yields to
+    interactive chat, respects the background-concurrency cap).  Raw
+    monologue text is persisted synchronously before this call, so
+    in-memory queue loss only drops extraction, not the trace itself.
+    """
 
     def _run() -> None:
         try:
@@ -128,7 +134,12 @@ def _spawn_pass2_attunement(
     reply_text: str,
     buffer_slice: list[BufferTurn],
 ) -> None:
-    """Spawn the async attunement pass-2 daemon (mirrors monologue _spawn_pass2)."""
+    """Enqueue the attunement pass-2 onto the process-global pass2_queue worker.
+
+    Mirrors _spawn_pass2 — enqueues rather than spawning a per-turn daemon
+    thread.  No-ops when the detector gate says this turn doesn't warrant a
+    full attunement run (salience / reflection-gate short-circuit).
+    """
     if not should_run_detector(buffer_slice, user_message, reply_text):
         return
     pass2_queue.enqueue(
