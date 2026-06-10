@@ -929,3 +929,44 @@ def test_list_since_iso_excludes_fading_when_disabled():
     assert len(results) == 1
     assert results[0].state == "active"
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# v0.0.33 Track 3: monotone peak_emotion_intensity
+# ---------------------------------------------------------------------------
+
+
+def test_peak_captured_on_create(store):
+    mem = Memory.create_new("loopy chased the ball", "conversation", "us",
+                            emotions={"joy": 6.0, "warmth": 3.0})
+    store.create(mem)
+    got = store.get(mem.id)
+    assert got.peak_emotion_intensity == 6.0
+
+
+def test_peak_is_monotone_under_update(store):
+    mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 6.0})
+    store.create(mem)
+    # Decay-shaped write: lower intensities must NOT lower the peak.
+    store.update(mem.id, emotions={"joy": 0.5})
+    assert store.get(mem.id).peak_emotion_intensity == 6.0
+    # A hotter later delta raises it.
+    store.update(mem.id, emotions={"joy": 8.5})
+    assert store.get(mem.id).peak_emotion_intensity == 8.5
+
+
+def test_peak_survives_emotions_emptied(store):
+    """The noise-floor deletion path writes an empty/reduced dict — the peak
+    must survive it (the entire point of v0.0.33 Track 3)."""
+    mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 6.0})
+    store.create(mem)
+    store.update(mem.id, emotions={})
+    got = store.get(mem.id)
+    assert got.emotions == {}
+    assert got.peak_emotion_intensity == 6.0
+
+
+def test_peak_defaults_zero_without_emotions(store):
+    mem = Memory.create_new("flat", "conversation", "us")
+    store.create(mem)
+    assert store.get(mem.id).peak_emotion_intensity == 0.0

@@ -92,6 +92,7 @@ class Memory:
     state: str = "active"
     content_snapshot: str | None = None
     recall_count: int = 0
+    peak_emotion_intensity: float = 0.0
 
     @classmethod
     def create_new(
@@ -125,6 +126,9 @@ class Memory:
             importance=importance if importance is not None else score / 10.0,
             score=score,
             metadata=metadata,
+            peak_emotion_intensity=max(
+                (float(v) for v in emotions.values()), default=0.0
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -191,7 +195,8 @@ CREATE TABLE IF NOT EXISTS memories (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     state TEXT NOT NULL DEFAULT 'active',
     content_snapshot TEXT,
-    recall_count INTEGER NOT NULL DEFAULT 0
+    recall_count INTEGER NOT NULL DEFAULT 0,
+    peak_emotion_intensity REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
@@ -258,6 +263,11 @@ class MemoryStore:
             self._conn.execute(
                 "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0"
             )
+        if "peak_emotion_intensity" not in existing:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN peak_emotion_intensity "
+                "REAL NOT NULL DEFAULT 0.0"
+            )
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
@@ -279,8 +289,8 @@ class MemoryStore:
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
                 importance, score, created_at, last_accessed_at, active, protected,
-                metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metadata_json, peak_emotion_intensity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -296,6 +306,10 @@ class MemoryStore:
                 1 if memory.active else 0,
                 1 if memory.protected else 0,
                 metadata_json,
+                max(
+                    [memory.peak_emotion_intensity]
+                    + [float(v) for v in memory.emotions.values()]
+                ),
             ),
         )
         self._conn.commit()
@@ -365,9 +379,16 @@ class MemoryStore:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
 
         column_map: dict[str, tuple[str, Any]] = {}
+        extra_clauses: list[str] = []
+        extra_values: list[Any] = []
         for key, value in fields.items():
             if key == "emotions":
                 column_map["emotions_json"] = ("emotions_json", json.dumps(value))
+                new_max = max((float(v) for v in (value or {}).values()), default=0.0)
+                extra_clauses.append(
+                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?)"
+                )
+                extra_values.append(new_max)
             elif key == "tags":
                 column_map["tags_json"] = ("tags_json", json.dumps(value))
             elif key == "metadata":
@@ -391,10 +412,12 @@ class MemoryStore:
                 raise ValueError(f"Unknown update field: {key!r}")
 
         # Empty `fields` kwargs — existence already verified above, nothing to write.
-        if not column_map:
+        if not column_map and not extra_clauses:
             return
-        set_clause = ", ".join(f"{col} = ?" for col, _ in column_map.values())
-        values = [v for _, v in column_map.values()]
+        set_clause = ", ".join(
+            [f"{col} = ?" for col, _ in column_map.values()] + extra_clauses
+        )
+        values = [v for _, v in column_map.values()] + extra_values
         values.append(memory_id)
         self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
         self._conn.commit()
@@ -593,4 +616,9 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         state=row["state"] if "state" in row_keys else "active",
         content_snapshot=row["content_snapshot"] if "content_snapshot" in row_keys else None,
         recall_count=row["recall_count"] if "recall_count" in row_keys else 0,
+        peak_emotion_intensity=(
+            float(row["peak_emotion_intensity"])
+            if "peak_emotion_intensity" in row_keys
+            else 0.0
+        ),
     )
