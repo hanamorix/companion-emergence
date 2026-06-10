@@ -83,3 +83,15 @@ def test_monologue_frame_renders_soul_and_narrative_hints():
     )
     assert "soul threads: late-night writing; tea over coffee" in frame
     assert "narrative threads: Loopy-the-cat thread; Hana's apartment" in frame
+
+
+def test_reply_frame_reboots_second_person_address():
+    frame = build_reply_frame(persona_name="Nell", user_name="Hana")
+    assert "private thought" in frame
+    assert "speaking to Hana directly in second person" in frame
+    assert "'you', never 'she'/'her'/'they'" in frame
+
+
+def test_reply_frame_user_name_defaults():
+    frame = build_reply_frame(persona_name="Nell")
+    assert "speaking to the user directly in second person" in frame
