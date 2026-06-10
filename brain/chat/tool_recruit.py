@@ -15,7 +15,9 @@ _MAXIMAL_SCORE = 0.999
 # and the works tools are intentionally omitted — they arrive via the full suite on a
 # maximal signal or via reach_for_capability's full re-invoke (see tool_loop, Task 2.3).
 
-# Always available — interior voice, self-state reads, and the escalation valve.
+# Always available — interior voice, self-state reads, the escalation valve,
+# and memory search (v0.0.33 Track 1: she can always reach for what she
+# knows; heavy memory tools stay salience-gated below).
 REFLEXIVE_CORE: tuple[str, ...] = (
     "record_monologue",
     "recall_monologue",
@@ -26,10 +28,10 @@ REFLEXIVE_CORE: tuple[str, ...] = (
     "get_personality",
     "felt_time_now",
     "pressure_since",
+    "search_memories",
 )
 
 _MEMORY_TOOLS = (
-    "search_memories",
     "recall_forgotten",
     "recall_arc",
     "list_open_arcs",
