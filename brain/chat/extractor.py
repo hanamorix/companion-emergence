@@ -141,6 +141,23 @@ Return ONLY the JSON object. No commentary.
 """
 
 
+def _vocab_prompt_line() -> str:
+    """Registered emotion names appended to the system prompt (soft assist).
+
+    The load-bearing guard is the `_filter_to_registered` apply-time filter;
+    this line just steers the LLM away from inventing channel names. Fail-soft:
+    any registry error → empty string, the extraction call proceeds unassisted.
+    """
+    try:
+        from brain.emotion.vocabulary import list_all
+
+        names = ", ".join(sorted(e.name for e in list_all()))
+        return f"\nRegistered emotion channels — use ONLY these names in emotion_delta: {names}\n"
+    except Exception:  # noqa: BLE001 — prompt assist must never break extraction
+        logger.debug("_vocab_prompt_line failed; system prompt unassisted", exc_info=True)
+        return ""
+
+
 def _build_user_prompt(
     monologue_blocks: tuple[str, ...],
     visible_reply: str,
@@ -182,7 +199,7 @@ def extract_from_thinking(
 
     prompt = _build_user_prompt(monologue_blocks, visible_reply, recent_turn_context)
     try:
-        raw = provider.generate(prompt, system=_SYSTEM_PROMPT)
+        raw = provider.generate(prompt, system=_SYSTEM_PROMPT + _vocab_prompt_line())
     except Exception as exc:  # noqa: BLE001
         logger.warning("extractor LLM call failed: %s", exc)
         return ExtractorOutput()
@@ -278,6 +295,23 @@ def _apply_memory_writes(writes: list[MemoryWrite], persona_dir: Path) -> None:
         store.close()
 
 
+def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
+    """Drop channels whose names are not in the process-global emotion registry.
+
+    Mirrors the pattern in brain/ingest/emotion_backfill.py::_normalize.
+    Fail-soft: on ANY error the input dict is returned unchanged so extraction
+    never breaks on a vocab read error.  A debug log is emitted so the failure
+    is visible without surfacing into the chat path.
+    """
+    from brain.emotion.vocabulary import get as _vocab_get
+
+    try:
+        return {name: v for name, v in emotions.items() if _vocab_get(name) is not None}
+    except Exception:  # noqa: BLE001
+        logger.debug("_filter_to_registered: vocab lookup raised; passing through unfiltered")
+        return emotions
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
     memory is committed per the system's existing aggregation model.
@@ -292,12 +326,17 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     Deltas are on a [-1.0, 1.0] scale from the extractor. We map them to
     importance = abs(delta) * 10 so a 0.15 nudge becomes importance 1.5 on
     the 0..10 MemoryStore scale.
+
+    Channel names are constrained to the registered emotion vocabulary before
+    writing — LLM-invented names are silently dropped here (mirrors the
+    _normalize pattern in brain/ingest/emotion_backfill.py).
     """
     from brain.memory.store import Memory, MemoryStore
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        emotions = {ch: abs(v) * 10.0 for ch, v in delta.items() if abs(v) > 1e-9}
+        registered_delta = _filter_to_registered(delta)
+        emotions = {ch: abs(v) * 10.0 for ch, v in registered_delta.items() if abs(v) > 1e-9}
         if not emotions:
             return
         # Build a brief descriptive content string from the non-zero emotion channels.
