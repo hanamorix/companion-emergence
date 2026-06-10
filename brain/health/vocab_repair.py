@@ -170,6 +170,11 @@ def run_vocab_repair(
 
     # ------------------------------------------------------------------
     # Step 2: derive descriptions via provider (fail-soft)
+    # F4 (crash-window): if the process dies here — after the Step-1 vocab
+    # write but before the state-file write at the end — the next run finds
+    # no 1.0-decay entries and therefore no stub_names, so Step 2 is silently
+    # skipped forever.  That is accepted: Step 1 (the load-bearing half-life
+    # fix) has already landed, and placeholder descriptions are cosmetic.
     # ------------------------------------------------------------------
     described = 0
     if provider is not None and stub_names:
@@ -220,7 +225,8 @@ def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
     """Return up to _MAX_EXCERPTS_PER_NAME memory excerpts mentioning name."""
     try:
-        candidates = store.search_text(name)
+        # F3: cap the search so a high-frequency name doesn't pull all rows.
+        candidates = store.search_text(name, limit=10)
         excerpts = []
         for mem in candidates:
             if name in (mem.emotions or {}):
@@ -250,6 +256,10 @@ def _describe_stubs(
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
     described = 0
+    # F2: mirror emotion_backfill's throttle pattern — wrap each batch in a
+    # background slot so interactive chat is never displaced.
+    from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
+
     # Batch into groups of _DESCRIBE_BATCH
     for batch_start in range(0, len(stub_names), _DESCRIBE_BATCH):
         batch = stub_names[batch_start : batch_start + _DESCRIBE_BATCH]
@@ -271,45 +281,60 @@ def _describe_stubs(
             + '{"name1": "one sentence", "name2": "one sentence"}'
         )
 
-        try:
-            raw = provider.generate(
-                user_prompt,
-                system=_DESCRIBE_SYSTEM,
-                persona_dir=persona_dir,
-            )
-            mapping: dict = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "vocab_repair: provider call or parse failed for batch %r: %s — "
-                "keeping placeholders for this batch",
-                batch,
-                exc,
-            )
-            continue
+        with _cli_throttle.background_slot() as _slot:
+            if not _slot:
+                logger.info(
+                    "vocab_repair: throttle slot unavailable — "
+                    "deferring remaining batches; Step 1 already landed"
+                )
+                break
 
-        # Patch entries in data
-        batch_set = set(batch)
-        patched = 0
-        for entry in data.get("emotions", []):
-            if not isinstance(entry, dict):
+            try:
+                # F1: guard the persona_dir kwarg — the LLMProvider ABC only
+                # declares (prompt, *, system); ClaudeCliProvider adds persona_dir
+                # as an extension.  A non-Cli provider raises TypeError on the
+                # extra kwarg, so retry without it.
+                try:
+                    raw = provider.generate(
+                        user_prompt,
+                        system=_DESCRIBE_SYSTEM,
+                        persona_dir=persona_dir,
+                    )
+                except TypeError:
+                    raw = provider.generate(user_prompt, system=_DESCRIBE_SYSTEM)
+                mapping: dict = json.loads(raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "vocab_repair: provider call or parse failed for batch %r: %s — "
+                    "keeping placeholders for this batch",
+                    batch,
+                    exc,
+                )
                 continue
-            n = entry.get("name")
-            if n not in batch_set:
-                continue
-            desc = mapping.get(n)
-            if not desc or not isinstance(desc, str):
-                continue
-            if entry.get("description") == PLACEHOLDER_DESCRIPTION:
-                entry["description"] = desc.strip()
-                patched += 1
 
-        if patched > 0:
-            _atomic_write_vocab(vocab_path, data)
-            described += patched
-            logger.info(
-                "vocab_repair: described %d stubs in batch starting at index %d",
-                patched,
-                batch_start,
-            )
+            # Patch entries in data
+            batch_set = set(batch)
+            patched = 0
+            for entry in data.get("emotions", []):
+                if not isinstance(entry, dict):
+                    continue
+                n = entry.get("name")
+                if n not in batch_set:
+                    continue
+                desc = mapping.get(n)
+                if not desc or not isinstance(desc, str):
+                    continue
+                if entry.get("description") == PLACEHOLDER_DESCRIPTION:
+                    entry["description"] = desc.strip()
+                    patched += 1
+
+            if patched > 0:
+                _atomic_write_vocab(vocab_path, data)
+                described += patched
+                logger.info(
+                    "vocab_repair: described %d stubs in batch starting at index %d",
+                    patched,
+                    batch_start,
+                )
 
     return described

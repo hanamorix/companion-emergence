@@ -263,6 +263,46 @@ def test_repair_derives_descriptions(tmp_path: Path) -> None:
     assert by_name["love"]["decay_half_life_days"] == 45.0
 
 
+class _NoPersonaDirProvider:
+    """Provider whose generate signature does NOT accept persona_dir.
+
+    Used to verify F1: vocab_repair falls back gracefully via TypeError retry
+    instead of crashing when a non-Cli provider is passed.
+    """
+
+    def __init__(self, response: str) -> None:
+        self.calls: list[str] = []
+        self._response = response
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        self.calls.append(prompt)
+        return self._response
+
+
+def test_repair_provider_without_persona_dir_kwarg(tmp_path: Path) -> None:
+    """A provider whose generate() lacks persona_dir → TypeError retry → descriptions derived."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    canned = json.dumps({"body_grief": "physical weight of loss"})
+    provider = _NoPersonaDirProvider(response=canned)
+
+    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+
+    assert report.repaired == 1
+    assert report.described == 1
+    assert len(provider.calls) == 1  # exactly one generate call via the fallback
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert by_name["body_grief"]["description"] == "physical weight of loss"
+
+
 def test_repair_no_stubs_noop(tmp_path: Path) -> None:
     """Vocab with zero stubs → state written complete, repaired==0, no LLM call."""
     from brain.health.vocab_repair import run_vocab_repair
