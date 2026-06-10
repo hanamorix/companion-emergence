@@ -51,11 +51,11 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
         # love is baseline, should also be present
         assert "love" in names
 
-        # Extensions have placeholder description + conservative decay
+        # Extensions have placeholder description + persona-typical decay (14d)
         body_grief = next(e for e in result["emotions"] if e["name"] == "body_grief")
         assert "reconstructed from memory" in body_grief["description"]
         assert body_grief["category"] == "persona_extension"
-        assert body_grief["decay_half_life_days"] == 1.0
+        assert body_grief["decay_half_life_days"] == 14.0
     finally:
         store.close()
 
@@ -76,6 +76,31 @@ def test_baseline_names_in_memories_not_duplicated() -> None:
         love_entries = [e for e in result["emotions"] if e["name"] == "love"]
         assert len(love_entries) == 1
         assert love_entries[0]["category"] == "core"  # baseline, not extension
+    finally:
+        store.close()
+
+
+def test_reconstructed_entry_gets_persona_typical_half_life() -> None:
+    """Reconstructed persona-extension entries carry decay_half_life_days == 14.0.
+
+    The 1.0 fast-decay default caused the stub-flood bug (2026-06-10): 42
+    reconstructed/healed emotion stubs decayed 14x faster than proper persona
+    entries (persona-typical half-life is 14.0) and were erased from memories
+    within ~9-13 days.
+    """
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"body_grief": 8.0},
+            )
+        )
+        result = reconstruct_vocabulary_from_memories(store)
+        body_grief = next(e for e in result["emotions"] if e["name"] == "body_grief")
+        assert body_grief["decay_half_life_days"] == 14.0
     finally:
         store.close()
 
