@@ -66,7 +66,7 @@ def test_block_renders_forming_patterns_hedged(tmp_path: Path):
     _append_pattern(tmp_path, _make_pattern("p1", "forming", description="goes terse when tired"))
     block = build_attunement_block(tmp_path)
     assert "goes terse when tired" in block
-    assert "you seem to" in block.lower() or "it feels like" in block.lower()
+    assert "she seems to" in block.lower() or "it feels like" in block.lower()
 
 
 def test_block_hides_recently_addressed_pattern(tmp_path: Path):
@@ -107,3 +107,23 @@ def test_block_alpha_1_does_not_include_addressability_directive(tmp_path: Path)
     block = build_attunement_block(tmp_path)
     assert "Don't force it" not in block
     assert "load-bearing" not in block.lower()
+
+
+def test_attunement_header_marks_private_read(tmp_path: Path):
+    """Header must include the private-read annotation."""
+    write_current_read(tmp_path, _make_read())
+    _append_pattern(tmp_path, _make_pattern("p1", "known", description="she softens about the dog"))
+    block = build_attunement_block(tmp_path)
+    assert (
+        "# What you've come to know about her "
+        "(your private read — when you speak to her, she is 'you')"
+    ) in block
+
+
+def test_forming_patterns_describe_her_not_you(tmp_path: Path):
+    """Forming patterns must use 'She seems to', not 'You seem to'."""
+    write_current_read(tmp_path, _make_read())
+    _append_pattern(tmp_path, _make_pattern("p1", "forming", description="goes terse when tired"))
+    block = build_attunement_block(tmp_path)
+    assert "She seems to" in block
+    assert "You seem to" not in block
