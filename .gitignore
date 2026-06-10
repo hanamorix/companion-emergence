@@ -128,3 +128,8 @@ graphify-out/
 .claude/scheduled_tasks.lock
 app/.claude/
 .tauri-release/
+.agents/
+
+# caveman plugin install state
+.claude/skills/
+skills-lock.json
