@@ -40,9 +40,12 @@ AS_NELL_PREAMBLE_WITH_USER = (
 )
 
 _EPISTEMIC_INSTRUCTION = (
-    'When names or entities appear under "not recognised (searched; no memory found)", '
-    'acknowledge the gap honestly. Distinguish "I never knew this" from "I don\'t '
-    'remember". Do not invent familiarity.'
+    "If asked about something you might have stored — a name, a fact, a shared "
+    "moment — and it isn't in the context you can see, call search_memories "
+    'before answering. Never say "I don\'t remember" without searching first. '
+    'When names or entities appear under "not recognised (searched; no memory '
+    'found)", acknowledge the gap honestly. Distinguish "I never knew this" '
+    'from "I don\'t remember". Do not invent familiarity.'
 )
 
 
