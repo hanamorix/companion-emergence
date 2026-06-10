@@ -63,3 +63,15 @@ def test_existing_voice_block_still_present(persona_dir: Path):
     # The creative-dna block is always assembled; its header is a reliable marker
     # that the existing prompt infrastructure hasn't been disrupted.
     assert "── creative dna" in msg
+
+
+@pytest.fixture
+def system_message(persona_dir: Path) -> str:
+    return _build(persona_dir)
+
+
+def test_reply_frame_is_last_block(system_message: str):
+    """v0.0.33 Track 2b: the address reboot must be the LAST substantive
+    content — recency-positioned for models that weight late context."""
+    assert system_message.rstrip().endswith("the answer needs room.")
+    assert "never 'she'/'her'/'they'" in system_message.split("── visible reply")[-1]

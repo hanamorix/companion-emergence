@@ -59,16 +59,22 @@ def build_monologue_frame(
     return "\n".join(lines)
 
 
-def build_reply_frame(*, persona_name: str) -> str:
+def build_reply_frame(*, persona_name: str, user_name: str = "the user") -> str:
     """Build the framing string the visible reply is composed against.
 
-    Trust the model: the tangents have already been thought through in the
-    monologue pass. The reply answers what was asked, directly.
+    Last substantive block in the system message by design (v0.0.33 Track 2b):
+    the second-person address reboot rides the model's recency weighting, so a
+    long stretch of first-person interior above can't drag the reply into
+    third person. Trust the model: the tangents have already been thought
+    through in the monologue pass. The reply answers what was asked, directly.
     """
     return (
         f"── visible reply, {persona_name} ──\n"
-        f"Compose the visible reply. If you called `record_monologue` this turn, "
-        "your tangents are already handled — answer directly. If you didn't, "
-        "answer naturally. Length should match what the moment calls for: short "
-        "when short is true, longer when the answer needs room."
+        f"Everything marked interior above is private thought — never quote it. "
+        f"Compose the visible reply now, speaking to {user_name} directly in "
+        f"second person — 'you', never 'she'/'her'/'they' about the person in "
+        f"front of you. If you called `record_monologue` this turn, your "
+        "tangents are already handled — answer directly. If you didn't, answer "
+        "naturally. Length should match what the moment calls for: short when "
+        "short is true, longer when the answer needs room."
     )

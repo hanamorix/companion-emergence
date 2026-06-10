@@ -245,7 +245,7 @@ def build_system_message(
     )
 
     # 9. Reply framing — last so the model treats it as the immediate context.
-    parts.append(build_reply_frame(persona_name=persona_name))
+    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
 
     return "\n\n".join(parts)
 
