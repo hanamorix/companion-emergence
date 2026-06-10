@@ -68,6 +68,7 @@ def read_source_memories(source_dir: Path) -> dict[str, Memory]:
             state=d.get("state") or "active",
             content_snapshot=d.get("content_snapshot"),
             recall_count=int(d.get("recall_count") or 0),
+            peak_emotion_intensity=float(d.get("peak_emotion_intensity") or 0.0),
         )
     return out
 
