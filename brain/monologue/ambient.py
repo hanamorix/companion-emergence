@@ -13,13 +13,23 @@ from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
 _AMBIENT_LIMIT = 5
 _CHAR_CAP = 1200
 _HEADER = "── interior continuity (your own recent thought) ──"
+_FOOTER_TEMPLATE = (
+    "── end interior continuity. Private thought — never quote it; "
+    "your reply speaks to {user_name} directly as 'you'. ──"
+)
 
 
 def build_interior_continuity_block(
-    store: MemoryStore, *, limit: int = _AMBIENT_LIMIT, char_cap: int = _CHAR_CAP
+    store: MemoryStore,
+    *,
+    limit: int = _AMBIENT_LIMIT,
+    char_cap: int = _CHAR_CAP,
+    user_name: str = "the user",
 ) -> str:
-    """Render up to `limit` most-recent monologue_trace memories, newest first.
-    Returns "" when there are none or on any error (best-effort)."""
+    """Render up to `limit` most-recent monologue_trace memories, newest first,
+    fenced header+footer. The char cap applies to the header+body only — the
+    privacy footer is appended after capping so it can never be truncated
+    (v0.0.33 Track 2a). Returns "" when there are none or on any error."""
     try:
         traces = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True, limit=limit)
     except Exception:  # noqa: BLE001
@@ -31,5 +41,5 @@ def build_interior_continuity_block(
     for m in traces:
         text = " ".join(m.content.split())  # collapse whitespace
         lines.append(f"· {text}")
-    block = "\n".join(lines)
-    return block[:char_cap]
+    body = "\n".join(lines)[:char_cap]
+    return body + "\n" + _FOOTER_TEMPLATE.format(user_name=user_name)
