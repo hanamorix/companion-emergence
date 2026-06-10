@@ -53,9 +53,9 @@ def test_known_patterns_appear_before_forming(tmp_path: Path):
     block = build_attunement_block(tmp_path)
     bullet_lines = [line for line in block.splitlines() if line.startswith("- ")]
 
-    # known bullets are rendered WITHOUT "you seem to"; forming WITH "you seem to"
-    known_indices = [j for j, ln in enumerate(bullet_lines) if "you seem to" not in ln.lower()]
-    forming_indices = [j for j, ln in enumerate(bullet_lines) if "you seem to" in ln.lower()]
+    # known bullets are rendered WITHOUT "she seems to"; forming WITH "she seems to"
+    known_indices = [j for j, ln in enumerate(bullet_lines) if "she seems to" not in ln.lower()]
+    forming_indices = [j for j, ln in enumerate(bullet_lines) if "she seems to" in ln.lower()]
 
     assert known_indices, "no known-pattern bullets found"
     assert forming_indices, "no forming-pattern bullets found"

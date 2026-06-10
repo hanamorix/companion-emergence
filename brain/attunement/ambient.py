@@ -65,12 +65,15 @@ def build_attunement_block(persona_dir: Path) -> str:
     if surfaceable:
         if lines:
             lines.append("")
-        lines.append("# What you've come to know about her")
+        lines.append(
+            "# What you've come to know about her "
+            "(your private read — when you speak to her, she is 'you')"
+        )
         for p in surfaceable:
             if p.maturity == "known":
                 lines.append(f"- {p.description}")
             else:
-                lines.append(f"- You seem to {p.description.lower()}")
+                lines.append(f"- She seems to {p.description.lower()}")
         lines.append("")
         lines.append("If a pattern feels load-bearing for this turn, you can name it. Don't force it.")
 
