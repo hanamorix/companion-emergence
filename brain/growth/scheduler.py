@@ -1,8 +1,14 @@
 """Growth scheduler — orchestrates crystallizers + applies decisions atomically.
 
-The scheduler is the *only* mutator of `emotion_vocabulary.json` and
-`emotion_growth.log.jsonl` during a growth tick. No engine touches these
-files except through `run_growth_tick`.
+The scheduler is the primary mutator of `emotion_vocabulary.json` during a
+growth tick, but two other paths also write to that file:
+- `brain/emotion/persona_loader.py` — `_heal_referenced_but_unregistered`
+  registers extractor-minted emotions the scheduler never saw, at load time.
+- `brain/health/vocab_repair.py` — one-time startup migration that fills in
+  missing descriptions for stub entries; idempotent (guarded by
+  ``vocab_repair_state.json``).
+
+No engine writes `emotion_growth.log.jsonl` except through `run_growth_tick`.
 
 Per principle audit 2026-04-25 (Phase 2a §4): the brain owns its own
 growth. Crystallizers decide; the scheduler applies; the log records

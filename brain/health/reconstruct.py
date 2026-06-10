@@ -12,7 +12,11 @@ from brain.emotion import vocabulary as _vocabulary
 from brain.memory.store import MemoryStore
 
 PLACEHOLDER_DESCRIPTION = "(reconstructed from memory)"
-PLACEHOLDER_DECAY_DAYS = 1.0  # conservative — fast decay until user re-tunes
+# Persona-typical persistence (14d half-life matches standard persona-extension
+# entries).  The original 1.0 fast-decay default caused the stub-flood bug
+# (2026-06-10 investigation): reconstructed/healed entries decayed 14x faster
+# than proper persona entries and were erased from memories in ~9-13 days.
+PLACEHOLDER_DECAY_DAYS = 14.0
 
 
 def reconstruct_vocabulary_from_memories(store: MemoryStore) -> dict:
