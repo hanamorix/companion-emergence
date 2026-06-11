@@ -93,6 +93,16 @@ def _load_user_name(persona_dir: Path) -> str | None:
         return None
 
 
+def _load_user_pronouns(persona_dir: Path) -> dict | None:
+    """PersonaConfig.user_pronouns; None if missing/unset. Best-effort."""
+    try:
+        from brain.persona_config import PersonaConfig
+
+        return PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def close_session(
     persona_dir: Path,
     session_id: str,
@@ -165,6 +175,7 @@ def close_session(
         user_name=user_name,
         assistant_name=assistant_name,
         emotion_vocab=emotion_vocab,
+        user_pronouns=_load_user_pronouns(persona_dir),
     )
     if extraction.failed:
         report.errors += 1
@@ -330,6 +341,7 @@ def extract_session_snapshot(
         user_name=user_name,
         assistant_name=assistant_name,
         emotion_vocab=emotion_vocab,
+        user_pronouns=_load_user_pronouns(persona_dir),
     )
     if extraction.failed:
         report.errors += 1

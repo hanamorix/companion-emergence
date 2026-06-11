@@ -322,3 +322,40 @@ def test_format_transcript_no_image_shas_unchanged():
     turns = [{"speaker": "user", "text": "hi nell"}]
     out = format_transcript(turns)
     assert out == "user: hi nell"
+
+
+# ---------------------------------------------------------------------------
+# user_pronouns — named extraction prompt
+# ---------------------------------------------------------------------------
+
+
+def test_named_extraction_prompt_renders_user_pronouns():
+    """he/him user → possessive 'his' in the attribution line; companion line pronoun-free."""
+    from brain.ingest.extract import extract_items_with_status
+    from brain.pronouns import PRESETS
+
+    captured: dict = {}
+
+    class _CaptureProvider:
+        def name(self):
+            return "capture"
+
+        def healthy(self):
+            return True
+
+        def chat(self, *a, **kw):
+            raise NotImplementedError
+
+        def generate(self, prompt, *, system=None):
+            captured["p"] = prompt
+            return "[]"
+
+    extract_items_with_status(
+        "u: hi\na: hey",
+        provider=_CaptureProvider(),
+        user_name="Alex",
+        assistant_name="Mira",
+        user_pronouns=PRESETS["he/him"],
+    )
+    assert "(his actions, his decisions, his words)" in captured["p"]
+    assert "her actions" not in captured["p"]
