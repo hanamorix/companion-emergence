@@ -71,7 +71,8 @@ _IDENTITY_TEMPLATE = (
     "\n\nIDENTITY: The conversation is between {user_label} (the user) and "
     "the user's companion, {companion_name}. When a description or "
     "canonical_key refers to the companion, use the name {companion_name} — "
-    'never "Claude", "the assistant", or "the AI".'
+    'never "Claude", "the assistant", or "the AI". '
+    "When a description refers to the user, use {subject}/{object}."
 )
 
 
@@ -80,6 +81,7 @@ def build_detector_system_prompt(
     *,
     companion_name: str = "",
     user_name: str = "",
+    user_pronouns: object = None,
 ) -> str:
     """Return the detector system prompt.
 
@@ -108,7 +110,13 @@ def build_detector_system_prompt(
             f"{cats_str}. Do NOT emit candidates for any other category."
         )
     if companion_name:
+        from brain.pronouns import resolve
+
+        pr = resolve(user_pronouns)
         prompt += _IDENTITY_TEMPLATE.format(
-            companion_name=companion_name, user_label=user_name or "the user"
+            companion_name=companion_name,
+            user_label=user_name or "the user",
+            subject=pr.subject,
+            object=pr.object,
         )
     return prompt

@@ -59,3 +59,19 @@ def test_base_prompt_does_not_gender_the_user() -> None:
 
     base = build_detector_system_prompt()
     assert not re.search(r"\b(she|her|hers|he|him|his)\b", base, re.IGNORECASE)
+
+
+def test_prompt_states_user_pronouns() -> None:
+    from brain.pronouns import PRESETS, to_dict
+
+    prompt = build_detector_system_prompt(
+        companion_name="Mira",
+        user_name="Alex",
+        user_pronouns=to_dict(PRESETS["he/him"]),
+    )
+    assert "When a description refers to the user, use he/him." in prompt
+
+
+def test_prompt_user_pronouns_default_she_her() -> None:
+    prompt = build_detector_system_prompt(companion_name="Mira", user_name="Alex")
+    assert "When a description refers to the user, use she/her." in prompt
