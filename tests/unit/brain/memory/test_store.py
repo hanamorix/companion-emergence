@@ -1019,6 +1019,50 @@ def test_peak_migration_seeds_from_current_intensities(tmp_path):
     assert row["peak_emotion_intensity"] == 0.0
 
 
+def test_peak_migration_skips_seeding_on_pre_emotions_json_schema(tmp_path):
+    """MemoryStore must NOT raise when opening a v0.0.12-shaped DB whose
+    memories table uses the old ``emotions`` column (not ``emotions_json``).
+    The peak seeding loop must be skipped fail-soft; the column is still added
+    with honest DEFAULT 0.0.  Mirrors the roundtrip fixture's old schema."""
+    db = tmp_path / "old_schema_memories.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            content TEXT,
+            importance INT,
+            memory_type TEXT,
+            domain TEXT,
+            created_at TEXT,
+            emotions TEXT,
+            tags TEXT,
+            active INT
+        )"""
+    )
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("id-old-001", "old memory content", 5, "conversation", "us", now, "{}", "[]", 1),
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening must NOT raise — peak seeding must be skipped gracefully
+    store = MemoryStore(db)
+    try:
+        # Column must exist (added by ALTER TABLE)
+        cols = {row[1] for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        assert "peak_emotion_intensity" in cols, "peak_emotion_intensity column was not added"
+        # The row must have an honest 0.0 (default, not an error)
+        row = store._conn.execute(
+            "SELECT peak_emotion_intensity FROM memories WHERE id = ?", ("id-old-001",)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 0.0
+    finally:
+        store.close()
+
+
 def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
     """Pin (D3): peak_emotion_intensity is one REAL scalar, not a per-emotion
     vector. A which-emotion-mattered use-case needs the deferred vector design —
