@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from brain.felt_time.state import FeltTimeState
 from brain.forgetting.policy import FADE_THRESHOLD
 from brain.forgetting.salience import DEFAULT_WEIGHTS, _emotion_input, _peak_input
-from brain.memory.store import Memory
+from brain.memory.store import Memory, MemoryStore
 
 
 def _mem(peak: float, days_old: float, emotions: dict | None = None) -> Memory:
@@ -63,3 +63,61 @@ def test_peak_survives_empty_emotions():
     mem = _mem(peak=5.0, days_old=7, emotions={})
     assert _emotion_input(mem) == 0.0
     assert _peak_input(mem, _fts()) > 0.0
+
+
+def test_peak_flows_through_live_forgetting_pass(tmp_path):
+    """Organ DoD: the producer (store choke point) and consumer (salience)
+    must connect THROUGH the real forgetting pass — not only in unit isolation.
+    Two week-old memories, emotions emptied (the post-noise-floor shape); the
+    peak-5 one survives the pass active, the peak-0 one fades.
+
+    Requires a minimal felt_time_state.json with lived_age_hours > 0 so
+    policy.is_exempt()'s cold-start guard (lived_age_hours <= 0 → all exempt)
+    does not short-circuit the pass.  A rate of 1 lived-hour per wall-hour
+    keeps the test deterministic without importing felt-time machinery.
+    """
+    import json as _json
+
+    from brain.forgetting import run_pass
+
+    class _Bus:
+        def publish(self, event):  # noqa: ANN001
+            pass
+
+    persona_dir = tmp_path
+    # Minimal felt-time state: lived rate ≈ 1 (lived hours == wall hours).
+    # lived_age_hours=4800 (200 days) puts memories squarely outside the
+    # RECENT_LIVED_HOURS exemption window.  last_tick_ts is set 4800 wall
+    # hours before now so the lived/wall rate ≈ 1 — no distortion to linger.
+    first_tick_iso = (datetime.now(UTC) - timedelta(hours=4800)).isoformat()
+    (persona_dir / "felt_time_state.json").write_text(
+        _json.dumps({
+            "lived_age_hours": 4800.0,
+            "last_tick_ts": first_tick_iso,
+            "anchors": {},
+            "pressure": {},
+            "horizon_pressure": {},
+            "arc_anchors": [],
+            "weather_baselines": {},
+            "replayed": False,
+        })
+    )
+
+    store = MemoryStore(persona_dir / "memories.db")
+    kept = Memory.create_new("loopy the dog", "conversation", "us",
+                             emotions={"joy": 5.0})
+    faded = Memory.create_new("weather small-talk", "conversation", "us")
+    week_ago = datetime.now(UTC) - timedelta(days=7)
+    for m in (kept, faded):
+        m.created_at = week_ago
+        m.last_accessed_at = week_ago
+        store.create(m)
+    store.update(kept.id, emotions={})  # noise-floor shape; peak stays 5.0
+    store.close()  # run_pass opens its own connection
+
+    summary = run_pass(persona_dir, event_bus=_Bus())
+    assert summary["total"] == 2
+
+    store = MemoryStore(persona_dir / "memories.db")
+    assert store.get(kept.id).state == "active"
+    assert store.get(faded.id).state == "fading"
