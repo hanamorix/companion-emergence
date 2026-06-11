@@ -89,11 +89,11 @@ def test_peak_flows_through_live_forgetting_pass(tmp_path):
     # lived_age_hours=4800 (200 days) puts memories squarely outside the
     # RECENT_LIVED_HOURS exemption window.  last_tick_ts is set 4800 wall
     # hours before now so the lived/wall rate ≈ 1 — no distortion to linger.
-    first_tick_iso = (datetime.now(UTC) - timedelta(hours=4800)).isoformat()
+    last_tick_iso = (datetime.now(UTC) - timedelta(hours=4800)).isoformat()
     (persona_dir / "felt_time_state.json").write_text(
         _json.dumps({
             "lived_age_hours": 4800.0,
-            "last_tick_ts": first_tick_iso,
+            "last_tick_ts": last_tick_iso,
             "anchors": {},
             "pressure": {},
             "horizon_pressure": {},
