@@ -1892,6 +1892,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     """
     persona = args.persona
     user_name = args.user_name
+    user_pronouns = getattr(args, "user_pronouns", None)
     migrate_from = args.migrate_from
     voice_template = args.voice_template
     force = bool(getattr(args, "force", False))
@@ -2000,7 +2001,9 @@ def _init_handler(args: argparse.Namespace) -> int:
 
     # ----- always: write persona_config + voice.md -----
     persona_dir.mkdir(parents=True, exist_ok=True)
-    config_path = write_persona_config(persona_dir, user_name=user_name, model=model)
+    config_path = write_persona_config(
+        persona_dir, user_name=user_name, user_pronouns=user_pronouns, model=model
+    )
     voice_path = install_voice_template(persona_dir, voice_template)
 
     from brain import app_config as _app_config
@@ -2011,7 +2014,10 @@ def _init_handler(args: argparse.Namespace) -> int:
     # GitHub Actions Windows caught this: a leading "✓" raised
     # UnicodeEncodeError during bundled `nell init` smoke.
     print(f"OK persona '{persona}' ready at {persona_dir}")
-    print(f"  - {config_path.name}: user_name={user_name!r}, model={model!r}")
+    print(
+        f"  - {config_path.name}: user_name={user_name!r}, "
+        f"user_pronouns={user_pronouns!r}, model={model!r}"
+    )
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2060,6 +2066,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "brain doesn't conflate you with historical figures referenced "
             "in soul context. Prompts if omitted; pass empty string ('') "
             "to leave unset."
+        ),
+    )
+    init_sub.add_argument(
+        "--user-pronouns",
+        default=None,
+        choices=["she/her", "he/him", "they/them"],
+        help=(
+            "How the Kindled refers to you in its inner life "
+            "(she/her, he/him, they/them). Defaults to she/her until set."
         ),
     )
     src_group = init_sub.add_mutually_exclusive_group()

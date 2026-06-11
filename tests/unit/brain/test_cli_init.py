@@ -228,3 +228,31 @@ def test_init_summary_is_encodable_on_windows_cp1252(monkeypatch, tmp_path: Path
     # must not contain glyphs such as "✓" that crash print() there.
     out.encode("cp1252")
     assert "OK persona 'siren' ready" in out
+
+
+def test_init_writes_user_pronouns(monkeypatch, tmp_path: Path) -> None:
+    """--user-pronouns they/them is persisted in persona_config.json."""
+    rc = _run_init(
+        monkeypatch,
+        tmp_path,
+        [
+            "--persona",
+            "siren",
+            "--user-name",
+            "Hana",
+            "--user-pronouns",
+            "they/them",
+            "--fresh",
+            "--voice-template",
+            "default",
+            "--model",
+            "sonnet",
+        ],
+    )
+    assert rc == 0
+    persona_dir = tmp_path / "personas" / "siren"
+    from brain.persona_config import PersonaConfig
+    from brain.pronouns import PRESETS, resolve
+
+    cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+    assert resolve(cfg.user_pronouns) == PRESETS["they/them"]

@@ -16,6 +16,7 @@ describe("Wizard InitArgs shape", () => {
     const args: InitArgs = {
       persona: "test",
       user_name: "Hana",
+      user_pronouns: null,
       voice_template: "default",
       migrate_from: null,
       force: false,
@@ -30,6 +31,7 @@ describe("Wizard InitArgs shape", () => {
       expect.arrayContaining([
         "persona",
         "user_name",
+        "user_pronouns",
         "voice_template",
         "migrate_from",
         "force",
@@ -51,6 +53,7 @@ describe("Wizard InitArgs shape", () => {
     const args: InitArgs = {
       persona: "alice",
       user_name: "Hana",
+      user_pronouns: null,
       voice_template: "default",
       migrate_from: null,
       force: false,

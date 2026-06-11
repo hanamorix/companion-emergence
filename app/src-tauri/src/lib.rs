@@ -38,6 +38,7 @@ pub struct AppConfig {
 pub struct InitArgs {
     pub persona: String,
     pub user_name: Option<String>,
+    pub user_pronouns: Option<String>,
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
@@ -874,6 +875,10 @@ fn build_init_args(args: &InitArgs) -> Vec<String> {
         v.push("--user-name".to_string());
         v.push(name.clone());
     }
+    if let Some(pronouns) = &args.user_pronouns {
+        v.push("--user-pronouns".to_string());
+        v.push(pronouns.clone());
+    }
     v.push("--voice-template".to_string());
     v.push(args.voice_template.clone());
     if let Some(path) = &args.migrate_from {
@@ -1558,6 +1563,7 @@ mod tests {
         let args = InitArgs {
             persona: "nell".into(),
             user_name: Some("Hana".into()),
+            user_pronouns: Some("they/them".into()),
             voice_template: "default".into(),
             migrate_from: None,
             force: false,
@@ -1568,6 +1574,7 @@ mod tests {
         assert!(argv.windows(2).any(|w| w == ["--persona", "nell"]));
         assert!(argv.windows(2).any(|w| w == ["--model", "sonnet"]));
         assert!(argv.windows(2).any(|w| w == ["--voice-template", "default"]));
+        assert!(argv.windows(2).any(|w| w == ["--user-pronouns", "they/them"]));
         assert!(argv.iter().any(|a| a == "--fresh"));
         assert!(!argv.iter().any(|a| a == "--force"));
     }
@@ -1577,6 +1584,7 @@ mod tests {
         let args = InitArgs {
             persona: "nell".into(),
             user_name: None,
+            user_pronouns: None,
             voice_template: "default".into(),
             migrate_from: Some("/tmp/og".into()),
             force: true,
@@ -1587,6 +1595,7 @@ mod tests {
         assert!(!argv.iter().any(|a| a == "--fresh"));
         assert!(argv.iter().any(|a| a == "--force"));
         assert!(!argv.iter().any(|a| a == "--user-name"));
+        assert!(!argv.iter().any(|a| a == "--user-pronouns"));
     }
 
     #[test]
