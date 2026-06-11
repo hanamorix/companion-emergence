@@ -36,6 +36,7 @@ export interface WizardState {
   mode: WizardMode;
   personaName: string;
   userName: string;
+  userPronouns: string;
   voiceTemplate: VoiceTemplate;
   migrateFromPath: string;
   migrateSource: MigrateSource;
@@ -45,6 +46,7 @@ const INITIAL_STATE: WizardState = {
   mode: "fresh",
   personaName: "",
   userName: "",
+  userPronouns: "they/them",
   voiceTemplate: "default",
   migrateFromPath: "",
   migrateSource: "nellbrain",
@@ -206,7 +208,7 @@ export function Wizard({ onDone }: Props) {
       const args: InitArgs = {
         persona: state.personaName,
         user_name: state.userName.trim() || null,
-        user_pronouns: null,
+        user_pronouns: state.userPronouns,
         voice_template: state.voiceTemplate,
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
@@ -329,6 +331,8 @@ export function Wizard({ onDone }: Props) {
           onNext={() => setStep("voice")}
           onBack={() => setStep("name")}
           avatar={avatar}
+          pronouns={state.userPronouns}
+          onPronounsChange={(v) => update("userPronouns", v)}
         />
       );
     case "voice":
