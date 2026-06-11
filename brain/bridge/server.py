@@ -620,6 +620,11 @@ class ModelConfigReq(BaseModel):
     model: str
 
 
+class PronounConfigReq(BaseModel):
+    preset: str | None = None
+    set: dict | None = None
+
+
 class NewSessionReq(BaseModel):
     client: Literal["cli", "tauri", "tests"] = "cli"
 
@@ -1219,6 +1224,51 @@ def build_app(
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
         return {"ok": True, "model": req.model}
+
+    # ── POST /persona/config/pronouns — user pronoun persist ──────────────
+    @app.post("/persona/config/pronouns", dependencies=[Depends(require_http_auth)])
+    async def set_persona_pronouns(req: PronounConfigReq) -> dict:
+        """Persist the user's pronouns (spec 2026-06-11-user-pronouns §5).
+
+        Accepts {"preset": "she/her"|"he/him"|"they/them"} or {"set": {full
+        PronounSet dict}}. Validated STRICTLY here (unlike the fail-soft
+        consumer-side resolve): garbage is a 422 client error, not a silent
+        she/her fallback. Returns {ok: true, pronouns: <stored dict>}.
+        """
+        from dataclasses import replace as dc_replace
+
+        from brain.persona_config import PersonaConfig
+        from brain.pronouns import DEFAULT_KEY, PRESETS, resolve, to_dict
+
+        if req.preset is not None:
+            if req.preset not in PRESETS:
+                return JSONResponse(
+                    status_code=422,
+                    content={"ok": False, "error": "unknown_preset", "valid": sorted(PRESETS)},
+                )
+            stored = to_dict(PRESETS[req.preset])
+        elif req.set is not None:
+            resolved = resolve(req.set)
+            # resolve() returns the IDENTICAL default singleton on fallback;
+            # a valid custom dict returns a NEW PronounSet instance.
+            # `is` distinguishes them — reject invalid partial/empty sets.
+            if resolved is PRESETS[DEFAULT_KEY]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"ok": False, "error": "invalid_set"},
+                )
+            stored = to_dict(resolved)
+        else:
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "error": "missing_body"},
+            )
+
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        updated = dc_replace(PersonaConfig.load(config_path), user_pronouns=stored)
+        updated.save(config_path)
+        return {"ok": True, "pronouns": stored}
 
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])
