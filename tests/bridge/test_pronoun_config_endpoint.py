@@ -68,6 +68,14 @@ def test_set_pronouns_full_set_accepted(tmp_path: Path):
     assert resolved.object == "xem"
 
 
+def test_set_pronouns_requires_auth(tmp_path: Path):
+    """Requests without a valid bearer token must return 401."""
+    client, _, _ = _make_client(tmp_path, auth_token="secret")
+    with client:
+        r = client.post("/persona/config/pronouns", json={"preset": "he/him"})
+    assert r.status_code == 401, r.text
+
+
 def test_set_pronouns_rejects_garbage(tmp_path: Path):
     """Unknown preset, partial set, and empty body all return 422."""
     client, _, _ = _make_client(tmp_path)
