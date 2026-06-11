@@ -10,6 +10,7 @@ Composite formula:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,14 @@ _EMOTION_DENOMINATOR = 10.0
 _HEBBIAN_DENOMINATOR = 20.0
 _RECALL_DENOMINATOR = 10.0
 _FRESHNESS_LIVED_HOURS_HORIZON = 720.0  # 30 lived-days
+
+# v0.0.33 Track 3 — peak blend. The FIELD never decays; its salience
+# contribution lingers over a long lived-time horizon so forgetting stays
+# reachable (spec constraint: sticky, never immortal). Calibration per the
+# plan's table: peak-5 fades ~day 46, loses ~day 127.
+_PEAK_LAMBDA = 1.5
+_PEAK_LOG_DENOMINATOR = math.log1p(10.0)
+_PEAK_LINGER_LIVED_HOURS_HORIZON = 4320.0  # 180 lived-days
 
 
 @dataclass(frozen=True)
@@ -69,36 +78,50 @@ def _soul_input(memory: Memory, soul_linked_ids: Iterable[str]) -> float:
     return 1.0 if memory.id in soul_linked_ids else 0.0
 
 
+def _lived_hours_since(anchor: datetime, felt_time_state: FeltTimeState | None) -> float | None:
+    """Lived hours elapsed since `anchor`, or None for the cold-start
+    treat-as-fresh cases (no felt-time state / no lived age / no usable rate).
+    Extracted from _freshness_input (v0.0.33) so the peak linger shares one
+    lived-time approximation."""
+    if felt_time_state is None:
+        return None
+    now = datetime.now(UTC)
+    wall_delta_s = (now - anchor).total_seconds()
+    if felt_time_state.lived_age_hours <= 0.0:
+        return None
+    if felt_time_state.last_tick_ts is None:
+        return wall_delta_s / 3600.0
+    wall_clock_since_first_tick_s = (
+        now - datetime.fromisoformat(felt_time_state.last_tick_ts)
+    ).total_seconds()
+    if wall_clock_since_first_tick_s <= 0:
+        return None
+    rate_lived_per_wall = felt_time_state.lived_age_hours / max(
+        wall_clock_since_first_tick_s / 3600.0, 1e-6
+    )
+    return (wall_delta_s / 3600.0) * rate_lived_per_wall
+
+
 def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
     if memory.last_accessed_at is None:
         return 0.0  # never accessed = no freshness signal
-    if felt_time_state is None:
-        return 1.0  # cold-start before felt-time exists = treat as fresh (spec §7)
-    # Approximation per spec §3 + §7 deferred — wall-clock delta × current
-    # lived-age ratio. Exact per-memory lived_age_at column deferred.
-    now = datetime.now(UTC)
-    wall_delta_s = (now - memory.last_accessed_at).total_seconds()
-    # If FeltTimeState has lived_age=0 (cold start), there's no rate to
-    # apply yet — treat as 1.0 (fresh) so we don't fade everything on the
-    # first pass.
-    if felt_time_state.lived_age_hours <= 0.0:
-        return 1.0  # cold-start: no lived age yet — treat as fresh
-    if felt_time_state.last_tick_ts is None:
-        # lived_age known but no tick history — approximate rate=1 (wall=lived).
-        lived_hours_since_access = wall_delta_s / 3600.0
-    else:
-        wall_clock_since_first_tick_s = (
-            now - datetime.fromisoformat(felt_time_state.last_tick_ts)
-        ).total_seconds()
-        if wall_clock_since_first_tick_s <= 0:
-            return 1.0
-        # rate = lived_hours per wall_hour since first tick (rough)
-        # For a tighter approximation we'd integrate, but spec §7 accepts this.
-        rate_lived_per_wall = felt_time_state.lived_age_hours / max(
-            wall_clock_since_first_tick_s / 3600.0, 1e-6
-        )
-        lived_hours_since_access = (wall_delta_s / 3600.0) * rate_lived_per_wall
-    return 1.0 - _clamp(lived_hours_since_access / _FRESHNESS_LIVED_HOURS_HORIZON)
+    lived = _lived_hours_since(memory.last_accessed_at, felt_time_state)
+    if lived is None:
+        return 1.0  # cold-start cases — treat as fresh (spec §7)
+    return 1.0 - _clamp(lived / _FRESHNESS_LIVED_HOURS_HORIZON)
+
+
+def _peak_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
+    """Salience residue of having mattered: log-scaled peak intensity with a
+    long linear linger. Survives emotion decay + noise-floor deletion by
+    reading the monotone peak field, not the live dict."""
+    peak = getattr(memory, "peak_emotion_intensity", 0.0) or 0.0
+    if peak <= 0.0:
+        return 0.0
+    anchor = memory.last_accessed_at or memory.created_at
+    lived = _lived_hours_since(anchor, felt_time_state)
+    linger = 1.0 if lived is None else 1.0 - _clamp(lived / _PEAK_LINGER_LIVED_HOURS_HORIZON)
+    return _clamp(_PEAK_LAMBDA * math.log1p(peak) / _PEAK_LOG_DENOMINATOR * linger)
 
 
 def score(
@@ -113,7 +136,7 @@ def score(
     """Composite salience in [0, 1]. See module docstring."""
     w = weights or DEFAULT_WEIGHTS
     inputs = SalienceInputs(
-        emotion=_emotion_input(memory),
+        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),
@@ -139,7 +162,7 @@ def compute_inputs(
     """Return the per-input breakdown — used by the graveyard writer to
     record salience_inputs_at_drop for audit."""
     return SalienceInputs(
-        emotion=_emotion_input(memory),
+        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),
