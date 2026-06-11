@@ -206,6 +206,7 @@ export function Wizard({ onDone }: Props) {
       const args: InitArgs = {
         persona: state.personaName,
         user_name: state.userName.trim() || null,
+        user_pronouns: null,
         voice_template: state.voiceTemplate,
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
