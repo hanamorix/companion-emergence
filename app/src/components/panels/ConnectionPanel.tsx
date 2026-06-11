@@ -1,12 +1,13 @@
 import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
-import type { PersonaState, ChatModel } from "../../bridge";
+import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
+import { PronounPicker } from "./PronounPicker";
 import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
 import { errString } from "../../lib/errString";
@@ -69,6 +70,10 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
+  const [showPronounPicker, setShowPronounPicker] = useState(false);
+  // Local pronoun override — updated optimistically after a successful apply.
+  const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
+  const displayPronouns = localPronouns ?? (conn?.user_pronouns as PronounPreset | null | undefined) ?? null;
   useEffect(() => {
     let cancelled = false;
     void detectInstallShape()
@@ -261,6 +266,7 @@ export function ConnectionPanel({
           </span>
           .{" "}
           <button
+            aria-label="change model"
             onClick={() => setShowModelPicker(true)}
             style={{
               background: "none",
@@ -283,6 +289,50 @@ export function ConnectionPanel({
           onClose={(newModel) => {
             if (newModel) setLocalModel(newModel);
             setShowModelPicker(false);
+          }}
+        />
+      )}
+
+      <Divider />
+      <SectionLabel>Your pronouns</SectionLabel>
+      {!showPronounPicker ? (
+        <div
+          style={{
+            fontSize: 10.5,
+            color: "var(--text-mute)",
+            lineHeight: 1.55,
+            marginBottom: 6,
+          }}
+        >
+          Currently{" "}
+          <span style={{ color: "var(--text)", fontWeight: 500 }}>
+            {displayPronouns ?? "she/her (default)"}
+          </span>
+          .{" "}
+          <button
+            aria-label="change pronouns"
+            onClick={() => setShowPronounPicker(true)}
+            style={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              color: "var(--accent)",
+              cursor: "pointer",
+              fontSize: "inherit",
+              fontFamily: "inherit",
+              textDecoration: "underline",
+            }}
+          >
+            change
+          </button>
+        </div>
+      ) : (
+        <PronounPicker
+          current={displayPronouns ?? "she/her"}
+          persona={persona}
+          onClose={(next) => {
+            if (next) setLocalPronouns(next);
+            setShowPronounPicker(false);
           }}
         />
       )}

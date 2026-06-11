@@ -54,3 +54,16 @@ def test_verb_agreement_and_cap():
     assert they.v("hasn't", "haven't") == "haven't"
     assert she.cap(she.subject) == "She"
     assert they.cap(they.subject) == "They"
+
+
+def test_preset_key_for_round_trips_presets():
+    from brain.pronouns import PRESETS, preset_key_for, to_dict
+    for key in ("she/her", "he/him", "they/them"):
+        assert preset_key_for(to_dict(PRESETS[key])) == key
+
+
+def test_preset_key_for_none_and_custom():
+    from brain.pronouns import preset_key_for
+    assert preset_key_for(None) is None
+    assert preset_key_for({"subject": "xe", "object": "xem", "possessive": "xyr",
+        "possessive_standalone": "xyrs", "reflexive": "xemself", "plural_verbs": False}) is None
