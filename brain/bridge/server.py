@@ -391,10 +391,13 @@ def _apply_replied_explicit_transition(
     )
     from brain.initiate.memory import update_initiate_memory_for_state
     from brain.persona_config import PersonaConfig
+    from brain.pronouns import resolve
 
+    _pronouns = None
     try:
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         user_name = cfg.user_name or "my user"
+        _pronouns = resolve(cfg.user_pronouns)
     except Exception:
         user_name = "my user"
 
@@ -421,6 +424,7 @@ def _apply_replied_explicit_transition(
             new_state="replied_explicit",
             ts=now,
             user_name=user_name,
+            pronouns=_pronouns,
         )
     finally:
         store.close()
@@ -1270,11 +1274,14 @@ def build_app(
         )
         from brain.initiate.memory import update_initiate_memory_for_state
         from brain.persona_config import PersonaConfig
+        from brain.pronouns import resolve
 
         s: BridgeAppState = app.state.bridge
+        _pronouns = None
         try:
             _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
             _user_name = _cfg.user_name or "my user"
+            _pronouns = resolve(_cfg.user_pronouns)
         except Exception:
             _user_name = "my user"
 
@@ -1316,6 +1323,7 @@ def build_app(
                         new_state=new_state,
                         ts=now,
                         user_name=_user_name,
+                        pronouns=_pronouns,
                     )
                 finally:
                     store.close()
@@ -1348,12 +1356,15 @@ def build_app(
         )
         from brain.initiate.memory import update_initiate_memory_for_state
         from brain.persona_config import PersonaConfig
+        from brain.pronouns import resolve
         from brain.soul.store import SoulStore, VoiceEvolution
 
         s: BridgeAppState = app.state.bridge
+        _pronouns = None
         try:
             _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
             _user_name = _cfg.user_name or "my user"
+            _pronouns = resolve(_cfg.user_pronouns)
         except Exception:
             _user_name = "my user"
 
@@ -1466,6 +1477,7 @@ def build_app(
                     new_state="replied_explicit",
                     ts=now_iso,
                     user_name=_user_name,
+                    pronouns=_pronouns,
                 )
             finally:
                 store.close()
@@ -1490,11 +1502,14 @@ def build_app(
         )
         from brain.initiate.memory import update_initiate_memory_for_state
         from brain.persona_config import PersonaConfig
+        from brain.pronouns import resolve
 
         s: BridgeAppState = app.state.bridge
+        _pronouns = None
         try:
             _cfg = PersonaConfig.load(s.persona_dir / "persona_config.json")
             _user_name = _cfg.user_name or "my user"
+            _pronouns = resolve(_cfg.user_pronouns)
         except Exception:
             _user_name = "my user"
 
@@ -1529,6 +1544,7 @@ def build_app(
                         new_state="dismissed",
                         ts=now_iso,
                         user_name=_user_name,
+                        pronouns=_pronouns,
                     )
                 finally:
                     store.close()

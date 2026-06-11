@@ -205,3 +205,37 @@ def test_update_with_no_prior_memory_writes_fresh(tmp_path) -> None:
         assert rows[0].metadata["initiate_audit_id"] == "ia_missing"
     finally:
         store.close()
+
+
+# ── Task 4: pronoun slots in non-pending templates ──────────────────────────
+
+
+def test_render_memory_they_them_agreement():
+    from brain.pronouns import PRESETS
+
+    text = render_memory_for_state(
+        subject="the garden",
+        message="hi",
+        state="unanswered",
+        user_name="Alex",
+        pronouns=PRESETS["they/them"],
+    )
+    assert "They've seen it. They haven't said anything about it." in text
+
+
+def test_render_memory_defaults_she_her():
+    text = render_memory_for_state(subject="s", message="m", state="delivered", user_name="Alex")
+    assert "She hasn't seen it yet." in text
+
+
+def test_render_memory_he_him():
+    from brain.pronouns import PRESETS
+
+    text = render_memory_for_state(
+        subject="s",
+        message="m",
+        state="replied_explicit",
+        user_name="Alex",
+        pronouns=PRESETS["he/him"],
+    )
+    assert "He answered." in text
