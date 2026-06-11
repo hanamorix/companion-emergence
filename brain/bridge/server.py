@@ -790,6 +790,12 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001
             logger.warning("could not touch last_opened_at: %s", _exc)
 
+        try:
+            from brain.bridge.pronoun_nudge import maybe_write_pronoun_nudge
+            maybe_write_pronoun_nudge(persona_dir, companion_name=persona_dir.name)
+        except Exception as _exc:  # noqa: BLE001 — startup must not break on the nudge
+            logger.warning("pronoun nudge check failed: %s", _exc)
+
         # Load the persona emotion vocabulary before any chat request can arrive.
         # Without this, aggregate_state silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
