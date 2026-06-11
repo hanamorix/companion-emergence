@@ -181,6 +181,18 @@ def test_growth_log_concurrent_appends_dont_clobber_each_other(tmp_path: Path) -
     assert names == expected_names
 
 
+# ---- Task 2 (user-pronouns): write_persona_config expands pronoun preset ----
+
+
+def test_write_persona_config_expands_pronoun_preset(tmp_path: Path) -> None:
+    from brain.persona_config import PersonaConfig
+    from brain.pronouns import PRESETS, resolve
+
+    write_persona_config(tmp_path, user_name="Alex", user_pronouns="they/them")
+    loaded = PersonaConfig.load(tmp_path / "persona_config.json")
+    assert resolve(loaded.user_pronouns) == PRESETS["they/them"]
+
+
 def test_soul_candidate_review_holds_lock_against_concurrent_queue(tmp_path: Path) -> None:
     """While review is in its read-modify-rewrite window, queue_soul_candidate
     must block until review releases the lock; previously the queued candidate
