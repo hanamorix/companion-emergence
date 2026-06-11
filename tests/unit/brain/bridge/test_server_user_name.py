@@ -22,7 +22,7 @@ def test_apply_replied_explicit_transition_passes_user_name(tmp_path: Path) -> N
     fake_row.subject = "a dream"
     fake_row.tone_rendered = "rendered message"
 
-    def fake_update_memory(store, *, audit_id, subject, message, new_state, ts, user_name="my user"):
+    def fake_update_memory(store, *, audit_id, subject, message, new_state, ts, user_name="my user", pronouns=None):
         captured.append({"user_name": user_name})
 
     fake_store = MagicMock()

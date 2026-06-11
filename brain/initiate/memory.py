@@ -22,10 +22,13 @@ later state transition can locate the same row.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from brain.initiate.schemas import StateName
 from brain.memory.store import Memory
+
+if TYPE_CHECKING:
+    from brain.pronouns import PronounSet
 
 logger = logging.getLogger(__name__)
 
@@ -41,26 +44,27 @@ _TEMPLATES: dict[str, str] = {
     ),
     "delivered": (
         "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "She hasn't seen it yet."
+        "{Subj} {hasnt} seen it yet."
     ),
     "read": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. She's seen it."
+        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
+        "{Subj_s} seen it."
     ),
     "replied_explicit": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. She answered."
+        "I reached out to {user_name} about {subject}. I said: {message_quoted}. {Subj} answered."
     ),
     "acknowledged_unclear": (
         "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "She's seen it. What she said next felt like new territory — I can't "
-        "tell if she was responding to my message or moving on."
+        "{Subj_s} seen it. What {subj} said next felt like new territory — I can't "
+        "tell if {subj} {was_were} responding to my message or moving on."
     ),
     "unanswered": (
         "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "She's seen it. She hasn't said anything about it."
+        "{Subj_s} seen it. {Subj} {hasnt} said anything about it."
     ),
     "dismissed": (
         "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "She closed the banner without responding — dismissed."
+        "{Subj} closed the banner without responding — dismissed."
     ),
 }
 
@@ -71,14 +75,23 @@ def render_memory_for_state(
     message: str,
     state: StateName,
     user_name: str = "my user",
+    pronouns: PronounSet | None = None,
 ) -> str:
     """Return the first-person memory text for a given state."""
+    from brain.pronouns import resolve
+
+    p = pronouns or resolve(None)
     template = _TEMPLATES.get(state) or _TEMPLATES["delivered"]
     truncated = message if len(message) <= 240 else message[:237] + "..."
     return template.format(
         subject=subject,
         message_quoted=f"'{truncated}'",
         user_name=user_name,
+        Subj=p.cap(p.subject),
+        subj=p.subject,
+        Subj_s=p.cap(p.subject) + p.v("'s", "'ve"),
+        hasnt=p.v("hasn't", "haven't"),
+        was_were=p.v("was", "were"),
     )
 
 
@@ -109,13 +122,14 @@ def write_initiate_memory(
     state: StateName,
     ts: str,
     user_name: str = "my user",
+    pronouns: PronounSet | None = None,
 ) -> None:
     """Write a fresh first-person memory entry. Called at send time.
 
     Failures are swallowed with a warning — the audit row is the durable
     record; a missing memory entry degrades ambient recall but isn't fatal.
     """
-    text = render_memory_for_state(subject=subject, message=message, state=state, user_name=user_name)
+    text = render_memory_for_state(subject=subject, message=message, state=state, user_name=user_name, pronouns=pronouns)
     memory = Memory.create_new(
         content=text,
         memory_type=_INITIATE_MEMORY_TYPE,
@@ -143,13 +157,14 @@ def update_initiate_memory_for_state(
     new_state: StateName,
     ts: str,
     user_name: str = "my user",
+    pronouns: PronounSet | None = None,
 ) -> None:
     """Re-render and update the existing memory entry for a state transition.
 
     Looks up the memory by metadata.initiate_audit_id == audit_id; falls
     back to a fresh write if not found (degrades gracefully).
     """
-    text = render_memory_for_state(subject=subject, message=message, state=new_state, user_name=user_name)
+    text = render_memory_for_state(subject=subject, message=message, state=new_state, user_name=user_name, pronouns=pronouns)
     try:
         memory_id = _find_memory_id_for_audit(memory_store, audit_id)
         if memory_id is not None:
@@ -175,6 +190,7 @@ def update_initiate_memory_for_state(
                 state=new_state,
                 ts=ts,
                 user_name=user_name,
+                pronouns=pronouns,
             )
     except Exception as exc:
         logger.warning("initiate memory update failed for %s: %s", audit_id, exc)

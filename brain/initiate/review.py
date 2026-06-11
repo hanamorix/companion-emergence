@@ -283,6 +283,16 @@ def _process_one_candidate(
         # entry surfaces this outreach to ambient recall on later turns.
         # Failure here is degraded (no recall surface) but not fatal.
         try:
+            from brain.persona_config import PersonaConfig
+            from brain.pronouns import resolve as _resolve_pronouns
+
+            try:
+                _pron = _resolve_pronouns(
+                    PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns
+                )
+            except Exception:  # noqa: BLE001
+                _pron = _resolve_pronouns(None)
+
             store = MemoryStore(persona_dir / "memories.db")
             try:
                 write_initiate_memory(
@@ -293,6 +303,7 @@ def _process_one_candidate(
                     state="delivered",
                     ts=now.isoformat(),
                     user_name=user_name,
+                    pronouns=_pron,
                 )
             finally:
                 store.close()
