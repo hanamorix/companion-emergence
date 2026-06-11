@@ -67,8 +67,18 @@ the source. Fabricated quotes are silently rejected and logged. You
 gain nothing by claiming what you cannot ground."""
 
 
+_IDENTITY_TEMPLATE = (
+    "\n\nIDENTITY: The conversation is between the user (\"she\"/\"her\" in the "
+    "rules above) and her companion, {companion_name}. When a description or "
+    "canonical_key refers to the companion, name her {companion_name} — "
+    'never "Claude", "the assistant", or "the AI".'
+)
+
+
 def build_detector_system_prompt(
     only_categories: frozenset[str] | None = None,
+    *,
+    companion_name: str = "",
 ) -> str:
     """Return the detector system prompt.
 
@@ -78,13 +88,21 @@ def build_detector_system_prompt(
     not double-counted. When None, returns the base prompt unchanged
     (preserves existing behaviour for normal per-turn detector calls).
 
+    When *companion_name* is provided, appends an identity-grounding block.
+    Without it the CLI-wrapped detector has no name for the companion and
+    falls back to its own self-concept, writing "Claude" into pattern
+    descriptions (live report, 2026-06-11). Empty name → base prompt
+    unchanged (no dangling block).
+
     Deterministic; tests pin its content.
     """
-    if only_categories is None:
-        return _DETECTOR_SYSTEM_PROMPT
-    cats_str = ", ".join(sorted(only_categories))
-    restriction = (
-        f"\n\nFOR THIS PASS ONLY: extract candidates for these categories: "
-        f"{cats_str}. Do NOT emit candidates for any other category."
-    )
-    return _DETECTOR_SYSTEM_PROMPT + restriction
+    prompt = _DETECTOR_SYSTEM_PROMPT
+    if only_categories is not None:
+        cats_str = ", ".join(sorted(only_categories))
+        prompt += (
+            f"\n\nFOR THIS PASS ONLY: extract candidates for these categories: "
+            f"{cats_str}. Do NOT emit candidates for any other category."
+        )
+    if companion_name:
+        prompt += _IDENTITY_TEMPLATE.format(companion_name=companion_name)
+    return prompt

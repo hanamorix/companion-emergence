@@ -40,3 +40,12 @@ def test_prompt_includes_decline_on_uncertainty_instruction() -> None:
 def test_prompt_is_deterministic() -> None:
     """Snapshot equality — the prompt is a constant, not a generator."""
     assert build_detector_system_prompt() == build_detector_system_prompt()
+
+
+def test_prompt_grounds_companion_identity() -> None:
+    """v0.0.33 fix: without identity grounding, the CLI-wrapped detector
+    falls back to its self-concept and names the companion 'Claude' in
+    pattern descriptions (live Phoebe report, 2026-06-11)."""
+    prompt = build_detector_system_prompt(companion_name="Phoebe")
+    assert "her companion, Phoebe" in prompt
+    assert 'never "Claude"' in prompt

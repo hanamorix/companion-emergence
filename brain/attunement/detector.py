@@ -237,7 +237,9 @@ def run_detector(
         return _decline_output(source_turn_id="")
 
     source_turn_id = buffer_slice[-1].id
-    system_prompt = build_detector_system_prompt(only_categories=only_categories)
+    system_prompt = build_detector_system_prompt(
+        only_categories=only_categories, companion_name=companion_name
+    )
     user_message = _build_user_message(buffer_slice, reply_text, companion_name=companion_name)
 
     raw = _call_haiku(system_prompt, user_message, persona_dir=persona_dir)
