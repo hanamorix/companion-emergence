@@ -16,11 +16,25 @@ def _make_client(persona_dir: Path, auth_token: str | None = None) -> TestClient
 
 
 def _seed_minimal_persona(tmp_path: Path) -> Path:
-    """Return a minimal persona dir that build_app lifespan accepts."""
+    """Return a minimal persona dir that build_app lifespan accepts.
+
+    Sets user_pronouns so the pronoun-nudge marker is not written — these
+    tests are about the feed endpoint, not the nudge behaviour.
+    """
+    import json as _json
+
+    from brain.pronouns import PRESETS, to_dict
+
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
     (persona_dir / "active_conversations").mkdir()
-    (persona_dir / "persona_config.json").write_text('{"provider": "fake", "searcher": "fake"}')
+    (persona_dir / "persona_config.json").write_text(
+        _json.dumps({
+            "provider": "fake",
+            "searcher": "fake",
+            "user_pronouns": to_dict(PRESETS["she/her"]),
+        })
+    )
     return persona_dir
 
 
