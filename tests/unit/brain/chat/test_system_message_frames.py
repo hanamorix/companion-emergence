@@ -75,3 +75,13 @@ def test_reply_frame_is_last_block(system_message: str):
     content — recency-positioned for models that weight late context."""
     assert system_message.rstrip().endswith("the answer needs room.")
     assert "never 'she'/'her'/'they'" in system_message.split("── visible reply")[-1]
+
+
+def test_deferred_d2_prompt_size_canary(system_message: str):
+    """Canary (D2): if ambient blocks bloat enough to bury the reply-frame
+    reboot, revisit the deferred compression/reorder pass. Bound of 9_000
+    is ~3x the fixture's current size (2901 chars as of v0.0.33) — it should
+    trip on structural growth, not drift. Ledger:
+    project_companion_emergence_deferred.md."""
+    assert len(system_message) < 9_000
+    assert system_message.rstrip().endswith("the answer needs room.")

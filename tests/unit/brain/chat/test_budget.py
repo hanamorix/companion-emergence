@@ -103,6 +103,22 @@ def test_apply_budget_short_session_below_threshold_passes_through() -> None:
     assert out == msgs
 
 
+def test_deferred_d2_system_message_never_compressed() -> None:
+    """Pin (D2): apply_budget must return the system message untouched.
+    Changing this assumption requires the deferred budget/reorder pass —
+    ledger: project_companion_emergence_deferred.md."""
+    huge_text = "x" * 8_000
+    msgs: list[ChatMessage] = [ChatMessage(role="system", content="be Nell")]
+    for i in range(60):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append(ChatMessage(role=role, content=huge_text))
+    for i in range(40):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append(ChatMessage(role=role, content="tail"))
+    out = apply_budget(msgs, max_tokens=10_000, preserve_tail_msgs=40, provider=_StubProvider())
+    assert out[0] == msgs[0]
+
+
 def test_apply_budget_with_no_head_to_compress_returns_unchanged() -> None:
     """When the message list is too short to have any head (system +
     preserve_tail_msgs >= total), pass through unchanged even if over budget."""

@@ -1017,3 +1017,14 @@ def test_peak_migration_seeds_from_current_intensities(tmp_path):
         "SELECT peak_emotion_intensity FROM memories WHERE id = ?", ("c" * 36,)
     ).fetchone()
     assert row["peak_emotion_intensity"] == 0.0
+
+
+def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
+    """Pin (D3): peak_emotion_intensity is one REAL scalar, not a per-emotion
+    vector. A which-emotion-mattered use-case needs the deferred vector design —
+    ledger: project_companion_emergence_deferred.md."""
+    cols = {row[1]: row[2] for row in store._conn.execute(
+        "PRAGMA table_info(memories)").fetchall()}
+    assert cols["peak_emotion_intensity"] == "REAL"
+    mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 2.0})
+    assert isinstance(mem.peak_emotion_intensity, float)

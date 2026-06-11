@@ -1,3 +1,5 @@
+import pytest
+
 from brain.chat.salience import SalienceSignal, assess_salience
 from brain.chat.tool_recruit import REFLEXIVE_CORE, select_tools
 from brain.tools import NELL_TOOL_NAMES
@@ -64,3 +66,23 @@ def test_select_tools_returns_base_order():
     # Also ensure the list is not empty and contains expected tools.
     assert "search_memories" in allowed
     assert "read_file" in allowed
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred D1 (v0.0.33 spec §Deferred / project_companion_emergence_deferred.md): "
+    "memory-shaped statements without '?' or past-cues do not recruit heavy memory "
+    "tools. If this XPASSes, the heuristics were broadened — update the ledger.",
+)
+def test_deferred_d1_memoryish_statement_recruits_heavy_memory_tools():
+    allowed = select_tools(assess_salience("tell me about my dog"))
+    assert "recall_forgotten" in allowed
+
+
+def test_deferred_d1_reach_valve_always_in_hand():
+    """Pin (D1 live-signal): reach_for_capability stays reflexive-core — its
+    dispatches in tool_invocations.log.jsonl are the usage data that tells us
+    whether always-on search_memories is sufficient. Ledger:
+    project_companion_emergence_deferred.md."""
+    assert "reach_for_capability" in REFLEXIVE_CORE
+    assert "reach_for_capability" in select_tools(assess_salience("ok"))
