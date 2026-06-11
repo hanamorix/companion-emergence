@@ -136,6 +136,7 @@ export async function setAlwaysOnTop(value: boolean): Promise<void> {
 export interface InitArgs {
   persona: string;
   user_name: string | null;
+  user_pronouns: string | null;
   voice_template: "default" | "nell-example" | "skip";
   migrate_from: string | null;
   force: boolean;
