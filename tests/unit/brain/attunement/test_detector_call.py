@@ -186,3 +186,20 @@ def test_run_detector_passes_companion_name_to_user_message(buffer):
     assert captured, "expected _call_haiku to be called"
     assert "MIRA" in captured[0]
     assert "NELL" not in captured[0]
+
+
+def test_detector_threads_companion_name_into_system_prompt(buffer):
+    """v0.0.33 fix: companion_name must reach the SYSTEM prompt's identity
+    block, not just the user-message reply label — otherwise the detector
+    names the companion 'Claude' in pattern descriptions."""
+    captured: dict[str, str] = {}
+
+    def _capture(system_prompt, user_message, *, persona_dir=None):
+        captured["system_prompt"] = system_prompt
+        return ""  # decline path; we only care about the prompt
+
+    with patch("brain.attunement.detector._call_haiku", side_effect=_capture):
+        run_detector(buffer_slice=buffer, reply_text="hi", companion_name="Phoebe")
+
+    assert "her companion, Phoebe" in captured["system_prompt"]
+    assert 'never "Claude"' in captured["system_prompt"]
