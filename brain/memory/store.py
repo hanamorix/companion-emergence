@@ -268,6 +268,27 @@ class MemoryStore:
                 "ALTER TABLE memories ADD COLUMN peak_emotion_intensity "
                 "REAL NOT NULL DEFAULT 0.0"
             )
+            # One-time seed from current intensities (column-existence is the
+            # marker; v0.0.33 Track 3). Intensities already erased by the
+            # pre-v0.0.32 stub decay are unrecoverable — those rows keep an
+            # honest 0.0 (spec D4). Fail-soft per row.
+            for row in self._conn.execute(
+                "SELECT id, emotions_json FROM memories"
+            ).fetchall():
+                try:
+                    emotions = json.loads(row["emotions_json"]) or {}
+                    vals = [
+                        float(v)
+                        for v in emotions.values()
+                        if isinstance(v, (int, float))
+                    ]
+                except (ValueError, TypeError):
+                    vals = []
+                if vals:
+                    self._conn.execute(
+                        "UPDATE memories SET peak_emotion_intensity = ? WHERE id = ?",
+                        (max(vals), row["id"]),
+                    )
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
