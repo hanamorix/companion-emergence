@@ -156,7 +156,7 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
 ) -> None:
     """End-to-end contract for run_bridge_foreground:
     - initial BridgeState written with pid/port/persona before uvicorn starts
-    - uvicorn.run is called with the chosen port
+    - uvicorn.Server.run is called with the chosen port
     - finally block writes clean shutdown (shutdown_clean=True, pid/port cleared)
     - atexit/signal registration happens but is isolated from the test
       process (we monkeypatch both to no-op).
@@ -164,7 +164,7 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
 
-    captured = {"port_at_uvicorn": None, "state_at_uvicorn": None}
+    captured: dict[str, object] = {"port_at_uvicorn": None, "state_at_uvicorn": None}
 
     monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
     monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
@@ -179,14 +179,22 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
     )
     monkeypatch.setattr(runner.signal, "signal", lambda _sig, _handler: None)
 
-    def fake_uvicorn_run(app, *, host, port, log_level):
-        # Snapshot what's persisted at the moment uvicorn would begin serving.
-        captured["port_at_uvicorn"] = port
-        st = state_file.read(persona_dir)
-        captured["state_at_uvicorn"] = st
-        return None
+    class FakeConfig:
+        def __init__(self, app, *, host, port, log_level, timeout_graceful_shutdown):
+            captured["port_at_uvicorn"] = port
 
-    monkeypatch.setattr(runner.uvicorn, "run", fake_uvicorn_run)
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            # Snapshot what's persisted at the moment the server would begin serving.
+            st = state_file.read(persona_dir)
+            captured["state_at_uvicorn"] = st
+
+    monkeypatch.setattr(runner.uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
 
     rc = runner.run_bridge_foreground(persona_dir, client_origin="tests")
     assert rc == 0
@@ -216,6 +224,55 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
     # ourselves so the bound callable doesn't fire at interpreter exit.
     assert len(atexit_captured) == 1
     assert atexit_captured[0][0] is runner._write_clean_shutdown
+
+
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
+
+def test_run_bridge_foreground_binds_shutdown_controller_to_uvicorn_server(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
+    monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
+    monkeypatch.setattr(runner.atexit, "register", lambda *_a, **_kw: None)
+    monkeypatch.setattr(runner.signal, "signal", lambda *_a, **_kw: None)
+
+    def fake_build_app(**kwargs):
+        captured["shutdown_controller"] = kwargs["shutdown_controller"]
+        return object()
+
+    class FakeConfig:
+        def __init__(self, app, *, host, port, log_level, timeout_graceful_shutdown):
+            captured["config"] = (app, host, port, log_level, timeout_graceful_shutdown)
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+            captured["server"] = self
+
+        def run(self):
+            controller = captured["shutdown_controller"]
+            assert controller.request("test") is True
+            assert self.should_exit is True
+
+    monkeypatch.setattr(runner, "build_app", fake_build_app)
+    monkeypatch.setattr(runner.uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
+
+    rc = runner.run_bridge_foreground(persona_dir, client_origin="tests")
+
+    assert rc == 0
+    assert captured["server"].should_exit is True
+    assert captured["config"][4] == 30  # timeout_graceful_shutdown
 
 
 # ---------------------------------------------------------------------------
