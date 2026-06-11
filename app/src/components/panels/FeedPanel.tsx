@@ -16,6 +16,7 @@ const TYPE_LABEL: Record<FeedEntryType, string> = {
   monologue: "Monologue",
   attunement_backfill: "Attunement",
   attunement_crystal: "Pattern",
+  pronoun_nudge: "Pronouns",
 };
 
 const TYPE_DOT: Record<FeedEntryType, string> = {
@@ -27,6 +28,7 @@ const TYPE_DOT: Record<FeedEntryType, string> = {
   monologue: "#9b8ab8",        // soft violet — inner thought
   attunement_backfill: "#c89890",  // soft rose — attunement
   attunement_crystal: "#c89890",   // soft rose — attunement
+  pronoun_nudge: "#c89890",        // soft rose — settling/identity
 };
 
 /**

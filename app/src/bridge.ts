@@ -164,7 +164,8 @@ export type FeedEntryType =
   | "voice_edit"
   | "monologue"
   | "attunement_backfill"
-  | "attunement_crystal";
+  | "attunement_crystal"
+  | "pronoun_nudge";
 
 export interface FeedEntry {
   type: FeedEntryType;

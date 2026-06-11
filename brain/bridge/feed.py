@@ -33,6 +33,7 @@ FeedEntryType = Literal[
     "monologue",
     "attunement_backfill",
     "attunement_crystal",
+    "pronoun_nudge",
 ]
 
 
@@ -45,6 +46,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "monologue": "what was running underneath",
     "attunement_backfill": "I've been getting to know you",
     "attunement_crystal": "something settled into place",
+    "pronoun_nudge": "a small new thing —",
 }
 
 
@@ -301,12 +303,19 @@ def build_attunement_entries_adapter(persona_dir: Path, *, limit: int) -> list[F
     return build_attunement_entries(persona_dir)[:limit]
 
 
+def build_pronoun_nudge_entries_adapter(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Adapter shim: calls pronoun nudge feed source and respects the limit arg."""
+    from brain.bridge.pronoun_nudge import build_pronoun_nudge_entries
+
+    return build_pronoun_nudge_entries(persona_dir)[:limit]
+
+
 def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
-    """Merge all 8 source streams into a single ts-desc feed, capped at limit.
+    """Merge all 9 source streams into a single ts-desc feed, capped at limit.
 
     Fault isolation: each per-source builder is called inside its own
     try/except so a single source's failure logs an exception and returns
-    an empty list for that stream, leaving the other seven usable. The
+    an empty list for that stream, leaving the other eight usable. The
     feed always returns SOMETHING (possibly empty) — never raises.
     """
     builders = (
@@ -317,6 +326,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
         build_voice_edit_entries,
         build_monologue_entries,
         build_attunement_entries_adapter,
+        build_pronoun_nudge_entries_adapter,
     )
 
     merged: list[FeedEntry] = []
