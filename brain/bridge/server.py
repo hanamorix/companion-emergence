@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sqlite3
 import threading
 from collections.abc import AsyncIterator
@@ -56,6 +55,7 @@ from brain.bridge.chat import (
 )
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider, ProviderError, get_provider
+from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
     create_session,
@@ -173,14 +173,15 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
     """Background task that triggers graceful shutdown after idle threshold.
 
     Production-only path. Tests should NOT start this watcher (default
-    idle_shutdown_seconds=None means no watcher) — firing SIGTERM in a test
-    process would kill pytest.
+    idle_shutdown_seconds=None means no watcher). Uses the shutdown controller
+    to request graceful shutdown via uvicorn server.should_exit — no self-signal.
     """
     while True:
         await asyncio.sleep(min(idle_shutdown_seconds, 60))
         if _check_idle(state, idle_shutdown_seconds):
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
-            os.kill(os.getpid(), 15)  # SIGTERM, lifespan __aexit__ runs cleanup
+            if state.shutdown_controller is None or not state.shutdown_controller.request("idle_timeout"):
+                logger.error("idle shutdown could not request controller shutdown")
             return
 
 
@@ -727,6 +728,7 @@ class BridgeAppState:
     last_chat_at: datetime | None = None
     supervisor_thread: Any | None = None
     auth_token: str | None = None
+    shutdown_controller: BridgeShutdownController | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +743,7 @@ def build_app(
     silence_minutes: float = 5.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
+    shutdown_controller: BridgeShutdownController | None = None,
     allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS,
 ) -> FastAPI:
     """Build a FastAPI app for the given persona. Public for tests + daemon.
@@ -777,6 +780,7 @@ def build_app(
             event_bus=bus,
             in_flight_locks={},
             auth_token=auth_token,
+            shutdown_controller=shutdown_controller,
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
 
@@ -2126,24 +2130,34 @@ def build_app(
         dependencies=[Depends(require_http_auth)],
     )
     async def supervisor_shutdown() -> dict[str, Any]:
-        """Trigger graceful shutdown via the same SIGTERM path the idle watcher uses.
+        """Trigger graceful shutdown via the shutdown controller.
 
         Returns 202 immediately. The actual drain (30s in-flight chat wait +
         supervisor join + buffer snapshot) runs in the FastAPI lifespan
-        teardown that SIGTERM triggers via uvicorn's signal handler.
+        teardown triggered by uvicorn server.should_exit via the controller.
+
+        Requires a shutdown controller (set by runner.py via build_app). If the
+        bridge was started without one (e.g. tests that do not pass a controller),
+        returns 503 shutdown_controller_unavailable.
 
         Manual recovery path for the Connection-panel restart button.
         Audit-logged at INFO so user-triggered restarts are correlatable
         in bug reports.
         """
         logger.info("manual restart via /supervisor/shutdown")
+        s: BridgeAppState = app.state.bridge
+        if s.shutdown_controller is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "shutdown_controller_unavailable",
+                    "message": "bridge was started without a shutdown controller",
+                },
+            )
 
-        async def _fire_sigterm() -> None:
-            # 100ms delay so the 202 response flushes before uvicorn tears down.
-            await asyncio.sleep(0.1)
-            os.kill(os.getpid(), signal.SIGTERM)
-
-        asyncio.create_task(_fire_sigterm())
+        ok = s.shutdown_controller.request("manual_restart")
+        if not ok:
+            logger.error("manual restart could not request controller shutdown")
         return {"status": "shutting_down", "drain_seconds": 30}
 
     # ── POST /sessions/close — explicit ingest trigger ─────────────────────
