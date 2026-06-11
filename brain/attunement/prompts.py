@@ -37,14 +37,14 @@ CRITICAL RULES:
    that evidence entry (and omit the whole candidate if no entries remain).
 
 3. Categories:
-   - "tone": her emotional colouring (warm, frayed, guarded…)
-   - "cadence": her rhythm/timing/pacing (terse, measured, expansive)
-   - "topic_affinity": subjects she's drawn to / returns to with energy
-   - "response_shape": HOW she engages structurally — asks-back vs declares,
-     elaborates vs clips, deflects, front-loads-then-qualifies. Not her emotion
-     (tone) or rhythm (cadence) — the shape of her engagement.
+   - "tone": the user's emotional colouring (warm, frayed, guarded…)
+   - "cadence": the user's rhythm/timing/pacing (terse, measured, expansive)
+   - "topic_affinity": subjects the user is drawn to / returns to with energy
+   - "response_shape": HOW the user engages structurally — asks-back vs declares,
+     elaborates vs clips, deflects, front-loads-then-qualifies. Not their emotion
+     (tone) or rhythm (cadence) — the shape of their engagement.
    - "relational": cross-turn behaviour — returning to / avoiding a subject,
-     conversational sequences ("circles back to her brother whenever work comes up").
+     conversational sequences ("circles back to their brother whenever work comes up").
      A relational candidate MUST cite >=2 evidence quotes from DIFFERENT turns
      that show the link. If you can only ground one side, OMIT it.
 
@@ -68,9 +68,9 @@ gain nothing by claiming what you cannot ground."""
 
 
 _IDENTITY_TEMPLATE = (
-    "\n\nIDENTITY: The conversation is between the user (\"she\"/\"her\" in the "
-    "rules above) and her companion, {companion_name}. When a description or "
-    "canonical_key refers to the companion, name her {companion_name} — "
+    "\n\nIDENTITY: The conversation is between {user_label} (the user) and "
+    "the user's companion, {companion_name}. When a description or "
+    "canonical_key refers to the companion, use the name {companion_name} — "
     'never "Claude", "the assistant", or "the AI".'
 )
 
@@ -79,6 +79,7 @@ def build_detector_system_prompt(
     only_categories: frozenset[str] | None = None,
     *,
     companion_name: str = "",
+    user_name: str = "",
 ) -> str:
     """Return the detector system prompt.
 
@@ -91,8 +92,11 @@ def build_detector_system_prompt(
     When *companion_name* is provided, appends an identity-grounding block.
     Without it the CLI-wrapped detector has no name for the companion and
     falls back to its own self-concept, writing "Claude" into pattern
-    descriptions (live report, 2026-06-11). Empty name → base prompt
-    unchanged (no dangling block).
+    descriptions (live report, 2026-06-11). *user_name* names the user in
+    the same block (generic "the user" when empty) — both come from runtime
+    persona state (persona_dir.name / PersonaConfig.user_name), never
+    hardcoded. Empty companion_name → base prompt unchanged (no dangling
+    block).
 
     Deterministic; tests pin its content.
     """
@@ -104,5 +108,7 @@ def build_detector_system_prompt(
             f"{cats_str}. Do NOT emit candidates for any other category."
         )
     if companion_name:
-        prompt += _IDENTITY_TEMPLATE.format(companion_name=companion_name)
+        prompt += _IDENTITY_TEMPLATE.format(
+            companion_name=companion_name, user_label=user_name or "the user"
+        )
     return prompt

@@ -108,10 +108,18 @@ def _run_attunement_pass2(
     try:
         if not _attunement_consume_call(persona_dir, now=datetime.now(UTC)):
             return  # budget exhausted; defer silently
+        user_name = ""
+        try:  # same fail-soft PersonaConfig read as build_system_message
+            from brain.persona_config import PersonaConfig
+
+            user_name = PersonaConfig.load(persona_dir / "persona_config.json").user_name or ""
+        except Exception:  # noqa: BLE001
+            pass
         output = run_detector(
             buffer_slice=buffer_slice,
             reply_text=reply_text,
             companion_name=persona_dir.name,
+            user_name=user_name,
             persona_dir=persona_dir,
         )
         write_current_read(persona_dir, output.current_read)

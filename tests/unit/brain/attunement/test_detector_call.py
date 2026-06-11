@@ -199,7 +199,10 @@ def test_detector_threads_companion_name_into_system_prompt(buffer):
         return ""  # decline path; we only care about the prompt
 
     with patch("brain.attunement.detector._call_haiku", side_effect=_capture):
-        run_detector(buffer_slice=buffer, reply_text="hi", companion_name="Phoebe")
+        run_detector(
+            buffer_slice=buffer, reply_text="hi",
+            companion_name="Mira", user_name="Alex",
+        )
 
-    assert "her companion, Phoebe" in captured["system_prompt"]
+    assert "between Alex (the user) and the user's companion, Mira" in captured["system_prompt"]
     assert 'never "Claude"' in captured["system_prompt"]

@@ -157,3 +157,21 @@ def test_run_attunement_pass2_calls_mark_addressed(tmp_path: Path):
         )
 
     mock_mark.assert_called_once_with(tmp_path, ["abc"], now_iso=mock_mark.call_args[1]["now_iso"])
+
+
+def test_pass2_threads_user_name_from_persona_config(tmp_path: Path):
+    """v0.0.33 identity-grounding: the live pass-2 path reads user_name from
+    persona_config.json and threads it to the detector (no hardcoded names)."""
+    import json
+
+    (tmp_path / "persona_config.json").write_text(json.dumps({"user_name": "Alex"}))
+    with patch("brain.chat.tool_loop.run_detector") as mock_detector:
+        _spawn_pass2_attunement(
+            tmp_path,
+            turn_id="t1",
+            user_message="I had a long day today, love.",
+            reply_text="Tell me about it.",
+            buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
+        )
+        _wait_for_attunement_threads()
+    assert mock_detector.call_args.kwargs["user_name"] == "Alex"

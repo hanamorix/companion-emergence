@@ -149,3 +149,23 @@ def test_run_backfill_persists_state_after_each_window(tmp_path: Path):
     payload = json.loads(state_path.read_text())
     assert payload["status"] == "complete"
     assert payload["schema_version"] == SCHEMA_VERSION
+
+
+def test_run_backfill_default_detector_threads_identity(tmp_path: Path):
+    """v0.0.33 identity-grounding: the default detector closure passes
+    companion_name (persona dir) AND user_name (persona_config.json) so
+    backfilled pattern descriptions name the companion correctly."""
+    _make_buffer_file(tmp_path, n_turns=25)
+    (tmp_path / "persona_config.json").write_text(json.dumps({"user_name": "Alex"}))
+    captured: list[dict] = []
+
+    def _capture(**kwargs):  # noqa: ANN003
+        captured.append(kwargs)
+        return _fake_detector_output()
+
+    with patch("brain.attunement.detector.run_detector", side_effect=_capture):
+        run_backfill(tmp_path, now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC))
+
+    assert captured, "expected the default detector closure to be invoked"
+    assert captured[0]["companion_name"] == tmp_path.name
+    assert captured[0]["user_name"] == "Alex"
