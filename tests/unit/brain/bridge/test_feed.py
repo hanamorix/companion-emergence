@@ -592,3 +592,13 @@ def test_build_feed_isolates_source_failures(tmp_path, monkeypatch):
     # Dream still appears even though research crashed.
     assert any(e.type == "dream" for e in entries)
     assert all(e.type != "research" for e in entries)
+
+
+def test_build_feed_includes_pronoun_nudge_when_marker_present(tmp_path):
+    """build_feed surfaces a pronoun_nudge entry when the marker file exists
+    (exercises build_pronoun_nudge_entries_adapter through the merge)."""
+    from brain.bridge.pronoun_nudge import maybe_write_pronoun_nudge
+
+    maybe_write_pronoun_nudge(tmp_path, companion_name="Nell")
+    entries = build_feed(tmp_path, limit=50)
+    assert any(e.type == "pronoun_nudge" for e in entries)
