@@ -21,6 +21,7 @@ import uvicorn
 
 from brain.bridge import state_file
 from brain.bridge.server import build_app
+from brain.bridge.shutdown import BridgeShutdownController
 
 logger = logging.getLogger(__name__)
 
@@ -197,14 +198,25 @@ def run_bridge_foreground(
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
+    shutdown_controller = BridgeShutdownController()
     app = build_app(
         persona_dir=persona_dir,
         client_origin=client_origin,
         idle_shutdown_seconds=idle_shutdown_seconds,
         auth_token=auth_token,
+        shutdown_controller=shutdown_controller,
     )
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        timeout_graceful_shutdown=30,
+    )
+    server = uvicorn.Server(config)
+    shutdown_controller.bind_server(server)
     try:
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+        server.run()
     finally:
         _write_clean_shutdown(persona_dir)
     return 0
