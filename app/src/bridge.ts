@@ -494,6 +494,23 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
 }
 
+export type PronounPreset = "she/her" | "he/him" | "they/them";
+
+/** Persist the user's pronoun preset. POSTs {preset} to /persona/config/pronouns. */
+export async function setPersonaPronouns(
+  persona: string,
+  preset: PronounPreset,
+): Promise<void> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/config/pronouns`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ preset }),
+    }),
+  );
+  if (!r.ok) throw new Error(`setPersonaPronouns failed: ${r.status}`);
+}
+
 // ── Memory recovery (forgetting-edge-cascade) ──────────────────────────
 
 export interface RecoverPreflight {

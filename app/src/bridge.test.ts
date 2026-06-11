@@ -30,6 +30,7 @@ import {
   rejectVoiceEdit,
   resetBridgeCredentialCache,
   setPersonaModel,
+  setPersonaPronouns,
   uploadImage,
 } from "./bridge";
 
@@ -273,6 +274,29 @@ describe("setPersonaModel", () => {
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
+  });
+});
+
+describe("setPersonaPronouns", () => {
+  beforeEach(() => {
+    resetBridgeCredentialCache();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs to /persona/config/pronouns with the supplied preset", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, pronouns: {} }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+    await setPersonaPronouns("alice", "he/him");
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/persona/config/pronouns");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    expect(init!.body).toContain("he/him");
   });
 });
 
