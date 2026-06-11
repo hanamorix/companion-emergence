@@ -30,4 +30,5 @@ def test_run_detector_threads_only_categories_into_system_prompt():
         mock_build.return_value = "mocked prompt"
         run_detector(buffer_slice=turns, reply_text="", only_categories=cats)
 
-    mock_build.assert_called_once_with(only_categories=cats, companion_name="", user_name="")
+    # Pins the full call contract — must include user_pronouns=None when not passed.
+    mock_build.assert_called_once_with(only_categories=cats, companion_name="", user_name="", user_pronouns=None)

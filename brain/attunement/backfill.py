@@ -255,10 +255,13 @@ def run_backfill(
         from brain.attunement.detector import run_detector as _default_detector
         _cname = persona_dir.name  # capture for closure
         _uname = ""
+        _upron = None
         try:  # same fail-soft PersonaConfig read as the live pass-2 path
             from brain.persona_config import PersonaConfig
 
-            _uname = PersonaConfig.load(persona_dir / "persona_config.json").user_name or ""
+            _cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+            _uname = _cfg.user_name or ""
+            _upron = _cfg.user_pronouns
         except Exception:  # noqa: BLE001
             pass
         if only_categories is not None:
@@ -271,6 +274,7 @@ def run_backfill(
                     only_categories=_cats,
                     companion_name=_cname,
                     user_name=_uname,
+                    user_pronouns=_upron,
                 )
         else:
             def detector_fn(*, buffer_slice, reply_text):  # noqa: ANN001
@@ -279,6 +283,7 @@ def run_backfill(
                     reply_text=reply_text,
                     companion_name=_cname,
                     user_name=_uname,
+                    user_pronouns=_upron,
                 )
 
     now_dt = now_dt or _datetime.now(UTC)

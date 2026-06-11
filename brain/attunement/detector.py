@@ -215,6 +215,7 @@ def run_detector(
     only_categories: frozenset[str] | None = None,
     companion_name: str = "",
     user_name: str = "",
+    user_pronouns: object = None,
     persona_dir: Path | None = None,
 ) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
@@ -242,6 +243,7 @@ def run_detector(
         only_categories=only_categories,
         companion_name=companion_name,
         user_name=user_name,
+        user_pronouns=user_pronouns,
     )
     user_message = _build_user_message(buffer_slice, reply_text, companion_name=companion_name)
 
