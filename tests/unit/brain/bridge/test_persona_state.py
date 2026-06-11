@@ -474,6 +474,7 @@ def test_persona_state_narrative_memory_recovered_false_on_fresh_persona(
 def test_connection_includes_user_pronouns_preset_key(tmp_path: Path) -> None:
     """Connection block includes user_pronouns as a preset key when configured."""
     import json
+
     from brain.pronouns import PRESETS, to_dict
 
     persona_dir = tmp_path / "nell"
