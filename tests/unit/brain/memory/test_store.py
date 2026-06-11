@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import _SCHEMA, Memory, MemoryStore
 
 
 def test_memory_create_new_generates_uuid() -> None:
@@ -970,3 +970,50 @@ def test_peak_defaults_zero_without_emotions(store):
     mem = Memory.create_new("flat", "conversation", "us")
     store.create(mem)
     assert store.get(mem.id).peak_emotion_intensity == 0.0
+
+
+def test_peak_migration_seeds_from_current_intensities(tmp_path):
+    """Open a pre-v0.0.33 DB (no peak column) containing rows — reopening
+    must add the column and seed peak = max(current intensities); empty or
+    corrupt emotions seed 0.0 (honest zero — spec D4)."""
+    db = tmp_path / "memories.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_SCHEMA)
+    # _SCHEMA now HAS the column — simulate the pre-v0.0.33 schema by
+    # rebuilding the table without it:
+    conn.executescript(
+        """
+        CREATE TABLE old_memories AS
+            SELECT id, content, memory_type, domain, emotions_json, tags_json,
+                   importance, score, created_at, last_accessed_at, active,
+                   protected, metadata_json, state, content_snapshot, recall_count
+            FROM memories;
+        DROP TABLE memories;
+        ALTER TABLE old_memories RENAME TO memories;
+        """
+    )
+    now = datetime.now(UTC).isoformat()
+    for mem_id, content, emotions in (
+        ("a" * 36, "warm one", '{"joy": 4.5}'),
+        ("b" * 36, "erased one", "{}"),
+        ("c" * 36, "corrupt one", "not json"),
+    ):
+        conn.execute(
+            "INSERT INTO memories (id, content, memory_type, domain, emotions_json,"
+            " tags_json, importance, score, created_at, active, protected,"
+            " metadata_json, state, recall_count)"
+            " VALUES (?, ?, 'conversation', 'us', ?, '[]', 0, 0, ?, 1, 0, '{}', 'active', 0)",
+            (mem_id, content, emotions, now),
+        )
+    conn.commit()
+    conn.close()
+
+    migrated = MemoryStore(db)  # reopen → column added + seeded
+    assert migrated.get("a" * 36).peak_emotion_intensity == 4.5
+    assert migrated.get("b" * 36).peak_emotion_intensity == 0.0
+    # Corrupt-JSON row: _row_to_memory itself can't parse it, so verify the
+    # migrated DB value directly — the seeding must have written honest 0.0.
+    row = migrated._conn.execute(
+        "SELECT peak_emotion_intensity FROM memories WHERE id = ?", ("c" * 36,)
+    ).fetchone()
+    assert row["peak_emotion_intensity"] == 0.0
