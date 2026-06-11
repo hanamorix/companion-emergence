@@ -46,6 +46,16 @@ def test_prompt_grounds_companion_identity() -> None:
     """v0.0.33 fix: without identity grounding, the CLI-wrapped detector
     falls back to its self-concept and names the companion 'Claude' in
     pattern descriptions (live Phoebe report, 2026-06-11)."""
-    prompt = build_detector_system_prompt(companion_name="Phoebe")
-    assert "her companion, Phoebe" in prompt
+    prompt = build_detector_system_prompt(companion_name="Phoebe", user_name="Hana")
+    assert "between Hana (the user) and the user's companion, Phoebe" in prompt
     assert 'never "Claude"' in prompt
+
+
+def test_base_prompt_does_not_gender_the_user() -> None:
+    """v0.0.33 fix, second pass: the rules hardcoded 'her'/'she' for the
+    user. Users aren't all female; gendered rules misread male users'
+    transcripts and can leak wrong pronouns into descriptions."""
+    import re
+
+    base = build_detector_system_prompt()
+    assert not re.search(r"\b(she|her|hers|he|him|his)\b", base, re.IGNORECASE)
