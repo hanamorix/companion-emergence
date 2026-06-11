@@ -9,8 +9,10 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from brain.bridge import daemon
@@ -344,7 +346,6 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     the daemon checking stop_event before the writer has flushed.
     """
     import threading
-    import time
 
     log_dir = _patch_paths(monkeypatch, tmp_path)
     log_path = log_dir / "bridge-nell.log"
@@ -1419,3 +1420,126 @@ def test_cmd_tail_returns_1_when_bridge_not_running(
     rc = daemon.cmd_tail(_args("nell"))
     assert rc == 1
     assert "bridge not running" in capsys.readouterr().err
+
+
+# ---------- Task 4: cmd_stop uses /supervisor/shutdown endpoint ----------
+
+
+def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell",
+            pid=33333,
+            port=51000,
+            started_at="2026-05-08T00:00:00+00:00",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="cli",
+            auth_token="secret",
+        ),
+    )
+
+    alive = {"value": True}
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(url, *, headers, timeout):
+        calls.append((url, {"headers": headers, "timeout": timeout}))
+        alive["value"] = False
+
+        class Response:
+            status_code = 202
+
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: alive["value"])
+    monkeypatch.setattr("brain.bridge.daemon.httpx.post", fake_post)
+    monkeypatch.setattr("brain.bridge.daemon.os.kill", lambda *_a: (_ for _ in ()).throw(AssertionError("must not signal")))
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+
+    rc = daemon.cmd_stop(_args("nell", timeout=5.0))
+
+    assert rc == 0
+    assert calls == [
+        (
+            "http://127.0.0.1:51000/supervisor/shutdown",
+            {"headers": {"Authorization": "Bearer secret"}, "timeout": 3.0},
+        )
+    ]
+    assert "bridge stopped" in capsys.readouterr().out
+
+
+def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell",
+            pid=44444,
+            port=51000,
+            started_at="2026-05-08T00:00:00+00:00",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="task-scheduler",
+            auth_token="secret",
+        ),
+    )
+
+    # Patch get_persona_dir directly so pathlib doesn't try to construct a
+    # WindowsPath on Python 3.13 macOS when os.name is patched to "nt".
+    monkeypatch.setattr(daemon.os, "name", "nt")
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda _name: persona_dir)
+    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr("brain.bridge.daemon.httpx.post", lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")))
+    monkeypatch.setattr("brain.bridge.daemon.os.kill", lambda *_a: (_ for _ in ()).throw(AssertionError("windows stop must not TerminateProcess")))
+
+    rc = daemon.cmd_stop(_args("nell", timeout=0.1))
+
+    assert rc == 1
+    assert "shutdown endpoint unreachable" in capsys.readouterr().err
+
+
+def test_cmd_stop_on_windows_with_force_terminates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from brain.bridge import state_file
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(persona_dir, state_file.BridgeState(
+        persona="nell", pid=44444, port=51000, started_at="2026-05-08T00:00:00+00:00",
+        stopped_at=None, shutdown_clean=False, client_origin="task-scheduler", auth_token="secret"))
+    # Patch get_persona_dir directly so pathlib doesn't try to construct a
+    # WindowsPath on Python 3.13 macOS when os.name is patched to "nt".
+    monkeypatch.setattr(daemon.os, "name", "nt")
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda _name: persona_dir)
+    alive = {"v": True}
+    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: alive["v"])
+    monkeypatch.setattr("brain.bridge.daemon.httpx.post", lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")))
+    killed = []
+    def fake_kill(pid, sig):
+        killed.append(pid)
+        alive["v"] = False
+    monkeypatch.setattr("brain.bridge.daemon.os.kill", fake_kill)
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    rc = daemon.cmd_stop(_args("nell", timeout=5.0, force=True))
+    assert rc == 0
+    assert killed == [44444]
+    assert "forcing Windows termination" in capsys.readouterr().err

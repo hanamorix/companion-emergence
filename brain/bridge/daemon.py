@@ -308,6 +308,18 @@ def cmd_run(args) -> int:
         release_lock(persona_dir, fd)
 
 
+def _request_shutdown_via_http(s: state_file.BridgeState, *, timeout: float = 3.0) -> None:
+    if s.port is None:
+        raise RuntimeError("bridge state missing port")
+    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+    r = httpx.post(
+        f"http://127.0.0.1:{s.port}/supervisor/shutdown",
+        headers=headers,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+
+
 def cmd_stop(args) -> int:
     from brain.paths import get_persona_dir
 
@@ -317,10 +329,34 @@ def cmd_stop(args) -> int:
         print("bridge not running")
         return 0
     try:
-        os.kill(s.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        print("bridge not running")
-        return 0
+        _request_shutdown_via_http(s)
+    except Exception as exc:
+        if os.name == "nt":
+            if getattr(args, "force", False):
+                print(
+                    "WARNING: forcing Windows termination; Python cleanup will NOT run. "
+                    "Recovery will snapshot active sessions non-destructively on next start.",
+                    file=sys.stderr,
+                )
+                try:
+                    os.kill(s.pid, signal.SIGTERM)  # TerminateProcess on Windows — explicit, logged, dirty by design
+                except ProcessLookupError:
+                    print("bridge not running")
+                    return 0
+            else:
+                print(
+                    f"bridge shutdown endpoint unreachable; refusing Windows hard kill because it would bypass cleanup: {exc}\n"
+                    "If the bridge is wedged, re-run with --force to terminate it (recovery will snapshot sessions on next start).",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX", exc_info=True)
+            try:
+                os.kill(s.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                print("bridge not running")
+                return 0
 
     deadline = time.time() + args.timeout
     while time.time() < deadline:
@@ -396,12 +432,18 @@ def cmd_tail(args) -> int:
 def cmd_restart(args) -> int:
     """Stop the bridge, then start it again. Two-phase, gated on stop success.
 
-    `cmd_stop` collapses "no bridge was running" and "clean SIGTERM stop"
-    into exit code 0; it returns 1 only when the bridge ignored SIGTERM
-    and timed out (wedged). Restart proceeds to start ONLY when stop
-    returned 0 — never over a wedged bridge. Restart's exit code is
-    whatever `cmd_start` returned (0/1/2) on the success path, or stop's
-    exit code on the bail path.
+    `cmd_stop` uses an endpoint-first stop (POST /supervisor/shutdown) with
+    a POSIX SIGTERM fallback on non-Windows platforms. On Windows, if the
+    shutdown endpoint is unreachable, `--force` is required as an explicit
+    escape hatch (dirty termination via TerminateProcess; recovery will
+    snapshot active sessions non-destructively on next start).
+
+    `cmd_stop` collapses "no bridge was running" and "clean endpoint stop"
+    into exit code 0; it returns 1 only when the bridge could not be stopped
+    (endpoint unreachable on Windows without --force, or poll timeout). Restart
+    proceeds to start ONLY when stop returned 0 — never over a wedged bridge.
+    Restart's exit code is whatever `cmd_start` returned (0/1/2) on the
+    success path, or stop's exit code on the bail path.
     """
     print("stopping bridge...")
     stop_rc = cmd_stop(args)
