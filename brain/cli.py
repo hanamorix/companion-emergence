@@ -2386,6 +2386,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
     _add_persona_arg(s_stop)
     s_stop.add_argument("--timeout", type=float, default=180.0)
+    s_stop.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
     s_stop.set_defaults(func=cmd_stop)
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
@@ -2400,6 +2401,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
     s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
+    s_restart.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
     s_restart.set_defaults(func=cmd_restart)
 
     s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
