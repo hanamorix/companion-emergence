@@ -41,10 +41,12 @@ _STR_FIELDS = tuple(f.name for f in fields(PronounSet) if f.name != "plural_verb
 
 
 def resolve(value: object) -> PronounSet:
-    """Preset key, full dict (future custom sets), or None/garbage → she/her.
+    """Preset key, PronounSet passthrough, full dict (future custom sets), or None/garbage → she/her.
 
     Never raises — config corruption must not break prompt assembly.
     """
+    if isinstance(value, PronounSet):
+        return value
     if isinstance(value, str) and value in PRESETS:
         return PRESETS[value]
     if isinstance(value, dict):
