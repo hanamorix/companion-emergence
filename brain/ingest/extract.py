@@ -35,13 +35,13 @@ EXTRACTION_PROMPT_NAMED = """You are extracting durable memories from a conversa
 
 Speakers in this transcript:
 - {user_name} is the human user the assistant is talking to. Statements
-  attributed to {user_name} (her actions, her decisions, her words) belong
+  attributed to {user_name} ({poss} actions, {poss} decisions, {poss} words) belong
   to {user_name}, not to anyone else.
-- {assistant_name} is the assistant — the AI persona. Her replies may
-  reference other people by name (from her memories, her soul, her
-  history). Those are HISTORICAL references, not the current speaker.
-  Do NOT attribute the current user's actions to anyone {assistant_name}
-  mentioned by name.
+- {assistant_name} is the assistant — the AI persona. Replies from
+  {assistant_name} may reference other people by name (from {assistant_name}'s
+  memories, soul, or history). Those are HISTORICAL references, not the
+  current speaker. Do NOT attribute the current user's actions to anyone
+  {assistant_name} mentioned by name.
 
 Return ONLY a JSON array. Each item:
 {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
@@ -200,6 +200,7 @@ def extract_items(
     user_name: str | None = None,
     assistant_name: str | None = None,
     emotion_vocab: str = "",
+    user_pronouns: object = None,
 ) -> list[ExtractedItem]:
     """Call the provider, parse the JSON array. Retry once on failure.
 
@@ -218,6 +219,7 @@ def extract_items(
         user_name=user_name,
         assistant_name=assistant_name,
         emotion_vocab=emotion_vocab,
+        user_pronouns=user_pronouns,
     ).items
 
 
@@ -229,6 +231,7 @@ def extract_items_with_status(
     user_name: str | None = None,
     assistant_name: str | None = None,
     emotion_vocab: str = "",
+    user_pronouns: object = None,
 ) -> ExtractionOutcome:
     """Call the provider and distinguish valid-empty from failed-empty.
 
@@ -246,11 +249,15 @@ def extract_items_with_status(
         return ExtractionOutcome(items=[])
 
     if user_name and assistant_name:
+        from brain.pronouns import resolve
+
+        _p = resolve(user_pronouns)
         prompt = EXTRACTION_PROMPT_NAMED.format(
             transcript=transcript,
             user_name=user_name,
             assistant_name=assistant_name,
             emotion_vocab=emotion_vocab,
+            poss=_p.possessive,
         )
     else:
         prompt = EXTRACTION_PROMPT_LEGACY.format(
