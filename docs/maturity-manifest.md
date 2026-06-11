@@ -49,6 +49,7 @@ These run but aren't fully closed loops. Labelled here so the half-wired state i
 |---|---|---|
 | recall_resonance (W4) | emits outbound candidates but gates so tight emission is unproven; no recall/hebbian/emotion write-back on the return arc | EXPERIMENTAL — tune / reinforce deferred |
 | body → initiate gating (W10) | body energy/exhaustion is live + read by the prompt, but never **gates** the initiate loop (low energy doesn't suppress dreams/drafts/sends) | EXPERIMENTAL — design call deferred |
+| **peak-salience** (v0.0.33) | persisted `peak_emotion_intensity` scalar on `Memory`, maintained at the `MemoryStore` create/update choke point (every emotion writer covered automatically — chat extraction, ingest seeding, backfill, pass-2 deltas, heartbeat decay persistence, source-mode recovery carry); consumed by the forgetting salience emotion blend (`_peak_input`, λ=1.5, 4320 lived-hour linger ≈180 lived-days). **DoD:** producer fires on every emotion write path (live chat/ingest/decay paths covered at the MemoryStore choke point); wire-through test `test_peak_flows_through_live_forgetting_pass`; reader = forgetting salience pass. **Promote to CORE-STABLE** after one minor release of live forgetting passes confirms the linger curve behaves as calibrated. | EXPERIMENTAL — promote after one minor |
 
 ---
 
