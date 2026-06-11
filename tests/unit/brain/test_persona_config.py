@@ -155,3 +155,27 @@ def test_persona_config_user_name_strips_whitespace_and_treats_empty_as_none(
     assert PersonaConfig.load(p).user_name is None
     p.write_text(json.dumps({"user_name": 42}))  # wrong type
     assert PersonaConfig.load(p).user_name is None
+
+
+# ---- Task 2 (user-pronouns): user_pronouns field ----
+
+
+def test_user_pronouns_round_trip(tmp_path: Path) -> None:
+    from brain.pronouns import PRESETS, resolve, to_dict
+
+    path = tmp_path / "persona_config.json"
+    cfg = PersonaConfig(user_pronouns=to_dict(PRESETS["he/him"]))
+    cfg.save(path)
+    loaded = PersonaConfig.load(path)
+    assert resolve(loaded.user_pronouns) == PRESETS["he/him"]
+
+
+def test_user_pronouns_malformed_falls_back_without_crash(tmp_path: Path) -> None:
+    import json
+
+    from brain.pronouns import PRESETS, resolve
+
+    path = tmp_path / "persona_config.json"
+    path.write_text(json.dumps({"user_pronouns": "not-a-dict-or-known-key"}))
+    loaded = PersonaConfig.load(path)  # must not raise
+    assert resolve(loaded.user_pronouns) == PRESETS["she/her"]

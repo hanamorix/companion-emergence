@@ -48,6 +48,7 @@ def _default_persona_config_dict() -> dict:
         "mcp_audit_log_level": DEFAULT_MCP_AUDIT_LOG_LEVEL,
         "user_name": None,
         "model": DEFAULT_MODEL,
+        "user_pronouns": None,
     }
 
 
@@ -77,6 +78,7 @@ class PersonaConfig:
     user_name: str | None = None
     model: str = DEFAULT_MODEL
     last_opened_at: str | None = None  # ISO8601 with Z suffix; written by bridge on startup
+    user_pronouns: dict | None = None  # expanded PronounSet dict; None → she/her at use-time
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -119,6 +121,8 @@ class PersonaConfig:
             if isinstance(user_name_raw, str) and user_name_raw.strip()
             else None
         )
+        user_pronouns_raw = data.get("user_pronouns")
+        user_pronouns = user_pronouns_raw if isinstance(user_pronouns_raw, dict) else None
         model_raw = data.get("model", DEFAULT_MODEL)
         model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
         if model_str in KNOWN_MODELS:
@@ -143,6 +147,7 @@ class PersonaConfig:
             user_name=user_name,
             model=model,
             last_opened_at=last_opened_at,
+            user_pronouns=user_pronouns,
         )
 
     @classmethod
@@ -181,6 +186,7 @@ class PersonaConfig:
             "user_name": self.user_name,
             "model": self.model,
             "last_opened_at": self.last_opened_at,
+            "user_pronouns": self.user_pronouns,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)

@@ -60,12 +60,17 @@ def write_persona_config(
     searcher: str | None = None,
     mcp_audit_log_level: str | None = None,
     model: str | None = None,
+    user_pronouns: str | None = None,
 ) -> Path:
     """Write or update <persona_dir>/persona_config.json with user_name.
 
     Preserves any existing fields when the file is already present —
     this lets `nell init` run safely after `nell migrate --install-as`,
     or be re-run to change just the user_name.
+
+    user_pronouns: a preset key ("she/her", "he/him", "they/them").
+    Unknown keys are silently ignored — the field is left at its current
+    value rather than storing a bad dict.
 
     Returns the config path.
     """
@@ -84,6 +89,11 @@ def write_persona_config(
         cfg.mcp_audit_log_level = mcp_audit_log_level
     if model is not None:
         cfg.model = model
+    if user_pronouns is not None:
+        from brain.pronouns import PRESETS, to_dict
+
+        if user_pronouns in PRESETS:
+            cfg.user_pronouns = to_dict(PRESETS[user_pronouns])
     cfg.save(config_path)
     return config_path
 
