@@ -89,7 +89,7 @@ describe("ConnectionPanel — no extended-reasoning toggle (v0.0.26)", () => {
         persona="nell"
       />,
     );
-    // Model picker shows a "change" link to swap the model.
-    expect(screen.getByRole("button", { name: /change/i })).toBeInTheDocument();
+    // Model picker shows a "change model" button to swap the model.
+    expect(screen.getByRole("button", { name: /change model/i })).toBeInTheDocument();
   });
 });

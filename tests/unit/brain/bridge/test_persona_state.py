@@ -466,3 +466,37 @@ def test_persona_state_narrative_memory_recovered_false_on_fresh_persona(
 
     state = build_persona_state(persona_dir)
     assert state["narrative_memory_recovered"] is False
+
+
+# ── Task 10.A2: connection block exposes user_pronouns preset key ─────────────
+
+
+def test_connection_includes_user_pronouns_preset_key(tmp_path: Path) -> None:
+    """Connection block includes user_pronouns as a preset key when configured."""
+    import json
+    from brain.pronouns import PRESETS, to_dict
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(json.dumps(
+        {"provider": "fake", "model": "sonnet", "user_pronouns": to_dict(PRESETS["he/him"])}
+    ))
+
+    state = build_persona_state(persona_dir)
+    conn = state["connection"]
+    assert conn["user_pronouns"] == "he/him"
+
+
+def test_connection_user_pronouns_none_when_unset(tmp_path: Path) -> None:
+    """Connection block has user_pronouns=None when persona_config has no pronouns."""
+    import json
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({"provider": "fake", "model": "sonnet"})
+    )
+
+    state = build_persona_state(persona_dir)
+    conn = state["connection"]
+    assert conn["user_pronouns"] is None
