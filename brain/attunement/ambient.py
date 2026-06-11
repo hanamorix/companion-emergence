@@ -41,15 +41,29 @@ def _is_addressed_recently(last_addressed_at: str | None) -> bool:
 
 def build_attunement_block(persona_dir: Path) -> str:
     """Return the rendered attunement block, or empty string when no state exists."""
+    from brain.persona_config import PersonaConfig
+    from brain.pronouns import resolve
+
+    try:
+        pr = resolve(PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns)
+    except Exception:  # noqa: BLE001 — prompt assembly must never break on config
+        pr = resolve(None)
+
     read = read_current_read(persona_dir)
     patterns = read_learned_patterns(persona_dir)
 
     lines: list[str] = []
 
     if read is not None and read.tone_label != "unknown":
-        lines.append("# What you sense about her right now")
-        lines.append(f"She sounds {read.tone_label} — {read.tone_justification}")
-        lines.append(f"Her cadence is {read.cadence_label} — {read.cadence_justification}")
+        lines.append(f"# What you sense about {pr.object} right now")
+        lines.append(
+            f"{pr.cap(pr.subject)} {pr.v('sounds', 'sound')} "
+            f"{read.tone_label} — {read.tone_justification}"
+        )
+        lines.append(
+            f"{pr.cap(pr.possessive)} cadence is "
+            f"{read.cadence_label} — {read.cadence_justification}"
+        )
         lines.append(f"Mood feels {_valence_phrase(read.mood_valence, read.mood_intensity)}.")
         if read.predicted_arc_shape:
             lines.append(f"Where this seems to be heading: {read.predicted_arc_shape}")
@@ -66,14 +80,16 @@ def build_attunement_block(persona_dir: Path) -> str:
         if lines:
             lines.append("")
         lines.append(
-            "# What you've come to know about her "
-            "(your private read — when you speak to her, she is 'you')"
+            f"# What you've come to know about {pr.object} "
+            f"(your private read — when you speak to {pr.object}, that's 'you')"
         )
         for p in surfaceable:
             if p.maturity == "known":
                 lines.append(f"- {p.description}")
             else:
-                lines.append(f"- She seems to {p.description.lower()}")
+                lines.append(
+                    f"- {pr.cap(pr.subject)} {pr.v('seems', 'seem')} to {p.description.lower()}"
+                )
         lines.append("")
         lines.append("If a pattern feels load-bearing for this turn, you can name it. Don't force it.")
 
