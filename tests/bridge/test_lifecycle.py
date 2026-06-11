@@ -348,3 +348,40 @@ def test_legacy_state_file_without_drain_errors_field_loads(tmp_path: Path):
     state = state_file.read(persona_dir)
     assert state is not None
     assert state.drain_errors == 0
+
+
+def test_idle_watcher_uses_shutdown_controller_not_os_kill(monkeypatch):
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.events import EventBus
+    from brain.bridge.server import BridgeAppState, _idle_watcher
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+
+        def request(self, reason: str) -> bool:
+            self.reasons.append(reason)
+            return True
+
+    controller = FakeController()
+    state = BridgeAppState(
+        persona_dir=Path("."),
+        persona="nell",
+        client_origin="tests",
+        started_at=datetime.now(UTC) - timedelta(seconds=10),
+        provider=object(),
+        event_bus=EventBus(),
+        in_flight_locks={},
+        shutdown_controller=controller,
+    )
+
+    monkeypatch.setattr(
+        "brain.bridge.server.os.kill",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("must not signal")),
+    )
+
+    asyncio.run(_idle_watcher(state, idle_shutdown_seconds=0.01))
+
+    assert controller.reasons == ["idle_timeout"]
