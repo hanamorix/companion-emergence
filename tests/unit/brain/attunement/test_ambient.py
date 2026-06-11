@@ -110,13 +110,13 @@ def test_block_alpha_1_does_not_include_addressability_directive(tmp_path: Path)
 
 
 def test_attunement_header_marks_private_read(tmp_path: Path):
-    """Header must include the private-read annotation."""
+    """Header must include the private-read annotation (copula-free 'that's you' form)."""
     write_current_read(tmp_path, _make_read())
     _append_pattern(tmp_path, _make_pattern("p1", "known", description="she softens about the dog"))
     block = build_attunement_block(tmp_path)
     assert (
         "# What you've come to know about her "
-        "(your private read — when you speak to her, she is 'you')"
+        "(your private read — when you speak to her, that's 'you')"
     ) in block
 
 
@@ -127,3 +127,51 @@ def test_forming_patterns_describe_her_not_you(tmp_path: Path):
     block = build_attunement_block(tmp_path)
     assert "She seems to" in block
     assert "You seem to" not in block
+
+
+# ---------------------------------------------------------------------------
+# Pronoun-rendering tests (Task 3)
+# ---------------------------------------------------------------------------
+
+def _write_pronouns(persona_dir, key):
+    import json
+
+    from brain.pronouns import PRESETS, to_dict
+
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({"user_pronouns": to_dict(PRESETS[key])})
+    )
+
+
+def test_ambient_renders_he_him(tmp_path: Path):
+    _write_pronouns(tmp_path, "he/him")
+    write_current_read(tmp_path, _make_read())
+    _append_pattern(tmp_path, _make_pattern("p1", "forming", description="deflects when tired"))
+    block = build_attunement_block(tmp_path)
+    assert "# What you sense about him right now" in block
+    assert "He sounds" in block
+    assert "His cadence is" in block
+    assert "(your private read — when you speak to him, that's 'you')" in block
+    assert "- He seems to" in block
+
+
+def test_ambient_renders_they_them_verb_agreement(tmp_path: Path):
+    _write_pronouns(tmp_path, "they/them")
+    write_current_read(tmp_path, _make_read())
+    _append_pattern(tmp_path, _make_pattern("p1", "forming", description="circles back to the dog"))
+    block = build_attunement_block(tmp_path)
+    assert "They sound" in block
+    assert "They sounds" not in block
+    assert "Their cadence is" in block
+    assert "(your private read — when you speak to them, that's 'you')" in block
+    assert "- They seem to" in block
+    assert "They seems" not in block
+
+
+def test_ambient_defaults_she_her_when_unset(tmp_path: Path):
+    write_current_read(tmp_path, _make_read())
+    _append_pattern(tmp_path, _make_pattern("p1", "forming", description="softens about the dog"))
+    block = build_attunement_block(tmp_path)
+    assert "She sounds" in block
+    assert "# What you sense about her right now" in block
+    assert "- She seems to" in block
