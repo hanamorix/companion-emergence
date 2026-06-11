@@ -119,6 +119,9 @@ export interface PersonaState {
     provider: string | null;
     model: string | null;
     last_heartbeat_at: string | null;
+    /** Preset key from backend preset_key_for — "she/her" | "he/him" | "they/them" | null.
+     *  Null means unset (defaults to she/her in the UI). */
+    user_pronouns?: string | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
   /** True iff orphan session buffers from a previous shutdown are still

@@ -68,3 +68,14 @@ def to_dict(p: PronounSet) -> dict:
         "possessive_standalone": p.possessive_standalone, "reflexive": p.reflexive,
         "plural_verbs": p.plural_verbs,
     }
+
+
+def preset_key_for(value: object) -> str | None:
+    """Return the preset key matching this stored set, or None (unset/custom).
+    Used to preselect the UI pill for an existing persona."""
+    if not isinstance(value, dict):
+        return None
+    for key, preset in PRESETS.items():
+        if to_dict(preset) == value:
+            return key
+    return None
