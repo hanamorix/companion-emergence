@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 
 import * as bridge from "../bridge";
+import * as appConfig from "../appConfig";
 import { useRestartBridge } from "./useRestartBridge";
 
 const PERSONA = "test-persona";
@@ -28,9 +29,10 @@ afterEach(() => {
 });
 
 describe("useRestartBridge", () => {
-  it("happy path: idle → closing → shutting_down → waiting_for_health → reconnecting → success", async () => {
-    vi.spyOn(bridge, "closeActiveSession").mockResolvedValue(jsonResponse(200));
+  it("happy path: idle → closing → shutting_down → reconnecting → waiting_for_health → reconnecting → success", async () => {
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
     vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
     vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
     const forceMock = vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
 
@@ -53,12 +55,13 @@ describe("useRestartBridge", () => {
     await waitFor(() => expect(result.current.state).toBe("success"));
   });
 
-  it("4xx from /sessions/close is treated as success — closeActiveSession returns the Response", async () => {
-    // Spec §6.2: only 5xx + timeouts escalate. Our closeActiveSession
+  it("4xx from /sessions/snapshot is treated as success — snapshotActiveSession returns the Response", async () => {
+    // Spec §6.2: only 5xx + timeouts escalate. Our snapshotActiveSession
     // never throws on 4xx — it returns the raw Response and the hook
     // moves forward to shutdown.
-    vi.spyOn(bridge, "closeActiveSession").mockResolvedValue(jsonResponse(404));
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(404));
     vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
     vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
     const forceMock = vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
 
@@ -73,10 +76,10 @@ describe("useRestartBridge", () => {
     expect(forceMock).not.toHaveBeenCalled();
   });
 
-  it("/sessions/close timeout escalates to forcing → reconnecting", async () => {
+  it("/sessions/snapshot timeout escalates to forcing → reconnecting", async () => {
     vi.useFakeTimers();
-    // Hang the close call past its 5s timeout.
-    vi.spyOn(bridge, "closeActiveSession").mockImplementation(
+    // Hang the snapshot call past its 5s timeout.
+    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
       () => new Promise<Response>(() => {}),
     );
     const forceMock = vi
@@ -106,7 +109,7 @@ describe("useRestartBridge", () => {
 
   it("/supervisor/shutdown timeout escalates to forcing → reconnecting", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "closeActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
     vi.spyOn(bridge, "shutdownBridge").mockImplementation(
       () => new Promise<Response>(() => {}),
     );
@@ -195,8 +198,8 @@ describe("useRestartBridge", () => {
   });
 
   it("re-entry guard: clicking restart while in flight is a no-op", async () => {
-    const closeMock = vi
-      .spyOn(bridge, "closeActiveSession")
+    const snapshotMock = vi
+      .spyOn(bridge, "snapshotActiveSession")
       .mockImplementation(() => new Promise<Response>(() => {}));
 
     const { result } = renderHook(() =>
@@ -208,7 +211,23 @@ describe("useRestartBridge", () => {
       result.current.restart();
     });
 
-    // Only one close call should be in flight despite three click attempts.
-    await waitFor(() => expect(closeMock).toHaveBeenCalledTimes(1));
+    // Only one snapshot call should be in flight despite three click attempts.
+    await waitFor(() => expect(snapshotMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("snapshots then shuts down then ensures a fresh bridge", async () => {
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ ok: true } as never);
+    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "live"));
+
+    act(() => result.current.restart());
+
+    await waitFor(() => expect(appConfig.ensureBridgeRunning).toHaveBeenCalledWith(PERSONA));
+    expect(bridge.snapshotActiveSession).toHaveBeenCalledWith(PERSONA);
+    expect(bridge.invokeForceRestart).not.toHaveBeenCalled();
   });
 });

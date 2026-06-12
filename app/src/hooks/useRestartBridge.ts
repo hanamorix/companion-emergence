@@ -2,17 +2,22 @@
  * useRestartBridge — orchestration hook for the v0.0.14 manual bridge
  * restart flow. Drives the state machine:
  *
- *   idle → closing → shutting_down → waiting_for_health → reconnecting → success
+ *   idle → closing → shutting_down → reconnecting → waiting_for_health → success
  *
  * with a `forcing` branch reachable from any of the first three states
  * when the matching HTTP step times out. A second failure after `forcing`
  * lands in `failed` with a user-readable error string.
  *
+ * Task 6 reorder: graceful path now calls ensureBridgeRunning between
+ * shutdown and health poll, and transitions reconnecting → waiting_for_health
+ * itself. The forced path still transitions waiting_for_health internally
+ * and leaves the outer reconnecting transition to fire after.
+ *
  * Spec: docs/superpowers/specs/2026-05-17-bridge-restart-button-design.md
  * Plan: docs/superpowers/plans/2026-05-17-bridge-restart-button.md (Phase 3).
  *
  * Timeouts are spec-locked (§5):
- *   - /sessions/close response:    5s
+ *   - /sessions/snapshot response: 5s
  *   - /supervisor/shutdown 202:    3s
  *   - /health polling window:     30s (per attempt; two attempts max)
  *   - post-SIGKILL grace:         handled inside Tauri force_restart_bridge
@@ -26,11 +31,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { PersonaState } from "../bridge";
 import {
-  closeActiveSession,
+  snapshotActiveSession,
   shutdownBridge,
   invokeForceRestart,
   fetchHealth,
 } from "../bridge";
+import { ensureBridgeRunning } from "../appConfig";
 import { errString } from "../lib/errString";
 
 export type RestartState =
@@ -116,15 +122,16 @@ export function useRestartBridge(
 
     const run = async () => {
       try {
-        // Try graceful close → shutdown → health. Any timeout escalates
-        // to SIGKILL fallback. A second health-poll failure → failed.
+        // Try graceful snapshot → shutdown → ensureBridgeRunning → health.
+        // Any timeout on snapshot escalates to SIGKILL fallback.
+        // A second health-poll failure → failed.
         const tryGraceful = async (): Promise<boolean> => {
           transition("closing");
           try {
             await withTimeout(
-              closeActiveSession(persona),
+              snapshotActiveSession(persona),
               TIMEOUT_CLOSE_MS,
-              "/sessions/close",
+              "/sessions/snapshot",
             );
           } catch {
             return false;
@@ -140,7 +147,17 @@ export function useRestartBridge(
           } catch {
             // Network failures here are expected — the bridge drops the
             // connection as it dies. Spec §6.4: treat as success and
-            // proceed to health poll.
+            // proceed to ensureBridgeRunning + health poll.
+          }
+
+          // Explicitly start a fresh bridge so the health poll has something
+          // to reach. Failure here means we can't guarantee a live bridge —
+          // escalate to forced restart.
+          transition("reconnecting");
+          try {
+            await ensureBridgeRunning(persona);
+          } catch {
+            return false;
           }
 
           transition("waiting_for_health");
@@ -149,6 +166,9 @@ export function useRestartBridge(
           } catch {
             return false;
           }
+          // Bridge is healthy — move to reconnecting so the parent's
+          // live-mode flip (onModeChanged / prop-effect) can resolve to success.
+          transition("reconnecting");
           return true;
         };
 
@@ -176,7 +196,14 @@ export function useRestartBridge(
           transition("failed");
           return;
         }
-        transition("reconnecting");
+        // Graceful path ends in reconnecting (after ensureBridgeRunning +
+        // pollHealth — the final reconnecting is the handoff to the parent's
+        // live-mode flip). Forced path ends in waiting_for_health; push it
+        // to reconnecting here so onModeChanged / prop-effect can resolve
+        // reconnecting → success when mode flips live.
+        if (!gracefulOk) {
+          transition("reconnecting");
+        }
       } finally {
         inFlightRef.current = false;
       }
