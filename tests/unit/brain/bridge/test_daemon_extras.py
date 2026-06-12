@@ -1550,6 +1550,50 @@ def test_acquire_lock_blocks_recent_garbage_lockfile(tmp_path: Path) -> None:
     assert lock_path.read_text(encoding="utf-8") == "not-a-pid"
 
 
+def test_acquire_lock_corrupt_branch_bails_if_lock_changed_under_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Double-read guard on the corrupt-lock branch: if a concurrent starter replaced
+    the corrupt lock with a valid one between our first read and the guard's re-read,
+    acquire_lock must return None without archiving the live lock.
+
+    Simulation: patch pathlib.Path.read_text so that the second call (the guard
+    re-read) returns a different value than the first call (which seeded
+    existing_text).  The first call returns the original corrupt content; the
+    second returns a valid pid string, mimicking a concurrent write.
+    """
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    lock_path.write_text("not-a-pid", encoding="utf-8")
+    old = time.time() - 600
+    os.utime(lock_path, (old, old))
+
+    original_read_text = Path.read_text
+    read_count = {"n": 0}
+
+    def patched_read_text(self, **kwargs):
+        result = original_read_text(self, **kwargs)
+        if self == lock_path:
+            read_count["n"] += 1
+            if read_count["n"] >= 2:
+                # Second read (the guard re-read): simulate concurrent replacement.
+                return "77777"
+        return result
+
+    monkeypatch.setattr(Path, "read_text", patched_read_text)
+
+    archived: list[object] = []
+    monkeypatch.setattr(daemon, "_archive_stale_lock", lambda p: archived.append(p))
+
+    result = daemon.acquire_lock(persona_dir)
+
+    # Guard fired: content changed → bail without archiving.
+    assert result is None
+    assert not archived, "archive must not be called when guard detects lock changed under race"
+
+
 def test_acquire_lock_recovers_old_alive_pid_when_bridge_health_is_dead(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1567,6 +1611,8 @@ def test_acquire_lock_recovers_old_alive_pid_when_bridge_health_is_dead(
     fd = daemon.acquire_lock(persona_dir)
 
     assert fd is not None
+    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
+    assert stale_files, "recovered alive-pid-dead-health lock should be archived as evidence"
     daemon.release_lock(persona_dir, fd)
 
 
