@@ -113,6 +113,7 @@ describe("useRestartBridge", () => {
     vi.spyOn(bridge, "shutdownBridge").mockImplementation(
       () => new Promise<Response>(() => {}),
     );
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
     const forceMock = vi
       .spyOn(bridge, "invokeForceRestart")
       .mockResolvedValue();
@@ -146,8 +147,9 @@ describe("useRestartBridge", () => {
 
   it("post-force health poll exhaustion → failed with user-readable error", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "closeActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
     vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
     // Health never comes back during either window.
     vi.spyOn(bridge, "fetchHealth").mockRejectedValue(new Error("dead"));
     vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
@@ -170,7 +172,7 @@ describe("useRestartBridge", () => {
 
   it("invokeForceRestart rejecting with a pid-missing message surfaces as errorDetail", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "closeActiveSession").mockImplementation(
+    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
       () => new Promise<Response>(() => {}),
     );
     vi.spyOn(bridge, "invokeForceRestart").mockRejectedValue(
