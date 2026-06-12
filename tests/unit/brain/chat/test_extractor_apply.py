@@ -281,3 +281,109 @@ def test_emotion_delta_vocab_failure_never_raises(
     # Must not raise — _safely() wraps _apply_emotion_delta; any internal
     # exception is caught and logged.
     apply_side_effects(out, persona_dir=persona_dir)
+
+
+# ---------------------------------------------------------------------------
+# F1 — Queue the moment, not the label (soul-candidate context fix)
+# ---------------------------------------------------------------------------
+
+
+def test_crystallisation_queues_theme_and_evidence_combined(persona_dir: Path):
+    """Queued record text must be 'theme — evidence'; placeholder memory must agree.
+
+    Before F1 the queued text was only c.theme (the short label), burying
+    c.evidence in a placeholder memory the reviewer never fetched.  After F1
+    both surfaces carry the combined string so the soul-review LLM actually
+    sees the source moment.
+    """
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(
+        crystallisation=[
+            CrystallisationCandidate(
+                theme="Ordinary trust",
+                evidence="she let the goodnight be ordinary instead of performing it",
+            )
+        ]
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    expected_text = "Ordinary trust — she let the goodnight be ordinary instead of performing it"
+
+    # soul_candidates.jsonl must carry the combined string.
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    assert candidates_path.exists(), "soul_candidates.jsonl should be written"
+    entry = json.loads(candidates_path.read_text().splitlines()[0])
+    assert entry.get("text") == expected_text, (
+        f"queued text should be 'theme — evidence'; got: {entry.get('text')!r}"
+    )
+
+    # The placeholder memory (memory_id in the candidate) must also carry the same string.
+    memory_id = entry.get("memory_id")
+    assert memory_id, f"candidate entry missing memory_id: {entry}"
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        mem = store.get(memory_id)
+        assert mem is not None, f"placeholder memory {memory_id!r} not found in MemoryStore"
+        assert mem.content == expected_text, (
+            f"placeholder memory content should equal combined text; "
+            f"got: {mem.content!r}"
+        )
+    finally:
+        store.close()
+
+
+def test_crystallisation_skips_empty_evidence(persona_dir: Path):
+    """A candidate whose evidence is whitespace-only must be skipped entirely.
+
+    Pydantic's min_length=1 rejects truly empty strings and the field_validator
+    rejects whitespace-only strings too.  We use model_construct to bypass
+    validation so we can test the runtime guard in _apply_crystallisation
+    directly (the guard exists as defence-in-depth for any future path that
+    bypasses pydantic).  No record must be appended to soul_candidates.jsonl
+    and no placeholder memory must be written.
+    """
+    from brain.memory.store import MemoryStore
+
+    c = CrystallisationCandidate.model_construct(theme="Hollow fragment", evidence="   ")
+    # Build an ExtractorOutput bypassing field validation so the whitespace-only
+    # candidate reaches _apply_crystallisation.
+    out = ExtractorOutput.model_construct(
+        memory_writes=[],
+        emotion_delta={},
+        crystallisation=[c],
+        reflex_audit=[],
+    )
+
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    assert not candidates_path.exists(), (
+        "soul_candidates.jsonl must NOT be written for a whitespace-only evidence candidate"
+    )
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        recent = store.list_active(limit=10)
+        soul_mems = [m for m in recent if m.memory_type == "monologue_soul_candidate"]
+        assert not soul_mems, (
+            f"no monologue_soul_candidate memory should be written; found: "
+            f"{[m.to_dict() for m in soul_mems]}"
+        )
+    finally:
+        store.close()
+
+
+def test_extractor_prompt_asks_for_grounded_evidence():
+    """_SYSTEM_PROMPT must instruct the LLM to provide 1-2 grounded sentences for evidence.
+
+    The old prompt used '<short>' for both theme and evidence, producing
+    abstract labels that could never ground a soul-review decision.
+    """
+    from brain.chat.extractor import _SYSTEM_PROMPT
+
+    assert "1-2 grounded sentences" in _SYSTEM_PROMPT, (
+        f"_SYSTEM_PROMPT should ask for '1-2 grounded sentences' in the crystallisation "
+        f"evidence field; current prompt:\n{_SYSTEM_PROMPT}"
+    )
