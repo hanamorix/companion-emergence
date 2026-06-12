@@ -529,13 +529,15 @@ export async function fetchChatHistory(
   return (await r.json()) as ChatHistoryResponse;
 }
 
-/** Lightweight /health probe used by the restart hook's poll loop. */
-export async function fetchHealth(persona: string): Promise<{ liveness: string }> {
+/** Lightweight /health probe used by the restart hook's poll loop and the
+ *  boot-time version handshake.  The `version` field is present from v0.0.33+
+ *  (bridge V2 handshake); older bridges omit it. */
+export async function fetchHealth(persona: string): Promise<{ liveness: string; version?: string }> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds) }),
   );
   if (!r.ok) throw new Error(`/health ${r.status}`);
-  return (await r.json()) as { liveness: string };
+  return (await r.json()) as { liveness: string; version?: string };
 }
 
 /** The three model tiers the bridge supports. */
