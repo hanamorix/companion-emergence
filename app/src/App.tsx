@@ -17,6 +17,7 @@ function dragWindow(e: React.MouseEvent) {
   void getCurrentWindow().startDragging();
 }
 import { fetchPersonaState, type PersonaState } from "./bridge";
+import { ensureBridgeCurrent } from "./bridgeVersionCheck";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
 import { LeftPanel } from "./components/LeftPanel";
@@ -45,11 +46,14 @@ type AppPhase =
 export default function App() {
   const [phase, setPhase] = useState<AppPhase>({ kind: "loading" });
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [versionMismatch, setVersionMismatch] = useState(false);
 
   async function startPersona(persona: string) {
     setPhase({ kind: "starting-bridge", persona, error: null });
     try {
       await ensureBridgeRunning(persona);
+      const versionResult = await ensureBridgeCurrent(persona);
+      setVersionMismatch(versionResult === "version_mismatch_unresolved");
       setPhase({ kind: "ready", persona });
     } catch (e) {
       setPhase({ kind: "starting-bridge", persona, error: errString(e) });
@@ -133,6 +137,27 @@ export default function App() {
   return (
     <>
       <div className="titlebar-drag" onMouseDown={dragWindow} />
+      {versionMismatch && (
+        <div
+          role="status"
+          style={{
+            position: "absolute",
+            bottom: 8,
+            left: "50%",
+            transform: "translateX(-50%)",
+            fontSize: 10,
+            color: "var(--mauve)",
+            background: "rgba(30,24,26,0.82)",
+            padding: "3px 10px",
+            borderRadius: 6,
+            pointerEvents: "none",
+            zIndex: 100,
+            whiteSpace: "nowrap",
+          }}
+        >
+          Companion's brain is running a different version — restart the app or reboot if things misbehave.
+        </div>
+      )}
       <Ready config={config!} setConfig={setConfig} persona={phase.persona} />
     </>
   );
