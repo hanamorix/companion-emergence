@@ -65,6 +65,12 @@ from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
 )
+from brain.health.soul_candidate_repair import (
+    run_soul_candidate_repair as _soul_candidate_repair_run,
+)
+from brain.health.soul_candidate_repair import (
+    should_run_soul_candidate_repair as _soul_candidate_repair_should_run,
+)
 from brain.health.vocab_repair import (
     run_vocab_repair as _vocab_repair_run,
 )
@@ -206,6 +212,23 @@ def run_folded(
                 _store.close()
     except Exception as exc:  # noqa: BLE001
         logger.warning("vocab repair failed during startup: %s", exc)
+
+    # One-shot startup: repair stuck monologue soul candidates — context-free
+    # fragments ("Ordinary trust") whose evidence sits in an unread memory.
+    # Provider-free: backfills text from the existing placeholder memory or
+    # expires the candidate. Adjacent to vocab_repair; independent try/except.
+    try:
+        if _soul_candidate_repair_should_run(persona_dir):
+            from brain.memory.store import MemoryStore as _MemoryStore
+
+            db_path = persona_dir / "memories.db"
+            _store = _MemoryStore(str(db_path), integrity_check=False)
+            try:
+                _soul_candidate_repair_run(persona_dir, store=_store)
+            finally:
+                _store.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("soul candidate repair failed during startup: %s", exc)
 
     while not stop_event.is_set():
         try:
