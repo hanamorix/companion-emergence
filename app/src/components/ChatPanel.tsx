@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { acceptVoiceEdit, closeSession, fetchActiveSession, fetchChatHistory, getBridgeCredentials, newSession, rejectVoiceEdit, uploadImage } from "../bridge";
+import { acceptVoiceEdit, fetchActiveSession, fetchChatHistory, getBridgeCredentials, newSession, rejectVoiceEdit, snapshotSession, uploadImage } from "../bridge";
 import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
 import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { VoiceEditPanel, type VoiceEditProposal } from "./VoiceEditPanel";
@@ -180,16 +180,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     onSpeakingChange?.(streaming);
   }, [streaming, onSpeakingChange]);
 
-  // Close the active session on unmount/app unload so the buffer flushes
-  // through ingest promptly. Sessions are created lazily on first send —
+  // Snapshot the active session on unmount/app unload — non-destructive:
+  // the replay buffer is preserved on disc so recovery can re-extract if
+  // the process is interrupted. Sessions are created lazily on first send —
   // opening the app should not create empty bridge sessions that then linger
   // after quit/reload.
   useEffect(() => {
-    const closeCurrentSession = (keepalive = false) => {
+    const snapshotCurrentSession = (keepalive = false) => {
       const sid = sessionRef.current;
       sessionRef.current = null;
       if (sid) {
-        void closeSession(persona, sid, { keepalive })
+        void snapshotSession(persona, sid, { keepalive })
           .then(() => {
             if (!keepalive && mountedRef.current) setMemorySaveWarning(null);
           })
@@ -199,18 +200,18 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             // silently discarding the user's expectation that memory was saved.
             if (!keepalive && mountedRef.current) {
               setMemorySaveWarning(
-                `Memory save pending for the previous chat: ${errString(e)}`,
+                `Memory snapshot pending for the previous chat: ${errString(e)}`,
               );
             }
           });
       }
     };
-    const onBeforeUnload = () => closeCurrentSession(true);
+    const onBeforeUnload = () => snapshotCurrentSession(true);
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => {
       window.removeEventListener("beforeunload", onBeforeUnload);
       cancelRef.current?.();
-      closeCurrentSession();
+      snapshotCurrentSession();
       // Free any object URLs we still hold for bubble thumbnails so
       // the renderer doesn't keep blob bytes pinned across unmount.
       for (const url of trackedUrlsRef.current) URL.revokeObjectURL(url);
