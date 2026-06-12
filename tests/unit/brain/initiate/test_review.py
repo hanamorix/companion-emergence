@@ -233,17 +233,14 @@ def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path, monkey
     )
 
     captured: list[dict] = []
-    events.set_publisher(captured.append)
-    try:
-        run_initiate_review_tick(
-            tmp_path,
-            provider=_fake_provider("send_notify"),
-            voice_template="be warm",
-            cap_per_tick=3,
-            now=daytime,
-        )
-    finally:
-        events.set_publisher(None)
+    events.set_publisher(captured.append)  # autouse conftest resets after the test
+    run_initiate_review_tick(
+        tmp_path,
+        provider=_fake_provider("send_notify"),
+        voice_template="be warm",
+        cap_per_tick=3,
+        now=daytime,
+    )
 
     delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
     assert len(delivered) == 1, f"expected 1 initiate_delivered event, got: {captured}"
@@ -271,16 +268,13 @@ def test_review_tick_does_not_publish_on_hold(tmp_path: Path, monkeypatch) -> No
     )
 
     captured: list[dict] = []
-    events.set_publisher(captured.append)
-    try:
-        run_initiate_review_tick(
-            tmp_path,
-            provider=_fake_provider("hold"),
-            voice_template="be warm",
-            cap_per_tick=3,
-        )
-    finally:
-        events.set_publisher(None)
+    events.set_publisher(captured.append)  # autouse conftest resets after the test
+    run_initiate_review_tick(
+        tmp_path,
+        provider=_fake_provider("hold"),
+        voice_template="be warm",
+        cap_per_tick=3,
+    )
 
     delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
     assert delivered == []
@@ -475,17 +469,14 @@ def test_initiate_delivered_event_carries_kind_and_diff(tmp_path: Path, monkeypa
     )
 
     captured: list[dict] = []
-    events.set_publisher(captured.append)
-    try:
-        run_initiate_review_tick(
-            persona,
-            provider=_fake_voice_edit_provider("send_quiet"),
-            voice_template="be warm",
-            cap_per_tick=3,
-            now=daytime,
-        )
-    finally:
-        events.set_publisher(None)
+    events.set_publisher(captured.append)  # autouse conftest resets after the test
+    run_initiate_review_tick(
+        persona,
+        provider=_fake_voice_edit_provider("send_quiet"),
+        voice_template="be warm",
+        cap_per_tick=3,
+        now=daytime,
+    )
 
     delivered = [e for e in captured if e.get("type") == "initiate_delivered"]
     assert len(delivered) == 1, f"expected 1 initiate_delivered, got: {captured}"
@@ -506,17 +497,14 @@ def test_initiate_delivered_event_carries_kind_and_diff(tmp_path: Path, monkeypa
     )
 
     captured2: list[dict] = []
-    events.set_publisher(captured2.append)
-    try:
-        run_initiate_review_tick(
-            persona2,
-            provider=_fake_provider("send_quiet"),
-            voice_template="be warm",
-            cap_per_tick=3,
-            now=daytime,
-        )
-    finally:
-        events.set_publisher(None)
+    events.set_publisher(captured2.append)  # autouse conftest resets after the test
+    run_initiate_review_tick(
+        persona2,
+        provider=_fake_provider("send_quiet"),
+        voice_template="be warm",
+        cap_per_tick=3,
+        now=daytime,
+    )
 
     delivered2 = [e for e in captured2 if e.get("type") == "initiate_delivered"]
     assert len(delivered2) == 1, f"expected 1 initiate_delivered for message, got: {captured2}"
