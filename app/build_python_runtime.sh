@@ -161,6 +161,13 @@ tar -xzf "$TMP_TAR" -C "$RUNTIME_DIR" --strip-components=1
 
 [ -x "$PY_BIN" ] || { echo "[build] FAIL: extracted python missing at $PY_BIN" >&2; exit 1; }
 
+if [ "$HOST_OS" = "windows" ]; then
+  if [[ ! -f "$RUNTIME_DIR/pythonw.exe" ]]; then
+    echo "[build] ERROR: Windows runtime missing pythonw.exe; Task Scheduler supervisor would show a console" >&2
+    exit 1
+  fi
+fi
+
 echo "[build] python sanity check"
 "$PY_BIN" --version
 

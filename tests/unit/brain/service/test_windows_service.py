@@ -292,3 +292,35 @@ def test_doctor_checks_persona_name_invalid(tmp_path: Path, monkeypatch) -> None
     checks = windows_service.doctor_checks(persona="../etc", nell_path=str(nell))
     persona_check = next(c for c in checks if c.name == "persona_name")
     assert not persona_check.ok
+
+
+# ---------------------------------------------------------------------------
+# Windowless Task Scheduler launch (pythonw.exe for bundled nell.bat)
+# ---------------------------------------------------------------------------
+
+
+def test_build_task_xml_uses_pythonw_for_bundled_nell_bat(tmp_path: Path, monkeypatch) -> None:
+    runtime = tmp_path / "python-runtime"
+    scripts = runtime / "Scripts"
+    scripts.mkdir(parents=True)
+    pythonw = runtime / "pythonw.exe"
+    pythonw.write_text("placeholder", encoding="utf-8")
+    nell_bat = scripts / "nell.bat"
+    nell_bat.write_text("@echo off\n", encoding="utf-8")
+
+    body = windows_service.build_task_xml(persona="nell", nell_path=nell_bat)
+
+    assert f"<Command>{str(pythonw)}</Command>" in body
+    assert "from brain.cli import main" in body
+    assert "supervisor run --persona &quot;nell&quot;" in body
+    assert "nell.bat" not in body[body.index("<Command>") : body.index("</Command>")]
+
+
+def test_build_task_xml_rejects_bundled_nell_bat_without_pythonw(tmp_path: Path) -> None:
+    scripts = tmp_path / "python-runtime" / "Scripts"
+    scripts.mkdir(parents=True)
+    nell_bat = scripts / "nell.bat"
+    nell_bat.write_text("@echo off\n", encoding="utf-8")
+
+    with pytest.raises(windows_service.WindowsServiceConfigError, match="pythonw.exe"):
+        windows_service.build_task_xml(persona="nell", nell_path=nell_bat)
