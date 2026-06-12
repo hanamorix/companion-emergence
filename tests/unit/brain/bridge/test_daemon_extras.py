@@ -657,7 +657,7 @@ def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
 
     captured: dict[str, object] = {}
 
-    def fake_close_stale(
+    def fake_snapshot_stale(
         persona_dir_arg,
         *,
         silence_minutes,
@@ -671,7 +671,7 @@ def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
         # Report list of 2 to assert returned count.
         return [object(), object()]
 
-    monkeypatch.setattr("brain.bridge.daemon.close_stale_sessions", fake_close_stale)
+    monkeypatch.setattr("brain.bridge.daemon.snapshot_stale_sessions", fake_snapshot_stale)
 
     drained = daemon.run_recovery_if_needed(persona_dir)
     assert drained == 2
@@ -705,11 +705,11 @@ def test_run_recovery_fires_on_drain_errors_even_when_shutdown_clean(
     )
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: False)
     monkeypatch.setattr(
-        "brain.bridge.daemon.close_stale_sessions",
+        "brain.bridge.daemon.snapshot_stale_sessions",
         lambda *a, **kw: [],
     )
     drained = daemon.run_recovery_if_needed(persona_dir)
-    assert drained == 0  # ran, but no orphan sessions to drain
+    assert drained == 0  # ran, but no orphan sessions to snapshot
 
 
 # ---------- acquire_lock / release_lock (lines 81-114) ----------
@@ -933,7 +933,7 @@ def test_cmd_start_prints_drain_message_when_recovery_ran(
     rc = daemon.cmd_start(_args("nell"))
     assert rc == 0
     captured = capsys.readouterr()
-    assert "drained 2 orphan sessions" in captured.out
+    assert "snapshotted 2 active sessions" in captured.out
     assert "bridge started on port 51001" in captured.out
     assert log_dir.exists()
 

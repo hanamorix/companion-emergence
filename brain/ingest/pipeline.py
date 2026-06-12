@@ -2,8 +2,8 @@
 
 close_session()             — run all 8 stages for one session, delete its buffer + cursor.
 extract_session_snapshot()  — non-destructive variant; uses cursor sidecar to extract only new turns.
-close_stale_sessions()      — destructive sweep (bridge shutdown drain); calls close_session per stale session.
-snapshot_stale_sessions()   — non-destructive periodic sweep (5-min silence); calls extract_session_snapshot.
+close_stale_sessions()      — destructive sweep; retained for explicit close/finalize callers (NOT used by shutdown or recovery).
+snapshot_stale_sessions()   — non-destructive sweep used by periodic supervision, shutdown, and recovery.
 finalize_stale_sessions()   — real-close sweep (24h silence); final snapshot + buffer delete + cursor delete.
 
 Stage flow:
@@ -633,13 +633,12 @@ def close_stale_sessions(
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
 
     Destructive — runs the full close_session pipeline (extract + delete buffer +
-    delete cursor sidecar) for every match. Used by the bridge shutdown drain
-    path (brain.bridge.server lifespan teardown and brain.bridge.daemon) where
-    "the bridge is going away" is the signal to flush everything immediately,
-    typically called with ``silence_minutes=0`` to catch every active session.
+    delete cursor sidecar) for every match. Retained for explicit close/finalize
+    callers only. NOT used by bridge shutdown or dirty-start recovery (both now
+    call ``snapshot_stale_sessions`` which is non-destructive).
 
-    For the periodic non-destructive 5-minute sweep, use
-    ``snapshot_stale_sessions`` instead (added 2026-05-10 — sticky sessions).
+    For the periodic non-destructive 5-minute sweep, startup recovery, or graceful
+    shutdown drain, use ``snapshot_stale_sessions`` instead.
     For the 24h real-close cadence, use ``finalize_stale_sessions``.
 
     Empty sessions (no turns) are cleaned up silently without running the
