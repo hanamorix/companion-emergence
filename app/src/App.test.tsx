@@ -79,6 +79,16 @@ vi.mock("./wizard/Avatar", () => ({
   WizardAvatar: () => null,
 }));
 
+// ── bridgeVersionCheck ────────────────────────────────────────────────────────
+const { ensureBridgeCurrent } = vi.hoisted(() => ({
+  ensureBridgeCurrent: vi.fn(async () => "ok" as const),
+}));
+
+vi.mock("./bridgeVersionCheck", () => ({
+  ensureBridgeCurrent,
+  _resetForTests: vi.fn(),
+}));
+
 // ── Import App after all mocks are in place ───────────────────────────────────
 import App from "./App";
 
@@ -138,6 +148,18 @@ describe("App boot routing", () => {
     );
     // PersonaPicker ("Which Kindled?") must not appear.
     expect(screen.queryByText(/Which Kindled/i)).not.toBeInTheDocument();
+  });
+
+  it("version_mismatch_unresolved → shows inline version-mismatch notice in ready state", async () => {
+    readAppConfig.mockResolvedValue(baseConfig("nell"));
+    ensureBridgeRunning.mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockResolvedValue("version_mismatch_unresolved");
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/different version/i)).toBeInTheDocument()
+    );
   });
 
   it("no selection, ≥2 personas → picker shown", async () => {
