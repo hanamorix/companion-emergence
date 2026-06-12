@@ -928,3 +928,21 @@ def test_post_voice_edit_reject_records_dismissed_no_voice_write(
     finally:
         store.close()
     assert evolutions == []
+
+
+def test_sessions_snapshot_preserves_buffer(persona_dir: Path, monkeypatch):
+    _patch_fake_provider(monkeypatch, reply="snapshot memory")
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        c.post("/chat", json={"session_id": sid, "message": "remember this"})
+
+        buffer_path = persona_dir / "active_conversations" / f"{sid}.jsonl"
+        assert buffer_path.exists()
+
+        r = c.post("/sessions/snapshot", json={"session_id": sid})
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["session_id"] == sid
+        assert body["closed"] is False
+        assert buffer_path.exists(), "snapshot must preserve replay buffer"
