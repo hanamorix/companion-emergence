@@ -156,6 +156,63 @@ def _xml_escape(text: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class WindowsTaskAction:
+    """Resolved command + arguments for the Task Scheduler ``<Exec>`` block."""
+
+    command: str
+    arguments: str
+
+
+def _supervisor_args(persona: str) -> str:
+    """Build the supervisor CLI arguments string for a Task Scheduler action."""
+    return f'supervisor run --persona "{persona}" --client-origin task-scheduler --idle-shutdown 0'
+
+
+def _task_action_for_nell_path(persona: str, nell_path: Path) -> WindowsTaskAction:
+    """Resolve the Task Scheduler ``<Exec>`` command + arguments.
+
+    For the bundled-runtime case (``nell.bat`` sitting in a ``Scripts/``
+    subdirectory next to a ``python-runtime/`` tree), launching ``nell.bat``
+    directly opens a ``cmd.exe`` console window at logon.  The
+    ``<Settings><Hidden>true`` flag only hides the task from the Task
+    Scheduler UI — it does NOT suppress the console window.
+
+    To avoid the console window we launch ``pythonw.exe`` (the
+    windowless Python interpreter that ships alongside ``python.exe`` in
+    every python-build-standalone Windows distribution) directly with a
+    ``-c`` inline command that replicates exactly what ``nell.bat`` does::
+
+        pythonw.exe -c "import sys; from brain.cli import main; sys.exit(main())" <args>
+
+    ENV PARITY NOTE: ``nell.bat`` sets no environment variables — it
+    only resolves ``python.exe`` by relative path and passes ``%*``.
+    The ``pythonw.exe -c`` action is therefore parity-equivalent.
+    KINDLED_HOME is already passed via the Task XML ``<Environment>``
+    block when ``nellbrain_home`` is provided; PYTHONPATH for a bundled
+    runtime is satisfied by site-packages being inside the runtime tree.
+
+    For any other nell entry point (``nell.exe``, system PATH ``nell``,
+    absolute paths), the command is used as-is — those are console apps
+    but they're not launched at logon via Task Scheduler from a bundled
+    runtime, so the window-visibility concern does not apply.
+    """
+    args = _supervisor_args(persona)
+    if nell_path.name.lower() == "nell.bat" and nell_path.parent.name.lower() == "scripts":
+        runtime_dir = nell_path.parent.parent
+        pythonw = runtime_dir / "pythonw.exe"
+        if not pythonw.exists():
+            raise WindowsServiceConfigError(
+                f"windowless Task Scheduler launch requires pythonw.exe next to bundled runtime: {pythonw}"
+            )
+        code = "import sys; from brain.cli import main; sys.exit(main())"
+        return WindowsTaskAction(
+            command=str(pythonw),
+            arguments=f'-c "{code}" {args}',
+        )
+    return WindowsTaskAction(command=str(nell_path), arguments=args)
+
+
 def build_task_xml(
     *,
     persona: str,
@@ -171,11 +228,13 @@ def build_task_xml(
       * ``<Settings><RestartOnFailure>`` — restart on crash with a
         2-minute interval, up to 3 times (matches launchd KeepAlive
         + systemd Restart=on-failure).
-      * ``<Actions><Exec>`` — ``nell.exe supervisor run --persona <name>
-        --client-origin task-scheduler --idle-shutdown 0`` — same
-        foreground-supervisor entry point launchd / systemd use.
-      * ``<Settings><Hidden>true`` — task doesn't open a console window
-        on login.
+      * ``<Actions><Exec>`` — supervisor entry point; for bundled Windows
+        installs uses ``pythonw.exe`` (windowless) instead of ``nell.bat``
+        (which would open a cmd.exe console at logon).
+      * ``<Settings><Hidden>true`` — hides the task from the Task Scheduler
+        UI only; it does NOT suppress a console window. Windowlessness
+        comes from launching pythonw.exe (see _task_action_for_nell_path),
+        not from <Hidden>.
 
     Pure function; no filesystem side effects. Tested on every
     platform via the same string-equality assertions that cover
@@ -188,15 +247,9 @@ def build_task_xml(
     # to absolute Windows paths, but if a user passes a literal absolute
     # path we still accept it.
     if nell_path_resolved.exists():
-        nell_path_str = str(nell_path_resolved.resolve())
-    else:
-        nell_path_str = str(nell_path_resolved)
+        nell_path_resolved = nell_path_resolved.resolve()
 
-    # The Arguments string is a single line — Task Scheduler doesn't
-    # tokenize it the way argv does. Wrap any path with spaces in
-    # double quotes so claude --print can find its image attachments
-    # later when the path includes ``Documents``-style folders.
-    args = f'supervisor run --persona "{persona}" --client-origin task-scheduler --idle-shutdown 0'
+    action = _task_action_for_nell_path(persona, nell_path_resolved)
 
     # Working directory and stdout/stderr can't be set per-task in
     # Task Scheduler the way launchd / systemd do — we let the runner
@@ -260,8 +313,8 @@ def build_task_xml(
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
         "    <Exec>\n"
-        f"      <Command>{_xml_escape(nell_path_str)}</Command>\n"
-        f"      <Arguments>{_xml_escape(args)}</Arguments>\n"
+        f"      <Command>{_xml_escape(action.command)}</Command>\n"
+        f"      <Arguments>{_xml_escape(action.arguments)}</Arguments>\n"
         f"{env_block}"
         "    </Exec>\n"
         "  </Actions>\n"
@@ -504,6 +557,7 @@ __all__ = [
     "WindowsServiceCommandError",
     "WindowsServiceConfigError",
     "WindowsServicePaths",
+    "WindowsTaskAction",
     "build_launchd_plist_xml",
     "build_task_xml",
     "doctor_checks",
