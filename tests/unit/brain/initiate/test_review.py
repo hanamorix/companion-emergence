@@ -623,6 +623,96 @@ def test_run_initiate_review_tick_calls_resonance_tick(tmp_path, monkeypatch):
     assert resonance_calls[0] == persona
 
 
+# ---------------------------------------------------------------------------
+# B7 — soft body-energy rest gate on recall-resonance outbound (fail-open)
+# ---------------------------------------------------------------------------
+
+def test_review_tick_passes_rest_state_through(tmp_path: Path, monkeypatch) -> None:
+    """run_initiate_review_tick(..., is_rest_state=True) must forward the flag
+    to run_resonance_tick so the recall-resonance source is suppressed."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    captured: dict[str, object] = {}
+
+    def fake_resonance(persona_dir, *, now=None, is_rest_state=False):
+        captured["is_rest_state"] = is_rest_state
+
+    monkeypatch.setattr("brain.initiate.review.run_resonance_tick", fake_resonance)
+    monkeypatch.setattr(
+        "brain.initiate.review.run_calibration_closer_tick",
+        lambda *args, **kwargs: None,
+    )
+    persona = tmp_path / "p"
+    persona.mkdir()
+
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x", is_rest_state=True)
+    assert captured.get("is_rest_state") is True, (
+        f"is_rest_state not forwarded: captured={captured}"
+    )
+
+
+def test_review_tick_passes_rest_state_false_by_default(tmp_path: Path, monkeypatch) -> None:
+    """Default (no is_rest_state kwarg) should pass False to run_resonance_tick."""
+    from brain.initiate.review import run_initiate_review_tick
+
+    captured: dict[str, object] = {}
+
+    def fake_resonance(persona_dir, *, now=None, is_rest_state=False):
+        captured["is_rest_state"] = is_rest_state
+
+    monkeypatch.setattr("brain.initiate.review.run_resonance_tick", fake_resonance)
+    monkeypatch.setattr(
+        "brain.initiate.review.run_calibration_closer_tick",
+        lambda *args, **kwargs: None,
+    )
+    persona = tmp_path / "p"
+    persona.mkdir()
+
+    run_initiate_review_tick(persona, provider=MagicMock(), voice_template="x")
+    assert captured.get("is_rest_state") is False
+
+
+def test_rest_energy_threshold_constant_exists() -> None:
+    """_REST_ENERGY_THRESHOLD must be a public constant on the review module."""
+    from brain.initiate import review  # noqa: F401
+
+    assert hasattr(review, "_REST_ENERGY_THRESHOLD"), (
+        "_REST_ENERGY_THRESHOLD not found on brain.initiate.review"
+    )
+    threshold = review._REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
+    assert isinstance(threshold, int), f"expected int, got {type(threshold)}"
+    assert 1 <= threshold <= 5, f"threshold {threshold} outside expected 1-5 range"
+
+
+def test_rest_state_from_energy_low_is_true() -> None:
+    """_rest_state_from_energy with low energy must return True."""
+    from brain.initiate.review import (  # type: ignore[attr-defined]
+        _REST_ENERGY_THRESHOLD,
+        _rest_state_from_energy,
+    )
+
+    assert _rest_state_from_energy(_REST_ENERGY_THRESHOLD) is True
+    assert _rest_state_from_energy(1) is True
+
+
+def test_rest_state_from_energy_active_is_false() -> None:
+    """_rest_state_from_energy with energy > threshold must return False."""
+    from brain.initiate.review import (  # type: ignore[attr-defined]
+        _REST_ENERGY_THRESHOLD,
+        _rest_state_from_energy,
+    )
+
+    assert _rest_state_from_energy(_REST_ENERGY_THRESHOLD + 1) is False
+    assert _rest_state_from_energy(10) is False
+
+
+def test_rest_state_from_energy_none_is_false() -> None:
+    """_rest_state_from_energy(None) must return False — fail-open on unreadable body."""
+    from brain.initiate.review import _rest_state_from_energy  # type: ignore[attr-defined]
+
+    assert _rest_state_from_energy(None) is False
+
+
 def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkeypatch):
     """_process_one_candidate must pass user_name to compose_tone, not hardcode 'Hana'."""
     import json
