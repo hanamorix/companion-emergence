@@ -31,6 +31,7 @@ import {
   resetBridgeCredentialCache,
   setPersonaModel,
   setPersonaPronouns,
+  snapshotSession,
   uploadImage,
 } from "./bridge";
 
@@ -379,5 +380,23 @@ describe("acceptVoiceEdit / rejectVoiceEdit", () => {
       new Response("server error", { status: 500 }),
     ));
     await expect(rejectVoiceEdit("alice", "ia_bad")).rejects.toThrow("/initiate/voice-edit/reject 500");
+  });
+
+  it("snapshots a session without closing it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "session-1", closed: false, committed: 0, deduped: 0, soul_candidates: 0, soul_queue_errors: 0, errors: 0 }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const r = await snapshotSession("alice", "session-1", { keepalive: true });
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:41001/sessions/snapshot",
+      expect.objectContaining({
+        method: "POST",
+        keepalive: true,
+        body: JSON.stringify({ session_id: "session-1" }),
+      }),
+    );
+    expect(r).toMatchObject({ closed: false });
   });
 });

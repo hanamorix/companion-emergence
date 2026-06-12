@@ -385,6 +385,69 @@ export async function closeActiveSession(
 }
 
 /**
+ * Extract memories from a session's live buffer without deleting the buffer.
+ *
+ * Non-destructive variant of closeSession: uses a cursor sidecar to extract
+ * only turns added since the previous snapshot. The raw replay buffer is
+ * preserved on disk so a future close or finalise pass can still commit it.
+ * Use this wherever replay buffer preservation is required (app close, restart).
+ */
+export async function snapshotSession(
+  persona: string,
+  sessionId: string,
+  options: CloseSessionOptions = {},
+): Promise<CloseSessionResponse> {
+  const r = await bridgeFetch(persona, (creds) => fetch(`${creds.url}/sessions/snapshot`, {
+    method: "POST",
+    headers: authHeaders(creds),
+    body: JSON.stringify({ session_id: sessionId }),
+    keepalive: options.keepalive,
+  }));
+  if (!r.ok) {
+    let detail = "";
+    try {
+      detail = closeErrorDetail(await r.json());
+    } catch {
+      const text = await r.text().catch(() => "");
+      detail = text.slice(0, 200);
+    }
+    throw new Error(`/sessions/snapshot ${r.status}: ${detail}`);
+  }
+  return (await r.json()) as CloseSessionResponse;
+}
+
+/**
+ * Snapshot whichever session the bridge currently has open, without closing it.
+ *
+ * Non-destructive variant of closeActiveSession: looks up the active session
+ * and snapshots it (buffer preserved). Returns a synthetic 204 when there is
+ * nothing to snapshot so the caller can treat "no active session" identically
+ * to a successful snapshot.
+ */
+export async function snapshotActiveSession(
+  persona: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let sessionId: string | null = null;
+  try {
+    sessionId = await fetchActiveSession(persona);
+  } catch {
+    return new Response(null, { status: 204 });
+  }
+  if (sessionId === null) {
+    return new Response(null, { status: 204 });
+  }
+  return bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/sessions/snapshot`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ session_id: sessionId }),
+      signal,
+    }),
+  );
+}
+
+/**
  * Trigger bridge graceful shutdown. Returns 202 immediately; the actual
  * 30s drain runs server-side via SIGTERM/lifespan teardown. Returns the
  * raw Response so the caller can distinguish 202 (scheduled) from a
