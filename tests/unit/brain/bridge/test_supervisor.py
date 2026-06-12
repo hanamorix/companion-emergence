@@ -647,3 +647,108 @@ def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert fired == []
+
+
+# ---------------------------------------------------------------------------
+# B7 — supervisor passes is_rest_state derived from body energy into
+#       _run_initiate_review_tick (fail-open: body read error → False)
+# ---------------------------------------------------------------------------
+
+def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: Path) -> None:
+    """When body energy is low (≤ _REST_ENERGY_THRESHOLD), supervisor must pass
+    is_rest_state=True into run_initiate_review_tick."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.body.state import BodyState
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
+
+    persona_dir = _persona_dir(tmp_path)
+    bus = _CapturingBus()
+
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+        captured["is_rest_state"] = is_rest_state
+
+    low_energy_body = BodyState(
+        energy=_REST_ENERGY_THRESHOLD,
+        temperature=5,
+        exhaustion=4,
+        session_hours=0.0,
+        days_since_contact=1.0,
+        body_emotions={},
+        computed_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.body.state.compute_body_state", return_value=low_energy_body),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), bus)
+
+    assert captured.get("is_rest_state") is True, f"expected is_rest_state=True for low energy, got: {captured}"
+
+
+def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_path: Path) -> None:
+    """When body energy is active (> _REST_ENERGY_THRESHOLD), supervisor must pass
+    is_rest_state=False into run_initiate_review_tick."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.body.state import BodyState
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
+
+    persona_dir = _persona_dir(tmp_path)
+    bus = _CapturingBus()
+
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+        captured["is_rest_state"] = is_rest_state
+
+    active_energy_body = BodyState(
+        energy=_REST_ENERGY_THRESHOLD + 1,
+        temperature=5,
+        exhaustion=2,
+        session_hours=0.0,
+        days_since_contact=1.0,
+        body_emotions={},
+        computed_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.body.state.compute_body_state", return_value=active_energy_body),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), bus)
+
+    assert captured.get("is_rest_state") is False, f"expected is_rest_state=False for active energy, got: {captured}"
+
+
+def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) -> None:
+    """When body state computation raises, supervisor must pass is_rest_state=False
+    (fail-open: a body bug must never permanently silence recall-resonance)."""
+    from unittest.mock import MagicMock, patch
+
+
+    persona_dir = _persona_dir(tmp_path)
+    bus = _CapturingBus()
+
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.body.state.compute_body_state", side_effect=RuntimeError("body read failed")),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), bus)
+
+    assert captured.get("is_rest_state") is False, (
+        f"fail-open violated: expected is_rest_state=False on body error, got: {captured}"
+    )

@@ -60,6 +60,22 @@ from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
+# Energy threshold for the soft rest gate on recall-resonance outbound.
+# When body energy is at or below this value, recall_resonance is suppressed
+# so she rests that autonomous source.  Other initiate sources (dreams,
+# crystallizations) are unaffected — this is a targeted soft gate, not a
+# global silence.  Fail-open: if body state is unreadable she keeps firing.
+_REST_ENERGY_THRESHOLD: int = 3
+
+
+def _rest_state_from_energy(energy: int | None) -> bool:
+    """Return True if the body is in a rest state (energy too low to reach out).
+
+    Fail-open: None energy (unreadable body state) → False so a body-read
+    failure never permanently silences recall-resonance outbound.
+    """
+    return energy is not None and energy <= _REST_ENERGY_THRESHOLD
+
 
 def _build_send_history(persona_dir: Path, now: datetime) -> list[dict]:
     """Recent outbound shape for the decision prompt."""
@@ -321,6 +337,7 @@ def run_initiate_review_tick(
     cap_per_tick: int = 3,
     now: datetime | None = None,
     user_presence: UserPresence | None = None,
+    is_rest_state: bool = False,
 ) -> None:
     """Process up to cap_per_tick queued candidates through the pipeline.
 
@@ -334,7 +351,7 @@ def run_initiate_review_tick(
     """
     now = now or datetime.now(UTC)
     run_calibration_closer_tick(persona_dir, now=now)
-    run_resonance_tick(persona_dir, now=now)
+    run_resonance_tick(persona_dir, now=now, is_rest_state=is_rest_state)
     candidates = read_candidates(persona_dir)[:cap_per_tick]
 
     if not candidates:
