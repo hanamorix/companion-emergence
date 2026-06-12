@@ -127,6 +127,26 @@ def test_graceful_shutdown_records_dirty_when_snapshot_drain_raises(
     assert after.shutdown_clean is False
 
 
+def test_shutdown_logs_drain_errors_when_snapshot_fails(persona_dir: Path, monkeypatch, caplog):
+    import logging
+
+    from tests.bridge.test_endpoints import _patch_fake_provider
+
+    _patch_fake_provider(monkeypatch, reply="bye")
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("snapshot exploded")
+
+    monkeypatch.setattr("brain.bridge.server._drain_sessions_blocking", boom)
+
+    with caplog.at_level(logging.ERROR, logger="brain.bridge.server"):
+        with _client(persona_dir) as c:
+            sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+            c.post("/chat", json={"session_id": sid, "message": "hi"})
+
+    assert any("shutdown drain failed" in r.message for r in caplog.records)
+
+
 def test_check_idle_predicate(persona_dir: Path):
     """_check_idle is a pure predicate; no side effects."""
     from brain.bridge.server import _check_idle
