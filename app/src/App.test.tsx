@@ -81,7 +81,9 @@ vi.mock("./wizard/Avatar", () => ({
 
 // ── bridgeVersionCheck ────────────────────────────────────────────────────────
 const { ensureBridgeCurrent } = vi.hoisted(() => ({
-  ensureBridgeCurrent: vi.fn(async () => "ok" as const),
+  ensureBridgeCurrent: vi.fn(
+    async (): Promise<"ok" | "restarted" | "version_mismatch_unresolved" | "skipped"> => "ok",
+  ),
 }));
 
 vi.mock("./bridgeVersionCheck", () => ({
