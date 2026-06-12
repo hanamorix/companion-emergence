@@ -219,6 +219,7 @@ def build_launchd_plist(
             "Crashed": True,
             "SuccessfulExit": False,
         },
+        "ExitTimeOut": 300,
         "WorkingDirectory": str(Path(working_directory).expanduser().resolve())
         if working_directory is not None
         else str(Path.home()),

@@ -169,6 +169,7 @@ def build_systemd_unit_text(
         "--client-origin systemd --idle-shutdown 0\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
+        "TimeoutStopSec=300\n"
         f"{env_block}\n"
         f"StandardOutput=append:{paths.stdout_path}\n"
         f"StandardError=append:{paths.stderr_path}\n"
