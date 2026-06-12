@@ -157,3 +157,53 @@ def test_run_pass_recovers_from_corrupt_forgetting_state(persona_with_low_salien
     summary = run_pass(persona_dir, event_bus=event_bus)
     # Should NOT crash; consecutive_low_passes counters all reset to 0
     assert "faded" in summary
+
+
+def test_run_pass_exempts_memory_under_soul_review_through_real_candidates_file(tmp_path):
+    """CANARY — pins the full composition run_pass → _load_soul_linked_ids →
+    brain.soul.candidates.list_under_review_memory_ids against a REAL
+    soul_candidates.jsonl.
+
+    History: forgetting's lazy import of brain.soul.candidates referenced a
+    module that did not exist from v0.0.14 until 2026-06-12 (the fail-soft
+    except swallowed the ImportError), so the under-review exemption was
+    silently dead for ~18 versions. This test fails if that composition ever
+    breaks again (module rename, signature drift, status-set drift).
+    """
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        tmp_path,
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    # Identical low-salience shape to the fades test — old, no emotions, no recalls.
+    m = Memory.create_new(
+        content="quiet moment awaiting soul review",
+        memory_type="monologue_soul_candidate",
+        domain="monologue",
+        emotions={},
+    )
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=10))
+    store.create(m)
+    store.close()
+
+    # Real candidates file via the real queue path: auto_pending = under review.
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=m.id,
+        item=ExtractedItem(text="quiet moment awaiting soul review", label="observation", importance=8),
+        session_id="monologue",
+    )
+
+    summary = run_pass(tmp_path, event_bus=MagicMock())
+
+    store = MemoryStore(tmp_path / "memories.db")
+    row = store._conn.execute("SELECT state FROM memories WHERE id = ?", (m.id,)).fetchone()
+    store.close()
+    assert row["state"] == "active", (
+        "memory under soul review must be exempt from fading — the "
+        "run_pass→soul.candidates composition is broken"
+    )
+    assert summary["exempt"] >= 1

@@ -128,7 +128,7 @@ Return ONLY a JSON object matching this schema:
 {
   "memory_writes":   [{"episode": "<one sentence>", "salience": 0.0-1.0}],
   "emotion_delta":   {"<emotion-channel>": <float in [-1.0, 1.0]>, ...},
-  "crystallisation": [{"theme": "<short>", "evidence": "<short>"}],
+  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it — 1-2 grounded sentences from the monologue>"}],
   "reflex_audit":    [{"tool": "<tool-name>", "reason": "<why they should have called it>"}]
 }
 
@@ -355,6 +355,15 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
         store.close()
 
 
+def _candidate_text(c: CrystallisationCandidate) -> str:
+    """Return the combined candidate string: '<theme> — <evidence>'.
+
+    Single source of truth used for both the queued ExtractedItem text and the
+    placeholder memory content so both surfaces agree.
+    """
+    return f"{c.theme} — {c.evidence}"
+
+
 def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_dir: Path) -> None:
     """Queue crystallisation candidates into soul_candidates.jsonl.
 
@@ -362,6 +371,11 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
     picks them up with the same mechanics as ingest-sourced candidates.
     The soul candidate record shape requires a memory_id, so we first commit
     a placeholder memory and use its id.
+
+    Candidates with whitespace-only evidence are skipped (debug-logged) — a
+    theme with no grounding moment is exactly the context-free fragment class
+    the D1 bug produced.  Pydantic's min_length=1 rejects truly empty strings;
+    the strip-check here catches whitespace-only strings that pass validation.
     """
     from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
     from brain.ingest.types import ExtractedItem
@@ -370,16 +384,28 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
     store = MemoryStore(persona_dir / "memories.db")
     try:
         for c in candidates:
+            if not c.evidence.strip():
+                logger.debug(
+                    "_apply_crystallisation: skipping candidate with empty/whitespace evidence "
+                    "(theme=%r)",
+                    c.theme,
+                )
+                continue
+
+            # Combined text carries the source moment into both the candidate
+            # record and the placeholder memory the reviewer can dereference.
+            combined = _candidate_text(c)
+
             # Commit a placeholder memory so queue_soul_candidate has a memory_id.
             mem = Memory.create_new(
-                content=c.evidence,
+                content=combined,
                 memory_type="monologue_soul_candidate",
                 domain="monologue",
                 importance=8.0,  # matches DEFAULT_SOUL_THRESHOLD exactly (0..10 scale)
             )
             store.create(mem)
             item = ExtractedItem(
-                text=c.theme,
+                text=combined,
                 label="observation",
                 importance=8,  # == DEFAULT_SOUL_THRESHOLD; only at-threshold items are queued
             )

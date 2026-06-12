@@ -45,13 +45,19 @@ def queue_soul_candidate(
     signal that SP-5 owns the crystallization decision.
 
     Record schema:
-        memory_id:   str   — the newly committed memory's id
-        text:        str   — the item's content
-        label:       str   — memory_type / label
-        importance:  int   — 1-10 extraction importance
-        session_id:  str   — source session
-        queued_at:   str   — ISO-8601 UTC timestamp
-        status:      str   — "auto_pending" (SP-5 consumes and updates this)
+        memory_id:    str   — the newly committed memory's id
+        text:         str   — the item's content
+        label:        str   — memory_type / label
+        importance:   int   — 1-10 extraction importance
+        session_id:   str   — source session
+        queued_at:    str   — ISO-8601 UTC timestamp
+        status:       str   — lifecycle: "auto_pending" → "accepted" | "rejected" |
+                              "expired".  SP-5 owns the transition.
+        defer_count:  int   — incremented on each defer; when it reaches
+                              brain.soul.review._MAX_DEFERS (3) the candidate is
+                              retired as "expired" without another LLM call.
+                              Absent on records queued before v0.0.34 — treated as 0.
+        expired_at:   str   — ISO-8601 UTC, set when status→"expired".
     """
     persona_dir.mkdir(parents=True, exist_ok=True)
     record = {
