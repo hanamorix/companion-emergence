@@ -827,3 +827,212 @@ def test_review_prompt_carries_source_moment_through_loop(tmp_path: Path) -> Non
     assert distinctive in captured_prompts[0], (
         f"source memory content not found in prompt: {captured_prompts[0][:400]!r}"
     )
+
+
+# ── F3: bounded defer + expired status ───────────────────────────────────────
+
+
+def test_apply_defer_increments_defer_count(tmp_path: Path) -> None:
+    """_apply_defer must increment defer_count from absent→1→2 AND touch last_deferred_at."""
+    from brain.soul.review import _apply_defer
+
+    record: dict = {"status": "auto_pending", "text": "a moment"}
+    # First defer: absent → 1
+    _apply_defer(record, dry_run=False)
+    assert record["defer_count"] == 1
+    assert "last_deferred_at" in record
+
+    # Second defer: 1 → 2
+    _apply_defer(record, dry_run=False)
+    assert record["defer_count"] == 2
+    assert "last_deferred_at" in record
+
+
+def test_candidate_at_max_defers_expires_without_llm_call(tmp_path: Path) -> None:
+    """A candidate with defer_count >= _MAX_DEFERS must be marked expired and
+    the provider must NOT be called for it (no LLM spend on a context-starved loop)."""
+    from brain.soul.review import _MAX_DEFERS
+
+    call_log: list[str] = []
+
+    class _RecordingProvider(LLMProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            call_log.append(prompt)
+            return json.dumps({
+                "decision": "defer",
+                "love_type": "craft",
+                "resonance": 5,
+                "confidence": 3,
+                "reasoning": "not sure",
+                "why_it_matters": "",
+            })
+
+        def name(self) -> str:
+            return "recording-fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            raise NotImplementedError
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir(parents=True)
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+
+    exhausted = _make_candidate("building the control on purpose")
+    exhausted["defer_count"] = _MAX_DEFERS  # exactly at the cap
+
+    _write_candidates(persona_dir, [exhausted])
+
+    report = review_pending_candidates(
+        persona_dir,
+        store=store,
+        soul_store=soul_store,
+        provider=_RecordingProvider(),
+        defer_cooldown_hours=0,  # bypass cooldown so the candidate is eligible
+    )
+
+    store.close()
+    soul_store.close()
+
+    # Provider must NOT have been called for the exhausted candidate
+    assert call_log == [], f"provider was called {len(call_log)} time(s) but should not have been"
+
+    # Candidate must be marked expired with a reason + expired_at
+    lines = (persona_dir / "soul_candidates.jsonl").read_text().strip().splitlines()
+    updated = json.loads(lines[0])
+    assert updated["status"] == "expired", f"expected expired, got {updated['status']!r}"
+    assert "insufficient context" in updated.get("reason", ""), (
+        f"reason should mention 'insufficient context', got {updated.get('reason')!r}"
+    )
+    assert "expired_at" in updated, "expired_at field must be set"
+
+    # Report should have examined=1 (we entered the loop for this candidate)
+    assert report.examined == 1
+
+
+def test_expired_candidate_skipped_and_survives(tmp_path: Path) -> None:
+    """An already-expired candidate must be skipped by a subsequent review pass
+    and its record must remain intact (status still 'expired')."""
+    call_log: list[str] = []
+
+    class _RecordingProvider(LLMProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            call_log.append(prompt)
+            return json.dumps({
+                "decision": "accept",
+                "love_type": "craft",
+                "resonance": 9,
+                "confidence": 9,
+                "reasoning": "clear",
+                "why_it_matters": "matters",
+            })
+
+        def name(self) -> str:
+            return "recording-fake-2"
+
+        def chat(self, messages, *, tools=None, options=None):
+            raise NotImplementedError
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir(parents=True)
+    store = _make_memory_store()
+    soul_store = _make_soul_store()
+
+    expired = _make_candidate("ordinary trust")
+    expired["status"] = "expired"
+    expired["reason"] = "insufficient context after 3 reviews"
+    expired["expired_at"] = datetime.now(UTC).isoformat()
+
+    _write_candidates(persona_dir, [expired])
+
+    report = review_pending_candidates(
+        persona_dir,
+        store=store,
+        soul_store=soul_store,
+        provider=_RecordingProvider(),
+        defer_cooldown_hours=0,
+    )
+
+    store.close()
+    soul_store.close()
+
+    # Provider must NOT have been called for the expired candidate
+    assert call_log == [], "provider was called for an already-expired candidate"
+
+    # The record must survive and remain expired
+    lines = (persona_dir / "soul_candidates.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 1, "expired candidate record was deleted"
+    record = json.loads(lines[0])
+    assert record["status"] == "expired"
+
+    # Report: nothing examined (expired candidates not in pending_indices at all)
+    assert report.examined == 0
+    assert report.pending_at_start == 0
+
+
+def test_expired_not_forgetting_exempt(tmp_path: Path) -> None:
+    """list_under_review_memory_ids must NOT include memory IDs linked to expired
+    candidates — an expired candidate's placeholder memory should become forgettable.
+
+    This pins the allowlist in brain.soul.candidates: only 'pending' and
+    'auto_pending' statuses are treated as under-review.
+    """
+    from brain.soul.candidates import list_under_review_memory_ids
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir(parents=True)
+
+    pending_mem_id = "mem-pending-001"
+    auto_pending_mem_id = "mem-auto-001"
+    expired_mem_id = "mem-expired-001"
+    accepted_mem_id = "mem-accepted-001"
+    rejected_mem_id = "mem-rejected-001"
+
+    candidates = [
+        {
+            "id": "c1",
+            "status": "pending",
+            "memory_id": pending_mem_id,
+            "text": "a",
+            "queued_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "id": "c2",
+            "status": "auto_pending",
+            "memory_id": auto_pending_mem_id,
+            "text": "b",
+            "queued_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "id": "c3",
+            "status": "expired",
+            "memory_id": expired_mem_id,
+            "text": "c",
+            "queued_at": datetime.now(UTC).isoformat(),
+            "reason": "insufficient context after 3 reviews",
+            "expired_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "id": "c4",
+            "status": "accepted",
+            "memory_id": accepted_mem_id,
+            "text": "d",
+            "queued_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "id": "c5",
+            "status": "rejected",
+            "memory_id": rejected_mem_id,
+            "text": "e",
+            "queued_at": datetime.now(UTC).isoformat(),
+        },
+    ]
+    _write_candidates(persona_dir, candidates)
+
+    under_review = set(list_under_review_memory_ids(persona_dir))
+
+    assert pending_mem_id in under_review, "pending memory_id must be under-review"
+    assert auto_pending_mem_id in under_review, "auto_pending memory_id must be under-review"
+    assert expired_mem_id not in under_review, "expired memory_id must NOT be under-review"
+    assert accepted_mem_id not in under_review, "accepted memory_id must NOT be under-review"
+    assert rejected_mem_id not in under_review, "rejected memory_id must NOT be under-review"
