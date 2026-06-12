@@ -44,6 +44,13 @@ DEFAULT_DEFER_COOLDOWN_HOURS = 24
 # Valid decision values the model may return
 VALID_DECISIONS = {"accept", "reject", "defer"}
 
+# Maximum number of defers before a candidate is retired as "expired".
+# After _MAX_DEFERS reviews the context hasn't improved — rather than
+# loop forever (24h-rate-limited but never resolving), the candidate is
+# honestly retired with a reason. A future richer candidate on the same
+# theme can re-queue independently.
+_MAX_DEFERS = 3
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -433,9 +440,10 @@ def _apply_reject(candidate: dict, decision: Decision, dry_run: bool) -> None:
 
 
 def _apply_defer(candidate: dict, dry_run: bool) -> None:
-    """Leave candidate pending (auto_pending). Touch last_deferred_at."""
+    """Leave candidate pending (auto_pending). Increment defer_count and touch last_deferred_at."""
     if dry_run:
         return
+    candidate["defer_count"] = int(candidate.get("defer_count", 0) or 0) + 1
     candidate["last_deferred_at"] = datetime.now(UTC).isoformat()
 
 
@@ -613,6 +621,24 @@ def _review_pending_candidates_locked(
 
             record = records[idx]
             candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
+
+            # Expiry short-circuit: candidates that have been deferred _MAX_DEFERS
+            # times have had repeated reviews with no improvement in context.
+            # Retire them honestly rather than burning LLM calls indefinitely.
+            if int(record.get("defer_count", 0) or 0) >= _MAX_DEFERS:
+                report.examined += 1
+                _mark_candidate(
+                    record,
+                    "expired",
+                    reason=f"insufficient context after {_MAX_DEFERS} reviews",
+                    expired_at=datetime.now(UTC).isoformat(),
+                )
+                logger.info(
+                    "soul review: candidate %s expired (defer_count >= %d)",
+                    candidate_id,
+                    _MAX_DEFERS,
+                )
+                continue
 
             related = _related_memory_snippets(store, record.get("text", ""))
             source_moment = _source_memory_snippet(store, record)
