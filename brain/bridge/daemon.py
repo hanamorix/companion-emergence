@@ -154,6 +154,12 @@ def acquire_lock(persona_dir: Path) -> int | None:
             return acquire_lock(persona_dir)
         except ValueError:
             if age > _LOCK_STALE_SECONDS:
+                # Double-read guard (best-effort, not atomic — same TOCTOU caveat
+                # as the dead/alive-pid branches): if a concurrent starter replaced
+                # the corrupt lock with a valid one between our first read and now,
+                # bail rather than archive their live lock.
+                if path.read_text().strip() != existing_text:
+                    return None
                 logger.warning("recovering stale corrupt bridge lockfile age=%.1fs", age)
                 _archive_stale_lock(path)
                 return acquire_lock(persona_dir)
