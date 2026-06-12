@@ -55,6 +55,7 @@ class CrystallisationCandidate(BaseModel):
 
     theme: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=500)
+    importance: int = Field(ge=1, le=10, default=8)
 
     @field_validator("theme", "evidence")
     @classmethod
@@ -128,7 +129,7 @@ Return ONLY a JSON object matching this schema:
 {
   "memory_writes":   [{"episode": "<one sentence>", "salience": 0.0-1.0}],
   "emotion_delta":   {"<emotion-channel>": <float in [-1.0, 1.0]>, ...},
-  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it — 1-2 grounded sentences from the monologue>"}],
+  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it — 1-2 grounded sentences from the monologue>", "importance": <int 1-10, how formative this theme is to who you are>}],
   "reflex_audit":    [{"tool": "<tool-name>", "reason": "<why they should have called it>"}]
 }
 
@@ -364,6 +365,16 @@ def _candidate_text(c: CrystallisationCandidate) -> str:
     return f"{c.theme} — {c.evidence}"
 
 
+def _normalize_theme(text: str) -> str:
+    """Extract and normalise the theme portion from a 'theme — evidence' string.
+
+    The stored soul-candidate text is 'theme — evidence'; splitting on ' — '
+    and taking [0] aligns with _candidate_text(c) which builds the same format.
+    When called on a bare theme string (no ' — '), returns the whole casefold.
+    """
+    return text.split(" — ")[0].strip().casefold()
+
+
 def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_dir: Path) -> None:
     """Queue crystallisation candidates into soul_candidates.jsonl.
 
@@ -376,10 +387,32 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
     theme with no grounding moment is exactly the context-free fragment class
     the D1 bug produced.  Pydantic's min_length=1 rejects truly empty strings;
     the strip-check here catches whitespace-only strings that pass validation.
+
+    Dedup by theme: auto_pending candidates whose theme already exists in
+    soul_candidates.jsonl are skipped — prevents near-duplicate pile-up when
+    the same theme surfaces across multiple monologue passes. Terminal statuses
+    (rejected, accepted, expired) do NOT block re-queueing. Within-batch dupes
+    are also filtered: pending_themes is updated after each successful queue so
+    a second identical theme in the same call is skipped too.
     """
-    from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
+    from brain.ingest.soul_queue import (
+        DEFAULT_SOUL_THRESHOLD,
+        list_soul_candidates,
+        queue_soul_candidate,
+    )
     from brain.ingest.types import ExtractedItem
     from brain.memory.store import Memory, MemoryStore
+
+    # Build pending-theme set once, fail-soft — dedup is best-effort.
+    try:
+        existing = list_soul_candidates(persona_dir)
+        pending_themes = {
+            _normalize_theme(r.get("text", ""))
+            for r in existing
+            if r.get("status") == "auto_pending"
+        }
+    except Exception:  # noqa: BLE001
+        pending_themes = set()  # fail-soft: no dedup, queue anyway
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -388,6 +421,16 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
                 logger.debug(
                     "_apply_crystallisation: skipping candidate with empty/whitespace evidence "
                     "(theme=%r)",
+                    c.theme,
+                )
+                continue
+
+            # Dedup by theme — skip if an auto_pending candidate with the same
+            # normalised theme is already queued (or was just queued this call).
+            norm = c.theme.strip().casefold()
+            if norm in pending_themes:
+                logger.debug(
+                    "_apply_crystallisation: skipping duplicate theme %r (already pending)",
                     c.theme,
                 )
                 continue
@@ -401,13 +444,13 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
                 content=combined,
                 memory_type="monologue_soul_candidate",
                 domain="monologue",
-                importance=8.0,  # matches DEFAULT_SOUL_THRESHOLD exactly (0..10 scale)
+                importance=c.importance * 1.0,  # extractor-scored 1-10; 0..10 MemoryStore scale
             )
             store.create(mem)
             item = ExtractedItem(
                 text=combined,
                 label="observation",
-                importance=8,  # == DEFAULT_SOUL_THRESHOLD; only at-threshold items are queued
+                importance=c.importance,  # extractor-scored; guard below filters live
             )
             if item.importance >= DEFAULT_SOUL_THRESHOLD:
                 queue_soul_candidate(
@@ -416,6 +459,8 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
                     item=item,
                     session_id="monologue",
                 )
+                # Track this theme so a later candidate in the same batch is also deduped.
+                pending_themes.add(norm)
     finally:
         store.close()
 
