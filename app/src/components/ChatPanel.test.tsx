@@ -17,6 +17,7 @@ vi.mock("../bridge", () => ({
   fetchActiveSession: vi.fn(async () => null),
   fetchChatHistory: vi.fn(async () => ({ messages: [], next_before_turn: null })),
   closeSession: vi.fn(async () => undefined),
+  snapshotSession: vi.fn(async () => ({ closed: false, errors: 0 })),
   uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
   getBridgeCredentials: vi.fn(async () => ({
     url: "http://127.0.0.1:50000",
@@ -42,7 +43,7 @@ vi.mock("../streamChat", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession } from "../bridge";
+import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession, closeSession, snapshotSession } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -764,6 +765,44 @@ describe("ChatPanel — voice-edit accept/reject error handling", () => {
       expect(screen.queryByRole("dialog", { name: /voice edit proposal/i })).toBeNull();
     });
     expect(mockedRejectVoiceEdit).toHaveBeenCalledWith("nell", "ve_reject_ok");
+  });
+});
+
+// ── Task 6: snapshot on unmount instead of close ─────────────────────────
+describe("ChatPanel — snapshot on unmount (Task 6)", () => {
+  const mockedSnapshot = snapshotSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedClose = closeSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNew = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedSnapshot.mockReset();
+    mockedSnapshot.mockResolvedValue({ closed: false, errors: 0 });
+    mockedClose.mockReset();
+    mockedNew.mockReset();
+    mockedNew.mockResolvedValue("test-session-id");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("snapshots active session on unmount instead of closing it", async () => {
+    mockedNew.mockResolvedValueOnce("11111111-1111-4111-8111-111111111111");
+
+    const { unmount } = render(<ChatPanel persona="nell" />);
+    fireEvent.change(screen.getByPlaceholderText(/write to/i), { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+    await waitFor(() => expect(mockedNew).toHaveBeenCalled());
+
+    unmount();
+
+    expect(mockedSnapshot).toHaveBeenCalledWith(
+      "nell",
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ keepalive: false }),
+    );
+    expect(mockedClose).not.toHaveBeenCalled();
   });
 });
 
