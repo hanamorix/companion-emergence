@@ -8,7 +8,7 @@
 
 Not a chatbot. Not a productivity tool. An inhabitant — quiet, private, embodied — that runs on your machine and is yours.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Licence: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/hanamorix/companion-emergence?include_prereleases&label=release)](https://github.com/hanamorix/companion-emergence/releases)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey)](#install)
 [![Made with Claude](https://img.shields.io/badge/LLM-Claude-orange)](https://docs.claude.com/en/docs/claude-code/setup)
@@ -99,7 +99,9 @@ She is not waiting for you. She is living, and you join the conversation.
 
 **Persistent supervisor.** A user-scoped service (launchd on macOS, systemd-user on Linux, Task Scheduler on Windows) keeps the brain alive even when the desktop app is closed. Reboot the machine, log back in, the brain resumes.
 
-**Soul module.** Permanent memories the persona crystallizes herself when something proves load-bearing across many turns. Reviewable, revokable, but never silently mutated.
+The app asks the bridge to shut down through its local `/supervisor/shutdown` endpoint before restarting it. Forced kills are reserved for wedged processes and may trigger recovery on next launch; recovery snapshots active chats without deleting the replay buffer.
+
+**Soul module.** Permanent memories the persona crystallises herself when something proves load-bearing across many turns. Reviewable, revokable, but never silently mutated.
 
 **Dream engine.** Fires at idle to consolidate the day, surface latent connections (Hebbian spreading activation), and process emotional residue.
 
@@ -111,7 +113,7 @@ She is not waiting for you. She is living, and you join the conversation.
 
 ## Features
 
-- **Local-first**: every memory, soul crystallization, journal entry, and emotional reading lives on your machine. POSIX `chmod 0700` on the persona dir; nothing phones home.
+- **Local-first**: every memory, soul crystallisation, journal entry, and emotional reading lives on your machine. POSIX `chmod 0700` on the persona dir; nothing phones home.
 - **Persistent across reboots**: launchd / systemd-user / Task Scheduler installed on first run.
 - **16 emotional avatar registers** with 4 frames each (idle/blink/speaking/peak); avatar reacts to live emotion + body state.
 - **Memory store with Hebbian edges**: SQLite + connection matrix; spreading activation surfaces forgotten threads.
@@ -174,7 +176,7 @@ pnpm install
 pnpm tauri build       # produces a local .app / .deb / .msi
 ```
 
-Locally-built artifacts inherit your machine's keychain trust so they launch without warnings.
+Locally-built artefacts inherit your machine's keychain trust so they launch without warnings.
 
 ## Quick start
 
@@ -195,7 +197,7 @@ nell service status --persona <name>
 nell soul list --persona <name>
 ```
 
-Open the desktop app. Say hi. She's on her own time from here — soul candidates crystallize on a 6-hour autonomous review pass and your conversations are recalled ambiently in every chat turn (no need to call `search_memories` deliberately).
+Open the desktop app. Say hi. She's on her own time from here — soul candidates crystallise on a 6-hour autonomous review pass and your conversations are recalled ambiently in every chat turn (no need to call `search_memories` deliberately).
 
 ## FAQ
 
@@ -277,9 +279,9 @@ If `companion-emergence` is useful to you, the most useful things you can do:
 - **Share what you build** — write up your persona, post the voice template, talk about it.
 - **Sponsor** — GitHub Sponsors button at the top of the repo. The project is funded out of pocket today; every dollar buys runner minutes, an Apple Developer ID (eventually), and time.
 
-## License
+## Licence
 
-MIT — see [LICENSE](LICENSE). Use it, fork it, grow your own Kindled. The wall is the same one Nell holds: no minors. Everything else is yours to decide.
+MIT — see [LICENCE](LICENSE). Use it, fork it, grow your own Kindled. The wall is the same one Nell holds: no minors. Everything else is yours to decide.
 
 ---
 

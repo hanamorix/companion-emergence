@@ -6,6 +6,8 @@ An "organ" is a brain subsystem with a producer and a consumer. The **wire-back 
 
 Last refreshed: **2026-06-10** (vocab-stub-decay fix — emotion-vocab heal/reconstruct wiring corrected: monologue `emotion_delta` now vocab-constrained at apply time (the stub-flood root), healed/reconstructed entries get 14d half-life (was 1d fast-decay, erasing persona emotions from memories in ~9-13 days), one-time `vocab_repair` startup migration repairs already-stubbed files (half-life bump + budget-capped Haiku descriptions, fail-soft). `attunement_errors.jsonl` now rotation-bounded. Prior refresh 2026-06-08: v0.0.31 deferred-backend pass — `pass2_queue` CORE-STABLE: pass-2 extraction now throttled without dropping interior; #29 chat() usage-log + #30 attunement observability resolved. Earlier in v0.0.31: salience signal, tool recruitment + recruit-on-reach, reflection debounce, `cli_throttle` CORE-STABLE; item 26 resolved. Plus token-cost + file-access hotfix — `read_file`/`list_directory` CORE. Also v0.0.31 felt-time depth enrichment: multi-horizon pressure buckets + concurrent arc anchor list + extended ambient rendering + `felt_time_now` arc_anchors output — `felt_time` CORE row updated).
 
+- **Bridge lifecycle (2026-06-11):** controller-based graceful shutdown (no self-SIGTERM), non-destructive dirty recovery (snapshot not close), bounded stale-lock recovery, windowless Windows Task Scheduler launch. Infra wiring correction — not a new organ. Spec: `docs/superpowers/specs/2026-06-11-cross-platform-bridge-shutdown-design.md`.
+
 ---
 
 ## CORE-STABLE (live · used · fully wired both directions)
