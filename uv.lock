@@ -130,7 +130,7 @@ wheels = [
 
 [[package]]
 name = "companion-emergence"
-version = "0.0.32"
+version = "0.0.33"
 source = { editable = "." }
 dependencies = [
     { name = "ddgs" },
