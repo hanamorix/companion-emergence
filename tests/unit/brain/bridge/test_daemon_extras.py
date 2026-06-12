@@ -1124,13 +1124,14 @@ def test_cmd_stop_returns_0_when_pid_already_dead(
     assert "bridge not running" in capsys.readouterr().out
 
 
-def test_cmd_stop_sends_sigterm_and_waits_for_pid_to_die(
+def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Monkeypatched lifecycle: pid_is_alive returns True initially, False after
-    SIGTERM. cmd_stop sends SIGTERM, polls, exits 0. No real subprocess spawned."""
+    """HTTP shutdown attempt fails (ConnectError), so cmd_stop falls back to
+    POSIX SIGTERM. pid_is_alive returns True initially, False after SIGTERM.
+    cmd_stop polls and exits 0. No real subprocess or network call made."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
@@ -1146,6 +1147,11 @@ def test_cmd_stop_sends_sigterm_and_waits_for_pid_to_die(
             shutdown_clean=False,
             client_origin="cli",
         ),
+    )
+
+    monkeypatch.setattr(
+        "brain.bridge.daemon.httpx.post",
+        lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")),
     )
 
     alive_state = {"alive": True}
