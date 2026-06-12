@@ -56,6 +56,12 @@ class MemoryActivationBaseline:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.row_factory = sqlite3.Row
+        # WAL + busy_timeout — mirror MemoryStore/HebbianMatrix. This DB is
+        # opened + written every heartbeat tick (~15 min) and can contend with
+        # the bridge's MemoryStore writer; WAL removes the reader/writer lock.
+        if ":memory:" not in str(self._db_path):
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_activation_baseline (
