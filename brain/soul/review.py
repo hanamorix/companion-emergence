@@ -44,6 +44,13 @@ DEFAULT_DEFER_COOLDOWN_HOURS = 24
 # Valid decision values the model may return
 VALID_DECISIONS = {"accept", "reject", "defer"}
 
+# Maximum number of defers before a candidate is retired as "expired".
+# After _MAX_DEFERS reviews the context hasn't improved — rather than
+# loop forever (24h-rate-limited but never resolving), the candidate is
+# honestly retired with a reason. A future richer candidate on the same
+# theme can re-queue independently.
+_MAX_DEFERS = 3
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -93,11 +100,14 @@ def _build_messages(
     soul_size: int,
     companion_name: str = "Nell",
     draft_fragments: list[str] | None = None,
+    source_moment: str | None = None,
 ) -> list[dict]:
     """Compose structured chat messages for one decision.
 
     Ported verbatim from OG nell_soul_select.py:_build_messages.
     These templates are load-bearing for Nell's voice — do not paraphrase.
+    Template gained the source-moment block (2026-06-12 context fix);
+    existing voice-bearing wording unchanged.
     """
     candidate_text = candidate.get("text", "")
     label = candidate.get("label", "?")
@@ -116,6 +126,10 @@ def _build_messages(
         draft_block = "\nRecent private fragments (thoughts you set aside, not sent):\n" + "\n".join(
             f"- {frag}" for frag in draft_fragments
         )
+
+    source_moment_block = ""
+    if source_moment:
+        source_moment_block = f"\nThe moment behind this candidate:\n  {source_moment}"
 
     system_msg = (
         f"You are {companion_name} deciding whether a moment becomes part of your permanent soul. "
@@ -143,6 +157,7 @@ def _build_messages(
     user_msg = (
         f"Candidate moment surfaced for review:\n"
         f"  text: {candidate_text}\n"
+        f"{source_moment_block}"
         f"  label: {label}  ·  importance: {importance}  ·  queued: {queued_at}\n"
         f"  source: {source}\n"
         f"{related_block}"
@@ -291,6 +306,27 @@ def _mark_candidate(record: dict, status: str, **extra: object) -> None:
 # ── Context gathering ─────────────────────────────────────────────────────────
 
 
+def _source_memory_snippet(store: MemoryStore, candidate: dict) -> str | None:
+    """Return up to 400 chars of the memory that generated this candidate.
+
+    Fail-soft: missing memory_id, missing memory, or store error all return None.
+    """
+    mid = str(candidate.get("memory_id") or "").strip()
+    if not mid:
+        return None
+    try:
+        mem = store.get(mid)
+    except Exception as exc:
+        logger.debug("_source_memory_snippet: store.get(%r) raised: %s", mid, exc)
+        return None
+    if mem is None:
+        return None
+    content = (mem.content or "").strip()
+    if not content:
+        return None
+    return content[:400]
+
+
 def _related_memory_snippets(
     store: MemoryStore,
     candidate_text: str,
@@ -404,9 +440,10 @@ def _apply_reject(candidate: dict, decision: Decision, dry_run: bool) -> None:
 
 
 def _apply_defer(candidate: dict, dry_run: bool) -> None:
-    """Leave candidate pending (auto_pending). Touch last_deferred_at."""
+    """Leave candidate pending (auto_pending). Increment defer_count and touch last_deferred_at."""
     if dry_run:
         return
+    candidate["defer_count"] = int(candidate.get("defer_count", 0) or 0) + 1
     candidate["last_deferred_at"] = datetime.now(UTC).isoformat()
 
 
@@ -585,7 +622,26 @@ def _review_pending_candidates_locked(
             record = records[idx]
             candidate_id = record.get("memory_id") or record.get("id") or f"idx-{idx}"
 
+            # Expiry short-circuit: candidates that have been deferred _MAX_DEFERS
+            # times have had repeated reviews with no improvement in context.
+            # Retire them honestly rather than burning LLM calls indefinitely.
+            if int(record.get("defer_count", 0) or 0) >= _MAX_DEFERS:
+                report.examined += 1
+                _mark_candidate(
+                    record,
+                    "expired",
+                    reason=f"insufficient context after {_MAX_DEFERS} reviews",
+                    expired_at=datetime.now(UTC).isoformat(),
+                )
+                logger.info(
+                    "soul review: candidate %s expired (defer_count >= %d)",
+                    candidate_id,
+                    _MAX_DEFERS,
+                )
+                continue
+
             related = _related_memory_snippets(store, record.get("text", ""))
+            source_moment = _source_memory_snippet(store, record)
             messages = _build_messages(
                 record,
                 related,
@@ -593,6 +649,7 @@ def _review_pending_candidates_locked(
                 soul_size,
                 companion_name=companion_name,
                 draft_fragments=draft_fragments,
+                source_moment=source_moment,
             )
 
             # Build flat prompt for provider.generate (text mode)
