@@ -577,6 +577,16 @@ export async function setPersonaPronouns(
       body: JSON.stringify({ preset }),
     }),
   );
+  if (r.status === 404) {
+    // Route absent = the running bridge predates the pronouns endpoint
+    // (a pre-update process that survived the app update — common on
+    // Windows where pre-v0.0.33 stop paths were broken).
+    throw new Error(
+      "setPersonaPronouns failed: 404 — the companion's brain is running an " +
+        "older version. Restart the bridge from the connection panel (or " +
+        "reboot) and try again.",
+    );
+  }
   if (!r.ok) throw new Error(`setPersonaPronouns failed: ${r.status}`);
 }
 
