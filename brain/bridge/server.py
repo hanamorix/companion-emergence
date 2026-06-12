@@ -465,6 +465,41 @@ def _close_session_blocking(
         )
 
 
+def _snapshot_session_blocking(
+    persona_dir: Path,
+    session_id: str,
+    provider: LLMProvider,
+) -> Any:
+    """Wrap brain.ingest.pipeline.extract_session_snapshot — blocks; called via asyncio.to_thread.
+
+    Non-destructive: the replay buffer is NOT deleted after extraction.
+    Uses a cursor sidecar to extract only turns added since the last snapshot.
+    Same per-call store pattern as _close_session_blocking.
+    """
+    from contextlib import ExitStack
+
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+        return extract_session_snapshot(
+            persona_dir,
+            session_id,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            embeddings=embeddings,
+        )
+
+
 async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 30.0) -> None:
     """Wait for all per-session in_flight locks to release, up to `timeout` seconds.
 
@@ -2159,6 +2194,52 @@ def build_app(
         if not ok:
             logger.error("manual restart could not request controller shutdown")
         return {"status": "shutting_down", "drain_seconds": 30}
+
+    # ── POST /sessions/snapshot — non-destructive ingest (preserves buffer) ──
+    @app.post("/sessions/snapshot", dependencies=[Depends(require_http_auth)])
+    async def sessions_snapshot(req: CloseReq) -> dict[str, Any]:
+        s: BridgeAppState = app.state.bridge
+        sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        async with lock:
+            try:
+                report = await asyncio.to_thread(
+                    _snapshot_session_blocking,
+                    s.persona_dir,
+                    req.session_id,
+                    s.provider,
+                )
+            except Exception as exc:
+                logger.exception("snapshot_session failed session=%s", req.session_id)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "snapshot_failed",
+                        "session_id": req.session_id,
+                        "closed": False,
+                        "errors": 1,
+                    },
+                ) from exc
+        events.publish(
+            "session_snapshot",
+            session_id=req.session_id,
+            committed=report.committed,
+            deduped=report.deduped,
+            soul_candidates=report.soul_candidates,
+            soul_queue_errors=report.soul_queue_errors,
+            errors=report.errors,
+        )
+        return {
+            "session_id": req.session_id,
+            "closed": False,
+            "committed": report.committed,
+            "deduped": report.deduped,
+            "soul_candidates": report.soul_candidates,
+            "soul_queue_errors": report.soul_queue_errors,
+            "errors": report.errors,
+        }
 
     # ── POST /sessions/close — explicit ingest trigger ─────────────────────
     @app.post("/sessions/close", dependencies=[Depends(require_http_auth)])
