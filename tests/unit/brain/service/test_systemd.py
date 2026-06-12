@@ -119,6 +119,7 @@ def test_build_systemd_unit_text_contains_required_sections(tmp_path: Path, monk
     ) in body
     # KeepAlive equivalent
     assert "Restart=on-failure" in body
+    assert "TimeoutStopSec=300\n" in body
     # Login-time start
     assert "WantedBy=default.target" in body
 

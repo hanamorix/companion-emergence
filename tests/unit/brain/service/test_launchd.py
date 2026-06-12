@@ -64,6 +64,7 @@ def test_build_launchd_plist_uses_foreground_supervisor_run(
     ]
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] == {"Crashed": True, "SuccessfulExit": False}
+    assert plist["ExitTimeOut"] == 300
     assert plist["EnvironmentVariables"] == {
         "PATH": "/custom/bin:/usr/bin:/bin",
         "KINDLED_HOME": str(data_home.resolve()),
