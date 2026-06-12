@@ -683,3 +683,147 @@ def test_soul_review_includes_recent_draft_block(tmp_path: Path) -> None:
     assert "Recent private fragments" in user_content
     assert "[d_reflection] An older thought." in user_content
     assert "[emotion_spike] A surge." in user_content
+
+
+# ── source-moment (F2) tests ──────────────────────────────────────────────────
+
+
+def test_build_messages_includes_source_moment_block() -> None:
+    """_build_messages with source_moment renders a 'The moment behind this candidate:' block."""
+    from brain.soul.review import _build_messages
+
+    candidate = {
+        "text": "she trusted silence",
+        "label": "trust",
+        "importance": 8,
+        "queued_at": "2026-06-12T00:00:00+00:00",
+        "source": "chat",
+    }
+    snippet = "she let the goodnight be ordinary"
+    messages = _build_messages(
+        candidate,
+        related=[],
+        emotional_summary="longing:7",
+        soul_size=3,
+        source_moment=snippet,
+    )
+    user_content = messages[1]["content"]
+    assert "The moment behind this candidate:" in user_content
+    assert snippet in user_content
+
+
+def test_build_messages_omits_block_without_source_moment() -> None:
+    """_build_messages with source_moment=None must NOT render the block."""
+    from brain.soul.review import _build_messages
+
+    candidate = {
+        "text": "she trusted silence",
+        "label": "trust",
+        "importance": 8,
+        "queued_at": "2026-06-12T00:00:00+00:00",
+        "source": "chat",
+    }
+    messages = _build_messages(
+        candidate,
+        related=[],
+        emotional_summary="longing:7",
+        soul_size=3,
+        source_moment=None,
+    )
+    user_content = messages[1]["content"]
+    assert "The moment behind this candidate" not in user_content
+
+
+def test_source_memory_snippet_fail_soft() -> None:
+    """_source_memory_snippet returns None gracefully for missing/error cases,
+    and the real content (capped at ≤400 chars) for a present memory."""
+    from brain.memory.store import Memory
+    from brain.soul.review import _source_memory_snippet
+
+    # (a) candidate without memory_id → None
+    assert _source_memory_snippet(_make_memory_store(), {}) is None
+
+    # (b) memory_id not in store → None
+    store_b = MemoryStore(":memory:")
+    assert _source_memory_snippet(store_b, {"memory_id": "nonexistent-id"}) is None
+    store_b.close()
+
+    # (c) store raising → None (no exception propagated)
+    class _BadStore:
+        def get(self, mid: str):
+            raise RuntimeError("simulated store error")
+
+    assert _source_memory_snippet(_BadStore(), {"memory_id": "any"}) is None  # type: ignore[arg-type]
+
+    # (d) present memory with long content → returned, capped at ≤400 chars
+    store_d = MemoryStore(":memory:")
+    long_content = "x" * 600
+    mem = Memory.create_new(
+        content=long_content,
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    store_d.create(mem)
+    result = _source_memory_snippet(store_d, {"memory_id": mem.id})
+    assert result is not None
+    assert len(result) <= 400
+    store_d.close()
+
+
+def test_review_prompt_carries_source_moment_through_loop(tmp_path: Path) -> None:
+    """The review loop passes the candidate's source memory content into the prompt."""
+    from brain.memory.store import Memory
+
+    store = MemoryStore(":memory:")
+    soul_store = _make_soul_store()
+
+    distinctive = "the lamp was still on when she fell asleep"
+    mem = Memory.create_new(
+        content=distinctive,
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    store.create(mem)
+
+    captured_prompts: list[str] = []
+
+    class _CapturingProvider(LLMProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            captured_prompts.append(prompt)
+            return json.dumps({
+                "decision": "defer",
+                "love_type": "craft",
+                "resonance": 5,
+                "confidence": 3,
+                "reasoning": "not sure",
+                "why_it_matters": "",
+            })
+
+        def name(self) -> str:
+            return "capturing-source-fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            raise NotImplementedError
+
+    candidate = _make_candidate("a moment to review")
+    candidate["memory_id"] = mem.id
+    _write_candidates(tmp_path, [candidate])
+
+    review_pending_candidates(
+        tmp_path,
+        store=store,
+        soul_store=soul_store,
+        provider=_CapturingProvider(),
+    )
+
+    store.close()
+    soul_store.close()
+
+    assert captured_prompts, "provider.generate was never called"
+    assert distinctive in captured_prompts[0], (
+        f"source memory content not found in prompt: {captured_prompts[0][:400]!r}"
+    )
