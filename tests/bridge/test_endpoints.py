@@ -946,3 +946,14 @@ def test_sessions_snapshot_preserves_buffer(persona_dir: Path, monkeypatch):
         assert body["session_id"] == sid
         assert body["closed"] is False
         assert buffer_path.exists(), "snapshot must preserve replay buffer"
+
+
+def test_health_reports_brain_version(persona_dir: Path):
+    """The version handshake (spec 2026-06-12) — frontend compares this
+    against the app version to detect a stale pre-update bridge."""
+    import brain
+
+    with _make_client(persona_dir) as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["version"] == brain.__version__

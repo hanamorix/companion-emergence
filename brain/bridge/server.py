@@ -45,6 +45,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from brain import __version__ as _brain_version
 from brain.bridge import events
 from brain.bridge.chat import (
     ChatMessage,
@@ -1087,6 +1088,7 @@ def build_app(
 
         return {
             "liveness": "ok",
+            "version": _brain_version,
             "persona": s.persona,
             "uptime_s": int(uptime),
             "pid": os.getpid(),
