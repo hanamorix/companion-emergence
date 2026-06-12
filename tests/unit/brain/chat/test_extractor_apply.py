@@ -387,3 +387,118 @@ def test_extractor_prompt_asks_for_grounded_evidence():
         f"_SYSTEM_PROMPT should ask for '1-2 grounded sentences' in the crystallisation "
         f"evidence field; current prompt:\n{_SYSTEM_PROMPT}"
     )
+
+
+# ---------------------------------------------------------------------------
+# B5 — extractor-scored importance gates queueing
+# ---------------------------------------------------------------------------
+
+
+def test_crystallisation_importance_below_threshold_not_queued(persona_dir: Path):
+    """importance=6 < DEFAULT_SOUL_THRESHOLD(8) → candidate NOT queued."""
+    out = ExtractorOutput(
+        crystallisation=[
+            CrystallisationCandidate(
+                theme="weak theme",
+                evidence="not very formative, just a passing thought",
+                importance=6,
+            )
+        ]
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    assert not candidates_path.exists(), (
+        "soul_candidates.jsonl must NOT be written for importance < DEFAULT_SOUL_THRESHOLD"
+    )
+
+
+def test_crystallisation_importance_at_threshold_is_queued(persona_dir: Path):
+    """importance=8 == DEFAULT_SOUL_THRESHOLD → candidate IS queued."""
+    out = ExtractorOutput(
+        crystallisation=[
+            CrystallisationCandidate(
+                theme="at threshold theme",
+                evidence="this moment matters and should be queued",
+                importance=8,
+            )
+        ]
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    assert candidates_path.exists(), "soul_candidates.jsonl must exist for importance == 8"
+    entry = json.loads(candidates_path.read_text().splitlines()[0])
+    assert entry.get("status") == "auto_pending"
+    assert "at threshold theme" in entry.get("text", "")
+
+
+# ---------------------------------------------------------------------------
+# B4 — dedup by theme
+# ---------------------------------------------------------------------------
+
+
+def test_crystallisation_within_batch_dedup_same_theme(persona_dir: Path):
+    """Two candidates with identical theme in one apply call → only ONE queued."""
+    out = ExtractorOutput(
+        crystallisation=[
+            CrystallisationCandidate(
+                theme="Recurring solitude",
+                evidence="first moment — she sat alone again",
+                importance=9,
+            ),
+            CrystallisationCandidate(
+                theme="Recurring solitude",
+                evidence="second moment — still alone, different night",
+                importance=9,
+            ),
+        ]
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    assert candidates_path.exists()
+    lines = candidates_path.read_text().strip().splitlines()
+    assert len(lines) == 1, (
+        f"Expected 1 queued candidate (dedup), got {len(lines)}: {lines}"
+    )
+
+
+def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path):
+    """A candidate whose theme matches a *rejected* record must still be queued.
+
+    Only auto_pending status blocks re-queueing; terminal statuses (rejected,
+    accepted, expired) are cleared — the theme may be worth revisiting.
+    """
+    # Pre-populate soul_candidates.jsonl with a rejected record for the same theme.
+    rejected_record = {
+        "memory_id": "mem-old-001",
+        "text": "Recurring solitude — an older moment, now rejected",
+        "label": "observation",
+        "importance": 8,
+        "session_id": "monologue",
+        "queued_at": "2026-06-01T10:00:00+00:00",
+        "status": "rejected",
+    }
+    candidates_path = persona_dir / "soul_candidates.jsonl"
+    candidates_path.write_text(json.dumps(rejected_record) + "\n", encoding="utf-8")
+
+    out = ExtractorOutput(
+        crystallisation=[
+            CrystallisationCandidate(
+                theme="Recurring solitude",
+                evidence="fresh moment — a new instance of solitude worth reviewing",
+                importance=9,
+            )
+        ]
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    lines = candidates_path.read_text().strip().splitlines()
+    # Original rejected + 1 new auto_pending = 2 lines total
+    assert len(lines) == 2, (
+        f"Expected 2 lines (rejected + new auto_pending), got {len(lines)}: {lines}"
+    )
+    new_entry = json.loads(lines[1])
+    assert new_entry.get("status") == "auto_pending"
+    assert "fresh moment" in new_entry.get("text", "")
