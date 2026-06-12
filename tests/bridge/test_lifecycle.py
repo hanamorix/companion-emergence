@@ -151,8 +151,9 @@ def test_check_idle_predicate(persona_dir: Path):
     assert _check_idle(s, idle_shutdown_seconds=1) is False  # too fresh
 
 
-def test_dirty_shutdown_drains_orphan_buffers(persona_dir: Path, monkeypatch):
-    """Pre-write a stale bridge.json + a session buffer; recovery should drain it."""
+def test_dirty_shutdown_snapshots_orphan_buffers_without_deleting(persona_dir: Path, monkeypatch):
+    """Pre-write a stale bridge.json + a session buffer; recovery should snapshot
+    (non-destructive) not drain (destructive).  Buffer must survive on disk."""
     from brain.bridge import daemon, state_file
     from brain.ingest.buffer import ingest_turn
 
@@ -168,18 +169,78 @@ def test_dirty_shutdown_drains_orphan_buffers(persona_dir: Path, monkeypatch):
     state_file.write(persona_dir, s)
 
     ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "user", "text": "hi"})
-    ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "assistant", "text": "hello"})
+    buffer_path = persona_dir / "active_conversations" / "orphan.jsonl"
+    assert buffer_path.exists()
 
-    drained_sessions: list = []
+    snapshotted: list = []
 
-    def fake_drain(persona_dir, **kw):
-        drained_sessions.append(kw.get("silence_minutes"))
+    def fake_snapshot(persona_dir, **kw):
+        snapshotted.append(kw.get("silence_minutes"))
         return []
 
-    monkeypatch.setattr("brain.bridge.daemon.close_stale_sessions", fake_drain)
+    monkeypatch.setattr("brain.bridge.daemon.snapshot_stale_sessions", fake_snapshot)
 
-    daemon.run_recovery_if_needed(persona_dir)
-    assert 0 in drained_sessions or 0.0 in drained_sessions
+    recovered = daemon.run_recovery_if_needed(persona_dir)
+
+    assert recovered == 0
+    assert 0 in snapshotted or 0.0 in snapshotted
+    assert buffer_path.exists()
+
+
+def test_dirty_recovery_real_snapshot_preserves_buffer_and_commits(persona_dir: Path, monkeypatch):
+    """End-to-end dirty recovery: real snapshot_stale_sessions, no mocking of it.
+
+    Buffer must survive on disk AND a memory must commit — non-destructive THROUGH
+    the real pipeline."""
+    import json
+
+    from brain.bridge import daemon, state_file
+    from brain.bridge.chat import ChatResponse
+    from brain.ingest.buffer import ingest_turn
+    from brain.memory.store import MemoryStore
+
+    # Patch the provider seam used by run_recovery_if_needed (brain.bridge.daemon.get_provider)
+    class _FakeProvider:
+        def name(self):
+            return "fake"
+
+        def chat(self, messages, *, tools=None, options=None):
+            return ChatResponse(content="recovered memory", tool_calls=[])
+
+        def generate(self, prompt, *, system=None):
+            return json.dumps([
+                {"text": "User has a dog named Loopy", "label": "fact", "importance": 7, "emotions": {}}
+            ])
+
+    monkeypatch.setattr("brain.bridge.daemon.get_provider", lambda _name, **_kw: _FakeProvider())
+
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona=persona_dir.name,
+            pid=999_999,
+            port=51234,
+            started_at="2026-04-28T10:00:00Z",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="cli",
+        ),
+    )
+    ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "user", "text": "remember my dog Loopy"})
+    ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "assistant", "text": "I will remember Loopy"})
+    buffer_path = persona_dir / "active_conversations" / "orphan.jsonl"
+    assert buffer_path.exists()
+
+    recovered = daemon.run_recovery_if_needed(persona_dir)
+
+    assert recovered == 1
+    assert buffer_path.exists(), "recovery must not delete the replay buffer"
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        rows = store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()
+        assert rows[0] >= 1
+    finally:
+        store.close()
 
 
 def test_clean_shutdown_skips_recovery(persona_dir: Path, monkeypatch):
@@ -198,7 +259,7 @@ def test_clean_shutdown_skips_recovery(persona_dir: Path, monkeypatch):
 
     called: list = []
     monkeypatch.setattr(
-        "brain.bridge.daemon.close_stale_sessions",
+        "brain.bridge.daemon.snapshot_stale_sessions",
         lambda persona_dir, **kw: called.append(kw.get("silence_minutes")) or [],
     )
 
@@ -228,14 +289,14 @@ def test_clean_shutdown_with_drain_errors_triggers_recovery(persona_dir: Path, m
 
     ingest_turn(persona_dir, {"session_id": "orphan", "speaker": "user", "text": "hi"})
 
-    drained_sessions: list = []
+    snapshotted_sessions: list = []
     monkeypatch.setattr(
-        "brain.bridge.daemon.close_stale_sessions",
-        lambda persona_dir, **kw: drained_sessions.append(kw.get("silence_minutes")) or [],
+        "brain.bridge.daemon.snapshot_stale_sessions",
+        lambda persona_dir, **kw: snapshotted_sessions.append(kw.get("silence_minutes")) or [],
     )
 
     daemon.run_recovery_if_needed(persona_dir)
-    assert drained_sessions, "recovery must fire for drain_errors > 0"
+    assert snapshotted_sessions, "recovery must fire for drain_errors > 0"
 
 
 def test_recovery_needed_predicate_drain_errors_arm(tmp_path: Path):

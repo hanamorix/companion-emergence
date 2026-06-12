@@ -10,8 +10,8 @@ Public surface used by CLI handlers in brain.cli:
   cmd_tail_log(args) -> int
 
 Internal:
-  run_recovery_if_needed(persona_dir) — drain orphan buffers if previous bridge
-    exited dirty.
+  run_recovery_if_needed(persona_dir) — snapshot orphan buffers (non-destructive)
+    if previous bridge exited dirty.
   spawn_detached(persona_dir, idle_shutdown_seconds, client_origin, log_path) -> pid
 """
 
@@ -32,7 +32,7 @@ import httpx
 
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
-from brain.ingest.pipeline import close_stale_sessions
+from brain.ingest.pipeline import snapshot_stale_sessions
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -64,7 +64,7 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
     config = PersonaConfig.load(persona_dir / "persona_config.json")
     provider = get_provider(config.provider, persona_dir=persona_dir)
     try:
-        reports = close_stale_sessions(
+        reports = snapshot_stale_sessions(
             persona_dir,
             silence_minutes=0,
             store=store,
@@ -209,7 +209,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         drained = run_recovery_if_needed(persona_dir)
         if drained is not None:
             if drained > 0:
-                print(f"recovered from dirty shutdown — drained {drained} orphan sessions")
+                print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
             else:
                 print("recovered from dirty shutdown (no orphan sessions to drain)")
 
@@ -292,7 +292,7 @@ def cmd_run(args) -> int:
         drained = run_recovery_if_needed(persona_dir)
         if drained is not None:
             if drained > 0:
-                print(f"recovered from dirty shutdown — drained {drained} orphan sessions")
+                print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
             else:
                 print("recovered from dirty shutdown (no orphan sessions to drain)")
 
