@@ -299,6 +299,22 @@ describe("setPersonaPronouns", () => {
     expect((init!.method)?.toUpperCase()).toBe("POST");
     expect(init!.body).toContain("he/him");
   });
+
+  it("names the stale-bridge cause on 404 (route absent = pre-update bridge)", async () => {
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", spy);
+    await expect(setPersonaPronouns("alice", "he/him")).rejects.toThrow(
+      /older version.*restart/i,
+    );
+  });
+
+  it("keeps the plain status message for non-404 failures", async () => {
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 500 }));
+    vi.stubGlobal("fetch", spy);
+    await expect(setPersonaPronouns("alice", "he/him")).rejects.toThrow(
+      "setPersonaPronouns failed: 500",
+    );
+  });
 });
 
 describe("acceptVoiceEdit / rejectVoiceEdit", () => {
