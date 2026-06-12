@@ -16,7 +16,9 @@ def test_run_initiate_review_tick_passes_user_presence(tmp_path: Path) -> None:
     )
     captured: list = []
 
-    def _fake_run(persona_dir, *, provider, voice_template, cap_per_tick=3, user_presence=None):
+    def _fake_run(
+        persona_dir, *, provider, voice_template, cap_per_tick=3, user_presence=None, is_rest_state=False
+    ):
         captured.append(user_presence)
 
     with (
