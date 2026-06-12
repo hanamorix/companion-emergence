@@ -1523,6 +1523,53 @@ def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
     assert "shutdown endpoint unreachable" in capsys.readouterr().err
 
 
+def test_acquire_lock_recovers_old_garbage_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    lock_path.write_text("not-a-pid", encoding="utf-8")
+    old = time.time() - 600
+    os.utime(lock_path, (old, old))
+
+    fd = daemon.acquire_lock(persona_dir)
+
+    assert fd is not None
+    assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
+    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
+    assert stale_files, "old corrupt lock should be preserved as stale evidence"
+    daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_blocks_recent_garbage_lockfile(tmp_path: Path) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    lock_path.write_text("not-a-pid", encoding="utf-8")
+
+    assert daemon.acquire_lock(persona_dir) is None
+    assert lock_path.read_text(encoding="utf-8") == "not-a-pid"
+
+
+def test_acquire_lock_recovers_old_alive_pid_when_bridge_health_is_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    lock_path.write_text("12345", encoding="utf-8")
+    old = time.time() - 600
+    os.utime(lock_path, (old, old))
+
+    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon, "_recorded_bridge_health", lambda _persona_dir: False)
+
+    fd = daemon.acquire_lock(persona_dir)
+
+    assert fd is not None
+    daemon.release_lock(persona_dir, fd)
+
+
 def test_cmd_stop_on_windows_with_force_terminates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -42,6 +42,47 @@ logger = logging.getLogger(__name__)
 
 LOCKFILE = "bridge.json.lock"
 
+_LOCK_STALE_SECONDS = 120.0
+# Known UX edge (accepted): a crash followed by a relaunch within
+# _LOCK_STALE_SECONDS of the lock's mtime blocks startup until the window
+# passes. Single-user desktop app — acceptable; documented here.
+
+
+def _lock_age_seconds(path: Path) -> float:
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _archive_stale_lock(path: Path) -> None:
+    """Rename a stale lock to a timestamped .stale-* sibling as evidence —
+    never silently delete it."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    target = path.with_name(f"{path.name}.stale-{stamp}")
+    try:
+        path.replace(target)
+    except FileNotFoundError:
+        return
+
+
+def _recorded_bridge_health(persona_dir: Path) -> bool:
+    """True iff the recorded bridge port answers /health 200.
+
+    Safe against PID/port reuse BECAUSE /health requires bearer auth
+    (server.py — Depends(require_http_auth)): a stray process squatting the
+    recorded port fails the token check → non-200 → lock recovers. If /health
+    auth is ever relaxed, this recovery path silently breaks."""
+    s = state_file.read(persona_dir)
+    if s is None or s.port is None:
+        return False
+    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+    try:
+        r = httpx.get(f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=0.5)
+        return r.status_code == 200
+    except httpx.HTTPError:
+        return False
+
 
 def run_recovery_if_needed(persona_dir: Path) -> int | None:
     """If previous bridge exited dirty, drain orphan buffers.
@@ -87,19 +128,36 @@ def acquire_lock(persona_dir: Path) -> int | None:
         os.write(fd, str(os.getpid()).encode())
         return fd
     except FileExistsError:
+        age = _lock_age_seconds(path)
         try:
             existing_text = path.read_text().strip()
             existing_pid = int(existing_text)
             if not state_file.pid_is_alive(existing_pid):
-                # Avoid unlinking a newly-created lock if another starter won
-                # the race after our first read.
+                # Double-read guard: best-effort, NOT atomic (TOCTOU race between
+                # read and replace). Acceptable for a single-user desktop app; the
+                # stale lock is archived as evidence, never silently deleted.
                 if path.read_text().strip() != existing_text:
                     return None
-                path.unlink()
+                _archive_stale_lock(path)
+                return acquire_lock(persona_dir)
+            if age > _LOCK_STALE_SECONDS and not _recorded_bridge_health(persona_dir):
+                logger.warning(
+                    "recovering stale bridge lockfile with alive pid but dead health pid=%s age=%.1fs",
+                    existing_pid,
+                    age,
+                )
+                if path.read_text().strip() != existing_text:
+                    return None
+                _archive_stale_lock(path)
                 return acquire_lock(persona_dir)
         except FileNotFoundError:
             return acquire_lock(persona_dir)
-        except (ValueError, OSError):
+        except ValueError:
+            if age > _LOCK_STALE_SECONDS:
+                logger.warning("recovering stale corrupt bridge lockfile age=%.1fs", age)
+                _archive_stale_lock(path)
+                return acquire_lock(persona_dir)
+        except OSError:
             pass
         return None
 
