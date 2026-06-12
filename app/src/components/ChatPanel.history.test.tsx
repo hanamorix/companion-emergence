@@ -16,7 +16,7 @@ vi.mock("../bridge", () => ({
   newSession: vi.fn(async () => "fresh-session"),
   fetchActiveSession: vi.fn(async () => null),
   fetchChatHistory: vi.fn(async () => ({ messages: [], next_before_turn: null })),
-  closeSession: vi.fn(async () => undefined),
+  snapshotSession: vi.fn(async () => ({ closed: false, errors: 0 })),
   uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
   getBridgeCredentials: vi.fn(async () => ({
     url: "http://127.0.0.1:50000",
