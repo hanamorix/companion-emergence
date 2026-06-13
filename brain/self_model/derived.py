@@ -16,7 +16,7 @@ The recency-weighted mean is the primary signal.
 Low-arousal nudge (low energy OR high exhaustion):
   Applied when body_energy <= 3 OR body_exhaustion >= 7.
   Channels nudged UP (by _BODY_NUDGE_AMOUNT):
-    "calm", "grief", "loneliness", "rest_need", "comfort_seeking"
+    "grief", "loneliness", "rest_need", "comfort_seeking"
 
 High-arousal nudge (high energy AND low exhaustion):
   Applied when body_energy >= 8 AND body_exhaustion <= 3.
@@ -70,7 +70,7 @@ _LOW_EXHAUSTION_THRESH: int = 3
 
 # Channel sets for body nudges (registered-only filtering applied at runtime)
 _LOW_AROUSAL_CHANNELS: frozenset[str] = frozenset(
-    {"calm", "grief", "loneliness", "rest_need", "comfort_seeking"}
+    {"grief", "loneliness", "rest_need", "comfort_seeking"}
 )
 _HIGH_AROUSAL_CHANNELS: frozenset[str] = frozenset(
     {"joy", "desire", "curiosity", "arousal"}

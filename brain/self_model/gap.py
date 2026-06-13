@@ -32,7 +32,7 @@ Gap dataclass fields per spec §4:
   magnitude          — sum of absolute deltas
   unnamed_pressure   — passed through from DerivedRead
   note               — optional Haiku-articulated note (None until Task 4)
-  status             — "open" | "resolved" | "dismissed"
+  status             — "open" | "acknowledged" | "dismissed" | "resolved"
   first_seen_ts      — ISO-8601 UTC string, set by the caller / cadence layer
   last_seen_ts       — ISO-8601 UTC string, set by the caller / cadence layer
   sustained_ticks    — integer count, incremented by the cadence layer
@@ -63,7 +63,7 @@ class Gap:
             known channel. Carried through unchanged from the derived read.
         note: optional human-readable articulation from the Haiku articulate layer
             (Task 4). None until articulated.
-        status: lifecycle marker — "open" | "resolved" | "dismissed".
+        status: lifecycle marker — "open" | "acknowledged" | "dismissed" | "resolved".
         first_seen_ts: ISO-8601 UTC timestamp set when the gap is first persisted.
         last_seen_ts: ISO-8601 UTC timestamp updated on each cadence tick.
         sustained_ticks: number of consecutive cadence ticks this gap has been open.
