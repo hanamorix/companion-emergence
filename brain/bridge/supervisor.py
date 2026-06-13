@@ -95,6 +95,7 @@ from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
 from brain.self_model import cadence as self_model_cadence
+from brain.self_model import reconcile as sm_reconcile
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
 from brain.self_model.derived import compute_derived
@@ -976,6 +977,30 @@ def _self_model_reflect(
     state, _recovered = self_model_state.load_or_recover(persona_dir)
     prior_gap = state.current_gap
 
+    # ── 4a: R-B2 anti-oscillation — honour the reconcile cooldown (live) ─────
+    # Drop any channel the prior gap put in cooldown (REGARDLESS of prior
+    # status — the reconcile tool leaves prior acknowledged/dismissed) and
+    # recompute magnitude, so a freshly-reconciled channel doesn't re-surface
+    # within its window. Carry the non-expired cooldowns forward so they
+    # survive this recompute and the status flip. Fail-soft.
+    carried_cooldowns: dict[str, str] = {}
+    if prior_gap is not None and prior_gap.channel_cooldowns:
+        try:
+            kept_channels: dict[str, float] = {}
+            for ch, delta in new_gap.per_channel.items():
+                if sm_reconcile.is_channel_in_cooldown(prior_gap, ch, now=now):
+                    continue
+                kept_channels[ch] = delta
+            new_gap.per_channel = kept_channels
+            new_gap.magnitude = sum(abs(v) for v in kept_channels.values())
+            # Keep only cooldowns that have not yet expired.
+            for ch, expiry in prior_gap.channel_cooldowns.items():
+                if sm_reconcile.is_channel_in_cooldown(prior_gap, ch, now=now):
+                    carried_cooldowns[ch] = expiry
+        except Exception:  # noqa: BLE001 — never let cooldown bookkeeping crash the tick
+            logger.exception("self_model: channel-cooldown filtering failed; ignoring")
+            carried_cooldowns = {}
+
     gap_active = new_gap.magnitude > 0.0 or new_gap.unnamed_pressure > 0.0
     if gap_active:
         # Carry sustained_ticks forward when this gap continues the prior one
@@ -996,9 +1021,12 @@ def _self_model_reflect(
         )
         new_gap.last_seen_ts = now.isoformat()
         new_gap.status = "open"
-        # Preserve any cooldowns the reconcile tool set on the prior gap.
+        # Preserve any cooldowns: those the reconcile tool set on the prior gap
+        # (carried_cooldowns, kept across status flips) plus the same-channel
+        # carry-forward when this is a continuation of an open prior gap.
+        new_gap.channel_cooldowns = dict(carried_cooldowns)
         if same_channels and prior_gap:
-            new_gap.channel_cooldowns = dict(prior_gap.channel_cooldowns)
+            new_gap.channel_cooldowns.update(prior_gap.channel_cooldowns)
         increment_gaps_surfaced(persona_dir)
 
         # ── 5: articulate above threshold (fail-soft inside) ─────────────────

@@ -179,3 +179,159 @@ def test_self_model_tick_fail_isolated_on_articulate_error(tmp_path: Path) -> No
     advanced = sm_cadence.load(persona_dir)
     assert advanced.next_reflection_at is not None
     assert advanced.consecutive_failures >= 1
+
+
+# ── Organ-DoD live-path resolution test (Fix C1) ──────────────────────────────
+
+
+def _capture_feed_events():
+    """Set a capturing feed publisher; return (events_list, teardown_fn)."""
+    from brain.bridge import events as ev
+
+    captured: list[dict] = []
+    ev.set_publisher(captured.append)
+    return captured, lambda: ev.set_publisher(None)
+
+
+def _clear_emotion_memories(persona_dir: Path) -> None:
+    """Deactivate every emotion-bearing memory so declared/derived re-match.
+
+    After this the self-model gap collapses to magnitude 0 (natural
+    reconvergence — no reconcile tool call).
+    """
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        store._conn.execute("UPDATE memories SET active = 0")  # noqa: SLF001
+        store._conn.commit()
+    finally:
+        store.close()
+
+
+def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
+    tmp_path: Path,
+) -> None:
+    """Organ DoD (C1): a gap that genuinely sustains across REAL reflection ticks
+    and then resolves emits a soul candidate + a feed event — on BOTH paths.
+
+    Drives the REAL ``_self_model_reflect`` body, persisting state between calls
+    so sustained_ticks accumulate through the real path (not hand-constructed).
+    """
+    from datetime import timedelta
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.ingest.soul_queue import list_soul_candidates
+    from brain.self_model import state as sm_state
+    from brain.self_model.reconcile import reconcile_self_read
+    from brain.self_model.resolve import _SUSTAINED_TICKS
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+
+    def _tick(persona_dir: Path, now: datetime) -> None:
+        _self_model_reflect(
+            persona_dir, provider=provider, event_bus=_CapturingBus(), now=now
+        )
+
+    # ── PATH A — reconcile ───────────────────────────────────────────────────
+    pa = _persona_dir(tmp_path)
+    _seed_divergent_memories(pa)
+
+    # Sustain the gap over enough real ticks to cross _SUSTAINED_TICKS.
+    for i in range(_SUSTAINED_TICKS + 1):
+        _tick(pa, base + timedelta(hours=6 * i))
+
+    sustained = sm_state.load_or_recover(pa)[0].current_gap
+    assert sustained is not None and sustained.status == "open"
+    assert sustained.sustained_ticks >= _SUSTAINED_TICKS, (
+        "the gap must genuinely sustain through the real ticks"
+    )
+
+    # She reconciles — the tool flips the persisted current_gap to acknowledged.
+    reconcile_self_read(persona_dir=pa, action="dismiss", channel="joy")
+
+    events_a, teardown_a = _capture_feed_events()
+    try:
+        # One more REAL tick: prior (acknowledged + sustained) must resolve.
+        _tick(pa, base + timedelta(hours=6 * (_SUSTAINED_TICKS + 1)))
+    finally:
+        teardown_a()
+
+    cands_a = list_soul_candidates(pa)
+    assert len(cands_a) == 1, "reconcile path must queue a soul candidate via the live tick"
+    resolved_evt_a = [e for e in events_a if e.get("type") == "self_model_gap_resolved"]
+    assert len(resolved_evt_a) == 1
+    assert resolved_evt_a[0].get("resolution_path") == "reconcile"
+
+    # ── PATH B — natural reconvergence ───────────────────────────────────────
+    pb_root = tmp_path / "b"
+    pb_root.mkdir()
+    pb = _persona_dir(pb_root)
+    _seed_divergent_memories(pb)
+
+    for i in range(_SUSTAINED_TICKS + 1):
+        _tick(pb, base + timedelta(hours=6 * i))
+
+    sustained_b = sm_state.load_or_recover(pb)[0].current_gap
+    assert sustained_b is not None and sustained_b.sustained_ticks >= _SUSTAINED_TICKS
+
+    # Memories re-match (declared == derived → magnitude collapses to 0). No tool.
+    _clear_emotion_memories(pb)
+
+    events_b, teardown_b = _capture_feed_events()
+    try:
+        _tick(pb, base + timedelta(hours=6 * (_SUSTAINED_TICKS + 1)))
+    finally:
+        teardown_b()
+
+    cands_b = list_soul_candidates(pb)
+    assert len(cands_b) == 1, "natural path must queue a soul candidate via the live tick"
+    resolved_evt_b = [e for e in events_b if e.get("type") == "self_model_gap_resolved"]
+    assert len(resolved_evt_b) == 1
+    assert resolved_evt_b[0].get("resolution_path") == "natural"
+
+
+# ── R-B2 live cooldown test (Fix C3) ──────────────────────────────────────────
+
+
+def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path) -> None:
+    """C3 (R-B2): after a reconcile sets a cooldown on a channel, the NEXT live
+    reflection tick drops that channel from the surfaced gap and carries the
+    (non-expired) cooldown forward so it survives the recompute.
+    """
+    from datetime import timedelta
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.self_model import state as sm_state
+    from brain.self_model.reconcile import is_channel_in_cooldown, reconcile_self_read
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir)
+
+    # Tick once → a gap surfaces on joy (and grief).
+    _self_model_reflect(
+        persona_dir, provider=provider, event_bus=_CapturingBus(), now=base
+    )
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None and "joy" in gap.per_channel
+
+    # She reconciles joy → cooldown set on joy.
+    reconcile_self_read(persona_dir=persona_dir, action="accept", channel="joy", delta=0.1)
+    gap_after = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert is_channel_in_cooldown(gap_after, "joy", now=base) is True
+
+    # Next live tick, still inside the cooldown window: joy must be suppressed
+    # from the surfaced gap, and the cooldown carried forward.
+    _self_model_reflect(
+        persona_dir, provider=provider, event_bus=_CapturingBus(), now=base + timedelta(hours=6)
+    )
+    new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert new_gap is not None
+    assert "joy" not in new_gap.per_channel, "joy is in cooldown → must not re-surface"
+    assert is_channel_in_cooldown(new_gap, "joy", now=base + timedelta(hours=6)) is True, (
+        "non-expired cooldown must survive the recompute / status flip"
+    )

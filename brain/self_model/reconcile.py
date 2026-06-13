@@ -165,6 +165,8 @@ def reconcile_self_read(
     Always fail-soft: a malformed call returns an ``{"error": ...}`` dict rather
     than raising into the chat turn.
     """
+    from brain.self_model.resolve import increment_reconciles
+
     now = _utcnow()
     state, _recovered = load_or_recover(persona_dir)
     gap = state.current_gap
@@ -178,6 +180,9 @@ def reconcile_self_read(
             gap.channel_cooldowns = {**(gap.channel_cooldowns or {}), channel: _cooldown_until(now)}
             gap.last_seen_ts = _iso(now)
             save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+        # Dead-loop observability (R-E4): record a successful reconcile so the
+        # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
+        increment_reconciles(persona_dir)
         return {"ok": True, "action": action, "channel": channel, "delta_written": wrote}
 
     if action == "dismiss":
@@ -190,6 +195,7 @@ def reconcile_self_read(
                 }
             gap.last_seen_ts = _iso(now)
             save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+        increment_reconciles(persona_dir)
         return {"ok": True, "action": "dismiss", "channel": channel}
 
     if action == "name":
@@ -197,9 +203,14 @@ def reconcile_self_read(
             return {"error": "name requires a non-empty 'name'"}
         candidate = _propose_vocabulary_candidate(persona_dir)
         if gap is not None:
-            gap.status = "acknowledged"
+            # ``name`` resolves *unnamed pressure*. Only mark the gap acknowledged
+            # if it actually carried unnamed pressure — a pure channel divergence
+            # is not what ``name`` addressed, so leave its status untouched.
+            if gap.unnamed_pressure > 0.0:
+                gap.status = "acknowledged"
             gap.last_seen_ts = _iso(now)
             save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+        increment_reconciles(persona_dir)
         return {"ok": True, "action": "name", "name": name, **candidate}
 
     return {"error": f"unknown action: {action!r}"}
