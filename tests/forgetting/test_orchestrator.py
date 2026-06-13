@@ -27,7 +27,7 @@ def persona_with_low_salience_memory(tmp_path):
         emotions={},
     )
     # Make it old enough to escape the recent-buffer exemption.
-    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=10))
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
     store.create(m)
     store.close()
     return tmp_path, m.id
@@ -59,6 +59,39 @@ def test_run_pass_exempts_recent_buffer(tmp_path):
     summary = run_pass(tmp_path, event_bus=event_bus)
     assert summary["faded"] == 0
     assert summary["exempt"] >= 1
+
+
+def test_run_pass_exempts_recent_factual_memory_within_grace(tmp_path):
+    """Part A through-pass: the exact user report — a memory from a few days
+    ago, no emotion/recall/soul, must stay ACTIVE under the 30-day grace.
+
+    RED before Part A: 5 wall-days (120h) exceeds the old 24h grace, so this
+    memory fades. GREEN after: 120h < 720h → exempt, stays active.
+    """
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"), tmp_path
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="we talked about the dog's name a few days ago",
+        memory_type="episodic",
+        domain="chat",
+        emotions={},
+    )
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=5))
+    store.create(m)
+    store.close()
+
+    summary = run_pass(tmp_path, event_bus=MagicMock())
+    assert summary["faded"] == 0
+    assert summary["exempt"] >= 1
+
+    store = MemoryStore(tmp_path / "memories.db")
+    row = store._conn.execute(
+        "SELECT state FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["state"] == "active"
+    store.close()
 
 
 def test_run_pass_lost_after_two_consecutive_low_passes(persona_with_low_salience_memory):
@@ -121,7 +154,7 @@ def test_run_pass_intensity_drivers_protects_borderline_memory(tmp_path):
     )
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="arc memory", memory_type="episodic", domain="chat", emotions={})
-    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=10))
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
     store.create(m)
     store.close()
 
@@ -185,7 +218,7 @@ def test_run_pass_exempts_memory_under_soul_review_through_real_candidates_file(
         domain="monologue",
         emotions={},
     )
-    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=10))
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
     store.create(m)
     store.close()
 

@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from brain.forgetting import run_pass
 from brain.memory.store import Memory, MemoryStore
@@ -37,13 +37,14 @@ def test_migrated_memory_within_grace_is_exempt(tmp_path):
 def test_post_migration_memory_not_grace_exempt_and_fades(tmp_path):
     # Same setup, but memory created AFTER migration → grace does not apply.
     (tmp_path / "felt_time_state.json").write_text(json.dumps({"lived_age_hours": 10.0}))
+    now = datetime.now(UTC)
     (tmp_path / "source-manifest.json").write_text(json.dumps({
-        "migrated_at_utc": datetime(2026, 5, 1, tzinfo=UTC).isoformat().replace("+00:00", "Z"),
+        "migrated_at_utc": (now - timedelta(days=90)).isoformat().replace("+00:00", "Z"),
         "lived_age_hours_at_migration": 5.0,
     }))
     store = MemoryStore(tmp_path / "memories.db")
     store.create(Memory(id="N", content="native", memory_type="conversation",
-                        domain="us", created_at=datetime(2026, 5, 15, tzinfo=UTC),
+                        domain="us", created_at=now - timedelta(days=40),
                         importance=0.0))
     store.close()
 
