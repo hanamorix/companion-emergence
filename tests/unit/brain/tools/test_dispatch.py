@@ -297,6 +297,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "read_file": {"path": str(tmp_path / "nonexistent.txt")},
         "list_directory": {"path": str(tmp_path)},
         "reach_for_capability": {"capability": "memory"},
+        "reconcile_self_read": {"action": "dismiss"},
     }
 
     for tool_name in _DISPATCH:

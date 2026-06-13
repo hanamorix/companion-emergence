@@ -100,6 +100,20 @@ def _recall_arc_wrapper(*, store, hebbian, persona_dir, query="", **_):
     return _recall_arc_impl(query=query, persona_dir=persona_dir)
 
 
+def _reconcile_self_read_wrapper(
+    *, store, hebbian, persona_dir, action, channel=None, delta=None, name=None, **_
+):
+    from brain.self_model.reconcile import reconcile_self_read as _reconcile_impl
+
+    return _reconcile_impl(
+        persona_dir=persona_dir,
+        action=action,
+        channel=channel,
+        delta=delta,
+        name=name,
+    )
+
+
 _DISPATCH: dict[str, Any] = {
     "get_emotional_state": get_emotional_state,
     "get_personality": get_personality,
@@ -124,6 +138,7 @@ _DISPATCH: dict[str, Any] = {
     "read_file": read_file,
     "list_directory": list_directory,
     "reach_for_capability": reach_for_capability,
+    "reconcile_self_read": _reconcile_self_read_wrapper,
 }
 
 
