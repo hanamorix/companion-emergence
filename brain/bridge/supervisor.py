@@ -87,7 +87,7 @@ from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
 )
-from brain.initiate.review import run_initiate_review_tick
+from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -1101,12 +1101,52 @@ def _run_initiate_review_tick(
     except Exception:
         logger.debug("_run_initiate_review_tick: compute_user_presence failed", exc_info=True)
         _user_presence = None
+    # Soft rest gate: suppress recall-resonance when body energy is low.
+    # Fail-open: a body-read error must never permanently silence her.
+    is_rest_state = False
+    try:
+        from brain.body.state import compute_body_state
+        from brain.body.words import count_words_in_session
+        from brain.emotion.aggregate import aggregate_state
+        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.utils.memory import days_since_human
+
+        _store = MemoryStore(persona_dir / "memories.db")
+        _now = datetime.now(UTC)
+        _rows = _store._conn.execute(  # noqa: SLF001
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT 200"
+        ).fetchall()
+        _memories = [_row_to_memory(row) for row in _rows]
+        _emotion_state = aggregate_state(_memories)
+        _days = days_since_human(_store, now=_now, persona_dir=persona_dir)
+        _words = count_words_in_session(
+            _store, persona_dir=persona_dir, session_hours=0.0, now=_now
+        )
+        _body = compute_body_state(
+            emotions=_emotion_state.emotions,
+            session_hours=0.0,
+            words_written=_words,
+            days_since_contact=_days,
+            now=_now,
+        )
+        is_rest_state = _rest_state_from_energy(_body.energy)
+    except Exception:
+        logger.debug(
+            "body-energy rest gate read failed; not resting (fail-open)",
+            exc_info=True,
+        )
+        is_rest_state = False  # fail-open: a body bug must never silence her permanently
     run_initiate_review_tick(
         persona_dir,
         provider=provider,
         voice_template=voice_template,
         cap_per_tick=cap_per_tick,
         user_presence=_user_presence,
+        is_rest_state=is_rest_state,
     )
     event_bus.publish(
         {
