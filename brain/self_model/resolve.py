@@ -212,39 +212,53 @@ def check_and_emit_resolution(
 
     Called from the cadence tick (Task 7) after recomputing the gap.
 
-    Resolution logic:
-      - ``prior`` must be open + sustained >= _SUSTAINED_TICKS.
-      - PATH A (reconcile):  ``new.status`` is in _RESOLVED_STATUSES.
-      - PATH B (natural):    ``new`` is open but ``new.magnitude`` is effectively 0.0
-                              (declared re-matched derived without a tool call).
+    **The decision is made on ``prior``, not ``new``** — this is load-bearing.
+    The resolution *evidence* (how long the gap sustained, and whether the
+    reconcile tool acted on it) lives on the PRIOR gap:
 
-    A gap resolved BEFORE _SUSTAINED_TICKS is transient — it silently passes
-    without crystallising.  This avoids noise from brief momentary divergences.
+      - ``prior.sustained_ticks`` is the count accumulated across the consecutive
+        ticks the gap stayed open. ``new`` is recomputed fresh each tick; on a
+        reconcile it resets (different channel set / non-open prior), and on
+        natural reconvergence it collapses to a zero-magnitude fresh gap. So
+        ``new`` never carries the sustained evidence.
+      - The reconcile tool mutates the PERSISTED current_gap (status →
+        acknowledged/dismissed). That persisted gap is loaded as ``prior`` on the
+        NEXT tick. So a reconcile shows up as ``prior.status`` being resolved,
+        not ``new.status``.
+
+    Resolution logic:
+      - ``prior`` must be non-None and sustained >= _SUSTAINED_TICKS.
+      - PATH A (reconcile):  ``prior.status`` is in _RESOLVED_STATUSES
+                             (the tool acted on it last tick).
+      - PATH B (natural):    ``prior`` was still open, and the gap is now closed —
+                             ``new`` is None, or ``new.magnitude == 0`` and
+                             ``new.unnamed_pressure == 0`` (declared re-matched
+                             derived with no tool call).
+
+    A gap that resolves BEFORE reaching _SUSTAINED_TICKS is transient — it
+    silently passes without crystallising.  This avoids noise from brief
+    momentary divergences.
 
     Args:
-        prior:       The gap state from the PREVIOUS cadence tick (before this tick).
-        new:         The gap state after this tick's recompute (may be the same
-                     object with updated status/ticks, or a freshly computed gap).
+        prior:       The gap state from the PREVIOUS cadence tick — the carrier
+                     of the resolution evidence (sustained_ticks + reconciled
+                     status).
+        new:         The freshly recomputed gap for THIS tick (or None when no
+                     gap is active). Used only to detect natural closure.
         persona_dir: Persona directory for all I/O.
         session_id:  Used in the soul candidate record.
     """
-    if prior is None or new is None:
+    if prior is None:
         return
 
-    # Prior must have been open.
-    if prior.status != "open":
+    # The gap must have been sustained long enough to crystallise. The sustained
+    # evidence lives on PRIOR (new is a fresh recompute and does not carry it).
+    if prior.sustained_ticks < _SUSTAINED_TICKS:
         return
 
-    # The gap must have been sustained long enough to crystallise.
-    # We check the NEW gap's sustained_ticks (which was incremented this tick)
-    # so a gap that reaches _SUSTAINED_TICKS exactly this tick and immediately
-    # resolves still crystallises.  A gap that resolves before reaching the
-    # threshold is transient and silently passes.
-    if new.sustained_ticks < _SUSTAINED_TICKS:
-        return
-
-    # PATH A — reconcile tool was called: gap is now acknowledged or dismissed.
-    if new.status in _RESOLVED_STATUSES:
+    # PATH A — reconcile tool was called last tick: PRIOR is now acknowledged
+    # or dismissed (the tool mutated the persisted gap; it loaded back as prior).
+    if prior.status in _RESOLVED_STATUSES:
         logger.info(
             "self_model: gap resolved via reconcile (sustained=%d, magnitude=%.3f)",
             prior.sustained_ticks,
@@ -253,9 +267,10 @@ def check_and_emit_resolution(
         _emit_resolution(persona_dir, prior, "reconcile", session_id)
         return
 
-    # PATH B — natural reconvergence: gap is still nominally open but magnitude
-    # collapsed to zero (declared re-matched derived with no tool call).
-    if new.status == "open" and new.magnitude == 0.0:
+    # PATH B — natural reconvergence: prior was still open, and the gap has now
+    # closed (no new gap, or its magnitude collapsed to zero) with no tool call.
+    new_closed = new is None or (new.magnitude == 0.0 and new.unnamed_pressure == 0.0)
+    if prior.status == "open" and new_closed:
         logger.info(
             "self_model: gap resolved naturally (sustained=%d, prior_magnitude=%.3f)",
             prior.sustained_ticks,

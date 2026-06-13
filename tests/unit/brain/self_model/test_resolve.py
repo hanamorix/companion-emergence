@@ -1,9 +1,15 @@
 """Task 6 — resolution tracking: sustained gap → soul candidate + feed event.
 
+The decision is made on the PRIOR gap (the carrier of the resolution evidence —
+sustained_ticks + reconciled status). ``new`` is a fresh recompute used only to
+detect natural closure. See ``check_and_emit_resolution`` for why.
+
 Two resolution paths (R-E4 dead-loop guard):
-  PATH A: gap sustained >= _SUSTAINED_TICKS, then reconciled (status acknowledged/dismissed)
-  PATH B: gap sustained >= _SUSTAINED_TICKS, then naturally reconverged (magnitude < threshold,
-           NO tool call)
+  PATH A: PRIOR sustained >= _SUSTAINED_TICKS, then reconciled (the reconcile tool
+          mutated the persisted gap → it loads back as prior with status
+          acknowledged/dismissed)
+  PATH B: PRIOR sustained >= _SUSTAINED_TICKS + still open, then naturally
+          reconverged — the new gap is closed (magnitude 0 / None), NO tool call
 
 Tests added one at a time per TDD discipline.
 """
@@ -54,10 +60,14 @@ def _read_soul_candidates(persona_dir: Path) -> list[dict]:
 
 
 def test_sustained_reconcile_queues_soul_candidate_and_feed_event(tmp_path: Path) -> None:
-    """PATH A: gap sustained >= _SUSTAINED_TICKS, then marked acknowledged → emits both."""
-    prior = _make_gap(status="open", sustained_ticks=_SUSTAINED_TICKS - 1, magnitude=2.0)
-    # After reconcile the gap status flips to acknowledged
-    resolved = _make_gap(status="acknowledged", sustained_ticks=_SUSTAINED_TICKS, magnitude=2.0)
+    """PATH A: PRIOR was sustained + the reconcile tool marked it acknowledged → emits both.
+
+    The evidence lives on prior: the reconcile tool mutated the persisted gap last
+    tick (status → acknowledged, sustained_ticks intact). It loads back as prior.
+    """
+    prior = _make_gap(status="acknowledged", sustained_ticks=_SUSTAINED_TICKS, magnitude=2.0)
+    # new is a fresh recompute this tick (status open, irrelevant to the decision).
+    resolved = _make_gap(status="open", sustained_ticks=1, magnitude=2.0)
 
     events, teardown = _capture_events()
     try:
@@ -87,12 +97,12 @@ def test_sustained_natural_reconvergence_queues_soul_candidate_and_feed_event(
 ) -> None:
     """PATH B (R-E4): resolution without tool call — magnitude drops to zero.
 
-    The gap was open + sustained, and the NEW gap's magnitude is zero
-    (declared re-matched derived). No reconcile tool was called.
+    PRIOR was open + sustained, and the NEW gap's magnitude is zero (declared
+    re-matched derived). No reconcile tool was called.
     """
     prior = _make_gap(status="open", sustained_ticks=_SUSTAINED_TICKS, magnitude=2.0)
-    # New gap: still open (no tool call), but magnitude collapsed to zero
-    resolved = _make_gap(status="open", sustained_ticks=_SUSTAINED_TICKS, magnitude=0.0)
+    # New gap: a fresh recompute with magnitude collapsed to zero (closed).
+    resolved = _make_gap(status="open", sustained_ticks=0, magnitude=0.0)
 
     events, teardown = _capture_events()
     try:
@@ -113,9 +123,13 @@ def test_sustained_natural_reconvergence_queues_soul_candidate_and_feed_event(
 
 
 def test_transient_gap_does_not_crystallise(tmp_path: Path) -> None:
-    """Only sustained gaps crystallise — a gap resolved before _SUSTAINED_TICKS is ignored."""
-    prior = _make_gap(status="open", sustained_ticks=0, magnitude=2.0)
-    resolved = _make_gap(status="acknowledged", sustained_ticks=_SUSTAINED_TICKS - 1, magnitude=2.0)
+    """Only sustained gaps crystallise — a gap resolved before _SUSTAINED_TICKS is ignored.
+
+    PRIOR carries the sustained evidence; here it never reached the threshold even
+    though it was reconciled (acknowledged), so nothing crystallises.
+    """
+    prior = _make_gap(status="acknowledged", sustained_ticks=_SUSTAINED_TICKS - 1, magnitude=2.0)
+    resolved = _make_gap(status="open", sustained_ticks=1, magnitude=2.0)
 
     events, teardown = _capture_events()
     try:
