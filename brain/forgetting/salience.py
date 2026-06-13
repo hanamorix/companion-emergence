@@ -31,7 +31,7 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 _EMOTION_DENOMINATOR = 10.0
 _HEBBIAN_DENOMINATOR = 20.0
 _RECALL_DENOMINATOR = 10.0
-_FRESHNESS_LIVED_HOURS_HORIZON = 720.0  # 30 lived-days
+_FRESHNESS_LIVED_HOURS_HORIZON = 2160.0  # 90 lived-days — soft landing past the 30-day recency grace
 
 # v0.0.33 Track 3 — peak blend. The FIELD never decays; its salience
 # contribution lingers over a long lived-time horizon so forgetting stays
@@ -103,9 +103,14 @@ def _lived_hours_since(anchor: datetime, felt_time_state: FeltTimeState | None) 
 
 
 def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
-    if memory.last_accessed_at is None:
-        return 0.0  # never accessed = no freshness signal
-    lived = _lived_hours_since(memory.last_accessed_at, felt_time_state)
+    # Anchor on last access if the memory was ever recalled, else on creation.
+    # A freshly-created memory has last_accessed_at=None; falling back to
+    # created_at is what lets recency protect a recent memory (it used to
+    # return 0.0 here — the structural defect that deleted days-old memories).
+    anchor = memory.last_accessed_at or memory.created_at
+    if anchor is None:
+        return 0.0
+    lived = _lived_hours_since(anchor, felt_time_state)
     if lived is None:
         return 1.0  # cold-start cases — treat as fresh (spec §7)
     return 1.0 - _clamp(lived / _FRESHNESS_LIVED_HOURS_HORIZON)

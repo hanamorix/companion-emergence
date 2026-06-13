@@ -145,17 +145,34 @@ def test_lived_age_freshness_inverse_to_time_since_access(tmp_path):
     hebbian.close()
 
 
-def test_freshness_zero_when_last_accessed_is_none():
+def test_freshness_falls_back_to_created_at_when_never_accessed():
+    """Part B: a never-accessed memory derives freshness from created_at, not 0.0.
+
+    Before the fix _freshness_input returned 0.0 whenever last_accessed_at was
+    None — which is every freshly-created memory. That zeroed the one signal
+    meant to protect recent memories. Now creation recency is the fallback
+    anchor: a just-created memory is fresh; an old never-accessed one is less so.
+    """
     store = MemoryStore(":memory:")
     hebbian = HebbianMatrix(":memory:")
+    # last_tick_ts=None → lived hours == wall hours (deterministic).
     state = FeltTimeState(lived_age_hours=100.0)
 
-    m = _make_memory()
-    store.create(m)
-    # No get() called — last_accessed_at stays None
-    s = score(m, store=store, hebbian=hebbian, felt_time_state=state, soul_linked_ids=set())
-    # Freshness contributes 0; emotion contributes 0 (no emotions); soul 0; hebbian 0; recall 0.
-    assert s == 0.0
+    recent = _make_memory(created_iso=datetime.now(UTC).isoformat())
+    old = _make_memory(created_iso=(datetime.now(UTC) - timedelta(days=60)).isoformat())
+    store.create(recent)
+    store.create(old)
+    # Neither is ever get()-accessed → last_accessed_at stays None for both.
+
+    s_recent = score(
+        recent, store=store, hebbian=hebbian, felt_time_state=state, soul_linked_ids=set()
+    )
+    s_old = score(old, store=store, hebbian=hebbian, felt_time_state=state, soul_linked_ids=set())
+
+    # Was exactly 0.0 before the fix — the structural defect.
+    assert s_recent > 0.0
+    # Creation recency is the only differing signal → recent scores higher.
+    assert s_recent > s_old
     store.close()
     hebbian.close()
 
