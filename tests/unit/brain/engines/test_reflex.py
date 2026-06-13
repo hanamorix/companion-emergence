@@ -98,6 +98,24 @@ def test_reflex_arc_set_load_missing_falls_back_to_defaults(tmp_path: Path):
     }
 
 
+def test_reflex_arc_set_load_missing_logs_info_not_warning(tmp_path: Path, caplog) -> None:
+    """Missing reflex_arcs.json logs at INFO (expected on fresh persona), not WARNING."""
+    import logging
+
+    missing = tmp_path / "reflex_arcs.json"
+    with caplog.at_level(logging.INFO, logger="brain.engines.reflex"):
+        ReflexArcSet.load(missing, default_path=DEFAULT_ARCS_PATH)
+
+    defaults_records = [
+        r for r in caplog.records if "using defaults" in r.getMessage()
+    ]
+    assert len(defaults_records) >= 1, "Expected at least one 'using defaults' log record"
+    for record in defaults_records:
+        assert record.levelname == "INFO", (
+            f"Expected INFO but got {record.levelname}: {record.getMessage()}"
+        )
+
+
 def test_reflex_arc_set_load_corrupt_falls_back_to_defaults(tmp_path: Path):
     bad = tmp_path / "arcs.json"
     bad.write_text("not valid json{{{", encoding="utf-8")
