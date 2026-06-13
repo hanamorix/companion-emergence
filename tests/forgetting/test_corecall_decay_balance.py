@@ -87,6 +87,12 @@ def test_corecall_cluster_still_fades_after_abandonment(tmp_path):
     store.close()
 
     # --- Phase 3: run forgetting; the abandoned cluster must fade. ---
+    # NOTE: the load-bearing W5 assertion is the edges-reach-0 check above
+    # (activation_count == 0). This fade assertion depends on the salience
+    # BLEND dropping below FADE once the hebbian + freshness arms collapse;
+    # if salience weights are ever re-tuned to weight the monotone recall_count
+    # arm more heavily, revisit this fade gate (it could false-green without W5
+    # being at fault — the edges-reach-0 invariant stays valid regardless).
     faded_or_lost = 0
     for _ in range(4):
         summary = run_pass(tmp_path, event_bus=MagicMock())
