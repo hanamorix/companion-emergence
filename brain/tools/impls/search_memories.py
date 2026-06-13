@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -9,8 +10,32 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
+logger = logging.getLogger(__name__)
+
 _TOKEN_MIN_LEN = 4  # matches _RECALL_TOKEN_MIN_LEN in brain/chat/prompt.py
 _TOKEN_LIMIT = 6
+
+_CORECALL_DELTA = 0.1       # gentle nudge; cf. add_memory/ingest at 0.5
+_CORECALL_FANOUT = 4        # anchor links to at most this many other results
+_CORECALL_MIN_RESULTS = 2   # below this there is nothing to associate
+
+
+def _reinforce_corecall(hebbian, memories: list) -> None:
+    """Strengthen star edges anchor(results[0]) -> each of the next _CORECALL_FANOUT.
+
+    Fail-soft: a reinforcement error must never break recall. Decay-subordinate:
+    only existing hebbian state is touched (no new salience term); abandoned
+    edges are GC'd by the heartbeat hebbian decay pass.
+    """
+    try:
+        if len(memories) < _CORECALL_MIN_RESULTS:
+            return
+        anchor = memories[0]
+        for m in memories[1 : 1 + _CORECALL_FANOUT]:
+            if m.id != anchor.id:
+                hebbian.strengthen(anchor.id, m.id, delta=_CORECALL_DELTA)
+    except Exception:  # noqa: BLE001 — reinforcement is best-effort
+        logger.debug("co-recall reinforcement failed", exc_info=True)
 
 
 def _query_tokens(query: str) -> list[str]:
@@ -82,6 +107,7 @@ def search_memories(
     else:
         ordered = candidates
 
+    _reinforce_corecall(hebbian, ordered[: _CORECALL_FANOUT + 1])
     results = [_mem_to_result(m) for m in ordered[:limit]]
 
     return {
