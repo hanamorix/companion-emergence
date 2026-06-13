@@ -107,6 +107,7 @@ def search_memories(
     else:
         ordered = candidates
 
+    _reinforce_corecall(hebbian, ordered[: _CORECALL_FANOUT + 1])
     results = [_mem_to_result(m) for m in ordered[:limit]]
 
     return {
