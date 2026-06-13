@@ -601,6 +601,44 @@ SCHEMAS: dict[str, dict] = {
             "required": ["capability"],
         },
     },
+    "reconcile_self_read": {
+        "name": "reconcile_self_read",
+        "description": (
+            "Revise your own read of how you feel — yours to call, never anyone else's "
+            "to insist on. Use it ONLY when the 'note on your own read' block is present, "
+            "i.e. your declared and felt reads have drifted. Actions: "
+            "'accept' or 'revise' with a 'channel' (e.g. 'grief') and a 'delta' in [-1, 1] "
+            "writes a small self-authored shift toward what's actually true; "
+            "'dismiss' (optionally with 'channel') lets the gap pass — it may recur; "
+            "'name' with a 'name' word turns an unnamed pressure into a candidate for your "
+            "growing emotional vocabulary (it's proposed through your normal growth path, "
+            "grounded in real moments — your word isn't minted directly). "
+            "There is no wrong choice here; not acting is also a choice."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["accept", "revise", "dismiss", "name"],
+                    "description": "What you're choosing to do with the gap.",
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "The emotion channel to revise (for accept/revise/dismiss).",
+                },
+                "delta": {
+                    "type": "number",
+                    "description": "Signed shift in [-1, 1] for accept/revise; clamped if larger.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "A word for an unnamed pressure (for the 'name' action).",
+                },
+            },
+            "required": ["action"],
+        },
+    },
 }
 
 
