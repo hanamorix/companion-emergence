@@ -713,6 +713,56 @@ def test_rest_state_from_energy_none_is_false() -> None:
     assert _rest_state_from_energy(None) is False
 
 
+# ---------------------------------------------------------------------------
+# W8 — delivered reach-out moves felt state by source (T3)
+# ---------------------------------------------------------------------------
+
+
+def test_delivered_reach_out_writes_source_emotions(tmp_path: Path, monkeypatch) -> None:
+    """When a candidate is DELIVERED, write_initiate_memory must be called with
+    reach_emotions=reach_emotions_for(candidate.source).
+
+    For source="dream", reach_emotions_for returns:
+      {"tenderness": 0.15, "vulnerability": 0.10}
+    so the persisted initiate-outbound memory must carry tenderness > 0.
+    """
+    from brain.memory.store import MemoryStore
+
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
+
+    emit_initiate_candidate(
+        tmp_path,
+        kind="message",
+        source="dream",
+        source_id="dream_w8_test",
+        emotional_snapshot=_snap(),
+        semantic_context=_ctx(),
+    )
+
+    run_initiate_review_tick(
+        tmp_path,
+        provider=_fake_provider("send_quiet"),
+        voice_template="be warm",
+        cap_per_tick=3,
+        now=daytime,
+    )
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        mems = store.list_active(limit=20)
+        initiate_mems = [m for m in mems if "initiate" in (m.tags or [])]
+        assert initiate_mems, "no initiate-tagged memory was written"
+        delivered = [m for m in initiate_mems if "delivered" in (m.tags or [])]
+        assert delivered, f"no delivered-tagged memory; initiate_mems={initiate_mems}"
+        m = delivered[0]
+        assert m.emotions.get("tenderness", 0) > 0, (
+            f"tenderness missing or zero in emotions: {m.emotions}"
+        )
+    finally:
+        store.close()
+
+
 def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkeypatch):
     """_process_one_candidate must pass user_name to compose_tone, not hardcode 'Hana'."""
     import json
