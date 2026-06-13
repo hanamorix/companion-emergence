@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import Memory
+from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls.search_memories import (
     _CORECALL_FANOUT,
     _reinforce_corecall,
@@ -77,3 +77,27 @@ def test_fail_soft_on_hebbian_error():
 
     a, b = _mem("a"), _mem("b")
     _reinforce_corecall(_BrokenHebbian(), [a, b])  # must not raise
+
+
+def test_search_memories_tool_strengthens_but_raw_search_text_does_not(tmp_path: Path):
+    """The reinforcement fires on the tool path, NOT on a bare store.search_text."""
+    store = MemoryStore(tmp_path / "memories.db")
+    heb = HebbianMatrix(tmp_path / "hebbian.db")
+    try:
+        a, b = _mem("henryk likes tea"), _mem("henryk likes quiet")
+        store.create(a)
+        store.create(b)
+
+        # bare search_text: no reinforcement
+        store.search_text("henryk", active_only=True, limit=5)
+        assert heb.activation_count(a.id) == 0
+
+        # the tool path: reinforcement fires
+        from brain.tools.impls.search_memories import search_memories
+
+        out = search_memories("henryk", store=store, hebbian=heb, persona_dir=tmp_path)
+        assert out["count"] >= 2
+        assert heb.activation_count(a.id) >= 1  # an edge now exists
+    finally:
+        store.close()
+        heb.close()
