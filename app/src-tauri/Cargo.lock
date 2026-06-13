@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "nellface"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
