@@ -231,3 +231,61 @@ def test_reconcile_through_dispatch(tmp_path: Path) -> None:
     assert result.get("ok") is True
     state, _ = load_or_recover(tmp_path)
     assert state.current_gap.status == "acknowledged"
+
+
+def test_successful_reconcile_increments_audit_counter(tmp_path: Path) -> None:
+    """C2: a successful reconcile bumps reconciles_called (the dead-loop audit
+    counter — resolve.py docstring claim becomes true).
+
+    The counter makes 'she surfaces the gap repeatedly but never reconciles'
+    observable; before this wiring it stayed 0 even on real reconciles.
+    """
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+    from brain.self_model.resolve import load_audit
+    from brain.tools.dispatch import dispatch
+
+    assert load_audit(tmp_path)["reconciles_called"] == 0
+
+    _seed_open_gap(tmp_path)
+    store = MemoryStore(tmp_path / "memories.db")
+    hebbian = HebbianMatrix(db_path=tmp_path / "hebbian.db")
+    try:
+        dispatch(
+            "reconcile_self_read",
+            {"action": "dismiss", "channel": "grief"},
+            store=store,
+            hebbian=hebbian,
+            persona_dir=tmp_path,
+        )
+    finally:
+        store.close()
+        hebbian.close()
+
+    assert load_audit(tmp_path)["reconciles_called"] == 1
+
+
+def test_name_does_not_acknowledge_a_pure_channel_gap(tmp_path: Path) -> None:
+    """Minor: ``name`` resolves unnamed pressure. A gap with NO unnamed_pressure
+    (a pure declared/derived channel divergence) is not what ``name`` addresses,
+    so its status must be left untouched rather than spuriously acknowledged.
+    """
+    # A channel gap with zero unnamed pressure — name does not address it.
+    _seed_open_gap(tmp_path, per_channel={"grief": 4.0}, magnitude=4.0, unnamed_pressure=0.0)
+    result = reconcile_self_read(persona_dir=tmp_path, action="name", name="some-word")
+    assert result.get("ok") is True
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap is not None
+    assert state.current_gap.status == "open", (
+        "name must not acknowledge a gap it did not address (no unnamed_pressure)"
+    )
+
+
+def test_failed_reconcile_does_not_increment_audit_counter(tmp_path: Path) -> None:
+    """C2: a malformed reconcile (error dict, no mutation) must NOT bump the counter."""
+    from brain.self_model.resolve import load_audit
+
+    # No 'channel' on an accept → error, nothing acted on.
+    result = reconcile_self_read(persona_dir=tmp_path, action="accept")
+    assert "error" in result
+    assert load_audit(tmp_path)["reconciles_called"] == 0
