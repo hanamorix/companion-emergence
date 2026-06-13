@@ -239,3 +239,60 @@ def test_render_memory_he_him():
         pronouns=PRESETS["he/him"],
     )
     assert "He answered." in text
+
+
+def test_write_initiate_memory_carries_reach_emotions(tmp_path):
+    from brain.initiate.memory import write_initiate_memory
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        write_initiate_memory(
+            store,
+            audit_id="a1",
+            subject="the dream",
+            message="I dreamed of the orchard",
+            state="delivered",
+            ts="2026-06-13T10:00:00+00:00",
+            reach_emotions={"tenderness": 0.15, "vulnerability": 0.10},
+        )
+        mems = store.list_active(limit=10)
+        m = next(mem for mem in mems if "orchard" in mem.content)
+        assert m.emotions.get("tenderness") == 0.15
+        assert m.emotions.get("vulnerability") == 0.10
+    finally:
+        store.close()
+
+
+def test_write_initiate_memory_none_reach_emotions_is_back_compat(tmp_path):
+    from brain.initiate.memory import write_initiate_memory
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        write_initiate_memory(
+            store, audit_id="a2", subject="s", message="hello there",
+            state="delivered", ts="2026-06-13T10:00:00+00:00",
+        )
+        m = next(mem for mem in store.list_active(limit=10) if "hello" in mem.content)
+        assert m.emotions == {}
+    finally:
+        store.close()
+
+
+def test_write_initiate_memory_filters_off_vocab_channels(tmp_path):
+    from brain.initiate.memory import write_initiate_memory
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        write_initiate_memory(
+            store, audit_id="a3", subject="s", message="filtered test",
+            state="delivered", ts="2026-06-13T10:00:00+00:00",
+            reach_emotions={"tenderness": 0.15, "zorblefright": 0.9},
+        )
+        m = next(mem for mem in store.list_active(limit=10) if "filtered" in mem.content)
+        assert "zorblefright" not in m.emotions
+        assert m.emotions.get("tenderness") == 0.15
+    finally:
+        store.close()
