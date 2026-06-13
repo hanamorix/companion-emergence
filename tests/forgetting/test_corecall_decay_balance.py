@@ -51,8 +51,8 @@ def test_corecall_cluster_still_fades_after_abandonment(tmp_path):
             emotions={},  # low intrinsic salience: no emotion, no soul
         )
         # Mirror test_orchestrator.py's low-salience fixture seeding, but older
-        # (20d) so the fade gate fires well clear of the recent-buffer window.
-        object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=20))
+        # (40d) so the fade gate fires well clear of the 30-day recent-buffer window.
+        object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
         store.create(m)
         ids.append(m.id)
     store.close()
