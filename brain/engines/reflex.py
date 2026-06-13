@@ -194,7 +194,10 @@ class ReflexArcSet:
                 raise ValueError("reflex arcs schema invalid: missing 'arcs' list")
 
         if not path.exists():
-            logger.warning("reflex arcs file %s not found, using defaults", path)
+            logger.info(
+                "reflex arcs file %s not found, using defaults (created automatically as the persona evolves)",
+                path,
+            )
             data = _default_factory()
             anomaly = None
         else:
