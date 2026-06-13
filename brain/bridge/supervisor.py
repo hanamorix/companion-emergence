@@ -94,6 +94,15 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
+from brain.self_model import cadence as self_model_cadence
+from brain.self_model import state as self_model_state
+from brain.self_model.articulate import articulate as sm_articulate
+from brain.self_model.derived import compute_derived
+from brain.self_model.gap import compute_gap
+from brain.self_model.resolve import (
+    check_and_emit_resolution,
+    increment_gaps_surfaced,
+)
 from brain.soul import cadence as soul_cadence
 
 logger = logging.getLogger(__name__)
@@ -119,6 +128,7 @@ def run_folded(
     log_rotation_interval_s: float | None = 3600.0,
     initiate_review_interval_s: float | None = 900.0,
     voice_reflection_interval_s: float | None = 86400.0,
+    self_model_interval_s: float | None = 0.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -415,6 +425,21 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor voice-reflection tick raised")
             last_voice_reflection_at = time.monotonic()
+
+        # Self-model reflection cadence — its OWN persisted-cadence block,
+        # mirroring soul review's decoupling from the monotonic timers. The
+        # tick gates itself internally on a persisted wall-clock cadence
+        # (self_model_cadence_state.json, which survives restart/sleep), so
+        # this enable flag only switches the block on/off — the pacing lives
+        # in the tick. Fault-isolated so a reflection crash can't take the
+        # supervisor down (Organ DoD — the producer fires on the live path).
+        if self_model_interval_s is not None:
+            try:
+                _run_self_model_tick(
+                    persona_dir, provider=provider, event_bus=event_bus
+                )
+            except Exception:
+                logger.exception("supervisor self-model tick raised")
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -828,6 +853,195 @@ def _run_soul_review_tick(
 
     eligible_after = count_eligible_pending(persona_dir)
     return report.model_failures, eligible_after
+
+
+# Minimum gap magnitude before the supervisor asks Haiku to articulate it.
+# Mirrors brain/self_model/articulate.py::_GAP_THRESHOLD (which also gates
+# internally) so the tick avoids a wasted call attempt below threshold.
+_SELF_MODEL_ARTICULATE_THRESHOLD = 0.4
+
+
+def _run_self_model_tick(
+    persona_dir: Path,
+    *,
+    provider: LLMProvider,
+    event_bus: EventBus | object,
+) -> None:
+    """Run one autonomous self-model reflection pass — the whole organ.
+
+    Composes the self-model end-to-end on the live supervisor path
+    (Organ Definition-of-Done — the producer fires here, not just in
+    isolation):
+
+      0. load the PERSISTED wall-clock cadence; if not due → return
+         (the cadence survives restart/sleep, mirroring soul review's
+         decoupling from the monotonic timers).
+      1. Read the recent active emotion-bearing memories.
+      2. declared = aggregate_state(memories)          (existing max-pool peak)
+      3. derived  = compute_derived(memories, body)    (new orthogonal trend)
+      4. gap      = compute_gap(declared, derived)
+      5. Track sustained_ticks vs the prior current_gap; bump the
+         gaps_surfaced audit counter while a gap is active.
+      6. If gap.magnitude >= threshold → articulate a note via Haiku.
+      7. check_and_emit_resolution(prior, new) → soul candidate + feed event
+         when a sustained gap just resolved (either path).
+      8. push_gap (displaced-gap helper preserves an unresolved displaced
+         gap in history), save state.
+      9. advance + save the cadence by outcome (clean / failure) so a
+         crash backs off and a clean pass schedules the normal interval.
+
+    Fail-isolated by the caller (run_folded's try/except), AND every I/O
+    step here is locally fail-soft so a single bad read degrades to
+    "no gap this tick" rather than a crash. On any exception the cadence
+    is still advanced with a "failure" outcome so the tick backs off
+    instead of busy-looping on a persistent error.
+
+    Mirrors the per-tick store-ownership pattern of _run_soul_review_tick:
+    opens MemoryStore inside this thread, closes via ExitStack.
+    """
+    now = datetime.now(UTC)
+
+    # ── 0: persisted-cadence gate (NOT monotonic — survives restart/sleep) ──
+    cadence_state = self_model_cadence.load(persona_dir)
+    if not self_model_cadence.is_due(cadence_state, now=now):
+        return
+
+    outcome = "clean"
+    try:
+        _self_model_reflect(persona_dir, provider=provider, event_bus=event_bus, now=now)
+    except Exception:
+        logger.exception("supervisor self-model reflect raised")
+        outcome = "failure"
+
+    cadence_state = self_model_cadence.compute_next_state(
+        cadence_state, outcome=outcome, now=now
+    )
+    self_model_cadence.save(persona_dir, cadence_state)
+
+
+def _self_model_reflect(
+    persona_dir: Path,
+    *,
+    provider: LLMProvider,
+    event_bus: EventBus | object,
+    now: datetime,
+) -> None:
+    """The reflection body — separated so cadence advance always runs.
+
+    See _run_self_model_tick for the step-by-step contract. This function
+    does steps 1-8; the caller owns the cadence gate (step 0) and advance
+    (step 9) so a crash here still backs the cadence off.
+    """
+    from brain.body.state import compute_body_state
+    from brain.body.words import count_words_in_session
+    from brain.emotion.aggregate import aggregate_state
+    from brain.memory.store import MemoryStore, _row_to_memory
+    from brain.utils.memory import days_since_human
+
+    # ── 1-3: read memories, declared + body + derived ───────────────────────
+    # Same query as _build_intensity_drivers: the 200 most recent active
+    # emotion-bearing memories. declared = max-pool peak; derived = trend+body.
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+
+        rows = store._conn.execute(  # noqa: SLF001
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT 200"
+        ).fetchall()
+        memories = [_row_to_memory(row) for row in rows]
+
+        declared = aggregate_state(memories)
+        days = days_since_human(store, now=now, persona_dir=persona_dir)
+        words = count_words_in_session(
+            store, persona_dir=persona_dir, session_hours=0.0, now=now
+        )
+        body = compute_body_state(
+            emotions=declared.emotions,
+            session_hours=0.0,
+            words_written=words,
+            days_since_contact=days,
+            now=now,
+        )
+
+    derived = compute_derived(
+        memories, body_energy=body.energy, body_exhaustion=body.exhaustion
+    )
+    new_gap = compute_gap(declared, derived)
+
+    # ── 4: load prior state, track sustained ticks ──────────────────────────
+    state, _recovered = self_model_state.load_or_recover(persona_dir)
+    prior_gap = state.current_gap
+
+    gap_active = new_gap.magnitude > 0.0 or new_gap.unnamed_pressure > 0.0
+    if gap_active:
+        # Carry sustained_ticks forward when this gap continues the prior one
+        # (same set of channels, prior still open); otherwise it's a fresh gap.
+        prior_open = prior_gap is not None and prior_gap.status == "open"
+        same_channels = (
+            prior_open
+            and prior_gap is not None
+            and set(prior_gap.per_channel) == set(new_gap.per_channel)
+        )
+        new_gap.sustained_ticks = (
+            (prior_gap.sustained_ticks + 1) if same_channels and prior_gap else 1
+        )
+        new_gap.first_seen_ts = (
+            prior_gap.first_seen_ts
+            if same_channels and prior_gap and prior_gap.first_seen_ts
+            else now.isoformat()
+        )
+        new_gap.last_seen_ts = now.isoformat()
+        new_gap.status = "open"
+        # Preserve any cooldowns the reconcile tool set on the prior gap.
+        if same_channels and prior_gap:
+            new_gap.channel_cooldowns = dict(prior_gap.channel_cooldowns)
+        increment_gaps_surfaced(persona_dir)
+
+        # ── 5: articulate above threshold (fail-soft inside) ─────────────────
+        if new_gap.magnitude >= _SELF_MODEL_ARTICULATE_THRESHOLD:
+            note = sm_articulate(new_gap, provider=provider, persona_dir=persona_dir)
+            if note:
+                new_gap.note = note
+
+    # ── 6: resolution downstream (two paths) ────────────────────────────────
+    # session_id is informational on the resolved soul candidate; the
+    # supervisor has no live session, so label the source.
+    check_and_emit_resolution(
+        prior_gap, new_gap, persona_dir=persona_dir, session_id="self_model_tick"
+    )
+
+    # ── 7: persist state (displaced-gap helper) ─────────────────────────────
+    if gap_active:
+        new_state = self_model_state.push_gap(state, new_gap)
+    else:
+        # No active gap this tick. If a prior gap is still open, displace it
+        # into history (push None is not supported, so move it manually) —
+        # otherwise just persist the (unchanged) state so the file exists.
+        if prior_gap is not None:
+            new_history = list(state.gap_history)
+            new_history.append(prior_gap)
+            new_state = self_model_state.SelfModelState(
+                current_gap=None, gap_history=new_history[-20:]
+            )
+        else:
+            new_state = state
+    self_model_state.save(persona_dir, new_state)
+
+    if hasattr(event_bus, "publish"):
+        event_bus.publish(
+            {
+                "type": "self_model_tick",
+                "trigger": "background",
+                "gap_active": gap_active,
+                "magnitude": new_gap.magnitude if gap_active else 0.0,
+                "sustained_ticks": new_gap.sustained_ticks if gap_active else 0,
+                "at": _now_iso(),
+            }
+        )
 
 
 def _run_narrative_memory_pass(
