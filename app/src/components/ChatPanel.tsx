@@ -6,6 +6,7 @@ import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { VoiceEditPanel, type VoiceEditProposal } from "./VoiceEditPanel";
 import { streamChat } from "../streamChat";
 import { errString } from "../lib/errString";
+import { friendlyChatError } from "../lib/friendlyChatError";
 
 // Tauri invocation is best-effort here: browser dev or older Tauri builds
 // may not have the notification command registered yet.
@@ -759,7 +760,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         ))}
         {error && (
           <div style={{ fontSize: 11, color: "var(--crimson)", padding: "6px 4px" }}>
-            {error}
+            {friendlyChatError(error)}
           </div>
         )}
         {memorySaveWarning && (
