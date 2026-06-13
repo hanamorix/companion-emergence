@@ -314,6 +314,23 @@ class _StreamingProxy:
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
+        # Image-bearing turns: chat_stream() flattens ImageBlocks to the text
+        # marker "[image: <sha>]" (it has no multimodal input path), so the
+        # model would see the tag but never the pixels. Route them through the
+        # real provider's non-streaming chat(), which base64-inlines the image
+        # via _chat_with_images and still returns dispatched_invocations (so
+        # pass-2 monologue fires). Forward the reply as word chunks, like the
+        # no-chat_stream fallback. Image turns lose token-level streaming but
+        # the model actually sees the picture — correct over fast.
+        # Regression: the v0.0.34 "got the tag but no image data" live bug.
+        from brain.bridge.provider import _message_has_image
+
+        if any(_message_has_image(m) for m in messages):
+            resp = self._real.chat(messages, tools=tools, options=options)
+            for word in _word_chunks(resp.content):
+                self._loop.call_soon_threadsafe(self._q.put_nowait, word)
+            return resp
+
         # Capture the MCP audit-log offset BEFORE the stream so we can read
         # dispatched_invocations after — without this the streaming path
         # drops all tool-call audit entries on the floor and run_tool_loop's

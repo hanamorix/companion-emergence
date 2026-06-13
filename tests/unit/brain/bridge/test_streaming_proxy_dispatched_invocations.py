@@ -140,3 +140,62 @@ def test_streaming_proxy_returns_empty_dispatched_when_options_missing(tmp_path:
         loop.close()
 
     assert result.dispatched_invocations == ()
+
+
+class _ImageAwareProvider:
+    """Fake provider whose chat_stream() flattens images (like the real CLI)
+    and whose chat() handles them. Tracks which method was called."""
+
+    def __init__(self) -> None:
+        self.chat_called = False
+        self.chat_stream_called = False
+
+    def name(self) -> str:
+        return "fake-image"
+
+    def healthy(self) -> bool:
+        return True
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        return ""
+
+    def complete(self, prompt: str) -> str:
+        return ""
+
+    def chat(self, messages, *, tools=None, options=None):
+        self.chat_called = True
+        return ChatResponse(content="I see the picture you made.", tool_calls=(), raw=None)
+
+    def chat_stream(self, messages, *, tools=None, options=None):
+        self.chat_stream_called = True
+        yield TextDelta(text="[image: aa685a7b] no pixels")
+        yield StreamDone(content="[image: aa685a7b] no pixels")
+
+
+def test_streaming_proxy_routes_image_turn_through_chat_not_chat_stream():
+    """A WS streaming chat with an attached image must NOT go through
+    chat_stream() (which flattens images to text markers) — it must route
+    to the real provider's chat() so the model sees the pixels.
+
+    Regression for the v0.0.34 'got the tag but no image data' bug: image
+    passthrough lived only in non-streaming chat(); the live WS path used
+    chat_stream() and silently dropped the image.
+    """
+    from brain.bridge.chat import ImageBlock
+
+    real = _ImageAwareProvider()
+    loop = asyncio.new_event_loop()
+    try:
+        q: asyncio.Queue = asyncio.Queue()
+        proxy = _StreamingProxy(real, q, loop)
+        sha = "a" * 64
+        img_msg = ChatMessage(
+            role="user",
+            content=(ImageBlock(image_sha=sha, media_type="image/jpeg"),),
+        )
+        resp = proxy.chat([img_msg], tools=None, options={})
+        assert real.chat_called is True, "image turn must route to chat()"
+        assert real.chat_stream_called is False, "image turn must NOT use chat_stream()"
+        assert "picture" in resp.content
+    finally:
+        loop.close()
