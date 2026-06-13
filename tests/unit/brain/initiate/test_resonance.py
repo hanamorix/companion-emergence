@@ -323,3 +323,15 @@ def test_run_resonance_tick_emits_on_spike(tmp_path):
     assert len(candidates) == 1
     assert candidates[0].source == "recall_resonance"
     assert candidates[0].source_id == "mem_y"
+
+
+def test_baseline_db_uses_wal_and_busy_timeout(tmp_path: Path):
+    """Match the WAL + busy_timeout discipline of MemoryStore/HebbianMatrix —
+    this DB is opened/written every heartbeat tick and can contend with the
+    bridge's MemoryStore writer."""
+    db_path = tmp_path / "memory_activation_baseline.db"
+    with MemoryActivationBaseline(db_path) as b:
+        mode = b._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() == "wal", f"expected WAL, got {mode!r}"
+        timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout == 5000, f"expected busy_timeout 5000, got {timeout}"
