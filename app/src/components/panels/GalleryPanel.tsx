@@ -30,9 +30,12 @@ export function GalleryPanel({ persona }: Props) {
 
   // Resolve the bridge base URL once for <img> src attributes.  Images
   // are served directly (not JSON) so we can't use bridgeFetch's fetch
-  // path — but the URL is stable and the auth token isn't needed for
-  // GET with the bridge's per-origin Bearer header (the browser sends
-  // the same auth headers because we set VITE_BRIDGE_URL consistently).
+  // path.  GET /images/{sha} is intentionally UNauthenticated: a browser
+  // <img src> cannot carry the bridge's bearer token (img requests send no
+  // Authorization header), and the images are content-addressed SHA-256
+  // blobs served only on the localhost bridge.  Proper query-token auth on
+  // the endpoint is deferred (ledger #17) — do not assume the bearer header
+  // is sent here; it is not.
   useEffect(() => {
     let cancelled = false;
     getBridgeCredentials(persona)
