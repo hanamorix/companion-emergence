@@ -123,13 +123,22 @@ def write_initiate_memory(
     ts: str,
     user_name: str = "my user",
     pronouns: PronounSet | None = None,
+    reach_emotions: dict[str, float] | None = None,
 ) -> None:
     """Write a fresh first-person memory entry. Called at send time.
 
     Failures are swallowed with a warning — the audit row is the durable
     record; a missing memory entry degrades ambient recall but isn't fatal.
+
+    reach_emotions: optional vocab-filtered emotion vector from reach_emotions_for();
+        applied to the delivered-reach memory so aggregate_state picks it up.
+        None (default) → no emotions written (back-compat).
     """
     text = render_memory_for_state(subject=subject, message=message, state=state, user_name=user_name, pronouns=pronouns)
+    _emotions: dict[str, float] | None = None
+    if reach_emotions:
+        from brain.chat.extractor import _filter_to_registered
+        _emotions = _filter_to_registered(reach_emotions) or None
     memory = Memory.create_new(
         content=text,
         memory_type=_INITIATE_MEMORY_TYPE,
@@ -141,6 +150,7 @@ def write_initiate_memory(
             "initiate_state": state,
             "initiate_ts": ts,
         },
+        emotions=_emotions,
     )
     try:
         memory_store.create(memory)
