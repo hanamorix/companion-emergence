@@ -220,6 +220,13 @@ def build_system_message(
     if attunement_block.strip():
         parts.append(attunement_block)
 
+    # 5e. Self-model gap block — when her *declared* and *derived* emotional
+    # reads have diverged (self-model design §3, R-F1). Hedged framing; only
+    # appended when an open gap exists, so an ordinary turn carries no bloat.
+    self_model_block = _build_self_model_block(persona_dir)
+    if self_model_block:
+        parts.append(self_model_block)
+
     # 6. Recent journal block (private — contract adjacent, per spec §4.3)
     journal_block = _build_recent_journal_block(store, user_name=user_name or "the user")
     if journal_block.strip():
@@ -893,6 +900,26 @@ def _build_attunement_block(persona_dir: Path) -> str:
         return build_attunement_block(persona_dir)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _build_self_model_block(persona_dir: Path) -> str | None:
+    """Return the self-model gap block, or None when there's nothing to surface.
+
+    Renders only when an open gap exists between her declared (max-pool) and
+    derived (trend/body) emotional reads (self-model design §3, R-F1). Hedged
+    framing — she's invited to notice, never commanded to revise.
+
+    Failure-safe: a missing/corrupt state file or any read error yields None so
+    a cold install never breaks chat composition.
+    """
+    try:
+        from brain.self_model.ambient import render_block
+        from brain.self_model.state import load_or_recover
+
+        state, _recovered = load_or_recover(persona_dir)
+        return render_block(state)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _build_recent_growth_block(persona_dir: Path, *, window_days: int = 7) -> str:

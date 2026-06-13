@@ -40,6 +40,7 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "read_file",
     "list_directory",
     "reach_for_capability",
+    "reconcile_self_read",
 )
 
 __all__ = [

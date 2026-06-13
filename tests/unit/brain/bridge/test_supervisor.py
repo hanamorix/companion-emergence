@@ -467,6 +467,123 @@ def test_run_folded_fires_log_rotation_after_interval(tmp_path: Path) -> None:
     assert not t.is_alive()
 
 
+def test_run_folded_fires_self_model_tick_when_due(tmp_path: Path) -> None:
+    """run_folded wires the self-model reflection into its own cadence block,
+    fault-isolated. The tick is persisted-cadence-gated internally (mirrors
+    soul review), so a fresh persona is due on the first iteration."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+
+    def fake_tick(*args, **kwargs):
+        fired.set()
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_self_model_tick",
+            side_effect=fake_tick,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+                self_model_interval_s=0.0,  # enabled
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "self-model tick never fired despite enabled cadence"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
+    """self_model_interval_s=None disables the self-model cadence block."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired: list[int] = []
+
+    def fake_tick(*args, **kwargs):
+        fired.append(1)
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._run_self_model_tick",
+            side_effect=fake_tick,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+                self_model_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert fired == [], "self-model tick fired even though disabled"
+
+
+def test_run_folded_self_model_fault_isolated(tmp_path: Path) -> None:
+    """A self-model tick that raises must not take down the supervisor loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+
+    def boom(*args, **kwargs):
+        fired.set()
+        raise RuntimeError("self-model exploded")
+
+    def runner():
+        with patch("brain.bridge.supervisor._run_self_model_tick", side_effect=boom):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+                self_model_interval_s=0.0,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "self-model tick never fired"
+    # Loop survives the crash — give it time to keep ticking, then stop.
+    time.sleep(0.2)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "supervisor loop died on a self-model crash (not fault-isolated)"
+
+
 def test_run_folded_skips_log_rotation_when_disabled(tmp_path: Path) -> None:
     """log_rotation_interval_s=None disables the cadence."""
     persona_dir = _persona_dir(tmp_path)

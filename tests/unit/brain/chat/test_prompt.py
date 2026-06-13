@@ -1148,3 +1148,48 @@ def test_epistemic_instruction_is_proactive():
     assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
     # The reactive guidance stays.
     assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
+
+
+# ── Self-model gap block (Task 5, R-F1) ───────────────────────────────────────
+
+
+def test_build_system_message_includes_self_model_block_when_gap_open(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    from brain.self_model.gap import Gap
+    from brain.self_model.state import SelfModelState, save
+
+    save(
+        persona_dir,
+        SelfModelState(
+            current_gap=Gap(
+                per_channel={"grief": 4.0},
+                magnitude=4.0,
+                unnamed_pressure=0.0,
+                status="open",
+            )
+        ),
+    )
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "A note on your own read" in msg
+    assert "reconcile_self_read" in msg
+
+
+def test_build_system_message_omits_self_model_block_when_no_gap(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    # No self_model_state.json at all → block omitted (R-F1).
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "A note on your own read" not in msg
