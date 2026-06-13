@@ -70,6 +70,24 @@ def test_interestset_load_missing_falls_back_to_defaults(tmp_path: Path):
     assert loaded.interests == ()  # default is empty
 
 
+def test_interestset_load_missing_logs_info_not_warning(tmp_path: Path, caplog) -> None:
+    """Missing interests.json logs at INFO (expected on fresh persona), not WARNING."""
+    import logging
+
+    missing = tmp_path / "interests.json"
+    with caplog.at_level(logging.INFO, logger="brain.engines._interests"):
+        InterestSet.load(missing, default_path=DEFAULT_INTERESTS_PATH)
+
+    defaults_records = [
+        r for r in caplog.records if "using defaults" in r.getMessage()
+    ]
+    assert len(defaults_records) >= 1, "Expected at least one 'using defaults' log record"
+    for record in defaults_records:
+        assert record.levelname == "INFO", (
+            f"Expected INFO but got {record.levelname}: {record.getMessage()}"
+        )
+
+
 # ---- Health T10: attempt_heal wiring ----
 
 
