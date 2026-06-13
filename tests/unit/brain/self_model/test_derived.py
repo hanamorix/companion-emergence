@@ -56,3 +56,25 @@ def test_compute_derived_never_raises_on_bad_input():
     object.__setattr__(bad, "emotions", None)
     out = compute_derived([bad], body_energy=5, body_exhaustion=2)
     assert isinstance(out, DerivedRead)
+
+
+# ─── Task 1b ───────────────────────────────────────────────────────────────
+
+
+def test_ordinary_state_zero_unnamed_pressure():
+    """R-E5: ordinary body state (energy=5, exhaustion=2) yields exactly 0.0."""
+    mems = [_mem({"joy": 3.0}, age_days=1), _mem({"loneliness": 2.0}, age_days=2)]
+    out = compute_derived(mems, body_energy=5, body_exhaustion=2)
+    assert out.unnamed_pressure == 0.0
+
+
+def test_strong_bodily_signal_with_no_channel_home_flags_pressure():
+    """High exhaustion + depleted energy but NO low-arousal emotion memories.
+
+    exhaustion=9, energy=1 → extreme low-arousal body state.
+    Only memory is faint, stale joy — not a low-arousal channel.
+    Residual body signal that cannot be absorbed → unnamed_pressure > 0.
+    """
+    mems = [_mem({"joy": 1.0}, age_days=30)]  # faint, stale, joy only
+    out = compute_derived(mems, body_energy=1, body_exhaustion=9)
+    assert out.unnamed_pressure > 0.0
