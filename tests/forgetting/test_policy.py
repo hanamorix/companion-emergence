@@ -26,7 +26,7 @@ def test_constants_match_spec():
     assert FADE_THRESHOLD == 0.25
     assert LOST_THRESHOLD == 0.10
     assert LOST_PASS_COUNT == 2
-    assert RECENT_LIVED_HOURS == 24.0
+    assert RECENT_LIVED_HOURS == 720.0
 
 
 def test_active_to_fading_when_below_fade_threshold():
@@ -101,7 +101,7 @@ def test_exempt_recent_buffer_blocks_any_transition():
 
 def test_not_exempt_when_old():
     """A memory older than RECENT_LIVED_HOURS in lived-age is fair game."""
-    old_created = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    old_created = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     m = _make_memory(state="active", created_iso=old_created)
     assert not is_exempt(
         m,

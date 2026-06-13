@@ -107,10 +107,10 @@ def test_peak_flows_through_live_forgetting_pass(tmp_path):
     kept = Memory.create_new("loopy the dog", "conversation", "us",
                              emotions={"joy": 5.0})
     faded = Memory.create_new("weather small-talk", "conversation", "us")
-    week_ago = datetime.now(UTC) - timedelta(days=7)
+    old = datetime.now(UTC) - timedelta(days=40)
     for m in (kept, faded):
-        m.created_at = week_ago
-        m.last_accessed_at = week_ago
+        m.created_at = old
+        m.last_accessed_at = old
         store.create(m)
     store.update(kept.id, emotions={})  # noise-floor shape; peak stays 5.0
     store.close()  # run_pass opens its own connection

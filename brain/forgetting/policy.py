@@ -22,7 +22,7 @@ from brain.memory.store import Memory
 FADE_THRESHOLD = 0.25
 LOST_THRESHOLD = 0.10
 LOST_PASS_COUNT = 2
-RECENT_LIVED_HOURS = 24.0
+RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (see is_exempt), not lived-age — the name is historical. Recent memories stay fully active+verbatim for a month.
 IMPORT_GRACE_LIVED_HOURS = 168.0  # 7 lived-days — settling window for migrated memories
 
 
@@ -104,10 +104,9 @@ def is_exempt(
     Three exemption classes per spec §4 (ordered cheapest first):
       1. Soul-crystallised
       2. Under soul-candidate review
-      3. Recent buffer — created within RECENT_LIVED_HOURS lived-hours.
-
-    The recent-buffer check uses lived_age (not wall-clock); during cold-
-    start when lived_age = 0, all memories are within the buffer.
+      3. Recent buffer — created within RECENT_LIVED_HOURS hours, measured by
+         WALL-CLOCK age (despite the constant's historical name). During
+         cold-start (now_lived_age_hours <= 0) all memories are exempt.
     """
     if memory.id in soul_crystallised_ids:
         return True
@@ -121,7 +120,7 @@ def is_exempt(
     # but at cold-start (no rate established) treat as fully recent.
     if now_lived_age_hours <= 0.0:
         return True
-    # Conservative: if wall-clock age is within RECENT_LIVED_HOURS hours,
-    # exempt regardless of lived-rate.
+    # Recent-buffer grace is wall-clock: a memory created within
+    # RECENT_LIVED_HOURS hours of now is exempt regardless of lived-rate.
     wall_age_hours = wall_age_s / 3600.0
     return wall_age_hours <= RECENT_LIVED_HOURS
