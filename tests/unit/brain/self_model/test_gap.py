@@ -21,9 +21,13 @@ def test_divergent_declared_vs_derived_nonzero_gap():
 
 
 def test_identical_signals_zero_gap():
-    """R-C1 converse: identical declared and derived → magnitude exactly 0.0."""
-    declared = EmotionalState(emotions={"calm": 4.0})
-    derived = DerivedRead(channels={"calm": 4.0}, unnamed_pressure=0.0, sources={})
+    """R-C1 converse: identical declared and derived → magnitude exactly 0.0.
+
+    Use a REGISTERED channel (grief) so the zero comes from equal deltas, not
+    from gap.py filtering an unregistered channel out.
+    """
+    declared = EmotionalState(emotions={"grief": 4.0})
+    derived = DerivedRead(channels={"grief": 4.0}, unnamed_pressure=0.0, sources={})
     gap = compute_gap(declared, derived)
     assert gap.magnitude == 0.0
 
