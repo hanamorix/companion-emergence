@@ -146,7 +146,10 @@ class InterestSet:
         """Load interests; on corrupt file, quarantine + heal, log WARNING."""
         source_path = path if path.exists() else default_path
         if source_path != path:
-            logger.warning("interests file %s not found, using defaults", path)
+            logger.info(
+                "interests file %s not found, using defaults (created automatically as the persona evolves)",
+                path,
+            )
             data = json.loads(default_path.read_text(encoding="utf-8"))
             out: list[Interest] = []
             for raw in data.get("interests", []):
