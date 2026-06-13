@@ -18,7 +18,7 @@ The shippable base. Each fires on a live supervisor/chat path, has ≥1 reader, 
 |---|---|---|
 | heartbeat | memory/emotion/body | dreams, reflex, growth, research, decay |
 | MemoryStore recall → salience | recall events | `recall_count` → forgetting salience |
-| forgetting (FADE/LOSE/graveyard) | composite salience (emotion/hebbian/recall/soul/freshness) | graveyard + grief |
+| forgetting (FADE/LOSE/graveyard) | composite salience (emotion/hebbian/recall/soul/freshness) | graveyard + grief. *2026-06-13 recency-grace fix: 30-wall-day recent-buffer grace (`RECENT_LIVED_HOURS` 24→720, wall-clock despite the name), freshness fallback to `created_at` (was structurally 0.0 on every never-accessed memory → deleted days-old conversations), 90-lived-day freshness horizon for a gentle post-grace landing. Through-pass test pins the user scenario.* |
 | emotion-aggregate | all active memories' `emotions` | the felt EmotionalState read by chat/body/dream/reflex |
 | **ingest emotion-seeding** | conversation transcript + registered vocab | **writes `emotions` onto bulk-extracted memories** → feeds emotion-aggregate/body/dream/felt-time/forgetting. *Promoted to CORE in v0.0.30 (W7 fix A2 + historical backfill A3); previously the affect-deaf gap.* |
 | dream | emotion (mood-gate) + soul + grief | hebbian reinforce, memories, feed |
