@@ -1021,9 +1021,9 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
         raise httpx.ConnectError("refused")
 
     monkeypatch.setattr("httpx.get", fake_get)
-    # Short-circuit the 5s deadline.
+    # Short-circuit the 50s readiness deadline (Bug 2b widened it from 5s).
     monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
-    fake_now = iter([0.0, 1.0, 2.0, 3.0, 4.0, 6.0])
+    fake_now = iter([0.0, 1.0, 2.0, 51.0])
     monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(fake_now))
 
     killed: dict[str, object] = {}
