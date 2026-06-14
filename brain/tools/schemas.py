@@ -581,6 +581,31 @@ SCHEMAS: dict[str, dict] = {
             "required": ["path"],
         },
     },
+    "propose_write": {
+        "name": "propose_write",
+        "description": (
+            "Propose writing to a file on the user's machine — create a new file "
+            "or append to an existing one. This does NOT write immediately; it asks "
+            "the user to approve the write in their app first. Use ONLY when the user "
+            "wants you to write something to disk. You cannot overwrite or delete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "absolute file path"},
+                "content": {
+                    "type": "string",
+                    "description": "text to write (omit if using making_id)",
+                },
+                "op": {"type": "string", "enum": ["create", "append"]},
+                "making_id": {
+                    "type": "string",
+                    "description": "optional: export a making by id instead of content",
+                },
+            },
+            "required": ["path", "op"],
+        },
+    },
     "reach_for_capability": {
         "name": "reach_for_capability",
         "description": (

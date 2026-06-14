@@ -114,6 +114,14 @@ def _reconcile_self_read_wrapper(
     )
 
 
+def _propose_write_wrapper(*, persona_dir, path, op, content=None, making_id=None, **_):
+    from brain.tools.impls.propose_write import propose_write
+
+    return propose_write(
+        path=path, content=content, op=op, making_id=making_id, persona_dir=persona_dir
+    )
+
+
 _DISPATCH: dict[str, Any] = {
     "get_emotional_state": get_emotional_state,
     "get_personality": get_personality,
@@ -139,6 +147,7 @@ _DISPATCH: dict[str, Any] = {
     "list_directory": list_directory,
     "reach_for_capability": reach_for_capability,
     "reconcile_self_read": _reconcile_self_read_wrapper,
+    "propose_write": _propose_write_wrapper,
 }
 
 
