@@ -34,6 +34,7 @@ FeedEntryType = Literal[
     "attunement_backfill",
     "attunement_crystal",
     "pronoun_nudge",
+    "file_write",
 ]
 
 
@@ -47,6 +48,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "attunement_backfill": "I've been getting to know you",
     "attunement_crystal": "something settled into place",
     "pronoun_nudge": "a small new thing —",
+    "file_write": "I wrote to a file —",
 }
 
 
@@ -98,6 +100,42 @@ def build_dream_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
             type="dream",
             ts=mem.created_at.isoformat(),
             opener=TYPE_OPENER["dream"],
+            body=mem.content,
+            audit_id=None,
+        )
+        for mem in mems
+        if mem.content
+    ]
+
+
+def build_file_write_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Read up to `limit` file_write memories from MemoryStore, newest first."""
+    from brain.memory.store import MemoryStore
+
+    db_path = persona_dir / "memories.db"
+    if not db_path.exists():
+        return []
+
+    try:
+        store = MemoryStore(db_path, integrity_check=False)
+    except Exception:
+        logger.exception("feed: opening MemoryStore for file_write source failed")
+        return []
+
+    try:
+        try:
+            mems = store.list_by_type("file_write", active_only=True, limit=limit)
+        except Exception:
+            logger.exception("feed: MemoryStore.list_by_type('file_write') failed")
+            return []
+    finally:
+        store.close()
+
+    return [
+        FeedEntry(
+            type="file_write",
+            ts=mem.created_at.isoformat(),
+            opener=TYPE_OPENER["file_write"],
             body=mem.content,
             audit_id=None,
         )
@@ -320,6 +358,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
     """
     builders = (
         build_dream_entries,
+        build_file_write_entries,
         build_research_entries,
         build_soul_entries,
         build_outreach_entries,
