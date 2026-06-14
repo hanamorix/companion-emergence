@@ -25,6 +25,7 @@ def test_type_opener_covers_all_types() -> None:
         "attunement_backfill",
         "attunement_crystal",
         "pronoun_nudge",
+        "file_write",
     }
     assert set(TYPE_OPENER.keys()) == expected
     for key, opener in TYPE_OPENER.items():
