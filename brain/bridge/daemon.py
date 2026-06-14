@@ -255,67 +255,67 @@ def cmd_start(args, *, out: dict | None = None) -> int:
             )
         return 2
 
-    fd = acquire_lock(persona_dir)
-    if fd is None:
-        print("bridge already starting (lockfile held)", file=sys.stderr)
-        return 2
-
-    try:
-        client_origin = getattr(args, "client_origin", "cli")
-        if client_origin == "launchd":
-            try:
-                from brain.service.launchd import truncate_launchd_logs_if_large
-
-                truncate_launchd_logs_if_large(args.persona)
-            except Exception:
-                logger.debug("launchd log truncation skipped", exc_info=True)
-
-        drained = run_recovery_if_needed(persona_dir)
-        if drained is not None:
-            if drained > 0:
-                print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
-            else:
-                print("recovered from dirty shutdown (no orphan sessions to drain)")
-
-        log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
-        idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
-        client_origin = getattr(args, "client_origin", "cli")
-        pid = spawn_detached(persona_dir, idle, client_origin, log_path)
-
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            time.sleep(0.1)
-            s = state_file.read(persona_dir)
-            if s is not None and s.pid == pid and s.port:
-                try:
-                    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-                    r = httpx.get(
-                        f"http://127.0.0.1:{s.port}/health",
-                        headers=headers,
-                        timeout=1.0,
-                    )
-                    if r.status_code == 200:
-                        print(f"bridge started on port {s.port} (pid {pid})")
-                        if out is not None:
-                            out["readiness"] = BridgeReadiness(
-                                pid=pid, port=s.port, auth_token=s.auth_token
-                            )
-                        return 0
-                except httpx.HTTPError:
-                    continue
-        # H-D: readiness failed — kill the orphan child and tell the user where to look.
+    # The per-persona lockfile is owned by the bridge PROCESS — the detached
+    # runner (see runner.main), held for its lifetime so pid-based stale
+    # recovery works. cmd_start is a short-lived launcher and must NOT hold it,
+    # or the child it spawns can't acquire it and dies. The is_running check
+    # above is the cheap pre-filter; the runner's lock is the real guard against
+    # two live bridges. (Bug 2a, v0.0.36.)
+    client_origin = getattr(args, "client_origin", "cli")
+    if client_origin == "launchd":
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # already dead
-        print(
-            f"bridge spawned (pid {pid}) but /health did not respond in 5s — "
-            f"killed orphan child. Inspect log at {log_path}",
-            file=sys.stderr,
-        )
-        return 1
-    finally:
-        release_lock(persona_dir, fd)
+            from brain.service.launchd import truncate_launchd_logs_if_large
+
+            truncate_launchd_logs_if_large(args.persona)
+        except Exception:
+            logger.debug("launchd log truncation skipped", exc_info=True)
+
+    drained = run_recovery_if_needed(persona_dir)
+    if drained is not None:
+        if drained > 0:
+            print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
+        else:
+            print("recovered from dirty shutdown (no orphan sessions to drain)")
+
+    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+    pid = spawn_detached(persona_dir, idle, client_origin, log_path)
+
+    # Readiness window: Windows cold-boot (recovery + persona load + soul review)
+    # routinely exceeds 5s; the old 5s deadline killed a healthy-but-slow bridge.
+    # 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
+    deadline = time.time() + 50.0
+    while time.time() < deadline:
+        time.sleep(0.1)
+        s = state_file.read(persona_dir)
+        if s is not None and s.pid == pid and s.port:
+            try:
+                headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+                r = httpx.get(
+                    f"http://127.0.0.1:{s.port}/health",
+                    headers=headers,
+                    timeout=1.0,
+                )
+                if r.status_code == 200:
+                    print(f"bridge started on port {s.port} (pid {pid})")
+                    if out is not None:
+                        out["readiness"] = BridgeReadiness(
+                            pid=pid, port=s.port, auth_token=s.auth_token
+                        )
+                    return 0
+            except httpx.HTTPError:
+                continue
+    # Readiness failed — kill the orphan child and tell the user where to look.
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # already dead
+    print(
+        f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
+        f"killed orphan child. Inspect log at {log_path}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def cmd_run(args) -> int:
