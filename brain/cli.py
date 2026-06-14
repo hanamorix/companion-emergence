@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,13 @@ from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.migrator.cli import build_parser as _build_migrate_parser
-from brain.paths import _PERSONA_NAME_RE, get_home, get_persona_dir, list_persona_names
+from brain.paths import (
+    _PERSONA_NAME_RE,
+    get_home,
+    get_log_dir,
+    get_persona_dir,
+    list_persona_names,
+)
 from brain.persona_config import PersonaConfig
 from brain.search.factory import get_searcher
 from brain.setup import (
@@ -2836,8 +2843,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI entry point. Returns shell exit code."""
+def _harden_std_streams() -> None:
+    """Under pythonw.exe (Windows, no console) sys.stdout/sys.stderr are None;
+    any write — including a bare ``print()`` in the bridge boot path — raises and
+    kills the process before logging is configured or the server binds. Point a
+    None stream at os.devnull so boot-path writes are harmless no-ops. A real
+    console stream is left untouched. (Bug 1, v0.0.36 Task Scheduler failure.)"""
+    import io
+
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
+            except OSError:
+                setattr(sys, name, io.StringIO())
+
+
+def _run_main(argv: list[str] | None = None) -> int:
+    """CLI body — wrapped by main() for std-stream hardening + crash logging."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if not args.command:
@@ -2865,6 +2888,33 @@ def main(argv: list[str] | None = None) -> int:
     ):
         args.persona = _resolve_persona_or_exit(None)
     return args.func(args)
+
+
+def _log_crash(exc: BaseException, argv: list[str] | None) -> None:
+    """Append a traceback to cli-crash.log — the diagnostic that was missing when
+    the pythonw boot died silently with no console + no log line (Bug 1)."""
+    import traceback
+
+    try:
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "cli-crash.log").open("a", encoding="utf-8") as f:
+            f.write(f"\n=== crash argv={argv} ===\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    except Exception:
+        pass  # never let crash-logging mask the original failure
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Hardens std streams (pythonw) + logs crashes to a file."""
+    _harden_std_streams()
+    try:
+        return _run_main(argv)
+    except SystemExit:
+        raise  # argparse / explicit sys.exit pass through untouched
+    except BaseException as exc:
+        _log_crash(exc, argv)
+        raise
 
 
 if __name__ == "__main__":
