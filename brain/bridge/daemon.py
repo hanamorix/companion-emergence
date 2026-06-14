@@ -255,12 +255,17 @@ def cmd_start(args, *, out: dict | None = None) -> int:
             )
         return 2
 
-    # The per-persona lockfile is owned by the bridge PROCESS — the detached
-    # runner (see runner.main), held for its lifetime so pid-based stale
-    # recovery works. cmd_start is a short-lived launcher and must NOT hold it,
-    # or the child it spawns can't acquire it and dies. The is_running check
-    # above is the cheap pre-filter; the runner's lock is the real guard against
-    # two live bridges. (Bug 2a, v0.0.36.)
+    # Hold the lock through recovery (so two concurrent starters can't both
+    # recover), then RELEASE it right before spawning. The bridge PROCESS — the
+    # detached runner (see runner.main) — re-acquires it and holds it for its
+    # lifetime, so pid-based stale recovery works. cmd_start must NOT hold the
+    # lock across the spawn, or the child can't acquire it and dies (Bug 2a,
+    # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        print("bridge already starting (lockfile held)", file=sys.stderr)
+        return 2
+
     client_origin = getattr(args, "client_origin", "cli")
     if client_origin == "launchd":
         try:
@@ -279,6 +284,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+    release_lock(persona_dir, fd)  # hand the lock to the child runner
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
 
     # Readiness window: Windows cold-boot (recovery + persona load + soul review)
