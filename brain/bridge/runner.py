@@ -222,18 +222,33 @@ def run_bridge_foreground(
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--persona-dir", required=True, type=Path)
     p.add_argument("--client-origin", default="cli")
     p.add_argument("--idle-shutdown-seconds", type=float, default=None)
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
-    return run_bridge_foreground(
-        args.persona_dir,
-        client_origin=args.client_origin,
-        idle_shutdown_seconds=args.idle_shutdown_seconds,
-    )
+    # Mutual-exclusion (Bug 2a, v0.0.36): the detached runner — spawned by
+    # cmd_start on app open — must refuse to bind a SECOND bridge for a persona
+    # that already has one. cmd_run (the task path) holds this same is_running +
+    # lockfile guard; the runner lacked it, so two concurrent `supervisor start`
+    # spawns each created a live bridge (two supervisors, parallel soul review).
+    from brain.bridge.daemon import acquire_lock, release_lock
+
+    if state_file.is_running(args.persona_dir):
+        return 2
+    fd = acquire_lock(args.persona_dir)
+    if fd is None:
+        return 2  # another starter holds the lock — lose cleanly, no second bridge
+    try:
+        return run_bridge_foreground(
+            args.persona_dir,
+            client_origin=args.client_origin,
+            idle_shutdown_seconds=args.idle_shutdown_seconds,
+        )
+    finally:
+        release_lock(args.persona_dir, fd)
 
 
 if __name__ == "__main__":
