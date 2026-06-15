@@ -36,7 +36,7 @@ def test_store_creates_db_and_schema_version(tmp_path: Path) -> None:
     db_path = tmp_path / "works.db"
     store = WorksStore(db_path)
     assert db_path.exists()
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
 
 
 def test_store_insert_and_get(tmp_path: Path) -> None:
