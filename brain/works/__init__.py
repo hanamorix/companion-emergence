@@ -37,6 +37,11 @@ class Work:
         session_id: Bridge session_id when available, None otherwise.
         word_count: Pre-computed for sorting/filtering without reading file.
         summary: Nell-supplied one-liner, optional, max 500 chars (validated at save).
+        disposition: private | eventual_share | discard (maker; default private).
+        private_reason: why a private making is hers alone, optional.
+        origin: tool (model-pull) | maker (autonomous); default tool.
+        charge_sources: JSON list of the charge provenance, optional.
+        shared_at: ISO-8601 timestamp when shared, None otherwise.
     """
 
     id: str
@@ -46,6 +51,11 @@ class Work:
     session_id: str | None
     word_count: int
     summary: str | None
+    disposition: str = "private"  # private | eventual_share | discard
+    private_reason: str | None = None
+    origin: str = "tool"  # tool (model-pull) | maker (autonomous)
+    charge_sources: str | None = None  # JSON list
+    shared_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict (e.g., for SQLite row, JSON response, frontmatter)."""
@@ -57,6 +67,11 @@ class Work:
             "session_id": self.session_id,
             "word_count": self.word_count,
             "summary": self.summary,
+            "disposition": self.disposition,
+            "private_reason": self.private_reason,
+            "origin": self.origin,
+            "charge_sources": self.charge_sources,
+            "shared_at": self.shared_at,
         }
 
     @classmethod
@@ -71,6 +86,11 @@ class Work:
             session_id=data.get("session_id"),
             word_count=int(data["word_count"]),
             summary=data.get("summary"),
+            disposition=data.get("disposition", "private"),
+            private_reason=data.get("private_reason"),
+            origin=data.get("origin", "tool"),
+            charge_sources=data.get("charge_sources"),
+            shared_at=data.get("shared_at"),
         )
 
 
