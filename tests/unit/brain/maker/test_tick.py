@@ -27,6 +27,34 @@ def test_tick_below_threshold_does_not_fire(tmp_path):
     store.close()
 
 
+def test_tick_flips_ready_eventual_share_to_shared(tmp_path):
+    from datetime import timedelta
+
+    from brain.works import Work, make_work_id
+    from brain.works.store import WorksStore
+    store = _store(tmp_path)
+    old = datetime.now(UTC) - timedelta(hours=48)
+    w = Work(id=make_work_id("share"), title="t", type="poem", created_at=old,
+             session_id=None, word_count=1, summary=None, disposition="eventual_share",
+             private_reason=None, origin="maker", charge_sources=None, shared_at=None)
+    ws = WorksStore(tmp_path / "works.db")
+    ws.insert(w, content="x")
+    ws.close()
+    save_charge(tmp_path, MakerCharge(0.0, "2026-06-14T00:00:00+00:00", None, 0))
+    run_maker_tick(
+        tmp_path,
+        store=store,
+        provider=None,
+        now=datetime.now(UTC),
+        make_fn=lambda **k: None,
+        threshold=100.0,  # below-threshold: flip runs regardless of discharge
+    )
+    ws = WorksStore(tmp_path / "works.db")
+    assert ws.get(make_work_id("share")).shared_at is not None
+    ws.close()
+    store.close()
+
+
 def test_tick_at_threshold_fires_and_resets(tmp_path):
     store = _store(tmp_path)
     fired = []
