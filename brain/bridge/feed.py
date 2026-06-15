@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from brain.maker.privacy import is_auto_surfaceable
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,28 +150,31 @@ def build_file_write_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry
 
 def build_maker_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
     """Shared makings only — disposition=eventual_share AND shared_at set.
-    Private + discard NEVER appear (privacy invariant; gate-asserted in Phase 4)."""
+
+    Defence-in-depth: full Work objects are reconstructed and filtered through
+    is_auto_surfaceable() — the privacy gate, not the SQL WHERE, is what keeps
+    private + discard makings out. Even if a future schema/query change returned
+    private rows, the gate drops them (privacy invariant, gate-asserted)."""
     from brain.works.store import WorksStore
     db = persona_dir / "works.db"
     if not db.exists():
         return []
     store = WorksStore(db)
     try:
-        rows = store._conn.execute(
-            "SELECT id, title, summary, content_path, shared_at FROM works "
-            "WHERE disposition='eventual_share' AND shared_at IS NOT NULL "
-            "ORDER BY shared_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        works = store.list_recent(limit=limit * 3)
     except Exception:
         logger.exception("feed: maker source query failed")
         return []
     finally:
         store.close()
-    out = []
-    for r in rows:
-        body = r["summary"] or ""
-        out.append(FeedEntry(type="maker", ts=r["shared_at"], opener=TYPE_OPENER["maker"],
-                             body=body, audit_id=None))
+    out: list[FeedEntry] = []
+    for w in works:
+        if w is None or not is_auto_surfaceable(w):
+            continue  # the gate — private/discard/unready never pass
+        out.append(FeedEntry(type="maker", ts=w.shared_at, opener=TYPE_OPENER["maker"],
+                             body=w.summary or "", audit_id=None))
+        if len(out) >= limit:
+            break
     return out
 
 
