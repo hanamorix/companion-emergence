@@ -35,6 +35,7 @@ FeedEntryType = Literal[
     "attunement_crystal",
     "pronoun_nudge",
     "file_write",
+    "maker",
 ]
 
 
@@ -49,6 +50,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "attunement_crystal": "something settled into place",
     "pronoun_nudge": "a small new thing —",
     "file_write": "I wrote to a file —",
+    "maker": "I made something —",
 }
 
 
@@ -142,6 +144,33 @@ def build_file_write_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry
         for mem in mems
         if mem.content
     ]
+
+
+def build_maker_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Shared makings only — disposition=eventual_share AND shared_at set.
+    Private + discard NEVER appear (privacy invariant; gate-asserted in Phase 4)."""
+    from brain.works.store import WorksStore
+    db = persona_dir / "works.db"
+    if not db.exists():
+        return []
+    store = WorksStore(db)
+    try:
+        rows = store._conn.execute(
+            "SELECT id, title, summary, content_path, shared_at FROM works "
+            "WHERE disposition='eventual_share' AND shared_at IS NOT NULL "
+            "ORDER BY shared_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    except Exception:
+        logger.exception("feed: maker source query failed")
+        return []
+    finally:
+        store.close()
+    out = []
+    for r in rows:
+        body = r["summary"] or ""
+        out.append(FeedEntry(type="maker", ts=r["shared_at"], opener=TYPE_OPENER["maker"],
+                             body=body, audit_id=None))
+    return out
 
 
 def build_research_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
@@ -349,16 +378,17 @@ def build_pronoun_nudge_entries_adapter(persona_dir: Path, *, limit: int) -> lis
 
 
 def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
-    """Merge all 9 source streams into a single ts-desc feed, capped at limit.
+    """Merge all source streams into a single ts-desc feed, capped at limit.
 
     Fault isolation: each per-source builder is called inside its own
     try/except so a single source's failure logs an exception and returns
-    an empty list for that stream, leaving the other eight usable. The
+    an empty list for that stream, leaving the others usable. The
     feed always returns SOMETHING (possibly empty) — never raises.
     """
     builders = (
         build_dream_entries,
         build_file_write_entries,
+        build_maker_entries,
         build_research_entries,
         build_soul_entries,
         build_outreach_entries,

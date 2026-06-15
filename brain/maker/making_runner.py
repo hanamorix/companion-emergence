@@ -47,5 +47,17 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     finally:
         works.close()
     logger.info("maker: made %r (%s) → %s", making.title, making.disposition, wid)
-    # Phase 3 inserts: wire_emotion(making), wire_memory(making), wire_feed_readiness(...)
-    from brain.maker import wiring  # noqa: F401  (Phase 3 fills this; import kept for ordering)
+
+    # The three wire-backs of a completed making. For a non-discard making the
+    # emotion delta is applied exactly as W8 applies reach_emotions: it is
+    # vocab-filtered by making_emotion_delta() and seeded onto the act-memory
+    # via Memory.create_new(emotions=...), so aggregate_state picks it up. A
+    # discarded making moves nothing — empty-emotion act-memory only. The feed
+    # wire-back (eventual_share → shared) is driven by flip_ready_shares from
+    # run_maker_tick, not here.
+    from brain.maker import wiring
+    if making.disposition != "discard":
+        delta = wiring.making_emotion_delta(making, dominant_source=sources[0] if sources else "soul")
+        wiring.write_making_memory(store, making, emotions=delta)
+    else:
+        wiring.write_making_memory(store, making, emotions={})
