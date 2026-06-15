@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ensureBridgeRunning,
@@ -16,10 +16,17 @@ function dragWindow(e: React.MouseEvent) {
   if (e.button !== 0) return;
   void getCurrentWindow().startDragging();
 }
-import { fetchPersonaState, type PersonaState } from "./bridge";
+import {
+  approvePendingWrite,
+  declinePendingWrite,
+  fetchPersonaState,
+  type PendingWrite,
+  type PersonaState,
+} from "./bridge";
 import { ensureBridgeCurrent } from "./bridgeVersionCheck";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
+import { PendingWriteCard } from "./components/PendingWriteCard";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { Wizard } from "./wizard/Wizard";
@@ -319,7 +326,21 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [state, setState] = useState<PersonaState | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  // Ids of pending writes the user has just acted on — optimistically hidden
+  // until the next /persona/state poll drops them server-side. Also disables
+  // that card's buttons so a double-click can't double-approve.
+  const [resolvingWrites, setResolvingWrites] = useState<Set<string>>(new Set());
   const soulFlashing = useSoulFlash(state);
+
+  const refetchState = useCallback(async () => {
+    try {
+      const s = await fetchPersonaState(persona);
+      setState(s);
+      setStateError(null);
+    } catch (e) {
+      setStateError(errString(e));
+    }
+  }, [persona]);
 
   useEffect(() => {
     let cancelled = false;
@@ -341,6 +362,31 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       clearInterval(id);
     };
   }, [persona]);
+
+  // Approve/decline a proposed file write. Mirror the reach-out card resolve:
+  // mark busy, call the endpoint, optimistic-remove + refetch. On failure,
+  // un-busy so the user can retry (the card reappears on the next poll if the
+  // write is still pending server-side).
+  async function resolveWrite(
+    id: string,
+    action: (persona: string, id: string) => Promise<unknown>,
+  ) {
+    setResolvingWrites((prev) => new Set(prev).add(id));
+    try {
+      await action(persona, id);
+      await refetchState();
+    } catch {
+      setResolvingWrites((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
+  const pendingWrites: PendingWrite[] = (state?.pending_writes ?? []).filter(
+    (w) => !resolvingWrites.has(w.id),
+  );
 
   useEffect(() => {
     document.documentElement.dataset.reducedMotion = config.reduced_motion ? "true" : "false";
@@ -393,12 +439,32 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           reducedMotion={config.reduced_motion}
         />
       </div>
-      <ChatPanel
-        persona={persona}
-        onSpeakingChange={setIsSpeaking}
-        recovering={state?.recovering ?? false}
-        feltTimeRecovered={state?.felt_time_recovered ?? false}
-      />
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {pendingWrites.length > 0 && (
+          <div
+            className="pending-write-list"
+            data-testid="pending-write-list"
+            role="list"
+            aria-label="Proposed file writes"
+          >
+            {pendingWrites.map((w) => (
+              <PendingWriteCard
+                key={w.id}
+                write={w}
+                busy={resolvingWrites.has(w.id)}
+                onApprove={(id) => void resolveWrite(id, approvePendingWrite)}
+                onDecline={(id) => void resolveWrite(id, declinePendingWrite)}
+              />
+            ))}
+          </div>
+        )}
+        <ChatPanel
+          persona={persona}
+          onSpeakingChange={setIsSpeaking}
+          recovering={state?.recovering ?? false}
+          feltTimeRecovered={state?.felt_time_recovered ?? false}
+        />
+      </div>
     </div>
   );
 }
