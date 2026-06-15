@@ -114,6 +114,12 @@ def _reconcile_self_read_wrapper(
     )
 
 
+def _surface_makings_wrapper(*, persona_dir, **_):
+    from brain.maker.disclosure import surface_makings
+
+    return surface_makings(persona_dir=persona_dir)
+
+
 def _propose_write_wrapper(*, persona_dir, path, op, content=None, making_id=None, **_):
     from brain.tools.impls.propose_write import propose_write
 
@@ -148,6 +154,7 @@ _DISPATCH: dict[str, Any] = {
     "reach_for_capability": reach_for_capability,
     "reconcile_self_read": _reconcile_self_read_wrapper,
     "propose_write": _propose_write_wrapper,
+    "surface_makings": _surface_makings_wrapper,
 }
 
 
