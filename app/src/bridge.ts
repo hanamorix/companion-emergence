@@ -135,6 +135,25 @@ export interface PersonaState {
    *  Cleared on the next supervisor tick — banner is naturally short-lived.
    *  Optional so older bridge builds without the field degrade gracefully. */
   felt_time_recovered?: boolean;
+  /** File writes she has proposed and that await the user's approve/decline.
+   *  Each is the consent gate for one guarded write — `propose_write` queued
+   *  it (writing nothing); the user commits it to disc or discards it via the
+   *  PendingWriteCard. Only un-resolved, un-expired rows surface here.
+   *  Optional so older bridge builds without the field parse — falls through
+   *  to undefined and the UI treats it as an empty list. */
+  pending_writes?: PendingWrite[];
+}
+
+export interface PendingWrite {
+  id: string;
+  op: "create" | "append";
+  /** Resolved absolute target path. */
+  path: string;
+  /** Content preview, capped server-side at 2000 chars. */
+  preview: string;
+  /** True iff the real content is longer than the preview. */
+  truncated: boolean;
+  proposed_at: string;
 }
 
 export interface BodyState {
@@ -732,5 +751,42 @@ export async function rejectVoiceEdit(
     }),
   );
   if (!r.ok) throw new Error(`/initiate/voice-edit/reject ${r.status}`);
+  return await r.json();
+}
+
+/**
+ * Approve a pending file write — commits it to disc (the guard re-runs at
+ * commit time, TOCTOU). Throws on non-2xx (404 unknown id, 409 already
+ * resolved). Auth-gated.
+ */
+export async function approvePendingWrite(
+  persona: string,
+  id: string,
+): Promise<unknown> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/writes/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+      headers: authOnlyHeaders(creds),
+    }),
+  );
+  if (!r.ok) throw new Error(`/persona/writes/${id}/approve ${r.status}`);
+  return await r.json();
+}
+
+/**
+ * Decline a pending file write — discards it, nothing touches disc. Throws
+ * on non-2xx (404 unknown id, 409 already resolved). Auth-gated.
+ */
+export async function declinePendingWrite(
+  persona: string,
+  id: string,
+): Promise<unknown> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/writes/${encodeURIComponent(id)}/decline`, {
+      method: "POST",
+      headers: authOnlyHeaders(creds),
+    }),
+  );
+  if (!r.ok) throw new Error(`/persona/writes/${id}/decline ${r.status}`);
   return await r.json();
 }

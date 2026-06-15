@@ -39,8 +39,10 @@ vi.mock("./appConfig", () => ({
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
-vi.mock("./bridge", () => ({
-  fetchPersonaState: vi.fn(async () => ({
+import type { PersonaState } from "./bridge";
+
+const { fetchPersonaState, approvePendingWrite, declinePendingWrite } = vi.hoisted(() => {
+  const baseState = (): PersonaState => ({
     persona: "test",
     emotions: {},
     body: null,
@@ -50,7 +52,18 @@ vi.mock("./bridge", () => ({
     mode: "live",
     recovering: false,
     felt_time_recovered: false,
-  })),
+  });
+  return {
+    fetchPersonaState: vi.fn(async (): Promise<PersonaState> => baseState()),
+    approvePendingWrite: vi.fn(async () => ({ ok: true })),
+    declinePendingWrite: vi.fn(async () => ({ ok: true })),
+  };
+});
+
+vi.mock("./bridge", () => ({
+  fetchPersonaState,
+  approvePendingWrite,
+  declinePendingWrite,
 }));
 
 // ── Heavy UI components that spawn their own effects ─────────────────────────
@@ -179,5 +192,54 @@ describe("App boot routing", () => {
     expect(screen.getByText(/nell/)).toBeInTheDocument();
     expect(screen.getByText(/phoebe/)).toBeInTheDocument();
     expect(writeAppConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("App pending-write cards", () => {
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    approvePendingWrite.mockClear();
+    declinePendingWrite.mockClear();
+    fetchPersonaState.mockReset().mockResolvedValue({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+      pending_writes: [
+        {
+          id: "w_1",
+          op: "create",
+          path: "/Users/h/note.md",
+          preview: "draft body",
+          truncated: false,
+          proposed_at: "2026-06-14T12:00:00+00:00",
+        },
+      ],
+    });
+  });
+
+  afterEach(cleanup);
+
+  it("renders a PendingWriteCard and approve calls the bridge helper", async () => {
+    const { fireEvent } = await import("@testing-library/react");
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/note\.md/)).toBeInTheDocument()
+    );
+    fireEvent.click(screen.getByText(/approve/i));
+    await waitFor(() =>
+      expect(approvePendingWrite).toHaveBeenCalledWith("nell", "w_1")
+    );
   });
 });

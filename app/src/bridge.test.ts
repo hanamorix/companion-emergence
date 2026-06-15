@@ -22,7 +22,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { invoke } from "@tauri-apps/api/core";
 import {
   acceptVoiceEdit,
+  approvePendingWrite,
   closeSession,
+  declinePendingWrite,
   fetchPersonaFeed,
   fetchPersonaState,
   getBridgeCredentials,
@@ -396,6 +398,34 @@ describe("acceptVoiceEdit / rejectVoiceEdit", () => {
       new Response("server error", { status: 500 }),
     ));
     await expect(rejectVoiceEdit("alice", "ia_bad")).rejects.toThrow("/initiate/voice-edit/reject 500");
+  });
+
+  it("approvePendingWrite POSTs to /persona/writes/{id}/approve with the bearer", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await approvePendingWrite("alice", "w_001");
+
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/persona/writes/w_001/approve");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    expect((init!.headers as Record<string, string>)?.Authorization).toBe("Bearer alice-tok");
+  });
+
+  it("declinePendingWrite POSTs to /persona/writes/{id}/decline with the bearer", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await declinePendingWrite("alice", "w_002");
+
+    const [url, init] = spy.mock.calls[0]!;
+    expect(String(url)).toContain("/persona/writes/w_002/decline");
+    expect((init!.method)?.toUpperCase()).toBe("POST");
+    expect((init!.headers as Record<string, string>)?.Authorization).toBe("Bearer alice-tok");
   });
 
   it("snapshots a session without closing it", async () => {
