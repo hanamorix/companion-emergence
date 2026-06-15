@@ -53,6 +53,11 @@ def run_maker_tick(
     state.prior_soul_count = soul_now
     save_charge(persona_dir, state)
 
+    # Feed wire-back: aged eventual_share makings become visible in the feed.
+    # Cheap (no LLM), fail-soft, runs every pass regardless of discharge.
+    from brain.maker.wiring import flip_ready_shares
+    flip_ready_shares(persona_dir, now=now, delay_hours=_cfg.SHARE_DELAY_HOURS)
+
     if state.charge < threshold:
         return
     # cooldown gate
