@@ -130,6 +130,7 @@ def run_folded(
     initiate_review_interval_s: float | None = 900.0,
     voice_reflection_interval_s: float | None = 86400.0,
     self_model_interval_s: float | None = 0.0,
+    maker_enabled: bool = True,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -442,9 +443,49 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor self-model tick raised")
 
+        # Maker (autonomous making) tick — fail-isolated. The tick gates itself
+        # internally on the persisted creative charge (maker_charge.json); this
+        # block only switches the organ on/off. Opens a per-tick MemoryStore
+        # inside this thread (the charge readers need it), mirroring the
+        # store-ownership pattern of the soul-review/self-model ticks.
+        if maker_enabled:  # default True; gate exists for tests/builds
+            try:
+                with ExitStack() as _maker_stack:
+                    _maker_store = MemoryStore(persona_dir / "memories.db")
+                    _maker_stack.callback(_maker_store.close)
+                    _maybe_run_maker_tick(
+                        persona_dir, store=_maker_store, provider=provider
+                    )
+            except Exception:
+                logger.exception("supervisor maker store-open raised")
+
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _run_maker_tick(persona_dir, *, store, provider):
+    """Run one maker tick on the live supervisor path.
+
+    The real making closure (make_and_wire) lands in Task 9 of the maker plan.
+    Until it exists, the import is guarded so Phase 1 stays green: the tick still
+    runs (accumulates the charge, logs "would make") but fires nothing because
+    make_fn falls back to None. Remove the fallback when Task 9 ships.
+    """
+    from brain.maker import run_maker_tick
+
+    try:
+        from brain.maker.making_runner import make_and_wire  # Task 9 supplies this
+    except ImportError:
+        make_and_wire = None  # tick runs + logs "would make", fires nothing
+    run_maker_tick(persona_dir, store=store, provider=provider, make_fn=make_and_wire)
+
+
+def _maybe_run_maker_tick(persona_dir, *, store, provider):
+    try:
+        _run_maker_tick(persona_dir, store=store, provider=provider)
+    except Exception:
+        logger.exception("supervisor maker tick raised")
 
 
 def _heartbeat_and_felt_time(
