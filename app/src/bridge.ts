@@ -122,6 +122,11 @@ export interface PersonaState {
     /** Preset key from backend preset_key_for — "she/her" | "he/him" | "they/them" | null.
      *  Null means unset (defaults to she/her in the UI). */
     user_pronouns?: string | null;
+    /** True iff the persona is authorized to leave autonomous notes.
+     *  Optional so older bridge builds without the field degrade to off. */
+    notes_enabled?: boolean;
+    /** The resolved per-OS notes folder when enabled, else null/undefined. */
+    notes_folder?: string | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
   /** True iff orphan session buffers from a previous shutdown are still
@@ -580,6 +585,37 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
     }),
   );
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
+}
+
+/** Response from POST /persona/config/notes. */
+export interface NotesConfig {
+  ok: boolean;
+  enabled: boolean;
+  /** The resolved per-OS notes folder, or null when disabled. */
+  folder: string | null;
+}
+
+/**
+ * Enable/disable autonomous persona notes for the given persona.
+ *
+ * POSTs {enabled} to POST /persona/config/notes. On enable the bridge
+ * resolves the per-OS folder (platformdirs Documents / '<Persona> Notes'),
+ * creates it, and persists it to persona_config.json. The client supplies
+ * no path — the system picks the folder. Returns {ok, enabled, folder}.
+ */
+export async function setPersonaNotes(
+  persona: string,
+  enabled: boolean,
+): Promise<NotesConfig> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/config/notes`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+  if (!r.ok) throw new Error(`setPersonaNotes failed: ${r.status}`);
+  return (await r.json()) as NotesConfig;
 }
 
 export type PronounPreset = "she/her" | "he/him" | "they/them";
