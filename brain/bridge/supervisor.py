@@ -131,6 +131,7 @@ def run_folded(
     voice_reflection_interval_s: float | None = 86400.0,
     self_model_interval_s: float | None = 0.0,
     maker_enabled: bool = True,
+    notes_enabled: bool = True,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -468,6 +469,23 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor maker store-open raised")
 
+        # Notes (autonomous persona notes) tick — fail-isolated. The tick gates
+        # itself internally on consent + away-time + cooldown + budget
+        # (notes_state.json / notes_budget.json); this block only switches the
+        # organ on/off. Opens a per-tick MemoryStore inside this thread (the
+        # runner reads dreams/emotion), mirroring the maker tick's store
+        # ownership. Organ DoD — the producer fires on the live path.
+        if notes_enabled:  # default True; gate exists for tests/builds
+            try:
+                with ExitStack() as _notes_stack:
+                    _notes_store = MemoryStore(persona_dir / "memories.db")
+                    _notes_stack.callback(_notes_store.close)
+                    _maybe_run_notes_tick(
+                        persona_dir, store=_notes_store, provider=provider
+                    )
+            except Exception:
+                logger.exception("supervisor notes store-open raised")
+
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
@@ -490,6 +508,36 @@ def _maybe_run_maker_tick(persona_dir, *, store, provider):
         _run_maker_tick(persona_dir, store=store, provider=provider)
     except Exception:
         logger.exception("supervisor maker tick raised")
+
+
+def _run_notes_tick(persona_dir, *, store, provider):
+    """Run one notes tick on the live supervisor path.
+
+    Loads persona config (consent + resolved folder), computes how long the user
+    has been away from UserPresence, and runs the gated tick — which, when away +
+    cooldown + budget clear, fires the real note-making closure
+    (make_note_and_wire): compose from her interior, write the folder-bounded note.
+    """
+    from brain.initiate.user_pattern import compute_user_presence
+    from brain.notes import run_notes_tick
+    from brain.notes.runner import make_note_and_wire
+
+    config = PersonaConfig.load(persona_dir / "persona_config.json")
+    silence_hours = compute_user_presence(persona_dir).silence_days * 24
+    run_notes_tick(
+        persona_dir,
+        config=config,
+        provider=provider,
+        silence_hours=silence_hours,
+        make_fn=make_note_and_wire,
+    )
+
+
+def _maybe_run_notes_tick(persona_dir, *, store, provider):
+    try:
+        _run_notes_tick(persona_dir, store=store, provider=provider)
+    except Exception:
+        logger.exception("supervisor notes tick raised")
 
 
 def _heartbeat_and_felt_time(
