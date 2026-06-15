@@ -52,6 +52,14 @@ from brain.bridge.usage_log import log_usage
 
 logger = logging.getLogger(__name__)
 
+# Windows: a console child (the `claude` CLI) launched from a windowless bridge
+# (pythonw / Task Scheduler, since v0.0.33) gets a fresh visible console unless
+# told otherwise — a "claude" window flashes on every provider call and can
+# steal keyboard focus. CREATE_NO_WINDOW suppresses it; the flag exists only on
+# Windows, so off-platform this is 0 (a no-op). stdout/stderr capture is
+# unaffected. Passed as creationflags= on every `claude` spawn below.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> None:
     """Record a stream idle-timeout for later diagnosis (spec
@@ -403,6 +411,7 @@ class ClaudeCliProvider(LLMProvider):
                     errors="replace",
                     timeout=self._timeout,
                     check=False,
+                    creationflags=_NO_WINDOW,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(
@@ -532,6 +541,7 @@ class ClaudeCliProvider(LLMProvider):
                     errors="replace",
                     timeout=self._timeout,
                     check=False,
+                    creationflags=_NO_WINDOW,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ProviderError(
@@ -708,6 +718,7 @@ class ClaudeCliProvider(LLMProvider):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=_NO_WINDOW,
                 )
             except OSError as exc:
                 yield StreamError(stage="claude_cli_spawn", detail=str(exc))
@@ -992,6 +1003,7 @@ class ClaudeCliProvider(LLMProvider):
                         timeout=self._timeout,
                         env=env_overrides,
                         check=False,
+                        creationflags=_NO_WINDOW,
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise ProviderError(
@@ -1136,6 +1148,7 @@ class ClaudeCliProvider(LLMProvider):
                         errors="replace",
                         timeout=self._timeout,
                         check=False,
+                        creationflags=_NO_WINDOW,
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise ProviderError(
