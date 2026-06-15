@@ -303,7 +303,13 @@ html[data-reduced-motion="true"] *::after {
 }
 .pending-write-card {
   border-left: 3px solid var(--rose);
-  background: rgba(200, 152, 144, 0.12);
+  /* Solid panel surface + a rose wash on top. The initiate-banner uses a 12%
+     rose over its parent panel's opaque --panel-bg; this card renders directly
+     over the dark --bg-scene, so it needs its own opaque base or it reads as
+     transparent/unreadable. */
+  background:
+    linear-gradient(rgba(200, 152, 144, 0.14), rgba(200, 152, 144, 0.14)),
+    var(--panel-bg);
   border-radius: 8px;
   padding: 10px 12px;
   display: flex;
