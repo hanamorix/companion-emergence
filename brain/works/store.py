@@ -31,19 +31,24 @@ from brain.works import Work
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 _SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS works (
-    id            TEXT PRIMARY KEY,
-    title         TEXT NOT NULL,
-    type          TEXT NOT NULL,
-    created_at    TEXT NOT NULL,
-    session_id    TEXT,
-    content_path  TEXT NOT NULL,
-    word_count    INTEGER NOT NULL,
-    summary       TEXT
+    id             TEXT PRIMARY KEY,
+    title          TEXT NOT NULL,
+    type           TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    session_id     TEXT,
+    content_path   TEXT NOT NULL,
+    word_count     INTEGER NOT NULL,
+    summary        TEXT,
+    disposition    TEXT NOT NULL DEFAULT 'private',
+    private_reason TEXT,
+    origin         TEXT NOT NULL DEFAULT 'tool',
+    charge_sources TEXT,
+    shared_at      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_works_created_at ON works(created_at DESC);
@@ -59,6 +64,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS works_fts USING fts5(
 
 PRAGMA user_version = {_SCHEMA_VERSION};
 """
+
+
+# v1 → v2: the Maker un-fences the store and adds disposition/provenance.
+# The repo convention is CREATE IF NOT EXISTS + PRAGMA user_version with no
+# ALTER migrations; this is the first ALTER migration. Each ADD COLUMN is
+# guarded against re-application (PRAGMA table_info), so the migration is
+# idempotent and safe to run on a fresh v2 db or an already-migrated one.
+_MIGRATIONS_V2 = [
+    "ALTER TABLE works ADD COLUMN disposition TEXT NOT NULL DEFAULT 'private'",
+    "ALTER TABLE works ADD COLUMN private_reason TEXT",
+    "ALTER TABLE works ADD COLUMN origin TEXT NOT NULL DEFAULT 'tool'",
+    "ALTER TABLE works ADD COLUMN charge_sources TEXT",
+    "ALTER TABLE works ADD COLUMN shared_at TEXT",
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing v1 db up to v2 by adding the new columns.
+
+    Column-presence driven rather than user_version driven: the idempotent
+    ``executescript(_SCHEMA_SQL)`` that precedes this call already bumps
+    ``PRAGMA user_version`` to 2 (it runs unconditionally), so a v1 table would
+    look "already v2" by version alone. Instead we read the actual columns: any
+    of the five that is missing gets ADDed. A fresh v2 db (born with all five)
+    no-ops; a v1 db gains exactly the absent columns. Idempotent.
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(works)")}
+    if not existing:
+        return  # no works table yet (shouldn't happen post-executescript)
+    for stmt in _MIGRATIONS_V2:
+        col = stmt.split("ADD COLUMN ")[1].split()[0]
+        if col not in existing:
+            conn.execute(stmt)
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    conn.commit()
 
 
 class WorksStore:
@@ -82,6 +122,10 @@ class WorksStore:
             with self._connect() as conn:
                 conn.executescript(_SCHEMA_SQL)
                 conn.commit()
+                # First ALTER migration in the repo. Runs right after the
+                # idempotent CREATE IF NOT EXISTS: a fresh db is already v2 and
+                # this no-ops; an existing v1 db gets the five columns added.
+                _migrate(conn)
             self._INITIALISED_PATHS.add(key)
 
     def _connect(self) -> sqlite3.Connection:
@@ -91,6 +135,25 @@ class WorksStore:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
         return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """A fresh connection for ad-hoc raw reads (e.g. PRAGMA table_info).
+
+        The store opens per-call by design; this property hands back a new
+        connection each access so callers needing a raw handle don't reach into
+        the per-method connection lifecycle.
+        """
+        return self._connect()
+
+    def close(self) -> None:
+        """No-op close — the store holds no long-lived connection.
+
+        Provided for symmetry with MemoryStore so maker/test call sites can
+        ``store.close()`` uniformly; each method already opens + closes its own
+        connection.
+        """
+        return None
 
     def schema_version(self) -> int:
         with self._connect() as conn:
@@ -125,8 +188,10 @@ class WorksStore:
                     """
                     INSERT INTO works
                       (id, title, type, created_at, session_id,
-                       content_path, word_count, summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       content_path, word_count, summary,
+                       disposition, private_reason, origin,
+                       charge_sources, shared_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         work.id,
@@ -137,6 +202,11 @@ class WorksStore:
                         content_path,
                         work.word_count,
                         work.summary,
+                        work.disposition,
+                        work.private_reason,
+                        work.origin,
+                        work.charge_sources,
+                        work.shared_at,
                     ),
                 )
                 conn.execute(
@@ -252,6 +322,7 @@ class WorksStore:
 
 
 def _row_to_work(row: sqlite3.Row) -> Work:
+    keys = row.keys()
     return Work(
         id=row["id"],
         title=row["title"],
@@ -260,4 +331,9 @@ def _row_to_work(row: sqlite3.Row) -> Work:
         session_id=row["session_id"],
         word_count=int(row["word_count"]),
         summary=row["summary"],
+        disposition=row["disposition"] if "disposition" in keys else "private",
+        private_reason=row["private_reason"] if "private_reason" in keys else None,
+        origin=row["origin"] if "origin" in keys else "tool",
+        charge_sources=row["charge_sources"] if "charge_sources" in keys else None,
+        shared_at=row["shared_at"] if "shared_at" in keys else None,
     )
