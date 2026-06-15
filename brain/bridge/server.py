@@ -679,6 +679,10 @@ class PronounConfigReq(BaseModel):
     set: dict | None = None
 
 
+class NotesConfigReq(BaseModel):
+    enabled: bool
+
+
 class NewSessionReq(BaseModel):
     client: Literal["cli", "tauri", "tests"] = "cli"
 
@@ -1333,6 +1337,38 @@ def build_app(
         updated = dc_replace(PersonaConfig.load(config_path), user_pronouns=stored)
         updated.save(config_path)
         return {"ok": True, "pronouns": stored}
+
+    # ── POST /persona/config/notes — autonomous-notes consent toggle ──────
+    @app.post("/persona/config/notes", dependencies=[Depends(require_http_auth)])
+    async def set_persona_notes(req: NotesConfigReq) -> dict:
+        """Enable/disable autonomous notes. On enable, resolve the per-OS folder
+        (platformdirs Documents / '<Persona> Notes'), create it, persist it.
+        The persona/system picks the folder — the client supplies no path."""
+        from dataclasses import replace as dc_replace
+
+        from brain.files.write_guard import check_write_target
+        from brain.notes.config import resolve_notes_folder
+        from brain.persona_config import PersonaConfig
+
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        cfg = PersonaConfig.load(config_path)
+        if req.enabled:
+            folder = resolve_notes_folder(s.persona_dir.name)
+            # safety: the resolved folder must itself clear the deny-list (Documents is fine)
+            probe = check_write_target(
+                str(folder / ".probe"), op="create", persona_dir=s.persona_dir
+            )
+            if not probe.ok:
+                return JSONResponse(
+                    status_code=422, content={"ok": False, "error": probe.error}
+                )
+            folder.mkdir(parents=True, exist_ok=True)
+            cfg = dc_replace(cfg, notes_enabled=True, notes_folder=str(folder))
+        else:
+            cfg = dc_replace(cfg, notes_enabled=False)
+        cfg.save(config_path)
+        return {"ok": True, "enabled": cfg.notes_enabled, "folder": cfg.notes_folder}
 
     # ── /persona/writes/{rid}/{approve,decline} — file-write consent gate ──
     @app.post("/persona/writes/{rid}/approve", dependencies=[Depends(require_http_auth)])
