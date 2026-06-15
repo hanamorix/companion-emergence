@@ -24,3 +24,17 @@ def making_emotion_delta(making: Making, *, dominant_source: str) -> dict[str, f
     for name, v in _SOURCE_ACCENT.get(dominant_source, {}).items():
         raw[name] = raw.get(name, 0.0) + v
     return _filter_to_registered(raw)
+
+
+def write_making_memory(store, making: Making, *, emotions: dict[str, float]) -> None:
+    """Episodic memory of the ACT of making (distinct from the artifact)."""
+    from brain.memory.store import Memory
+    content = f"I made something — \"{making.title}\" ({making.type}). It came from what's been moving in me."
+    mem = Memory.create_new(
+        content=content, memory_type="making", domain="interior",
+        tags=["making", making.disposition], emotions=emotions or None,
+    )
+    try:
+        store.create(mem)
+    except Exception:
+        logger.exception("maker: act-memory write failed")
