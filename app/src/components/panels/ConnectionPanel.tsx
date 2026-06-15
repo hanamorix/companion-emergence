@@ -8,6 +8,7 @@ import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
 import { PronounPicker } from "./PronounPicker";
+import { NotesToggle } from "./NotesToggle";
 import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
 import { errString } from "../../lib/errString";
@@ -336,6 +337,14 @@ export function ConnectionPanel({
           }}
         />
       )}
+
+      <Divider />
+      <SectionLabel>Notes</SectionLabel>
+      <NotesToggle
+        persona={persona}
+        enabled={conn?.notes_enabled ?? false}
+        folder={conn?.notes_folder ?? null}
+      />
 
       <Divider />
       <SectionLabel>Updates</SectionLabel>
