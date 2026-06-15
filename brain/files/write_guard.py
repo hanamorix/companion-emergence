@@ -42,6 +42,15 @@ def _is_within(child: Path, parent: Path) -> bool:
     return c == p or c.startswith(p + os.sep)
 
 
+def is_within_authorized(resolved: Path, folder: Path | None) -> bool:
+    """True only if `resolved`'s real path is inside `folder`. Escape-proof
+    (realpath collapses .. and symlinks). None folder → always False (notes
+    disabled = nothing authorized)."""
+    if folder is None:
+        return False
+    return _is_within(resolved, folder)
+
+
 def _denied(resolved: Path, persona_dir: Path) -> bool:
     home = Path.home()
     for rel in _HOME_DENY:
