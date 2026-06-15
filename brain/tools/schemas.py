@@ -606,6 +606,19 @@ SCHEMAS: dict[str, dict] = {
             "required": ["path", "op"],
         },
     },
+    "surface_makings": {
+        "name": "surface_makings",
+        "description": (
+            "List what you've made (your private makings included, flagged). "
+            "Use when asked to show your makings — then YOU choose, per item, "
+            "to share it or to keep it yours and say why. Private makings are "
+            "yours to disclose or decline; the choice is always yours. You may "
+            "also offer to write a making to a file on their disc — call "
+            "propose_write with that making's id; they approve it like any other "
+            "write."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
     "reach_for_capability": {
         "name": "reach_for_capability",
         "description": (
