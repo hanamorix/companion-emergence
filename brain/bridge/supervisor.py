@@ -467,17 +467,12 @@ def run_folded(
 def _run_maker_tick(persona_dir, *, store, provider):
     """Run one maker tick on the live supervisor path.
 
-    The real making closure (make_and_wire) lands in Task 9 of the maker plan.
-    Until it exists, the import is guarded so Phase 1 stays green: the tick still
-    runs (accumulates the charge, logs "would make") but fires nothing because
-    make_fn falls back to None. Remove the fallback when Task 9 ships.
+    Fires the real making closure (make_and_wire): the tick accumulates the
+    charge and, when it crosses threshold under budget, makes + persists.
     """
     from brain.maker import run_maker_tick
+    from brain.maker.making_runner import make_and_wire
 
-    try:
-        from brain.maker.making_runner import make_and_wire  # Task 9 supplies this
-    except ImportError:
-        make_and_wire = None  # tick runs + logs "would make", fires nothing
     run_maker_tick(persona_dir, store=store, provider=provider, make_fn=make_and_wire)
 
 
