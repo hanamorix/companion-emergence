@@ -92,6 +92,43 @@ def test_build_system_message_includes_interior_continuity(
     assert "turning over what she said about leaving" in msg
 
 
+def test_build_system_message_includes_maker_awareness_block(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    from brain.works import Work, make_work_id
+    from brain.works.store import WorksStore
+
+    w = Work(
+        id=make_work_id("m"),
+        title="Dusk Letter",
+        type="letter",
+        created_at=datetime.now(UTC),
+        session_id=None,
+        word_count=1,
+        summary="s",
+        disposition="private",
+        private_reason="raw",
+        origin="maker",
+        charge_sources=None,
+        shared_at=None,
+    )
+    ws = WorksStore(persona_dir / "works.db")
+    ws.insert(w, content="the private content here")
+    ws.close()
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "what you've been making" in msg
+    assert "Dusk Letter" in msg
+    assert "yours alone" in msg.lower()
+    # privacy invariant: artifact content NEVER appears in the block
+    assert "the private content here" not in msg
+
+
 def test_build_system_message_preamble_persona_name_substituted(
     tmp_path: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:

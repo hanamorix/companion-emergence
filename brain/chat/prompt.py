@@ -18,6 +18,7 @@ from pathlib import Path
 
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.engines.daemon_state import DaemonState, get_residue_context
+from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
 
@@ -236,6 +237,16 @@ def build_system_message(
     growth_block = _build_recent_growth_block(persona_dir)
     if growth_block.strip():
         parts.append(growth_block)
+
+    # 7b. Interior making-awareness — recent makings by title+type only (never
+    # artifact content). Private makings are tagged hers-alone so she does not
+    # volunteer them. Fail-soft (mirrors the outbound-recall block above).
+    try:
+        maker_block = build_maker_awareness_block(persona_dir, limit=5)
+        if maker_block:
+            parts.append(maker_block)
+    except Exception:  # noqa: BLE001
+        pass
 
     # 8. Inner monologue framing — names the record_monologue tool, articulates
     # situational trigger criteria. Per spec 2026-05-30 §2.
