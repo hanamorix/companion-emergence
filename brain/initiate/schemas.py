@@ -24,6 +24,7 @@ CandidateSource = Literal[
     "reflex_firing",
     "research_completion",
     "recall_resonance",
+    "note",
 ]
 Decision = Literal[
     "send_notify",
