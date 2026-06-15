@@ -38,7 +38,7 @@ _MEMORY_TOOLS = (
     "add_memory",
     "add_journal",
 )
-_FILE_TOOLS = ("read_file", "list_directory")
+_FILE_TOOLS = ("read_file", "list_directory", "propose_write")
 
 
 def select_tools(
