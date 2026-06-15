@@ -107,9 +107,36 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
         return
     logger.info("notes: wrote %r → %s", note.subject, path)
 
-    # --- Phase 4 wiring seam (NOT THIS TASK) ---
-    # After a successful write, wire the note back into her loops:
-    #   * a note-state initiate memory naming the folder (→ ambient mention),
-    #   * an emotion delta seeded onto that memory,
-    #   * a feed entry (build_note_entries).
-    # Leave this seam clear; the through-path above is what Task 8 proves.
+    # --- Phase 4 wiring (Task 9): wire the note back into her loops ---
+    # A note-state initiate memory names the folder so she mentions it next chat,
+    # and carries a small tenderness delta (vocab-filtered inside the writer). The
+    # feed reads these note-state memories via brain.bridge.feed.build_note_entries.
+    _wire_note_back(persona_dir, note=note, folder=folder, user_name=user_name, now=now)
+
+
+def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: str,
+                    now: datetime) -> None:
+    """Write the note-state initiate memory + emotion delta after a successful
+    write. Fail-soft: the file is already on disk; a missing memory only degrades
+    ambient mention, never the write itself."""
+    from uuid import uuid4
+
+    from brain.initiate.memory import write_initiate_memory
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        write_initiate_memory(
+            store,
+            audit_id=uuid4().hex,
+            subject=note.subject,
+            message=f"I left {user_name} a note in {folder}",
+            state="note",
+            ts=now.isoformat(),
+            user_name=user_name,
+            reach_emotions={"tenderness": 0.12},
+        )
+    except Exception:
+        logger.exception("notes.runner: wiring the note-state memory failed")
+    finally:
+        store.close()

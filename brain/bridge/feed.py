@@ -38,6 +38,7 @@ FeedEntryType = Literal[
     "pronoun_nudge",
     "file_write",
     "maker",
+    "note",
 ]
 
 
@@ -53,6 +54,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "pronoun_nudge": "a small new thing —",
     "file_write": "I wrote to a file —",
     "maker": "I made something —",
+    "note": "I left you a note —",
 }
 
 
@@ -146,6 +148,52 @@ def build_file_write_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry
         for mem in mems
         if mem.content
     ]
+
+
+def build_note_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Read up to `limit` note-state initiate memories from MemoryStore, newest
+    first. Notes are written by brain.notes.runner via write_initiate_memory with
+    state='note' (memory_type='initiate_outbound', tagged 'note'). We scope to the
+    note state so ordinary outreach memories never bleed into this source."""
+    from brain.memory.store import MemoryStore
+
+    db_path = persona_dir / "memories.db"
+    if not db_path.exists():
+        return []
+
+    try:
+        store = MemoryStore(db_path, integrity_check=False)
+    except Exception:
+        logger.exception("feed: opening MemoryStore for note source failed")
+        return []
+
+    try:
+        try:
+            mems = store.list_by_type("initiate_outbound", active_only=True, limit=limit * 3)
+        except Exception:
+            logger.exception("feed: MemoryStore.list_by_type('initiate_outbound') failed")
+            return []
+    finally:
+        store.close()
+
+    out: list[FeedEntry] = []
+    for mem in mems:
+        if "note" not in (mem.tags or []):
+            continue
+        if not mem.content:
+            continue
+        out.append(
+            FeedEntry(
+                type="note",
+                ts=mem.created_at.isoformat(),
+                opener=TYPE_OPENER["note"],
+                body=mem.content,
+                audit_id=None,
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
 
 
 def build_maker_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
@@ -393,6 +441,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
     builders = (
         build_dream_entries,
         build_file_write_entries,
+        build_note_entries,
         build_maker_entries,
         build_research_entries,
         build_soul_entries,
