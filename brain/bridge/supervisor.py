@@ -363,6 +363,15 @@ def run_folded(
                 _run_narrative_memory_pass(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor narrative-memory pass raised")
+            # Expire stale pending file-write proposals (24h TTL) so a confirm
+            # card the user never acted on stops surfacing on /persona/state.
+            # Fail-isolated: a sweep error must not skip the rest of the tick.
+            try:
+                from brain.files import pending as _file_pending
+
+                _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
+            except Exception:
+                logger.exception("supervisor pending-write sweep raised")
             last_maintenance_at = time.monotonic()
 
         # Finalize cadence — 24h silence (default) or explicit. Each pass

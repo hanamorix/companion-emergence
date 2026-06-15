@@ -1334,6 +1334,53 @@ def build_app(
         updated.save(config_path)
         return {"ok": True, "pronouns": stored}
 
+    # ── /persona/writes/{rid}/{approve,decline} — file-write consent gate ──
+    @app.post("/persona/writes/{rid}/approve", dependencies=[Depends(require_http_auth)])
+    async def approve_write(rid: str) -> dict:
+        """Approve a pending file write → commit it (TOCTOU guard re-runs).
+
+        404 if the id is unknown, 409 if it's already resolved
+        (committed / declined / expired / refused). Otherwise commit_write
+        re-runs the write guard on the resolved path and performs the write,
+        opening a MemoryStore for the file_write memory wire-back.
+        """
+        from brain.files import pending
+        from brain.files.commit import commit_write
+
+        rec = pending.get(persona_dir, rid)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown write")
+        if rec.get("status") != "pending":
+            raise HTTPException(status_code=409, detail=f"already {rec.get('status')}")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            res = commit_write(persona_dir, rid, store=store)
+        finally:
+            store.close()
+        return res
+
+    @app.post("/persona/writes/{rid}/decline", dependencies=[Depends(require_http_auth)])
+    async def decline_write_route(rid: str) -> dict:
+        """Decline a pending file write → resolve it without writing anything.
+
+        Same 404 / 409 shape as approve. decline_write marks the record
+        declined and wires a file_write memory (no file content stored).
+        """
+        from brain.files import pending
+        from brain.files.commit import decline_write
+
+        rec = pending.get(persona_dir, rid)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown write")
+        if rec.get("status") != "pending":
+            raise HTTPException(status_code=409, detail=f"already {rec.get('status')}")
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            res = decline_write(persona_dir, rid, store=store)
+        finally:
+            store.close()
+        return res
+
     # ── /self/works[*] — self-knowledge surface (source spec §15.2) ────────
     @app.get("/self/works", dependencies=[Depends(require_http_auth)])
     def get_self_works(type: str | None = None, limit: int = 20) -> dict:
