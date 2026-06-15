@@ -132,6 +132,12 @@ def test_ingest_turn_rejects_path_traversal_session_id(tmp_path: Path) -> None:
     string straight into a filename interpolation."""
     import pytest as _pytest
 
+    # Snapshot the shared pytest basetemp BEFORE the evil loop. A real traversal
+    # would create a NEW entry here; comparing before/after is robust against
+    # unrelated tmp dirs whose names merely contain "escape"/"passwd" (e.g.
+    # security tests named *_escape_*), which a substring scan false-flagged.
+    before = set(tmp_path.parent.iterdir())
+
     for evil in [
         "../../etc/passwd",
         "../escape",
@@ -146,10 +152,9 @@ def test_ingest_turn_rejects_path_traversal_session_id(tmp_path: Path) -> None:
     # Empty string is fine — the `or` fallback in ingest_turn synthesizes a
     # fresh sess_<8hex> id. The audit's concern was that "" would land at
     # ".jsonl"; that no longer happens.
-    # Persona dir is unchanged — no escaped writes
-    parent_files = list(tmp_path.parent.iterdir())
-    leaked = [p for p in parent_files if "passwd" in p.name or "escape" in p.name]
-    assert leaked == [], f"unexpected leak: {leaked}"
+    # Persona dir is unchanged — no escaped writes landed in the parent.
+    after = set(tmp_path.parent.iterdir())
+    assert after == before, f"unexpected leak: {sorted(after - before)}"
 
 
 def test_ingest_turn_accepts_uuid_and_sess_prefix_session_ids(tmp_path: Path) -> None:
