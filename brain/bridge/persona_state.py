@@ -65,6 +65,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
         "soul_highlight": _build_soul_highlight(persona_dir),
+        "pending_writes": _build_pending_writes(persona_dir),
         "connection": _build_connection(persona_dir),
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
@@ -156,6 +157,46 @@ def _felt_time_recovered(persona_dir: Path) -> bool:
         return bool(json.loads(state_file.read_text()).get("replayed", False))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _build_pending_writes(persona_dir: Path) -> list[dict]:
+    """Pending file-write proposals awaiting the user's approve/decline.
+
+    The consent gate for the file-write capability: ``propose_write`` queues
+    a guarded write (writing nothing) and the frontend polls these so it can
+    render a confirm card. Only ``pending`` rows that haven't expired surface
+    here — ``list_pending`` already filters out resolved (committed / declined
+    / refused / error) and TTL-expired records, so a card never lingers after
+    the user acts or the 24h window lapses.
+
+    Each row carries a content ``preview`` (capped at 2000 chars) plus a
+    ``truncated`` flag so the card can show the gist without shipping a huge
+    body over the wire.
+
+    Fail-soft: any read error contributes ``[]`` rather than raising, matching
+    the rest of this aggregator.
+    """
+    from brain.files import pending
+
+    try:
+        rows = pending.list_pending(persona_dir, now=datetime.now(UTC))
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: pending_writes read failed", exc_info=True)
+        return []
+    out = []
+    for r in rows:
+        content = r.get("content", "")
+        out.append(
+            {
+                "id": r["id"],
+                "op": r["op"],
+                "path": r["resolved_path"],
+                "preview": content[:2000],
+                "truncated": len(content) > 2000,
+                "proposed_at": r["proposed_at"],
+            }
+        )
+    return out
 
 
 def _build_connection(persona_dir: Path) -> dict[str, Any]:
