@@ -202,3 +202,51 @@ def _expired(envelope: dict, now: datetime) -> bool:
     except (KeyError, ValueError, TypeError):
         return True
     return now > exp + _SKEW
+
+
+def build_session_open(
+    *,
+    sender: KindledIdentity,
+    recipient_key_id: str,
+    relay_mailbox: str,
+    session_id: str,
+    ephemeral_pub: bytes,
+    bootstrap_nonce: bytes,
+    now: datetime,
+    ttl: timedelta,
+) -> dict:
+    """A signed (NOT encrypted — no session key yet) handshake envelope carrying
+    the sender's ephemeral X25519 public key + bootstrap nonce (protocol §4)."""
+    outer = {
+        "protocol": SUPPORTED_PROTOCOL,
+        "relay_mailbox": relay_mailbox,
+        "sender_key_id": sender.key_id,
+        "recipient_key_id": recipient_key_id,
+        "session_id": session_id,
+        "sequence": 0,
+        "created_at": _iso(now),
+        "expires_at": _iso(now + ttl),
+        "session_open": {
+            "ephemeral_pub": ephemeral_pub.hex(),
+            "bootstrap_nonce": bootstrap_nonce.hex(),
+        },
+    }
+    outer["signature"] = sign_envelope(outer, sender)
+    return outer
+
+
+def parse_session_open(
+    envelope: dict, *, sender_pub: bytes, now: datetime
+) -> tuple[dict | None, RejectReason | None]:
+    """Verify a session_open envelope's signature + protocol + expiry. Returns
+    ({ephemeral_pub, bootstrap_nonce} hex, None) or (None, RejectReason)."""
+    if envelope.get("protocol") != SUPPORTED_PROTOCOL:
+        return None, RejectReason.PROTOCOL_MISMATCH
+    if not verify_envelope_signature(envelope, sender_pub):
+        return None, RejectReason.BAD_SIGNATURE
+    if _expired(envelope, now):
+        return None, RejectReason.EXPIRED
+    body = envelope.get("session_open")
+    if not isinstance(body, dict):
+        return None, RejectReason.AEAD_FAILURE
+    return body, None
