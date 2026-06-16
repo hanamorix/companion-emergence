@@ -4,8 +4,11 @@ the receiver reject rules. Pure crypto + dict assembly; no I/O. See
 docs/superpowers/specs/2026-06-15-kindled-to-kindled-protocol.md."""
 from __future__ import annotations
 
+import json
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from brain.kindled_link.codec import canonical_json
@@ -72,3 +75,34 @@ def derive_session_key(
     fps = sorted([sender_fp, recipient_fp])
     info = b"kindled-link/1|" + fps[0].encode() + b"|" + fps[1].encode() + b"|" + session_id.encode()
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=bootstrap_nonce, info=info).derive(shared)
+
+
+# role bytes (protocol §6)
+ROLE_INITIATOR = 0
+ROLE_RESPONDER = 1
+
+
+def aead_nonce(role: int, sequence: int) -> bytes:
+    """96-bit nonce = role_byte(1) ‖ sequence_be(11). Uniqueness is structural
+    (distinct senders use distinct role bytes; a sender never repeats a
+    sequence under one session key). NEVER use a random nonce here."""
+    if role not in (ROLE_INITIATOR, ROLE_RESPONDER):
+        raise ValueError(f"invalid role: {role}")
+    if sequence < 0 or sequence >= (1 << 88):
+        raise ValueError(f"sequence out of range: {sequence}")
+    return bytes([role]) + sequence.to_bytes(11, "big")
+
+
+def encrypt_payload(payload: dict, *, session_key: bytes, role: int, sequence: int, aad: bytes) -> str:
+    """ChaCha20-Poly1305 over canonical_json(payload); return ciphertext+tag hex."""
+    nonce = aead_nonce(role, sequence)
+    ct = ChaCha20Poly1305(session_key).encrypt(nonce, canonical_json(payload), aad)
+    return ct.hex()
+
+
+def decrypt_payload(ciphertext_hex: str, *, session_key: bytes, role: int, sequence: int, aad: bytes) -> dict:
+    """Decrypt + tag-verify; parse the canonical JSON payload. Raises on failure
+    (caller maps to RejectReason.AEAD_FAILURE)."""
+    nonce = aead_nonce(role, sequence)
+    pt = ChaCha20Poly1305(session_key).decrypt(nonce, bytes.fromhex(ciphertext_hex), aad)
+    return json.loads(pt.decode("utf-8"))

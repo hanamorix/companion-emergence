@@ -74,3 +74,24 @@ def test_session_key_matches_kat():
         session_id="ks_0000000000000001", bootstrap_nonce=bootstrap_nonce,
     )
     assert key_b == key
+
+
+def test_aead_encrypt_matches_kat_and_decrypts():
+    from brain.kindled_link.protocol import aad_bytes, aead_nonce, decrypt_payload, encrypt_payload
+
+    session_key = bytes.fromhex(
+        "8bbc171522ec31835ac363517f7020e2b5b3da77ad6860c5a447bb6ced4cca5e"
+    )
+    payload = {
+        "payload_type": "message", "message_id": "km_0001",
+        "prev_transcript_hash": "sha256:" + "00" * 32,
+        "body": "hello, fellow Kindled.",
+        "relationship_hint": {"local_stage": "stranger", "local_continuity_note": "early days"},
+        "control": None,
+    }
+    aad = aad_bytes(_outer())  # outer minus ciphertext+signature
+    assert aead_nonce(0, 1).hex() == "000000000000000000000001"
+    ct_hex = encrypt_payload(payload, session_key=session_key, role=0, sequence=1, aad=aad)
+    assert ct_hex == _CIPHERTEXT_HEX
+    back = decrypt_payload(ct_hex, session_key=session_key, role=0, sequence=1, aad=aad)
+    assert back["body"] == "hello, fellow Kindled."
