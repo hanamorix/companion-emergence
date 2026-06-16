@@ -1,18 +1,24 @@
 """Minimal dumb relay (protocol §8 / design §8). Stores opaque encrypted
 envelopes by mailbox and forwards them; never sees plaintext. In-memory state
-for the dev/alpha relay. Mailbox-ownership auth on fetch/ack is added in Task 8."""
+for the dev/alpha relay."""
 from __future__ import annotations
 
 import itertools
+import secrets
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+from brain.kindled_link.codec import canonical_json
+from brain.kindled_link.identity import verify as _verify
 
 
 class _Store:
     def __init__(self) -> None:
         self.mailboxes: dict[str, list[dict]] = {}
         self._ids = itertools.count(1)
+        self.owners: dict[str, str] = {}   # mailbox_id → identity_pub hex
+        self.nonces: dict[str, set[str]] = {}  # mailbox_id → live nonces
 
     def push(self, envelope: dict) -> str:
         mbx = envelope["relay_mailbox"]
@@ -28,18 +34,60 @@ class _Store:
         self.mailboxes[mailbox_id] = kept
 
 
+class _RegisterReq(BaseModel):
+    mailbox_id: str
+    identity_pub: str
+
+
 class _FetchReq(BaseModel):
     mailbox_id: str
+    nonce: str | None = None
+    signature: str | None = None
+    identity_pub: str | None = None
 
 
 class _AckReq(BaseModel):
     mailbox_id: str
     envelope_ids: list[str]
+    nonce: str | None = None
+    signature: str | None = None
+    identity_pub: str | None = None
 
 
-def create_app() -> FastAPI:
+def _check_auth(store: _Store, mailbox_id: str, nonce: str | None,
+                signature: str | None, identity_pub: str | None) -> None:
+    owner = store.owners.get(mailbox_id)
+    if owner is None or nonce is None or signature is None or identity_pub is None:
+        raise HTTPException(status_code=401, detail="auth required")
+    if identity_pub != owner:
+        raise HTTPException(status_code=401, detail="not mailbox owner")
+    if nonce not in store.nonces.get(mailbox_id, set()):
+        raise HTTPException(status_code=401, detail="bad nonce")
+    body = canonical_json({"purpose": "kindled-relay-auth/1",
+                           "mailbox": mailbox_id, "nonce": nonce})
+    try:
+        ok = _verify(bytes.fromhex(identity_pub), bytes.fromhex(signature), body)
+    except ValueError:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=401, detail="bad signature")
+    store.nonces[mailbox_id].discard(nonce)  # single-use
+
+
+def create_app(require_auth: bool = False) -> FastAPI:
     app = FastAPI()
     store = _Store()
+
+    @app.post("/mailbox/register")
+    def register(req: _RegisterReq) -> dict:
+        store.owners.setdefault(req.mailbox_id, req.identity_pub)  # first-write-wins
+        return {"ok": True, "owner": store.owners[req.mailbox_id]}
+
+    @app.post("/mailbox/challenge")
+    def challenge(req: _FetchReq) -> dict:
+        nonce = secrets.token_hex(16)
+        store.nonces.setdefault(req.mailbox_id, set()).add(nonce)
+        return {"nonce": nonce}
 
     @app.post("/envelope")
     def post_envelope(envelope: dict) -> dict:  # open push, rate-limited in prod
@@ -47,10 +95,14 @@ def create_app() -> FastAPI:
 
     @app.post("/mailbox/fetch")
     def fetch(req: _FetchReq) -> dict:
+        if require_auth:
+            _check_auth(store, req.mailbox_id, req.nonce, req.signature, req.identity_pub)
         return {"envelopes": store.fetch(req.mailbox_id)}
 
     @app.post("/mailbox/ack")
     def ack(req: _AckReq) -> dict:
+        if require_auth:
+            _check_auth(store, req.mailbox_id, req.nonce, req.signature, req.identity_pub)
         store.ack(req.mailbox_id, req.envelope_ids)
         return {"ok": True}
 
