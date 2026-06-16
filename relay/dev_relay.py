@@ -23,7 +23,11 @@ class _Store:
     def push(self, envelope: dict) -> str:
         mbx = envelope["relay_mailbox"]
         env_id = f"env_{next(self._ids)}"
-        self.mailboxes.setdefault(mbx, []).append({"id": env_id, **envelope})
+        # The relay's tracking id is transport metadata kept SEPARATE from the
+        # opaque envelope — never merged into it. Injecting a field into the
+        # envelope would change its canonical JSON and break the recipient's
+        # signature verification (the relay must not mutate the payload).
+        self.mailboxes.setdefault(mbx, []).append({"id": env_id, "envelope": envelope})
         return env_id
 
     def fetch(self, mailbox_id: str) -> list[dict]:

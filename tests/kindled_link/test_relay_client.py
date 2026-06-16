@@ -32,7 +32,7 @@ def test_register_push_fetch_ack_roundtrip():
     rc.register()
     rc.push(_envelope())                     # anyone can push to mbx_me
     envs = rc.fetch()                         # owner-authenticated fetch
-    assert len(envs) == 1 and envs[0]["ciphertext"] == "deadbeef"
+    assert len(envs) == 1 and envs[0]["envelope"]["ciphertext"] == "deadbeef"
     rc.ack([envs[0]["id"]])
     assert rc.fetch() == []
 
