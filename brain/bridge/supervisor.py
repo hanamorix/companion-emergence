@@ -243,6 +243,24 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("soul candidate repair failed during startup: %s", exc)
 
+    # One-shot startup: clear a persisted self-model gap left by the pre-fix
+    # (v0.0.36 total-mass-mean) derived read — the magnitude-354 artifact. The
+    # next reflection tick recomputes honestly under the windowed-peak read; the
+    # reset prevents a false "natural resolution" from the collapsing artifact.
+    # Provider-free, state-file only; independent try/except.
+    try:
+        from brain.health.self_model_repair import (
+            run_self_model_repair as _self_model_repair_run,
+        )
+        from brain.health.self_model_repair import (
+            should_run_self_model_repair as _self_model_repair_should_run,
+        )
+
+        if _self_model_repair_should_run(persona_dir):
+            _self_model_repair_run(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("self-model repair failed during startup: %s", exc)
+
     while not stop_event.is_set():
         try:
             with ExitStack() as stack:
