@@ -80,11 +80,11 @@ def test_full_message_loop_through_relay(tmp_path):
 
     fetched = rc_b.fetch()
     assert len(fetched) == 1
-    # Strip the relay-internal "id" tracking field before protocol verification.
-    # The relay merges {"id": ..., **envelope} for ack purposes; "id" is not
-    # part of the signed envelope and must not appear in sig_input_bytes.
+    # The relay returns {"id": <transport id>, "envelope": <pristine envelope>};
+    # the id is transport metadata kept OUT of the signed payload, so no stripping
+    # is needed — verify the envelope directly.
     env_id = fetched[0]["id"]
-    wire_env = {k: v for k, v in fetched[0].items() if k != "id"}
+    wire_env = fetched[0]["envelope"]
     hw = store_b.get_seq_high_water(a.key_id, "ks_1")
     payload, reason = verify_and_open(
         wire_env, recipient=b, sender_pub=a.public_bytes,
@@ -97,8 +97,7 @@ def test_full_message_loop_through_relay(tmp_path):
 
     # Replay simulation: relay re-delivers the same envelope → rejected by HWM.
     rc_a.push(env)
-    again_raw = rc_b.fetch()[0]
-    again = {k: v for k, v in again_raw.items() if k != "id"}
+    again = rc_b.fetch()[0]["envelope"]
     _, reason2 = verify_and_open(
         again, recipient=b, sender_pub=a.public_bytes, session_key=sk,
         sender_role=ROLE_INITIATOR,
