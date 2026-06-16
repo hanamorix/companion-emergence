@@ -115,3 +115,26 @@ def test_protocol_mismatch_rejected():
                                 session_key=sk, sender_role=ROLE_INITIATOR,
                                 seq_high_water=0, now=_NOW)
     assert reason == RejectReason.PROTOCOL_MISMATCH
+
+
+def test_session_open_roundtrip():
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    from brain.kindled_link.protocol import build_session_open, parse_session_open
+
+    a, b = _pair()
+    eph = X25519PrivateKey.from_private_bytes(bytes(range(64, 96)))
+    bootstrap = bytes(range(200, 216))
+    env = build_session_open(
+        sender=a, recipient_key_id=b.key_id, relay_mailbox="mbx_b",
+        session_id="ks_1", ephemeral_pub=eph.public_key().public_bytes_raw(),
+        bootstrap_nonce=bootstrap, now=_NOW, ttl=timedelta(days=7),
+    )
+    parsed, reason = parse_session_open(env, sender_pub=a.public_bytes, now=_NOW)
+    assert reason is None
+    assert parsed["ephemeral_pub"] == eph.public_key().public_bytes_raw().hex()
+    assert parsed["bootstrap_nonce"] == bootstrap.hex()
+    # tamper the ephemeral → signature breaks
+    env["session_open"]["ephemeral_pub"] = "00" * 32
+    _, reason2 = parse_session_open(env, sender_pub=a.public_bytes, now=_NOW)
+    assert reason2 == RejectReason.BAD_SIGNATURE
