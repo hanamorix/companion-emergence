@@ -22,7 +22,7 @@ def test_push_then_fetch_returns_envelope():
     r = c.post("/mailbox/fetch", json={"mailbox_id": "mbx_b"})
     assert r.status_code == 200
     envs = r.json()["envelopes"]
-    assert len(envs) == 1 and envs[0]["ciphertext"] == "deadbeef"
+    assert len(envs) == 1 and envs[0]["envelope"]["ciphertext"] == "deadbeef"
 
 
 def test_ack_removes_envelope():
