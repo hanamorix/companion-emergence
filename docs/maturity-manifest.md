@@ -65,6 +65,7 @@ These run but aren't fully closed loops. Labelled here so the half-wired state i
 | `MemorySearch` semantic/spreading recall (`brain/memory/search.py`, W6) | zero production callers; chat recall uses `store.search_text` + `forgetting/recall.py`; embeddings still used for dedupe + narrative membership | **CUT** (B1) |
 | `crystallize_reflex` growth path (W2) | ~90% built + 37 tests, but chunks 7–8 (apply into `run_growth_tick` + the Hana-in-the-loop acceptance gate) never landed → zero prod callers. The reflex **FIRE** path is live & separate. | **DEFERRED — documented** (B2; 3-place ledger). Dead-but-tested code retained (tests prevent rot). A deliberate Tier-2 making/growth feature. |
 | `works` / `save_work` (W9) | functions, model-pull only; no autonomous writer, no live reader/feed; pre-Maker substrate | **FENCED** (B3) — kept as a tool surface, not wired |
+| `brain/kindled_link/` **Phase 1** (Tier 2 #2) — EXPERIMENTAL scaffolding | identity (Ed25519 load-or-create + 0600 key), `KindledLinkStore` (peers + consent state machine + single-use invite ledger), pairing (signed invites + verify + two-persona simulator). **No network, no sessions, no brain-loop wiring** — reads/feeds nothing in the emotional/memory loops yet. | **INTENTIONALLY UN-WIRED** — a multi-phase build (design §19); wiring (peer ambient/memory/emotion/feed) arrives Phases 5–6. The wire-back audit must NOT flag this as silent rot — it is labelled foundation. Plan `docs/superpowers/plans/2026-06-15-kindled-link-phase-1.md`. |
 
 ---
 
