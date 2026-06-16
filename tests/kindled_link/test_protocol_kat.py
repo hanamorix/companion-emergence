@@ -51,3 +51,26 @@ def test_verify_signature_roundtrip_and_tamper():
     assert verify_envelope_signature(outer, idn_a.public_bytes) is True
     tampered = dict(outer, sequence=2)  # changed a signed field
     assert verify_envelope_signature(tampered, idn_a.public_bytes) is False
+
+
+def test_session_key_matches_kat():
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    from brain.kindled_link.protocol import derive_session_key
+
+    eph_a = X25519PrivateKey.from_private_bytes(bytes(range(64, 96)))
+    eph_b = X25519PrivateKey.from_private_bytes(bytes(range(96, 128)))
+    bootstrap_nonce = bytes(range(200, 216))
+    key = derive_session_key(
+        eph_a, eph_b.public_key().public_bytes_raw(),
+        sender_fp=_KIDA, recipient_fp=_KIDB,
+        session_id="ks_0000000000000001", bootstrap_nonce=bootstrap_nonce,
+    )
+    assert key.hex() == "8bbc171522ec31835ac363517f7020e2b5b3da77ad6860c5a447bb6ced4cca5e"
+    # init-independent: B derives the same key from its side
+    key_b = derive_session_key(
+        eph_b, eph_a.public_key().public_bytes_raw(),
+        sender_fp=_KIDB, recipient_fp=_KIDA,
+        session_id="ks_0000000000000001", bootstrap_nonce=bootstrap_nonce,
+    )
+    assert key_b == key
