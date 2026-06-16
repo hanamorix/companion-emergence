@@ -67,3 +67,17 @@ def import_invite(
         "peer_id": body["fingerprint"],
         "fingerprint_phrase": fingerprint_phrase(pub),
     }
+
+
+def confirm_local_fingerprint(
+    store: KindledLinkStore, peer_id: str, *, now: datetime | None = None
+) -> None:
+    """The local user verified the fingerprint phrase: pending_local -> pending_remote."""
+    store.set_consent(peer_id, "pending_remote", now or datetime.now(UTC))
+
+
+def mark_remote_paired(
+    store: KindledLinkStore, peer_id: str, *, now: datetime | None = None
+) -> None:
+    """The remote side confirmed too: pending_remote -> paired (durable consent)."""
+    store.set_consent(peer_id, "paired", now or datetime.now(UTC))
