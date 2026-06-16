@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS consumed_invites (
     invite_id   TEXT PRIMARY KEY,
     consumed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS seq_high_water (
+    peer_id     TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    high_water  INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -130,4 +136,24 @@ class KindledLinkStore:
             raise ConsentTransitionError(
                 f"invite already consumed: {invite_id!r}"
             ) from exc
+        self._conn.commit()
+
+    def get_seq_high_water(self, peer_id: str, session_id: str) -> int:
+        """The highest accepted per-(peer, session) sequence (0 if none). Used by
+        the receiver to reject replayed/duplicate envelopes (protocol §8 rule 5)."""
+        row = self._conn.execute(
+            "SELECT high_water FROM seq_high_water WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        return int(row["high_water"]) if row else 0
+
+    def set_seq_high_water(self, peer_id: str, session_id: str, value: int) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO seq_high_water (peer_id, session_id, high_water)
+            VALUES (?, ?, ?)
+            ON CONFLICT(peer_id, session_id) DO UPDATE SET high_water = excluded.high_water
+            """,
+            (peer_id, session_id, value),
+        )
         self._conn.commit()
