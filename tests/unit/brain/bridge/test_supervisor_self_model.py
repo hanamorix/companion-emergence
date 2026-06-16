@@ -34,25 +34,32 @@ def _persona_dir(tmp_path: Path) -> Path:
 
 
 def _seed_divergent_memories(persona_dir: Path) -> None:
-    """An OLD high-intensity joy + several RECENT grief memories.
+    """OLD high-intensity joy + love peaks, beyond the recent window, plus many
+    RECENT grief memories.
 
-    max-pool (declared) surfaces joy; recency-mean (derived) leans grief →
-    a non-zero gap that declared and derived genuinely disagree on.
+    declared (max-pool over the whole history) surfaces joy + love at their old
+    peaks; derived (peak over the most-recent _RECENT_WINDOW_COUNT=30 memories)
+    sees only the recent grief — so joy and love show a real negative gap
+    ("I claim these but haven't felt them lately"), while grief ~matches. Two
+    divergent channels so a reconcile on one leaves the gap non-empty.
     """
     from brain.memory.store import Memory, MemoryStore
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        old_joy = Memory.create_new(
-            content="an old bright day",
-            memory_type="episodic",
-            domain="self",
-            emotions={"joy": 9.0},
-            importance=8.0,
-        )
-        object.__setattr__(old_joy, "created_at", datetime(2026, 1, 1, tzinfo=UTC))
-        store.create(old_joy)
-        for i in range(4):
+        for name, intensity in (("joy", 9.0), ("love", 8.0)):
+            old = Memory.create_new(
+                content=f"an old bright day of {name}",
+                memory_type="episodic",
+                domain="self",
+                emotions={name: intensity},
+                importance=8.0,
+            )
+            object.__setattr__(old, "created_at", datetime(2026, 1, 1, tzinfo=UTC))
+            store.create(old)
+        # > _RECENT_WINDOW_COUNT recent grief memories so the old peaks fall
+        # outside the derived window.
+        for i in range(31):
             m = Memory.create_new(
                 content=f"a recent ache #{i}",
                 memory_type="episodic",

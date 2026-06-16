@@ -24,17 +24,23 @@ def _mem(emotions: dict, age_days: float) -> Memory:
     return m
 
 
-def test_derived_returns_recency_weighted_not_maxpool():
-    """OLD high-intensity joy + RECENT low-intensity grief.
+def test_derived_is_recent_window_peak_excluding_old_peaks():
+    """Windowed peak: a high-intensity OLD memory beyond the recent window does
+    NOT contribute; only the recent window's peaks do.
 
-    max-pool (declared) would surface joy; recency-mean (derived) leans
-    grief because the recent memory carries far more weight.
+    (Replaces the old recency-MEAN contract — the derived read is now a peak
+    over the most-recent _RECENT_WINDOW_COUNT memories, commensurable with the
+    declared lifetime peak. The two diverge only when a channel's peak is older
+    than the window — an honest "I claim this but haven't felt it lately" gap.)
     """
-    mems = [_mem({"joy": 9.0}, age_days=20), _mem({"grief": 3.0}, age_days=0)]
+    # 31 recent grief memories + 1 old joy peak. With a 30-memory window the
+    # oldest (joy) falls outside the window → derived sees grief, not joy.
+    mems = [_mem({"grief": 3.0}, age_days=0) for _ in range(31)]
+    mems.append(_mem({"joy": 9.0}, age_days=60))
     out = compute_derived(mems, body_energy=5, body_exhaustion=2)
     assert isinstance(out, DerivedRead)
-    # derived grief should be >= joy (recency wins), unlike max-pool which would say joy=9
-    assert out.channels.get("grief", 0) >= out.channels.get("joy", 0)
+    assert out.channels.get("grief", 0) == 3.0
+    assert out.channels.get("joy", 0) == 0.0  # old peak excluded by the recent window
 
 
 def test_identical_recent_and_peak_signals_no_divergence():
@@ -78,3 +84,28 @@ def test_strong_bodily_signal_with_no_channel_home_flags_pressure():
     mems = [_mem({"joy": 1.0}, age_days=30)]  # faint, stale, joy only
     out = compute_derived(mems, body_energy=1, body_exhaustion=9)
     assert out.unnamed_pressure > 0.0
+
+
+# ─── Windowed-peak regression (self_model_state.json magnitude-354 artifact) ──
+
+
+def test_recent_diverse_channels_no_dilution_artifact():
+    """Regression for the live magnitude-354 bug.
+
+    With many memories EACH carrying a different channel at peak (the normal
+    shape of a real persona — any one channel appears in only a fraction of
+    memories), the old total-mass-normalised derived diluted every channel to
+    a small fraction of its peak, so the gap vs declared (max-pool peak) was a
+    large uniform-negative offset (~N_channels × peak). The windowed peak reads
+    each recently-felt channel at its actual peak → derived ≈ declared → the
+    gap is small.
+    """
+    from brain.emotion.aggregate import aggregate_state
+    from brain.self_model.gap import compute_gap
+
+    chans = ["joy", "grief", "curiosity", "love"]
+    mems = [_mem({chans[i % len(chans)]: 7.0}, age_days=i % 3) for i in range(40)]
+    declared = aggregate_state(mems)
+    derived = compute_derived(mems, body_energy=5, body_exhaustion=2)
+    gap = compute_gap(declared, derived)
+    assert gap.magnitude < 3.0, f"dilution artifact present: magnitude={gap.magnitude:.1f}"
