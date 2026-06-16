@@ -4,7 +4,9 @@ the receiver reject rules. Pure crypto + dict assembly; no I/O. See
 docs/superpowers/specs/2026-06-15-kindled-to-kindled-protocol.md."""
 from __future__ import annotations
 
+import enum
 import json
+from datetime import UTC, datetime, timedelta
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -20,6 +22,8 @@ SUPPORTED_PROTOCOL = "kindled-link/1"
 _AAD_EXCLUDE = ("ciphertext", "signature")
 # Outer-envelope field excluded from the signing input.
 _SIG_EXCLUDE = ("signature",)
+
+_SKEW = timedelta(minutes=5)
 
 
 def _without(outer: dict, keys) -> dict:
@@ -106,3 +110,95 @@ def decrypt_payload(ciphertext_hex: str, *, session_key: bytes, role: int, seque
     nonce = aead_nonce(role, sequence)
     pt = ChaCha20Poly1305(session_key).decrypt(nonce, bytes.fromhex(ciphertext_hex), aad)
     return json.loads(pt.decode("utf-8"))
+
+
+class RejectReason(enum.Enum):
+    PROTOCOL_MISMATCH = "protocol_mismatch"
+    BAD_SIGNATURE = "bad_signature"
+    WRONG_RECIPIENT = "wrong_recipient"
+    AEAD_FAILURE = "aead_failure"
+    REPLAY = "replay"
+    EXPIRED = "expired"
+
+
+def build_envelope(
+    *,
+    payload: dict,
+    sender: KindledIdentity,
+    recipient_key_id: str,
+    relay_mailbox: str,
+    session_id: str,
+    sequence: int,
+    role: int,
+    session_key: bytes,
+    now: datetime,
+    ttl: timedelta,
+) -> dict:
+    """Assemble a signed, encrypted outer envelope (protocol §3)."""
+    outer = {
+        "protocol": SUPPORTED_PROTOCOL,
+        "relay_mailbox": relay_mailbox,
+        "sender_key_id": sender.key_id,
+        "recipient_key_id": recipient_key_id,
+        "session_id": session_id,
+        "sequence": sequence,
+        "created_at": _iso(now),
+        "expires_at": _iso(now + ttl),
+    }
+    aad = aad_bytes(outer)
+    outer["ciphertext"] = encrypt_payload(
+        payload, session_key=session_key, role=role, sequence=sequence, aad=aad
+    )
+    outer["signature"] = sign_envelope(outer, sender)
+    return outer
+
+
+def verify_and_open(
+    envelope: dict,
+    *,
+    recipient: KindledIdentity,
+    sender_pub: bytes,
+    session_key: bytes,
+    sender_role: int,
+    seq_high_water: int,
+    now: datetime,
+) -> tuple[dict | None, RejectReason | None]:
+    """Apply the receiver reject rules (protocol §8) in order. Returns
+    (payload, None) on success or (None, RejectReason) on rejection. The
+    transcript-hash check (rule 7) is advisory and intentionally NOT applied
+    here."""
+    if envelope.get("protocol") != SUPPORTED_PROTOCOL:
+        return None, RejectReason.PROTOCOL_MISMATCH
+    if not verify_envelope_signature(envelope, sender_pub):
+        return None, RejectReason.BAD_SIGNATURE
+    if envelope.get("recipient_key_id") != recipient.key_id:
+        return None, RejectReason.WRONG_RECIPIENT
+    try:
+        sequence = int(envelope["sequence"])
+    except (KeyError, TypeError, ValueError):
+        return None, RejectReason.AEAD_FAILURE
+    if sequence <= seq_high_water:
+        return None, RejectReason.REPLAY
+    if _expired(envelope, now):
+        return None, RejectReason.EXPIRED
+    try:
+        aad = aad_bytes(envelope)
+        payload = decrypt_payload(
+            envelope["ciphertext"], session_key=session_key,
+            role=sender_role, sequence=sequence, aad=aad,
+        )
+    except Exception:
+        return None, RejectReason.AEAD_FAILURE
+    return payload, None
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expired(envelope: dict, now: datetime) -> bool:
+    try:
+        exp = datetime.strptime(envelope["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (KeyError, ValueError, TypeError):
+        return True
+    return now > exp + _SKEW
