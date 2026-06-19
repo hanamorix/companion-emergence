@@ -107,6 +107,11 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
         )
         return {"error": f"file too large ({size} bytes > {_FILE_READ_MAX_BYTES} cap) — not shown"}
 
+    # Platform-correct case handling: normcase lowercases on Windows (case-
+    # insensitive FS) and is a no-op on macOS/Linux, where realpath already
+    # canonicalises case on the case-insensitive macOS FS and keeps genuinely
+    # distinct files distinct on case-sensitive Linux. Do NOT casefold here — on
+    # Linux that would collide two different files (Notes.md vs notes.md).
     _dedup_key = os.path.normcase(os.path.realpath(str(p)))
     if _read_cache.seen_recently(_dedup_key):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
