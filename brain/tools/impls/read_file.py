@@ -7,6 +7,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.tools.impls import _read_cache
+
 _FILE_READ_MAX_BYTES = 256 * 1024
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
@@ -104,6 +106,16 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             error="too large",
         )
         return {"error": f"file too large ({size} bytes > {_FILE_READ_MAX_BYTES} cap) — not shown"}
+
+    _dedup_key = os.path.normcase(os.path.realpath(str(p)))
+    if _read_cache.seen_recently(_dedup_key):
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
+        return {
+            "path": str(p),
+            "deduped": True,
+            "note": "you already read this file moments ago this turn — its content is above.",
+        }
+    _read_cache.mark(_dedup_key)
 
     try:
         data = p.read_bytes()
