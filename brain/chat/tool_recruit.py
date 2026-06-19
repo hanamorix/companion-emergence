@@ -40,6 +40,26 @@ _MEMORY_TOOLS = (
 )
 _FILE_TOOLS = ("read_file", "list_directory", "propose_write")
 
+# Works tools confirmed present in NELL_TOOL_NAMES: save_work, list_works, search_works, read_work.
+_WORKS_TOOLS = ("save_work", "list_works", "search_works", "read_work")
+
+
+def tools_for_capability(capability: str) -> list[str]:
+    """The slim tool set a reach_for_capability(capability) should expand to —
+    that capability's tools + the reflexive core. Unknown capability → full suite
+    (preserve the agency safety-valve)."""
+    cap = (capability or "").strip().lower()
+    table: dict[str, tuple[str, ...]] = {
+        "files": _FILE_TOOLS,
+        "memory": _MEMORY_TOOLS,
+        "works": _WORKS_TOOLS,
+    }
+    extra = table.get(cap)
+    if extra is None:
+        return list(NELL_TOOL_NAMES)
+    keep = set(REFLEXIVE_CORE) | set(extra)
+    return [t for t in NELL_TOOL_NAMES if t in keep]
+
 
 def select_tools(
     signal: SalienceSignal,

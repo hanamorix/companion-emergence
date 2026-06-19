@@ -9,7 +9,6 @@ from brain.bridge.provider import LLMProvider
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
-from brain.tools import NELL_TOOL_NAMES
 
 # ---------------------------------------------------------------------------
 # Stub provider for scripted sequential ChatResponse objects
@@ -100,11 +99,16 @@ def test_recruit_on_reach_expands_and_reruns(tmp_path: Path) -> None:
     # Exactly 2 provider.chat calls
     assert len(provider.chat_calls) == 2, f"Expected 2 chat calls, got {len(provider.chat_calls)}"
 
-    # 2nd call used the FULL tool suite
+    # 2nd call used the scoped tool set for the reached capability ("memory"),
+    # not the full suite — T5 (E) scopes reach re-invoke to the faculty.
+    from brain.chat.tool_recruit import tools_for_capability
     second_tool_names = {t["function"]["name"] for t in (provider.chat_calls[1]["tools"] or [])}
-    assert set(NELL_TOOL_NAMES).issubset(second_tool_names), (
-        f"2nd call tools missing: {set(NELL_TOOL_NAMES) - second_tool_names}"
+    expected_tools = set(tools_for_capability("memory"))
+    assert expected_tools.issubset(second_tool_names), (
+        f"2nd call tools missing: {expected_tools - second_tool_names}"
     )
+    # Heavy tools NOT in the memory faculty must be absent (scoped, not full suite)
+    assert "crystallize_soul" not in second_tool_names
 
     # Final content is from call #2
     assert final_resp.content == "Now I can answer properly"

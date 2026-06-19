@@ -33,6 +33,7 @@ from brain.bridge.provider import LLMProvider
 from brain.chat import pass2_queue
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
 from brain.chat.reflection_gate import should_reflect
+from brain.chat.tool_recruit import tools_for_capability
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -246,7 +247,16 @@ def _maybe_recruit_and_rerun(
     if set(recruited_allowed) >= set(NELL_TOOL_NAMES):
         return None
     try:
-        tools = build_tools_list(companion_name, allowed=list(NELL_TOOL_NAMES))
+        # Scope the re-invoke to the capability she reached for, not the full suite.
+        # invocations entries carry "arguments" as a dict on both the tool_calls path
+        # (tc.arguments is a dict) and the dispatched_invocations MCP path.
+        reach_inv = next(
+            (inv for inv in invocations if inv.get("name") == "reach_for_capability"),
+            None,
+        )
+        capability = (reach_inv.get("arguments") or {}).get("capability", "") if reach_inv else ""
+        allowed_now = tools_for_capability(capability)
+        tools = build_tools_list(companion_name, allowed=allowed_now)
         # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
         rerun_messages = list(messages) + [
             ChatMessage(
