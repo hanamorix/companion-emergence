@@ -551,7 +551,9 @@ SCHEMAS: dict[str, dict] = {
         "description": (
             "Read a text file from the user's computer. Use ONLY when the user explicitly asks you "
             "to read, open, or look at a specific file or path — never proactively. If something you "
-            "read matters, you can choose to remember or reflect on it."
+            "read matters, you can choose to remember or reflect on it. "
+            "Given a folder and an approximate filename, list that folder once and read the matching "
+            "file. Do not walk up to parent directories or search unrelated locations."
         ),
         "parameters": {
             "type": "object",
@@ -576,7 +578,9 @@ SCHEMAS: dict[str, dict] = {
         "name": "list_directory",
         "description": (
             "List the files in a directory on the user's computer — e.g. ~/Desktop. Use ONLY when the "
-            "user explicitly asks you to look at a folder or their desktop — never proactively."
+            "user explicitly asks you to look at a folder or their desktop — never proactively. "
+            "Given a folder and an approximate filename, list that folder once and read the matching "
+            "file. Do not walk up to parent directories or search unrelated locations."
         ),
         "parameters": {
             "type": "object",
