@@ -9,6 +9,7 @@ from pathlib import Path
 
 _FILE_READ_MAX_BYTES = 256 * 1024
 _SUGGEST_MAX = 10
+_DEFAULT_HEAD_LINES = 400
 
 
 def _suggest(target: Path) -> list[str]:
@@ -63,8 +64,14 @@ def _audit(
         pass
 
 
-def read_file(path: str, *, persona_dir: Path, **_) -> dict:
-    """Read a text file's contents (read-only). Refuses files over the size cap."""
+def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
+              offset: int = 0, **_) -> dict:
+    """Read a text file's contents (read-only). Refuses files over the size cap.
+
+    max_lines: optional — return at most this many lines (ranged read).
+    offset: 0-based line to start reading from (used with max_lines).
+    Large files without max_lines are head-capped at _DEFAULT_HEAD_LINES.
+    """
     raw = path
     try:
         p = Path(os.path.expandvars(os.path.expanduser(path))).resolve()
@@ -114,8 +121,28 @@ def read_file(path: str, *, persona_dir: Path, **_) -> dict:
             )
             return {"path": str(p), "note": f"(binary file, {size} bytes — not shown)"}
 
+        lines = content.splitlines(keepends=True)
+        total = len(lines)
+        start = max(0, int(offset or 0))
+        if max_lines is not None:
+            window = lines[start:start + max(0, int(max_lines))]
+            truncated = (start + len(window)) < total or start > 0
+        elif total > _DEFAULT_HEAD_LINES:
+            window = lines[:_DEFAULT_HEAD_LINES]
+            truncated = True
+        else:
+            window = lines[start:] if start else lines
+            truncated = start > 0
+        sliced = "".join(window)
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
-        return {"path": str(p), "content": content}
+        out: dict = {"path": str(p), "content": sliced, "total_lines": total}
+        if truncated:
+            out["truncated"] = True
+            out["note"] = (
+                f"showing lines {start}-{start + len(window)} of {total}; "
+                "pass offset/max_lines to read more"
+            )
+        return out
 
     except OSError as exc:
         _audit(

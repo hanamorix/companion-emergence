@@ -560,6 +560,14 @@ SCHEMAS: dict[str, dict] = {
                     "type": "string",
                     "description": "Absolute or ~-relative path to the file.",
                 },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Optional: read at most this many lines (ranged read). Prefer this over reading whole files.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Optional: start reading at this 0-based line (with max_lines).",
+                },
             },
             "required": ["path"],
         },
