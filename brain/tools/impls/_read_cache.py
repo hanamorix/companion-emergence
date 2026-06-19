@@ -1,6 +1,8 @@
-"""Within-invocation read dedup. Keyed on realpath.casefold() so the same file
-isn't re-emitted (and re-billed) repeatedly inside one reply. TTL-scoped so a
-legitimate re-read in a later reply still returns content.
+"""Within-invocation read dedup. Keyed on the caller's normcase(realpath) so the
+same file isn't re-emitted (and re-billed) repeatedly inside one reply — this is
+platform-correct (macOS realpath canonicalises case; Linux keeps distinct files
+distinct; Windows normcase lowercases). TTL-scoped so a legitimate re-read in a
+later reply still returns content.
 
 Scoping note: no per-turn correlation ID is available in the tool dispatch
 path (dispatch() receives store/hebbian/persona_dir but no request/turn ID).
