@@ -60,6 +60,45 @@ logger = logging.getLogger(__name__)
 # unaffected. Passed as creationflags= on every `claude` spawn below.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# ---------------------------------------------------------------------------
+# Per-turn budget backstop (Task 6 / A)
+# ---------------------------------------------------------------------------
+
+# Generous catastrophe ceiling — must never bite a normal reply.
+# Sized to let even a heavy multi-tool Opus turn finish; only catches
+# runaway 11-28-tool file-crawl loops that would exhaust the subscription.
+# Matched by substring of the model id so short aliases ("sonnet") and
+# fully-qualified ids ("claude-sonnet-4-6") both resolve.
+_BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
+    ("haiku", 0.30),
+    ("sonnet", 0.75),
+    ("opus", 3.00),
+)
+_BUDGET_FALLBACK: float = 1.50
+
+# Graceful message when the CLI hits the per-turn ceiling mid-reply.
+_BUDGET_EXCEEDED_MSG: str = (
+    "I reached this turn's work limit before I finished — "
+    "ask me to continue and I'll pick up where I left off."
+)
+
+
+def _MAX_TURN_BUDGET_USD(model: str) -> float:  # noqa: N802  (module-level constant function)
+    """Return the per-turn catastrophe budget for *model*.
+
+    This is NOT a normal budget — it must never fire on a legitimate reply.
+    It exists solely to cap runaway file-tool loops (11-28 calls/reply) that
+    would exhaust the subscription in one turn.
+
+    Matched by substring of the lowercased model id so both short aliases
+    ('sonnet', 'opus') and fully-qualified ids ('claude-sonnet-4-6') work.
+    """
+    low = model.lower()
+    for tier, usd in _BUDGET_BY_TIER:
+        if tier in low:
+            return usd
+    return _BUDGET_FALLBACK
+
 
 def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> None:
     """Record a stream idle-timeout for later diagnosis (spec
@@ -527,6 +566,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
         with _system_prompt_tempfile(system_prompt) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -557,6 +597,18 @@ class ClaudeCliProvider(LLMProvider):
 
         try:
             payload = json.loads(result.stdout)
+            if payload.get("subtype") == "error_max_budget_usd" or (
+                payload.get("is_error")
+                and any(
+                    "maximum budget" in str(e).lower()
+                    for e in payload.get("errors", [])
+                )
+            ):
+                partial = str(payload.get("result", "")).strip()
+                text = (
+                    f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
+                )
+                return ChatResponse(content=text, tool_calls=(), raw=payload)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ProviderError(
@@ -622,6 +674,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
 
         # MCP tools path — write a temp config and extend argv.
         tmp_mcp_path: str | None = None
@@ -833,7 +886,24 @@ class ClaudeCliProvider(LLMProvider):
                             if k in obj
                         }
                         log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
-                        yield StreamDone(content=result_text, metadata=metadata)
+                        # Over-budget catastrophe backstop: the CLI hit --max-budget-usd.
+                        # Flush any partial text already streamed + append the cut-off note.
+                        if obj.get("subtype") == "error_max_budget_usd" or (
+                            obj.get("is_error")
+                            and any(
+                                "maximum budget" in str(e).lower()
+                                for e in obj.get("errors", [])
+                            )
+                        ):
+                            partial = "".join(delta_chunks).strip() or result_text.strip()
+                            cutoff = (
+                                f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
+                                if partial
+                                else _BUDGET_EXCEEDED_MSG
+                            )
+                            yield StreamDone(content=cutoff, metadata=metadata)
+                        else:
+                            yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
 
                 # EOF: emit terminal event if result frame never arrived.
@@ -927,6 +997,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
         # System prompt (which on this path includes flattened history) goes
         # to a tempfile + --system-prompt-file. Stdin is reserved for the
         # stream-json user frame so we can't pipe it the way the text path
@@ -1017,7 +1088,18 @@ class ClaudeCliProvider(LLMProvider):
                     f"exit {result.returncode}: {_claude_failure_detail(result)}",
                 )
 
-            content = _parse_stream_json_result(result.stdout)
+            try:
+                content = _parse_stream_json_result(result.stdout)
+            except ProviderError as exc:
+                if exc.stage == "error_max_budget_usd":
+                    partial = exc.detail.strip()
+                    text = (
+                        f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
+                        if partial
+                        else _BUDGET_EXCEEDED_MSG
+                    )
+                    return ChatResponse(content=text, tool_calls=(), raw=None)
+                raise
             dispatched: tuple[dict[str, Any], ...] = ()
             if tools_enabled:
                 dispatched = tuple(
@@ -1134,6 +1216,7 @@ class ClaudeCliProvider(LLMProvider):
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
             _apply_lean_flags(cmd)
+            cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
 
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
@@ -1164,6 +1247,18 @@ class ClaudeCliProvider(LLMProvider):
 
             try:
                 payload = json.loads(result.stdout)
+                if payload.get("subtype") == "error_max_budget_usd" or (
+                    payload.get("is_error")
+                    and any(
+                        "maximum budget" in str(e).lower()
+                        for e in payload.get("errors", [])
+                    )
+                ):
+                    partial = str(payload.get("result", "")).strip()
+                    text = (
+                        f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
+                    )
+                    return ChatResponse(content=text, tool_calls=(), raw=payload)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 raise ProviderError(
@@ -1435,8 +1530,17 @@ def _parse_stream_json_result(stdout: str) -> str:
     text lives on the ``{"type": "result", "result": "..."}`` frame
     emitted last. If no result frame is present, fall back to
     concatenating any ``{"type":"assistant"}`` content with type "text".
+
+    Raises
+    ------
+    ProviderError("error_max_budget_usd", partial_text)
+        When the result frame carries ``subtype == "error_max_budget_usd"``
+        (the per-turn catastrophe ceiling was hit). The partial text so far
+        is included as the detail so the caller can prepend it to the
+        graceful cut-off message.
     """
     result_text: str | None = None
+    result_frame: dict | None = None
     assistant_chunks: list[str] = []
     for line in stdout.splitlines():
         line = line.strip()
@@ -1449,11 +1553,23 @@ def _parse_stream_json_result(stdout: str) -> str:
         ftype = frame.get("type")
         if ftype == "result" and "result" in frame:
             result_text = str(frame["result"])
+            result_frame = frame
         elif ftype == "assistant":
             content = frame.get("message", {}).get("content") or []
             for block in content:
                 if block.get("type") == "text":
                     assistant_chunks.append(str(block.get("text", "")))
+    if result_frame is not None and (
+        result_frame.get("subtype") == "error_max_budget_usd"
+        or (
+            result_frame.get("is_error")
+            and any(
+                "maximum budget" in str(e).lower()
+                for e in result_frame.get("errors", [])
+            )
+        )
+    ):
+        raise ProviderError("error_max_budget_usd", result_text or "")
     if result_text is not None:
         return result_text
     if assistant_chunks:
