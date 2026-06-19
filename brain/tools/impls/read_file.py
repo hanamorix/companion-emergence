@@ -1,12 +1,35 @@
 """read_file tool — read-only, guarded, audited. Used only when the user asks."""
 from __future__ import annotations
 
+import difflib
 import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 _FILE_READ_MAX_BYTES = 256 * 1024
+_SUGGEST_MAX = 10
+
+
+def _suggest(target: Path) -> list[str]:
+    """Case-insensitive / fuzzy filename suggestions from the target's parent dir.
+    Keeps the model from crawling parent dirs when it guesses a wrong name."""
+    parent = target.parent
+    try:
+        if not parent.is_dir():
+            return []
+        names = [c.name for c in parent.iterdir() if c.is_file()]
+    except OSError:
+        return []
+    stem = target.name.casefold()
+    # substring matches first, then close fuzzy matches, deduped, capped.
+    subs = [n for n in names if stem in n.casefold() or n.casefold() in stem]
+    fuzzy = difflib.get_close_matches(target.name, names, n=_SUGGEST_MAX, cutoff=0.6)
+    out: list[str] = []
+    for n in [*subs, *fuzzy]:
+        if n not in out:
+            out.append(n)
+    return out[:_SUGGEST_MAX]
 
 
 def _audit(
@@ -50,6 +73,7 @@ def read_file(path: str, *, persona_dir: Path, **_) -> dict:
         return {"error": f"bad path: {exc}"}
 
     if not p.exists() or not p.is_file():
+        suggestions = _suggest(p)
         _audit(
             persona_dir,
             tool="read_file",
@@ -59,7 +83,7 @@ def read_file(path: str, *, persona_dir: Path, **_) -> dict:
             ok=False,
             error="not a readable file",
         )
-        return {"error": f"not a readable file: {p}"}
+        return {"error": f"not a readable file: {p}", "did_you_mean": suggestions}
 
     size = p.stat().st_size
     if size > _FILE_READ_MAX_BYTES:
