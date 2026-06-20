@@ -28,6 +28,23 @@ CREATE TABLE IF NOT EXISTS seq_high_water (
     high_water  INTEGER NOT NULL,
     PRIMARY KEY (peer_id, session_id)
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    peer_id          TEXT NOT NULL,
+    session_id       TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    msg_count        INTEGER NOT NULL,
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT,
+    last_outbound_at TEXT,
+    cooldown_until   TEXT,
+    PRIMARY KEY (peer_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS peer_counters (
+    peer_id             TEXT PRIMARY KEY,
+    reset_date          TEXT NOT NULL,
+    outbound_count      INTEGER NOT NULL,
+    provider_call_count INTEGER NOT NULL
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -155,5 +172,101 @@ class KindledLinkStore:
             ON CONFLICT(peer_id, session_id) DO UPDATE SET high_water = excluded.high_water
             """,
             (peer_id, session_id, value),
+        )
+        self._conn.commit()
+
+    # --- sessions (Phase 3) ---
+    def create_session(self, peer_id: str, session_id: str, now: datetime) -> None:
+        self._conn.execute(
+            """INSERT INTO sessions
+               (peer_id, session_id, state, msg_count, started_at)
+               VALUES (?, ?, 'open', 0, ?)""",
+            (peer_id, session_id, now.isoformat()),
+        )
+        self._conn.commit()
+
+    def get_session(self, peer_id: str, session_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_active_session(self, peer_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE peer_id = ? AND state = 'open' "
+            "ORDER BY started_at DESC LIMIT 1",
+            (peer_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def bump_session_outbound(
+        self, peer_id: str, session_id: str, now: datetime
+    ) -> None:
+        self._conn.execute(
+            """UPDATE sessions
+               SET msg_count = msg_count + 1, last_outbound_at = ?
+               WHERE peer_id = ? AND session_id = ?""",
+            (now.isoformat(), peer_id, session_id),
+        )
+        self._conn.commit()
+
+    def end_session(
+        self, peer_id: str, session_id: str, *, now: datetime,
+        cooldown_until: datetime,
+    ) -> None:
+        self._conn.execute(
+            """UPDATE sessions
+               SET state = 'ended', ended_at = ?, cooldown_until = ?
+               WHERE peer_id = ? AND session_id = ?""",
+            (now.isoformat(), cooldown_until.isoformat(), peer_id, session_id),
+        )
+        self._conn.commit()
+
+    # --- peer_counters (Phase 3, daily caps; fail-safe-permissive reset) ---
+    def get_counters(self, peer_id: str, today: str) -> dict:
+        row = self._conn.execute(
+            "SELECT * FROM peer_counters WHERE peer_id = ?", (peer_id,)
+        ).fetchone()
+        if row is None or row["reset_date"] != today:
+            return {"outbound_count": 0, "provider_call_count": 0}
+        return {
+            "outbound_count": int(row["outbound_count"]),
+            "provider_call_count": int(row["provider_call_count"]),
+        }
+
+    def _ensure_counter_row(self, peer_id: str, today: str) -> None:
+        row = self._conn.execute(
+            "SELECT reset_date FROM peer_counters WHERE peer_id = ?", (peer_id,)
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO peer_counters "
+                "(peer_id, reset_date, outbound_count, provider_call_count) "
+                "VALUES (?, ?, 0, 0)",
+                (peer_id, today),
+            )
+        elif row["reset_date"] != today:
+            self._conn.execute(
+                "UPDATE peer_counters SET reset_date = ?, outbound_count = 0, "
+                "provider_call_count = 0 WHERE peer_id = ?",
+                (today, peer_id),
+            )
+
+    def incr_outbound_count(self, peer_id: str, today: str) -> None:
+        self._ensure_counter_row(peer_id, today)
+        self._conn.execute(
+            "UPDATE peer_counters SET outbound_count = outbound_count + 1 "
+            "WHERE peer_id = ?",
+            (peer_id,),
+        )
+        self._conn.commit()
+
+    def incr_provider_count(self, peer_id: str, today: str) -> None:
+        self._ensure_counter_row(peer_id, today)
+        self._conn.execute(
+            "UPDATE peer_counters SET provider_call_count = provider_call_count + 1 "
+            "WHERE peer_id = ?",
+            (peer_id,),
         )
         self._conn.commit()
