@@ -108,9 +108,11 @@ class SessionEngine:
         if (self._store.get_counters(peer_id, today)["provider_call_count"]
                 >= _DAILY_PROVIDER_CAP):
             return None
+        affinity = relationship.get_relationship_state(self._store, peer_id).affinity_tags
         prompt = build_peer_prompt(
             persona_voice=persona_voice, ambient=ambient,
             peer_stage=peer_stage, transcript_summary=transcript_summary,
+            affinity_tags=affinity,
         )
         with self._throttle.background_slot() as granted:
             if not granted:
