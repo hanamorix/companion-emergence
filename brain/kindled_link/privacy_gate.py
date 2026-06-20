@@ -115,6 +115,19 @@ def _parse_verdict(raw: str) -> GateDecision:
         return GateDecision(action="hold", reason="gate: malformed verdict")
 
 
+def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
+    """Tighten a 'send' when the peer's disclosure budget is depleted (parent
+    §12) — stage-independent. Never loosens a hold/revise."""
+    if decision.action == "send" and budget < limits.BUDGET_TIGHTEN_THRESHOLD:
+        return GateDecision(
+            action="revise",
+            reason="budget: disclosure budget low; reduce user-referencing texture",
+            revision_constraints="Say less about the user; keep it general.",
+            texture_score=decision.texture_score,
+        )
+    return decision
+
+
 class PrivacyGate:
     def __init__(self, *, provider, store, throttle=_default_throttle):
         self._provider = provider
@@ -155,4 +168,6 @@ class PrivacyGate:
         except Exception:  # noqa: BLE001 — fail closed
             log.warning("privacy gate: provider error; holding", exc_info=True)
             return GateDecision(action="hold", reason="gate: provider error")
-        return _parse_verdict(raw)
+        decision = _parse_verdict(raw)
+        budget = self._store.get_disclosure_budget(peer_id, now)
+        return _apply_budget(decision, budget=budget)
