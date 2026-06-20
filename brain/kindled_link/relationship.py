@@ -231,3 +231,42 @@ def save_reflection_cadence(persona_dir, now: datetime) -> None:
     d.mkdir(parents=True, exist_ok=True)
     (d / _CADENCE_FILE).write_text(
         json.dumps({"last_run": now.isoformat()}), encoding="utf-8")
+
+
+# base + per-source accent (mirrors the W8 / maker reach_emotion map shape)
+_EMOTION_BASE = {"tenderness": 0.08}
+_EMOTION_ACCENT = {
+    "warmth": {"tenderness": 0.06},
+    "repair": {"relief": 0.06},
+    "delight": {"joy": 0.06},
+}
+
+
+def relationship_emotion_delta(*, dominant_source: str) -> dict[str, float]:
+    """Small vocab-filtered, decay-subordinate emotion delta for a peer moment."""
+    from brain.chat.extractor import _filter_to_registered
+    raw = dict(_EMOTION_BASE)
+    for name, v in _EMOTION_ACCENT.get(dominant_source, {}).items():
+        raw[name] = raw.get(name, 0.0) + v
+    return _filter_to_registered(raw)
+
+
+def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: datetime) -> dict[str, float]:
+    """Scale `delta` so the peer's cumulative windowed influence stays ≤ cap
+    (parent §14.3, anti love-bomb). Returns the delta actually applied ({} if the
+    peer is fully capped). The accumulator is updated by the applied magnitude.
+
+    The cap is a decay leaky-bucket BY DESIGN (anti-burst-domination: a peer
+    can never dominate her felt state at any instant). After partial decay a peer
+    may re-engage, but the INSTANTANEOUS accumulated influence is always <= cap."""
+    magnitude = sum(abs(v) for v in delta.values())
+    if magnitude <= 0:
+        return {}
+    current = store.get_peer_emotion_accumulated(peer_id, now)
+    headroom = max(0.0, limits.PEER_EMOTION_WINDOW_CAP - current)
+    if headroom <= 0:
+        return {}
+    scale = min(1.0, headroom / magnitude)
+    applied = {k: v * scale for k, v in delta.items()}
+    store.add_peer_emotion(peer_id, magnitude * scale, now)
+    return applied
