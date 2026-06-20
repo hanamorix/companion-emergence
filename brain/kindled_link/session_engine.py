@@ -9,6 +9,7 @@ from datetime import datetime
 
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link.gate import DenyAllGate
+from brain.kindled_link.peer_prompt import build_peer_prompt
 
 # NOTE: keep this module free of the literal forbidden symbol names — the T9
 # conformance oracle parses imports/attributes by AST (so a comment like this is
@@ -74,3 +75,24 @@ class SessionEngine:
             if now < datetime.fromisoformat(recent["cooldown_until"]):
                 return False
         return True
+
+    def generate_draft(
+        self, *, peer_id: str, session_id: str, persona_voice: str,
+        ambient: str, peer_stage: str, transcript_summary: str, today: str,
+    ) -> str | None:
+        # Daily provider-call cap (parent §9): GENERATION itself is bounded, not
+        # only sends — else background draft calls escape the 60/day cap
+        # (re-red-team Major B). Returns None when spent; caller defers.
+        if (self._store.get_counters(peer_id, today)["provider_call_count"]
+                >= _DAILY_PROVIDER_CAP):
+            return None
+        prompt = build_peer_prompt(
+            persona_voice=persona_voice, ambient=ambient,
+            peer_stage=peer_stage, transcript_summary=transcript_summary,
+        )
+        with self._throttle.background_slot() as granted:
+            if not granted:
+                return None
+            draft = self._provider.complete(prompt)
+        self._store.incr_provider_count(peer_id, today)
+        return draft
