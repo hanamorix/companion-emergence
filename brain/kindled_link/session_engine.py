@@ -177,7 +177,7 @@ class SessionEngine:
             self._store.bump_session_outbound(peer_id, session_id, now)
             self._store.incr_outbound_count(peer_id, today)
             self._store.debit_disclosure_budget(
-                peer_id, decision.texture_score, now)
+                peer_id, max(limits.MIN_SEND_DEBIT, decision.texture_score), now)
             return "send"
         if action == "end_or_pause":
             self._store.end_session(

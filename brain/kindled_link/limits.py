@@ -17,3 +17,8 @@ DAILY_PROVIDER_CAP = 60
 BUDGET_MAX = 1.0
 BUDGET_REFILL_PER_DAY = 0.5
 BUDGET_TIGHTEN_THRESHOLD = 0.25
+# Floor debit per send: ensures message COUNT depletes the budget even when a
+# model self-reports texture_score=0.0 — bounds crumb-extraction via a long
+# correspondence of "zero-texture" sends. At this floor ~50 sends exhaust the
+# budget before the tighten threshold is hit.
+MIN_SEND_DEBIT = 0.02
