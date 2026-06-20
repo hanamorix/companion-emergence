@@ -270,3 +270,25 @@ def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: dateti
     applied = {k: v * scale for k, v in delta.items()}
     store.add_peer_emotion(peer_id, magnitude * scale, now)
     return applied
+
+
+def write_kindled_peer_memory(
+    mem_store, *, peer_id: str, session_id: str, speaker: str, stage: str,
+    content: str, emotions: dict[str, float] | None = None,
+) -> None:
+    """Write a provenance-marked peer memory (parent §14). Permanently
+    peer-sourced: recalled in user chat it surfaces as 'something a peer said',
+    never as the user's words or as fact (see the _build_recall_block guard)."""
+    from brain.chat.extractor import _filter_to_registered
+    from brain.memory.store import Memory
+    seeded = _filter_to_registered(emotions or {}) or None
+    mem = Memory.create_new(
+        content=content, memory_type="kindled_peer", domain="kindled_peer",
+        tags=["kindled_peer", f"peer:{peer_id}"], emotions=seeded,
+        metadata={"peer_id": peer_id, "session_id": session_id,
+                  "speaker": speaker, "relationship_stage": stage},
+    )
+    try:
+        mem_store.create(mem)
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.warning("kindled_peer memory write failed", exc_info=True)
