@@ -9,6 +9,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PEER_MODULES = [
     _ROOT / "brain" / "kindled_link" / "peer_prompt.py",
     _ROOT / "brain" / "kindled_link" / "session_engine.py",
+    _ROOT / "brain" / "kindled_link" / "privacy_gate.py",
 ]
 # the genuine injection-hole names (verified in the red-team against the real code)
 _FORBIDDEN = {"dispatch", "tool_recruit", "reach_for_capability",
@@ -59,6 +60,9 @@ def test_peer_modules_reference_no_tool_path():
 _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.gate",       # gate protocol types only — no tool surface
     "brain.kindled_link.peer_prompt",  # peer prompt builder — no tool surface
+    "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
+    "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
+    "brain.kindled_link.store",      # persistence layer — no tool surface (session_engine imports)
     "brain.bridge.cli_throttle",     # throttle module — no tool surface
 }
 
