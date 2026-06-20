@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 
 from brain.bridge import cli_throttle as _default_throttle
+from brain.kindled_link import limits
 from brain.kindled_link.gate import DenyAllGate, OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
 
@@ -32,11 +33,13 @@ def _check_day(now: datetime, today: str) -> None:
             f"today={today!r} disagrees with now's date {expected!r}; "
             "pass today=now.strftime('%Y-%m-%d') to keep cap reads consistent."
         )
-_MIN_OUTBOUND_GAP_SECONDS = 60
-_SESSION_MSG_CAP = 24
-_SESSION_COOLDOWN_HOURS = 6
-_DAILY_OUTBOUND_CAP = 20
-_DAILY_PROVIDER_CAP = 60
+
+
+_MIN_OUTBOUND_GAP_SECONDS = limits.MIN_OUTBOUND_GAP_SECONDS
+_SESSION_MSG_CAP = limits.SESSION_MSG_CAP
+_SESSION_COOLDOWN_HOURS = limits.SESSION_COOLDOWN_HOURS
+_DAILY_OUTBOUND_CAP = limits.DAILY_OUTBOUND_CAP
+_DAILY_PROVIDER_CAP = limits.DAILY_PROVIDER_CAP
 # (Phase 3 has no inbound/poll path; the inbound flood cap lands with the
 # relay-poll/wiring phase — see spec §10 Deferred.)
 
