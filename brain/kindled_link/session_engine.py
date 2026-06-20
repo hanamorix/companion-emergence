@@ -11,8 +11,9 @@ from datetime import datetime
 
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link import limits
-from brain.kindled_link.gate import DenyAllGate, OutboundPayload
+from brain.kindled_link.gate import OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
+from brain.kindled_link.privacy_gate import PrivacyGate
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _SESSION_MSG_CAP = limits.SESSION_MSG_CAP
 _SESSION_COOLDOWN_HOURS = limits.SESSION_COOLDOWN_HOURS
 _DAILY_OUTBOUND_CAP = limits.DAILY_OUTBOUND_CAP
 _DAILY_PROVIDER_CAP = limits.DAILY_PROVIDER_CAP
+_DEFAULT_STAGE = "stranger"
 # (Phase 3 has no inbound/poll path; the inbound flood cap lands with the
 # relay-poll/wiring phase — see spec §10 Deferred.)
 
@@ -50,7 +52,9 @@ class SessionEngine:
         self._store = store
         self._identity = identity
         self._provider = provider
-        self._gate = gate if gate is not None else DenyAllGate()
+        self._gate = gate if gate is not None else PrivacyGate(
+            provider=provider, store=store
+        )
         self._throttle = throttle
 
     def can_send_now(self, peer_id: str, session_id: str, now: datetime) -> bool:
@@ -145,8 +149,9 @@ class SessionEngine:
         _check_day(now, today)
         if not self._send_allowed(peer_id, session_id, now, today):
             return "hold"
-        peer = self._store.get_peer(peer_id)
-        stage = (peer or {}).get("consent_state", "stranger")
+        # Phase 4: the gate gets the relationship STAGE, hardcoded strictest until
+        # Phase 5 maturation exists — never the consent_state (paired/paused).
+        stage = _DEFAULT_STAGE
         try:
             decision = self._gate.review(
                 payload, peer_id=peer_id, stage=stage,
