@@ -60,6 +60,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.gate",       # gate protocol types only — no tool surface
     "brain.kindled_link.peer_prompt",  # peer prompt builder — no tool surface
     "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
+    "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
     "brain.bridge.cli_throttle",     # throttle module — no tool surface
 }
 
