@@ -104,3 +104,15 @@ def test_full_payload_incl_relationship_hint_reaches_gate(tmp_path):
                          reason="autonomous-start", now=now, today="2026-06-20",
                          send_fn=_SendSpy())
     assert gate.seen[0].relationship_hint == {"local_continuity_note": "x"}
+
+
+def test_process_outbound_raises_when_today_disagrees_with_now(tmp_path):
+    # FIX 2: now/today must agree; a stale today is a silent wrong-day-cap read.
+    import pytest
+    eng, store, now = _eng(tmp_path, DenyAllGate())
+    # now is 2026-06-20; passing today as a different date must raise ValueError
+    with pytest.raises(ValueError):
+        eng.process_outbound(
+            peer_id="kid_a", session_id="s1", payload=OutboundPayload(body="hi"),
+            reason="autonomous-start", now=now, today="2026-06-19", send_fn=_SendSpy()
+        )
