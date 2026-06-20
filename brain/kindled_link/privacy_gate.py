@@ -138,12 +138,20 @@ class PrivacyGate:
     def _payload_text(payload: OutboundPayload) -> str:
         parts = [payload.body or ""]
         if payload.relationship_hint:
-            parts.append(json.dumps(payload.relationship_hint, sort_keys=True))
+            try:
+                parts.append(json.dumps(payload.relationship_hint, sort_keys=True))
+            except Exception:  # noqa: BLE001 — non-serialisable hint; fail closed
+                # The sentinel matches the POSIX-path pattern in _PATTERNS so
+                # _prefilter will hold this payload — prevents a non-serialisable
+                # hint from slipping through the gate as clean text.
+                parts.append("/etc/kindled/unserialisable-hint")
         return "\n".join(parts)
 
     def review(self, payload: OutboundPayload, *, peer_id: str, stage: str,
                transcript_summary: str, reason: str, now: datetime,
                today: str) -> GateDecision:
+        # `stage` is intentionally unused until Phase 5 maturation wires in
+        # stage-aware thresholds; the gate is unconditionally strict until then.
         # Layer 1: deterministic pre-filter — hard leaks, no LLM call.
         pre = _prefilter(self._payload_text(payload))
         if pre is not None:

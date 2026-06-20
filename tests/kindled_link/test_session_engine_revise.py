@@ -129,6 +129,34 @@ def test_revision_provider_error_fails_closed(tmp_path):
     assert action == "hold"
 
 
+def test_zero_texture_send_still_depletes_budget(tmp_path):
+    """FIX 1 — disclosure-budget MIN_SEND_DEBIT floor.
+
+    A gate that always returns texture_score=0.0 must still deplete the budget
+    so a long correspondence (crumb-extraction) cannot leave it unchanged.
+    After one send with texture_score=0.0 the budget must have dropped by at
+    least limits.MIN_SEND_DEBIT.
+    """
+    from brain.kindled_link import limits
+
+    class _ZeroTexture:
+        def review(self, payload, **kw):
+            return GateDecision(action="send", texture_score=0.0)
+
+    sent = []
+    eng, store, now = _eng(tmp_path, _ZeroTexture())
+    budget_before = store.get_disclosure_budget("kid_a", now)
+    eng.process_outbound(
+        peer_id="kid_a", session_id="s1",
+        payload=OutboundPayload(body="hello"), reason="r",
+        now=now, today="2026-06-20",
+        send_fn=lambda p: sent.append(p),
+    )
+    budget_after = store.get_disclosure_budget("kid_a", now)
+    assert len(sent) == 1
+    assert budget_before - budget_after >= limits.MIN_SEND_DEBIT
+
+
 def test_recovery_through_privacy_gate_holds_and_no_double_debit(tmp_path):
     # red-team M6: a recovered draft re-gated through the REAL PrivacyGate (default)
     # holds (empty transcript_summary → strict) and does not debit the budget.
