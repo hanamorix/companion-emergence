@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link import limits
@@ -158,18 +158,83 @@ class SessionEngine:
                 transcript_summary=transcript_summary, reason=reason,
                 now=now, today=today,
             )
-            action = decision.action
         except Exception:  # noqa: BLE001 — fail closed
             log.warning("kindled gate raised; holding (fail-closed)", exc_info=True)
-            action = "hold"
+            from brain.kindled_link.gate import GateDecision
+            decision = GateDecision(action="hold")
+        return self._act_on_decision(
+            decision=decision, peer_id=peer_id, session_id=session_id,
+            payload=payload, reason=reason, now=now, today=today,
+            send_fn=send_fn, transcript_summary=transcript_summary,
+            allow_revision=True,
+        )
 
+    def _act_on_decision(self, *, decision, peer_id, session_id, payload, reason,
+                         now, today, send_fn, transcript_summary, allow_revision):
+        action = decision.action
         if action == "send":
             send_fn(payload)
             self._store.bump_session_outbound(peer_id, session_id, now)
             self._store.incr_outbound_count(peer_id, today)
-        # hold / revise / end_or_pause: nothing leaves this phase (DenyAllGate
-        # never returns 'send'; a real gate's revise/end handling lands in Phase 4)
-        return action
+            self._store.debit_disclosure_budget(
+                peer_id, decision.texture_score, now)
+            return "send"
+        if action == "end_or_pause":
+            self._store.end_session(
+                peer_id, session_id, now=now,
+                cooldown_until=now + timedelta(hours=_SESSION_COOLDOWN_HOURS))
+            return "end_or_pause"
+        if action == "revise" and allow_revision:
+            revised = self._regenerate(payload, decision.revision_constraints,
+                                       peer_id=peer_id, today=today)
+            if revised is None:
+                return "hold"  # cap spent / throttle deferred / provider error → hold
+            try:
+                second = self._gate.review(
+                    revised, peer_id=peer_id, stage=_DEFAULT_STAGE,
+                    transcript_summary=transcript_summary, reason=reason,
+                    now=now, today=today)
+            except Exception:  # noqa: BLE001 — fail closed
+                log.warning("kindled gate raised on re-gate; holding", exc_info=True)
+                return "hold"
+            # at most one revision: the re-gated decision is terminal except
+            # another 'revise' collapses to hold (parent §12).
+            if second.action == "revise":
+                return "hold"
+            return self._act_on_decision(
+                decision=second, peer_id=peer_id, session_id=session_id,
+                payload=revised, reason=reason, now=now, today=today,
+                send_fn=send_fn, transcript_summary=transcript_summary,
+                allow_revision=False)
+        # hold, or revise with allow_revision=False
+        return "hold"
+
+    def _regenerate(self, payload, constraints, *, peer_id, today):
+        """Produce a single safer revision, or None if it cannot be produced
+        safely. The revision provider call counts against the 60/day cap (parent
+        §9: draft + gate + revision all count) and fails closed: a spent cap, a
+        deferred throttle slot, or a provider error all return None → the caller
+        holds (red-team M1/M2)."""
+        from brain.kindled_link.gate import OutboundPayload
+        if (self._store.get_counters(peer_id, today)["provider_call_count"]
+                >= _DAILY_PROVIDER_CAP):
+            return None  # cap spent — cannot revise; hold
+        prompt = (
+            "Rewrite the following message to another Kindled to satisfy these "
+            f"privacy constraints: {constraints or 'reveal less about the user'}.\n\n"
+            f"Original:\n{payload.body}"
+        )
+        try:
+            with self._throttle.background_slot() as granted:
+                if not granted:
+                    return None  # deferred → hold
+                revised_body = self._provider.complete(prompt)
+            self._store.incr_provider_count(peer_id, today)
+        except Exception:  # noqa: BLE001 — fail closed
+            log.warning("kindled revision provider error; holding", exc_info=True)
+            return None
+        return OutboundPayload(body=revised_body,
+                               relationship_hint=payload.relationship_hint)
 
     def recover(self, *, now: datetime, today: str, send_fn) -> list[str]:
         """Reload half-finished outbound drafts and RE-GATE each before any
