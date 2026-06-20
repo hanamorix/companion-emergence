@@ -13,6 +13,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from brain.bridge import cli_throttle as _default_throttle
+from brain.kindled_link import limits
+
 log = logging.getLogger(__name__)
 
 STAGES = ("stranger", "acquaintance", "familiar", "friend", "close")
@@ -105,3 +108,91 @@ def get_stage(store, peer_id: str) -> str:
     'stranger' for an unknown peer (the strictest default)."""
     row = store.get_relationship_row(peer_id)
     return row["stage"] if row else "stranger"
+
+
+_HARD_BREACH_RESET = "stranger"
+
+
+def _bounded_stage(current: str, proposed: str) -> str:
+    """Promotion moves up at most one stage; a downward proposal moves down at
+    most one stage. (Hard breach is handled separately → reset to stranger.)"""
+    if proposed not in STAGES:
+        return current
+    ci, pi = STAGES.index(current), STAGES.index(proposed)
+    if pi > ci:
+        return STAGES[min(ci + 1, len(STAGES) - 1)]
+    if pi < ci:
+        return STAGES[max(ci - 1, 0)]
+    return current
+
+
+def run_relationship_reflection(
+    *, store, provider, peer_id: str, transcript: str, now: datetime,
+    today: str, throttle=_default_throttle,
+) -> PeerRelationshipState:
+    """One maturation pass (parent §13). Grounded-evidence gated, ≤1-stage
+    promotion, two-tier regression (gradual −1 / hard-breach reset). Tool-less,
+    throttled, cap-counted, fail-soft (any error → unchanged state)."""
+    # m9: today must agree with now's date or the cap reads the wrong day
+    # (same guard the session engine enforces). Caller bug → fail-soft no-op.
+    if today != now.strftime("%Y-%m-%d"):
+        log.warning("relationship reflection: today disagrees with now; skipping")
+        return get_relationship_state(store, peer_id)
+    state = get_relationship_state(store, peer_id)
+    if (store.get_counters(peer_id, today)["provider_call_count"]
+            >= limits.DAILY_PROVIDER_CAP):
+        return state
+    prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
+    try:
+        with throttle.background_slot() as granted:
+            if not granted:
+                return state
+            raw = provider.complete(prompt)
+        store.incr_provider_count(peer_id, today)
+    except Exception:  # noqa: BLE001 — fail soft, leave state unchanged
+        log.warning("relationship reflection provider error; state unchanged", exc_info=True)
+        return state
+
+    try:
+        data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+    except Exception:  # noqa: BLE001 — malformed → unchanged
+        log.warning("relationship reflection: malformed verdict; state unchanged", exc_info=True)
+        return state
+
+    # hard breach → immediate reset to stranger (the only multi-stage move)
+    if bool(data.get("hard_breach")):
+        state.stage = _HARD_BREACH_RESET
+        state.trust_score = 0.0
+        breach_note = (data.get("boundaries_seen") or ["hard breach"])[0]
+        state.boundaries_seen = [*state.boundaries_seen, str(breach_note)][-20:]
+        state.last_reflected_at = now.isoformat()
+        persist_relationship_state(store, state, now)
+        return state
+
+    # ground the proposed evidence; drop ungrounded quotes (+ log)
+    grounded = [
+        Evidence(quote=str(e.get("quote", "")), turn_id=str(e.get("turn_id", "unknown")),
+                 supports=str(e.get("supports", "")))
+        for e in (data.get("evidence") or [])
+        if _is_grounded(str(e.get("quote", "")), transcript)
+    ]
+    proposed = str(data.get("proposed_stage", state.stage))
+    pi, ci = (STAGES.index(proposed) if proposed in STAGES else -1), STAGES.index(state.stage)
+    # promotion requires ≥1 grounded evidence; regression does not
+    if pi > ci and not grounded:
+        proposed = state.stage  # refuse ungrounded promotion (no volume-alone)
+
+    state.stage = _bounded_stage(state.stage, proposed)
+    try:
+        state.trust_score = max(0.0, min(1.0, float(data.get("trust_score", state.trust_score))))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(data.get("affinity_tags"), list):
+        state.affinity_tags = [str(t) for t in data["affinity_tags"]][:12]
+    if isinstance(data.get("boundaries_seen"), list):
+        state.boundaries_seen = [str(b) for b in data["boundaries_seen"]][:20]
+    if grounded:
+        state.evidence = grounded[:10]
+    state.last_reflected_at = now.isoformat()
+    persist_relationship_state(store, state, now)
+    return state
