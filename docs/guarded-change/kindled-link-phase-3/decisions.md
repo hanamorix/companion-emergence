@@ -20,5 +20,30 @@
 | 9 | Nitpick | T6 provider spy gains a `chat` attribute; test asserts it was never called |
 | 8,10 | Nitpick | Logged as accepted DORMANT seams (recover producer unwired; background_slot real monotonic) — manifest note at promote time |
 
-Next: re-review is at author/Hana discretion (first bounce; iteration cap not reached).
-Then stage 5 build via subagent-driven-development.
+Next: re-review run (Hana elected to re-red-team v2).
+
+## Gate: stage-3 re-red-team (v2 plan) (2026-06-20)
+
+- **Worst finding severity:** Major (two new)
+- **Route taken:** revise plan (stage 2) → plan revision v3 — no spec restart
+- **Bounce count at this gate:** 2
+- **Part A:** all 10 v2 dispositions verified LANDED by an independent reviewer
+- **Findings:** see `3-redteam-plan-v2.md`
+
+### Resolutions in plan revision v3
+
+| # | Sev | Resolution |
+|---|---|---|
+| A | Major | `recover` pre-checks `_send_allowed`; pacing/cap/closed-session pre-empt → `"deferred"`, draft stays PENDING (retried), not dropped; + retry test |
+| B | Major | `generate_draft` enforces the daily provider cap (returns None when spent) + test |
+| — | Minor | session-open check folded into shared `_send_allowed` (process_outbound + recover) |
+| — | Minor | recover empty-transcript_summary flagged for Phase 4 (spec §10) |
+| — | Nitpick | citation drift corrected (plan T2 + spec §4); AST-getattr blind-spot accepted |
+
+### Iteration-cap note
+
+This is the **2nd backward loop at stage 3**. Per the methodology's anti-livelock rule, a
+3rd backward loop on the same finding-class triggers human intervention. The bounce-2
+Majors are a *different* class (recovery/cap-enforcement seam, surfaced by the bounce-1
+fixes) than bounce-1 (docstring/dead-predicate/inbound), so this is not a re-thrown class —
+but the decision to re-review a 3rd time vs proceed to build is **surfaced to Hana**.
