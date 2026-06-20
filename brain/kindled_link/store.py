@@ -45,6 +45,24 @@ CREATE TABLE IF NOT EXISTS peer_counters (
     outbound_count      INTEGER NOT NULL,
     provider_call_count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outbound_drafts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_id      TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transcript (
+    peer_id     TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    direction   TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    provenance  TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    PRIMARY KEY (peer_id, session_id, seq)
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -270,3 +288,52 @@ class KindledLinkStore:
             (peer_id,),
         )
         self._conn.commit()
+
+    # --- outbound_drafts (Phase 3, recovery re-gate) ---
+    def save_draft(
+        self, *, peer_id: str, session_id: str, payload_json: str,
+        now: datetime, status: str = "pending",
+    ) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO outbound_drafts
+               (peer_id, session_id, payload_json, status, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (peer_id, session_id, payload_json, status, now.isoformat()),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_pending_drafts(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM outbound_drafts WHERE status = 'pending' ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_draft_status(self, draft_id: int, status: str) -> None:
+        self._conn.execute(
+            "UPDATE outbound_drafts SET status = ? WHERE id = ?",
+            (status, draft_id),
+        )
+        self._conn.commit()
+
+    # --- transcript (Phase 3, provenance-marked) ---
+    def append_transcript(
+        self, *, peer_id: str, session_id: str, seq: int, direction: str,
+        text: str, now: datetime, provenance: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO transcript
+               (peer_id, session_id, seq, direction, text, provenance, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (peer_id, session_id, seq, direction, text, provenance,
+             now.isoformat()),
+        )
+        self._conn.commit()
+
+    def recent_transcript(self, peer_id: str, *, limit: int = 10) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM transcript WHERE peer_id = ? "
+            "ORDER BY seq DESC LIMIT ?",
+            (peer_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
