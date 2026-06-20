@@ -50,3 +50,22 @@ def test_prefilter_catches_leak_in_relationship_hint():
         body="just a warm hello",
         relationship_hint={"local_continuity_note": "/Users/hana/diary.md"}))
     assert _prefilter(text) is not None  # the path in the hint is caught
+
+
+def test_payload_text_non_serialisable_hint_is_held_by_prefilter():
+    """FIX 2 — _payload_text fail-closed on non-serialisable relationship_hint.
+
+    If relationship_hint contains a non-JSON-serialisable value (e.g. object()),
+    _payload_text must NOT raise; it must return a sentinel that _prefilter treats
+    as a hit (held), never passing silently as clean text.
+    """
+    from brain.kindled_link.gate import OutboundPayload
+    from brain.kindled_link.privacy_gate import PrivacyGate, _prefilter
+    payload = OutboundPayload(
+        body="warm hello",
+        relationship_hint={"x": object()},  # non-serialisable
+    )
+    # Must not raise
+    text = PrivacyGate._payload_text(payload)
+    # The resulting text must be flagged by _prefilter (not returned as clean)
+    assert _prefilter(text) is not None
