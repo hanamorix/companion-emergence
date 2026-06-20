@@ -12,6 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link import limits
@@ -196,3 +197,37 @@ def run_relationship_reflection(
     state.last_reflected_at = now.isoformat()
     persist_relationship_state(store, state, now)
     return state
+
+
+_CADENCE_FILE = "relationship_cadence.json"
+
+
+def load_reflection_cadence(persona_dir) -> dict:
+    """Load the persisted reflection cadence state. Returns {"last_run": iso|None}."""
+    p = Path(persona_dir) / "kindled_link" / _CADENCE_FILE
+    if not p.exists():
+        return {"last_run": None}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — fail-soft, treat as never-run
+        return {"last_run": None}
+
+
+def reflection_is_due(persona_dir, now: datetime, *, interval_hours: float = 24.0) -> bool:
+    """Check if a reflection pass is due (wall-clock cadence, default 24h interval)."""
+    last = load_reflection_cadence(persona_dir).get("last_run")
+    if not last:
+        return True
+    try:
+        elapsed_h = (now - datetime.fromisoformat(last)).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        return True
+    return elapsed_h >= interval_hours
+
+
+def save_reflection_cadence(persona_dir, now: datetime) -> None:
+    """Persist the reflection cadence state (last_run timestamp)."""
+    d = Path(persona_dir) / "kindled_link"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / _CADENCE_FILE).write_text(
+        json.dumps({"last_run": now.isoformat()}), encoding="utf-8")
