@@ -151,6 +151,7 @@ class SessionEngine:
             decision = self._gate.review(
                 payload, peer_id=peer_id, stage=stage,
                 transcript_summary=transcript_summary, reason=reason,
+                now=now, today=today,
             )
             action = decision.action
         except Exception:  # noqa: BLE001 — fail closed
