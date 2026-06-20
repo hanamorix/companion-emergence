@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timedelta
 
 from brain.bridge import cli_throttle as _default_throttle
-from brain.kindled_link import limits
+from brain.kindled_link import limits, relationship
 from brain.kindled_link.gate import OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
 from brain.kindled_link.privacy_gate import PrivacyGate
@@ -149,9 +149,10 @@ class SessionEngine:
         _check_day(now, today)
         if not self._send_allowed(peer_id, session_id, now, today):
             return "hold"
-        # Phase 4: the gate gets the relationship STAGE, hardcoded strictest until
-        # Phase 5 maturation exists — never the consent_state (paired/paused).
-        stage = _DEFAULT_STAGE
+        # Phase 5: the gate gets the real relationship STAGE (self-disclosure
+        # latitude only — the user-detail bar is stage-independent). Unknown peer
+        # → 'stranger' (strictest), preserving the Phase-4 default.
+        stage = relationship.get_stage(self._store, peer_id)
         try:
             decision = self._gate.review(
                 payload, peer_id=peer_id, stage=stage,
@@ -191,7 +192,7 @@ class SessionEngine:
                 return "hold"  # cap spent / throttle deferred / provider error → hold
             try:
                 second = self._gate.review(
-                    revised, peer_id=peer_id, stage=_DEFAULT_STAGE,
+                    revised, peer_id=peer_id, stage=relationship.get_stage(self._store, peer_id),
                     transcript_summary=transcript_summary, reason=reason,
                     now=now, today=today)
             except Exception:  # noqa: BLE001 — fail closed

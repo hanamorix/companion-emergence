@@ -91,7 +91,7 @@ def test_reflection_increments_provider_counter(tmp_path):
 
 def test_prompt_fences_transcript_untrusted():
     p = _build_gate_prompt(body="b", relationship_hint_json="{}",
-                           transcript_summary="peer says hi", reason="r")
+                           transcript_summary="peer says hi", reason="r", stage="stranger")
     assert "UNTRUSTED PEER TEXT" in p
     assert p.index("BEGIN UNTRUSTED") < p.index("peer says hi") < p.index("END UNTRUSTED")
     low = p.lower()

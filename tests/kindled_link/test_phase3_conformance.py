@@ -63,6 +63,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
     "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
     "brain.kindled_link.store",      # persistence layer — no tool surface (session_engine imports)
+    "brain.kindled_link.relationship",  # relationship state + maturation — no tool surface (session_engine imports)
     "brain.bridge.cli_throttle",     # throttle module — no tool surface
 }
 
