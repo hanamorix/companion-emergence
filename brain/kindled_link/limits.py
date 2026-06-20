@@ -22,3 +22,8 @@ BUDGET_TIGHTEN_THRESHOLD = 0.25
 # correspondence of "zero-texture" sends. At this floor ~50 sends exhaust the
 # budget before the tighten threshold is hit.
 MIN_SEND_DEBIT = 0.02
+
+# Per-peer emotion influence cap (parent §14.3, anti love-bomb). Cumulative
+# influence within a rolling window decays linearly to zero over the window.
+PEER_EMOTION_WINDOW_CAP = 0.6
+PEER_EMOTION_WINDOW_HOURS = 24.0
