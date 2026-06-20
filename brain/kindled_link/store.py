@@ -8,6 +8,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+from brain.kindled_link import limits
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS peers (
     peer_id        TEXT PRIMARY KEY,
@@ -62,6 +64,11 @@ CREATE TABLE IF NOT EXISTS transcript (
     provenance  TEXT NOT NULL,
     ts          TEXT NOT NULL,
     PRIMARY KEY (peer_id, session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS disclosure_budget (
+    peer_id     TEXT PRIMARY KEY,
+    budget      REAL NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 """
 
@@ -349,3 +356,38 @@ class KindledLinkStore:
             (peer_id,),
         ).fetchone()
         return row["cu"] if row and row["cu"] else None
+
+    # --- disclosure budget (Phase 4, parent §12; pull-computed refill) ---
+    def get_disclosure_budget(self, peer_id: str, now: datetime) -> float:
+        row = self._conn.execute(
+            "SELECT budget, updated_at FROM disclosure_budget WHERE peer_id = ?",
+            (peer_id,),
+        ).fetchone()
+        if row is None:
+            return limits.BUDGET_MAX
+        return self._refilled(row["budget"], row["updated_at"], now)
+
+    def debit_disclosure_budget(
+        self, peer_id: str, amount: float, now: datetime
+    ) -> None:
+        current = self.get_disclosure_budget(peer_id, now)  # refill-to-now
+        new_budget = max(0.0, current - amount)
+        self._conn.execute(
+            """INSERT INTO disclosure_budget (peer_id, budget, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(peer_id) DO UPDATE SET
+                   budget = excluded.budget, updated_at = excluded.updated_at""",
+            (peer_id, new_budget, now.isoformat()),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _refilled(stored: float, updated_at: str, now: datetime) -> float:
+        try:
+            elapsed_days = (
+                now - datetime.fromisoformat(updated_at)
+            ).total_seconds() / 86400.0
+        except (ValueError, TypeError):
+            elapsed_days = 0.0
+        refilled = stored + max(0.0, elapsed_days) * limits.BUDGET_REFILL_PER_DAY
+        return min(limits.BUDGET_MAX, max(0.0, refilled))
