@@ -5,11 +5,12 @@ conformance oracle enforces this by AST). Every outbound passes the gate; the
 Phase 3 default gate holds everything."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
 from brain.bridge import cli_throttle as _default_throttle
-from brain.kindled_link.gate import DenyAllGate
+from brain.kindled_link.gate import DenyAllGate, OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
 
 log = logging.getLogger(__name__)
@@ -148,3 +149,32 @@ class SessionEngine:
         # hold / revise / end_or_pause: nothing leaves this phase (DenyAllGate
         # never returns 'send'; a real gate's revise/end handling lands in Phase 4)
         return action
+
+    def recover(self, *, now: datetime, today: str, send_fn) -> list[str]:
+        """Reload half-finished outbound drafts and RE-GATE each before any
+        resend — never blind-resend AND never silently drop (parent §9).
+
+        A draft that is not currently sendable for a PACING/CAP/closed-session
+        reason is left PENDING ("deferred") for a later tick — it must not be
+        marked terminal and removed, or a draft saved <60s before a crash would be
+        discarded forever (re-red-team Major A). Only a draft that passes the
+        pacing guard is re-gated; its gate decision (hold/send/…) is terminal."""
+        actions: list[str] = []
+        for draft in self._store.get_pending_drafts():
+            if not self._send_allowed(draft["peer_id"], draft["session_id"],
+                                      now, today):
+                actions.append("deferred")  # stays pending; retried next tick
+                continue
+            data = json.loads(draft["payload_json"])
+            payload = OutboundPayload(
+                body=data.get("body", ""),
+                relationship_hint=data.get("relationship_hint"),
+            )
+            action = self.process_outbound(
+                peer_id=draft["peer_id"], session_id=draft["session_id"],
+                payload=payload, reason="recovery-regate", now=now,
+                today=today, send_fn=send_fn,
+            )
+            self._store.set_draft_status(draft["id"], action)
+            actions.append(action)
+        return actions
