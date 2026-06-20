@@ -52,3 +52,24 @@ def test_provider_counter_independent(tmp_path):
     c = s.get_counters("kid_a", "2026-06-20")
     assert c["provider_call_count"] == 1
     assert c["outbound_count"] == 0
+
+
+def test_latest_cooldown_until_uses_max_across_sessions(tmp_path):
+    # final-review #1 + stage-6 cooldown finding: MAX(cooldown_until), so a
+    # later-ENDED session with an EARLIER cooldown can't hide a still-cooling one.
+    s = _store(tmp_path)
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    s.create_session("kid_a", "s1", now)
+    s.create_session("kid_a", "s2", now)
+    # s2 ends first with the LATER cooldown; s1 ends later with an EARLIER cooldown
+    s.end_session("kid_a", "s2", now=now, cooldown_until=now + timedelta(hours=6))
+    s.end_session("kid_a", "s1", now=now + timedelta(minutes=1),
+                  cooldown_until=now + timedelta(hours=2))
+    assert s.latest_cooldown_until("kid_a") == (now + timedelta(hours=6)).isoformat()
+
+
+def test_latest_cooldown_until_none_when_no_ended(tmp_path):
+    s = _store(tmp_path)
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    s.create_session("kid_a", "s1", now)
+    assert s.latest_cooldown_until("kid_a") is None
