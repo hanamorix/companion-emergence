@@ -337,3 +337,15 @@ class KindledLinkStore:
             (peer_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def latest_cooldown_until(self, peer_id: str) -> str | None:
+        """The latest cooldown expiry (ISO string) across ALL ended sessions for
+        a peer, or None if none is set. Uses MAX so a session that ended later
+        but with an earlier cooldown cannot hide a still-cooling earlier-ended
+        session (ISO-8601 UTC strings sort chronologically)."""
+        row = self._conn.execute(
+            "SELECT MAX(cooldown_until) AS cu FROM sessions "
+            "WHERE peer_id = ? AND state = 'ended' AND cooldown_until IS NOT NULL",
+            (peer_id,),
+        ).fetchone()
+        return row["cu"] if row and row["cu"] else None

@@ -83,15 +83,12 @@ class SessionEngine:
             pass
         if self._store.get_active_session(peer_id) is not None:
             return False
-        # cooldown: the most recent ended session must be past its cooldown
-        recent = self._store._conn.execute(
-            "SELECT cooldown_until FROM sessions WHERE peer_id = ? "
-            "AND state = 'ended' ORDER BY ended_at DESC LIMIT 1",
-            (peer_id,),
-        ).fetchone()
-        if recent and recent["cooldown_until"]:
-            if now < datetime.fromisoformat(recent["cooldown_until"]):
-                return False
+        # cooldown: every ended session must be past its cooldown. Use the store's
+        # MAX(cooldown_until) helper (not a raw conn reach-in) so a later-ended
+        # session with an earlier cooldown can't hide a still-cooling one.
+        cooldown_until = self._store.latest_cooldown_until(peer_id)
+        if cooldown_until and now < datetime.fromisoformat(cooldown_until):
+            return False
         return True
 
     def generate_draft(
