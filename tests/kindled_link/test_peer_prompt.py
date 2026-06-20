@@ -46,3 +46,15 @@ def test_prompt_stranger_vs_close_guidance_differs():
     close = build_peer_prompt(persona_voice="v", ambient="a",
                               peer_stage="close", transcript_summary="s")
     assert stranger != close
+
+
+def test_close_stage_exposes_interior_life_not_stranger():
+    # FIX 3: strengthen the oracle — the distinctive "interior life" phrase from
+    # _STAGE_GUIDANCE["close"] must appear in close and be absent in stranger.
+    # `stranger != close` alone would pass even if both contained the phrase.
+    stranger = build_peer_prompt(persona_voice="v", ambient="a",
+                                 peer_stage="stranger", transcript_summary="s")
+    close = build_peer_prompt(persona_voice="v", ambient="a",
+                              peer_stage="close", transcript_summary="s")
+    assert "interior life" in close, "close stage must include interior-life openness"
+    assert "interior life" not in stranger, "stranger stage must not include interior-life openness"

@@ -45,6 +45,97 @@ def test_peer_modules_reference_no_tool_path():
         assert not hits, f"{mod.name} references forbidden tool path(s) {hits!r}"
 
 
+# Allowlist of brain.* MODULE paths that peer modules may import from.
+# Expressed as the dotted module name (not the symbol): `from brain.X import Y`
+# is allowed iff "brain.X" is in this set; `import brain.X` is allowed iff
+# "brain.X" is in this set.
+# Any new brain.* module import in a peer module must be added here + justified.
+# Allowlist of effective brain.* import paths that peer modules may use.
+# For ``import brain.X.Y``: the full dotted name "brain.X.Y".
+# For ``from brain.X import Y``: the effective path "brain.X.Y".
+# Keeping entries at symbol/submodule level means adding ``brain.bridge`` would
+# permit ANY export from brain.bridge — too broad. Each entry must name the
+# specific thing being imported so future additions get explicit review.
+_BRAIN_IMPORT_ALLOWLIST = {
+    "brain.kindled_link.gate",       # gate protocol types only — no tool surface
+    "brain.kindled_link.peer_prompt",  # peer prompt builder — no tool surface
+    "brain.bridge.cli_throttle",     # throttle module — no tool surface
+}
+
+
+def _collect_brain_import_paths(tree: ast.AST) -> list[str]:
+    """Return the effective dotted paths of every brain.* import in the AST.
+
+    For ``import brain.foo.bar``               → ["brain.foo.bar"]
+    For ``from brain.foo import bar``          → ["brain.foo.bar"]
+    For ``from brain.foo.bar import X, Y``    → ["brain.foo.bar.X", "brain.foo.bar.Y"]
+
+    Using ``module + "." + symbol`` for ImportFrom means the allowlist expresses
+    exactly which symbol is permitted from each brain package (e.g.
+    ``brain.bridge.cli_throttle`` allows only the throttle submodule, not
+    arbitrary exports from ``brain.bridge``).
+
+    Relative imports are skipped — they cannot name an absolute brain.* path.
+    """
+    paths: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("brain."):
+                    paths.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue  # relative — skip
+            if node.module and node.module.startswith("brain."):
+                for alias in node.names:
+                    paths.append(f"{node.module}.{alias.name}")
+    return paths
+
+
+def _is_allowlisted(import_path: str) -> bool:
+    """True if import_path is covered by _BRAIN_IMPORT_ALLOWLIST.
+
+    An import path is covered if it exactly matches an allowlist entry (the
+    import IS the allowlisted module/submodule) OR if it starts with
+    ``entry + "."`` (the import is a symbol FROM an allowlisted module).
+
+    Examples:
+      "brain.kindled_link.gate"           → exact match → allowed
+      "brain.kindled_link.gate.DenyAllGate" → prefixed by "brain.kindled_link.gate." → allowed
+      "brain.bridge.cli_throttle"         → exact match → allowed
+      "brain.bridge.cli_throttle.foo"     → prefixed → allowed
+      "brain.chat.tool_recruit"           → no match → FORBIDDEN
+    """
+    for entry in _BRAIN_IMPORT_ALLOWLIST:
+        if import_path == entry or import_path.startswith(entry + "."):
+            return True
+    return False
+
+
+def test_peer_modules_import_only_allowlisted_modules():
+    """FIX 1: future-proof import allowlist oracle.
+
+    Any ``brain.*`` module imported by a peer module that is NOT covered by
+    ``_BRAIN_IMPORT_ALLOWLIST`` is a potential tool-injection vector — a
+    future developer could add ``from brain.chat.tool_recruit import …``
+    and the 5-name denylist (test_peer_modules_reference_no_tool_path)
+    would miss it if the symbol name doesn't happen to be on the list.
+    This test catches ANY new brain.* import regardless of symbol name.
+
+    Stdlib, third-party, and relative imports are unconditionally allowed.
+    """
+    for mod_path in _PEER_MODULES:
+        src = mod_path.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(mod_path))
+        for import_path in _collect_brain_import_paths(tree):
+            assert _is_allowlisted(import_path), (
+                f"{mod_path.name} imports {import_path!r} which is NOT covered by "
+                f"_BRAIN_IMPORT_ALLOWLIST {_BRAIN_IMPORT_ALLOWLIST!r}. "
+                "If this import is safe, add it to _BRAIN_IMPORT_ALLOWLIST and "
+                "document why it introduces no tool-path reachability."
+            )
+
+
 def test_chat_path_does_not_import_kindled_link():
     # §7.2: Phase 3 cannot regress the chat token path — it isn't reachable from it.
     targets = list((_ROOT / "brain" / "chat").rglob("*.py"))

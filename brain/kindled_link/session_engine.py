@@ -18,6 +18,20 @@ log = logging.getLogger(__name__)
 # NOTE: keep this module free of the literal forbidden symbol names — the T9
 # conformance oracle parses imports/attributes by AST (so a comment like this is
 # safe), but do not import or reference the agentic tool surface.
+
+
+def _check_day(now: datetime, today: str) -> None:
+    """Raise ValueError if today does not match now's calendar date (ISO format).
+
+    A stale `today` silently reads the wrong day's cap counters — an easy
+    caller mistake that _check_day catches eagerly at the send boundary.
+    """
+    expected = now.strftime("%Y-%m-%d")
+    if today != expected:
+        raise ValueError(
+            f"today={today!r} disagrees with now's date {expected!r}; "
+            "pass today=now.strftime('%Y-%m-%d') to keep cap reads consistent."
+        )
 _MIN_OUTBOUND_GAP_SECONDS = 60
 _SESSION_MSG_CAP = 24
 _SESSION_COOLDOWN_HOURS = 6
@@ -128,6 +142,7 @@ class SessionEngine:
         future real gate from firing a burst of sends that bypasses §5.3 — the
         predicates are wired into the send path, not merely unit-tested (red-team
         Major #2 + re-red-team session-state Minor)."""
+        _check_day(now, today)
         if not self._send_allowed(peer_id, session_id, now, today):
             return "hold"
         peer = self._store.get_peer(peer_id)
