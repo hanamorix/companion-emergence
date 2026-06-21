@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -29,10 +30,18 @@ def _normalise(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", unicodedata.normalize("NFC", text)).strip().casefold()
 
 
+_MIN_GROUNDED_QUOTE_CHARS = 12
+
+
 def _is_grounded(quote: str, transcript: str) -> bool:
-    """True iff the normalised quote is a substring of the normalised transcript."""
+    """True iff the normalised quote is a substring of the normalised transcript
+    AND long enough to be meaningful. A trivial sub-12-char quote (a single word
+    or character that happens to appear) does NOT ground a stage promotion
+    (stage-6 review: substring grounding is necessary-not-sufficient)."""
     q = _normalise(quote)
-    return bool(q) and q in _normalise(transcript)
+    if len(q) < _MIN_GROUNDED_QUOTE_CHARS:
+        return False
+    return q in _normalise(transcript)
 
 
 def _build_reflection_prompt(*, current_stage: str, transcript: str) -> str:
@@ -248,6 +257,8 @@ def relationship_emotion_delta(*, dominant_source: str) -> dict[str, float]:
     raw = dict(_EMOTION_BASE)
     for name, v in _EMOTION_ACCENT.get(dominant_source, {}).items():
         raw[name] = raw.get(name, 0.0) + v
+    # drop any non-finite values before they can reach felt state (stage-6 review)
+    raw = {k: v for k, v in raw.items() if math.isfinite(v)}
     return _filter_to_registered(raw)
 
 
@@ -260,7 +271,9 @@ def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: dateti
     can never dominate her felt state at any instant). After partial decay a peer
     may re-engage, but the INSTANTANEOUS accumulated influence is always <= cap."""
     magnitude = sum(abs(v) for v in delta.values())
-    if magnitude <= 0:
+    # NaN/inf must NOT slip past (all NaN comparisons are False → it would apply
+    # at full strength while the accumulator never charges = unbounded; stage-6 Major)
+    if not math.isfinite(magnitude) or magnitude <= 0:
         return {}
     current = store.get_peer_emotion_accumulated(peer_id, now)
     headroom = max(0.0, limits.PEER_EMOTION_WINDOW_CAP - current)
