@@ -26,7 +26,11 @@ from pathlib import Path
 from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
 from brain.chat.budget import apply_budget
-from brain.chat.prompt import build_system_message
+from brain.chat.prompt import (
+    build_static_system_message,
+    build_system_message,
+    build_volatile_context,
+)
 from brain.chat.salience import assess_salience
 from brain.chat.session import SessionState, create_session
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
@@ -175,17 +179,43 @@ def respond(
     soul_db = persona_dir / "crystallizations.db"
     soul_store = SoulStore(str(soul_db))
     try:
-        # 5. System message — pass the user's current input so the recall
-        # block can surface memories matching this turn (Phase 2.A).
-        system_msg = build_system_message(
-            persona_dir,
-            voice_md=voice_md,
-            daemon_state=daemon_state,
-            soul_store=soul_store,
-            store=store,
-            user_input=user_input,
-            reply_to_audit_id=reply_to_audit_id,
-        )
+        # 5. System message — prompt-caching split (Options A / A+).
+        #
+        # Text/stream turns: freeze the system prompt to just the static head
+        # (preamble + voice.md + epistemic) so the system+tools cache unit is
+        # byte-stable cross-call, and carry the per-turn volatile context as a
+        # stdin suffix appended after history + the new user turn (see
+        # provider._format_claude_print_prompt + run_tool_loop chat_options).
+        #
+        # Image turns: keep the pre-change single-system-message shape. The
+        # image path (_chat_with_images) folds prior history into the
+        # --system-prompt-file and sends only the final user turn via
+        # stream-json; it has no stdin tail to carry a suffix, so all volatile
+        # context must stay in the system message. Using the unchanged
+        # build_system_message() here keeps that rare path byte-equivalent to
+        # pre-change (criterion C5).
+        if image_shas:
+            system_msg = build_system_message(
+                persona_dir,
+                voice_md=voice_md,
+                daemon_state=daemon_state,
+                soul_store=soul_store,
+                store=store,
+                user_input=user_input,
+                reply_to_audit_id=reply_to_audit_id,
+            )
+            volatile_suffix: str | None = None
+        else:
+            system_msg = build_static_system_message(persona_dir, voice_md=voice_md)
+            volatile_suffix = build_volatile_context(
+                persona_dir,
+                voice_md=voice_md,
+                daemon_state=daemon_state,
+                soul_store=soul_store,
+                store=store,
+                user_input=user_input,
+                reply_to_audit_id=reply_to_audit_id,
+            )
     finally:
         soul_store.close()
 
@@ -230,6 +260,19 @@ def respond(
         signal = None
         allowed = None
     tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
+
+    # Per-call provider options carrying the Option A+ volatile suffix. On text/
+    # stream turns this threads the per-turn context to the provider so it lands
+    # in the stdin tail (after history) instead of the frozen system prompt, and
+    # signals the provider to drop the now-relocated clock line from the top of
+    # the JSONL context block (include_block_clock=False). Empty on image turns
+    # (volatile stays in the system message) → no behavioural change there.
+    chat_options: dict = {}
+    if volatile_suffix is not None:
+        chat_options["volatile_suffix"] = volatile_suffix
+        chat_options["include_block_clock"] = False
+        chat_options["session_id"] = session.session_id
+
     response, invocations = run_tool_loop(
         messages,
         provider=provider,
@@ -240,6 +283,7 @@ def respond(
         companion_name=persona_dir.name,
         recruited_allowed=allowed,
         signal=signal,
+        chat_options=chat_options or None,
     )
     content = response.content or ""
 

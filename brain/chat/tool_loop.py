@@ -227,6 +227,7 @@ def _maybe_recruit_and_rerun(
     persona_dir: Path,
     companion_name: str,
     recruited_allowed: list[str] | None,
+    chat_options: dict | None = None,
 ) -> ChatResponse | None:
     """If the model reached for a withheld faculty, re-invoke ONCE with the full
     tool suite so it can complete the reach this turn.
@@ -256,7 +257,11 @@ def _maybe_recruit_and_rerun(
                          "do not call reach_for_capability again.]"),
             )
         ]
-        rerun = provider.chat(rerun_messages, tools=tools, options={"persona_dir": str(persona_dir)})
+        rerun = provider.chat(
+            rerun_messages,
+            tools=tools,
+            options={"persona_dir": str(persona_dir), **(chat_options or {})},
+        )
         if rerun.dispatched_invocations:
             invocations.extend(rerun.dispatched_invocations)
         return rerun
@@ -277,6 +282,7 @@ def run_tool_loop(
     recruited_allowed: list[str] | None = None,
     max_iterations: int = MAX_TOOL_ITERATIONS,
     signal=None,
+    chat_options: dict | None = None,
 ) -> tuple[ChatResponse, list[dict]]:
     """Loop: provider.chat() → if tool_calls, dispatch each → retry.
 
@@ -306,11 +312,19 @@ def run_tool_loop(
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
 
+    # Per-call provider options. chat_options carries the Option A+ volatile
+    # suffix (+ include_block_clock / session_id) when the caller supplied it;
+    # merged with persona_dir so every provider.chat() in the loop sends the
+    # same volatile tail the system message used to carry pre-change. (The final
+    # forced pass below deliberately omits persona_dir to preserve its
+    # pre-change no-usage-log behaviour — see there.)
+    call_options: dict[str, Any] = {"persona_dir": str(persona_dir), **(chat_options or {})}
+
     for _iteration in range(max_iterations):
         last_response = provider.chat(
             messages,
             tools=tools,
-            options={"persona_dir": str(persona_dir)},
+            options=call_options,
         )
         # Provider-dispatched invocations (claude-cli MCP path): tools
         # already ran inside the subprocess. Surface them for telemetry
@@ -330,6 +344,7 @@ def run_tool_loop(
                 persona_dir=persona_dir,
                 companion_name=companion_name,
                 recruited_allowed=recruited_allowed,
+                chat_options=chat_options,
             )
             if recruited is not None:
                 last_response = recruited
@@ -402,8 +417,12 @@ def run_tool_loop(
 
     # Hit iteration cap — force a final pass with no tools so the model
     # is obligated to produce a content response (per OG pattern).
+    # Pass chat_options (volatile suffix) but NOT persona_dir, preserving the
+    # pre-change behaviour where this forced pass did not log usage; the
+    # volatile tail still rides along so the model keeps the same context the
+    # system message used to carry.
     logger.warning("tool loop hit max_iterations=%d", max_iterations)
-    last_response = provider.chat(messages, tools=None)
+    last_response = provider.chat(messages, tools=None, options=(chat_options or None))
     monologue_text = _find_monologue_text(invocations)
     if monologue_text:
         _spawn_pass2(
