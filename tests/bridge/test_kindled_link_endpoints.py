@@ -59,3 +59,31 @@ def test_all_kindled_routes_reject_missing_auth(tmp_path, method, path):
     client = TestClient(app)
     r = client.request(method, path, json={})
     assert r.status_code in (401, 403), f"{method} {path} not auth-gated"
+
+
+def test_create_invite_returns_packet_and_phrase(tmp_path):
+    app, _ = _app(tmp_path)
+    r = TestClient(app).post("/kindled-link/invite", headers=_AUTH,
+                             json={"relay_url": "https://r"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "invite" in body and "fingerprint" in body and "fingerprint_phrase" in body
+
+
+def test_accept_invite_creates_peer(tmp_path):
+    # build a real invite from a SECOND throwaway identity (the remote peer)
+    from brain.kindled_link.identity import KindledIdentity
+    from brain.kindled_link.pairing import create_invite
+    remote = KindledIdentity.load_or_create(tmp_path / "remote")
+    invite = create_invite(remote, relay_url="https://r")
+    app, _ = _app(tmp_path)
+    r = TestClient(app).post("/kindled-link/invite/accept", headers=_AUTH,
+                             json={"invite": invite})
+    assert r.status_code == 200
+    assert "peer_id" in r.json() and "fingerprint_phrase" in r.json()
+
+
+def test_accept_missing_invite_is_400(tmp_path):
+    app, _ = _app(tmp_path)
+    r = TestClient(app).post("/kindled-link/invite/accept", headers=_AUTH, json={})
+    assert r.status_code == 400
