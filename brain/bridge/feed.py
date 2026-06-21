@@ -442,7 +442,10 @@ def build_kindled_link_entries(persona_dir: Path, *, limit: int) -> list[FeedEnt
     from brain.kindled_link.feed_source import relationship_milestone_entries
     from brain.kindled_link.store import KindledLinkStore
     store = KindledLinkStore(db, integrity_check=False)
-    rows = relationship_milestone_entries(store, limit=limit)
+    try:
+        rows = relationship_milestone_entries(store, limit=limit)
+    finally:
+        store.close()
     out: list[FeedEntry] = []
     for r in rows:
         ts = r.get("ts")

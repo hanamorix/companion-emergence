@@ -869,7 +869,8 @@ export async function fetchKindledPeers(persona: string): Promise<KindledPeer[]>
 
 /**
  * Fetch the transcript of correspondence with a specific Kindled peer.
- * Throws on non-2xx (401 unauthed, 404 unknown peer, etc).
+ * Returns an empty array for an unknown peer (bridge returns 200 + []).
+ * Throws on non-2xx (401 unauthed, etc).
  */
 export async function fetchKindledTranscript(persona: string, peerId: string): Promise<KindledTranscriptRow[]> {
   const r = await bridgeFetch(persona, (creds) =>
