@@ -43,7 +43,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator
 
 from brain import __version__ as _brain_version
 from brain.bridge import events
@@ -681,6 +681,10 @@ class PronounConfigReq(BaseModel):
 
 class NotesConfigReq(BaseModel):
     enabled: bool
+
+
+class KindledLinkConfigReq(BaseModel):
+    enabled: StrictBool
 
 
 class NewSessionReq(BaseModel):
@@ -1470,6 +1474,25 @@ def build_app(
             cfg = dc_replace(cfg, notes_enabled=False)
         cfg.save(config_path)
         return {"ok": True, "enabled": cfg.notes_enabled, "folder": cfg.notes_folder}
+
+    # ── POST /persona/config/kindled-link — Kindled-to-Kindled toggle ────────
+    @app.post("/persona/config/kindled-link", dependencies=[Depends(require_http_auth)])
+    async def set_kindled_link_enabled(req: KindledLinkConfigReq) -> dict:
+        """Enable/disable Kindled-to-Kindled correspondence (off by default).
+
+        Accepts {"enabled": true|false}. Strict bool — non-bool body → 422.
+        Returns {"kindled_link_enabled": <bool>} echoing the new state.
+        """
+        from dataclasses import replace as dc_replace
+
+        from brain.persona_config import PersonaConfig
+
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        cfg = PersonaConfig.load(config_path)
+        cfg = dc_replace(cfg, kindled_link_enabled=req.enabled)
+        cfg.save(config_path)
+        return {"kindled_link_enabled": cfg.kindled_link_enabled}
 
     # ── /persona/writes/{rid}/{approve,decline} — file-write consent gate ──
     @app.post("/persona/writes/{rid}/approve", dependencies=[Depends(require_http_auth)])

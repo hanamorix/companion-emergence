@@ -51,6 +51,7 @@ def _default_persona_config_dict() -> dict:
         "user_pronouns": None,
         "notes_enabled": False,
         "notes_folder": None,
+        "kindled_link_enabled": False,
     }
 
 
@@ -83,6 +84,7 @@ class PersonaConfig:
     user_pronouns: dict | None = None  # expanded PronounSet dict; None → she/her at use-time
     notes_enabled: bool = False
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
+    kindled_link_enabled: bool = False
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -128,6 +130,7 @@ class PersonaConfig:
         user_pronouns_raw = data.get("user_pronouns")
         user_pronouns = user_pronouns_raw if isinstance(user_pronouns_raw, dict) else None
         notes_enabled = bool(data.get("notes_enabled", False))
+        kindled_link_enabled = bool(data.get("kindled_link_enabled", False))
         notes_folder_raw = data.get("notes_folder")
         notes_folder = (
             notes_folder_raw if isinstance(notes_folder_raw, str) and notes_folder_raw else None
@@ -159,6 +162,7 @@ class PersonaConfig:
             user_pronouns=user_pronouns,
             notes_enabled=notes_enabled,
             notes_folder=notes_folder,
+            kindled_link_enabled=kindled_link_enabled,
         )
 
     @classmethod
@@ -200,6 +204,7 @@ class PersonaConfig:
             "user_pronouns": self.user_pronouns,
             "notes_enabled": self.notes_enabled,
             "notes_folder": self.notes_folder,
+            "kindled_link_enabled": self.kindled_link_enabled,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
