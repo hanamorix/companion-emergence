@@ -1257,6 +1257,107 @@ def build_app(
             "backfill": backfill,
         }
 
+    # ── /kindled-link/{peers,transcript,holds} — read endpoints ────────────
+    @app.get("/kindled-link/peers", dependencies=[Depends(require_http_auth)])
+    def kindled_peers() -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import list_peers
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"peers": []}
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return {"peers": list_peers(store)}
+        finally:
+            store.close()
+
+    @app.get("/kindled-link/peers/{peer_id}/transcript",
+             dependencies=[Depends(require_http_auth)])
+    def kindled_transcript(peer_id: str) -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import peer_transcript
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"transcript": []}
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return {"transcript": peer_transcript(store, peer_id)}
+        finally:
+            store.close()
+
+    @app.get("/kindled-link/holds", dependencies=[Depends(require_http_auth)])
+    def kindled_holds() -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import holds_status
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"held_count": 0, "items": []}
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return holds_status(store)
+        finally:
+            store.close()
+
+    # ── POST /kindled-link/{invite,invite/accept} — pairing endpoints ─────────
+    @app.post("/kindled-link/invite", dependencies=[Depends(require_http_auth)])
+    def kindled_create_invite(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
+        from brain.kindled_link.pairing import create_invite
+        idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
+        relay_url = (payload or {}).get("relay_url") or ""  # relay_url is a required str (m5)
+        invite = create_invite(idn, relay_url=relay_url)
+        # return the SAME fingerprint phrase the accept side verifies (M2)
+        return {"invite": invite, "fingerprint": idn.key_id,
+                "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
+
+    @app.post("/kindled-link/invite/accept", dependencies=[Depends(require_http_auth)])
+    def kindled_accept_invite(payload: dict[str, Any]) -> dict[str, Any]:
+        from brain.kindled_link.pairing import InviteError, confirm_local_fingerprint, import_invite
+        from brain.kindled_link.store import (
+            ConsentTransitionError,
+            KindledLinkStore,
+            kindled_db_path,
+        )
+        invite = payload.get("invite")
+        if not invite:
+            raise HTTPException(status_code=400, detail="missing invite")
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)  # helper no longer mkdirs (M3)
+        store = KindledLinkStore(db)
+        try:
+            result = import_invite(invite, store=store, now=datetime.now(UTC))  # B1: no recipient
+            confirm_local_fingerprint(store, result["peer_id"])  # M1: inside the guard
+        except (InviteError, ConsentTransitionError) as exc:  # M1/m7: catch both → 400
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return result
+
+    @app.post("/kindled-link/peers/{peer_id}/consent",
+              dependencies=[Depends(require_http_auth)])
+    def kindled_set_consent(peer_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        from brain.kindled_link.store import (
+            ConsentTransitionError,
+            KindledLinkStore,
+            kindled_db_path,
+        )
+
+        action_map = {"pause": "paused", "resume": "paired",
+                      "revoke": "revoked", "block": "blocked"}
+        new_state = action_map.get((payload or {}).get("action", ""))
+        if new_state is None:
+            raise HTTPException(status_code=400, detail="unknown consent action")
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)  # helper no longer mkdirs (M3)
+        store = KindledLinkStore(db)
+        try:
+            store.set_consent(peer_id, new_state, datetime.now(UTC))
+            return {"peer_id": peer_id, "consent_state": new_state}
+        except ConsentTransitionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            store.close()
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:

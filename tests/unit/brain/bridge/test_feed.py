@@ -28,6 +28,7 @@ def test_type_opener_covers_all_types() -> None:
         "file_write",
         "maker",
         "note",
+        "kindled_link",
     }
     assert set(TYPE_OPENER.keys()) == expected
     for key, opener in TYPE_OPENER.items():

@@ -39,6 +39,7 @@ FeedEntryType = Literal[
     "file_write",
     "maker",
     "note",
+    "kindled_link",
 ]
 
 
@@ -55,6 +56,7 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "file_write": "I wrote to a file —",
     "maker": "I made something —",
     "note": "I left you a note —",
+    "kindled_link": "a friendship deepened —",
 }
 
 
@@ -430,6 +432,31 @@ def build_pronoun_nudge_entries_adapter(persona_dir: Path, *, limit: int) -> lis
     return build_pronoun_nudge_entries(persona_dir)[:limit]
 
 
+def build_kindled_link_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
+    """Relationship stage-up milestones (parent §14 feeds-into 'Feed'). Reads the
+    Phase-5 feed_source; fail-soft (no db file → [])."""
+    from brain.kindled_link.store import kindled_db_path
+    db = kindled_db_path(persona_dir)
+    if not db.exists():
+        return []
+    from brain.kindled_link.feed_source import relationship_milestone_entries
+    from brain.kindled_link.store import KindledLinkStore
+    store = KindledLinkStore(db, integrity_check=False)
+    try:
+        rows = relationship_milestone_entries(store, limit=limit)
+    finally:
+        store.close()
+    out: list[FeedEntry] = []
+    for r in rows:
+        ts = r.get("ts")
+        if not ts:
+            continue
+        out.append(FeedEntry(
+            type="kindled_link", ts=ts, opener=TYPE_OPENER["kindled_link"],
+            body=f"my bond with {r['peer_id']} grew to {r['stage']}."))
+    return out
+
+
 def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
     """Merge all source streams into a single ts-desc feed, capped at limit.
 
@@ -450,6 +477,7 @@ def build_feed(persona_dir: Path, *, limit: int = 50) -> list[FeedEntry]:
         build_monologue_entries,
         build_attunement_entries_adapter,
         build_pronoun_nudge_entries_adapter,
+        build_kindled_link_entries,
     )
 
     merged: list[FeedEntry] = []
