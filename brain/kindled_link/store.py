@@ -101,6 +101,12 @@ CREATE TABLE IF NOT EXISTS local_identity (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outbound_seq (
+    peer_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
 CREATE TABLE IF NOT EXISTS pending_handshakes (
     peer_id         TEXT NOT NULL,
     session_id      TEXT NOT NULL,
@@ -637,6 +643,26 @@ class KindledLinkStore:
             "peer_role": int(row["peer_role"]),
             "established_at": row["established_at"],
         }
+
+    def next_outbound_sequence(self, peer_id: str, session_id: str) -> int:
+        """Return the next strictly-increasing per-(peer, session) sequence number.
+
+        Implemented as a single atomic upsert with RETURNING so concurrent callers
+        can never observe the same sequence under the same session key.
+        The sequence starts at 1 (sequence 0 is reserved for session_open).
+        """
+        row = self._conn.execute(
+            """
+            INSERT INTO outbound_seq (peer_id, session_id, seq)
+            VALUES (?, ?, 1)
+            ON CONFLICT(peer_id, session_id)
+            DO UPDATE SET seq = seq + 1
+            RETURNING seq
+            """,
+            (peer_id, session_id),
+        ).fetchone()
+        self._conn.commit()
+        return int(row[0])
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a
