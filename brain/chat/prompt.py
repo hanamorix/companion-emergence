@@ -459,6 +459,15 @@ def _build_soul_highlights(soul_store: SoulStore) -> str:
         return ""
 
 
+def _peer_attributed(mem, snippet: str) -> str:
+    """Provenance invariant (kindled-link §14): a peer-sourced memory must surface
+    as 'something a peer said', never as the user's own words or as fact. Applied
+    at every Memory-object recall render point."""
+    if getattr(mem, "memory_type", "") == "kindled_peer":
+        return f"(something a peer said) {snippet}"
+    return snippet
+
+
 def _build_recall_block(
     store: MemoryStore,
     user_input: str,
@@ -532,7 +541,7 @@ def _build_recall_block(
             if domain:
                 prefix += f" · {domain}"
             prefix += "]"
-            lines.append(f"- {prefix} {snippet}")
+            lines.append(f"- {prefix} {_peer_attributed(mem, snippet)}")
 
         return "\n".join(lines)
 
@@ -627,7 +636,7 @@ def _build_recall_block(
             snippet = (getattr(mem, "content", "") or "").strip()
             if len(snippet) > max_chars:
                 snippet = snippet[: max_chars - 1].rstrip() + "…"
-            lines.append(f'    - "{snippet}"')
+            lines.append(f'    - "{_peer_attributed(mem, snippet)}"')
 
     if fading_top:
         lines.append("  softened (fading; original detail gone):")
@@ -635,7 +644,7 @@ def _build_recall_block(
             snippet = (getattr(mem, "content", "") or "").strip()
             if len(snippet) > max_chars:
                 snippet = snippet[: max_chars - 1].rstrip() + "…"
-            lines.append(f'    - "{snippet}"  [state: fading]')
+            lines.append(f'    - "{_peer_attributed(mem, snippet)}"  [state: fading]')
 
     if lost_top:
         lines.append("  lost (no longer in active memory):")

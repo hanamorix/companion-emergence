@@ -10,6 +10,8 @@ _PEER_MODULES = [
     _ROOT / "brain" / "kindled_link" / "peer_prompt.py",
     _ROOT / "brain" / "kindled_link" / "session_engine.py",
     _ROOT / "brain" / "kindled_link" / "privacy_gate.py",
+    _ROOT / "brain" / "kindled_link" / "relationship.py",
+    _ROOT / "brain" / "kindled_link" / "feed_source.py",
 ]
 # the genuine injection-hole names (verified in the red-team against the real code)
 _FORBIDDEN = {"dispatch", "tool_recruit", "reach_for_capability",
@@ -63,7 +65,10 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
     "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
     "brain.kindled_link.store",      # persistence layer — no tool surface (session_engine imports)
+    "brain.kindled_link.relationship",  # relationship state + maturation — no tool surface (session_engine imports)
     "brain.bridge.cli_throttle",     # throttle module — no tool surface
+    "brain.chat.extractor",          # extractor symbols only — no tool surface (feed_source.py candidate reader)
+    "brain.memory.store",            # MemoryStore symbols only — no tool surface (future kindled_peer memory writes)
 }
 
 
