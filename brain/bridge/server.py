@@ -1319,6 +1319,29 @@ def build_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result
 
+    @app.post("/kindled-link/peers/{peer_id}/consent",
+              dependencies=[Depends(require_http_auth)])
+    def kindled_set_consent(peer_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        from brain.kindled_link.store import (
+            ConsentTransitionError,
+            KindledLinkStore,
+            kindled_db_path,
+        )
+
+        action_map = {"pause": "paused", "resume": "paired",
+                      "revoke": "revoked", "block": "blocked"}
+        new_state = action_map.get((payload or {}).get("action", ""))
+        if new_state is None:
+            raise HTTPException(status_code=400, detail="unknown consent action")
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)  # helper no longer mkdirs (M3)
+        store = KindledLinkStore(db)
+        try:
+            store.set_consent(peer_id, new_state, datetime.now(UTC))
+            return {"peer_id": peer_id, "consent_state": new_state}
+        except ConsentTransitionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
