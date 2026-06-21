@@ -203,6 +203,12 @@ def complete_session(
     if pending is None:
         return  # No pending handshake — nothing to complete
 
+    # Initiator-side clobber guard (mirrors on_session_open): if a key is already
+    # established for this session, a replayed/interrupted leg-3 must drop without
+    # re-deriving or re-creating the sessions row (T2.5 review).
+    if store.get_session_key(responder_peer_id, session_id) is not None:
+        return
+
     my_eph_priv = X25519PrivateKey.from_private_bytes(pending["my_eph_priv_raw"])
     responder_eph_pub = bytes.fromhex(parsed["ephemeral_pub"])
     # Use the INITIATOR's original bootstrap_nonce (stored in pending row).
