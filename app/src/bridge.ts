@@ -898,7 +898,7 @@ export async function fetchKindledHolds(persona: string): Promise<KindledHolds> 
  * Optional relayUrl defaults to null (use the brain's default relay).
  * Throws on non-2xx (401 unauthed, etc).
  */
-export async function createKindledInvite(persona: string, relayUrl?: string): Promise<{ invite: unknown; fingerprint: string }> {
+export async function createKindledInvite(persona: string, relayUrl?: string): Promise<{ invite: unknown; fingerprint: string; fingerprint_phrase: string }> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/invite`, {
       method: "POST",
@@ -907,7 +907,7 @@ export async function createKindledInvite(persona: string, relayUrl?: string): P
     }),
   );
   if (!r.ok) throw new Error(`/kindled-link/invite ${r.status}`);
-  return (await r.json()) as { invite: unknown; fingerprint: string };
+  return (await r.json()) as { invite: unknown; fingerprint: string; fingerprint_phrase: string };
 }
 
 /**
@@ -929,7 +929,7 @@ export async function acceptKindledInvite(persona: string, invite: unknown): Pro
 /**
  * Set the consent state for a Kindled peer relationship.
  * Action must be one of: "pause", "resume", "revoke", "block".
- * Throws on non-2xx (401 unauthed, 404 unknown peer, etc).
+ * Throws on non-2xx (401 unauthed; 400 unknown peer / illegal transition / unknown action).
  */
 export async function setKindledConsent(persona: string, peerId: string, action: "pause" | "resume" | "revoke" | "block"): Promise<void> {
   const r = await bridgeFetch(persona, (creds) =>
