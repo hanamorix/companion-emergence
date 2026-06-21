@@ -4,6 +4,7 @@ later phases). Connection idiom mirrors brain/memory/store.py (integrity check �
 WAL + 5s busy_timeout → Row → executescript)."""
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,21 @@ CREATE TABLE IF NOT EXISTS disclosure_budget (
     peer_id     TEXT PRIMARY KEY,
     budget      REAL NOT NULL,
     updated_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relationship_state (
+    peer_id              TEXT PRIMARY KEY,
+    stage                TEXT NOT NULL,
+    trust_score          REAL NOT NULL,
+    affinity_tags_json   TEXT NOT NULL,
+    boundaries_json      TEXT NOT NULL,
+    repair_history_json  TEXT NOT NULL,
+    evidence_json        TEXT NOT NULL,
+    last_reflected_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS peer_emotion_window (
+    peer_id      TEXT PRIMARY KEY,
+    accumulated  REAL NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 """
 
@@ -391,3 +407,68 @@ class KindledLinkStore:
             elapsed_days = 0.0
         refilled = stored + max(0.0, elapsed_days) * limits.BUDGET_REFILL_PER_DAY
         return min(limits.BUDGET_MAX, max(0.0, refilled))
+
+    # --- relationship_state (Phase 5, parent §13) ---
+    def get_relationship_row(self, peer_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM relationship_state WHERE peer_id = ?", (peer_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_relationship_row(
+        self, *, peer_id: str, stage: str, trust_score: float,
+        affinity_tags_json: str, boundaries_json: str, repair_history_json: str,
+        evidence_json: str, now: datetime,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO relationship_state
+               (peer_id, stage, trust_score, affinity_tags_json, boundaries_json,
+                repair_history_json, evidence_json, last_reflected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(peer_id) DO UPDATE SET
+                 stage=excluded.stage, trust_score=excluded.trust_score,
+                 affinity_tags_json=excluded.affinity_tags_json,
+                 boundaries_json=excluded.boundaries_json,
+                 repair_history_json=excluded.repair_history_json,
+                 evidence_json=excluded.evidence_json,
+                 last_reflected_at=excluded.last_reflected_at""",
+            (peer_id, stage, trust_score, affinity_tags_json, boundaries_json,
+             repair_history_json, evidence_json, now.isoformat()),
+        )
+        self._conn.commit()
+
+    # --- peer_emotion_window (Phase 5, parent §14.3 anti love-bomb) ---
+    def get_peer_emotion_accumulated(self, peer_id: str, now: datetime) -> float:
+        row = self._conn.execute(
+            "SELECT accumulated, updated_at FROM peer_emotion_window WHERE peer_id = ?",
+            (peer_id,),
+        ).fetchone()
+        if row is None:
+            return 0.0
+        return self._decayed_window(row["accumulated"], row["updated_at"], now)
+
+    def add_peer_emotion(self, peer_id: str, magnitude: float, now: datetime) -> float:
+        if not math.isfinite(magnitude):  # defense-in-depth (stage-6 review)
+            magnitude = 0.0
+        current = self.get_peer_emotion_accumulated(peer_id, now)
+        new_total = current + max(0.0, magnitude)
+        self._conn.execute(
+            """INSERT INTO peer_emotion_window (peer_id, accumulated, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(peer_id) DO UPDATE SET
+                 accumulated=excluded.accumulated, updated_at=excluded.updated_at""",
+            (peer_id, new_total, now.isoformat()),
+        )
+        self._conn.commit()
+        return new_total
+
+    @staticmethod
+    def _decayed_window(stored: float, updated_at: str, now: datetime) -> float:
+        try:
+            elapsed_h = (now - datetime.fromisoformat(updated_at)).total_seconds() / 3600.0
+        except (ValueError, TypeError):
+            return stored
+        if elapsed_h <= 0:
+            return stored
+        frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
+        return stored * frac
