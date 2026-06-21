@@ -27,3 +27,8 @@ MIN_SEND_DEBIT = 0.02
 # influence within a rolling window decays linearly to zero over the window.
 PEER_EMOTION_WINDOW_CAP = 0.6
 PEER_EMOTION_WINDOW_HOURS = 24.0
+
+# Local inbound flood cap (parent design §9): max envelopes decrypted/processed
+# per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
+# degraded state — bounds local decrypt/provider work against a flooding peer.
+INBOUND_FLOOD_CAP = 20
