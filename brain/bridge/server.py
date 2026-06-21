@@ -1265,7 +1265,11 @@ def build_app(
         db = kindled_db_path(persona_dir)
         if not db.exists():
             return {"peers": []}
-        return {"peers": list_peers(KindledLinkStore(db, integrity_check=False))}
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return {"peers": list_peers(store)}
+        finally:
+            store.close()
 
     @app.get("/kindled-link/peers/{peer_id}/transcript",
              dependencies=[Depends(require_http_auth)])
@@ -1275,7 +1279,11 @@ def build_app(
         db = kindled_db_path(persona_dir)
         if not db.exists():
             return {"transcript": []}
-        return {"transcript": peer_transcript(KindledLinkStore(db, integrity_check=False), peer_id)}
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return {"transcript": peer_transcript(store, peer_id)}
+        finally:
+            store.close()
 
     @app.get("/kindled-link/holds", dependencies=[Depends(require_http_auth)])
     def kindled_holds() -> dict[str, Any]:
@@ -1284,7 +1292,11 @@ def build_app(
         db = kindled_db_path(persona_dir)
         if not db.exists():
             return {"held_count": 0, "items": []}
-        return holds_status(KindledLinkStore(db, integrity_check=False))
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            return holds_status(store)
+        finally:
+            store.close()
 
     # ── POST /kindled-link/{invite,invite/accept} — pairing endpoints ─────────
     @app.post("/kindled-link/invite", dependencies=[Depends(require_http_auth)])
@@ -1317,6 +1329,8 @@ def build_app(
             confirm_local_fingerprint(store, result["peer_id"])  # M1: inside the guard
         except (InviteError, ConsentTransitionError) as exc:  # M1/m7: catch both → 400
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            store.close()
         return result
 
     @app.post("/kindled-link/peers/{peer_id}/consent",
@@ -1341,6 +1355,8 @@ def build_app(
             return {"peer_id": peer_id, "consent_state": new_state}
         except ConsentTransitionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            store.close()
 
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])

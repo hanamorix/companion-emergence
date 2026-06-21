@@ -15,18 +15,31 @@ interface Props {
   persona: string;
 }
 
-/** Which consent actions are available for a given consent_state */
+/** Which consent actions are available for a given consent_state.
+ * Mirrors store.py _ALLOWED_TRANSITIONS so the UI never offers an action
+ * the backend will 400:
+ *   paired         → pause | revoke | block
+ *   paused         → resume | revoke | block
+ *   pending_local  → revoke | block
+ *   pending_remote → revoke | block
+ *   revoked        → block
+ *   blocked        → (terminal — no actions)
+ */
 function consentActions(consentState: string): Array<"pause" | "resume" | "revoke" | "block"> {
   switch (consentState) {
     case "paired":
-    case "familiar":
       return ["pause", "revoke", "block"];
     case "paused":
       return ["resume", "revoke", "block"];
-    case "pending":
+    case "pending_local":
+    case "pending_remote":
       return ["revoke", "block"];
-    default:
+    case "revoked":
       return ["block"];
+    case "blocked":
+      return [];
+    default:
+      return [];
   }
 }
 

@@ -52,3 +52,9 @@ def test_invite_consumed_ledger() -> None:
     assert s.is_invite_consumed("inv_1") is True
     with pytest.raises(ConsentTransitionError):
         s.mark_invite_consumed("inv_1", now)  # single-use: re-consume rejected
+
+
+def test_close_is_idempotent_enough() -> None:
+    """close() must exist and not raise on first call."""
+    s = KindledLinkStore(":memory:")
+    s.close()  # must not raise
