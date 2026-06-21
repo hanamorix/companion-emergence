@@ -4,6 +4,7 @@ later phases). Connection idiom mirrors brain/memory/store.py (integrity check �
 WAL + 5s busy_timeout → Row → executescript)."""
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -447,6 +448,8 @@ class KindledLinkStore:
         return self._decayed_window(row["accumulated"], row["updated_at"], now)
 
     def add_peer_emotion(self, peer_id: str, magnitude: float, now: datetime) -> float:
+        if not math.isfinite(magnitude):  # defense-in-depth (stage-6 review)
+            magnitude = 0.0
         current = self.get_peer_emotion_accumulated(peer_id, now)
         new_total = current + max(0.0, magnitude)
         self._conn.execute(
