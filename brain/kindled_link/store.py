@@ -101,6 +101,24 @@ CREATE TABLE IF NOT EXISTS local_identity (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_handshakes (
+    peer_id         TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    my_eph_priv     BLOB NOT NULL,
+    bootstrap_nonce BLOB NOT NULL,
+    my_role         INT  NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS session_keys (
+    peer_id        TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    session_key    BLOB NOT NULL,
+    my_role        INT  NOT NULL,
+    peer_role      INT  NOT NULL,
+    established_at TEXT NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -520,6 +538,101 @@ class KindledLinkStore:
         )
         self._conn.commit()
         return mbx
+
+    # --- pending_handshakes (Phase 7a T2.5 — 3-leg session handshake) ---
+
+    def save_pending_handshake(
+        self,
+        *,
+        peer_id: str,
+        session_id: str,
+        my_eph_priv_raw: bytes,
+        bootstrap_nonce: bytes,
+        my_role: int,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist the initiator's ephemeral private key + bootstrap nonce while
+        waiting for the responder's leg-2 reply."""
+        ts = now.isoformat() if now else ""
+        self._conn.execute(
+            """
+            INSERT INTO pending_handshakes
+                (peer_id, session_id, my_eph_priv, bootstrap_nonce, my_role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id, session_id) DO UPDATE SET
+                my_eph_priv=excluded.my_eph_priv,
+                bootstrap_nonce=excluded.bootstrap_nonce,
+                my_role=excluded.my_role,
+                created_at=excluded.created_at
+            """,
+            (peer_id, session_id, my_eph_priv_raw, bootstrap_nonce, my_role, ts),
+        )
+        self._conn.commit()
+
+    def get_pending_handshake(self, peer_id: str, session_id: str) -> dict | None:
+        """Return the pending handshake row as a dict (with BLOB fields as bytes),
+        or None if absent."""
+        row = self._conn.execute(
+            "SELECT * FROM pending_handshakes WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "peer_id": row["peer_id"],
+            "session_id": row["session_id"],
+            "my_eph_priv_raw": bytes(row["my_eph_priv"]),
+            "bootstrap_nonce": bytes(row["bootstrap_nonce"]),
+            "my_role": int(row["my_role"]),
+            "created_at": row["created_at"],
+        }
+
+    def clear_pending_handshake(self, peer_id: str, session_id: str) -> None:
+        """Delete the pending handshake row (called after complete_session)."""
+        self._conn.execute(
+            "DELETE FROM pending_handshakes WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        )
+        self._conn.commit()
+
+    # --- session_keys (Phase 7a T2.5 — persisted session key) ---
+
+    def save_session_key(
+        self,
+        *,
+        peer_id: str,
+        session_id: str,
+        session_key: bytes,
+        my_role: int,
+        peer_role: int,
+        now: datetime,
+    ) -> None:
+        """Persist a derived session key. Does NOT clobber an existing row
+        (INSERT OR IGNORE — the clobber guard lives in session.py)."""
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO session_keys
+                (peer_id, session_id, session_key, my_role, peer_role, established_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (peer_id, session_id, session_key, my_role, peer_role, now.isoformat()),
+        )
+        self._conn.commit()
+
+    def get_session_key(self, peer_id: str, session_id: str) -> dict | None:
+        """Return a dict with session_key/my_role/peer_role/established_at, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM session_keys WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "session_key": bytes(row["session_key"]),
+            "my_role": int(row["my_role"]),
+            "peer_role": int(row["peer_role"]),
+            "established_at": row["established_at"],
+        }
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a
