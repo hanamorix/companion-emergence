@@ -481,3 +481,9 @@ class KindledLinkStore:
             return stored
         frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
         return stored * frac
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection. Callers should invoke this in a
+        finally block after every request-scoped store usage to avoid file-descriptor
+        leaks (stage-6 review fix)."""
+        self._conn.close()
