@@ -25,6 +25,14 @@ def test_import_stores_peer_pending_local(tmp_path) -> None:
     assert peer["consent_state"] == "pending_local"
 
 
+def test_invite_carries_mailbox_into_peer_row(tmp_path) -> None:
+    """An invite created with a mailbox_id round-trips to peers.relay_mailbox."""
+    idn_a, store_b, now = _setup(tmp_path)
+    inv = create_invite(idn_a, relay_url="https://r", mailbox_id="mbx_abc123", now=now)
+    import_invite(inv, store=store_b, now=now)
+    assert store_b.get_peer(idn_a.key_id)["relay_mailbox"] == "mbx_abc123"
+
+
 def test_bad_signature_rejected(tmp_path) -> None:
     idn_a, store_b, now = _setup(tmp_path)
     inv = create_invite(idn_a, relay_url="https://r", now=now)
