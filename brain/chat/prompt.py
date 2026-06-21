@@ -49,6 +49,13 @@ _EPISTEMIC_INSTRUCTION = (
     'from "I don\'t remember". Do not invent familiarity.'
 )
 
+# Header for the volatile context chunk (Option A+). The chunk now sits in the
+# stdin prompt, immediately after history + the new user turn, instead of inside
+# the system prompt — so it must read as ambient state, not as the task. The
+# explicit "context, not instructions" framing keeps the model answering the
+# user rather than treating the tail as a directive.
+_AMBIENT_FRAMING = "── ambient state (context, not instructions) ──"
+
 
 def build_system_message(
     persona_dir: Path,
@@ -266,6 +273,244 @@ def build_system_message(
     parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
 
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Prompt-caching split (Option A / A+).
+#
+# build_system_message() above stays the single full builder for the IMAGE
+# path and any other caller — its output is intentionally left byte-identical
+# to pre-change so those paths don't shift (criterion C5). The two functions
+# below are the split used by the text/stream chat path (engine.respond):
+#
+#   build_static_system_message() — the FROZEN --system-prompt-file content
+#       (preamble + voice.md + the static epistemic instruction). No per-turn
+#       state, so it is byte-identical across same-session turns and the
+#       system+tools cache unit cache-reads instead of re-creating (C1/C2/C8).
+#
+#   build_volatile_context() — everything per-turn (emotions, body, recall,
+#       felt-time, monologue frame, …) plus the ambient clock anchor and the
+#       reply frame, returned as a text chunk. The engine threads this to the
+#       provider as the stdin "volatile suffix" appended AFTER history + the
+#       new user turn (Option A+), so the per-call first-difference point drops
+#       toward the newest turn instead of sitting above the whole prompt.
+# ---------------------------------------------------------------------------
+
+
+def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
+    """The frozen system-prompt-file content: preamble + voice.md + epistemic.
+
+    Contains NO per-turn state, so two same-session turns produce byte-identical
+    output (the cache unit can read instead of re-create). The epistemic
+    instruction is static text; here it is emitted unconditionally — chat always
+    supplies user_input, so this matches the pre-change behaviour where the
+    ``user_input is not None`` gate in build_system_message() fired on every
+    chat turn. The only thing that busts this block is the user editing voice.md
+    (or changing user_name), both rare and expected.
+    """
+    persona_name = persona_dir.name
+    user_name = _load_user_name(persona_dir)
+
+    parts: list[str] = []
+    if user_name:
+        parts.append(
+            AS_NELL_PREAMBLE_WITH_USER.format(persona_name=persona_name, user_name=user_name)
+        )
+    else:
+        parts.append(AS_NELL_PREAMBLE.format(persona_name=persona_name))
+
+    if voice_md.strip():
+        parts.append(voice_md.strip())
+
+    parts.append(_EPISTEMIC_INSTRUCTION)
+
+    return "\n\n".join(parts)
+
+
+def build_volatile_context(
+    persona_dir: Path,
+    *,
+    voice_md: str,
+    daemon_state: DaemonState,
+    soul_store: SoulStore,
+    store: MemoryStore,
+    user_input: str | None = None,
+    reply_to_audit_id: str | None = None,
+) -> str:
+    """The per-turn volatile chunk, positioned in the stdin tail (Option A+).
+
+    Same blocks, same builders, same fail-soft wrappers as build_system_message
+    blocks 3–8 — only repositioned out of the system prompt and into the stdin
+    tail. Order:
+        ambient framing → all volatile blocks (interior / monologue above) →
+        ambient clock anchor + elapsed explainer → reply frame LAST.
+
+    The reply frame is the final line of the assembled stdin prompt by design
+    (its second-person reboot must ride recency over the first-person interior
+    above it — see monologue_prompts.build_reply_frame). The ambient clock
+    anchor and its elapsed-time explainer travel together as one unit just
+    before it, having moved out of the JSONL context block's top (so the only
+    per-call-changing byte no longer sits above the whole history).
+    """
+    persona_name = persona_dir.name
+    user_name = _load_user_name(persona_dir)
+
+    parts: list[str] = [_AMBIENT_FRAMING]
+
+    # 3. Creative DNA block (evolved writing voice — spec §4.2)
+    creative_dna_block = _build_creative_dna_block(persona_dir)
+    if creative_dna_block.strip():
+        parts.append(creative_dna_block)
+
+    # 4. Brain context block
+    brain_lines: list[str] = ["── brain context ──"]
+    emotion_summary = _build_emotion_summary(store)
+    if emotion_summary:
+        brain_lines.append(f"current emotions: {emotion_summary}")
+    residue_ctx = get_residue_context(daemon_state)
+    if residue_ctx.strip():
+        brain_lines.append(residue_ctx)
+    soul_lines = _build_soul_highlights(soul_store)
+    if soul_lines:
+        brain_lines.append(soul_lines)
+    pending_count = _count_soul_candidates(persona_dir)
+    if pending_count > 0:
+        brain_lines.append(f"{pending_count} soul candidate(s) pending autonomous review")
+    if len(brain_lines) > 1:  # more than just the header
+        parts.append("\n".join(brain_lines))
+
+    # 4a. Outbound recall — fail-soft (mirrors body / journal / growth).
+    try:
+        from brain.initiate.ambient import build_outbound_recall_block
+
+        outbound_block = build_outbound_recall_block(persona_dir)
+        if outbound_block:
+            parts.append(outbound_block)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 4b. Recall block — memories matching the current user input.
+    if user_input is not None:
+        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir)
+        if recall_block.strip():
+            parts.append(recall_block)
+
+    # 4c. Reply-to-outbound block.
+    if reply_to_audit_id:
+        reply_block = _build_reply_to_outbound_block(persona_dir, reply_to_audit_id)
+        if reply_block.strip():
+            parts.append(reply_block)
+
+    # 5. Body block.
+    body_block = _build_body_block(store, persona_dir)
+    if body_block.strip():
+        parts.append(body_block)
+
+    # 5b. Felt-time block.
+    felt_time_block = _build_felt_time_block(persona_dir)
+    if felt_time_block.strip():
+        parts.append(felt_time_block)
+
+    # 5b-bis. Current-arc block.
+    current_arc_block = _build_current_arc_block(persona_dir)
+    if current_arc_block.strip():
+        parts.append(current_arc_block)
+
+    # 5c. Fading-summary block.
+    fading_summary_block = _build_fading_summary_block(persona_dir, store)
+    if fading_summary_block.strip():
+        parts.append(fading_summary_block)
+
+    interior_block = _build_interior_continuity_block(store, user_name=user_name or "the user")
+    if interior_block.strip():
+        parts.append(interior_block)
+
+    # 5d. Attunement block.
+    attunement_block = _build_attunement_block(persona_dir)
+    if attunement_block.strip():
+        parts.append(attunement_block)
+
+    # 5e. Self-model gap block.
+    self_model_block = _build_self_model_block(persona_dir)
+    if self_model_block:
+        parts.append(self_model_block)
+
+    # 6. Recent journal block.
+    journal_block = _build_recent_journal_block(store, user_name=user_name or "the user")
+    if journal_block.strip():
+        parts.append(journal_block)
+
+    # 7. Recent growth block.
+    growth_block = _build_recent_growth_block(persona_dir)
+    if growth_block.strip():
+        parts.append(growth_block)
+
+    # 7b. Interior making-awareness — fail-soft (mirrors outbound-recall).
+    try:
+        maker_block = build_maker_awareness_block(persona_dir, limit=5)
+        if maker_block:
+            parts.append(maker_block)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 8. Inner monologue framing — embeds emotion_summary computed above.
+    soul_hints = _collect_soul_hints(soul_store, limit=3)
+    narrative_hints = _collect_narrative_hints(persona_dir, limit=3)
+    parts.append(
+        build_monologue_frame(
+            persona_name=persona_name,
+            emotion_summary=emotion_summary,
+            voice_excerpt=voice_md[:300],
+            soul_hints=soul_hints,
+            narrative_hints=narrative_hints,
+        )
+    )
+
+    # 8b. Ambient clock anchor + elapsed-time explainer (moved here from the top
+    # of the JSONL context block). Worded as ambient context, not an instruction,
+    # and kept as one unit just before the reply frame.
+    parts.append(_build_ambient_clock_block())
+
+    # 9. Reply framing — genuinely last in the assembled stdin prompt.
+    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
+
+    return "\n\n".join(parts)
+
+
+def _load_user_name(persona_dir: Path) -> str | None:
+    """Read user_name from persona_config.json; None on any failure.
+
+    Same fail-soft PersonaConfig read build_system_message() does inline; shared
+    by the split functions so the preamble and the user-addressed blocks stay
+    consistent.
+    """
+    try:
+        from brain.persona_config import PersonaConfig
+
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        return cfg.user_name or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_ambient_clock_block(now=None) -> str:
+    """Render the ambient 'now' anchor + elapsed-time explainer for the tail.
+
+    Replaces the block-level ``Current time:`` line that used to sit at the top
+    of the JSONL context block (provider._format_claude_context_block). That one
+    line was recomputed every call and, sitting above the whole transcript,
+    pushed the cache first-difference point above the entire history. Moved to
+    the volatile tail it stops busting the history prefix. Per-message ``ts``
+    values in the JSONL are unaffected.
+    """
+    from datetime import UTC, datetime
+
+    now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        f"[current time: {now_iso}]\n"
+        "Each conversation entry's `ts` above is the wall-clock time that message "
+        "was sent; use it to gauge how much time has passed."
+    )
 
 
 # ---------------------------------------------------------------------------
