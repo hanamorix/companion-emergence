@@ -826,3 +826,117 @@ export async function declinePendingWrite(
   if (!r.ok) throw new Error(`/persona/writes/${id}/decline ${r.status}`);
   return await r.json();
 }
+
+// ── Kindled-link federation (Phase 6 Task 6) ──────────────────────────────
+
+/** A single Kindled peer this companion is linked to. */
+export interface KindledPeer {
+  peer_id: string;
+  fingerprint: string;
+  relay_url: string | null;
+  consent_state: string;
+  stage: string;
+  affinity_tags: string[];
+  has_active_session: boolean;
+}
+
+/** One row of a Kindled transcript between two linked peers. */
+export interface KindledTranscriptRow {
+  seq: number;
+  direction: string;
+  text: string;
+  provenance: string;
+  ts: string;
+}
+
+/** Metadata about held (pending/remote) correspondence from linked peers. */
+export interface KindledHolds {
+  held_count: number;
+  items: { session_id: string; created_at: string }[];
+}
+
+/**
+ * Fetch the list of Kindled peers this companion is linked to.
+ * Throws on non-2xx (401 unauthed, 403 forbidden, etc).
+ */
+export async function fetchKindledPeers(persona: string): Promise<KindledPeer[]> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/peers`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/peers ${r.status}`);
+  return ((await r.json()) as { peers: KindledPeer[] }).peers;
+}
+
+/**
+ * Fetch the transcript of correspondence with a specific Kindled peer.
+ * Throws on non-2xx (401 unauthed, 404 unknown peer, etc).
+ */
+export async function fetchKindledTranscript(persona: string, peerId: string): Promise<KindledTranscriptRow[]> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/peers/${encodeURIComponent(peerId)}/transcript`,
+      { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/transcript ${r.status}`);
+  return ((await r.json()) as { transcript: KindledTranscriptRow[] }).transcript;
+}
+
+/**
+ * Fetch metadata about held correspondence from Kindled peers.
+ * Throws on non-2xx (401 unauthed, etc).
+ */
+export async function fetchKindledHolds(persona: string): Promise<KindledHolds> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/holds`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/holds ${r.status}`);
+  return (await r.json()) as KindledHolds;
+}
+
+/**
+ * Create a new Kindled invite for peer discovery.
+ * Optional relayUrl defaults to null (use the brain's default relay).
+ * Throws on non-2xx (401 unauthed, etc).
+ */
+export async function createKindledInvite(persona: string, relayUrl?: string): Promise<{ invite: unknown; fingerprint: string }> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/invite`, {
+      method: "POST",
+      headers: { ...authHeaders(creds), "Content-Type": "application/json" },
+      body: JSON.stringify({ relay_url: relayUrl ?? null }),
+    }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/invite ${r.status}`);
+  return (await r.json()) as { invite: unknown; fingerprint: string };
+}
+
+/**
+ * Accept a Kindled invite code to link with a peer.
+ * Throws on non-2xx (401 unauthed, 400 invalid invite, etc).
+ */
+export async function acceptKindledInvite(persona: string, invite: unknown): Promise<{ peer_id: string; fingerprint_phrase: string }> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/invite/accept`, {
+      method: "POST",
+      headers: { ...authHeaders(creds), "Content-Type": "application/json" },
+      body: JSON.stringify({ invite }),
+    }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/invite/accept ${r.status}`);
+  return (await r.json()) as { peer_id: string; fingerprint_phrase: string };
+}
+
+/**
+ * Set the consent state for a Kindled peer relationship.
+ * Action must be one of: "pause", "resume", "revoke", "block".
+ * Throws on non-2xx (401 unauthed, 404 unknown peer, etc).
+ */
+export async function setKindledConsent(persona: string, peerId: string, action: "pause" | "resume" | "revoke" | "block"): Promise<void> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/peers/${encodeURIComponent(peerId)}/consent`, {
+      method: "POST",
+      headers: { ...authHeaders(creds), "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/consent ${r.status}`);
+}
