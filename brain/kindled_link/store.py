@@ -11,6 +11,15 @@ from pathlib import Path
 
 from brain.kindled_link import limits
 
+
+def kindled_db_path(persona_dir) -> Path:
+    """The kindled-link SQLite path for a persona. Establishes the convention
+    (no prior live call site). Does NOT mkdir — the writers (identity.load_or_create,
+    relationship cadence) own dir creation; read paths guard on db.exists()
+    instead of creating an empty dir on a hot read (red-team M3)."""
+    return Path(persona_dir) / "kindled_link" / "kindled_link.db"
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS peers (
     peer_id        TEXT PRIMARY KEY,
@@ -472,3 +481,9 @@ class KindledLinkStore:
             return stored
         frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
         return stored * frac
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection. Callers should invoke this in a
+        finally block after every request-scoped store usage to avoid file-descriptor
+        leaks (stage-6 review fix)."""
+        self._conn.close()
