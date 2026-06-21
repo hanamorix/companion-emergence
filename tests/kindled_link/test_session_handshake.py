@@ -118,6 +118,32 @@ def test_clobber_guard_on_session_open_does_not_overwrite(tmp_path):
     assert after_key == established_key
 
 
+def test_complete_session_duplicate_leg3_does_not_raise(tmp_path):
+    """An interrupted/replayed leg-3 (session_keys already established while the
+    pending row still exists, e.g. a crash between save and clear) must drop
+    gracefully — not raise sqlite IntegrityError on the sessions PK (initiator-side
+    clobber guard, mirrors on_session_open)."""
+    idn_a, store_a, idn_b, store_b = _make_pair(tmp_path)
+
+    leg1 = open_session(store_a, idn_a, peer_id=idn_b.key_id, now=_NOW)
+    session_id = leg1["session_id"]
+    leg2 = on_session_open(store_b, idn_b, envelope=leg1, now=_NOW)
+
+    # Simulate leg-3 having run far enough to persist the key + sessions row but
+    # crash before clearing the pending row.
+    complete_session(store_a, idn_a, reply_envelope=leg2, now=_NOW)
+    established = store_a.get_session_key(idn_b.key_id, session_id)["session_key"]
+    store_a.save_pending_handshake(  # re-create the not-cleared pending row
+        peer_id=idn_b.key_id, session_id=session_id,
+        my_eph_priv_raw=bytes(range(32)), bootstrap_nonce=bytes(range(16)),
+        my_role=0, now=_NOW,
+    )
+
+    # Re-running leg-3 must NOT raise and must NOT change the key.
+    complete_session(store_a, idn_a, reply_envelope=leg2, now=_NOW)
+    assert store_a.get_session_key(idn_b.key_id, session_id)["session_key"] == established
+
+
 def test_on_session_open_unknown_sender_returns_none(tmp_path):
     """on_session_open drops (returns None) when the sender has no peer row."""
     idn_a = KindledIdentity(Ed25519PrivateKey.from_private_bytes(bytes(range(32))))
