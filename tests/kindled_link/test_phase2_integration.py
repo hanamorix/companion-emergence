@@ -45,7 +45,7 @@ def _handshake(idn_a, idn_b):
     so = build_session_open(
         sender=idn_a, recipient_key_id=idn_b.key_id, relay_mailbox="mbx_b",
         session_id="ks_1", ephemeral_pub=eph_a.public_key().public_bytes_raw(),
-        bootstrap_nonce=bootstrap, now=_NOW, ttl=timedelta(days=7),
+        bootstrap_nonce=bootstrap, sender_mailbox="mbx_a", now=_NOW, ttl=timedelta(days=7),
     )
     parsed, reason = parse_session_open(so, sender_pub=idn_a.public_bytes, now=_NOW)
     assert reason is None

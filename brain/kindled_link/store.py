@@ -5,6 +5,7 @@ WAL + 5s busy_timeout → Row → executescript)."""
 from __future__ import annotations
 
 import math
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS peers (
     fingerprint    TEXT NOT NULL,
     consent_state  TEXT NOT NULL,
     relay_url      TEXT,
+    relay_mailbox  TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -95,6 +97,10 @@ CREATE TABLE IF NOT EXISTS peer_emotion_window (
     accumulated  REAL NOT NULL,
     updated_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS local_identity (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -138,6 +144,15 @@ class KindledLinkStore:
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for DBs created before a column existed
+        (CREATE TABLE IF NOT EXISTS won't add a column to an existing table)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(peers)")}
+        if "relay_mailbox" not in cols:
+            self._conn.execute("ALTER TABLE peers ADD COLUMN relay_mailbox TEXT")
+            self._conn.commit()
 
     def upsert_peer(
         self,
@@ -147,22 +162,25 @@ class KindledLinkStore:
         fingerprint: str,
         consent_state: str,
         relay_url: str | None,
+        relay_mailbox: str | None = None,
         now: datetime,
     ) -> None:
         ts = now.isoformat()
         self._conn.execute(
             """
             INSERT INTO peers (peer_id, identity_pub, fingerprint, consent_state,
-                               relay_url, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                               relay_url, relay_mailbox, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(peer_id) DO UPDATE SET
                 identity_pub=excluded.identity_pub,
                 fingerprint=excluded.fingerprint,
                 consent_state=excluded.consent_state,
                 relay_url=excluded.relay_url,
+                relay_mailbox=COALESCE(excluded.relay_mailbox, peers.relay_mailbox),
                 updated_at=excluded.updated_at
             """,
-            (peer_id, identity_pub_hex, fingerprint, consent_state, relay_url, ts, ts),
+            (peer_id, identity_pub_hex, fingerprint, consent_state, relay_url,
+             relay_mailbox, ts, ts),
         )
         self._conn.commit()
 
@@ -481,6 +499,27 @@ class KindledLinkStore:
             return stored
         frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
         return stored * frac
+
+    # --- local identity (Phase 7a — decoupled mailbox) ---
+    def get_or_create_local_mailbox(self) -> str:
+        """Return this Kindled's relay mailbox id, generating it once if absent.
+
+        The mailbox is intentionally NOT derived from key_id so the relay
+        cannot link a mailbox to an identity (decoupled-mailbox scheme,
+        Phase 7a T2.4). Format: ``mbx_`` + 8 random hex bytes (16 chars)."""
+        key = "relay_mailbox"
+        row = self._conn.execute(
+            "SELECT value FROM local_identity WHERE key = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            return row["value"]
+        mbx = "mbx_" + secrets.token_hex(8)
+        self._conn.execute(
+            "INSERT INTO local_identity (key, value) VALUES (?, ?)",
+            (key, mbx),
+        )
+        self._conn.commit()
+        return mbx
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a

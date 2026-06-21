@@ -212,15 +212,19 @@ def build_session_open(
     session_id: str,
     ephemeral_pub: bytes,
     bootstrap_nonce: bytes,
+    sender_mailbox: str,
     now: datetime,
     ttl: timedelta,
 ) -> dict:
     """A signed (NOT encrypted — no session key yet) handshake envelope carrying
-    the sender's ephemeral X25519 public key + bootstrap nonce (protocol §4)."""
+    the sender's ephemeral X25519 public key + bootstrap nonce (protocol §4).
+    `sender_mailbox` is the sender's own relay mailbox, signed in the outer so the
+    recipient can address its reply leg back (decoupled-mailbox scheme, Phase 7a)."""
     outer = {
         "protocol": SUPPORTED_PROTOCOL,
         "relay_mailbox": relay_mailbox,
         "sender_key_id": sender.key_id,
+        "sender_mailbox": sender_mailbox,
         "recipient_key_id": recipient_key_id,
         "session_id": session_id,
         "sequence": 0,
@@ -249,4 +253,6 @@ def parse_session_open(
     body = envelope.get("session_open")
     if not isinstance(body, dict):
         return None, RejectReason.AEAD_FAILURE
-    return body, None
+    # Surface the signed outer sender_mailbox alongside the handshake body so the
+    # responder can address its reply leg (decoupled-mailbox scheme, Phase 7a).
+    return {**body, "sender_mailbox": envelope.get("sender_mailbox")}, None
