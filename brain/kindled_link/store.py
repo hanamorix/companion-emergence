@@ -263,8 +263,12 @@ class KindledLinkStore:
 
     # --- sessions (Phase 3) ---
     def create_session(self, peer_id: str, session_id: str, now: datetime) -> None:
+        # Idempotent: a replayed/interrupted handshake leg may re-derive the same
+        # (peer_id, session_id); OR IGNORE keeps it from raising on the PK so the
+        # caller drops gracefully rather than crashing (T2.5 review — initiator
+        # clobber path). An existing open session is left untouched.
         self._conn.execute(
-            """INSERT INTO sessions
+            """INSERT OR IGNORE INTO sessions
                (peer_id, session_id, state, msg_count, started_at)
                VALUES (?, ?, 'open', 0, ?)""",
             (peer_id, session_id, now.isoformat()),
