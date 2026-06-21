@@ -1286,6 +1286,39 @@ def build_app(
             return {"held_count": 0, "items": []}
         return holds_status(KindledLinkStore(db, integrity_check=False))
 
+    # ── POST /kindled-link/{invite,invite/accept} — pairing endpoints ─────────
+    @app.post("/kindled-link/invite", dependencies=[Depends(require_http_auth)])
+    def kindled_create_invite(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
+        from brain.kindled_link.pairing import create_invite
+        idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
+        relay_url = (payload or {}).get("relay_url") or ""  # relay_url is a required str (m5)
+        invite = create_invite(idn, relay_url=relay_url)
+        # return the SAME fingerprint phrase the accept side verifies (M2)
+        return {"invite": invite, "fingerprint": idn.key_id,
+                "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
+
+    @app.post("/kindled-link/invite/accept", dependencies=[Depends(require_http_auth)])
+    def kindled_accept_invite(payload: dict[str, Any]) -> dict[str, Any]:
+        from brain.kindled_link.pairing import InviteError, confirm_local_fingerprint, import_invite
+        from brain.kindled_link.store import (
+            ConsentTransitionError,
+            KindledLinkStore,
+            kindled_db_path,
+        )
+        invite = payload.get("invite")
+        if not invite:
+            raise HTTPException(status_code=400, detail="missing invite")
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)  # helper no longer mkdirs (M3)
+        store = KindledLinkStore(db)
+        try:
+            result = import_invite(invite, store=store, now=datetime.now(UTC))  # B1: no recipient
+            confirm_local_fingerprint(store, result["peer_id"])  # M1: inside the guard
+        except (InviteError, ConsentTransitionError) as exc:  # M1/m7: catch both → 400
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
