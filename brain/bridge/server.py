@@ -1257,6 +1257,35 @@ def build_app(
             "backfill": backfill,
         }
 
+    # ── /kindled-link/{peers,transcript,holds} — read endpoints ────────────
+    @app.get("/kindled-link/peers", dependencies=[Depends(require_http_auth)])
+    def kindled_peers() -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import list_peers
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"peers": []}
+        return {"peers": list_peers(KindledLinkStore(db, integrity_check=False))}
+
+    @app.get("/kindled-link/peers/{peer_id}/transcript",
+             dependencies=[Depends(require_http_auth)])
+    def kindled_transcript(peer_id: str) -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import peer_transcript
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"transcript": []}
+        return {"transcript": peer_transcript(KindledLinkStore(db, integrity_check=False), peer_id)}
+
+    @app.get("/kindled-link/holds", dependencies=[Depends(require_http_auth)])
+    def kindled_holds() -> dict[str, Any]:
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.kindled_link.views import holds_status
+        db = kindled_db_path(persona_dir)
+        if not db.exists():
+            return {"held_count": 0, "items": []}
+        return holds_status(KindledLinkStore(db, integrity_check=False))
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
