@@ -24,3 +24,11 @@ def test_reflection_prompt_fences_transcript_untrusted():
     assert p.index("BEGIN UNTRUSTED") < p.index("I value slow trust") < p.index("END UNTRUSTED")
     assert "stranger" in p
     assert "one stage" in p.lower() or "at most one" in p.lower()
+
+
+def test_is_grounded_rejects_trivial_short_quote():
+    # stage-6 Minor: a 1-char / sub-12-char quote present anywhere must NOT ground.
+    assert _is_grounded("a", "banana") is False
+    assert _is_grounded("short", "this has short in it") is False
+    # a real >=12-char grounded quote still grounds
+    assert _is_grounded("the dog rolled over", "Earlier: The dog rolled over today.") is True
