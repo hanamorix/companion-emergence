@@ -87,3 +87,34 @@ def test_accept_missing_invite_is_400(tmp_path):
     app, _ = _app(tmp_path)
     r = TestClient(app).post("/kindled-link/invite/accept", headers=_AUTH, json={})
     assert r.status_code == 400
+
+
+def _seed_peer(persona, *, consent_state):
+    s = _seed_store(persona)
+    s.upsert_peer(peer_id="kid_a", identity_pub_hex="aa", fingerprint="kid_a",
+                  consent_state=consent_state, relay_url="https://r", now=NOW)
+
+
+def test_consent_pause_paired_peer(tmp_path):
+    app, persona = _app(tmp_path)
+    _seed_peer(persona, consent_state="paired")
+    r = TestClient(app).post("/kindled-link/peers/kid_a/consent", headers=_AUTH,
+                             json={"action": "pause"})
+    assert r.status_code == 200 and r.json()["consent_state"] == "paused"
+
+
+def test_consent_illegal_transition_is_400(tmp_path):
+    # blocked is terminal — resume must be rejected, not silently applied
+    app, persona = _app(tmp_path)
+    _seed_peer(persona, consent_state="blocked")
+    r = TestClient(app).post("/kindled-link/peers/kid_a/consent", headers=_AUTH,
+                             json={"action": "resume"})
+    assert r.status_code == 400
+
+
+def test_consent_unknown_action_is_400(tmp_path):
+    app, persona = _app(tmp_path)
+    _seed_peer(persona, consent_state="paired")
+    r = TestClient(app).post("/kindled-link/peers/kid_a/consent", headers=_AUTH,
+                             json={"action": "frobnicate"})
+    assert r.status_code == 400
