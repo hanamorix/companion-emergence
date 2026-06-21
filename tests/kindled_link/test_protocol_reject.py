@@ -128,7 +128,7 @@ def test_session_open_roundtrip():
     env = build_session_open(
         sender=a, recipient_key_id=b.key_id, relay_mailbox="mbx_b",
         session_id="ks_1", ephemeral_pub=eph.public_key().public_bytes_raw(),
-        bootstrap_nonce=bootstrap, now=_NOW, ttl=timedelta(days=7),
+        bootstrap_nonce=bootstrap, sender_mailbox="mbx_a", now=_NOW, ttl=timedelta(days=7),
     )
     parsed, reason = parse_session_open(env, sender_pub=a.public_bytes, now=_NOW)
     assert reason is None

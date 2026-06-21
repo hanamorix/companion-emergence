@@ -1307,9 +1307,16 @@ def build_app(
     def kindled_create_invite(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
         from brain.kindled_link.pairing import create_invite
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
         idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
         relay_url = (payload or {}).get("relay_url") or ""  # relay_url is a required str (m5)
-        invite = create_invite(idn, relay_url=relay_url)
+        # Carry our own decoupled relay mailbox so the importer can address leg-1.
+        store = KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)
+        try:
+            mailbox_id = store.get_or_create_local_mailbox()
+        finally:
+            store.close()
+        invite = create_invite(idn, relay_url=relay_url, mailbox_id=mailbox_id)
         # return the SAME fingerprint phrase the accept side verifies (M2)
         return {"invite": invite, "fingerprint": idn.key_id,
                 "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
