@@ -230,6 +230,7 @@ class _RecordingProvider(_LLMProvider):
 
     def __init__(self) -> None:
         self.last_messages: list[_ChatMessage] = []
+        self.last_options: dict[str, Any] | None = None
 
     def name(self) -> str:
         return "recording"
@@ -245,6 +246,7 @@ class _RecordingProvider(_LLMProvider):
         options: dict[str, Any] | None = None,
     ) -> _ChatResponse:
         self.last_messages = list(messages)
+        self.last_options = dict(options) if options else None
         h = hashlib.sha256(repr(messages).encode()).hexdigest()[:16]
         return _ChatResponse(content=f"RECORDED: {h}", tool_calls=())
 
@@ -335,17 +337,21 @@ def test_respond_falls_back_to_history_when_buffer_read_fails(
     assert "hi back" in contents
 
 
-def test_respond_system_message_includes_outbound_recall_block(
+def test_respond_outbound_recall_block_rides_volatile_tail(
     persona_dir: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     recording_provider: _RecordingProvider,
 ) -> None:
-    """Phase 7.2 — the always-on verify slice is injected into the system message.
+    """Phase 7.2 — the always-on verify slice still reaches the model.
 
-    Seeds an audit row dated within the 24h ambient window, then drives a
-    full chat turn through a recording provider and asserts the system
-    message contains "Recent outbound" plus the seeded subject.
+    Post prompt-caching split (Option A+), per-turn volatile blocks no longer
+    ride in the frozen system message — they are threaded to the provider as
+    the stdin ``volatile_suffix`` (options) appended after history. Seeds an
+    audit row inside the 24h ambient window, drives a full chat turn through a
+    recording provider, and asserts the outbound-recall block ("Recent
+    outbound" + the seeded subject) is present in the volatile suffix and is
+    NOT in the (now frozen) system message.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -384,8 +390,16 @@ def test_respond_system_message_includes_outbound_recall_block(
     assert system_msgs, "expected a system message"
     system_text = system_msgs[0]
     assert isinstance(system_text, str)
-    assert "Recent outbound" in system_text
-    assert "the kolinsky sable brushes" in system_text
+    # The block now rides the stdin volatile tail, NOT the frozen system prompt.
+    assert "Recent outbound" not in system_text
+    options = recording_provider.last_options
+    assert options is not None, "expected per-call options carrying the volatile suffix"
+    suffix = options.get("volatile_suffix")
+    assert isinstance(suffix, str) and suffix, "expected a volatile_suffix in options"
+    assert "Recent outbound" in suffix
+    assert "the kolinsky sable brushes" in suffix
+    # And the clock relocation signal travels with it.
+    assert options.get("include_block_clock") is False
 
 
 def test_respond_replays_image_turn_from_buffer(
