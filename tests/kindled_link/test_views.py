@@ -38,7 +38,7 @@ def test_holds_status_never_exposes_draft_body(tmp_path):
     s = _store(tmp_path)
     s.save_draft(peer_id="kid_a", session_id="s1",
                  payload_json='{"body": "SECRET_USER_DETAIL_SENTINEL"}', now=NOW,
-                 status="held")
+                 status="hold")
     out = holds_status(s)
     assert out["held_count"] == 1
     assert out["items"][0]["session_id"] == "s1"
@@ -56,7 +56,7 @@ def test_transcript_never_contains_a_held_draft_body(tmp_path):
     s = _store(tmp_path)
     s.save_draft(peer_id="kid_a", session_id="s1",
                  payload_json='{"body": "SECRET_USER_DETAIL_SENTINEL"}', now=NOW,
-                 status="held")
+                 status="hold")
     rows = peer_transcript(s, "kid_a")
     assert "SECRET_USER_DETAIL_SENTINEL" not in _j.dumps(rows)
     assert rows == []  # nothing in the transcript table

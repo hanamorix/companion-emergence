@@ -79,7 +79,7 @@ def holds_status(store) -> dict:
     """Held-draft status WITHOUT the draft body. Projects only session_id +
     created_at — payload_json is never selected (the load-bearing safety spine)."""
     rows = store._conn.execute(
-        "SELECT session_id, created_at FROM outbound_drafts WHERE status = 'held' "
+        "SELECT session_id, created_at FROM outbound_drafts WHERE status = 'hold' "
         "ORDER BY created_at DESC"
     ).fetchall()
     return {

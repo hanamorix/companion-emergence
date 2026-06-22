@@ -229,6 +229,57 @@ def test_through_path_a2_gate_and_relationship_consulted(tmp_path):
     assert len(get_stage_calls) >= 1, "get_stage must be read during the tick"
 
 
+def test_live_hold_persists_a_hold_draft_for_the_holds_panel(tmp_path):
+    """Stage-6 review: a gate 'hold' on the live tick must persist a 'hold'
+    outbound_drafts row so the holds panel (views.holds_status, querying 'hold')
+    and the H4 gradual-regression signal are actually fed — the live path
+    previously never persisted a draft."""
+    from brain.kindled_link.views import holds_status
+
+    idn_a, idn_b = _make_identities()
+    rc_a, rc_b = _make_relay(idn_a, idn_b)
+    sa, sb = _paired_stores(tmp_path, idn_a, idn_b)
+    session_id = _run_handshake(sa, idn_a, sb, idn_b, rc_a, rc_b, tmp_path=tmp_path)
+    send_message(sa, idn_a, rc_a, peer_id=idn_b.key_id, session_id=session_id,
+                 payload={"text": "hi"}, now=_NOW)
+
+    persona_dir_b = tmp_path / "b"
+    persona_dir_b.mkdir(parents=True, exist_ok=True)
+    run_kindled_link_tick(
+        persona_dir_b, store=sb, identity=idn_b, relay_client=rc_b,
+        provider=_spy_provider(), gate=_spy_gate(action="hold"),
+        config=_enabled_config(), now=_NOW,
+    )
+
+    assert holds_status(sb)["held_count"] == 1
+
+
+def test_recovered_flag_written_when_a_draft_is_recovered(tmp_path):
+    """Stage-6 review (G2): when recover re-gates a half-finished draft, the tick
+    writes kindled_link/recovered.flag so the panel can show the recovery banner.
+    The reader (/kindled-link/status) previously had no writer."""
+    import json as _json
+
+    idn_a, idn_b = _make_identities()
+    rc_a, rc_b = _make_relay(idn_a, idn_b)
+    sa, sb = _paired_stores(tmp_path, idn_a, idn_b)
+    session_id = _run_handshake(sa, idn_a, sb, idn_b, rc_a, rc_b, tmp_path=tmp_path)
+
+    # A half-finished outbound draft persisted before a 'crash' — recover re-gates it.
+    sb.save_draft(peer_id=idn_a.key_id, session_id=session_id,
+                  payload_json=_json.dumps({"body": "half-finished"}), now=_NOW)
+
+    persona_dir_b = tmp_path / "b"
+    persona_dir_b.mkdir(parents=True, exist_ok=True)
+    run_kindled_link_tick(
+        persona_dir_b, store=sb, identity=idn_b, relay_client=rc_b,
+        provider=_spy_provider(), gate=_spy_gate(action="hold"),
+        config=_enabled_config(), now=_NOW,
+    )
+
+    assert (persona_dir_b / "kindled_link" / "recovered.flag").exists()
+
+
 # ---------------------------------------------------------------------------
 # §14 E4 — provider draft call takes a cli_throttle background slot
 # ---------------------------------------------------------------------------

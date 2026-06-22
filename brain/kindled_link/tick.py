@@ -11,6 +11,7 @@ All callables take explicit ``now`` — no internal clock.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -123,6 +124,18 @@ def run_kindled_link_tick(
                 log.warning("kindled tick: peer %s error", peer_id, exc_info=True)
                 degraded.append(peer_id)
 
+    # Recovery indicator (G2): when a half-finished draft was recovered, drop a
+    # flag the panel reads (server.py /kindled-link/status). Stage-6 review: the
+    # reader existed but nothing wrote it. Fail-soft — a missing flag only hides
+    # the banner, never breaks the tick.
+    if any_recovered:
+        try:
+            (persona_dir / "kindled_link").mkdir(parents=True, exist_ok=True)
+            (persona_dir / "kindled_link" / "recovered.flag").write_text(
+                now.isoformat(), encoding="utf-8")
+        except Exception:  # noqa: BLE001 — fail-soft observability flag
+            log.warning("kindled tick: could not write recovered.flag", exc_info=True)
+
     # 5. Persist cadence timestamp
     save_tick_cadence(persona_dir, now)
 
@@ -185,7 +198,18 @@ def _tick_peer(
             )
             if draft is not None:
                 payload = OutboundPayload(body=draft)
-                engine.process_outbound(
+                # Persist the draft as 'pending' BEFORE gating so (a) a crash
+                # mid-gate leaves a recoverable row (recover reads 'pending'),
+                # and (b) the gate outcome is recorded — a 'hold' row feeds the
+                # holds panel (views.holds_status queries 'hold') and the H4
+                # gradual-regression signal (_count_recent_holds). Stage-6 review:
+                # the live path previously never persisted a draft, leaving
+                # recover/holds/H4 structurally empty.
+                draft_id = store.save_draft(
+                    peer_id=peer_id, session_id=session_id,
+                    payload_json=json.dumps({"body": draft}), now=now,
+                )
+                action = engine.process_outbound(
                     peer_id=peer_id,
                     session_id=session_id,
                     payload=payload,
@@ -195,6 +219,7 @@ def _tick_peer(
                     send_fn=send_fn,
                     transcript_summary=transcript_summary,
                 )
+                store.set_draft_status(draft_id, action)
         return
 
     # No active session — try autonomous start

@@ -39,7 +39,7 @@ def test_get_holds_never_contains_body_at_http_layer(tmp_path):
     s = _seed_store(persona)
     s.save_draft(peer_id="kid_a", session_id="s1",
                  payload_json='{"body": "SECRET_USER_DETAIL_SENTINEL"}', now=NOW,
-                 status="held")
+                 status="hold")  # live status string (stage-6 fix: was 'held')
     r = TestClient(app).get("/kindled-link/holds", headers=_AUTH)
     assert r.status_code == 200 and r.json()["held_count"] == 1
     assert "SECRET_USER_DETAIL_SENTINEL" not in r.text
