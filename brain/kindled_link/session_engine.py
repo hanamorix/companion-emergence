@@ -239,7 +239,8 @@ class SessionEngine:
         return OutboundPayload(body=revised_body,
                                relationship_hint=payload.relationship_hint)
 
-    def recover(self, *, now: datetime, today: str, send_fn) -> list[str]:
+    def recover(self, *, now: datetime, today: str, send_fn=None,
+                send_fn_factory=None) -> list[str]:
         """Reload half-finished outbound drafts and RE-GATE each before any
         resend — never blind-resend AND never silently drop (parent §9).
 
@@ -247,7 +248,14 @@ class SessionEngine:
         reason is left PENDING ("deferred") for a later tick — it must not be
         marked terminal and removed, or a draft saved <60s before a crash would be
         discarded forever (re-red-team Major A). Only a draft that passes the
-        pacing guard is re-gated; its gate decision (hold/send/…) is terminal."""
+        pacing guard is re-gated; its gate decision (hold/send/…) is terminal.
+
+        The actual transmit closure is per-(peer, session): pass `send_fn_factory`
+        — `factory(peer_id, session_id) -> send_fn` — so a re-gated 'send' reaches
+        the right peer's relay mailbox. `send_fn` (a single closure) is the legacy
+        form kept for tests; a no-op single `send_fn` silently drops a recovered
+        send while marking it 'send' (T5/T6 review Important), so live callers must
+        pass `send_fn_factory`."""
         actions: list[str] = []
         for draft in self._store.get_pending_drafts():
             if not self._send_allowed(draft["peer_id"], draft["session_id"],
@@ -259,10 +267,14 @@ class SessionEngine:
                 body=data.get("body", ""),
                 relationship_hint=data.get("relationship_hint"),
             )
+            eff_send_fn = (
+                send_fn_factory(draft["peer_id"], draft["session_id"])
+                if send_fn_factory is not None else send_fn
+            )
             action = self.process_outbound(
                 peer_id=draft["peer_id"], session_id=draft["session_id"],
                 payload=payload, reason="recovery-regate", now=now,
-                today=today, send_fn=send_fn,
+                today=today, send_fn=eff_send_fn,
             )
             self._store.set_draft_status(draft["id"], action)
             actions.append(action)
