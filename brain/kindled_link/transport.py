@@ -145,6 +145,15 @@ def poll_and_ingest(
             # Process only the first INBOUND_FLOOD_CAP; leave the rest un-acked.
             items = items[:INBOUND_FLOOD_CAP]
 
+        # Within a peer-group, handle session_open (handshake) envelopes before
+        # message envelopes (stable — arrival order preserved within each class).
+        # Defensive: a message can only decrypt once its session key exists, so a
+        # session_open arriving in the same poll must be processed first or the
+        # message would hit the no-session drop. Protocol forward-dependency makes
+        # this near-unreachable, but the reorder removes the message-loss window
+        # entirely (T3/T4 review Q4).
+        items = sorted(items, key=lambda it: 0 if "session_open" in it["envelope"] else 1)
+
         for item in items:
             env_id = item["id"]
             env = item["envelope"]
