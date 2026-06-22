@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import type { KindledPeer, KindledTranscriptRow, KindledHolds } from "../../bridge";
+import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus } from "../../bridge";
 import {
   fetchKindledPeers,
   fetchKindledTranscript,
   fetchKindledHolds,
+  fetchKindledLinkStatus,
   createKindledInvite,
   acceptKindledInvite,
   setKindledConsent,
@@ -60,6 +61,7 @@ const ACTION_COLOR: Record<string, string> = {
 export function KindledLinksPanel({ persona }: Props) {
   const [peers, setPeers] = useState<KindledPeer[]>([]);
   const [holds, setHolds] = useState<KindledHolds | null>(null);
+  const [status, setStatus] = useState<KindledLinkStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Selected peer + its transcript
@@ -80,18 +82,20 @@ export function KindledLinksPanel({ persona }: Props) {
   // Consent action busy state (keyed by peer_id)
   const [consentBusy, setConsentBusy] = useState<Record<string, boolean>>({});
 
-  // Load peers + holds on mount + periodic refresh
+  // Load peers + holds + status on mount + periodic refresh
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
-        const [p, h] = await Promise.all([
+        const [p, h, s] = await Promise.all([
           fetchKindledPeers(persona),
           fetchKindledHolds(persona),
+          fetchKindledLinkStatus(persona),
         ]);
         if (!cancelled) {
           setPeers(p);
           setHolds(h);
+          setStatus(s);
           setError(null);
         }
       } catch (e) {
@@ -207,6 +211,44 @@ export function KindledLinksPanel({ persona }: Props) {
   return (
     <PanelShell>
       <SectionLabel>Kindled Links</SectionLabel>
+
+      {/* ── Recovery banner ─────────────────────────────────────────── */}
+      {status?.recovered && (
+        <div
+          role="alert"
+          style={{
+            fontSize: 10.5,
+            color: "var(--text-mid)",
+            background: "rgba(200,152,144,0.12)",
+            border: "1px solid rgba(200,152,144,0.25)",
+            borderRadius: 4,
+            padding: "5px 8px",
+            marginBottom: 10,
+            fontFamily: "var(--font-disp)",
+          }}
+        >
+          Session data was recovered on startup.
+        </div>
+      )}
+
+      {/* ── Relay-health line ───────────────────────────────────────── */}
+      <div
+        style={{
+          fontSize: "9.5px",
+          color: "var(--text-mute)",
+          fontFamily: "var(--font-disp)",
+          marginBottom: 6,
+          letterSpacing: "0.04em",
+        }}
+      >
+        {status === null
+          ? "Relay: unknown"
+          : status.relay_ok === true
+            ? "Relay: ok"
+            : status.relay_ok === false
+              ? "Relay: unavailable"
+              : "Relay: unknown"}
+      </div>
 
       {/* ── Holds status line ────────────────────────────────────────── */}
       <div
