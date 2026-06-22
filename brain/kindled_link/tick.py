@@ -57,6 +57,10 @@ def run_kindled_link_tick(
         engine_kwargs["throttle"] = throttle
     engine = SessionEngine(**engine_kwargs)
 
+    # Single-clock: `today` is derived ONCE from `now` and threaded everywhere
+    # (recover, _tick_peer, generate_draft, process_outbound).  No callee
+    # recomputes its own `today`; _check_day enforces consistency at the send
+    # boundary (T8 Part C — confirmed, no behaviour change needed).
     today = now.strftime("%Y-%m-%d")
 
     def _recovery_send_factory(peer_id: str, session_id: str):
