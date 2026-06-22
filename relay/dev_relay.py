@@ -112,3 +112,29 @@ def create_app(require_auth: bool = False) -> FastAPI:
 
     app.state.store = store
     return app
+
+
+def main() -> None:
+    """Run the self-hosted alpha relay (Phase 7a).
+
+    Config via env: KINDLED_RELAY_HOST (default 127.0.0.1), KINDLED_RELAY_PORT
+    (default 8787), KINDLED_RELAY_AUTH ("1"/"0", default "1" — fetch/ack require
+    mailbox-ownership proof; `/envelope` push stays open by design).
+
+    BIND CONSTRAINT (Phase 7a): `/envelope` is unauthenticated, so bind to
+    127.0.0.1 or a trusted LAN only — NOT a public interface. Public-relay abuse
+    hardening (rate limits, durable storage, quotas) is Phase 7b. To run:
+        uv run python -m relay.dev_relay
+    """
+    import os
+
+    import uvicorn
+
+    host = os.environ.get("KINDLED_RELAY_HOST", "127.0.0.1")
+    port = int(os.environ.get("KINDLED_RELAY_PORT", "8787"))
+    require_auth = os.environ.get("KINDLED_RELAY_AUTH", "1") != "0"
+    uvicorn.run(create_app(require_auth=require_auth), host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()

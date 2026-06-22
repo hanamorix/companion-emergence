@@ -71,11 +71,17 @@ def _build_gate_prompt(*, body: str, relationship_hint_json: str,
         f"Disallowed in any outbound message: {_DISALLOWED}.",
         "Broad, non-identifying texture about the user is allowed; specifics are not.",
     ]
-    # Self-disclosure latitude: added ONLY at friend/close AND only when the
-    # disclosure budget is not depleted (§12: a low budget reduces latitude
+    # Self-disclosure latitude: added ONLY at familiar/friend/close AND only when
+    # the disclosure budget is not depleted (§12: a low budget reduces latitude
     # regardless of stage). This concerns the Kindled's OWN interior only — it
     # never relaxes the user-detail rules above (which are stage- AND budget-blind).
-    if stage in ("friend", "close") and budget_ok:
+    if stage == "familiar" and budget_ok:
+        parts.append(
+            "This peer is a familiar correspondent. The Kindled may share a little "
+            "more of HER OWN interior — a current feeling, something she's working "
+            "on — but stays reserved. This concerns her own experience ONLY; it does "
+            "NOT relax any user-privacy rules above.")
+    elif stage in ("friend", "close") and budget_ok:
         parts.append(
             "This peer is a trusted friend. The Kindled may speak more openly about "
             "HER OWN interior life — her feelings, what she has made, her dreams. "

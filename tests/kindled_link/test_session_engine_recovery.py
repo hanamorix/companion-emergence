@@ -38,6 +38,40 @@ def test_recover_regates_pending_draft_never_blind_resends(tmp_path):
     assert store.get_pending_drafts() == []  # draft resolved, off the pending list
 
 
+class _SendGate:
+    def review(self, payload, **kw):
+        return GateDecision(action="send", texture_score=0.1)
+
+
+def test_recover_send_fn_factory_transmits_to_the_drafts_peer_session(tmp_path):
+    """A re-gated 'send' on recovery must reach the draft's OWN peer/session via
+    send_fn_factory — not a single shared no-op that silently drops + mis-marks
+    it 'send' (T5/T6 review Important)."""
+    store = KindledLinkStore(tmp_path / "k.db")
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    store.create_session("kid_a", "s1", now)
+    store.upsert_peer(peer_id="kid_a", identity_pub_hex="aa", fingerprint="f",
+                      consent_state="paired", relay_url="https://r", now=now)
+    store.save_draft(peer_id="kid_a", session_id="s1",
+                     payload_json=json.dumps({"body": "recovered send"}), now=now)
+
+    eng = SessionEngine(store=store, identity=None, provider=_StubProvider(),
+                        gate=_SendGate())
+
+    factory_args = []
+    sent = []
+
+    def factory(peer_id, session_id):
+        factory_args.append((peer_id, session_id))
+        return lambda payload: sent.append((peer_id, session_id, payload.body))
+
+    actions = eng.recover(now=now, today="2026-06-20", send_fn_factory=factory)
+
+    assert actions == ["send"]
+    assert factory_args == [("kid_a", "s1")]            # factory bound to the draft
+    assert sent == [("kid_a", "s1", "recovered send")]  # actually transmitted
+
+
 def test_recover_defers_pacing_held_draft_keeps_it_pending(tmp_path):
     # re-red-team Major A: a draft not sendable for a PACING reason must stay
     # pending (retried later), NOT be dropped. Here last_outbound = now, so the

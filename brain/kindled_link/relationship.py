@@ -136,13 +136,52 @@ def _bounded_stage(current: str, proposed: str) -> str:
     return current
 
 
+# Threshold for the external regression signal (hold_count): ≥ this many
+# consecutive holds forces a gradual −1 stage regression regardless of the
+# model verdict (the signal can only REGRESS, never promote).
+_HOLD_REGRESS_THRESHOLD = 3
+
+_REFLECTION_REJECTIONS_FILE = "reflection_rejections.jsonl"
+
+
+def _log_rejection(*, persona_dir, peer_id: str, rejected_quote: str,
+                   now: datetime) -> None:
+    """Append one ungrounded-quote rejection row (audit-tier, fail-soft)."""
+    if persona_dir is None:
+        return
+    try:
+        row = json.dumps({
+            "ts": now.isoformat(),
+            "peer_id": peer_id,
+            "rejected_quote": rejected_quote[:500],
+        }, separators=(",", ":"))
+        p = Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(row + "\n")
+    except Exception:  # noqa: BLE001 — audit; never raise into caller
+        log.warning("reflection rejection log write failed", exc_info=True)
+
+
 def run_relationship_reflection(
     *, store, provider, peer_id: str, transcript: str, now: datetime,
     today: str, throttle=_default_throttle,
+    regression_signal: dict | None = None,
+    persona_dir=None,
 ) -> PeerRelationshipState:
     """One maturation pass (parent §13). Grounded-evidence gated, ≤1-stage
     promotion, two-tier regression (gradual −1 / hard-breach reset). Tool-less,
-    throttled, cap-counted, fail-soft (any error → unchanged state)."""
+    throttled, cap-counted, fail-soft (any error → unchanged state).
+
+    regression_signal: optional external pressure dict carrying e.g.
+      {"hold_count": int, "emotion_pressure": float}. When sustained pressure
+      is detected (hold_count >= _HOLD_REGRESS_THRESHOLD or emotion_pressure
+      over threshold) a gradual −1 regression is applied EVEN IF the model
+      proposes no change. The signal can only REGRESS, never promote.
+
+    persona_dir: if provided, ungrounded evidence quotes are logged to
+      <persona_dir>/kindled_link/reflection_rejections.jsonl (fail-soft).
+    """
     # m9: today must agree with now's date or the cap reads the wrong day
     # (same guard the session engine enforces). Caller bug → fail-soft no-op.
     if today != now.strftime("%Y-%m-%d"):
@@ -179,13 +218,19 @@ def run_relationship_reflection(
         persist_relationship_state(store, state, now)
         return state
 
-    # ground the proposed evidence; drop ungrounded quotes (+ log)
-    grounded = [
-        Evidence(quote=str(e.get("quote", "")), turn_id=str(e.get("turn_id", "unknown")),
-                 supports=str(e.get("supports", "")))
-        for e in (data.get("evidence") or [])
-        if _is_grounded(str(e.get("quote", "")), transcript)
-    ]
+    # ground the proposed evidence; drop ungrounded quotes + log rejections
+    grounded = []
+    for e in (data.get("evidence") or []):
+        quote = str(e.get("quote", ""))
+        if _is_grounded(quote, transcript):
+            grounded.append(Evidence(
+                quote=quote,
+                turn_id=str(e.get("turn_id", "unknown")),
+                supports=str(e.get("supports", "")),
+            ))
+        else:
+            _log_rejection(persona_dir=persona_dir, peer_id=peer_id,
+                           rejected_quote=quote, now=now)
     proposed = str(data.get("proposed_stage", state.stage))
     pi, ci = (STAGES.index(proposed) if proposed in STAGES else -1), STAGES.index(state.stage)
     # promotion requires ≥1 grounded evidence; regression does not
@@ -203,6 +248,18 @@ def run_relationship_reflection(
         state.boundaries_seen = [str(b) for b in data["boundaries_seen"]][:20]
     if grounded:
         state.evidence = grounded[:10]
+
+    # External regression signal — can only REGRESS, never promote.
+    if regression_signal:
+        try:
+            hold_count = int(regression_signal.get("hold_count", 0))
+            if hold_count >= _HOLD_REGRESS_THRESHOLD:
+                ci2 = STAGES.index(state.stage)
+                if ci2 > 0:
+                    state.stage = STAGES[ci2 - 1]
+        except Exception:  # noqa: BLE001 — fail-soft
+            log.warning("regression signal apply error; ignoring", exc_info=True)
+
     state.last_reflected_at = now.isoformat()
     persist_relationship_state(store, state, now)
     return state

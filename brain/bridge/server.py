@@ -43,7 +43,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator
 
 from brain import __version__ as _brain_version
 from brain.bridge import events
@@ -683,6 +683,12 @@ class NotesConfigReq(BaseModel):
     enabled: bool
 
 
+class KindledLinkConfigReq(BaseModel):
+    enabled: StrictBool
+    relay_url: str | None = None
+    relay_url: str | None = None
+
+
 class NewSessionReq(BaseModel):
     client: Literal["cli", "tauri", "tests"] = "cli"
 
@@ -1303,9 +1309,16 @@ def build_app(
     def kindled_create_invite(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
         from brain.kindled_link.pairing import create_invite
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
         idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
         relay_url = (payload or {}).get("relay_url") or ""  # relay_url is a required str (m5)
-        invite = create_invite(idn, relay_url=relay_url)
+        # Carry our own decoupled relay mailbox so the importer can address leg-1.
+        store = KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)
+        try:
+            mailbox_id = store.get_or_create_local_mailbox()
+        finally:
+            store.close()
+        invite = create_invite(idn, relay_url=relay_url, mailbox_id=mailbox_id)
         # return the SAME fingerprint phrase the accept side verifies (M2)
         return {"invite": invite, "fingerprint": idn.key_id,
                 "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
@@ -1470,6 +1483,44 @@ def build_app(
             cfg = dc_replace(cfg, notes_enabled=False)
         cfg.save(config_path)
         return {"ok": True, "enabled": cfg.notes_enabled, "folder": cfg.notes_folder}
+
+    # ── POST /persona/config/kindled-link — Kindled-to-Kindled toggle ────────
+    @app.post("/persona/config/kindled-link", dependencies=[Depends(require_http_auth)])
+    async def set_kindled_link_enabled(req: KindledLinkConfigReq) -> dict:
+        """Enable/disable Kindled-to-Kindled correspondence (off by default).
+
+        Accepts {"enabled": true|false}. Strict bool — non-bool body → 422.
+        Returns {"kindled_link_enabled": <bool>} echoing the new state.
+        """
+        from dataclasses import replace as dc_replace
+
+        from brain.persona_config import PersonaConfig
+
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        cfg = PersonaConfig.load(config_path)
+        relay_url = (req.relay_url or "").strip() or None
+        cfg = dc_replace(cfg, kindled_link_enabled=req.enabled, kindled_relay_url=relay_url)
+        cfg.save(config_path)
+        return {
+            "kindled_link_enabled": cfg.kindled_link_enabled,
+            "kindled_relay_url": cfg.kindled_relay_url,
+        }
+
+    # ── GET /kindled-link/status — relay health + recovery flag ──────────────
+    @app.get("/kindled-link/status", dependencies=[Depends(require_http_auth)])
+    def kindled_link_status() -> dict[str, Any]:
+        """Relay health + session-recovery flag for the KindledLinksPanel banner.
+
+        Returns relay_health view fields plus `recovered` (True iff the
+        kindled_link/recovered.flag file exists, written by the tick engine
+        on startup when it finds in-flight sessions to recover). Fail-soft.
+        """
+        from brain.kindled_link.views import relay_health
+
+        health = relay_health(persona_dir)
+        recovered = (persona_dir / "kindled_link" / "recovered.flag").exists()
+        return {**health, "recovered": recovered}
 
     # ── /persona/writes/{rid}/{approve,decline} — file-write consent gate ──
     @app.post("/persona/writes/{rid}/approve", dependencies=[Depends(require_http_auth)])

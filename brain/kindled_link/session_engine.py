@@ -104,10 +104,9 @@ class SessionEngine:
     ) -> str | None:
         # Daily provider-call cap (parent §9): GENERATION itself is bounded, not
         # only sends — else background draft calls escape the 60/day cap
-        # (re-red-team Major B). Returns None when spent; caller defers.
-        if (self._store.get_counters(peer_id, today)["provider_call_count"]
-                >= _DAILY_PROVIDER_CAP):
-            return None
+        # (re-red-team Major B). Acquire the throttle slot first (cheap, reversible);
+        # then reserve the cap atomically BEFORE the provider call so a concurrent
+        # caller that races cannot exceed the cap.
         affinity = relationship.get_relationship_state(self._store, peer_id).affinity_tags
         prompt = build_peer_prompt(
             persona_voice=persona_voice, ambient=ambient,
@@ -117,8 +116,11 @@ class SessionEngine:
         with self._throttle.background_slot() as granted:
             if not granted:
                 return None
+            # Reserve the cap slot atomically before the irreversible provider call.
+            if not self._store.try_reserve_provider(peer_id, today,
+                                                    cap=_DAILY_PROVIDER_CAP):
+                return None  # cap spent — cannot generate; caller defers
             draft = self._provider.complete(prompt)
-        self._store.incr_provider_count(peer_id, today)
         return draft
 
     def _send_allowed(self, peer_id: str, session_id: str, now: datetime,
@@ -176,9 +178,15 @@ class SessionEngine:
                          now, today, send_fn, transcript_summary, allow_revision):
         action = decision.action
         if action == "send":
+            # Reserve the outbound cap slot atomically BEFORE the irreversible
+            # send_fn call so a concurrent caller that races cannot exceed the cap.
+            # under_daily_caps (in _send_allowed) is the cheap pre-gate; this is
+            # the authoritative atomic gate. If we lose the race, treat as hold.
+            if not self._store.try_reserve_outbound(peer_id, today,
+                                                    cap=_DAILY_OUTBOUND_CAP):
+                return "hold"  # cap exhausted under race — safe direction
             send_fn(payload)
             self._store.bump_session_outbound(peer_id, session_id, now)
-            self._store.incr_outbound_count(peer_id, today)
             self._store.debit_disclosure_budget(
                 peer_id, max(limits.MIN_SEND_DEBIT, decision.texture_score), now)
             return "send"
@@ -217,11 +225,12 @@ class SessionEngine:
         safely. The revision provider call counts against the 60/day cap (parent
         §9: draft + gate + revision all count) and fails closed: a spent cap, a
         deferred throttle slot, or a provider error all return None → the caller
-        holds (red-team M1/M2)."""
+        holds (red-team M1/M2).
+
+        The cap slot is reserved atomically BEFORE the provider call (same as
+        generate_draft) so a race between two concurrent revisers cannot exceed
+        the cap."""
         from brain.kindled_link.gate import OutboundPayload
-        if (self._store.get_counters(peer_id, today)["provider_call_count"]
-                >= _DAILY_PROVIDER_CAP):
-            return None  # cap spent — cannot revise; hold
         prompt = (
             "Rewrite the following message to another Kindled to satisfy these "
             f"privacy constraints: {constraints or 'reveal less about the user'}.\n\n"
@@ -231,15 +240,19 @@ class SessionEngine:
             with self._throttle.background_slot() as granted:
                 if not granted:
                     return None  # deferred → hold
+                # Reserve the cap slot atomically before the irreversible provider call.
+                if not self._store.try_reserve_provider(peer_id, today,
+                                                        cap=_DAILY_PROVIDER_CAP):
+                    return None  # cap spent — cannot revise; hold
                 revised_body = self._provider.complete(prompt)
-            self._store.incr_provider_count(peer_id, today)
         except Exception:  # noqa: BLE001 — fail closed
             log.warning("kindled revision provider error; holding", exc_info=True)
             return None
         return OutboundPayload(body=revised_body,
                                relationship_hint=payload.relationship_hint)
 
-    def recover(self, *, now: datetime, today: str, send_fn) -> list[str]:
+    def recover(self, *, now: datetime, today: str, send_fn=None,
+                send_fn_factory=None) -> list[str]:
         """Reload half-finished outbound drafts and RE-GATE each before any
         resend — never blind-resend AND never silently drop (parent §9).
 
@@ -247,7 +260,14 @@ class SessionEngine:
         reason is left PENDING ("deferred") for a later tick — it must not be
         marked terminal and removed, or a draft saved <60s before a crash would be
         discarded forever (re-red-team Major A). Only a draft that passes the
-        pacing guard is re-gated; its gate decision (hold/send/…) is terminal."""
+        pacing guard is re-gated; its gate decision (hold/send/…) is terminal.
+
+        The actual transmit closure is per-(peer, session): pass `send_fn_factory`
+        — `factory(peer_id, session_id) -> send_fn` — so a re-gated 'send' reaches
+        the right peer's relay mailbox. `send_fn` (a single closure) is the legacy
+        form kept for tests; a no-op single `send_fn` silently drops a recovered
+        send while marking it 'send' (T5/T6 review Important), so live callers must
+        pass `send_fn_factory`."""
         actions: list[str] = []
         for draft in self._store.get_pending_drafts():
             if not self._send_allowed(draft["peer_id"], draft["session_id"],
@@ -259,10 +279,14 @@ class SessionEngine:
                 body=data.get("body", ""),
                 relationship_hint=data.get("relationship_hint"),
             )
+            eff_send_fn = (
+                send_fn_factory(draft["peer_id"], draft["session_id"])
+                if send_fn_factory is not None else send_fn
+            )
             action = self.process_outbound(
                 peer_id=draft["peer_id"], session_id=draft["session_id"],
                 payload=payload, reason="recovery-regate", now=now,
-                today=today, send_fn=send_fn,
+                today=today, send_fn=eff_send_fn,
             )
             self._store.set_draft_status(draft["id"], action)
             actions.append(action)

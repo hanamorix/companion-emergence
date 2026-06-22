@@ -77,3 +77,26 @@ def test_leaked_mailbox_id_without_key_cannot_fetch():
     r = c.post("/mailbox/fetch", json={"mailbox_id": "mbx_b", "nonce": nonce,
                                        "signature": sig, "identity_pub": attacker.public_bytes.hex()})
     assert r.status_code == 401
+
+
+def test_main_runs_uvicorn_with_env_config(monkeypatch):
+    """main() binds host/port from env (default loopback) and runs uvicorn.
+    Patched so no real server starts."""
+    import relay.dev_relay as dr
+
+    calls = {}
+    monkeypatch.setenv("KINDLED_RELAY_HOST", "127.0.0.1")
+    monkeypatch.setenv("KINDLED_RELAY_PORT", "9999")
+    monkeypatch.setenv("KINDLED_RELAY_AUTH", "1")
+    monkeypatch.setattr(dr, "create_app", lambda require_auth=False: ("app", require_auth))
+
+    import sys
+    import types
+    fake_uvicorn = types.SimpleNamespace(
+        run=lambda app, host, port: calls.update(app=app, host=host, port=port))
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+
+    dr.main()
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 9999
+    assert calls["app"] == ("app", True)  # auth enabled

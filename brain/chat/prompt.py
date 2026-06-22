@@ -462,8 +462,13 @@ def _build_soul_highlights(soul_store: SoulStore) -> str:
 def _peer_attributed(mem, snippet: str) -> str:
     """Provenance invariant (kindled-link §14): a peer-sourced memory must surface
     as 'something a peer said', never as the user's own words or as fact. Applied
-    at every Memory-object recall render point."""
-    if getattr(mem, "memory_type", "") == "kindled_peer":
+    at every recall render point — for both Memory objects (active/fading) and
+    graveyard DICT entries (the lost path; the tombstone carries memory_type)."""
+    mtype = (
+        mem.get("memory_type", "") if isinstance(mem, dict)
+        else getattr(mem, "memory_type", "")
+    )
+    if mtype == "kindled_peer":
         return f"(something a peer said) {snippet}"
     return snippet
 
@@ -653,7 +658,7 @@ def _build_recall_block(
             if len(summary) > max_chars:
                 summary = summary[: max_chars - 1].rstrip() + "…"
             reason = entry.get("graveyard_reason", "forgotten")
-            lines.append(f'    - "{summary}"  [forgotten — {reason}]')
+            lines.append(f'    - "{_peer_attributed(entry, summary)}"  [forgotten — {reason}]')
 
     if unfamiliar:
         lines.append("  not recognised (searched; no memory found):")
