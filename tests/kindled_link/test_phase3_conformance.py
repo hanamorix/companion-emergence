@@ -12,6 +12,11 @@ _PEER_MODULES = [
     _ROOT / "brain" / "kindled_link" / "privacy_gate.py",
     _ROOT / "brain" / "kindled_link" / "relationship.py",
     _ROOT / "brain" / "kindled_link" / "feed_source.py",
+    # Phase 7a orchestration that touches peer text → provider (stage-6 review:
+    # these must not be able to reach the agentic tool surface either).
+    _ROOT / "brain" / "kindled_link" / "tick.py",
+    _ROOT / "brain" / "kindled_link" / "transport.py",
+    _ROOT / "brain" / "kindled_link" / "session.py",
 ]
 # the genuine injection-hole names (verified in the red-team against the real code)
 _FORBIDDEN = {"dispatch", "tool_recruit", "reach_for_capability",
@@ -69,6 +74,16 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.bridge.cli_throttle",     # throttle module — no tool surface
     "brain.chat.extractor",          # extractor symbols only — no tool surface (feed_source.py candidate reader)
     "brain.memory.store",            # MemoryStore symbols only — no tool surface (future kindled_peer memory writes)
+    # Phase 7a internal orchestration modules — all kindled-internal, no tool surface:
+    "brain.kindled_link.cadence",       # persisted tick cadence — no tool surface
+    "brain.kindled_link.session",       # X25519 session handshake — no tool surface
+    "brain.kindled_link.session_engine",  # pacing/gate orchestration — no tool surface
+    "brain.kindled_link.transport",     # relay send/poll adapter — no tool surface
+    "brain.kindled_link.protocol",      # envelope codec/crypto — no tool surface
+    "brain.kindled_link.relay_client",  # outbound-only relay client — no tool surface
+    "brain.kindled_link.audit",         # transport audit log — no tool surface
+    "brain.kindled_link.identity",      # Ed25519 identity — no tool surface
+    "brain.kindled_link.codec",         # canonical JSON — no tool surface
 }
 
 
