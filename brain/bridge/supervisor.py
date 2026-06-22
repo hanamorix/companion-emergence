@@ -132,6 +132,7 @@ def run_folded(
     self_model_interval_s: float | None = 0.0,
     maker_enabled: bool = True,
     notes_enabled: bool = True,
+    kindled_link_enabled: bool = True,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -504,6 +505,19 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor notes store-open raised")
 
+        # Kindled-link tick — fail-isolated. The tick self-paces via its own
+        # persisted cadence (kindled_tick_cadence.json); this block only
+        # switches the organ on/off. The REAL user gate is
+        # config.kindled_link_enabled (default False) + config.kindled_relay_url
+        # being set — checked inside _run_kindled_link_tick. ExitStack store
+        # + httpx client ownership live inside that helper. Organ DoD — the
+        # producer fires on the live path.
+        if kindled_link_enabled:  # default True; coarse test/build switch
+            try:
+                _maybe_run_kindled_link_tick(persona_dir, provider=provider)
+            except Exception:
+                logger.exception("supervisor kindled-link tick raised")
+
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
@@ -556,6 +570,64 @@ def _maybe_run_notes_tick(persona_dir, *, store, provider):
         _run_notes_tick(persona_dir, store=store, provider=provider)
     except Exception:
         logger.exception("supervisor notes tick raised")
+
+
+def _run_kindled_link_tick(persona_dir, *, provider, now=None):
+    """Run one kindled-link tick on the live supervisor path.
+
+    Loads config; returns immediately if kindled_relay_url is not set
+    (feature not wired). Otherwise constructs identity, store, relay
+    client and delegates to run_kindled_link_tick — which self-paces via
+    its own persisted cadence (kindled_tick_cadence.json).
+
+    The httpx.Client is built INSIDE this function (not at import time)
+    so the supervisor never holds a live HTTP handle between ticks.
+    """
+    import httpx
+
+    from brain.kindled_link.identity import KindledIdentity
+    from brain.kindled_link.relay_client import RelayClient
+    from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+    from brain.kindled_link.tick import run_kindled_link_tick
+
+    now = now or datetime.now(UTC)
+    config = PersonaConfig.load(persona_dir / "persona_config.json")
+
+    if config.kindled_relay_url is None:
+        return  # feature not wired — nothing to poll
+
+    idn = KindledIdentity.load_or_create(persona_dir)
+
+    with ExitStack() as _kl_stack:
+        store = KindledLinkStore(kindled_db_path(persona_dir))
+        _kl_stack.callback(store.close)
+        mailbox = store.get_or_create_local_mailbox()
+        http = httpx.Client(base_url=config.kindled_relay_url, timeout=10.0)
+        _kl_stack.callback(http.close)
+        relay = RelayClient(http, identity=idn, mailbox_id=mailbox)
+        try:
+            relay.register()
+        except Exception:
+            logger.warning(
+                "supervisor kindled-link relay register failed — skipping tick this round"
+            )
+            return
+        run_kindled_link_tick(
+            persona_dir,
+            store=store,
+            identity=idn,
+            relay_client=relay,
+            provider=provider,
+            config=config,
+            now=now,
+        )
+
+
+def _maybe_run_kindled_link_tick(persona_dir, *, provider, now=None):
+    try:
+        _run_kindled_link_tick(persona_dir, provider=provider, now=now)
+    except Exception:
+        logger.exception("supervisor kindled-link tick raised")
 
 
 def _heartbeat_and_felt_time(
