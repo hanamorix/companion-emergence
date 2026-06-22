@@ -685,6 +685,8 @@ class NotesConfigReq(BaseModel):
 
 class KindledLinkConfigReq(BaseModel):
     enabled: StrictBool
+    relay_url: str | None = None
+    relay_url: str | None = None
 
 
 class NewSessionReq(BaseModel):
@@ -1497,9 +1499,28 @@ def build_app(
         s: BridgeAppState = app.state.bridge
         config_path = s.persona_dir / "persona_config.json"
         cfg = PersonaConfig.load(config_path)
-        cfg = dc_replace(cfg, kindled_link_enabled=req.enabled)
+        relay_url = (req.relay_url or "").strip() or None
+        cfg = dc_replace(cfg, kindled_link_enabled=req.enabled, kindled_relay_url=relay_url)
         cfg.save(config_path)
-        return {"kindled_link_enabled": cfg.kindled_link_enabled}
+        return {
+            "kindled_link_enabled": cfg.kindled_link_enabled,
+            "kindled_relay_url": cfg.kindled_relay_url,
+        }
+
+    # ── GET /kindled-link/status — relay health + recovery flag ──────────────
+    @app.get("/kindled-link/status", dependencies=[Depends(require_http_auth)])
+    def kindled_link_status() -> dict[str, Any]:
+        """Relay health + session-recovery flag for the KindledLinksPanel banner.
+
+        Returns relay_health view fields plus `recovered` (True iff the
+        kindled_link/recovered.flag file exists, written by the tick engine
+        on startup when it finds in-flight sessions to recover). Fail-soft.
+        """
+        from brain.kindled_link.views import relay_health
+
+        health = relay_health(persona_dir)
+        recovered = (persona_dir / "kindled_link" / "recovered.flag").exists()
+        return {**health, "recovered": recovered}
 
     # ── /persona/writes/{rid}/{approve,decline} — file-write consent gate ──
     @app.post("/persona/writes/{rid}/approve", dependencies=[Depends(require_http_auth)])
