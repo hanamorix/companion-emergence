@@ -537,9 +537,15 @@ class ClaudeCliProvider(LLMProvider):
                 tools_enabled=bool(tools),
             )
 
-        flat_prompt = _format_claude_print_prompt(conversation_messages)
+        volatile_suffix = (options or {}).get("volatile_suffix")
+        include_block_clock = (options or {}).get("include_block_clock", True)
+        flat_prompt = _format_claude_print_prompt(
+            conversation_messages,
+            volatile_suffix=volatile_suffix,
+            include_block_clock=include_block_clock,
+        )
         _maybe_log_cache_debug(
-            options, call_type="chat", system_prompt=system_prompt, volatile_suffix=None
+            options, call_type="chat", system_prompt=system_prompt, volatile_suffix=volatile_suffix
         )
 
         if tools:
@@ -665,9 +671,15 @@ class ClaudeCliProvider(LLMProvider):
         _pd = (options or {}).get("persona_dir")
         log_persona_dir: Path | None = Path(_pd) if _pd else None
 
-        flat_prompt = _format_claude_print_prompt(conversation_messages)
+        volatile_suffix = (options or {}).get("volatile_suffix")
+        include_block_clock = (options or {}).get("include_block_clock", True)
+        flat_prompt = _format_claude_print_prompt(
+            conversation_messages,
+            volatile_suffix=volatile_suffix,
+            include_block_clock=include_block_clock,
+        )
         _maybe_log_cache_debug(
-            options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=None
+            options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=volatile_suffix
         )
 
         cmd = [
@@ -1438,7 +1450,12 @@ def _maybe_log_cache_debug(
         pass
 
 
-def _format_claude_print_prompt(messages: list[ChatMessage]) -> str:
+def _format_claude_print_prompt(
+    messages: list[ChatMessage],
+    *,
+    volatile_suffix: str | None = None,
+    include_block_clock: bool = True,
+) -> str:
     """Format messages for ``claude -p`` without transcript role labels.
 
     A single text turn stays verbatim to preserve the simple generation shape.
@@ -1446,12 +1463,28 @@ def _format_claude_print_prompt(messages: list[ChatMessage]) -> str:
     names. The previous ``User:`` / ``Assistant:`` script shape primed Claude
     to continue that transcript, which sometimes leaked role labels into
     Nell's visible reply.
+
+    ``volatile_suffix`` (Option A+) is the per-turn ambient context chunk. When
+    provided it is appended AFTER the rendered context block in BOTH branches —
+    so it is never dropped on a session's first turn (which hits the single-
+    message branch) — placing every changing byte at the very end of the stdin
+    prompt. ``include_block_clock=False`` drops the relocated clock line from the
+    top of the JSONL block (the suffix carries it instead). Both default to the
+    pre-change behaviour, so non-chat callers are unaffected.
     """
     if not messages:
         return ""
     if len(messages) == 1:
-        return messages[0].content_text()
-    return _format_claude_context_block(messages, includes_latest_user=True)
+        base = messages[0].content_text()
+    else:
+        base = _format_claude_context_block(
+            messages,
+            includes_latest_user=True,
+            include_block_clock=include_block_clock,
+        )
+    if volatile_suffix:
+        return f"{base}\n\n{volatile_suffix}"
+    return base
 
 
 def _format_claude_context_block(
@@ -1459,6 +1492,7 @@ def _format_claude_context_block(
     *,
     includes_latest_user: bool,
     now: datetime | None = None,
+    include_block_clock: bool = True,
 ) -> str:
     """Return a JSONL context block for Claude CLI prompt/system text.
 
@@ -1468,9 +1502,14 @@ def _format_claude_context_block(
     instead of creating new transcript lines.
 
     ``now`` is an optional test seam — when None the real UTC clock is used.
-    """
-    now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    ``include_block_clock`` (default True, the pre-change behaviour) controls the
+    block-level ``Current time:`` anchor + its elapsed-time explainer at the top
+    of the block. The chat path passes False because that anchor moves to the
+    Option A+ volatile suffix (it was the one per-call-changing byte sitting
+    above the whole transcript, busting the history prefix); the image path and
+    any other caller keep it. Per-message ``ts`` values are unaffected either way.
+    """
     if includes_latest_user:
         instruction = (
             "Answer the final human entry directly in the companion's voice. "
@@ -1486,11 +1525,15 @@ def _format_claude_context_block(
 
     lines = [
         "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
-        f"Current time: {now_iso}.",
-        "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed.",
-        instruction,
-        "",
     ]
+    if include_block_clock:
+        now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(f"Current time: {now_iso}.")
+        lines.append(
+            "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed."
+        )
+    lines.append(instruction)
+    lines.append("")
     lines.extend(_claude_context_jsonl_lines(messages))
     return "\n".join(lines)
 
