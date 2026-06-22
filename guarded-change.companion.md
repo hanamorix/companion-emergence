@@ -38,12 +38,17 @@ measurement:
     output: "changes/<slug>/8-harness.md"
 
 metrics:                  # standing regression metrics (source: the JSONL logs)
-  # CURRENT CAPABILITY (read first): NO replay/held workload exists yet, so regression for this
-  # project is ADVISORY-ONLY across the board today — all metrics are measured over "whatever
-  # turns happened to run" and cannot isolate a change's own contribution. The `gating: true`
-  # flags below mean "gating ONCE a comparable replay workload exists" (a stage-2 task), not
-  # "gating now." Until then, "done" rests on conformance (1.5 criteria); regression deltas are
-  # advisory signals to confirm against conformance. See the workload note under Notes.
+  # CURRENT CAPABILITY (read first): A COMPARABLE REPLAY WORKLOAD NOW EXISTS —
+  # `scripts/cache_replay_workload.py` (landed 2026-06-22, prompt-caching-adopt P1). It fires a
+  # deterministic N-turn single-session sequence against a scratch persona (real claude calls) and
+  # emits per-`call_type=="chat"` cache_creation/cache_read with an OLD-vs-NEW `--compare` A/B. The
+  # `gating: true` cache/cost metrics below ARE gating when measured via this replay (same seed both
+  # arms isolates a change's own contribution — the false-regression guard the methodology requires).
+  # The cache_debug.jsonl probe (NELL_CACHE_DEBUG=1) adds C1 system-prompt byte-stability.
+  # STILL ADVISORY: deltas computed over "whatever live turns happened to run" (no fixed workload) —
+  # those remain advisory; confirm against the replay A/B + conformance. The live streaming+tools
+  # path also already logs cache tokens (provider.py chat_stream), so a comparable live turn-set is
+  # a valid gating measure too (see C2-live in a change's 1.5-criteria). See the workload note under Notes.
   # --- GATING-WHEN-WORKLOAD-EXISTS: measurable per chat call in chat_usage.jsonl (call_type=="chat") ---
   - name: cost_per_chat_call_usd
     source: "chat_usage.jsonl: total_cost_usd where call_type==chat, mean"
