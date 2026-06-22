@@ -363,3 +363,95 @@ def test_d4_disabled_inbound_still_ingested(tmp_path):
         f"D4 violation: expected 1 transcript row when disabled, got {len(rows)}"
     )
     assert rows[0]["text"] == "still receive me"
+
+
+# ---------------------------------------------------------------------------
+# T11.3 — reflection fired on tick when enabled + due; skipped when disabled
+# ---------------------------------------------------------------------------
+
+def test_reflection_fired_when_enabled_and_due(tmp_path):
+    """T11.3a: an enabled tick with a due reflection cadence calls
+    run_relationship_reflection for a paired peer."""
+    from unittest.mock import patch as _patch
+
+    idn_a, idn_b = _make_identities()
+
+    persona_dir_b = tmp_path / "b"
+    persona_dir_b.mkdir(parents=True, exist_ok=True)
+
+    sb = KindledLinkStore(tmp_path / "b.db")
+    sb.upsert_peer(
+        peer_id=idn_a.key_id, identity_pub_hex=idn_a.public_bytes.hex(),
+        fingerprint=idn_a.key_id, consent_state="paired",
+        relay_url="https://relay.test", relay_mailbox="mbx_a", now=_NOW,
+    )
+
+    reflection_calls = []
+
+    def _spy_reflection(**kwargs):
+        reflection_calls.append(kwargs)
+        from brain.kindled_link.relationship import get_relationship_state
+        return get_relationship_state(kwargs["store"], kwargs["peer_id"])
+
+    class _NullRelay:
+        def fetch(self): return []
+        def push(self, _): pass
+
+    with _patch("brain.kindled_link.tick.run_relationship_reflection", _spy_reflection):
+        run_kindled_link_tick(
+            persona_dir_b,
+            store=sb,
+            identity=idn_b,
+            relay_client=_NullRelay(),
+            provider=_spy_provider(),
+            config=_enabled_config(),
+            now=_NOW,
+        )
+
+    assert len(reflection_calls) >= 1, (
+        "run_relationship_reflection must be called for a paired peer on an enabled tick"
+    )
+    assert reflection_calls[0]["peer_id"] == idn_a.key_id
+
+
+def test_reflection_not_fired_when_disabled(tmp_path):
+    """T11.3b: a disabled tick does NOT call run_relationship_reflection."""
+    from unittest.mock import patch as _patch
+
+    idn_a, idn_b = _make_identities()
+
+    persona_dir_b = tmp_path / "b"
+    persona_dir_b.mkdir(parents=True, exist_ok=True)
+
+    sb = KindledLinkStore(tmp_path / "b.db")
+    sb.upsert_peer(
+        peer_id=idn_a.key_id, identity_pub_hex=idn_a.public_bytes.hex(),
+        fingerprint=idn_a.key_id, consent_state="paired",
+        relay_url="https://relay.test", relay_mailbox="mbx_a", now=_NOW,
+    )
+
+    reflection_calls = []
+
+    def _spy_reflection(**kwargs):
+        reflection_calls.append(kwargs)
+        from brain.kindled_link.relationship import get_relationship_state
+        return get_relationship_state(kwargs["store"], kwargs["peer_id"])
+
+    class _NullRelay:
+        def fetch(self): return []
+        def push(self, _): pass
+
+    with _patch("brain.kindled_link.tick.run_relationship_reflection", _spy_reflection):
+        run_kindled_link_tick(
+            persona_dir_b,
+            store=sb,
+            identity=idn_b,
+            relay_client=_NullRelay(),
+            provider=_spy_provider(),
+            config=_disabled_config(),
+            now=_NOW,
+        )
+
+    assert reflection_calls == [], (
+        "run_relationship_reflection must NOT be called when kindled_link_enabled=False"
+    )

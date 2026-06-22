@@ -17,6 +17,11 @@ from pathlib import Path
 
 from brain.kindled_link.cadence import save_tick_cadence, tick_is_due
 from brain.kindled_link.gate import OutboundPayload
+from brain.kindled_link.relationship import (
+    reflection_is_due,
+    run_relationship_reflection,
+    save_reflection_cadence,
+)
 from brain.kindled_link.session import open_session
 from brain.kindled_link.session_engine import SessionEngine
 from brain.kindled_link.transport import poll_and_ingest, send_message
@@ -107,6 +112,7 @@ def run_kindled_link_tick(
                     identity=identity,
                     relay_client=relay_client,
                     engine=engine,
+                    provider=provider,
                     peer_id=peer_id,
                     now=now,
                     today=today,
@@ -134,6 +140,7 @@ def _tick_peer(
     identity,
     relay_client,
     engine: SessionEngine,
+    provider,
     peer_id: str,
     now: datetime,
     today: str,
@@ -143,6 +150,8 @@ def _tick_peer(
 
     Checks for an active session with a fresh inbound → gated response.
     Falls back to autonomous START if no active session and can_start_session.
+    Fires run_relationship_reflection when its cadence is due (provider call,
+    gated by config.kindled_link_enabled — already true at this call site).
     """
     active_sess = store.get_active_session(peer_id)
 
@@ -195,6 +204,43 @@ def _tick_peer(
             relay_client.push(leg1)
         except Exception:  # noqa: BLE001 — fault-isolated
             log.warning("kindled tick: open_session failed for %s", peer_id, exc_info=True)
+
+    # Relationship reflection — run when cadence is due (provider call; caller
+    # already confirmed config.kindled_link_enabled before entering _tick_peer).
+    if reflection_is_due(persona_dir, now):
+        try:
+            transcript_rows = store.recent_transcript(peer_id)
+            transcript_text = " | ".join(row["text"] for row in reversed(transcript_rows))
+            hold_count = _count_recent_holds(store, peer_id)
+            run_relationship_reflection(
+                store=store,
+                provider=provider,
+                peer_id=peer_id,
+                transcript=transcript_text,
+                now=now,
+                today=today,
+                regression_signal={"hold_count": hold_count},
+                persona_dir=persona_dir,
+            )
+            save_reflection_cadence(persona_dir, now)
+        except Exception:  # noqa: BLE001 — fault-isolated; reflection is best-effort
+            log.warning("kindled tick: reflection failed for %s", peer_id, exc_info=True)
+
+
+def _count_recent_holds(store, peer_id: str) -> int:
+    """Count 'hold'-status outbound drafts for a peer (fail-soft → 0).
+
+    Uses a direct store query — get_pending_drafts only returns 'pending' rows,
+    so we reach into the connection for the 'hold' status specifically.
+    """
+    try:
+        rows = store._conn.execute(
+            "SELECT COUNT(*) FROM outbound_drafts WHERE peer_id = ? AND status = 'hold'",
+            (peer_id,),
+        ).fetchone()
+        return int(rows[0]) if rows else 0
+    except Exception:  # noqa: BLE001 — fail-soft; 0 means no regression pressure
+        return 0
 
 
 def _make_send_fn(*, store, identity, relay_client, peer_id, session_id, now, persona_dir):
