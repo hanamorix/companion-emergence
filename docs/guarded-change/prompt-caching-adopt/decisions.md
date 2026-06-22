@@ -31,3 +31,26 @@ Change: `prompt-caching-adopt` (fork `7baa145b`, Options A + A+ + cache instrume
   `prompt.py`/`engine.py`/`provider.py`/`tool_loop.py`; rebase onto post-Phase-7 main, apply once).
 - Human override: none.
 - Iteration-cap state: stage-4 bounce count for finding-class {plan/measurement} = 1.
+
+---
+
+**Stage 7 (code gate) — 2026-06-22**
+- Stage-6 cold code red-team (general-purpose, no shared context; read diff + real code + criteria).
+- Worst severity: **MINOR**. Partition verified clean (no per-turn byte in static head — the C1
+  make-or-break), no block dropped/duplicated, epistemic-gating behavior-preserving, suffix reaches
+  all 3 provider call paths + live `_StreamingProxy`→`chat_stream`, image byte-identical.
+- Minor: build_system_message vs build_volatile_context duplication-drift risk (a block added to one
+  not the other diverges; completeness test catches DROP not ADD-only-to-volatile). Logged, accepted.
+- Housekeeping: untracked test_prompt_caching_split.py → git add'd in the build commit.
+- **Route: MINOR → fix-in-place, proceed to harness (8).** No human override.
+- Iteration-cap: stage-7 bounce count = 0.
+
+**Stage 8 (harness) — 2026-06-22**
+- Replay A/B, scratch persona, 8 real claude turns/arm. Build 0fd1e4a7.
+- **C1 PASS** (NEW 1 distinct system_sha256). **C2-text PASS** (create 51087→48200 −6%, read not
+  collapsed). **C3 PASS** (read-ratio 0.93→1.56). **C7-auto PASS** (image byte-identity test).
+  Headline: **cache_read +59%** — the mechanism (prefix now caches) confirmed.
+- C4 PARTIAL (scratch magnitude recorded; real --history-file run pending, active_conversations empty).
+- C5/C2-live NOT RUN (live tools path) — human decision pending. C6 full suite + C7 human PENDING.
+- **Route: clean direction, no blocker/major. Holding at stage 8 for human gates** (C7 voice read +
+  C5-live decision + full-suite C6) before merge. NOT merged.
