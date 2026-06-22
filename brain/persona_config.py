@@ -52,6 +52,7 @@ def _default_persona_config_dict() -> dict:
         "notes_enabled": False,
         "notes_folder": None,
         "kindled_link_enabled": False,
+        "kindled_relay_url": None,
     }
 
 
@@ -85,6 +86,7 @@ class PersonaConfig:
     notes_enabled: bool = False
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
     kindled_link_enabled: bool = False
+    kindled_relay_url: str | None = None  # relay where this Kindled's mailbox lives; None = not wired
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -135,6 +137,12 @@ class PersonaConfig:
         notes_folder = (
             notes_folder_raw if isinstance(notes_folder_raw, str) and notes_folder_raw else None
         )
+        kindled_relay_url_raw = data.get("kindled_relay_url")
+        kindled_relay_url = (
+            kindled_relay_url_raw
+            if isinstance(kindled_relay_url_raw, str) and kindled_relay_url_raw.strip()
+            else None
+        )
         model_raw = data.get("model", DEFAULT_MODEL)
         model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
         if model_str in KNOWN_MODELS:
@@ -163,6 +171,7 @@ class PersonaConfig:
             notes_enabled=notes_enabled,
             notes_folder=notes_folder,
             kindled_link_enabled=kindled_link_enabled,
+            kindled_relay_url=kindled_relay_url,
         )
 
     @classmethod
@@ -205,6 +214,7 @@ class PersonaConfig:
             "notes_enabled": self.notes_enabled,
             "notes_folder": self.notes_folder,
             "kindled_link_enabled": self.kindled_link_enabled,
+            "kindled_relay_url": self.kindled_relay_url,
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
