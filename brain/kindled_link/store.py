@@ -664,6 +664,13 @@ class KindledLinkStore:
         self._conn.commit()
         return int(row[0])
 
+    def list_paired_peers(self) -> list[str]:
+        """Return peer_ids of all peers in consent_state='paired'."""
+        rows = self._conn.execute(
+            "SELECT peer_id FROM peers WHERE consent_state = 'paired'"
+        ).fetchall()
+        return [row["peer_id"] for row in rows]
+
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a
         finally block after every request-scoped store usage to avoid file-descriptor

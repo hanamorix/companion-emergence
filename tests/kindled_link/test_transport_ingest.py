@@ -354,7 +354,7 @@ def test_session_open_inbound_triggers_on_session_open_and_pushes_reply(tmp_path
     rc_a.push(leg1)
 
     # B's poll_and_ingest should trigger on_session_open and push the reply
-    summary = poll_and_ingest(sb, idn_b, rc_b, now=_NOW)
+    poll_and_ingest(sb, idn_b, rc_b, now=_NOW)
 
     # B must now have a session_keys row (responder established the key)
     sk_b = sb.get_session_key(idn_a.key_id, session_id)
