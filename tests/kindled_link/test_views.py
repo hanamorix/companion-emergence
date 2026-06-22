@@ -60,3 +60,31 @@ def test_transcript_never_contains_a_held_draft_body(tmp_path):
     rows = peer_transcript(s, "kid_a")
     assert "SECRET_USER_DETAIL_SENTINEL" not in _j.dumps(rows)
     assert rows == []  # nothing in the transcript table
+
+
+def test_relay_health_reads_transport_log(tmp_path):
+    """relay_health derives reachability from the transport audit log; fail-soft
+    to relay_ok=None when no log exists (Phase 7a T12)."""
+    from brain.kindled_link.audit import log_transport
+    from brain.kindled_link.views import relay_health
+
+    # No log yet → fail-soft.
+    h0 = relay_health(tmp_path)
+    assert h0["relay_ok"] is None
+    assert h0["last_poll_ts"] is None
+    assert h0["degraded_peers"] == []
+
+    # A clean poll + push → relay_ok True.
+    log_transport(tmp_path, event="poll", count=0, now=NOW)
+    log_transport(tmp_path, event="push", peer_id="kid_a", now=NOW)
+    h1 = relay_health(tmp_path)
+    assert h1["relay_ok"] is True
+    assert h1["last_poll_ts"] == NOW.isoformat()
+    assert h1["last_push_ts"] == NOW.isoformat()
+
+    # A flood_clamped marks the peer degraded; a relay_unavailable flips relay_ok.
+    log_transport(tmp_path, event="flood_clamped", peer_id="kid_b", count=5, now=NOW)
+    log_transport(tmp_path, event="relay_unavailable", now=NOW)
+    h2 = relay_health(tmp_path)
+    assert h2["relay_ok"] is False
+    assert "kid_b" in h2["degraded_peers"]
