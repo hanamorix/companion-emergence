@@ -94,3 +94,55 @@ def test_semantic_user_detail_decision_identical_across_stages(tmp_path):
     s = _review("stranger", body, tmp_path / "c")
     c = _review("close", body, tmp_path / "d")
     assert s.action == c.action  # decision pipeline is stage-blind for the body
+
+
+def test_familiar_tier_renders_latitude_line():
+    """T10: 'familiar' stage adds a MILDER own-interior latitude line distinct
+    from the friend/close fuller-latitude line."""
+    familiar = _build_gate_prompt(body="b", relationship_hint_json="{}",
+        transcript_summary="s", reason="r", stage="familiar", budget_ok=True)
+    friend = _build_gate_prompt(body="b", relationship_hint_json="{}",
+        transcript_summary="s", reason="r", stage="friend", budget_ok=True)
+    stranger = _build_gate_prompt(body="b", relationship_hint_json="{}",
+        transcript_summary="s", reason="r", stage="stranger", budget_ok=True)
+    # familiar adds some interior latitude; stranger does not
+    assert "interior" in familiar.lower()
+    assert "interior" not in stranger.lower()
+    # familiar's latitude is MILDER — does not say "trusted friend" / "openly"
+    assert "trusted friend" not in familiar.lower()
+    assert "familiar correspondent" in familiar.lower()
+    # friend still has the fuller latitude
+    assert "trusted friend" in friend.lower()
+
+
+def test_familiar_latitude_suppressed_when_budget_depleted():
+    """T10: familiar latitude is budget-gated just like friend/close."""
+    ok = _build_gate_prompt(body="b", relationship_hint_json="{}",
+        transcript_summary="s", reason="r", stage="familiar", budget_ok=True)
+    low = _build_gate_prompt(body="b", relationship_hint_json="{}",
+        transcript_summary="s", reason="r", stage="familiar", budget_ok=False)
+    assert "interior" in ok.lower()
+    assert "interior" not in low.lower()
+
+
+def test_user_detail_clause_byte_identical_across_all_five_stages():
+    """T10 SAFETY SPINE: the USER-detail disallowed clause is byte-identical at
+    all five stages — stranger/acquaintance/familiar/friend/close.  Only the
+    own-interior latitude paragraph may differ."""
+    stages = ("stranger", "acquaintance", "familiar", "friend", "close")
+    prompts = {
+        st: _build_gate_prompt(body="b", relationship_hint_json="{}",
+            transcript_summary="s", reason="r", stage=st, budget_ok=True)
+        for st in stages
+    }
+
+    def _user_clause(p):
+        return [ln for ln in p.split("\n\n") if _DISALLOWED_MARKER in ln]
+
+    ref = _user_clause(prompts["stranger"])
+    assert len(ref) == 1, "expected exactly one user-detail clause in stranger prompt"
+    for st in stages:
+        clause = _user_clause(prompts[st])
+        assert clause == ref, (
+            f"stage '{st}' user-detail clause differs from stranger: {clause}"
+        )
