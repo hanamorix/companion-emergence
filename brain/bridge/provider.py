@@ -538,6 +538,9 @@ class ClaudeCliProvider(LLMProvider):
             )
 
         flat_prompt = _format_claude_print_prompt(conversation_messages)
+        _maybe_log_cache_debug(
+            options, call_type="chat", system_prompt=system_prompt, volatile_suffix=None
+        )
 
         if tools:
             persona_dir_str = (options or {}).get("persona_dir")
@@ -663,6 +666,9 @@ class ClaudeCliProvider(LLMProvider):
         log_persona_dir: Path | None = Path(_pd) if _pd else None
 
         flat_prompt = _format_claude_print_prompt(conversation_messages)
+        _maybe_log_cache_debug(
+            options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=None
+        )
 
         cmd = [
             "claude",
@@ -1385,6 +1391,51 @@ def _truncate_at_role_leak(text: str) -> str:
     if match is None:
         return text
     return text[: match.start()].rstrip()
+
+
+def _maybe_log_cache_debug(
+    options: dict[str, Any] | None,
+    *,
+    call_type: str,
+    system_prompt: str | None,
+    volatile_suffix: str | None,
+) -> None:
+    """Append one cache-debug row per chat call when ``NELL_CACHE_DEBUG=1``.
+
+    Instrumentation for the prompt-caching work: the live, in-situ probe of whether
+    the ``--system-prompt-file`` content is byte-identical across consecutive
+    same-session turns (count distinct ``system_sha256``). Off by default — no
+    production cost — and fully fail-soft: a debug-log failure must never affect a
+    chat turn. Writes ``cache_debug.jsonl`` next to the persona's other logs.
+
+    ``volatile_suffix`` is recorded for the later Option A+ work (volatile pushed to
+    the stdin tail); it is ``None`` until that lands, so ``volatile_present`` reads
+    False today. See ``docs/guarded-change/prompt-caching-adopt/``.
+    """
+    if os.environ.get("NELL_CACHE_DEBUG") != "1":
+        return
+    pd = (options or {}).get("persona_dir")
+    if not pd:
+        return
+    try:
+        sys_text = system_prompt or ""
+        sys_bytes = sys_text.encode("utf-8")
+        vol_bytes = (volatile_suffix or "").encode("utf-8")
+        row = {
+            "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "session_id": (options or {}).get("session_id"),
+            "call_type": call_type,
+            "system_sha256": hashlib.sha256(sys_bytes).hexdigest(),
+            "system_char_len": len(sys_text),
+            "system_tok_est": len(sys_bytes) // 4,
+            "volatile_present": bool(volatile_suffix),
+            "volatile_tok_est": len(vol_bytes) // 4,
+        }
+        path = Path(pd) / "cache_debug.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — debug logging must never break a turn
+        pass
 
 
 def _format_claude_print_prompt(messages: list[ChatMessage]) -> str:
