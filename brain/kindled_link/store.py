@@ -367,6 +367,42 @@ class KindledLinkStore:
         )
         self._conn.commit()
 
+    def try_reserve_outbound(self, peer_id: str, today: str, *, cap: int) -> bool:
+        """Atomically check-and-increment outbound_count if below cap.
+
+        A single UPDATE … WHERE outbound_count < cap RETURNING outbound_count
+        statement: if a row is returned the slot was reserved (True); if no row
+        is returned the cap is already met (False, no increment). SQLite
+        serialises writers so this is race-safe — no separate read needed.
+        """
+        self._ensure_counter_row(peer_id, today)
+        row = self._conn.execute(
+            "UPDATE peer_counters "
+            "SET outbound_count = outbound_count + 1 "
+            "WHERE peer_id = ? AND outbound_count < ? "
+            "RETURNING outbound_count",
+            (peer_id, cap),
+        ).fetchone()
+        self._conn.commit()
+        return row is not None
+
+    def try_reserve_provider(self, peer_id: str, today: str, *, cap: int) -> bool:
+        """Atomically check-and-increment provider_call_count if below cap.
+
+        Mirrors try_reserve_outbound but targets the provider_call_count column.
+        Returns True if the slot was reserved, False if already at cap.
+        """
+        self._ensure_counter_row(peer_id, today)
+        row = self._conn.execute(
+            "UPDATE peer_counters "
+            "SET provider_call_count = provider_call_count + 1 "
+            "WHERE peer_id = ? AND provider_call_count < ? "
+            "RETURNING provider_call_count",
+            (peer_id, cap),
+        ).fetchone()
+        self._conn.commit()
+        return row is not None
+
     # --- outbound_drafts (Phase 3, recovery re-gate) ---
     def save_draft(
         self, *, peer_id: str, session_id: str, payload_json: str,

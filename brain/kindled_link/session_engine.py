@@ -104,10 +104,9 @@ class SessionEngine:
     ) -> str | None:
         # Daily provider-call cap (parent §9): GENERATION itself is bounded, not
         # only sends — else background draft calls escape the 60/day cap
-        # (re-red-team Major B). Returns None when spent; caller defers.
-        if (self._store.get_counters(peer_id, today)["provider_call_count"]
-                >= _DAILY_PROVIDER_CAP):
-            return None
+        # (re-red-team Major B). Acquire the throttle slot first (cheap, reversible);
+        # then reserve the cap atomically BEFORE the provider call so a concurrent
+        # caller that races cannot exceed the cap.
         affinity = relationship.get_relationship_state(self._store, peer_id).affinity_tags
         prompt = build_peer_prompt(
             persona_voice=persona_voice, ambient=ambient,
@@ -117,8 +116,11 @@ class SessionEngine:
         with self._throttle.background_slot() as granted:
             if not granted:
                 return None
+            # Reserve the cap slot atomically before the irreversible provider call.
+            if not self._store.try_reserve_provider(peer_id, today,
+                                                    cap=_DAILY_PROVIDER_CAP):
+                return None  # cap spent — cannot generate; caller defers
             draft = self._provider.complete(prompt)
-        self._store.incr_provider_count(peer_id, today)
         return draft
 
     def _send_allowed(self, peer_id: str, session_id: str, now: datetime,
@@ -176,9 +178,15 @@ class SessionEngine:
                          now, today, send_fn, transcript_summary, allow_revision):
         action = decision.action
         if action == "send":
+            # Reserve the outbound cap slot atomically BEFORE the irreversible
+            # send_fn call so a concurrent caller that races cannot exceed the cap.
+            # under_daily_caps (in _send_allowed) is the cheap pre-gate; this is
+            # the authoritative atomic gate. If we lose the race, treat as hold.
+            if not self._store.try_reserve_outbound(peer_id, today,
+                                                    cap=_DAILY_OUTBOUND_CAP):
+                return "hold"  # cap exhausted under race — safe direction
             send_fn(payload)
             self._store.bump_session_outbound(peer_id, session_id, now)
-            self._store.incr_outbound_count(peer_id, today)
             self._store.debit_disclosure_budget(
                 peer_id, max(limits.MIN_SEND_DEBIT, decision.texture_score), now)
             return "send"
@@ -217,11 +225,12 @@ class SessionEngine:
         safely. The revision provider call counts against the 60/day cap (parent
         §9: draft + gate + revision all count) and fails closed: a spent cap, a
         deferred throttle slot, or a provider error all return None → the caller
-        holds (red-team M1/M2)."""
+        holds (red-team M1/M2).
+
+        The cap slot is reserved atomically BEFORE the provider call (same as
+        generate_draft) so a race between two concurrent revisers cannot exceed
+        the cap."""
         from brain.kindled_link.gate import OutboundPayload
-        if (self._store.get_counters(peer_id, today)["provider_call_count"]
-                >= _DAILY_PROVIDER_CAP):
-            return None  # cap spent — cannot revise; hold
         prompt = (
             "Rewrite the following message to another Kindled to satisfy these "
             f"privacy constraints: {constraints or 'reveal less about the user'}.\n\n"
@@ -231,8 +240,11 @@ class SessionEngine:
             with self._throttle.background_slot() as granted:
                 if not granted:
                     return None  # deferred → hold
+                # Reserve the cap slot atomically before the irreversible provider call.
+                if not self._store.try_reserve_provider(peer_id, today,
+                                                        cap=_DAILY_PROVIDER_CAP):
+                    return None  # cap spent — cannot revise; hold
                 revised_body = self._provider.complete(prompt)
-            self._store.incr_provider_count(peer_id, today)
         except Exception:  # noqa: BLE001 — fail closed
             log.warning("kindled revision provider error; holding", exc_info=True)
             return None
