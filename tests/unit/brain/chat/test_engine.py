@@ -230,6 +230,7 @@ class _RecordingProvider(_LLMProvider):
 
     def __init__(self) -> None:
         self.last_messages: list[_ChatMessage] = []
+        self.last_options: dict[str, Any] | None = None
 
     def name(self) -> str:
         return "recording"
@@ -245,6 +246,7 @@ class _RecordingProvider(_LLMProvider):
         options: dict[str, Any] | None = None,
     ) -> _ChatResponse:
         self.last_messages = list(messages)
+        self.last_options = dict(options) if options else None
         h = hashlib.sha256(repr(messages).encode()).hexdigest()[:16]
         return _ChatResponse(content=f"RECORDED: {h}", tool_calls=())
 
@@ -335,17 +337,21 @@ def test_respond_falls_back_to_history_when_buffer_read_fails(
     assert "hi back" in contents
 
 
-def test_respond_system_message_includes_outbound_recall_block(
+def test_respond_outbound_recall_block_rides_volatile_tail(
     persona_dir: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     recording_provider: _RecordingProvider,
 ) -> None:
-    """Phase 7.2 — the always-on verify slice is injected into the system message.
+    """Phase 7.2 — the always-on verify slice still reaches the model.
 
-    Seeds an audit row dated within the 24h ambient window, then drives a
-    full chat turn through a recording provider and asserts the system
-    message contains "Recent outbound" plus the seeded subject.
+    Post prompt-caching split (Option A+), per-turn volatile blocks no longer
+    ride in the frozen system message — they are threaded to the provider as
+    the stdin ``volatile_suffix`` (options) appended after history. Seeds an
+    audit row inside the 24h ambient window, drives a full chat turn through a
+    recording provider, and asserts the outbound-recall block ("Recent
+    outbound" + the seeded subject) is present in the volatile suffix and is
+    NOT in the (now frozen) system message.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -384,8 +390,16 @@ def test_respond_system_message_includes_outbound_recall_block(
     assert system_msgs, "expected a system message"
     system_text = system_msgs[0]
     assert isinstance(system_text, str)
-    assert "Recent outbound" in system_text
-    assert "the kolinsky sable brushes" in system_text
+    # The block now rides the stdin volatile tail, NOT the frozen system prompt.
+    assert "Recent outbound" not in system_text
+    options = recording_provider.last_options
+    assert options is not None, "expected per-call options carrying the volatile suffix"
+    suffix = options.get("volatile_suffix")
+    assert isinstance(suffix, str) and suffix, "expected a volatile_suffix in options"
+    assert "Recent outbound" in suffix
+    assert "the kolinsky sable brushes" in suffix
+    # And the clock relocation signal travels with it.
+    assert options.get("include_block_clock") is False
 
 
 def test_respond_replays_image_turn_from_buffer(
@@ -445,3 +459,114 @@ def test_respond_replays_image_turn_from_buffer(
             found = True
             break
     assert found, "image-bearing user turn was not replayed from buffer"
+
+
+def test_respond_image_turn_system_message_is_unsplit_full(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """C5 — the IMAGE path stays byte-identical to the pre-change shape.
+
+    An image turn must NOT take the Option A/A+ split: it builds the FULL system
+    message via the unchanged ``build_system_message`` (volatile blocks inline)
+    and carries NO ``volatile_suffix`` (the image fold has no stdin tail). The
+    proof: the system message the engine sent on an image turn carries the
+    volatile markers inline (so it is the unsplit full build, NOT the static-only
+    head), is byte-identical to ``build_system_message`` re-run over the SAME
+    frozen inputs, and the options carry no volatile suffix / clock flag.
+
+    Determinism: ``build_system_message`` reads body/temperature state the engine
+    mutates per turn, so we freeze the body block on BOTH builds via a stub,
+    leaving the rest byte-comparable. (The system message itself carries no wall
+    clock — that line lives only in the provider's JSONL block — so no other clock
+    pin is needed.)
+    """
+    import brain.chat.prompt as prompt_mod
+    from brain.chat.prompt import (
+        _AMBIENT_FRAMING,
+        build_static_system_message,
+        build_system_message,
+    )
+    from brain.engines.daemon_state import load_daemon_state
+    from brain.images import save_image_bytes
+    from brain.memory.store import Memory
+    from brain.soul.store import SoulStore
+
+    # Seed deterministic emotion state so a split-vs-unsplit difference is
+    # observable in the system message (emotions surface in the brain block).
+    store.create(
+        Memory.create_new(
+            content="A tender afternoon with Jordan.",
+            memory_type="event",
+            domain="relationship",
+            emotions={"love": 7.0, "tenderness": 5.0},
+            tags=[],
+        )
+    )
+
+    # Freeze the body block (the only per-call mutating volatile block) so the
+    # engine's build and our reference build compare byte-for-byte.
+    frozen_body = "── body ──\nenergy: 7/10, temperature: 3/9, exhaustion: 0/10"
+    original_body_builder = prompt_mod._build_body_block
+    prompt_mod._build_body_block = lambda *a, **k: frozen_body  # type: ignore[attr-defined]
+    try:
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00"
+            b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        record = save_image_bytes(persona_dir, png_bytes, "image/png")
+        sha = record.sha
+
+        user_input = "what do you think of this?"
+        respond(
+            persona_dir,
+            user_input,
+            store=store,
+            hebbian=hebbian,
+            provider=recording_provider,
+            image_shas=[sha],
+            voice_md_override="# Nell",
+        )
+
+        sent = recording_provider.last_messages
+        system_msgs = [m.content for m in sent if m.role == "system"]
+        assert system_msgs, "expected a system message on the image turn"
+        sent_system = system_msgs[0]
+        assert isinstance(sent_system, str)
+
+        # The image-turn system message must be the UNSPLIT full build: volatile
+        # blocks inline, NOT the static-only head, NOT the volatile-tail shape.
+        static_head = build_static_system_message(persona_dir, voice_md="# Nell")
+        assert sent_system != static_head, "image turn must NOT use the static-only head"
+        assert "── brain context ──" in sent_system
+        assert "current emotions:" in sent_system
+        assert frozen_body in sent_system
+        assert _AMBIENT_FRAMING not in sent_system
+
+        # Byte-identity against a fresh unsplit build over the same frozen inputs.
+        daemon_state, _ = load_daemon_state(persona_dir)
+        soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+        try:
+            expected_system = build_system_message(
+                persona_dir,
+                voice_md="# Nell",
+                daemon_state=daemon_state,
+                soul_store=soul_store,
+                store=store,
+                user_input=user_input,
+                reply_to_audit_id=None,
+            )
+        finally:
+            soul_store.close()
+        assert sent_system == expected_system
+    finally:
+        prompt_mod._build_body_block = original_body_builder  # type: ignore[attr-defined]
+
+    # And NO volatile suffix / clock-relocation flag rides on an image turn.
+    options = recording_provider.last_options
+    if options is not None:
+        assert options.get("volatile_suffix") is None
+        assert "include_block_clock" not in options
