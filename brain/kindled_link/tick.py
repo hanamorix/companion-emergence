@@ -59,29 +59,15 @@ def run_kindled_link_tick(
 
     today = now.strftime("%Y-%m-%d")
 
-    def _send_closure_for(peer_id: str, session_id: str):
-        """Return a send_fn bound to this peer/session."""
-        def _send(payload: OutboundPayload) -> None:
-            send_message(
-                store, identity, relay_client,
-                peer_id=peer_id,
-                session_id=session_id,
-                payload={"text": payload.body},
-                now=now,
-                persona_dir=persona_dir,
-            )
-        return _send
-
-    # Build a generic send closure for recover (it reads peer/session from the draft)
-    def _recovery_send(payload: OutboundPayload) -> None:
-        # recover() drives its own per-draft send_fn; this outer closure is the
-        # fallback for the engine.recover() call signature.  The engine's recover
-        # method calls process_outbound internally with draft-specific peer/session,
-        # so we only need to supply *a* send_fn at this level.
-        pass  # engine.recover calls process_outbound which passes its own send_fn
-
-    recovered_actions = engine.recover(now=now, today=today, send_fn=_recovery_send)
-    any_recovered = any(a not in ("deferred",) for a in recovered_actions)
+    def _recovery_send_factory(peer_id: str, session_id: str):
+        """Per-draft transmit closure for engine.recover — binds the draft's own
+        peer/session so a re-gated 'send' reaches the right relay mailbox (T5/T6
+        review: a single no-op send_fn silently dropped + mis-marked recovered
+        sends)."""
+        return _make_send_fn(
+            store=store, identity=identity, relay_client=relay_client,
+            peer_id=peer_id, session_id=session_id, now=now, persona_dir=persona_dir,
+        )
 
     # 3. Inbound — ALWAYS (even when disabled — D4)
     inbound_summary = poll_and_ingest(
@@ -92,9 +78,17 @@ def run_kindled_link_tick(
 
     degraded: list[str] = []
     peers_processed = 0
+    any_recovered = False
 
-    # 4. Autonomous outbound + start — ONLY if enabled (D1)
+    # 4. Recover + autonomous outbound + start — ONLY if enabled (D1). Recovery
+    # re-gates half-finished drafts and may transmit, so it is gated too: when
+    # disabled, pending drafts stay deferred (not sent), recovered on a later
+    # enabled tick.
     if config.kindled_link_enabled:
+        recovered_actions = engine.recover(
+            now=now, today=today, send_fn_factory=_recovery_send_factory
+        )
+        any_recovered = any(a not in ("deferred",) for a in recovered_actions)
         for peer_id in store.list_paired_peers():
             peer = store.get_peer(peer_id)
             if peer is None:
@@ -166,13 +160,13 @@ def _tick_peer(
                 now=now, persona_dir=persona_dir,
             )
             # generate_draft reads relationship stage + ambient
+            rel_row = store.get_relationship_row(peer_id)
             draft = engine.generate_draft(
                 peer_id=peer_id,
                 session_id=session_id,
                 persona_voice="",
                 ambient="",
-                peer_stage=store.get_relationship_row(peer_id)["stage"]
-                if store.get_relationship_row(peer_id) else "stranger",
+                peer_stage=rel_row["stage"] if rel_row else "stranger",
                 transcript_summary=transcript_summary,
                 today=today,
             )
