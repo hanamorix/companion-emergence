@@ -127,6 +127,10 @@ export interface PersonaState {
     notes_enabled?: boolean;
     /** The resolved per-OS notes folder when enabled, else null/undefined. */
     notes_folder?: string | null;
+    /** True iff Kindled-to-Kindled correspondence is enabled. */
+    kindled_link_enabled?: boolean;
+    /** The relay URL when enabled, else null/undefined. */
+    kindled_relay_url?: string | null;
   };
   mode: "live" | "bridge_down" | "provider_down" | "offline";
   /** True iff orphan session buffers from a previous shutdown are still
@@ -616,6 +620,48 @@ export async function setPersonaNotes(
   );
   if (!r.ok) throw new Error(`setPersonaNotes failed: ${r.status}`);
   return (await r.json()) as NotesConfig;
+}
+
+export interface KindledLinkConfig {
+  kindled_link_enabled: boolean;
+  kindled_relay_url: string | null;
+}
+
+export async function setKindledLinkEnabled(
+  persona: string,
+  enabled: boolean,
+  relayUrl: string | null,
+): Promise<KindledLinkConfig> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/persona/config/kindled-link`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: JSON.stringify({ enabled, relay_url: relayUrl }),
+    }),
+  );
+  if (!r.ok) throw new Error(`setKindledLinkEnabled failed: ${r.status}`);
+  return (await r.json()) as KindledLinkConfig;
+}
+
+/** Status returned by GET /kindled-link/status. */
+export interface KindledLinkStatus {
+  relay_ok: boolean | null;
+  last_poll_ts: string | null;
+  last_push_ts: string | null;
+  degraded_peers: string[];
+  recovered: boolean;
+}
+
+/**
+ * Fetch relay health + recovery flag for the KindledLinksPanel.
+ * Throws on non-2xx (401 unauthed, etc).
+ */
+export async function fetchKindledLinkStatus(persona: string): Promise<KindledLinkStatus> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/status`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/status ${r.status}`);
+  return (await r.json()) as KindledLinkStatus;
 }
 
 export type PronounPreset = "she/her" | "he/him" | "they/them";

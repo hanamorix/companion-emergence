@@ -214,6 +214,8 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         "model": None,
         "last_heartbeat_at": None,
         "user_pronouns": None,
+        "kindled_link_enabled": False,
+        "kindled_relay_url": None,
     }
     try:
         from brain.persona_config import PersonaConfig
@@ -223,6 +225,8 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         out["provider"] = cfg.provider
         out["model"] = cfg.model
         out["user_pronouns"] = preset_key_for(cfg.user_pronouns)
+        out["kindled_link_enabled"] = cfg.kindled_link_enabled
+        out["kindled_relay_url"] = cfg.kindled_relay_url
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: persona_config read failed", exc_info=True)
     try:
