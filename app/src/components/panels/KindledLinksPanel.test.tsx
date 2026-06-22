@@ -19,6 +19,13 @@ vi.mock("../../bridge", () => ({
   fetchKindledPeers: vi.fn(async () => [makePeer("paired")]),
   fetchKindledHolds: vi.fn(async () => ({ held_count: 0, items: [] })),
   fetchKindledTranscript: vi.fn(async () => []),
+  fetchKindledLinkStatus: vi.fn(async () => ({
+    relay_ok: null,
+    last_poll_ts: null,
+    last_push_ts: null,
+    degraded_peers: [],
+    recovered: false,
+  })),
   createKindledInvite: vi.fn(), acceptKindledInvite: vi.fn(), setKindledConsent: vi.fn(),
 }));
 
@@ -49,5 +56,33 @@ describe("KindledLinksPanel", () => {
     // wait for the peer row to appear (consent_state badge)
     expect(await screen.findByText(/blocked/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /pause|resume|revoke|block/i })).toBeNull();
+  });
+
+  it("shows recovery banner when status reports recovered=true", async () => {
+    const { fetchKindledLinkStatus } = await import("../../bridge");
+    vi.mocked(fetchKindledLinkStatus).mockResolvedValue({
+      relay_ok: true,
+      last_poll_ts: "2026-06-22T10:00:00Z",
+      last_push_ts: null,
+      degraded_peers: [],
+      recovered: true,
+    });
+    render(<KindledLinksPanel persona="nell" />);
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/recover/i);
+  });
+
+  it("shows relay-health line with relay status", async () => {
+    const { fetchKindledLinkStatus } = await import("../../bridge");
+    vi.mocked(fetchKindledLinkStatus).mockResolvedValue({
+      relay_ok: true,
+      last_poll_ts: "2026-06-22T10:00:00Z",
+      last_push_ts: null,
+      degraded_peers: [],
+      recovered: false,
+    });
+    render(<KindledLinksPanel persona="nell" />);
+    // relay-health line must be visible somewhere
+    expect(await screen.findByText(/relay/i)).toBeInTheDocument();
   });
 });

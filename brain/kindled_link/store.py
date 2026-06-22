@@ -5,6 +5,7 @@ WAL + 5s busy_timeout → Row → executescript)."""
 from __future__ import annotations
 
 import math
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS peers (
     fingerprint    TEXT NOT NULL,
     consent_state  TEXT NOT NULL,
     relay_url      TEXT,
+    relay_mailbox  TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -95,6 +97,34 @@ CREATE TABLE IF NOT EXISTS peer_emotion_window (
     accumulated  REAL NOT NULL,
     updated_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS local_identity (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS outbound_seq (
+    peer_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS pending_handshakes (
+    peer_id         TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    my_eph_priv     BLOB NOT NULL,
+    bootstrap_nonce BLOB NOT NULL,
+    my_role         INT  NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS session_keys (
+    peer_id        TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    session_key    BLOB NOT NULL,
+    my_role        INT  NOT NULL,
+    peer_role      INT  NOT NULL,
+    established_at TEXT NOT NULL,
+    PRIMARY KEY (peer_id, session_id)
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -138,6 +168,15 @@ class KindledLinkStore:
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for DBs created before a column existed
+        (CREATE TABLE IF NOT EXISTS won't add a column to an existing table)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(peers)")}
+        if "relay_mailbox" not in cols:
+            self._conn.execute("ALTER TABLE peers ADD COLUMN relay_mailbox TEXT")
+            self._conn.commit()
 
     def upsert_peer(
         self,
@@ -147,22 +186,25 @@ class KindledLinkStore:
         fingerprint: str,
         consent_state: str,
         relay_url: str | None,
+        relay_mailbox: str | None = None,
         now: datetime,
     ) -> None:
         ts = now.isoformat()
         self._conn.execute(
             """
             INSERT INTO peers (peer_id, identity_pub, fingerprint, consent_state,
-                               relay_url, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                               relay_url, relay_mailbox, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(peer_id) DO UPDATE SET
                 identity_pub=excluded.identity_pub,
                 fingerprint=excluded.fingerprint,
                 consent_state=excluded.consent_state,
                 relay_url=excluded.relay_url,
+                relay_mailbox=COALESCE(excluded.relay_mailbox, peers.relay_mailbox),
                 updated_at=excluded.updated_at
             """,
-            (peer_id, identity_pub_hex, fingerprint, consent_state, relay_url, ts, ts),
+            (peer_id, identity_pub_hex, fingerprint, consent_state, relay_url,
+             relay_mailbox, ts, ts),
         )
         self._conn.commit()
 
@@ -227,8 +269,12 @@ class KindledLinkStore:
 
     # --- sessions (Phase 3) ---
     def create_session(self, peer_id: str, session_id: str, now: datetime) -> None:
+        # Idempotent: a replayed/interrupted handshake leg may re-derive the same
+        # (peer_id, session_id); OR IGNORE keeps it from raising on the PK so the
+        # caller drops gracefully rather than crashing (T2.5 review — initiator
+        # clobber path). An existing open session is left untouched.
         self._conn.execute(
-            """INSERT INTO sessions
+            """INSERT OR IGNORE INTO sessions
                (peer_id, session_id, state, msg_count, started_at)
                VALUES (?, ?, 'open', 0, ?)""",
             (peer_id, session_id, now.isoformat()),
@@ -320,6 +366,42 @@ class KindledLinkStore:
             (peer_id,),
         )
         self._conn.commit()
+
+    def try_reserve_outbound(self, peer_id: str, today: str, *, cap: int) -> bool:
+        """Atomically check-and-increment outbound_count if below cap.
+
+        A single UPDATE … WHERE outbound_count < cap RETURNING outbound_count
+        statement: if a row is returned the slot was reserved (True); if no row
+        is returned the cap is already met (False, no increment). SQLite
+        serialises writers so this is race-safe — no separate read needed.
+        """
+        self._ensure_counter_row(peer_id, today)
+        row = self._conn.execute(
+            "UPDATE peer_counters "
+            "SET outbound_count = outbound_count + 1 "
+            "WHERE peer_id = ? AND outbound_count < ? "
+            "RETURNING outbound_count",
+            (peer_id, cap),
+        ).fetchone()
+        self._conn.commit()
+        return row is not None
+
+    def try_reserve_provider(self, peer_id: str, today: str, *, cap: int) -> bool:
+        """Atomically check-and-increment provider_call_count if below cap.
+
+        Mirrors try_reserve_outbound but targets the provider_call_count column.
+        Returns True if the slot was reserved, False if already at cap.
+        """
+        self._ensure_counter_row(peer_id, today)
+        row = self._conn.execute(
+            "UPDATE peer_counters "
+            "SET provider_call_count = provider_call_count + 1 "
+            "WHERE peer_id = ? AND provider_call_count < ? "
+            "RETURNING provider_call_count",
+            (peer_id, cap),
+        ).fetchone()
+        self._conn.commit()
+        return row is not None
 
     # --- outbound_drafts (Phase 3, recovery re-gate) ---
     def save_draft(
@@ -481,6 +563,149 @@ class KindledLinkStore:
             return stored
         frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
         return stored * frac
+
+    # --- local identity (Phase 7a — decoupled mailbox) ---
+    def get_or_create_local_mailbox(self) -> str:
+        """Return this Kindled's relay mailbox id, generating it once if absent.
+
+        The mailbox is intentionally NOT derived from key_id so the relay
+        cannot link a mailbox to an identity (decoupled-mailbox scheme,
+        Phase 7a T2.4). Format: ``mbx_`` + 8 random hex bytes (16 chars)."""
+        key = "relay_mailbox"
+        row = self._conn.execute(
+            "SELECT value FROM local_identity WHERE key = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            return row["value"]
+        mbx = "mbx_" + secrets.token_hex(8)
+        self._conn.execute(
+            "INSERT INTO local_identity (key, value) VALUES (?, ?)",
+            (key, mbx),
+        )
+        self._conn.commit()
+        return mbx
+
+    # --- pending_handshakes (Phase 7a T2.5 — 3-leg session handshake) ---
+
+    def save_pending_handshake(
+        self,
+        *,
+        peer_id: str,
+        session_id: str,
+        my_eph_priv_raw: bytes,
+        bootstrap_nonce: bytes,
+        my_role: int,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist the initiator's ephemeral private key + bootstrap nonce while
+        waiting for the responder's leg-2 reply."""
+        ts = now.isoformat() if now else ""
+        self._conn.execute(
+            """
+            INSERT INTO pending_handshakes
+                (peer_id, session_id, my_eph_priv, bootstrap_nonce, my_role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id, session_id) DO UPDATE SET
+                my_eph_priv=excluded.my_eph_priv,
+                bootstrap_nonce=excluded.bootstrap_nonce,
+                my_role=excluded.my_role,
+                created_at=excluded.created_at
+            """,
+            (peer_id, session_id, my_eph_priv_raw, bootstrap_nonce, my_role, ts),
+        )
+        self._conn.commit()
+
+    def get_pending_handshake(self, peer_id: str, session_id: str) -> dict | None:
+        """Return the pending handshake row as a dict (with BLOB fields as bytes),
+        or None if absent."""
+        row = self._conn.execute(
+            "SELECT * FROM pending_handshakes WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "peer_id": row["peer_id"],
+            "session_id": row["session_id"],
+            "my_eph_priv_raw": bytes(row["my_eph_priv"]),
+            "bootstrap_nonce": bytes(row["bootstrap_nonce"]),
+            "my_role": int(row["my_role"]),
+            "created_at": row["created_at"],
+        }
+
+    def clear_pending_handshake(self, peer_id: str, session_id: str) -> None:
+        """Delete the pending handshake row (called after complete_session)."""
+        self._conn.execute(
+            "DELETE FROM pending_handshakes WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        )
+        self._conn.commit()
+
+    # --- session_keys (Phase 7a T2.5 — persisted session key) ---
+
+    def save_session_key(
+        self,
+        *,
+        peer_id: str,
+        session_id: str,
+        session_key: bytes,
+        my_role: int,
+        peer_role: int,
+        now: datetime,
+    ) -> None:
+        """Persist a derived session key. Does NOT clobber an existing row
+        (INSERT OR IGNORE — the clobber guard lives in session.py)."""
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO session_keys
+                (peer_id, session_id, session_key, my_role, peer_role, established_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (peer_id, session_id, session_key, my_role, peer_role, now.isoformat()),
+        )
+        self._conn.commit()
+
+    def get_session_key(self, peer_id: str, session_id: str) -> dict | None:
+        """Return a dict with session_key/my_role/peer_role/established_at, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM session_keys WHERE peer_id = ? AND session_id = ?",
+            (peer_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "session_key": bytes(row["session_key"]),
+            "my_role": int(row["my_role"]),
+            "peer_role": int(row["peer_role"]),
+            "established_at": row["established_at"],
+        }
+
+    def next_outbound_sequence(self, peer_id: str, session_id: str) -> int:
+        """Return the next strictly-increasing per-(peer, session) sequence number.
+
+        Implemented as a single atomic upsert with RETURNING so concurrent callers
+        can never observe the same sequence under the same session key.
+        The sequence starts at 1 (sequence 0 is reserved for session_open).
+        """
+        row = self._conn.execute(
+            """
+            INSERT INTO outbound_seq (peer_id, session_id, seq)
+            VALUES (?, ?, 1)
+            ON CONFLICT(peer_id, session_id)
+            DO UPDATE SET seq = seq + 1
+            RETURNING seq
+            """,
+            (peer_id, session_id),
+        ).fetchone()
+        self._conn.commit()
+        return int(row[0])
+
+    def list_paired_peers(self) -> list[str]:
+        """Return peer_ids of all peers in consent_state='paired'."""
+        rows = self._conn.execute(
+            "SELECT peer_id FROM peers WHERE consent_state = 'paired'"
+        ).fetchall()
+        return [row["peer_id"] for row in rows]
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a

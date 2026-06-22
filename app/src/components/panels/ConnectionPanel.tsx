@@ -9,6 +9,7 @@ import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
+import { KindledLinkToggle } from "./KindledLinkToggle";
 import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
 import { errString } from "../../lib/errString";
@@ -344,6 +345,14 @@ export function ConnectionPanel({
         persona={persona}
         enabled={conn?.notes_enabled ?? false}
         folder={conn?.notes_folder ?? null}
+      />
+
+      <Divider />
+      <SectionLabel>Kindled Correspondence</SectionLabel>
+      <KindledLinkToggle
+        persona={persona}
+        enabled={conn?.kindled_link_enabled ?? false}
+        relayUrl={conn?.kindled_relay_url ?? null}
       />
 
       <Divider />

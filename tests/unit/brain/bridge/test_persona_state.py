@@ -501,3 +501,25 @@ def test_connection_user_pronouns_none_when_unset(tmp_path: Path) -> None:
     state = build_persona_state(persona_dir)
     conn = state["connection"]
     assert conn["user_pronouns"] is None
+
+
+def test_connection_includes_kindled_link_fields(tmp_path: Path) -> None:
+    """Connection block surfaces kindled_link_enabled + kindled_relay_url from config."""
+    import json
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({
+            "provider": "fake",
+            "model": "sonnet",
+            "kindled_link_enabled": True,
+            "kindled_relay_url": "http://127.0.0.1:9000",
+        })
+    )
+
+    from brain.bridge.persona_state import build_persona_state
+
+    conn = build_persona_state(persona_dir)["connection"]
+    assert conn["kindled_link_enabled"] is True
+    assert conn["kindled_relay_url"] == "http://127.0.0.1:9000"
