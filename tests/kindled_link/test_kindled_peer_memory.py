@@ -28,6 +28,17 @@ def test_peer_attributed_helper_prefixes_only_kindled_peer():
     assert _peer_attributed(user, "I went to the sea") == "I went to the sea"
 
 
+def test_peer_attributed_handles_graveyard_dict_entry():
+    # The lost/graveyard recall path renders from a DICT (not a Memory object);
+    # a lost kindled_peer memory must STILL be attributed (Phase 7a T12 — closes
+    # the Phase-5 lost-path provenance gap; the tombstone carries memory_type).
+    from brain.chat.prompt import _peer_attributed
+    peer_entry = {"memory_type": "kindled_peer", "summary": "the sea"}
+    user_entry = {"memory_type": "conversation", "summary": "the sea"}
+    assert _peer_attributed(peer_entry, "the sea").lower().startswith("(something a peer said)")
+    assert _peer_attributed(user_entry, "the sea") == "the sea"
+
+
 def test_recall_block_attributes_kindled_peer_memory_legacy_path(tmp_path):
     # provenance invariant through the legacy recall path (persona_dir=None).
     from brain.chat.prompt import _build_recall_block
