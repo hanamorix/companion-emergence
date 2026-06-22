@@ -24,7 +24,8 @@ class InviteError(ValueError):
 
 
 def create_invite(
-    idn: KindledIdentity, *, relay_url: str, now: datetime | None = None
+    idn: KindledIdentity, *, relay_url: str, mailbox_id: str | None = None,
+    now: datetime | None = None
 ) -> dict:
     now = now or datetime.now(UTC)
     body = {
@@ -35,6 +36,10 @@ def create_invite(
         "fingerprint": idn.key_id,
         "expires_at": (now + _INVITE_TTL).isoformat(),
     }
+    # The inviter's own relay mailbox (decoupled-mailbox scheme, Phase 7a) — the
+    # importer persists it so it can address leg-1. Signed as part of the body.
+    if mailbox_id is not None:
+        body["mailbox_id"] = mailbox_id
     return {"body": body, "signature": idn.sign(canonical_json(body)).hex()}
 
 
@@ -61,7 +66,7 @@ def import_invite(
     store.upsert_peer(
         peer_id=body["fingerprint"], identity_pub_hex=pub.hex(),
         fingerprint=body["fingerprint"], consent_state="pending_local",
-        relay_url=body["relay_url"], now=now,
+        relay_url=body["relay_url"], relay_mailbox=body.get("mailbox_id"), now=now,
     )
     return {
         "peer_id": body["fingerprint"],
