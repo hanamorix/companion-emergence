@@ -37,7 +37,9 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     with _cli_throttle.background_slot() as slot:
         if not slot:
             logger.info("maker: throttle slot unavailable — deferring making")
-            raise RuntimeError("throttle deferred")  # tick treats as fail-soft (partial charge)
+            # Distinct signal so run_maker_tick treats it as a quiet retry, NOT a
+            # failure (no cooldown, no charge penalty, no error log).
+            raise _cli_throttle.ThrottleDeferred("throttle deferred")
         making = _maker.make(provider, charge_sources=sources,
                              emotion_summary=_emotion_summary(store))
 

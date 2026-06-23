@@ -68,6 +68,16 @@ def run_maker_tick(
                 return
         except ValueError:
             pass
+    # Pre-flight throttle gate — a defer must cost NOTHING. Check the slot BEFORE
+    # consuming budget or engaging cooldown, so a transient yield doesn't burn the
+    # day's making and scream a traceback (Windows v0.0.38 report). The runner's
+    # real background_slot() acquire stays the authoritative guard for the rare
+    # race (handled by the ThrottleDeferred catch below).
+    from brain.bridge.cli_throttle import ThrottleDeferred, slot_available
+    if not slot_available():
+        logger.info("maker: throttle slot unavailable — deferring (nothing spent)")
+        return
+
     # cost cap
     if not consume_budget(persona_dir, now=now, cap=daily_cap):
         logger.info("maker: daily cap reached — deferring")
@@ -79,6 +89,11 @@ def run_maker_tick(
             make_fn(persona_dir=persona_dir, store=store, provider=provider, now=now)
         state.charge = 0.0
         state.last_fire_ts = now.isoformat()
+    except ThrottleDeferred:
+        # Lost the slot in the pre-flight→acquire race. A quiet no-op: leave the
+        # charge intact so it retries when the slot frees. No cooldown, no error.
+        logger.info("maker: making deferred by throttle — retry next tick")
+        return
     except Exception:
         logger.exception("maker: making failed — partial charge, cooldown engaged")
         state.charge = _cfg.FAILED_MAKE_CHARGE
