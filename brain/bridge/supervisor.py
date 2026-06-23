@@ -55,6 +55,7 @@ from brain.attunement.backfill import (
 from brain.attunement.backfill import (
     should_run_supplementary_backfill as _attunement_should_run_supplementary_backfill,
 )
+from brain.bridge import persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
@@ -176,7 +177,11 @@ def run_folded(
     )
     last_maintenance_at = time.monotonic() if soul_review_interval_s is not None else None
     _last_intensity_drivers: IntensityDrivers | None = None
-    last_finalize_at = time.monotonic() if finalize_interval_s is not None else None
+    finalize_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "finalize_cadence.json")
+        if finalize_interval_s is not None
+        else None
+    )
     last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
     last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
     last_voice_reflection_at = time.monotonic() if voice_reflection_interval_s is not None else None
@@ -398,10 +403,8 @@ def run_folded(
         # runs at most one final snapshot per stale session, then deletes
         # buffer + cursor + registry entry. Slow cadence (hourly default)
         # because the threshold is days, not minutes.
-        if (
-            finalize_interval_s is not None
-            and last_finalize_at is not None
-            and time.monotonic() - last_finalize_at >= finalize_interval_s
+        if finalize_cadence_state is not None and persisted_cadence.is_due(
+            finalize_cadence_state, now=datetime.now(UTC)
         ):
             try:
                 _run_finalize_tick(
@@ -412,7 +415,13 @@ def run_folded(
                 )
             except Exception:
                 logger.exception("supervisor finalize tick raised")
-            last_finalize_at = time.monotonic()
+            finally:
+                finalize_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=finalize_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "finalize_cadence.json", finalize_cadence_state
+                )
 
         # Log-rotation cadence — hourly default. Bounded JSONL archives so
         # heartbeats/dreams/emotion_growth don't grow forever; yearly
