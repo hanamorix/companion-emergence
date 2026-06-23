@@ -83,7 +83,9 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
 
     if not _acquire_slot():
         logger.info("notes: throttle slot unavailable — deferring note")
-        raise RuntimeError("throttle deferred")  # tick treats as fail-soft (cooldown advances)
+        # Distinct signal so run_notes_tick treats it as a quiet retry, NOT a
+        # failure (no cooldown advance, no error log).
+        raise _cli_throttle.ThrottleDeferred("throttle deferred")
 
     from brain.memory.store import MemoryStore
     store = MemoryStore(persona_dir / "memories.db")

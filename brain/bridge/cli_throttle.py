@@ -26,6 +26,16 @@ _last_interactive_monotonic: float = -1e9
 _inflight_background = 0
 
 
+class ThrottleDeferred(RuntimeError):  # noqa: N818 — a control signal, not an error
+    """A background runner raises this when the throttle denied its slot.
+
+    The tick treats it as a quiet no-op (retry next tick) — NOT a failure: no
+    error log, no traceback, no cooldown penalty, no budget spend. Distinct from
+    a generic Exception so the tick can tell a transient yield apart from a real
+    making/compose error.
+    """
+
+
 def reset() -> None:  # test helper
     global _last_interactive_monotonic, _inflight_background
     with _lock:
@@ -46,6 +56,24 @@ def should_yield(*, now: float | None = None) -> bool:
     with _lock:
         t = time.monotonic() if now is None else now
         return (t - _last_interactive_monotonic) < _IDLE_SECONDS
+
+
+def slot_available(*, now: float | None = None, min_idle: float | None = None) -> bool:
+    """Read-only peek: True if a background slot could be acquired right now —
+    chat idle long enough AND the concurrency cap not full. Does NOT touch the
+    semaphore, so it is safe as a pre-flight gate before a tick commits budget /
+    cooldown. Fails OPEN (True) on internal error, matching acquire_background —
+    a defer must never be reported when the throttle itself malfunctions."""
+    try:
+        with _lock:
+            t = time.monotonic() if now is None else now
+            idle = _IDLE_SECONDS if min_idle is None else min_idle
+            if (t - _last_interactive_monotonic) < idle:
+                return False
+            return _inflight_background < _MAX_CONCURRENT_BACKGROUND
+    except Exception:  # noqa: BLE001 — fail open
+        log.warning("cli_throttle.slot_available failed; reporting available (fail-open)", exc_info=True)
+        return True
 
 
 def acquire_background(*, now: float | None = None, min_idle: float | None = None) -> bool:
