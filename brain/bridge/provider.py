@@ -1313,11 +1313,23 @@ def _maybe_log_cache_debug(
     front-line proof of C1/C2 is the pure-function unit test; this is the live
     cross-check on the real assembled bytes. Writes ``cache_debug.jsonl`` next
     to the persona's other logs.
+
+    Enabled by EITHER ``NELL_CACHE_DEBUG=1`` in the environment OR a marker file
+    ``<persona_dir>/cache_debug.on``. The file trigger exists because env vars
+    don't reliably survive a GUI launch (e.g. nellface starting the bridge), so
+    ``touch <persona_dir>/cache_debug.on`` turns logging on regardless of how the
+    app was started; delete it to turn off.
     """
-    if os.environ.get("NELL_CACHE_DEBUG") != "1":
-        return
     pd = (options or {}).get("persona_dir")
     if not pd:
+        return
+    enabled = os.environ.get("NELL_CACHE_DEBUG") == "1"
+    if not enabled:
+        try:
+            enabled = (Path(pd) / "cache_debug.on").exists()
+        except Exception:  # noqa: BLE001
+            enabled = False
+    if not enabled:
         return
     try:
         import hashlib
