@@ -1,6 +1,9 @@
+import logging
 from datetime import UTC, datetime
 
+from brain.bridge import cli_throttle
 from brain.maker import run_maker_tick
+from brain.maker.budget import consume_budget
 from brain.maker.charge import MakerCharge, load_charge, save_charge
 from brain.memory.store import Memory, MemoryStore
 
@@ -71,6 +74,36 @@ def test_tick_at_threshold_fires_and_resets(tmp_path):
     )
     assert fired == [1]
     assert load_charge(tmp_path).charge == 0.0  # reset after fire
+    store.close()
+
+
+def test_tick_throttle_unavailable_spends_no_budget_or_cooldown(tmp_path, caplog):
+    # A throttle defer must cost nothing: no make_fn call, no budget spend, no
+    # cooldown engaged, no charge penalty, no ERROR log (Windows v0.0.38 report).
+    store = _store(tmp_path)
+    fired = []
+    save_charge(tmp_path, MakerCharge(999.0, "2026-06-14T00:00:00+00:00", None, 0))
+    cli_throttle.mark_interactive_active()  # chat "recent" → slot unavailable
+    with caplog.at_level(logging.ERROR):
+        run_maker_tick(
+            tmp_path,
+            store=store,
+            provider=None,
+            now=datetime(2026, 6, 14, 0, 1, tzinfo=UTC),
+            make_fn=lambda **k: fired.append(1),
+            threshold=1.0,
+            cooldown_hours=0.0,
+            daily_cap=1,
+        )
+    assert fired == []  # making not attempted
+    after = load_charge(tmp_path)
+    # charge preserved (still above threshold; not reset to 0, not the FAILED
+    # penalty) → it retries next tick once the slot frees
+    assert after.charge >= 999.0
+    assert after.last_fire_ts is None  # cooldown NOT engaged
+    # budget untouched → still available today
+    assert consume_budget(tmp_path, now=datetime(2026, 6, 14, 0, 2, tzinfo=UTC), cap=1) is True
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)  # no crash log
     store.close()
 
 

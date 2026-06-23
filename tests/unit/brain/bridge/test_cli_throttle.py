@@ -80,6 +80,36 @@ def test_should_yield_does_not_consume_a_slot():
     cli_throttle.release_background()
 
 
+def test_slot_available_true_when_idle_and_cap_free():
+    cli_throttle.reset()
+    far = cli_throttle._IDLE_SECONDS + 100.0
+    assert cli_throttle.slot_available(now=far) is True
+
+
+def test_slot_available_false_when_interactive_recent():
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active(at=0.0)
+    assert cli_throttle.slot_available(now=1.0) is False
+
+
+def test_slot_available_false_when_cap_full():
+    cli_throttle.reset()
+    far = cli_throttle._IDLE_SECONDS + 100.0
+    assert cli_throttle.acquire_background(now=far) is True  # take the only slot
+    try:
+        assert cli_throttle.slot_available(now=far) is False
+    finally:
+        cli_throttle.release_background()
+
+
+def test_slot_available_does_not_consume_a_slot():
+    cli_throttle.reset()
+    far = cli_throttle._IDLE_SECONDS + 100.0
+    cli_throttle.slot_available(now=far)  # peeking must not take the slot
+    assert cli_throttle.acquire_background(now=far) is True
+    cli_throttle.release_background()
+
+
 def test_acquire_background_min_idle_override():
     # A shorter min_idle lets a turn-coupled caller (pass-2) drain sooner than the
     # cadence default (_IDLE_SECONDS), while still respecting the concurrency cap.

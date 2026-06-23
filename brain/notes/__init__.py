@@ -41,6 +41,15 @@ def run_notes_tick(
                 return
         except ValueError:
             pass
+    # Pre-flight throttle gate — a defer must cost NOTHING. Check the slot BEFORE
+    # consuming budget or advancing the cooldown, so a transient yield doesn't
+    # burn the day's note and scream a traceback (Windows v0.0.38 report). The
+    # runner's real background_slot() acquire stays the authoritative guard for
+    # the rare race (handled by the ThrottleDeferred catch below).
+    from brain.bridge.cli_throttle import ThrottleDeferred, slot_available
+    if not slot_available():
+        logger.info("notes: throttle slot unavailable — deferring (nothing spent)")
+        return
     if not consume_budget(persona_dir, now=now, cap=daily_cap):
         return
     try:
@@ -48,6 +57,11 @@ def run_notes_tick(
             make_fn(persona_dir=persona_dir, config=config, provider=provider, now=now)
         state.last_note_at = now.isoformat()
         save_notes_state(persona_dir, state)
+    except ThrottleDeferred:
+        # Lost the slot in the pre-flight→acquire race. Quiet no-op: do NOT
+        # advance the cooldown — let the next tick retry once the slot frees.
+        logger.info("notes: note deferred by throttle — retry next tick")
+        return
     except Exception:
         logger.exception("notes: making a note failed")
         state.last_note_at = now.isoformat()  # advance to respect cooldown — no tight retry

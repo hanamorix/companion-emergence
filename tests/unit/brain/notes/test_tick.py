@@ -1,5 +1,7 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
+from brain.bridge import cli_throttle
 from brain.notes import run_notes_tick
 
 
@@ -32,6 +34,27 @@ def test_tick_fires_when_away_and_enabled(tmp_path):
                    silence_hours=20.0, make_fn=lambda **k: made.append(1),
                    now=datetime.now(UTC), away_hours=12.0, cooldown_hours=24.0, daily_cap=1)
     assert made == [1]
+
+
+def test_tick_throttle_unavailable_spends_no_budget_or_cooldown(tmp_path, caplog):
+    # A throttle defer must cost nothing: no make_fn, no budget spend, cooldown
+    # NOT advanced, no ERROR log (Windows v0.0.38 report — same shape as maker).
+    from brain.notes.state import load_notes_state
+    folder = tmp_path / "Notes"
+    folder.mkdir()
+    made = []
+    now = datetime(2026, 6, 15, 12, tzinfo=UTC)
+    cli_throttle.mark_interactive_active()  # chat "recent" → slot unavailable
+    with caplog.at_level(logging.ERROR):
+        run_notes_tick(tmp_path, config=_Cfg(True, str(folder)), provider=None,
+                       silence_hours=20.0, make_fn=lambda **k: made.append(1),
+                       now=now, away_hours=12.0, cooldown_hours=24.0, daily_cap=1)
+    assert made == []  # note not attempted
+    assert load_notes_state(tmp_path).last_note_at is None  # cooldown NOT advanced
+    # budget untouched → still available today
+    from brain.notes.state import consume_budget
+    assert consume_budget(tmp_path, now=now, cap=1) is True
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)  # no crash log
 
 
 def test_tick_respects_cooldown(tmp_path):
