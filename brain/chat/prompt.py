@@ -324,6 +324,26 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
 
     parts.append(_EPISTEMIC_INSTRUCTION)
 
+    # Inner-monologue DIRECTIVE — the static "think first, then reply" framing.
+    # Lives here (end of the frozen system block, i.e. BEFORE history + the user
+    # turn) so the two-phase instruction is read before the model commits to a
+    # reply, restoring record_monologue compliance on single-pass turns. Only the
+    # STATIC part rides along: emotion_summary / soul_hints / narrative_hints are
+    # passed empty so no per-turn data enters the frozen block (it stays
+    # byte-identical across same-session turns). voice_excerpt is voice.md-derived,
+    # already static. The volatile emotion/soul/arc context is still delivered by
+    # the brain-context / soul-highlights / current-arc blocks in the volatile
+    # tail; only the directive itself is positional and needs to be here.
+    parts.append(
+        build_monologue_frame(
+            persona_name=persona_name,
+            emotion_summary="",
+            voice_excerpt=voice_md[:300],
+            soul_hints=(),
+            narrative_hints=(),
+        )
+    )
+
     return "\n\n".join(parts)
 
 
@@ -453,18 +473,15 @@ def build_volatile_context(
     except Exception:  # noqa: BLE001
         pass
 
-    # 8. Inner monologue framing — embeds emotion_summary computed above.
-    soul_hints = _collect_soul_hints(soul_store, limit=3)
-    narrative_hints = _collect_narrative_hints(persona_dir, limit=3)
-    parts.append(
-        build_monologue_frame(
-            persona_name=persona_name,
-            emotion_summary=emotion_summary,
-            voice_excerpt=voice_md[:300],
-            soul_hints=soul_hints,
-            narrative_hints=narrative_hints,
-        )
-    )
+    # 8. Inner monologue framing has MOVED to build_static_system_message (the
+    # frozen system block, before history+user) — its "call record_monologue
+    # FIRST, then reply" directive is position-sensitive: when it rode here in the
+    # volatile tail (after the user turn) the reply frame's recency pulled the
+    # model straight to replying and record_monologue stopped firing on
+    # single-pass (non-tool) turns. The directive is static, so freezing it costs
+    # no caching; the per-turn emotion/soul/narrative context it used to carry is
+    # already delivered above by the brain-context / soul-highlights /
+    # current-arc blocks. The reply frame stays LAST here (recency, by design).
 
     # 8b. Ambient clock anchor + elapsed-time explainer (moved here from the top
     # of the JSONL context block). Worded as ambient context, not an instruction,

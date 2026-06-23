@@ -61,8 +61,12 @@ def persona_dir(tmp_path: Path) -> Path:
 
 
 # Markers that must NEVER appear in the frozen static block (C2). Each is the
-# heading / signature line of a volatile block currently interleaved into the
-# pre-change system message.
+# heading / signature line of a per-turn volatile block.
+# NOTE: "inner monologue" is deliberately NOT here — the monologue *directive*
+# is static (position-sensitive: it must be read before the user turn) and rides
+# the frozen block by design. Only its per-turn DATA (emotions/soul/narrative
+# hints) is volatile, and that is asserted absent via the data markers below.
+# The reply frame ("visible reply") stays volatile-only (recency, last block).
 _VOLATILE_MARKERS = (
     "── brain context ──",
     "current emotions:",
@@ -71,7 +75,8 @@ _VOLATILE_MARKERS = (
     "felt time",
     "── recent journal",
     "── recent growth ──",
-    "inner monologue",
+    "soul threads:",
+    "narrative threads:",
     "visible reply",
     "Current time",
     "current time:",
@@ -242,8 +247,24 @@ def test_information_completeness_every_block_survives(
     # must survive verbatim into the split. (The split additionally INTRODUCES
     # the ambient framing line + the relocated clock block; that's repositioning/
     # rewording, allowed by C4 — we only check nothing is LOST.)
+    #
+    # EXCEPTION: the monologue frame is intentionally DECOMPOSED, not just moved.
+    # Its position-sensitive directive now rides the static block built with EMPTY
+    # emotion/soul/narrative hints (so the frozen block stays byte-stable), while
+    # that per-turn hint DATA is delivered by the brain-context / soul-highlights /
+    # current-arc blocks. So the full message's monologue block (which embeds the
+    # live hints) does NOT appear verbatim — by design. We skip it here and assert
+    # the decomposition explicitly below.
     for block in full_blocks:
+        if "inner monologue" in block:
+            continue
         assert block in combined, f"block dropped in the A/A+ split: {block[:80]!r}"
+
+    # The monologue DIRECTIVE survives (in static), and the hint DATA it used to
+    # carry survives via other blocks (in volatile) — nothing is lost, only
+    # repositioned and decomposed.
+    assert "record_monologue" in static, "monologue directive must survive in the static block"
+    assert "current emotions:" in volatile, "emotion data must survive via the brain-context block"
 
 
 def test_volatile_context_reply_frame_is_last(
@@ -262,8 +283,55 @@ def test_volatile_context_reply_frame_is_last(
     )
     blocks = volatile.split("\n\n")
     assert "visible reply" in blocks[-1], "reply frame must be the last block of the volatile tail"
-    # The monologue (interior) frame must sit ABOVE the reply frame.
-    assert volatile.index("inner monologue") < volatile.index("visible reply")
+    # The monologue DIRECTIVE has moved to the static block (before history+user);
+    # its frame must NOT ride the volatile tail anymore (that post-user position
+    # is the regression — recency pulled the model past it to the reply frame).
+    # Use the directive's header as the marker: the reply frame legitimately
+    # back-references `record_monologue` ("if you called record_monologue..."), so
+    # the tool name alone is not a clean directive signature; the header is.
+    assert "inner monologue" not in volatile, (
+        "monologue directive frame must not be in the volatile tail (it belongs in the "
+        "static block, before the user turn — see the A+ monologue regression)"
+    )
+
+
+def test_monologue_directive_precedes_user_turn_position(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """C-mono (position-sensitivity regression guard): the monologue directive
+    must be assembled BEFORE the user turn, so the model reads "call
+    record_monologue first, then reply" before committing to a reply.
+
+    The static block is passed to the CLI as --system-prompt-file and therefore
+    always precedes the stdin (history + user turn + volatile tail). So the
+    positional invariant reduces to: the directive rides the STATIC block and is
+    absent from the volatile tail. The A+ regression was precisely the directive
+    sitting in the volatile tail (after the user turn), where the reply frame's
+    recency suppressed record_monologue on single-pass turns.
+
+    This is the assembly-position guard. The *behavioral* confirmation — that
+    record_monologue actually fires on a plain substantive turn — is the live
+    CLI replay (stage-8 harness), since firing can only be observed by running
+    the model, not by inspecting assembled text.
+    """
+    voice = "# Nell\n\nsouthern novelist."
+    static = build_static_system_message(persona_dir, voice_md=voice)
+    volatile = build_volatile_context(
+        persona_dir,
+        voice_md=voice,
+        daemon_state=DaemonState(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Jordan.",
+    )
+    assert "record_monologue" in static, "directive must ride the static (pre-history) block"
+    assert "── inner monologue" in static, "directive frame header must be in the static block"
+    # The reply frame legitimately mentions record_monologue, so key the tail
+    # check on the directive's header, which is unique to the directive frame.
+    assert "inner monologue" not in volatile, "directive frame must NOT ride the post-user tail"
+    # The two-phase wording (first monologue, then reply) is what makes it
+    # position-sensitive — confirm it's the directive, not a stray mention.
+    assert "two phases" in static.lower()
 
 
 def test_volatile_context_starts_with_ambient_framing(
