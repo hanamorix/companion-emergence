@@ -187,8 +187,16 @@ def run_folded(
         if finalize_interval_s is not None
         else None
     )
-    last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
-    last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
+    log_rotation_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "log_rotation_cadence.json")
+        if log_rotation_interval_s is not None
+        else None
+    )
+    initiate_review_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "initiate_review_cadence.json")
+        if initiate_review_interval_s is not None
+        else None
+    )
     voice_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "voice_reflection_cadence.json")
         if voice_reflection_interval_s is not None
@@ -334,6 +342,16 @@ def run_folded(
         # Heartbeat cadence — independent of session-cleanup cadence.
         # Fault-isolated so a heartbeat failure can't take down the
         # session-cleanup loop or cascade into bridge shutdown.
+        # INTENTIONALLY STILL MONOTONIC (defer #21 residual — NOT an oversight):
+        # _heartbeat_and_felt_time consumes last_heartbeat_at to compute the
+        # felt-time wall_s elapsed-since-last (line ~701), whose monotonic basis
+        # is a deliberately-conservative bias (it underweights activity across a
+        # system sleep rather than overweighting it — see that function's
+        # docstring). The 15-min interval also fires within a typical session, so
+        # the restart-reset bite is lowest of all cadences. Converting it would
+        # need the felt-time elapsed reworked off a persisted last-fire; not worth
+        # the risk on the highest-fan-out cadence. Persist this ONLY alongside a
+        # felt-time-elapsed redesign.
         if (
             heartbeat_interval_s is not None
             and last_heartbeat_at is not None
@@ -443,29 +461,37 @@ def run_folded(
         # heartbeats/dreams/emotion_growth don't grow forever; yearly
         # archive for soul_audit (every decision must remain reachable).
         # Fault-isolated per-log inside the tick function.
-        if (
-            log_rotation_interval_s is not None
-            and last_log_rotation_at is not None
-            and time.monotonic() - last_log_rotation_at >= log_rotation_interval_s
+        if log_rotation_cadence_state is not None and persisted_cadence.is_due(
+            log_rotation_cadence_state, now=datetime.now(UTC)
         ):
             try:
                 _run_log_rotation_tick(persona_dir, event_bus)
             except Exception:
                 logger.exception("supervisor log-rotation tick raised")
-            last_log_rotation_at = time.monotonic()
+            finally:
+                log_rotation_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=log_rotation_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "log_rotation_cadence.json", log_rotation_cadence_state
+                )
 
         # Initiate review cadence — mirrors soul_review. Per-pass cost cap
         # (3 candidates max). Fault-isolated.
-        if (
-            initiate_review_interval_s is not None
-            and last_initiate_review_at is not None
-            and time.monotonic() - last_initiate_review_at >= initiate_review_interval_s
+        if initiate_review_cadence_state is not None and persisted_cadence.is_due(
+            initiate_review_cadence_state, now=datetime.now(UTC)
         ):
             try:
                 _run_initiate_review_tick(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor initiate-review tick raised")
-            last_initiate_review_at = time.monotonic()
+            finally:
+                initiate_review_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=initiate_review_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "initiate_review_cadence.json", initiate_review_cadence_state
+                )
 
         # Voice-reflection cadence — daily by default. Gathers last 7 days
         # of crystallizations + dreams + message tones and may emit a
