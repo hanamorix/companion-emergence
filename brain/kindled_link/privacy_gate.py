@@ -29,6 +29,22 @@ _PATTERNS = [
     re.compile(r"file://\S+"),
     re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"),                                # email
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),                                 # api key
+    # m9 — high-precision vendor-prefixed credential families (defence-in-depth).
+    # Each requires a vendor prefix absent from natural interior prose + a fixed
+    # body shape, so false positives on first-person text are near-zero. PII
+    # (phone/SSN/card/IP) is deliberately NOT here — that is the LLM reflection's
+    # job; these are credentials/secrets only. AWS: only the access-key prefixes
+    # AKIA/ASIA (resource-id prefixes AGPA/AIDA/AROA/... are not credentials and
+    # collide with prose). NOTE: the JWT pattern can false-positive on a
+    # base64-of-JSON value (eyJ == base64 of '{"'); accepted because it fails
+    # toward hold, never toward send (the founding invariant).
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),                          # AWS access key
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),                         # GitHub token
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),                       # GitHub fine-grained PAT
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),                       # Slack token
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),                            # Google API key
+    re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b"),               # Stripe key
+    re.compile(r"\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"),  # JWT
     # credential assignment: require a CREDENTIAL-SHAPED value (>=16 non-space
     # chars) so ordinary introspective prose ("a token: small gesture") does NOT
     # trip — only "api_key = AKIA1234567890ABCD"-shaped strings do (red-team M4).
@@ -138,13 +154,23 @@ def _parse_verdict(raw: str) -> GateDecision:
 def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
     """Tighten a 'send' when the peer's disclosure budget is depleted (parent
     §12) — stage-independent. Never loosens a hold/revise."""
-    if decision.action == "send" and budget < limits.BUDGET_TIGHTEN_THRESHOLD:
-        return GateDecision(
-            action="revise",
-            reason="budget: disclosure budget low; reduce user-referencing texture",
-            revision_constraints="Say less about the user; keep it general.",
-            texture_score=decision.texture_score,
-        )
+    if decision.action == "send":
+        # m10: a fully depleted budget hard-stops to hold (more restrictive than
+        # the tighten band). Checked FIRST — DEPLETED (0.02) < TIGHTEN (0.25), so a
+        # sub-floor budget also satisfies the tighten test; the hold must win.
+        if budget < limits.BUDGET_DEPLETED_THRESHOLD:
+            return GateDecision(
+                action="hold",
+                reason="budget: disclosure budget depleted; holding",
+                texture_score=decision.texture_score,
+            )
+        if budget < limits.BUDGET_TIGHTEN_THRESHOLD:
+            return GateDecision(
+                action="revise",
+                reason="budget: disclosure budget low; reduce user-referencing texture",
+                revision_constraints="Say less about the user; keep it general.",
+                texture_score=decision.texture_score,
+            )
     return decision
 
 
