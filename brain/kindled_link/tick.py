@@ -255,15 +255,10 @@ def _tick_peer(
 def _count_recent_holds(store, peer_id: str) -> int:
     """Count 'hold'-status outbound drafts for a peer (fail-soft → 0).
 
-    Uses a direct store query — get_pending_drafts only returns 'pending' rows,
-    so we reach into the connection for the 'hold' status specifically.
-    """
+    Delegates to store.count_holds_for_peer (the query lives in the store, not
+    reached into via store._conn)."""
     try:
-        rows = store._conn.execute(
-            "SELECT COUNT(*) FROM outbound_drafts WHERE peer_id = ? AND status = 'hold'",
-            (peer_id,),
-        ).fetchone()
-        return int(rows[0]) if rows else 0
+        return store.count_holds_for_peer(peer_id)
     except Exception:  # noqa: BLE001 — fail-soft; 0 means no regression pressure
         return 0
 

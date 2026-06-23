@@ -175,25 +175,33 @@ class PrivacyGate:
         if pre is not None:
             return pre
         # Provider-cap guard (parent §9: the gate call counts against 60/day).
-        if (self._store.get_counters(peer_id, today)["provider_call_count"]
-                >= limits.DAILY_PROVIDER_CAP):
+        # Atomically reserve the slot up front (race-safe vs a concurrent
+        # gate/reflection call for the same peer); refund below if the LLM call
+        # never completes, so only completed calls net-count (defer ≠ failure).
+        if not self._store.try_reserve_provider(
+            peer_id, today, cap=limits.DAILY_PROVIDER_CAP
+        ):
             return GateDecision(action="hold", reason="gate: provider cap spent")
-        # Layer 2: tool-less reflection under the background throttle.
-        budget = self._store.get_disclosure_budget(peer_id, now)
-        prompt = _build_gate_prompt(
-            body=payload.body or "",
-            relationship_hint_json=json.dumps(payload.relationship_hint or {},
-                                              sort_keys=True),
-            transcript_summary=transcript_summary, reason=reason, stage=stage,
-            budget_ok=budget >= limits.BUDGET_TIGHTEN_THRESHOLD,
-        )
+        # Slot reserved — from here, EVERY non-completing exit must release it.
+        # The try spans the budget read + prompt build too, so an unexpected raise
+        # anywhere before the call can't leak the reserved slot (fail-closed).
         try:
+            # Layer 2: tool-less reflection under the background throttle.
+            budget = self._store.get_disclosure_budget(peer_id, now)
+            prompt = _build_gate_prompt(
+                body=payload.body or "",
+                relationship_hint_json=json.dumps(payload.relationship_hint or {},
+                                                  sort_keys=True),
+                transcript_summary=transcript_summary, reason=reason, stage=stage,
+                budget_ok=budget >= limits.BUDGET_TIGHTEN_THRESHOLD,
+            )
             with self._throttle.background_slot() as granted:
                 if not granted:
+                    self._store.release_provider_slot(peer_id, today)  # no call → refund
                     return GateDecision(action="hold", reason="gate: throttle deferred")
                 raw = self._provider.complete(prompt)
-            self._store.incr_provider_count(peer_id, today)
         except Exception:  # noqa: BLE001 — fail closed
+            self._store.release_provider_slot(peer_id, today)  # no completed call → refund
             log.warning("privacy gate: provider error; holding", exc_info=True)
             return GateDecision(action="hold", reason="gate: provider error")
         decision = _parse_verdict(raw)

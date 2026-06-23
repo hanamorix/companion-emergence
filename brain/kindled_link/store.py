@@ -405,6 +405,20 @@ class KindledLinkStore:
         self._conn.commit()
         return row is not None
 
+    def release_provider_slot(self, peer_id: str, today: str) -> None:
+        """Refund one reserved provider slot, floored at 0. A gate/reflection call
+        reserves a slot atomically BEFORE the LLM call; if the call never happens
+        (throttle defer) or fails before completing, the slot is released so only
+        completed calls net-count against DAILY_PROVIDER_CAP (defer ≠ failure)."""
+        self._ensure_counter_row(peer_id, today)
+        self._conn.execute(
+            "UPDATE peer_counters "
+            "SET provider_call_count = MAX(0, provider_call_count - 1) "
+            "WHERE peer_id = ?",
+            (peer_id,),
+        )
+        self._conn.commit()
+
     # --- outbound_drafts (Phase 3, recovery re-gate) ---
     def save_draft(
         self, *, peer_id: str, session_id: str, payload_json: str,
@@ -431,6 +445,17 @@ class KindledLinkStore:
             (status, draft_id),
         )
         self._conn.commit()
+
+    def count_holds_for_peer(self, peer_id: str) -> int:
+        """Count this peer's 'hold'-status outbound drafts (the H4 gradual-
+        regression signal). get_pending_drafts only returns 'pending' rows, so
+        the hold count needs its own query — kept in the store so callers don't
+        reach into the connection."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM outbound_drafts WHERE peer_id = ? AND status = 'hold'",
+            (peer_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     # --- transcript (Phase 3, provenance-marked) ---
     def append_transcript(
