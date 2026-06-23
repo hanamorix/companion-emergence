@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import itertools
 import secrets
+import time
+from collections.abc import Callable
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,13 +14,50 @@ from pydantic import BaseModel
 from brain.kindled_link.codec import canonical_json
 from brain.kindled_link.identity import verify as _verify
 
+# Challenge nonces expire after this many seconds (#49). Short window: an unused
+# or stolen nonce can't replay indefinitely, and a mailbox's live-nonce set can't
+# grow unbounded (expired entries are pruned on every issue/check, and an emptied
+# mailbox entry is dropped). NOTE: the OUTER count of distinct mailbox keys is NOT
+# bounded here — `/mailbox/challenge` is unauthenticated, so a flood of distinct
+# mailbox_ids is an abuse vector left to 7b (durable relay + rate-limits/quotas,
+# defer #48). A prod relay may tune the TTL; the dev/alpha relay enforces one so
+# the dev posture isn't laxer.
+_NONCE_TTL_SECONDS = 120.0
+
 
 class _Store:
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self.mailboxes: dict[str, list[dict]] = {}
         self._ids = itertools.count(1)
         self.owners: dict[str, str] = {}   # mailbox_id → identity_pub hex
-        self.nonces: dict[str, set[str]] = {}  # mailbox_id → live nonces
+        self._clock = clock
+        self.nonces: dict[str, dict[str, float]] = {}  # mailbox_id → {nonce: expires_at}
+
+    def _prune_nonces(self, mailbox_id: str) -> None:
+        live = self.nonces.get(mailbox_id)
+        if not live:
+            return
+        now = self._clock()
+        expired = [n for n, exp in live.items() if exp <= now]
+        for n in expired:
+            del live[n]
+        if not live:  # drop the emptied mailbox entry so the outer dict doesn't accrete
+            self.nonces.pop(mailbox_id, None)
+
+    def issue_nonce(self, mailbox_id: str, nonce: str) -> None:
+        self._prune_nonces(mailbox_id)
+        self.nonces.setdefault(mailbox_id, {})[nonce] = self._clock() + _NONCE_TTL_SECONDS
+
+    def nonce_live(self, mailbox_id: str, nonce: str) -> bool:
+        self._prune_nonces(mailbox_id)
+        return nonce in self.nonces.get(mailbox_id, {})
+
+    def discard_nonce(self, mailbox_id: str, nonce: str) -> None:
+        live = self.nonces.get(mailbox_id)
+        if live is not None:
+            live.pop(nonce, None)
+            if not live:
+                self.nonces.pop(mailbox_id, None)
 
     def push(self, envelope: dict) -> str:
         mbx = envelope["relay_mailbox"]
@@ -65,7 +104,7 @@ def _check_auth(store: _Store, mailbox_id: str, nonce: str | None,
         raise HTTPException(status_code=401, detail="auth required")
     if identity_pub != owner:
         raise HTTPException(status_code=401, detail="not mailbox owner")
-    if nonce not in store.nonces.get(mailbox_id, set()):
+    if not store.nonce_live(mailbox_id, nonce):
         raise HTTPException(status_code=401, detail="bad nonce")
     body = canonical_json({"purpose": "kindled-relay-auth/1",
                            "mailbox": mailbox_id, "nonce": nonce})
@@ -75,12 +114,14 @@ def _check_auth(store: _Store, mailbox_id: str, nonce: str | None,
         ok = False
     if not ok:
         raise HTTPException(status_code=401, detail="bad signature")
-    store.nonces[mailbox_id].discard(nonce)  # single-use
+    store.discard_nonce(mailbox_id, nonce)  # single-use
 
 
-def create_app(require_auth: bool = False) -> FastAPI:
+def create_app(
+    require_auth: bool = False, clock: Callable[[], float] = time.monotonic
+) -> FastAPI:
     app = FastAPI()
-    store = _Store()
+    store = _Store(clock=clock)
 
     @app.post("/mailbox/register")
     def register(req: _RegisterReq) -> dict:
@@ -90,7 +131,7 @@ def create_app(require_auth: bool = False) -> FastAPI:
     @app.post("/mailbox/challenge")
     def challenge(req: _FetchReq) -> dict:
         nonce = secrets.token_hex(16)
-        store.nonces.setdefault(req.mailbox_id, set()).add(nonce)
+        store.issue_nonce(req.mailbox_id, nonce)
         return {"nonce": nonce}
 
     @app.post("/envelope")

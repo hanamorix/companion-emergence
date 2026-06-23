@@ -13,6 +13,16 @@ def _peer():
     return s, now
 
 
+def test_upsert_peer_rejects_unknown_consent_state() -> None:
+    # upsert_peer must validate consent_state up front (#45) — a garbage value
+    # would otherwise insert an invalid state that breaks set_consent later.
+    s = KindledLinkStore(":memory:")
+    now = datetime(2026, 6, 15, tzinfo=UTC)
+    with pytest.raises(ConsentTransitionError, match="unknown consent state"):
+        s.upsert_peer(peer_id="p", identity_pub_hex="00" * 32, fingerprint="kid_x",
+                      consent_state="bogus", relay_url=None, now=now)
+
+
 def test_legal_path_to_paired() -> None:
     s, now = _peer()
     s.set_consent("p", "pending_remote", now)

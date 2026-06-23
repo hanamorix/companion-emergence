@@ -189,6 +189,8 @@ class KindledLinkStore:
         relay_mailbox: str | None = None,
         now: datetime,
     ) -> None:
+        if consent_state not in CONSENT_STATES:
+            raise ConsentTransitionError(f"unknown consent state: {consent_state!r}")
         ts = now.isoformat()
         self._conn.execute(
             """
