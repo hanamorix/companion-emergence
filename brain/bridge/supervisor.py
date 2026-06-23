@@ -168,14 +168,19 @@ def run_folded(
     )
     last_heartbeat_at = time.monotonic() if heartbeat_interval_s is not None else None
     # Soul review is PERSISTED (survives restart/sleep); forgetting+narrative
-    # stay on a monotonic timer (last_maintenance_at), decoupled so a soul-review
-    # catch-up burst doesn't drag narrative's LLM calls onto the fast cadence.
+    # maintenance is ALSO PERSISTED now (defer #21 — its own maintenance_cadence
+    # file), still decoupled from soul review so a soul-review catch-up burst
+    # doesn't drag narrative's LLM calls onto the fast cadence.
     soul_cadence_state = (
         soul_cadence.load_cadence_state(persona_dir)
         if soul_review_interval_s is not None
         else None
     )
-    last_maintenance_at = time.monotonic() if soul_review_interval_s is not None else None
+    maintenance_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "maintenance_cadence.json")
+        if soul_review_interval_s is not None
+        else None
+    )
     _last_intensity_drivers: IntensityDrivers | None = None
     finalize_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "finalize_cadence.json")
@@ -369,10 +374,8 @@ def run_folded(
         # catch-up burst doesn't run narrative's LLM calls every 30 min).
         # Decoupling is safe: forgetting already exempts under-review soul-linked
         # memories, so pass order relative to soul review doesn't matter.
-        if (
-            soul_review_interval_s is not None
-            and last_maintenance_at is not None
-            and time.monotonic() - last_maintenance_at >= soul_review_interval_s
+        if maintenance_cadence_state is not None and persisted_cadence.is_due(
+            maintenance_cadence_state, now=datetime.now(UTC)
         ):
             try:
                 forgetting_run_pass(
@@ -397,7 +400,15 @@ def run_folded(
                 _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
             except Exception:
                 logger.exception("supervisor pending-write sweep raised")
-            last_maintenance_at = time.monotonic()
+            # End-of-block advance+save (not a finally): every statement above is
+            # inside its own try/except, so the block body cannot raise — the
+            # advance is unconditionally reached. (defer #21)
+            maintenance_cadence_state = persisted_cadence.advance(
+                now=datetime.now(UTC), interval_s=soul_review_interval_s
+            )
+            persisted_cadence.save_cadence(
+                persona_dir, "maintenance_cadence.json", maintenance_cadence_state
+            )
 
         # Finalize cadence — 24h silence (default) or explicit. Each pass
         # runs at most one final snapshot per stale session, then deletes
