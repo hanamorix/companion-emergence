@@ -22,6 +22,12 @@ BUDGET_TIGHTEN_THRESHOLD = 0.25
 # correspondence of "zero-texture" sends. At this floor ~50 sends exhaust the
 # budget before the tighten threshold is hit.
 MIN_SEND_DEBIT = 0.02
+# Hard depletion floor (m10): below this a 'send' is held outright, not merely
+# tightened to revise. "If you cannot afford the minimum debit, you cannot send."
+# Closes the crumb-leak where a depleted budget downgraded send->revise and the
+# re-gated revision could still send one MIN_SEND_DEBIT-floored crumb per attempt.
+# Equals MIN_SEND_DEBIT by construction; named separately for intent + tuning.
+BUDGET_DEPLETED_THRESHOLD = MIN_SEND_DEBIT
 
 # Per-peer emotion influence cap (parent §14.3, anti love-bomb). Cumulative
 # influence within a rolling window decays linearly to zero over the window.
