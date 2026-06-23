@@ -189,7 +189,11 @@ def run_folded(
     )
     last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
     last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
-    last_voice_reflection_at = time.monotonic() if voice_reflection_interval_s is not None else None
+    voice_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "voice_reflection_cadence.json")
+        if voice_reflection_interval_s is not None
+        else None
+    )
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
@@ -466,16 +470,20 @@ def run_folded(
         # of crystallizations + dreams + message tones and may emit a
         # voice-edit candidate (gated by >=3 evidence items inside the
         # reflection tick itself). Fault-isolated.
-        if (
-            voice_reflection_interval_s is not None
-            and last_voice_reflection_at is not None
-            and time.monotonic() - last_voice_reflection_at >= voice_reflection_interval_s
+        if voice_cadence_state is not None and persisted_cadence.is_due(
+            voice_cadence_state, now=datetime.now(UTC)
         ):
             try:
                 _run_voice_reflection_tick(persona_dir, provider, event_bus)
             except Exception:
                 logger.exception("supervisor voice-reflection tick raised")
-            last_voice_reflection_at = time.monotonic()
+            finally:
+                voice_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=voice_reflection_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "voice_reflection_cadence.json", voice_cadence_state
+                )
 
         # Self-model reflection cadence — its OWN persisted-cadence block,
         # mirroring soul review's decoupling from the monotonic timers. The
