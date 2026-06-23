@@ -373,11 +373,12 @@ def run_folded(
             )
             soul_cadence.save_cadence_state(persona_dir, soul_cadence_state)
 
-        # Maintenance cadence — forgetting + narrative, on the same interval but
-        # a monotonic timer (decoupled from soul review above so a soul-review
-        # catch-up burst doesn't run narrative's LLM calls every 30 min).
-        # Decoupling is safe: forgetting already exempts under-review soul-linked
-        # memories, so pass order relative to soul review doesn't matter.
+        # Maintenance cadence — forgetting + narrative, PERSISTED wall-clock on
+        # the same interval value as soul review but its OWN state file (defer
+        # #21), decoupled from soul review above so a soul-review catch-up burst
+        # doesn't run narrative's LLM calls every 30 min. Decoupling is safe:
+        # forgetting already exempts under-review soul-linked memories, so pass
+        # order relative to soul review doesn't matter.
         if maintenance_cadence_state is not None and persisted_cadence.is_due(
             maintenance_cadence_state, now=datetime.now(UTC)
         ):
