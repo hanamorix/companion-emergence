@@ -47,20 +47,30 @@ def import_invite(
     invite: dict, *, store: KindledLinkStore, now: datetime | None = None
 ) -> dict:
     now = now or datetime.now(UTC)
-    body = invite["body"]
-    sig = bytes.fromhex(invite["signature"])
-    pub = bytes.fromhex(body["identity_pub"])
+    # Extraction + structural validation runs under a malformed-input guard: a
+    # hostile/garbage relay packet (missing fields, non-dict body, bad hex, bad
+    # timestamp) must surface as InviteError, never a raw KeyError/ValueError/
+    # TypeError. Explicit InviteErrors raised inside pass through untouched (#46 —
+    # reachable since 7a wired real relay transport).
+    try:
+        body = invite["body"]
+        sig = bytes.fromhex(invite["signature"])
+        pub = bytes.fromhex(body["identity_pub"])
 
-    if body.get("protocol") != PROTOCOL:
-        raise InviteError("protocol_mismatch")
-    if not verify(pub, sig, canonical_json(body)):
-        raise InviteError("bad_signature")
-    if fingerprint(pub) != body["fingerprint"]:
-        raise InviteError("fingerprint_mismatch")
-    if datetime.fromisoformat(body["expires_at"]) < now:
-        raise InviteError("expired")
-    if store.is_invite_consumed(body["invite_id"]):
-        raise InviteError("invite_consumed")
+        if body.get("protocol") != PROTOCOL:
+            raise InviteError("protocol_mismatch")
+        if not verify(pub, sig, canonical_json(body)):
+            raise InviteError("bad_signature")
+        if fingerprint(pub) != body["fingerprint"]:
+            raise InviteError("fingerprint_mismatch")
+        if datetime.fromisoformat(body["expires_at"]) < now:
+            raise InviteError("expired")
+        if store.is_invite_consumed(body["invite_id"]):
+            raise InviteError("invite_consumed")
+    except InviteError:
+        raise
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        raise InviteError("malformed_invite") from exc
 
     store.mark_invite_consumed(body["invite_id"], now)
     store.upsert_peer(
