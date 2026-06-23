@@ -267,3 +267,79 @@ def test_disabled_cadence_writes_no_state_file(
 
     for name in ("finalize_cadence.json", "maintenance_cadence.json", "voice_reflection_cadence.json"):
         assert not (persona_dir / name).exists(), f"disabled cadence must not write {name}"
+
+
+def test_initiate_review_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "initiate_review_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        stop.set()
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_initiate_review_tick", _counter)
+
+    watchdog = threading.Timer(2.0, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        initiate_review_interval_s=900.0,  # 15min: monotonic alone would not fire on a fresh proc
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1, "persisted past-due initiate review must fire on a fresh process"
+    saved = json.loads((persona_dir / "initiate_review_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=10)
+
+
+def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "log_rotation_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        stop.set()
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_log_rotation_tick", _counter)
+
+    watchdog = threading.Timer(2.0, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        log_rotation_interval_s=3600.0,  # 1h: monotonic alone would not fire on a fresh proc
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1, "persisted past-due log rotation must fire on a fresh process"
+    saved = json.loads((persona_dir / "log_rotation_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
