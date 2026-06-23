@@ -30,6 +30,56 @@ class _P:
         return self.reply
 
 
+class _SpyStore(KindledLinkStore):
+    def __init__(self, path):
+        super().__init__(path)
+        self.calls = []
+
+    def try_reserve_provider(self, *a, **k):
+        self.calls.append("try_reserve_provider")
+        return super().try_reserve_provider(*a, **k)
+
+    def incr_provider_count(self, *a, **k):
+        self.calls.append("incr_provider_count")
+        return super().incr_provider_count(*a, **k)
+
+    def release_provider_slot(self, *a, **k):
+        self.calls.append("release_provider_slot")
+        return super().release_provider_slot(*a, **k)
+
+
+class _Defer:
+    @contextlib.contextmanager
+    def background_slot(self, *, now=None):
+        yield False
+
+    def should_yield(self, *, now=None):
+        return False
+
+
+def test_reflection_releases_reserved_slot_on_throttle_defer(tmp_path):
+    # Reflection mirrors the gate: atomic reserve, refund on throttle-defer so
+    # the deferred call doesn't burn the provider cap (defer ≠ failure).
+    spy = _SpyStore(tmp_path / "k.db")
+    run_relationship_reflection(store=spy, provider=_P("{}"), peer_id="kid_a",
+        transcript="x", now=NOW, today="2026-06-20", throttle=_Defer())
+    assert "try_reserve_provider" in spy.calls
+    assert "release_provider_slot" in spy.calls
+    assert "incr_provider_count" not in spy.calls
+    assert spy.get_counters("kid_a", "2026-06-20")["provider_call_count"] == 0
+
+
+def test_reflection_counts_one_on_success(tmp_path):
+    spy = _SpyStore(tmp_path / "k.db")
+    reply = ('{"proposed_stage":"stranger","trust_score":0.1,"affinity_tags":[],'
+             '"boundaries_seen":[],"evidence":[],"hard_breach":false}')
+    run_relationship_reflection(store=spy, provider=_P(reply), peer_id="kid_a",
+        transcript="x", now=NOW, today="2026-06-20", throttle=_Grant())
+    assert "try_reserve_provider" in spy.calls
+    assert "release_provider_slot" not in spy.calls  # completed → no refund
+    assert spy.get_counters("kid_a", "2026-06-20")["provider_call_count"] == 1
+
+
 def _run(tmp_path, reply, transcript, seed_stage="stranger"):
     s = KindledLinkStore(tmp_path / "k.db")
     if seed_stage != "stranger":
