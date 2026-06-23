@@ -25,16 +25,6 @@ logger = logging.getLogger(__name__)
 _DREAM_LIMIT = 3
 
 
-def _acquire_slot() -> bool:
-    """Acquire the background throttle slot (interactive chat takes priority).
-
-    Indirected so tests can bypass the real throttle without standing up the
-    process-global state. Returns True when the caller may proceed.
-    """
-    with _cli_throttle.background_slot() as slot:
-        return bool(slot)
-
-
 def _dreams_summary(store: Any) -> str:
     try:
         dreams = store.list_by_type("dream", active_only=True, limit=_DREAM_LIMIT)
@@ -81,12 +71,7 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
     folder = Path(folder_raw)
     user_name = getattr(config, "user_name", None) or "you"
 
-    if not _acquire_slot():
-        logger.info("notes: throttle slot unavailable — deferring note")
-        # Distinct signal so run_notes_tick treats it as a quiet retry, NOT a
-        # failure (no cooldown advance, no error log).
-        raise _cli_throttle.ThrottleDeferred("throttle deferred")
-
+    # Gather her interior first — cheap local DB reads, no LLM, no slot needed.
     from brain.memory.store import MemoryStore
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -96,13 +81,21 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
         store.close()
     last_session_summary = _last_session_summary(persona_dir)
 
-    note = _compose.make_note(
-        provider,
-        user_name=user_name,
-        dreams_summary=dreams_summary,
-        emotion_summary=emotion_summary,
-        last_session_summary=last_session_summary,
-    )
+    # Compose (the LLM call) runs INSIDE the held background slot so the
+    # concurrency cap + chat-yield apply to it — mirroring maker (defer #57).
+    # If the slot is unavailable, raise the distinct signal so run_notes_tick
+    # treats it as a quiet retry, NOT a failure (no cooldown advance, no error).
+    with _cli_throttle.background_slot() as slot:
+        if not slot:
+            logger.info("notes: throttle slot unavailable — deferring note")
+            raise _cli_throttle.ThrottleDeferred("throttle deferred")
+        note = _compose.make_note(
+            provider,
+            user_name=user_name,
+            dreams_summary=dreams_summary,
+            emotion_summary=emotion_summary,
+            last_session_summary=last_session_summary,
+        )
     path = _write.commit_note(persona_dir, folder, note, now=now)
     if path is None:
         logger.warning("notes: commit_note refused the write (guard) — nothing written")
