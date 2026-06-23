@@ -65,3 +65,22 @@ def test_single_use_invite_rejected_on_second_import(tmp_path) -> None:
     import_invite(inv, store=store_b, now=now)
     with pytest.raises(InviteError, match="invite_consumed"):
         import_invite(inv, store=store_b, now=now)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {},  # no "body" / "signature" at all
+        {"body": {}, "signature": "00"},  # body missing every field
+        {"body": "not-a-dict", "signature": "00"},  # body not a mapping
+        {"body": {"identity_pub": "zz"}, "signature": "00"},  # bad hex in a field
+        {"body": {"identity_pub": "ab"}, "signature": "nothex"},  # bad hex signature
+    ],
+)
+def test_malformed_invite_raises_inviteerror_not_keyerror(tmp_path, malformed) -> None:
+    # A hostile/garbage relay packet must surface as InviteError("malformed_invite"),
+    # never a raw KeyError/ValueError/TypeError that callers don't expect (#46 — now
+    # reachable since 7a wired real relay transport).
+    _idn_a, store_b, now = _setup(tmp_path)
+    with pytest.raises(InviteError, match="malformed_invite"):
+        import_invite(malformed, store=store_b, now=now)
