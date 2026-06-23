@@ -31,8 +31,8 @@ def _run(tmp_path, monkeypatch):
     persona_dir.mkdir()
     folder = tmp_path / "Notes"
     folder.mkdir()
-    import brain.notes.runner as r
-    monkeypatch.setattr(r, "_acquire_slot", lambda: True, raising=False)
+    # autouse _reset_cli_throttle leaves the slot idle/available — compose runs
+    # inside the held slot without monkeypatching (defer #57 restructure).
     make_note_and_wire(persona_dir=persona_dir, config=_Cfg(str(folder)), provider=_Provider(),
                        now=datetime(2026, 6, 15, tzinfo=UTC))
     return persona_dir, folder
