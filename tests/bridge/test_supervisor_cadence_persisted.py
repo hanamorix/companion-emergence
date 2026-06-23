@@ -106,3 +106,86 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
     assert calls[0] >= 1, "persisted past-due maintenance must fire on a fresh process"
     saved = json.loads((persona_dir / "maintenance_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)
+
+
+def test_voice_reflection_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "voice_reflection_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        stop.set()
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_voice_reflection_tick", _counter)
+
+    watchdog = threading.Timer(2.0, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        voice_reflection_interval_s=86400.0,  # 24h: monotonic alone would never fire
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1, "persisted past-due voice reflection must fire on a fresh process"
+    saved = json.loads((persona_dir / "voice_reflection_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=23)
+
+
+def test_cadence_advances_even_when_tick_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The always-advance-on-exception contract (spec §Ordering contract): a tick
+    # that RAISES must still advance+save the cadence — one re-fire per interval,
+    # NOT a tight retry storm. Guards against a future refactor moving advance
+    # into the try block (the plan's "major if violated"). Red-team finding M1.
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "finalize_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    stop = threading.Event()
+    raised = [0]
+
+    def _raiser(*a, **k):
+        raised[0] += 1
+        stop.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_finalize_tick", _raiser)
+
+    watchdog = threading.Timer(2.0, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=3600.0,
+    )
+    watchdog.cancel()
+
+    assert raised[0] >= 1, "the raising tick must have fired"
+    # Despite the tick raising, the cadence advanced to the future (not still past-due):
+    saved = json.loads((persona_dir / "finalize_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
+        "advance+save must run in finally even when the tick raises"
+    )
