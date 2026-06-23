@@ -72,7 +72,17 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 
-_PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
+# Companion-specific context keys that ride in the `options` dict but are NOT
+# model generation parameters. Providers that forward `options` to a generation
+# API (e.g. OllamaProvider → payload["options"]) must STRIP these first, or they
+# leak into the model's sampler params. `persona_dir` is the MCP-server hint;
+# `volatile_suffix` / `include_block_clock` are the Option-A+ stdin-tail controls
+# (consumed directly by ClaudeCliProvider, meaningless elsewhere); `session_id`
+# is the Option-B CLI-session id (Claude-only). Keep this in sync with any new
+# context key added to `options`.
+_PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
+    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id"}
+)
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
 # this many seconds, the subprocess is treated as wedged: it gets terminated
