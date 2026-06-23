@@ -188,17 +188,23 @@ def run_relationship_reflection(
         log.warning("relationship reflection: today disagrees with now; skipping")
         return get_relationship_state(store, peer_id)
     state = get_relationship_state(store, peer_id)
-    if (store.get_counters(peer_id, today)["provider_call_count"]
-            >= limits.DAILY_PROVIDER_CAP):
+    # Atomically reserve the provider slot up front (race-safe vs a concurrent
+    # gate/reflection call for the same peer); refund if the LLM call never
+    # completes so only completed calls net-count (defer ≠ failure). Mirrors the
+    # privacy gate.
+    if not store.try_reserve_provider(peer_id, today, cap=limits.DAILY_PROVIDER_CAP):
         return state
-    prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
+    # Slot reserved — the try spans the prompt build too, so any raise before the
+    # call releases it (no leaked reservation; fail-soft to unchanged state).
     try:
+        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
         with throttle.background_slot() as granted:
             if not granted:
+                store.release_provider_slot(peer_id, today)  # no call → refund
                 return state
             raw = provider.complete(prompt)
-        store.incr_provider_count(peer_id, today)
     except Exception:  # noqa: BLE001 — fail soft, leave state unchanged
+        store.release_provider_slot(peer_id, today)  # no completed call → refund
         log.warning("relationship reflection provider error; state unchanged", exc_info=True)
         return state
 
