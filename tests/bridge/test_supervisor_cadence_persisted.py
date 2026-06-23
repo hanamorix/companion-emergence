@@ -58,3 +58,51 @@ def test_finalize_fires_from_persisted_due_time_on_fresh_process(
     assert calls[0] >= 1, "persisted past-due finalize must fire on a fresh process"
     saved = json.loads((persona_dir / "finalize_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
+
+
+def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "maintenance_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    # far-future soul state so soul review doesn't interfere
+    (persona_dir / "soul_review_state.json").write_text(
+        json.dumps(
+            {
+                "next_review_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+                "consecutive_failures": 0,
+            }
+        )
+    )
+    _neutralise(monkeypatch)
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        stop.set()
+        return {}
+
+    monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _counter)
+
+    watchdog = threading.Timer(2.0, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=6 * 3600.0,
+        finalize_interval_s=None,
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1, "persisted past-due maintenance must fire on a fresh process"
+    saved = json.loads((persona_dir / "maintenance_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)
