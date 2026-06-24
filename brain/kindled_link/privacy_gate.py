@@ -59,6 +59,15 @@ _DISALLOWED = (
 )
 
 
+# #48 C-10: cap the text handed to the deterministic _prefilter. The pre-filter
+# email pattern backtracks ~O(n^2) on a long no-"@" string; bounding the scan
+# input bounds that work. The LLM reflection still receives the FULL untruncated
+# payload.body (see _build_gate_prompt), and the gate fails closed to hold, so a
+# leak past the cap is still caught by the load-bearing layer — only the cheap
+# backstop is shortened. 8192 is far above any legitimate peer message.
+MAX_SCAN_CHARS = 8192
+
+
 def _prefilter(text: str) -> GateDecision | None:
     """Return a hold/revise decision on a hard structural leak, else None.
     NEVER returns send."""
@@ -182,10 +191,13 @@ class PrivacyGate:
 
     @staticmethod
     def _payload_text(payload: OutboundPayload) -> str:
-        parts = [payload.body or ""]
+        # cap the BODY first so the fail-closed hint/sentinel below always survives
+        # truncation (#48 C-10).
+        parts = [(payload.body or "")[:MAX_SCAN_CHARS]]
         if payload.relationship_hint:
             try:
-                parts.append(json.dumps(payload.relationship_hint, sort_keys=True))
+                parts.append(json.dumps(payload.relationship_hint,
+                                        sort_keys=True)[:MAX_SCAN_CHARS])
             except Exception:  # noqa: BLE001 — non-serialisable hint; fail closed
                 # The sentinel matches the POSIX-path pattern in _PATTERNS so
                 # _prefilter will hold this payload — prevents a non-serialisable
