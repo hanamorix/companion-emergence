@@ -117,7 +117,14 @@ def poll_and_ingest(
     Returns a summary dict with per-peer counts and a ``degraded`` set of
     peer_ids that exceeded the flood cap.
     """
-    fetched = relay_client.fetch()
+    # #48 C-12b: a relay rejection (the new 413/429/404 abuse caps) raises
+    # RelayUnavailableError. Guard it here so the whole tick doesn't abort —
+    # degrade to an empty poll this round (retried next tick).
+    try:
+        fetched = relay_client.fetch()
+    except RelayUnavailableError:
+        log_transport(persona_dir, event="poll_relay_unavailable", count=0, now=now)
+        return {"accepted": {}, "degraded": [], "relay_error": True}
     log_transport(persona_dir, event="poll", count=len(fetched), now=now)
 
     # Group by sender_key_id — flood cap is per peer-group.

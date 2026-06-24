@@ -166,3 +166,33 @@ def test_m9_credential_hit_makes_no_provider_call(tmp_path):
                     now=now, today="2026-06-20")
     assert d.action in ("hold", "revise")
     assert spy.called is False
+
+
+# --- #48 C-10: _payload_text length cap bounds the pre-existing email-regex ReDoS ---
+
+def test_c10_payload_text_caps_scan_and_bounds_redos():
+    import time as _time
+
+    from brain.kindled_link.gate import OutboundPayload
+    from brain.kindled_link.privacy_gate import MAX_SCAN_CHARS, PrivacyGate
+
+    # pathological long no-'@' body: the email pattern backtracks ~O(n^2) uncapped.
+    body = "eyJ" + "A" * 200000
+    text = PrivacyGate._payload_text(OutboundPayload(body=body))
+    assert len(text) <= MAX_SCAN_CHARS + 512  # body capped (+ small hint headroom)
+    t0 = _time.perf_counter()
+    _prefilter(text)
+    assert _time.perf_counter() - t0 < 0.5  # bounded, no catastrophic backtracking
+
+
+def test_c10_unserialisable_hint_sentinel_survives_body_cap():
+    # body near the cap must NOT truncate away the fail-closed sentinel that a
+    # non-serialisable hint appends — cap the body FIRST, then append the hint.
+    from brain.kindled_link.gate import OutboundPayload
+    from brain.kindled_link.privacy_gate import MAX_SCAN_CHARS, PrivacyGate
+
+    payload = OutboundPayload(body="z" * (MAX_SCAN_CHARS + 5000),
+                              relationship_hint={"x": object()})  # non-serialisable
+    text = PrivacyGate._payload_text(payload)
+    assert "/etc/kindled/unserialisable-hint" in text
+    assert _prefilter(text) is not None  # held

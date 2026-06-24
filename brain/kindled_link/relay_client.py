@@ -27,10 +27,18 @@ class RelayClient:
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
-                return self._http.post(path, json=payload)
+                resp = self._http.post(path, json=payload)
             except httpx.TransportError as exc:  # network errors only — bounded backoff
                 last_exc = exc
                 time.sleep(_BACKOFF_BASE_S * (2**attempt))
+                continue
+            # #48 C-12: a 4xx/5xx (new relay abuse rejections 413/429/404, or any
+            # error) must fail SOFT — raise RelayUnavailableError so callers don't
+            # read .json()["nonce"]/["envelopes"] off an error body (KeyError crash).
+            # A status error is NOT retried (it is not a transport failure).
+            if resp.status_code >= 400:
+                raise RelayUnavailableError(f"relay {path} -> {resp.status_code}")
+            return resp
         raise RelayUnavailableError(str(last_exc))
 
     def register(self) -> None:
