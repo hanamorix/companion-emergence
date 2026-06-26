@@ -22,6 +22,7 @@ from brain.narrative_memory.tool import recall_arc as _recall_arc_impl
 from brain.tools.impls.add_journal import add_journal
 from brain.tools.impls.add_memory import add_memory
 from brain.tools.impls.boot import boot
+from brain.tools.impls.compact_history import compact_history
 from brain.tools.impls.crystallize_soul import crystallize_soul
 from brain.tools.impls.get_body_state import get_body_state
 from brain.tools.impls.get_emotional_state import get_emotional_state
@@ -155,6 +156,7 @@ _DISPATCH: dict[str, Any] = {
     "reconcile_self_read": _reconcile_self_read_wrapper,
     "propose_write": _propose_write_wrapper,
     "surface_makings": _surface_makings_wrapper,
+    "compact_history": compact_history,
 }
 
 
@@ -198,6 +200,12 @@ _DISPATCH["record_monologue"] = _dispatch_record_monologue
 
 _WORKS_TOOLS = frozenset({"save_work", "list_works", "search_works", "read_work"})
 
+# Tools that need a live LLM provider injected (compaction summarises via the
+# provider). Routed through a dedicated path so the global injected dict stays
+# {store, hebbian, persona_dir} and the other impls don't see an unexpected
+# provider kwarg.
+_PROVIDER_TOOLS = frozenset({"compact_history"})
+
 
 def dispatch(
     name: str,
@@ -206,6 +214,8 @@ def dispatch(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     persona_dir: Path,
+    provider: Any = None,
+    session_id: str | None = None,
 ) -> dict:
     """Dispatch a tool call by name with arguments.
 
@@ -289,6 +299,21 @@ def dispatch(
     if name in _WORKS_TOOLS:
         try:
             return fn(**arguments, persona_dir=persona_dir)
+        except TypeError as exc:
+            raise ToolDispatchError(f"bad arguments to tool {name!r}: {exc}") from exc
+
+    if name in _PROVIDER_TOOLS:
+        if provider is None:
+            raise ToolDispatchError(f"tool {name!r} requires a provider but none was injected")
+        if not session_id:
+            raise ToolDispatchError(f"tool {name!r} requires a session_id but none was injected")
+        try:
+            return fn(
+                **arguments,
+                persona_dir=persona_dir,
+                provider=provider,
+                session_id=session_id,
+            )
         except TypeError as exc:
             raise ToolDispatchError(f"bad arguments to tool {name!r}: {exc}") from exc
 

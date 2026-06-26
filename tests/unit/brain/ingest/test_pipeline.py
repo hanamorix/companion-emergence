@@ -147,6 +147,75 @@ def test_close_session_on_missing_buffer_returns_empty_report(
     assert report.memory_ids == []
 
 
+def test_summary_row_not_re_ingested_as_memory(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C7.1 (blocker fix): a compaction `summary` row must NEVER be extracted as
+    memory. extract_session_snapshot filters it out before transcription, so a
+    delta whose only new content is a summary yields zero extracted memories and
+    a provider that records its transcript never sees the summary text."""
+    from datetime import UTC, datetime, timedelta
+
+    sid = "sess_summary_skip"
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    # One real (already-extracted) turn, then a summary row.
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hello",
+                           "ts": base.isoformat(timespec="seconds")})
+    # Advance the cursor past the real turn so the only un-extracted delta is the
+    # summary.
+    from brain.ingest.buffer import write_cursor
+    write_cursor(tmp_path, sid, base.isoformat(timespec="seconds"))
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "summary",
+                           "text": "FADED-PROSE-must-not-be-extracted",
+                           "ts": datetime.now(UTC).isoformat(timespec="seconds")})
+
+    class _RecordingProvider(_CannedProvider):
+        def __init__(self) -> None:
+            super().__init__([{"text": "x", "label": "fact", "importance": 5}])
+            self.prompts: list[str] = []
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            self.prompts.append(prompt)
+            return super().generate(prompt, system=system)
+
+    provider = _RecordingProvider()
+    report = extract_session_snapshot(
+        tmp_path, sid, store=store, hebbian=hebbian, provider=provider,
+        config={"extraction_max_retries": 0},
+    )
+    assert report.extracted == 0
+    assert report.committed == 0
+    # The provider was never even called with the summary text (delta was empty
+    # after filtering).
+    assert all("FADED-PROSE" not in p for p in provider.prompts)
+
+
+def test_close_session_does_not_re_ingest_summary_row(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C7.1 (blocker) on the SECOND extraction path: close_session must also never
+    transcribe a `summary` row to the extractor (the fix lives in format_transcript,
+    the shared chokepoint, so both paths are covered)."""
+    sid = "sess_close_summary"
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "Hana", "text": "hello there"})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "summary",
+                           "text": "FADED-PROSE-must-not-be-extracted"})
+
+    class _RecordingProvider(_CannedProvider):
+        def __init__(self) -> None:
+            super().__init__([{"text": "x", "label": "fact", "importance": 5}])
+            self.prompts: list[str] = []
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            self.prompts.append(prompt)
+            return super().generate(prompt, system=system)
+
+    provider = _RecordingProvider()
+    close_session(tmp_path, sid, store=store, hebbian=hebbian, provider=provider)
+    # The summary text was never sent to the extractor.
+    assert all("FADED-PROSE" not in p for p in provider.prompts)
+
+
 def test_close_session_full_path_correct_counts(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:

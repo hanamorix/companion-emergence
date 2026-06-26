@@ -129,6 +129,7 @@ def run_folded(
     log_rotation_interval_s: float | None = 3600.0,
     initiate_review_interval_s: float | None = 900.0,
     voice_reflection_interval_s: float | None = 86400.0,
+    compaction_interval_s: float | None = 86400.0,
     self_model_interval_s: float | None = 0.0,
     maker_enabled: bool = True,
     notes_enabled: bool = True,
@@ -179,6 +180,7 @@ def run_folded(
     last_log_rotation_at = time.monotonic() if log_rotation_interval_s is not None else None
     last_initiate_review_at = time.monotonic() if initiate_review_interval_s is not None else None
     last_voice_reflection_at = time.monotonic() if voice_reflection_interval_s is not None else None
+    last_compaction_at = time.monotonic() if compaction_interval_s is not None else None
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
@@ -437,6 +439,21 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor voice-reflection tick raised")
             last_voice_reflection_at = time.monotonic()
+
+        # Conversation-compaction cadence — daily by default. For each active
+        # conversation, fold turns older than 24h (already extracted to memory)
+        # into a persisted summary block and archive the originals — human-memory
+        # fading + a byte-stable replayed prefix. Fault-isolated.
+        if (
+            compaction_interval_s is not None
+            and last_compaction_at is not None
+            and time.monotonic() - last_compaction_at >= compaction_interval_s
+        ):
+            try:
+                _run_compaction_tick(persona_dir, provider)
+            except Exception:
+                logger.exception("supervisor compaction tick raised")
+            last_compaction_at = time.monotonic()
 
         # Self-model reflection cadence — its OWN persisted-cadence block,
         # mirroring soul review's decoupling from the monotonic timers. The
@@ -1489,6 +1506,31 @@ def _run_initiate_review_tick(
             "at": _now_iso(),
         }
     )
+
+
+def _run_compaction_tick(persona_dir: Path, provider: LLMProvider) -> None:
+    """Fold each active conversation's aged, extracted turns into its summary.
+
+    Iterates active_conversations buffers and calls the shared compaction core
+    with a 24h cutoff and fold (fade). Per-session failures are logged and do not
+    stop the sweep — autonomous-behaviour: defer cleanly, don't fail loudly.
+    """
+    from datetime import timedelta
+
+    from brain.chat.compaction import compact_conversation
+    from brain.ingest.buffer import list_active_sessions
+
+    for session_id in list_active_sessions(persona_dir):
+        try:
+            compact_conversation(
+                persona_dir,
+                session_id,
+                older_than=timedelta(hours=24),
+                fold_existing_summary=True,
+                provider=provider,
+            )
+        except Exception:
+            logger.exception("compaction tick: session=%s raised", session_id)
 
 
 def _run_voice_reflection_tick(
