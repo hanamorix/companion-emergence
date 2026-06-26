@@ -95,6 +95,14 @@ def _split_buffer(turns: list[dict]) -> tuple[dict | None, list[dict]]:
     return existing, raw
 
 
+def _turn_identity(t: dict) -> tuple:
+    """A stable identity for a buffer turn, used to match archived turns against
+    a re-read buffer (race-safe rewrite). (ts, speaker, text) is unique enough;
+    a collision means two byte-identical turns in the same second, where keeping
+    or dropping one is harmless."""
+    return (t.get("ts"), t.get("speaker"), t.get("text"))
+
+
 def _summary_text(row: dict | None) -> str:
     return (row or {}).get("text", "") or ""
 
@@ -230,7 +238,27 @@ def compact_conversation(
             )
 
         # --- Install [summary, *retained] atomically ---------------------------
-        rewrite_session_atomic(persona_dir, session_id, [summary_row, *retained])
+        # Re-read the live buffer just before the rewrite and rebuild the retained
+        # set from CURRENT turns minus the archived ones (by identity). The
+        # summarize step above is a slow provider call (the claude CLI, seconds);
+        # a concurrent chat turn for this session may have appended new turns via
+        # ingest_turn during that window. Rewriting from the stale snapshot would
+        # os.replace those appends away (lost-update). Reconstructing from the
+        # re-read preserves them — shrinking the loss window from the whole
+        # summarize to the µs between this re-read and os.replace. (`ingest_turn`
+        # takes no compaction lock by design — appends must stay fast.)
+        archived_ids: list[tuple] = [_turn_identity(t) for t in removable]
+        current = read_session(persona_dir, session_id)
+        _, current_raw = _split_buffer(current)
+        retained_now: list[dict] = []
+        for t in current_raw:
+            tid = _turn_identity(t)
+            if tid in archived_ids:
+                archived_ids.remove(tid)  # consume once (multiset-safe vs dup turns)
+            else:
+                retained_now.append(t)
+        rewrite_session_atomic(persona_dir, session_id, [summary_row, *retained_now])
+        retained = retained_now
         logger.info(
             "compaction: session=%s gen=%d folded=%s compacted_n=%d fell_soft=%s",
             session_id, new_gen, fold_existing_summary, len(removable), fell_soft,

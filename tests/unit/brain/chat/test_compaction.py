@@ -359,6 +359,43 @@ def test_c12_stale_mtime_reaped(tmp_path: Path) -> None:
     assert acquire_compaction_lock(tmp_path, sid, stale_s=600.0) is True
 
 
+# --------------------------------------------------------------------------- C13
+def test_c13_concurrent_append_during_summarize_survives(tmp_path: Path) -> None:
+    """A chat turn appended DURING the slow summarize (separate thread, the daily
+    cadence) must not be clobbered by the rewrite. Simulated by a provider whose
+    generate() appends a fresh turn mid-call — the rewrite must preserve it."""
+    sid = "sess_c13"
+    base = datetime.now(UTC) - timedelta(hours=10)
+    tss = _seed(tmp_path, sid, 100, base=base)
+    write_cursor(tmp_path, sid, tss[-1])
+
+    class _AppendingProvider:
+        """Mimics a concurrent chat turn landing during the summarize window."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, *, prompt: str) -> str:
+            self.calls += 1
+            # Concurrent append (what _persist_turn does on another thread).
+            ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                                   "text": "RACE-MESSAGE",
+                                   "ts": _iso(datetime.now(UTC))})
+            return "SUM"
+
+    res = compact_conversation(tmp_path, sid, older_than=timedelta(hours=1),
+                               fold_existing_summary=True, provider=_AppendingProvider(),
+                               min_keep_tail=40)
+    assert res.compacted is True
+    after = read_session(tmp_path, sid)
+    texts = [t.get("text") for t in after]
+    # The turn appended mid-summarize survived the rewrite (not clobbered).
+    assert "RACE-MESSAGE" in texts
+    # And it is NOT in the archive (it was never selected for removal).
+    archived_texts = [t.get("text") for t in read_archive(tmp_path, sid)]
+    assert "RACE-MESSAGE" not in archived_texts
+
+
 # --------------------------------------------------------------------------- C7
 def test_c7_count_chat_turns_excludes_summary(tmp_path: Path) -> None:
     from brain.felt_time.chat_log import count_chat_turns_since
