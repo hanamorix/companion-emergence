@@ -1371,6 +1371,43 @@ def build_app(
         finally:
             store.close()
 
+    # ── POST /kindled-link/identity/rotate — rotate local identity key ─────
+    @app.post("/kindled-link/identity/rotate", dependencies=[Depends(require_http_auth)])
+    def kindled_rotate_identity() -> dict[str, Any]:
+        """Rotate the local Kindled identity key. Queues signed rotation notices
+        for all paired peers (tick drains them). Returns the new fingerprint."""
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
+        from brain.kindled_link.protocol import build_key_rotation_notice
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+
+        now = datetime.now(UTC)
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        store = KindledLinkStore(db, integrity_check=False)
+        try:
+            new_idn, old_idn = KindledIdentity.rotate(persona_dir)
+            paired = store.list_paired_peers()
+            for peer in paired:
+                notice = build_key_rotation_notice(
+                    old_sender=old_idn,
+                    new_identity_pub=new_idn.public_bytes,
+                    new_key_id=new_idn.key_id,
+                    relay_mailbox=peer.get("relay_mailbox") or "",
+                    recipient_key_id=peer["peer_id"],
+                    now=now,
+                    ttl=timedelta(days=7),
+                )
+                store.queue_rotation_notice(peer["peer_id"], json.dumps(notice), now)
+        finally:
+            store.close()
+        return {
+            "new_key_id": new_idn.key_id,
+            "fingerprint_phrase": fingerprint_phrase(new_idn.public_bytes),
+        }
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
