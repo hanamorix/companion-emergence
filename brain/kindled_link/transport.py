@@ -17,6 +17,7 @@ from brain.kindled_link.identity import KindledIdentity
 from brain.kindled_link.limits import INBOUND_FLOOD_CAP
 from brain.kindled_link.protocol import (
     build_envelope,
+    parse_key_rotation_notice,
     verify_and_open,
 )
 from brain.kindled_link.relay_client import RelayClient, RelayUnavailableError
@@ -104,6 +105,57 @@ def send_message(
     return True
 
 
+
+def _handle_key_rotation_notice(
+    envelope: dict,
+    *,
+    sender_id: str,
+    store: KindledLinkStore,
+    persona_dir: Path,
+    now: datetime,
+) -> None:
+    """Verify + apply a key_rotation_notice from a known peer."""
+    peer = store.get_peer(sender_id)
+    if peer is None:
+        log_transport(
+            persona_dir, event="rotation_unknown_peer", peer_id=sender_id, now=now
+        )
+        return
+    sender_old_pub = bytes.fromhex(peer["identity_pub"])
+    result, reason = parse_key_rotation_notice(
+        envelope, sender_old_pub=sender_old_pub, now=now
+    )
+    if reason is not None:
+        log_transport(
+            persona_dir,
+            event="rotation_rejected",
+            peer_id=sender_id,
+            reject_reason=reason.name,
+            now=now,
+        )
+        return
+    new_pub_hex = result["new_identity_pub"]
+    new_key_id = result["new_key_id"]
+    # Idempotent: already applied
+    if new_pub_hex == peer["identity_pub"]:
+        return
+    # Rollback attack: new == previous key
+    if new_pub_hex == (peer.get("previous_identity_pub") or ""):
+        log_transport(
+            persona_dir,
+            event="rotation_rollback_rejected",
+            peer_id=sender_id,
+            now=now,
+        )
+        return
+    store.update_peer_identity(sender_id, new_pub_hex, new_key_id, now)
+    log_transport(
+        persona_dir,
+        event="peer_key_rotated",
+        peer_id=sender_id,
+        now=now,
+    )
+
 def poll_and_ingest(
     store: KindledLinkStore,
     identity: KindledIdentity,
@@ -188,6 +240,18 @@ def poll_and_ingest(
                 else:
                     # We have a pending handshake → we are the INITIATOR (leg 3)
                     complete_session(store, identity, reply_envelope=env, now=now)
+                to_ack.append(env_id)
+                continue
+
+            # --- key_rotation_notice (signed, cleartext — no session key needed) ---
+            if env.get("message_type") == "key_rotation_notice":
+                _handle_key_rotation_notice(
+                    env,
+                    sender_id=sender_id,
+                    store=store,
+                    persona_dir=persona_dir,
+                    now=now,
+                )
                 to_ack.append(env_id)
                 continue
 
