@@ -40,13 +40,13 @@ class _StubProvider:
         self.response = response
         self.calls: list[str] = []
 
-    def generate(self, *, prompt: str) -> str:
+    def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:
         self.calls.append(prompt)
         return self.response
 
 
 class _ExplodingProvider:
-    def generate(self, *, prompt: str) -> str:  # noqa: D401
+    def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:  # noqa: D401
         raise RuntimeError("provider down")
 
 
@@ -292,7 +292,7 @@ def test_c1a_prefix_byte_stable_between_compactions(tmp_path: Path) -> None:
     assert prefixes[2].startswith(prefixes[1])
 
 
-def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path) -> None:
+def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path, monkeypatch) -> None:
     """Over-cap path (the criterion's required case): apply_budget must NOT insert
     a fresh LLM summary into the prefix every turn (the old per-turn re-summary
     defect). It fires the persisted compaction ONCE (the accepted single cache
@@ -311,6 +311,11 @@ def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path) -> None:
                                "text": "x" * 4000, "ts": ts})
     write_cursor(tmp_path, sid, tss[-1])  # all extracted
     provider = _StubProvider("SUM")
+    # The backstop builds its own COMPACTION_MODEL provider; pin it to our stub so
+    # the fire-once count is observable (and no real CLI is shelled in the test).
+    monkeypatch.setattr(
+        "brain.chat.compaction.build_compaction_provider", lambda pd: provider
+    )
 
     def one_turn() -> list[ChatMessage]:
         history = _buffer_turns_to_messages(tmp_path, read_session(tmp_path, sid))
@@ -375,7 +380,7 @@ def test_c13_concurrent_append_during_summarize_survives(tmp_path: Path) -> None
         def __init__(self) -> None:
             self.calls = 0
 
-        def generate(self, *, prompt: str) -> str:
+        def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:
             self.calls += 1
             # Concurrent append (what _persist_turn does on another thread).
             ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",

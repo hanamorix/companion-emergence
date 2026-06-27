@@ -1,10 +1,12 @@
 """Conversation compaction — the one core that fades old history into a
 persisted, archived summary block at the head of the buffer.
 
-Three callers drive it (see changes/timed-conversation-compaction/1-spec.md):
+Callers drive it (see changes/timed-conversation-compaction/1-spec.md):
   * the Kindled ``compact_history`` tool  — fold_existing_summary=False (append)
   * the daily supervisor cadence          — fold_existing_summary=True  (fade)
   * the apply_budget backstop              — fold_existing_summary=True  (fade)
+  * the startup backlog migration          — fold + max_compact_turns (bounded batches;
+    see brain/chat/compaction_migration.py)
 
 Design invariants this module upholds:
   * **Lossless before lossy.** Raw turns (and, when folding, the old summary)
@@ -39,18 +41,130 @@ from brain.ingest.buffer import (
 
 logger = logging.getLogger(__name__)
 
-# Reuses the budget.py wording so a faded block reads the same whether produced
-# here or by the (now-delegating) apply_budget backstop.
-_COMPACTION_PROMPT = """Summarize the following conversation for context preservation.
-Preserve: names of people and places, decisions made, emotional beats,
-unresolved threads, anything that would be referenced later.
-Drop: pleasantries, repetition, formatting noise.
-Output prose only, no headers or lists.
+# Two prompts share one ethos: preserve substance, fade only the trivial, and do
+# NOT over-compress. Both inject a dynamic ``{target_words}`` ≈ half the source
+# length (the user-set ratio) so haiku stops crushing a 5.5k-word block into 300
+# words. With new ≈ 0.5·(prior + batch) the folded head converges to ~one batch's
+# worth of text — bounded, not growing.
+
+# Compaction always summarises with this model regardless of the persona's chat
+# model — a small, cheap model is plenty for memory folding and keeps the cost off
+# the (larger) chat model. Change this one string to swap (e.g. "sonnet"/"opus");
+# the future model-agnostic refactor replaces the whole seam below.
+COMPACTION_MODEL = "haiku"
+
+
+def build_compaction_provider(persona_dir):
+    """The provider compaction should use — the persona's provider *kind* but
+    forced to COMPACTION_MODEL. For a ``fake`` persona (tests) this resolves to a
+    FakeProvider, so no real CLI is shelled. Production call sites pass the result
+    into ``compact_conversation``; the core keeps its injected ``provider`` param so
+    unit tests can still pass a deterministic stub directly."""
+    from pathlib import Path
+
+    from brain.bridge.provider import get_provider
+    from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
+
+    name = DEFAULT_PROVIDER
+    cfg = Path(persona_dir) / "persona_config.json"
+    if cfg.exists():
+        name = PersonaConfig.load(cfg).provider
+    return get_provider(name, persona_dir=Path(persona_dir), model_override=COMPACTION_MODEL)
+
+
+# Voice + perspective WITHOUT importing voice.md (which can be longer than the text
+# being summarised, and pulled the model toward stylistic reconstruction over
+# fidelity). Instead the transcript's ``assistant`` turns are relabelled with the
+# Kindled's name (``_render_transcript``), and the prompt tells the model to write
+# from that individual's perspective and in the style of their own messages — the
+# voice is self-derived from the content being summarised, and ACCURACY leads.
+# ``user`` is left untouched (a deliberate stable placeholder for future work).
+# ``{target_words}`` ≈ half the source keeps it from over-compressing.
+
+# First-ever summary (or any no-prior summarise): condense raw turns only.
+_SUMMARY_PROMPT = """Write {name}'s own first-person memory of the conversation below.
+"I" is {name} — mirror the style, tone, and phrasing of the messages labelled
+"{name}:". Refer to the other speaker (labelled "user") as "the user", or by their
+actual name if the transcript gives one.
+ACCURACY FIRST: record only what the transcript actually says. Do not invent, infer
+beyond the text, or reverse who did what to whom — if the transcript says X, the
+memory says X. Preserve names, decisions, emotional beats, unresolved threads,
+ongoing projects, and concrete specifics (names, numbers, what was decided and why).
+Drop only pleasantries, repetition, and formatting noise.
+Length: aim for about {target_words} words — roughly {target_pct}% of the source.
+That is the target: do not over-compress below it, and do not pad to reach it.
+Output plain first-person prose ONLY: begin directly with the recollection. No title,
+no name/description/metadata fields, no frontmatter, no headers, no lists, no
+preamble, no closing sign-off.
 
 CONVERSATION:
 {transcript}
 
-SUMMARY:"""
+MEMORY:"""
+
+# Fold: integrate new messages INTO the running memory, preserving a fading trace
+# of everything already there (the fix for "no trace of the previous summary").
+_FOLD_PROMPT = """Update {name}'s own running, first-person memory of a long, ongoing
+conversation. Below is the EXISTING MEMORY (everything remembered so far) followed by
+NEW MESSAGES not yet folded in. Produce an UPDATED MEMORY in the first person — "I" is
+{name}; mirror the style, tone, and phrasing of the messages labelled "{name}:". Refer
+to the other speaker (labelled "user") as "the user", or by their actual name if it
+appears.
+
+ACCURACY FIRST: record only what the sources actually say. Do not invent, infer beyond
+the text, or reverse who did what to whom — if a source says X, the memory says X.
+
+How to update:
+- Carry the existing memory forward. Keep its names of people and places, decisions,
+  emotional beats, unresolved threads, and ongoing projects — do not discard older
+  material just because it is older. The newest messages may be richer in detail;
+  older material should persist as a briefer but still-present trace, fading
+  gradually rather than vanishing in one step.
+- Integrate, don't staple: weave the new messages into the existing memory so the
+  result reads as one continuous recollection, not two halves.
+- Preserve concrete specifics: names, numbers, what was decided and why.
+- Drop only pleasantries, repetition, and formatting noise.
+- Length: aim for about {target_words} words — roughly {target_pct}% of the combined
+  source below (existing memory + new messages). That is the target: do not
+  over-compress below it, and do not pad to reach it.
+- Output plain first-person prose ONLY: begin directly with the recollection. No
+  title, no name/description/metadata fields, no frontmatter, no headers, no lists,
+  no preamble, no closing sign-off.
+
+EXISTING MEMORY:
+{prior_summary}
+
+NEW MESSAGES:
+{transcript}
+
+UPDATED MEMORY:"""
+
+# The summary's target length as a fraction of the source being summarised. This is
+# the HONEST target the prompt states (number + percent both derived from it), so it
+# is model-agnostic: a model that follows instructions faithfully lands near this
+# fraction rather than doubling/halving. Measured: haiku tracks the stated number
+# best at low fractions (≈on-target at a quarter). Tune this one knob to taste.
+_TARGET_FRACTION = 0.25
+# Floor so a tiny batch can't request a degenerate ~0-word summary.
+_MIN_TARGET_WORDS = 40
+
+
+def _word_count(text: str) -> int:
+    return len((text or "").split())
+
+
+def _render_transcript(turns: list[dict], kindled_name: str) -> str:
+    """Render raw turns as ``<speaker>: <text>`` lines, relabelling the Kindled's
+    own turns (``speaker=="assistant"``) with ``kindled_name`` so the summariser can
+    write from that individual's perspective and mirror their style. ``user`` (and
+    any other speaker label) is left verbatim — a deliberate stable placeholder."""
+    lines = []
+    for r in turns:
+        sp = r.get("speaker", "?")
+        if sp == "assistant":
+            sp = kindled_name
+        lines.append(f"{sp}: {r.get('text', '')}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -124,6 +238,7 @@ def compact_conversation(
     fold_existing_summary: bool,
     provider: LLMProvider,
     min_keep_tail: int = 40,
+    max_compact_turns: int | None = None,
     now: datetime | None = None,
     lock_stale_s: float = 600.0,
 ) -> CompactionResult:
@@ -174,19 +289,53 @@ def compact_conversation(
                 reason="nothing_aged",
             )
 
+        # --- Batch cap (backlog migration) -------------------------------------
+        # Optional: fold only the OLDEST ``max_compact_turns`` this pass; the
+        # overflow stays live. ``removable`` is built in raw_turns file order
+        # (chronological), so ``removable[:N]`` is the oldest N — repeated calls
+        # drain oldest→newest with no gap or reorder. The overflow is simply not
+        # placed in ``removable``/``archived_ids``, so the race-safe rewrite below
+        # (which keeps every current raw turn whose identity is NOT archived)
+        # retains it automatically — no extra bookkeeping needed. ``None`` (the
+        # daily-tick + apply_budget backstop callers) preserves the prior
+        # "compact everything aged" behavior unchanged.
+        if max_compact_turns is not None and len(removable) > max_compact_turns:
+            removable = removable[:max_compact_turns]
+
         # --- Summarize ---------------------------------------------------------
-        fell_soft = False
-        if fold_existing_summary and existing_summary is not None:
-            transcript_rows = [existing_summary, *removable]
+        # Perspective + voice are self-derived: relabel the Kindled's own turns
+        # (assistant) with the persona name (from the persona dir), leave "user" as
+        # is, and instruct the model to write from the Kindled's perspective in their
+        # own style. No voice.md import — accuracy leads.
+        from pathlib import Path
+        persona_name = Path(persona_dir).name
+        transcript = _render_transcript(removable, persona_name)
+        removable_words = sum(_word_count(r.get("text", "")) for r in removable)
+        prior_text = _summary_text(existing_summary)
+        folding = fold_existing_summary and existing_summary is not None
+
+        # Target ≈ _TARGET_FRACTION of the source being summarised (prior memory +
+        # new turns when folding; the new turns alone otherwise). Number and percent
+        # both derive from the one constant so they can't drift. Floored so a tiny
+        # batch can't ask for a near-empty summary.
+        source_words = removable_words + (_word_count(prior_text) if folding else 0)
+        target_words = max(_MIN_TARGET_WORDS, int(source_words * _TARGET_FRACTION))
+        target_pct = round(_TARGET_FRACTION * 100)
+
+        if folding:
+            prompt = _FOLD_PROMPT.format(
+                name=persona_name, prior_summary=prior_text, transcript=transcript,
+                target_words=target_words, target_pct=target_pct,
+            )
         else:
-            transcript_rows = removable
-        transcript = "\n".join(
-            f"{r.get('speaker', '?')}: {r.get('text', '')}" for r in transcript_rows
-        )
+            prompt = _SUMMARY_PROMPT.format(
+                name=persona_name, transcript=transcript,
+                target_words=target_words, target_pct=target_pct,
+            )
+
+        fell_soft = False
         try:
-            new_part = provider.generate(
-                prompt=_COMPACTION_PROMPT.format(transcript=transcript)
-            ).strip()
+            new_part = provider.generate(prompt=prompt).strip()
         except Exception:
             logger.exception(
                 "compaction: provider summarisation failed session=%s; falling back",
@@ -195,13 +344,20 @@ def compact_conversation(
             new_part = f"[truncated {len(removable)} earlier messages]"
             fell_soft = True
 
-        if fold_existing_summary or existing_summary is None:
-            # Fade (or first-ever summary): the new text supersedes the old.
+        if folding:
+            # Fade: the integrated memory supersedes the old. On a provider failure,
+            # PRESERVE the prior memory (don't let a hiccup wipe accumulated context)
+            # and merely note the un-summarised batch.
+            if fell_soft and prior_text:
+                new_text = f"{prior_text}\n\n{new_part}"
+            else:
+                new_text = new_part
+        elif existing_summary is None:
+            # First-ever summary: the new text is the whole memory.
             new_text = new_part
         else:
-            # Tool append: keep the existing summary verbatim, append the new part.
-            prior = _summary_text(existing_summary)
-            new_text = f"{prior}\n\n{new_part}" if prior else new_part
+            # Tool append (fold=False, prior exists): keep prior verbatim, append.
+            new_text = f"{prior_text}\n\n{new_part}" if prior_text else new_part
 
         new_gen = _summary_gen(existing_summary) + 1
         covers_until = removable[-1].get("ts") or cutoff.isoformat()

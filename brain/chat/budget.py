@@ -65,14 +65,18 @@ def apply_budget(
     #    left intact by the core's cursor guard).
     if persona_dir is not None and session_id:
         try:
-            from brain.chat.compaction import compact_conversation
+            from brain.chat.compaction import (
+                build_compaction_provider,
+                compact_conversation,
+            )
 
             compact_conversation(
                 persona_dir,
                 session_id,
                 older_than=timedelta(0),
                 fold_existing_summary=True,
-                provider=provider,
+                # Compaction always folds with COMPACTION_MODEL, not the chat model.
+                provider=build_compaction_provider(persona_dir),
                 min_keep_tail=preserve_tail_msgs,
             )
         except Exception:

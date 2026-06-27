@@ -450,7 +450,8 @@ def run_folded(
             and time.monotonic() - last_compaction_at >= compaction_interval_s
         ):
             try:
-                _run_compaction_tick(persona_dir, provider)
+                from brain.chat.compaction import build_compaction_provider
+                _run_compaction_tick(persona_dir, build_compaction_provider(persona_dir))
             except Exception:
                 logger.exception("supervisor compaction tick raised")
             last_compaction_at = time.monotonic()
