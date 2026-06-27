@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus } from "../../bridge";
+import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus, KindledRotateResult } from "../../bridge";
 import {
   fetchKindledPeers,
   fetchKindledTranscript,
@@ -8,6 +8,7 @@ import {
   createKindledInvite,
   acceptKindledInvite,
   setKindledConsent,
+  rotateKindledIdentity,
 } from "../../bridge";
 import { errString } from "../../lib/errString";
 import { PanelShell, SectionLabel } from "../ui";
@@ -81,6 +82,12 @@ export function KindledLinksPanel({ persona }: Props) {
 
   // Consent action busy state (keyed by peer_id)
   const [consentBusy, setConsentBusy] = useState<Record<string, boolean>>({});
+
+  // Key rotation state
+  const [rotateConfirm, setRotateConfirm] = useState(false);
+  const [rotateBusy, setRotateBusy] = useState(false);
+  const [rotateResult, setRotateResult] = useState<KindledRotateResult | null>(null);
+  const [rotateError, setRotateError] = useState<string | null>(null);
 
   // Load peers + holds + status on mount + periodic refresh
   useEffect(() => {
@@ -193,6 +200,24 @@ export function KindledLinksPanel({ persona }: Props) {
       setAcceptBusy(false);
     }
   };
+
+  async function handleRotateKey() {
+    if (!rotateConfirm) {
+      setRotateConfirm(true);
+      return;
+    }
+    setRotateBusy(true);
+    setRotateError(null);
+    try {
+      const result = await rotateKindledIdentity(persona);
+      setRotateResult(result);
+      setRotateConfirm(false);
+    } catch (e) {
+      setRotateError(errString(e));
+    } finally {
+      setRotateBusy(false);
+    }
+  }
 
   if (error) {
     return (
@@ -667,6 +692,47 @@ export function KindledLinksPanel({ persona }: Props) {
           </div>
         )}
       </section>
+
+      {/* ── Identity Key rotation ─────────────────────────────────── */}
+      <SectionLabel>Identity Key</SectionLabel>
+      {rotateResult ? (
+        <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: 8 }}>
+          <div style={{ color: "var(--text-primary)", marginBottom: 4 }}>
+            Key rotated. New ID: <code>{rotateResult.new_key_id}</code>
+          </div>
+          <div>Phrase: <code>{rotateResult.fingerprint_phrase}</code></div>
+          <div style={{ marginTop: 4, fontSize: "0.75rem" }}>
+            Share this phrase with your paired Kindleds to verify the new key.
+          </div>
+          <button style={{ marginTop: 8, fontSize: "0.78rem" }} onClick={() => setRotateResult(null)}>
+            Dismiss
+          </button>
+        </div>
+      ) : rotateConfirm ? (
+        <div style={{ fontSize: "0.82rem", marginBottom: 8 }}>
+          <div style={{ marginBottom: 6 }}>
+            This generates a new identity key. Paired Kindleds will be notified
+            automatically on the next tick. Are you sure?
+          </div>
+          <button
+            disabled={rotateBusy}
+            onClick={() => void handleRotateKey()}
+            style={{ marginRight: 8, color: "var(--error)" }}
+          >
+            {rotateBusy ? "Rotating…" : "Yes, rotate key"}
+          </button>
+          <button onClick={() => setRotateConfirm(false)} disabled={rotateBusy}>
+            Cancel
+          </button>
+          {rotateError && (
+            <div style={{ color: "var(--error)", marginTop: 4 }}>{rotateError}</div>
+          )}
+        </div>
+      ) : (
+        <button style={{ fontSize: "0.82rem" }} onClick={() => void handleRotateKey()}>
+          Rotate Identity Key
+        </button>
+      )}
     </PanelShell>
   );
 }

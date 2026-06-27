@@ -987,3 +987,20 @@ export async function setKindledConsent(persona: string, peerId: string, action:
   );
   if (!r.ok) throw new Error(`/kindled-link/consent ${r.status}`);
 }
+
+export interface KindledRotateResult {
+  new_key_id: string;
+  fingerprint_phrase: string;
+}
+
+export async function rotateKindledIdentity(persona: string): Promise<KindledRotateResult> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/identity/rotate`, {
+      method: "POST",
+      headers: authHeaders(creds),
+      body: "{}",
+    }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/identity/rotate ${r.status}`);
+  return (await r.json()) as KindledRotateResult;
+}
