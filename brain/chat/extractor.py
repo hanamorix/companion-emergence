@@ -57,6 +57,20 @@ class CrystallisationCandidate(BaseModel):
     evidence: str = Field(min_length=1, max_length=500)
     importance: int = Field(ge=1, le=10, default=8)
 
+    # The extractor LLM occasionally returns a field longer than its cap. Truncate
+    # (mode="before", so it runs ahead of the max_length constraint) rather than
+    # raising — because the WHOLE ExtractorOutput is model_validate()'d at once, a
+    # raise here drops the entire turn's extraction, not just this candidate.
+    @field_validator("theme", mode="before")
+    @classmethod
+    def _truncate_theme(cls, v: object) -> object:
+        return v[:200] if isinstance(v, str) else v
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _truncate_evidence(cls, v: object) -> object:
+        return v[:500] if isinstance(v, str) else v
+
     @field_validator("theme", "evidence")
     @classmethod
     def _reject_whitespace_only(cls, v: str) -> str:
@@ -70,6 +84,18 @@ class ReflexAuditEntry(BaseModel):
 
     tool: str = Field(min_length=1, max_length=64)
     reason: str = Field(min_length=1, max_length=300)
+
+    # Truncate over-length values (mode="before") instead of raising — see the
+    # note on CrystallisationCandidate: a length raise drops the whole extraction.
+    @field_validator("tool", mode="before")
+    @classmethod
+    def _truncate_tool(cls, v: object) -> object:
+        return v[:64] if isinstance(v, str) else v
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _truncate_reason(cls, v: object) -> object:
+        return v[:300] if isinstance(v, str) else v
 
     @field_validator("tool", "reason")
     @classmethod

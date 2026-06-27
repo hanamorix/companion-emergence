@@ -127,3 +127,37 @@ def test_system_prompt_includes_formative_hint():
         f"_SYSTEM_PROMPT should contain 'how formative' for the importance field; "
         f"current prompt:\n{_SYSTEM_PROMPT}"
     )
+
+
+# ── Over-length truncation (live bug 2026-06-27): the extractor LLM occasionally
+#    returns a field longer than its cap. Previously Field(max_length=...) raised
+#    string_too_long, and because the WHOLE ExtractorOutput is model_validate()'d
+#    at once, ONE over-length nested field dropped the entire turn's extraction.
+#    Fix: mode="before" validators truncate to the cap instead of raising.
+
+def test_reflex_audit_reason_truncates_instead_of_raising():
+    ra = ReflexAuditEntry(tool="search_memories", reason="A" * 400)
+    assert len(ra.reason) == 300
+    ra2 = ReflexAuditEntry(tool="t" * 100, reason="ok")
+    assert len(ra2.tool) == 64
+
+
+def test_crystallisation_candidate_fields_truncate():
+    cc = CrystallisationCandidate(theme="T" * 300, evidence="E" * 600)
+    assert len(cc.theme) == 200
+    assert len(cc.evidence) == 500
+
+
+def test_extractor_output_model_validate_survives_overlong_nested_field():
+    # The real path (extractor.py:228 model_validate) must NOT drop the whole
+    # extraction because one nested reason/evidence overflowed.
+    data = {
+        "memory_writes": [{"episode": "something happened", "salience": 0.5}],
+        "crystallisation": [{"theme": "T" * 250, "evidence": "E" * 700}],
+        "reflex_audit": [{"tool": "search_memories", "reason": "R" * 500}],
+    }
+    out = ExtractorOutput.model_validate(data)
+    assert len(out.memory_writes) == 1
+    assert len(out.crystallisation[0].theme) == 200
+    assert len(out.crystallisation[0].evidence) == 500
+    assert len(out.reflex_audit[0].reason) == 300
