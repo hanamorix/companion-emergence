@@ -125,6 +125,11 @@ CREATE TABLE IF NOT EXISTS session_keys (
     established_at TEXT NOT NULL,
     PRIMARY KEY (peer_id, session_id)
 );
+CREATE TABLE IF NOT EXISTS pending_rotation_notices (
+    peer_id       TEXT PRIMARY KEY,
+    envelope_json TEXT NOT NULL,
+    queued_at     TEXT NOT NULL
+);
 """
 
 CONSENT_STATES = frozenset(
@@ -176,6 +181,12 @@ class KindledLinkStore:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(peers)")}
         if "relay_mailbox" not in cols:
             self._conn.execute("ALTER TABLE peers ADD COLUMN relay_mailbox TEXT")
+            self._conn.commit()
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(peers)")}
+        if "previous_identity_pub" not in cols:
+            self._conn.execute(
+                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT"
+            )
             self._conn.commit()
 
     def upsert_peer(
@@ -727,12 +738,61 @@ class KindledLinkStore:
         self._conn.commit()
         return int(row[0])
 
-    def list_paired_peers(self) -> list[str]:
-        """Return peer_ids of all peers in consent_state='paired'."""
+    def list_paired_peers(self) -> list[dict]:
+        """Return all peer records with consent_state = 'paired'."""
         rows = self._conn.execute(
-            "SELECT peer_id FROM peers WHERE consent_state = 'paired'"
+            "SELECT * FROM peers WHERE consent_state = 'paired'"
         ).fetchall()
-        return [row["peer_id"] for row in rows]
+        return [dict(r) for r in rows]
+
+    # ── Key-rotation methods (#47) ─────────────────────────────────────────
+
+    def queue_rotation_notice(
+        self, peer_id: str, envelope_json: str, now: datetime
+    ) -> None:
+        """Persist a pre-signed rotation notice for a peer. Upserts — a second
+        rotation while a first is pending replaces the entry."""
+        self._conn.execute(
+            "INSERT INTO pending_rotation_notices (peer_id, envelope_json, queued_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(peer_id) DO UPDATE SET "
+            "envelope_json = excluded.envelope_json, queued_at = excluded.queued_at",
+            (peer_id, envelope_json, now.isoformat()),
+        )
+        self._conn.commit()
+
+    def pop_pending_rotation_notices(self) -> list[dict]:
+        """Return all queued rotation notices (read-only — does not delete)."""
+        rows = self._conn.execute(
+            "SELECT peer_id, envelope_json, queued_at FROM pending_rotation_notices"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_rotation_notice(self, peer_id: str) -> None:
+        """Delete the queued rotation notice for a peer after successful delivery."""
+        self._conn.execute(
+            "DELETE FROM pending_rotation_notices WHERE peer_id = ?", (peer_id,)
+        )
+        self._conn.commit()
+
+    def update_peer_identity(
+        self,
+        peer_id: str,
+        new_pub_hex: str,
+        new_fingerprint: str,
+        now: datetime,
+    ) -> None:
+        """Rotate a peer's stored identity: save old pub in previous_identity_pub."""
+        self._conn.execute(
+            "UPDATE peers SET "
+            "previous_identity_pub = identity_pub, "
+            "identity_pub = ?, "
+            "fingerprint = ?, "
+            "updated_at = ? "
+            "WHERE peer_id = ?",
+            (new_pub_hex, new_fingerprint, now.isoformat(), peer_id),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a
