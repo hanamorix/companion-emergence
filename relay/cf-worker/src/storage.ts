@@ -26,9 +26,16 @@ export class Store {
   }
 
   async register(mailboxId: string, identityPub: string, nowMs: number): Promise<string> {
+    // Fast path: already registered — return the persisted winner immediately.
+    // Correctness does NOT depend on this; the atomic upsert below is the guarantee.
     const existing = await this.ownerOf(mailboxId);
     if (existing) return existing;
 
+    // Cap check: reject NEW registrations when the registered pool is full.
+    // Matches Python semantics: an existing owner is returned before this check,
+    // and an unregistered→registered promotion does not add a new registered row
+    // (it replaces an unregistered one), so an existing-but-unregistered row is
+    // counted in registered=0 and doesn't inflate the registered count.
     const count = await this.db
       .prepare("SELECT COUNT(*) AS c FROM mailboxes WHERE registered=1")
       .first<{ c: number }>();
@@ -36,14 +43,27 @@ export class Store {
       throw new RelayReject(429, "registered mailbox cap reached");
     }
 
+    // Atomic first-write-wins upsert:
+    //   - If the row doesn't exist: insert it as registered.
+    //   - If the row exists AND is unregistered (registered=0): promote it
+    //     (set identity_pub + registered=1).
+    //   - If the row exists AND is ALREADY registered (registered=1): the
+    //     WHERE clause on DO UPDATE is false, so the row is left untouched —
+    //     this is the ownership-hijack guard.
+    // After the upsert we re-read the persisted identity_pub to return the true
+    // winner, not the caller's argument (which may have lost the race).
     await this.db
       .prepare(
         "INSERT INTO mailboxes (mailbox_id, identity_pub, registered, created_at) VALUES (?,?,1,?) " +
-        "ON CONFLICT(mailbox_id) DO UPDATE SET identity_pub=excluded.identity_pub, registered=1"
+        "ON CONFLICT(mailbox_id) DO UPDATE SET identity_pub=excluded.identity_pub, registered=1 " +
+        "WHERE mailboxes.registered=0"
       )
       .bind(mailboxId, identityPub, nowMs)
       .run();
-    return identityPub;
+
+    // Re-read the winner — may differ from identityPub if we lost the race.
+    const winner = await this.ownerOf(mailboxId);
+    return winner ?? identityPub; // fallback is unreachable (we just upserted registered=1)
   }
 
   async issueNonce(mailboxId: string, nonce: string, nowMs: number): Promise<void> {
