@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.kindled_link.audit import log_transport
 from brain.kindled_link.cadence import save_tick_cadence, tick_is_due
 from brain.kindled_link.gate import OutboundPayload
 from brain.kindled_link.relationship import (
@@ -23,11 +24,73 @@ from brain.kindled_link.relationship import (
     run_relationship_reflection,
     save_reflection_cadence,
 )
+from brain.kindled_link.relay_client import RelayUnavailableError
 from brain.kindled_link.session import open_session
 from brain.kindled_link.session_engine import SessionEngine
 from brain.kindled_link.transport import poll_and_ingest, send_message
 
 log = logging.getLogger(__name__)
+
+
+def _drain_pending_rotation_notices(
+    store,
+    relay_client,
+    persona_dir: Path,
+    now: datetime,
+) -> None:
+    """Post any queued pre-signed rotation notices to peer relay mailboxes.
+
+    Fault-isolated: a failure for one peer does not abort the others.
+    A notice that has expired (>7d since rotation) is dropped -- the peer
+    must re-pair if they missed it.
+    """
+
+    notices = store.pop_pending_rotation_notices()
+    for notice_row in notices:
+        peer_id = notice_row["peer_id"]
+        try:
+            env = json.loads(notice_row["envelope_json"])
+        except (json.JSONDecodeError, KeyError):
+            store.clear_rotation_notice(peer_id)
+            continue
+        # Check expiry before attempting relay
+        try:
+            exp_str = env.get("expires_at", "")
+            exp = datetime.strptime(exp_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=UTC
+            )
+            if now > exp:
+                store.clear_rotation_notice(peer_id)
+                log_transport(
+                    persona_dir,
+                    event="rotation_notice_expired",
+                    peer_id=peer_id,
+                    now=now,
+                )
+                continue
+        except (ValueError, TypeError):
+            store.clear_rotation_notice(peer_id)
+            continue
+        try:
+            relay_client.push(env)
+            store.clear_rotation_notice(peer_id)
+            log_transport(
+                persona_dir,
+                event="rotation_notice_sent",
+                peer_id=peer_id,
+                now=now,
+            )
+        except RelayUnavailableError:
+            log_transport(
+                persona_dir,
+                event="rotation_notice_queued",
+                peer_id=peer_id,
+                now=now,
+            )
+        except Exception:  # noqa: BLE001 -- fault-isolated; leave in queue
+            log.warning(
+                "kindled tick: rotation notice send failed for %s", peer_id, exc_info=True
+            )
 
 
 def run_kindled_link_tick(
@@ -85,6 +148,12 @@ def run_kindled_link_tick(
         persona_dir=persona_dir,
         now=now,
     )
+
+    # Drain any pending rotation notices (fault-isolated).
+    try:
+        _drain_pending_rotation_notices(store, relay_client, persona_dir, now)
+    except Exception:  # noqa: BLE001 -- fault-isolated; drain failure must not crash the tick
+        log.warning("kindled tick: drain rotation notices failed", exc_info=True)
 
     degraded: list[str] = []
     peers_processed = 0
