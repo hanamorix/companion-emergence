@@ -696,7 +696,7 @@ export function KindledLinksPanel({ persona }: Props) {
       {/* ── Identity Key rotation ─────────────────────────────────── */}
       <SectionLabel>Identity Key</SectionLabel>
       {rotateResult ? (
-        <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: 8 }}>
+        <div style={{ fontSize: "0.82rem", color: "var(--text-mute)", marginBottom: 8 }}>
           <div style={{ color: "var(--text-primary)", marginBottom: 4 }}>
             Key rotated. New ID: <code>{rotateResult.new_key_id}</code>
           </div>
