@@ -84,6 +84,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.audit",         # transport audit log — no tool surface
     "brain.kindled_link.identity",      # Ed25519 identity — no tool surface
     "brain.kindled_link.codec",         # canonical JSON — no tool surface
+    "brain.health.jsonl_reader",        # streaming JSONL reader — no tool surface (feed_source.py reads transport.jsonl for feed entries)
 }
 
 
