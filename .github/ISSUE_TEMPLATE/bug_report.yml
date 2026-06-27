@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a bug or unexpected behaviour
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. The most useful thing you can tell us is **which version** you're on and **which experimental features you have enabled** — several capabilities ship off-by-default and experimental, and that narrows the cause fast.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From the app's About panel, or the release you installed (e.g. v0.0.39).
+      placeholder: v0.0.39
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel, built from source)
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: checkboxes
+    id: experimental
+    attributes:
+      label: Experimental features enabled
+      description: Which off-by-default / experimental features were ON when the bug happened? (Leave all unchecked if none — that's useful too.)
+      options:
+        - label: "Kindled Links (companion-to-companion correspondence)"
+        - label: "She makes things (Maker)"
+        - label: "She can write to my files (file-write)"
+        - label: "She can leave me notes (persona notes)"
+        - label: "Ollama / a non-Claude provider"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / errors
+      description: Any error text, or relevant lines from the app. Avoid pasting private conversation content.
+      render: shell
