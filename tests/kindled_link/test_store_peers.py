@@ -35,4 +35,5 @@ def test_list_paired_peers_returns_only_paired() -> None:
                   fingerprint="kid_pending", consent_state="pending_local",
                   relay_url=None, now=now)
     result = s.list_paired_peers()
-    assert result == ["kid_paired"]
+    assert len(result) == 1
+    assert result[0]["peer_id"] == "kid_paired"

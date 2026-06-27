@@ -99,10 +99,8 @@ def run_kindled_link_tick(
             now=now, today=today, send_fn_factory=_recovery_send_factory
         )
         any_recovered = any(a not in ("deferred",) for a in recovered_actions)
-        for peer_id in store.list_paired_peers():
-            peer = store.get_peer(peer_id)
-            if peer is None:
-                continue
+        for peer in store.list_paired_peers():
+            peer_id = peer["peer_id"]
             cs = peer.get("consent_state", "")
             if cs in ("paused", "revoked", "blocked"):
                 continue
