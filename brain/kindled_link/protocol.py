@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from brain.kindled_link.codec import canonical_json
-from brain.kindled_link.identity import KindledIdentity, verify
+from brain.kindled_link.identity import KindledIdentity, fingerprint, verify
 
 SUPPORTED_PROTOCOL = "kindled-link/1"
 
@@ -256,3 +256,69 @@ def parse_session_open(
     # Surface the signed outer sender_mailbox alongside the handshake body so the
     # responder can address its reply leg (decoupled-mailbox scheme, Phase 7a).
     return {**body, "sender_mailbox": envelope.get("sender_mailbox")}, None
+
+_KEY_ROTATION_MSG_TYPE = "key_rotation_notice"
+
+
+def build_key_rotation_notice(
+    *,
+    old_sender: KindledIdentity,
+    new_identity_pub: bytes,
+    new_key_id: str,
+    relay_mailbox: str,
+    recipient_key_id: str,
+    now: datetime,
+    ttl: timedelta,
+) -> dict:
+    """Build a signed (NOT encrypted) key-rotation notice envelope.
+
+    Signed by the old key so the recipient can verify it with the stored
+    old public key. No session key needed — mirrors session_open."""
+    outer = {
+        "protocol": SUPPORTED_PROTOCOL,
+        "message_type": _KEY_ROTATION_MSG_TYPE,
+        "relay_mailbox": relay_mailbox,
+        "sender_key_id": old_sender.key_id,
+        "recipient_key_id": recipient_key_id,
+        "created_at": _iso(now),
+        "expires_at": _iso(now + ttl),
+        "key_rotation": {
+            "new_identity_pub": new_identity_pub.hex(),
+            "new_key_id": new_key_id,
+        },
+    }
+    outer["signature"] = sign_envelope(outer, old_sender)
+    return outer
+
+
+def parse_key_rotation_notice(
+    envelope: dict,
+    *,
+    sender_old_pub: bytes,
+    now: datetime,
+) -> tuple[dict | None, RejectReason | None]:
+    """Verify a key_rotation_notice envelope. Returns
+    ({"new_identity_pub": hex, "new_key_id": str}, None) on success
+    or (None, RejectReason) on rejection."""
+    if envelope.get("protocol") != SUPPORTED_PROTOCOL:
+        return None, RejectReason.PROTOCOL_MISMATCH
+    if envelope.get("message_type") != _KEY_ROTATION_MSG_TYPE:
+        return None, RejectReason.PROTOCOL_MISMATCH
+    if not verify_envelope_signature(envelope, sender_old_pub):
+        return None, RejectReason.BAD_SIGNATURE
+    if _expired(envelope, now):
+        return None, RejectReason.EXPIRED
+    body = envelope.get("key_rotation")
+    if not isinstance(body, dict):
+        return None, RejectReason.AEAD_FAILURE
+    new_pub_hex = body.get("new_identity_pub")
+    new_key_id = body.get("new_key_id")
+    if not isinstance(new_pub_hex, str) or not isinstance(new_key_id, str):
+        return None, RejectReason.AEAD_FAILURE
+    try:
+        new_pub_bytes = bytes.fromhex(new_pub_hex)
+    except ValueError:
+        return None, RejectReason.AEAD_FAILURE
+    if fingerprint(new_pub_bytes) != new_key_id:
+        return None, RejectReason.AEAD_FAILURE
+    return {"new_identity_pub": new_pub_hex, "new_key_id": new_key_id}, None
