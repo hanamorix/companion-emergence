@@ -141,3 +141,4 @@ AGENTS.md
 app/pnpm-workspace.yaml
 # dragonfly diagnosis hunts — local working/scratch (ledgers + token harnesses)
 hunts/
+app/src-tauri/python-runtime/

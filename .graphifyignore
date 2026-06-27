@@ -1,0 +1,9 @@
+app/src-tauri/python-runtime/
+wizard-validation/
+graphify-out/
+.venv/
+node_modules/
+migrated-nell/
+expressions/
+target/
+dist/
