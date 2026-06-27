@@ -1410,6 +1410,47 @@ def _initiate_d_stats_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+def _kindled_rotate_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell kindled rotate-key` — rotate local identity key."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    persona_dir = get_persona_dir(args.persona)
+    s = state_file.read(persona_dir)
+    if s is None:
+        print(
+            "error: bridge is not running. Start it with `nell service start`.",
+            file=sys.stderr,
+        )
+        return 1
+    port = s.port
+    auth_token = s.auth_token
+    url = f"http://127.0.0.1:{port}/kindled-link/identity/rotate"
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        print(
+            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+        return 1
+    print(f"Key rotated. New key ID: {data['new_key_id']}")
+    print(f"New fingerprint phrase: {data['fingerprint_phrase']}")
+    print("Rotation notices queued for paired peers — will deliver on next tick.")
+    return 0
+
+
 def _soul_review_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell soul review` — run autonomous soul review pass."""
     persona_dir = get_persona_dir(args.persona)
@@ -2839,6 +2880,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output as JSON array.",
     )
     personas_sub.set_defaults(func=_personas_handler)
+
+    # nell kindled — Kindled-link identity management (Task 7)
+    kindled_sub = subparsers.add_parser(
+        "kindled",
+        help="Kindled-link identity commands.",
+    )
+    kindled_actions = kindled_sub.add_subparsers(dest="kindled_action", required=True)
+
+    k_rotate = kindled_actions.add_parser(
+        "rotate-key",
+        help="Rotate this Kindled's Ed25519 identity key and notify paired peers.",
+    )
+    k_rotate.add_argument("--persona", required=True, help="Persona name (required).")
+    k_rotate.set_defaults(func=_kindled_rotate_handler)
 
     return parser
 
