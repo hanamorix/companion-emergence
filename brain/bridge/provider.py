@@ -1186,6 +1186,16 @@ class ClaudeCliProvider(LLMProvider):
                     f"unexpected output format: {result.stdout[:200]!r}",
                 ) from exc
 
+            # Log per-call token usage (incl. cache_creation/cache_read) like the
+            # other CLI paths — this is the production tool-bearing chat path, so
+            # without this chat_usage.jsonl misses the bulk of real chat turns.
+            log_usage(
+                persona_dir,
+                call_type="chat",
+                model=self._model,
+                frame=payload,
+            )
+
             dispatched = _read_audit_lines_since(
                 audit_log_path,
                 audit_offset_before,
