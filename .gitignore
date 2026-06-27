@@ -133,3 +133,11 @@ app/.claude/
 # caveman plugin install state
 .claude/skills/
 skills-lock.json
+
+# Codex agent config + instruction mirror (personal, parallel to .claude/)
+.codex/
+AGENTS.md
+# pnpm v10 auto-generated build-approval scratch (placeholder values)
+app/pnpm-workspace.yaml
+# dragonfly diagnosis hunts — local working/scratch (ledgers + token harnesses)
+hunts/
