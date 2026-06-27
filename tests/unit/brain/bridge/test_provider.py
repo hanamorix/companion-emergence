@@ -595,3 +595,43 @@ def test_llm_provider_complete_delegates_to_generate() -> None:
     assert via_complete == via_generate
     # Sanity: shim isn't a stub returning empty/None.
     assert via_complete.startswith("DREAM: ")
+
+
+def test_ollama_chat_excludes_context_keys_from_generation_options() -> None:
+    """Option-A/A+ context keys must NOT leak into Ollama's gen-params.
+
+    engine.respond threads volatile_suffix / include_block_clock / session_id (and persona_dir)
+    through the provider `options` dict. Those are internal context-routing keys, not Ollama
+    sampler params — if they reach payload["options"] they corrupt the model's generation params.
+    Real sampler params (e.g. temperature) must still pass through. (Fork 7e7c7491.)
+    """
+    from unittest.mock import MagicMock, patch
+
+    from brain.bridge.chat import ChatMessage
+    from brain.bridge.provider import OllamaProvider
+
+    captured: dict = {}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002 - mirrors httpx.post kwarg
+        captured["payload"] = json
+        resp = MagicMock()
+        resp.raise_for_status = lambda: None
+        resp.json = lambda: {"message": {"content": "ok"}}
+        return resp
+
+    with patch("httpx.post", side_effect=_fake_post):
+        OllamaProvider().chat(
+            [ChatMessage(role="user", content="hello")],
+            options={
+                "persona_dir": "/tmp/x",
+                "volatile_suffix": "VOLATILE",
+                "include_block_clock": False,
+                "session_id": "sess-1",
+                "temperature": 0.7,
+            },
+        )
+
+    opts = captured["payload"].get("options", {})
+    assert opts.get("temperature") == 0.7, "real sampler param must pass through"
+    for leaked in ("persona_dir", "volatile_suffix", "include_block_clock", "session_id"):
+        assert leaked not in opts, f"{leaked} leaked into Ollama generation options"

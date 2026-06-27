@@ -119,7 +119,14 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 
-_PROVIDER_CONTEXT_OPTION_KEYS = frozenset({"persona_dir"})
+_PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
+    # Internal context-routing keys threaded through the provider `options` dict by
+    # engine.respond — NOT generation params. They must be stripped before options are
+    # forwarded to a provider's sampler (e.g. Ollama gen-params), or they corrupt the
+    # model call. Keep in sync with every context key engine.py sets on chat_options
+    # (persona_dir + the Option-A/A+ trio). See fork 7e7c7491.
+    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id"}
+)
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
 # this many seconds, the subprocess is treated as wedged: it gets terminated
