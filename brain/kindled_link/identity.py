@@ -100,3 +100,39 @@ class KindledIdentity:
 
     def sign(self, data: bytes) -> bytes:
         return self._priv.sign(data)
+
+    @classmethod
+    def rotate(cls, persona_dir: Path) -> tuple[KindledIdentity, KindledIdentity]:
+        """Generate a new keypair, write it atomically. Returns (new, old).
+
+        The caller MUST use `old` to sign rotation notices before discarding it.
+        The key file is overwritten with the same mkstemp→fsync→os.replace
+        atomicity as load_or_create (#44). `old` remains valid in memory
+        throughout the caller's lifetime — only the on-disk file changes."""
+        old = cls.load_or_create(persona_dir)
+        key_path = persona_dir / _KEY_DIRNAME / _KEY_FILENAME
+        priv = Ed25519PrivateKey.generate()
+        raw = priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(key_path.parent), prefix=".identity-rotate-", suffix=".tmp"
+        )
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+            os.close(fd)
+            os.replace(tmp_name, key_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
+        return cls(priv), old
