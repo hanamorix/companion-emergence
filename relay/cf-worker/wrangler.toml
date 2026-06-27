@@ -1,0 +1,16 @@
+name = "kindled-relay"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kindled-relay"
+database_id = "PLACEHOLDER_SET_IN_TASK_7"   # filled by `wrangler d1 create` at deploy
+
+# CF native fixed-window rate limiting (free). 60 requests / 60s per key.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
