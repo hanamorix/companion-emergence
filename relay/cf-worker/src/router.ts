@@ -8,6 +8,15 @@ function newNonce(): string { return bytesToHex(crypto.getRandomValues(new Uint8
 export async function handle(request: Request, env: Env, store: Store, nowMs: number): Promise<Response> {
   const url = new URL(request.url);
   if (request.method !== "POST") return new Response("not found", { status: 404 });
+
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip && env.RATE_LIMITER) {
+    try {
+      const { success } = await env.RATE_LIMITER.limit({ key: ip });
+      if (!success) return Response.json({ detail: "rate limit exceeded" }, { status: 429 });
+    } catch { /* fail-open: a limiter error must never 500 the relay */ }
+  }
+
   let body: any;
   try { body = await request.json(); } catch { return Response.json({ detail: "bad json" }, { status: 400 }); }
 
