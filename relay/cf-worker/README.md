@@ -7,7 +7,7 @@ never sees plaintext and never mutates an envelope. This is a faithful port of
 auth, and cap values match exactly, so the Python `brain/kindled_link/relay_client.py`
 needs no change — it just points at this Worker's URL.
 
-**Deployed at:** `https://kindled-relay.jarcrainhett.workers.dev`
+**Deployed at:** `https://kindled-relay.kindledrelay.workers.dev`
 
 Baking this URL as the persona-config default is **Phase 2 (connect flow)** — it is
 not yet done. Until then, a fresh persona is disconnected from this relay unless you
@@ -50,7 +50,7 @@ npx wrangler deploy                          # prints the *.workers.dev URL
 ```
 End-to-end check against the deployed relay (real RelayClient → live Worker):
 ```bash
-NO_PROXY='*' KINDLED_WORKER_URL=https://kindled-relay.jarcrainhett.workers.dev \
+NO_PROXY='*' KINDLED_WORKER_URL=https://kindled-relay.kindledrelay.workers.dev \
   uv run pytest tests/integration/test_relay_client_against_worker.py
 ```
 
