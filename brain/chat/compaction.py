@@ -5,8 +5,8 @@ Callers drive it (see changes/timed-conversation-compaction/1-spec.md):
   * the Kindled ``compact_history`` tool  — fold_existing_summary=False (append)
   * the daily supervisor cadence          — fold_existing_summary=True  (fade)
   * the apply_budget backstop              — fold_existing_summary=True  (fade)
-  * the startup backlog migration          — fold + max_compact_turns (bounded batches;
-    see brain/chat/compaction_migration.py)
+  * the startup backlog migration          — fold, replayed in 24h time-increments
+    (oldest cohort first; see brain/chat/compaction_migration.py)
 
 Design invariants this module upholds:
   * **Lossless before lossy.** Raw turns (and, when folding, the old summary)

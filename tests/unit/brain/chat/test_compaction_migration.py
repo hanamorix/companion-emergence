@@ -77,14 +77,15 @@ fixture_required = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------- C-M2/3/4/7/10
+# ---------------------------------------------------------------- C-M2/4/7/10
 @fixture_required
-def test_cm2_cm3_cm7_backlog_drained_and_bounded(tmp_path: Path) -> None:
+def test_cm2_cm7_backlog_drained(tmp_path: Path) -> None:
+    now = datetime(2026, 6, 30, tzinfo=UTC)  # fixed → deterministic vs the fixture ts
     rows = _load_fixture(tmp_path)
     original_raw = _raw(rows)
     prov = _StubProvider()
 
-    res = run_backlog_migration(tmp_path, provider=prov, batch=40)
+    res = run_backlog_migration(tmp_path, provider=prov, now=now)
 
     # C-M2: head is one summary, only the protected tail (<=40) remains live.
     session = read_session(tmp_path, FIXTURE_SID)
@@ -94,24 +95,54 @@ def test_cm2_cm3_cm7_backlog_drained_and_bounded(tmp_path: Path) -> None:
     assert _marker_path(tmp_path).exists()
     assert res.marker_written is True
 
-    # C-M3: every provider call sees <=40 raw turns; batching actually happened.
-    assert prov.calls, "expected at least one fold call"
-    assert all(_count_transcript_raw_turns(p) <= 40 for p in prov.calls)
-    removable_total = len(original_raw) - len(live_raw)
-    expected_passes = -(-removable_total // 40)  # ceil
-    # one extra "nothing_aged" no-op pass terminates the loop
-    assert res.total_passes == expected_passes + 1
-    assert len(prov.calls) == expected_passes  # no-op pass makes no generate call
+    # Folded everything aged past the tail, across MULTIPLE 24h time-steps (not one
+    # enormous call, and not fixed-size count batches — see the time-stepping test).
+    assert res.total_compacted == len(original_raw) - len(live_raw)
+    assert 1 < len(prov.calls) < len(original_raw)
 
-    # C-M7: completed without hitting the ceiling.
+    # C-M7: drained, no ceiling hit.
     assert res.sessions_drained == 1 and not res.undrained_sessions
+
+
+# ------------------------------------------------- time-stepping (24h increments)
+def test_time_stepping_one_fold_per_24h_cohort(tmp_path: Path) -> None:
+    """The migration REPLAYS the daily cadence: one fold per 24h cohort, oldest
+    first — not fixed-size message-count batches. 3 day-cohorts → 3 folds (a count
+    batcher would do ceil(260/40)=7)."""
+    now = datetime(2026, 6, 27, 12, 0, 0, tzinfo=UTC)
+    sid, days, per_day = "sess-days", 3, 100
+    rows: list[dict] = []
+    for d in range(days):  # d=0 oldest; each day sits cleanly inside one 24h window
+        base = now - timedelta(hours=24 * (days - d) + 2)
+        for i in range(per_day):
+            ts = (base + timedelta(minutes=i)).isoformat(timespec="seconds")
+            rows.append({"session_id": sid,
+                         "speaker": "user" if len(rows) % 2 == 0 else "assistant",
+                         "text": f"day{d} turn{i}", "ts": ts})
+    ac = tmp_path / "active_conversations"; ac.mkdir(parents=True)
+    (ac / f"{sid}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    write_cursor(tmp_path, sid, rows[-1]["ts"])
+    prov = _StubProvider()
+
+    res = run_backlog_migration(tmp_path, provider=prov, now=now)
+
+    # One fold per 24h cohort, oldest-first; NOT count batches.
+    assert len(prov.calls) == days
+    assert res.total_passes == days
+    # 100 + 100 + (100 - 40 protected tail) = 260 folded.
+    assert res.total_compacted == days * per_day - 40
+    archived = [t for t in read_archive(tmp_path, sid) if t.get("speaker") != "summary"]
+    assert [t["ts"] for t in archived] == sorted(t["ts"] for t in archived)  # oldest-first
+    assert archived[0]["text"] == "day0 turn0"  # oldest cohort folded first
+    session = read_session(tmp_path, sid)
+    assert session[0]["speaker"] == "summary" and len(_raw(session)) == 40
 
 
 @fixture_required
 def test_cm4_lossless_multiset(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original = Counter(_identity(t) for t in _raw(rows))
-    run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    run_backlog_migration(tmp_path, provider=_StubProvider())
 
     archived = Counter(_identity(t) for t in read_archive(tmp_path, FIXTURE_SID)
                        if t.get("speaker") != "summary")
@@ -125,7 +156,7 @@ def test_cm4_lossless_multiset(tmp_path: Path) -> None:
 def test_cm10_archive_oldest_first_contiguous(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original_raw = _raw(rows)
-    run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    run_backlog_migration(tmp_path, provider=_StubProvider())
 
     archived_raw = [t for t in read_archive(tmp_path, FIXTURE_SID)
                     if t.get("speaker") != "summary"]
@@ -172,7 +203,7 @@ def test_cm1_marker_gate_is_noop(tmp_path: Path) -> None:
 # --------------------------------------------------------------------- C-M5
 def test_cm5_idempotent_rerun_and_drained(tmp_path: Path) -> None:
     _seed_small_backlog(tmp_path, "sid-a")
-    run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    run_backlog_migration(tmp_path, provider=_StubProvider())
     assert _marker_path(tmp_path).exists()
 
     # (a) re-run with marker present → no provider calls.
@@ -213,7 +244,7 @@ def test_cm6_mid_cursor_only_folds_extracted(tmp_path: Path) -> None:
     mid_ts = rows[50]["ts"]
     write_cursor(tmp_path, "sid-a", mid_ts)  # only turns <= rows[50] are extracted
 
-    run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    run_backlog_migration(tmp_path, provider=_StubProvider())
 
     for t in read_archive(tmp_path, "sid-a"):
         if t.get("speaker") == "summary":
@@ -238,7 +269,7 @@ def test_cm8_fault_isolation_one_session_raises(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(mig, "compact_conversation", flaky)
 
     # Must NOT raise out of the entry point.
-    res = run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    res = run_backlog_migration(tmp_path, provider=_StubProvider())
 
     assert "sid-b" in seen                         # other session still processed
     assert "sid-a" in res.undrained_sessions
@@ -256,11 +287,11 @@ def test_cm12_transient_noop_withholds_marker(tmp_path: Path, monkeypatch, trans
         return CompactionResult(False, 0, 0, False, False, reason=transient_reason)
 
     monkeypatch.setattr(mig, "compact_conversation", transient)
-    res1 = run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    res1 = run_backlog_migration(tmp_path, provider=_StubProvider())
     assert not _marker_path(tmp_path).exists()     # transient miss → no marker
     assert "sid-a" in res1.undrained_sessions and res1.marker_written is False
 
     # Restore the real core → it drains and the marker is now written (retry path).
     monkeypatch.setattr(mig, "compact_conversation", real)
-    res2 = run_backlog_migration(tmp_path, provider=_StubProvider(), batch=40)
+    res2 = run_backlog_migration(tmp_path, provider=_StubProvider())
     assert _marker_path(tmp_path).exists() and res2.marker_written is True

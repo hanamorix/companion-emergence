@@ -7,11 +7,14 @@ potentially hundreds of aged, already-extracted turns. The live path
 which folds *all* removable turns in *one* provider call — on a large backlog that is
 a single enormous summary call ("hit cold").
 
-``run_backlog_migration`` drains that backlog ONCE, GRACEFULLY, in bounded batches, at
-startup, before the live path touches it. It is a thin *driver* over the shared
-compaction core (``compact_conversation`` with ``max_compact_turns``) — no second
-compaction implementation, so every core invariant (lossless-before-lossy, cursor
-guard, ``min_keep_tail``, idempotency, lock) is reused, not re-derived.
+``run_backlog_migration`` drains that backlog ONCE, GRACEFULLY, at startup, before the
+live path touches it, by REPLAYING the daily cadence: it folds in 24h time-increments,
+oldest cohort first — fold everything ≥N days old, then ≥(N-1) days old + the running
+summary, … down to the live 24h cutoff. Each provider call therefore sees at most ~one
+day of new messages plus the re-compressed summary, never the whole backlog. It is a
+thin *driver* over the shared compaction core (``compact_conversation`` with a stepped
+``older_than``) — no second compaction implementation, so every core invariant
+(lossless-before-lossy, cursor guard, ``min_keep_tail``, idempotency, lock) is reused.
 
 Run-once is gated by the marker ``archived_conversations/.compat_migrated``, written
 **only** when every active session reached a *drained* end-state. A transient miss
@@ -32,7 +35,7 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import compact_conversation
-from brain.ingest.buffer import list_active_sessions
+from brain.ingest.buffer import list_active_sessions, read_cursor, read_session
 
 logger = logging.getLogger(__name__)
 
@@ -75,80 +78,130 @@ def _write_marker(persona_dir: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+def _parse_ts(raw: object) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
 def _drain_session(
     persona_dir: Path,
     session_id: str,
     *,
     provider: LLMProvider,
-    batch: int,
-    older_than: timedelta,
+    step: timedelta,
+    older_than_floor: timedelta,
+    now: datetime,
     max_passes: int,
     result: MigrationResult,
 ) -> bool:
-    """Fold one session's backlog in bounded batches. Returns True iff drained.
+    """Fold one session's backlog in time increments — OLDEST cohort first.
 
-    Each pass folds the oldest ``batch`` removable turns into the (re-compressed)
-    head summary, so no single provider call ever sees the whole backlog. A pass
-    that returns compacted=True made progress and the loop continues; the first
-    compacted=False ends it — drained only if the reason says so.
+    This historically REPLAYS the daily cadence: fold everything older than the
+    oldest whole-``step`` boundary, then lower the age threshold by one ``step``
+    each pass, folding the next cohort into the running summary, down to
+    ``older_than_floor`` (the live cadence's own 24h cutoff). With ``step`` =
+    ``older_than_floor`` = 24h that is exactly "fold all messages ≥3 days old, then
+    ≥2 days old + the summary, then ≥1 day old + the summary". Each provider call
+    therefore sees at most ~one ``step`` of new messages plus the re-compressed
+    summary — never the whole backlog. Returns True iff drained (no transient miss
+    / ceiling / error).
     """
-    for _ in range(max_passes):
+    cursor = read_cursor(persona_dir, session_id)
+    if cursor is None:
+        # Nothing extracted yet → genuinely nothing foldable; a drained no-op.
+        return True
+    turns = read_session(persona_dir, session_id)
+    aged = [
+        now - ts
+        for ts in (
+            _parse_ts(t.get("ts")) for t in turns if t.get("speaker") != "summary"
+        )
+        if ts is not None and (now - ts) >= older_than_floor
+    ]
+    if not aged:
+        return True  # nothing older than the floor → nothing to fold
+    # Highest step that still covers the oldest aged turn; descend to the floor so
+    # the OLDEST messages fold first (the user's "3 days old, then 2 days old +
+    # summary" semantics). int() floors, so step*k ≤ oldest_age — the oldest cohort
+    # is always captured at k = n_steps.
+    n_steps = max(1, int(max(aged) / step))
+    if n_steps > max_passes:
+        logger.warning(
+            "backlog migration: session=%s needs %d steps > max_passes=%d; capping "
+            "(some of the oldest backlog will fold next start)",
+            session_id, n_steps, max_passes,
+        )
+        n_steps = max_passes
+    for k in range(n_steps, 0, -1):
         res = compact_conversation(
             persona_dir,
             session_id,
-            older_than=older_than,
+            older_than=max(older_than_floor, step * k),
             fold_existing_summary=True,
             provider=provider,
-            max_compact_turns=batch,
+            now=now,
         )
         result.total_passes += 1
         if res.compacted:
-            # Progress (reason=="ok"). Note: a provider failure also returns
-            # compacted=True with a deterministic soft note (fell_soft) — still
-            # progress, so we keep draining, never spin on it.
+            # Progress (reason=="ok"; a provider failure still returns compacted=
+            # True with a deterministic soft note — still progress, never spins).
             result.total_compacted += res.compacted_n
             continue
-        # compacted is False → a no-op. Drained only for a genuine end-state;
-        # locked / archive_failed are transient → leave undrained, retry later.
-        return res.reason in _DRAINED_REASONS
-    # Hit the pass ceiling without draining (pathological) — withhold the marker.
-    logger.warning(
-        "backlog migration: session=%s hit max_passes=%d without draining",
-        session_id, max_passes,
-    )
-    return False
+        if res.reason not in _DRAINED_REASONS:
+            # locked / archive_failed → transient: stop, withhold marker, retry.
+            return False
+        # nothing_aged for this cohort (an empty step) → continue to the next.
+    return True
 
 
 def run_backlog_migration(
     persona_dir: Path,
     *,
     provider: LLMProvider,
-    batch: int = 40,
-    older_than: timedelta = timedelta(hours=24),
+    step: timedelta = timedelta(hours=24),
+    older_than_floor: timedelta = timedelta(hours=24),
+    now: datetime | None = None,
     max_passes_per_session: int = 1000,
 ) -> MigrationResult:
-    """Drain every active conversation's pre-compaction backlog, once, in batches.
+    """Drain every active conversation's pre-compaction backlog, once, by REPLAYING
+    the daily cadence in ``step`` (default 24h) time-increments, oldest cohort first.
 
     Fault-isolated: never raises. The run-once marker is written only when EVERY
     active session reaches a drained end-state; any transient miss / error / ceiling
-    withholds it so a later restart retries. See module docstring.
+    withholds it so a later restart retries. See module docstring + _drain_session.
     """
     result = MigrationResult()
     persona_dir = Path(persona_dir)
+    now = now or datetime.now(UTC)
     try:
         if _marker_path(persona_dir).exists():
             result.already_migrated = True
             return result
 
+        # Create the archive dir up-front (before any provider call) as a visible
+        # "migration started" indicator, and log a start line — so a running-but-slow
+        # migration is observable from the filesystem and the log. The MARKER (not
+        # the dir) is the run-once gate, so creating the dir early is safe for
+        # idempotency: an incomplete run leaves the dir present but the marker absent.
+        (persona_dir / "archived_conversations").mkdir(parents=True, exist_ok=True)
         sessions = list_active_sessions(persona_dir)
         result.sessions_seen = len(sessions)
+        logger.info(
+            "backlog migration: starting — %d active session(s): %s",
+            len(sessions), sessions,
+        )
         all_drained = True
         for sid in sessions:
             try:
                 drained = _drain_session(
                     persona_dir, sid,
-                    provider=provider, batch=batch, older_than=older_than,
-                    max_passes=max_passes_per_session, result=result,
+                    provider=provider, step=step, older_than_floor=older_than_floor,
+                    now=now, max_passes=max_passes_per_session, result=result,
                 )
             except Exception:
                 logger.exception("backlog migration: session=%s raised; left undrained", sid)
