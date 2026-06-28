@@ -1,5 +1,6 @@
 import { Env } from "./index";
 import { Store, RelayReject } from "./storage";
+import { checkAuth } from "./auth";
 
 function bytesToHex(b: Uint8Array): string { return [...b].map((x) => x.toString(16).padStart(2, "0")).join(""); }
 function newNonce(): string { return bytesToHex(crypto.getRandomValues(new Uint8Array(16))); }
@@ -26,6 +27,15 @@ export async function handle(request: Request, env: Env, store: Store, nowMs: nu
       case "/envelope": {
         const id = await store.push(body as Record<string, unknown>, nowMs);
         return Response.json({ id });
+      }
+      case "/mailbox/fetch": {
+        await checkAuth(store, body, nowMs);
+        return Response.json({ envelopes: await store.fetch(String(body.mailbox_id)) });
+      }
+      case "/mailbox/ack": {
+        await checkAuth(store, body, nowMs);
+        await store.ack(String(body.mailbox_id), (body.envelope_ids ?? []).map(String));
+        return Response.json({ ok: true });
       }
       default:
         return new Response("not found", { status: 404 });
