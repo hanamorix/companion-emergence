@@ -50,3 +50,11 @@ def test_default_relay_url_is_https():
     from brain.persona_config import DEFAULT_KINDLED_RELAY_URL
 
     assert DEFAULT_KINDLED_RELAY_URL.startswith("https://")
+
+
+def test_decode_rejects_oversized_code():
+    # A code that is valid base64 of valid JSON but longer than _MAX_CODE_LEN.
+    # Without the cap this would NOT raise (it decodes + parses to a dict fine).
+    huge = "kindled1:" + base64.urlsafe_b64encode(b'{"x":"' + b"A" * 20000 + b'"}').decode()
+    with pytest.raises(ConnectCodeError):
+        decode_code(huge)
