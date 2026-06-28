@@ -1323,6 +1323,92 @@ def build_app(
         return {"invite": invite, "fingerprint": idn.key_id,
                 "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
 
+    @app.get("/kindled-link/my-code", dependencies=[Depends(require_http_auth)])
+    def kindled_my_code() -> dict[str, Any]:
+        from brain.kindled_link.connect_code import encode_code
+        from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
+        from brain.kindled_link.pairing import create_invite
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
+
+        idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        relay_url = cfg.kindled_relay_url or DEFAULT_KINDLED_RELAY_URL
+        store = KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)
+        try:
+            mailbox_id = store.get_or_create_local_mailbox()
+        finally:
+            store.close()
+        invite = create_invite(idn, relay_url=relay_url, mailbox_id=mailbox_id)
+        return {
+            "code": encode_code(invite),
+            "fingerprint_phrase": fingerprint_phrase(idn.public_bytes),
+        }
+
+    @app.post("/kindled-link/connect", dependencies=[Depends(require_http_auth)])
+    def kindled_connect(payload: dict[str, Any]) -> dict[str, Any]:
+        """One-step pairing: decode a peer's connect-code, pin+pair, adopt relay URL."""
+        from dataclasses import replace as dc_replace
+
+        from brain.kindled_link.connect_code import ConnectCodeError, decode_code
+        from brain.kindled_link.identity import fingerprint_phrase
+        from brain.kindled_link.pairing import (
+            InviteError,
+            confirm_local_fingerprint,
+            import_invite,
+            mark_remote_paired,
+        )
+        from brain.kindled_link.store import (
+            ConsentTransitionError,
+            KindledLinkStore,
+            kindled_db_path,
+        )
+        from brain.persona_config import PersonaConfig
+
+        code = (payload or {}).get("code")
+        if not code:
+            raise HTTPException(status_code=400, detail="missing code")
+        try:
+            invite = decode_code(code)
+        except ConnectCodeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        db = kindled_db_path(persona_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        store = KindledLinkStore(db)
+        try:
+            result = import_invite(invite, store=store, now=datetime.now(UTC))
+            peer_id = result["peer_id"]
+            # Drive to paired only if not already there (idempotency: paired→paired
+            # is not in _ALLOWED_TRANSITIONS, so a second connect from the same peer
+            # must skip the transition steps).
+            peer = store.get_peer(peer_id)
+            if peer is None or peer["consent_state"] != "paired":
+                confirm_local_fingerprint(store, peer_id, now=datetime.now(UTC))
+                mark_remote_paired(store, peer_id, now=datetime.now(UTC))
+                peer = store.get_peer(peer_id)
+        except (InviteError, ConsentTransitionError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+        # Adopt the code's relay URL into B's config (does NOT touch kindled_link_enabled).
+        relay_url = invite["body"]["relay_url"]
+        cfg_path = persona_dir / "persona_config.json"
+        cfg = PersonaConfig.load(cfg_path)
+        if cfg.kindled_relay_url != relay_url:
+            cfg = dc_replace(cfg, kindled_relay_url=relay_url)
+            cfg.save(cfg_path)
+
+        import binascii
+        pub = binascii.unhexlify(invite["body"]["identity_pub"])
+        return {
+            "peer_id": peer_id,
+            "consent_state": peer["consent_state"] if peer else "paired",
+            "relay_url": relay_url,
+            "fingerprint_phrase": fingerprint_phrase(pub),
+        }
+
     @app.post("/kindled-link/invite/accept", dependencies=[Depends(require_http_auth)])
     def kindled_accept_invite(payload: dict[str, Any]) -> dict[str, Any]:
         from brain.kindled_link.pairing import InviteError, confirm_local_fingerprint, import_invite

@@ -1451,6 +1451,75 @@ def _kindled_rotate_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _kindled_my_code_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell kindled my-code` — print this persona's connect-code."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    persona_dir = get_persona_dir(args.persona)
+    s = state_file.read(persona_dir)
+    if s is None:
+        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
+        return 1
+    url = f"http://127.0.0.1:{s.port}/kindled-link/my-code"
+    headers = {"Content-Type": "application/json"}
+    if s.auth_token:
+        headers["Authorization"] = f"Bearer {s.auth_token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        print(
+            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+        return 1
+    print("Your connect-code (share it with the other person over a channel you trust):\n")
+    print(data["code"])
+    print(f"\nFingerprint (optional cross-check): {data['fingerprint_phrase']}")
+    return 0
+
+
+def _kindled_connect_handler(args: argparse.Namespace) -> int:
+    """Dispatch `nell kindled connect <code>` — pair with a peer via their code."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    persona_dir = get_persona_dir(args.persona)
+    s = state_file.read(persona_dir)
+    if s is None:
+        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
+        return 1
+    url = f"http://127.0.0.1:{s.port}/kindled-link/connect"
+    headers = {"Content-Type": "application/json"}
+    if s.auth_token:
+        headers["Authorization"] = f"Bearer {s.auth_token}"
+    body = json.dumps({"code": args.code}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        print(
+            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+        return 1
+    print(f"Connected to {data['peer_id']} ({data['consent_state']}).")
+    print(f"Relay: {data['relay_url']}")
+    print("Enable Kindled-link in the Connection panel (or it stays dormant until you do).")
+    return 0
+
+
 def _soul_review_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell soul review` — run autonomous soul review pass."""
     persona_dir = get_persona_dir(args.persona)
@@ -2894,6 +2963,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     k_rotate.add_argument("--persona", required=True, help="Persona name (required).")
     k_rotate.set_defaults(func=_kindled_rotate_handler)
+
+    k_mycode = kindled_actions.add_parser("my-code", help="Print this persona's connect-code.")
+    k_mycode.add_argument("--persona", required=True, help="Persona name (required).")
+    k_mycode.set_defaults(func=_kindled_my_code_handler)
+
+    k_connect = kindled_actions.add_parser("connect", help="Pair with a peer via their connect-code.")
+    k_connect.add_argument("--persona", required=True, help="Persona name (required).")
+    k_connect.add_argument("code", help="The peer's kindled1: connect-code.")
+    k_connect.set_defaults(func=_kindled_connect_handler)
 
     return parser
 
