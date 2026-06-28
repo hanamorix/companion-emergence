@@ -39,6 +39,13 @@ def test_decode_rejects_non_dict_payload():
         decode_code("kindled1:" + payload)
 
 
+def test_decode_rejects_non_ascii_base64():
+    # A code whose b64 part contains non-ASCII chars must raise ConnectCodeError,
+    # not UnicodeEncodeError bubbling as a 500.
+    with pytest.raises(ConnectCodeError):
+        decode_code("kindled1:café==")
+
+
 def test_default_relay_url_is_https():
     from brain.persona_config import DEFAULT_KINDLED_RELAY_URL
 

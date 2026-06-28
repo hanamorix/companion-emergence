@@ -33,7 +33,7 @@ def decode_code(code: str) -> dict:
     try:
         raw = base64.urlsafe_b64decode(b64.encode("ascii"))
         payload = json.loads(raw)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, UnicodeError) as exc:
         raise ConnectCodeError("malformed connect-code") from exc
     if not isinstance(payload, dict):
         raise ConnectCodeError("connect-code payload is not an object")
