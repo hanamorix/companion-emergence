@@ -1363,7 +1363,7 @@ def build_app(
             KindledLinkStore,
             kindled_db_path,
         )
-        from brain.persona_config import PersonaConfig
+        from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
 
         code = (payload or {}).get("code")
         if not code:
@@ -1376,28 +1376,36 @@ def build_app(
         db = kindled_db_path(persona_dir)
         db.parent.mkdir(parents=True, exist_ok=True)
         store = KindledLinkStore(db)
+        now = datetime.now(UTC)
         try:
-            result = import_invite(invite, store=store, now=datetime.now(UTC))
-            peer_id = result["peer_id"]
-            # Drive to paired only if not already there (idempotency: paired→paired
-            # is not in _ALLOWED_TRANSITIONS, so a second connect from the same peer
-            # must skip the transition steps).
-            peer = store.get_peer(peer_id)
-            if peer is None or peer["consent_state"] != "paired":
-                confirm_local_fingerprint(store, peer_id, now=datetime.now(UTC))
-                mark_remote_paired(store, peer_id, now=datetime.now(UTC))
+            # Idempotency: if this peer is already paired, do NOT re-import (which would
+            # transiently reset consent to pending_local via upsert_peer). Verify the
+            # code is still valid by decoding the fingerprint, then short-circuit.
+            existing_peer_id = invite.get("body", {}).get("fingerprint")
+            existing = store.get_peer(existing_peer_id) if existing_peer_id else None
+            if existing is not None and existing["consent_state"] == "paired":
+                peer_id = existing_peer_id
+                peer = existing
+            else:
+                result = import_invite(invite, store=store, now=now)  # sig-verified pin
+                peer_id = result["peer_id"]
+                confirm_local_fingerprint(store, peer_id, now=now)
+                mark_remote_paired(store, peer_id, now=now)
                 peer = store.get_peer(peer_id)
         except (InviteError, ConsentTransitionError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             store.close()
 
-        # Adopt the code's relay URL into B's config (does NOT touch kindled_link_enabled).
-        relay_url = invite["body"]["relay_url"]
+        # Use OUR OWN relay — never adopt a relay dictated by the peer's code (a hostile
+        # code could otherwise pin our traffic to the attacker's relay once enabled).
+        # Both honest peers default to the hosted relay → they converge; custom-relay
+        # pairs configure their relay manually via the config endpoint.
         cfg_path = persona_dir / "persona_config.json"
         cfg = PersonaConfig.load(cfg_path)
-        if cfg.kindled_relay_url != relay_url:
-            cfg = dc_replace(cfg, kindled_relay_url=relay_url)
+        own_relay = cfg.kindled_relay_url or DEFAULT_KINDLED_RELAY_URL
+        if cfg.kindled_relay_url != own_relay:
+            cfg = dc_replace(cfg, kindled_relay_url=own_relay)
             cfg.save(cfg_path)
 
         import binascii
@@ -1405,7 +1413,7 @@ def build_app(
         return {
             "peer_id": peer_id,
             "consent_state": peer["consent_state"] if peer else "paired",
-            "relay_url": relay_url,
+            "relay_url": own_relay,
             "fingerprint_phrase": fingerprint_phrase(pub),
         }
 
