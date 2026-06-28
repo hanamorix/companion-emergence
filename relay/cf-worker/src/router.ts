@@ -43,7 +43,7 @@ export async function handle(request: Request, env: Env, store: Store, nowMs: nu
       }
       case "/mailbox/ack": {
         await checkAuth(store, body, nowMs);
-        await store.ack(String(body.mailbox_id), (body.envelope_ids ?? []).map(String));
+        await store.ack(String(body.mailbox_id), Array.isArray(body.envelope_ids) ? body.envelope_ids.map(String) : []);
         return Response.json({ ok: true });
       }
       default:
