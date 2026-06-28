@@ -40,4 +40,26 @@ describe("fetch + ack auth", () => {
     const ar = await post("/mailbox/ack", { mailbox_id: "m1", envelope_ids: [envelopes[0].id], nonce: n2, signature: hex(sig2), identity_pub: pubHex });
     expect((await ar.json<{ ok: boolean }>()).ok).toBe(true);
   });
+
+  it("ack with non-array envelope_ids does not 500 — returns 200 ok (no-op)", async () => {
+    const { kp, pubHex, hex } = await keypair();
+    await post("/mailbox/register", { mailbox_id: "m2", identity_pub: pubHex });
+    await post("/envelope", { relay_mailbox: "m2", ciphertext: "bb" });
+
+    const { nonce } = await (await post("/mailbox/challenge", { mailbox_id: "m2" })).json<{ nonce: string }>();
+    const authBody = canonicalJson({ purpose: "kindled-relay-auth/1", mailbox: "m2", nonce });
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, new TextEncoder().encode(authBody)));
+
+    const ar = await post("/mailbox/ack", { mailbox_id: "m2", envelope_ids: "not-an-array", nonce, signature: hex(sig), identity_pub: pubHex });
+    expect(ar.status).toBe(200);
+    expect((await ar.json<{ ok: boolean }>()).ok).toBe(true);
+
+    // envelope was NOT deleted (no-op ack)
+    const { nonce: n2 } = await (await post("/mailbox/challenge", { mailbox_id: "m2" })).json<{ nonce: string }>();
+    const ab2 = canonicalJson({ purpose: "kindled-relay-auth/1", mailbox: "m2", nonce: n2 });
+    const sig2 = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, new TextEncoder().encode(ab2)));
+    const fr = await post("/mailbox/fetch", { mailbox_id: "m2", nonce: n2, signature: hex(sig2), identity_pub: pubHex });
+    const { envelopes } = await fr.json<{ envelopes: { id: string }[] }>();
+    expect(envelopes.length).toBe(1);
+  });
 });
