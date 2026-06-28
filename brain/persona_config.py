@@ -28,6 +28,11 @@ DEFAULT_PROVIDER = "claude-cli"
 DEFAULT_SEARCHER = "ddgs"
 DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
 DEFAULT_MODEL = "sonnet"
+# The hosted Kindled-link relay (free CF Worker, Phase 1). NOT wired into
+# PersonaConfig.load — kindled_relay_url stays None until a peer connect adopts
+# a relay (Phase 2), so an un-connected persona is dormant. Used only at
+# connect-code generation (default when no relay configured) + adopted at connect.
+DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 
 # Allowlists for hand-edited or migrated config files. A value outside
 # the set degrades to the default with an attempt_heal anomaly logged
