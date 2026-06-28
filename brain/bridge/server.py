@@ -1502,6 +1502,23 @@ def build_app(
             "fingerprint_phrase": fingerprint_phrase(new_idn.public_bytes),
         }
 
+    # ── POST /kindled-link/self-test — in-process relay/crypto round-trip ────
+    @app.post("/kindled-link/self-test", dependencies=[Depends(require_http_auth)])
+    def kindled_self_test() -> dict[str, Any]:
+        """Drive the full Kindled-link loop (relay → pair → handshake → round-trip)
+        between the persona's real identity and a throwaway ephemeral peer.
+        Returns {ok, stages:[{name,ok,detail}], relay_url}. Never raises."""
+        import httpx
+
+        from brain.kindled_link import self_test as _self_test
+        from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
+
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        relay_url = cfg.kindled_relay_url or DEFAULT_KINDLED_RELAY_URL
+        # trust_env=False: a dev-shell proxy must not intercept the relay call.
+        with httpx.Client(base_url=relay_url, timeout=30, trust_env=False) as http:
+            return _self_test.run_self_test(persona_dir, http=http)
+
     # ── POST /persona/config/model — live model switching ──────────────────
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
