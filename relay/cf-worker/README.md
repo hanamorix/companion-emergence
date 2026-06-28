@@ -7,9 +7,12 @@ never sees plaintext and never mutates an envelope. This is a faithful port of
 auth, and cap values match exactly, so the Python `brain/kindled_link/relay_client.py`
 needs no change — it just points at this Worker's URL.
 
-**Live default:** `https://kindled-relay.jarcrainhett.workers.dev`
-(baked as `DEFAULT_KINDLED_RELAY_URL` in `brain/persona_config.py`; override per
-persona by setting `kindled_relay_url`, or globally via the `KINDLED_RELAY_URL` env var).
+**Deployed at:** `https://kindled-relay.jarcrainhett.workers.dev`
+
+Baking this URL as the persona-config default is **Phase 2 (connect flow)** — it is
+not yet done. Until then, a fresh persona is disconnected from this relay unless you
+explicitly configure it: set `kindled_relay_url` per-persona, or set the
+`KINDLED_RELAY_URL` env var globally. There is no auto-default today.
 
 ## Endpoints (parity with dev_relay.py)
 - `POST /mailbox/register` `{mailbox_id, identity_pub}` → `{ok, owner}` (first-write-wins)
