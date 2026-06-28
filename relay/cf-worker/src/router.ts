@@ -23,6 +23,10 @@ export async function handle(request: Request, env: Env, store: Store, nowMs: nu
         await store.issueNonce(String(body.mailbox_id), nonce, nowMs);
         return Response.json({ nonce });
       }
+      case "/envelope": {
+        const id = await store.push(body as Record<string, unknown>, nowMs);
+        return Response.json({ id });
+      }
       default:
         return new Response("not found", { status: 404 });
     }
