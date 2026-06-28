@@ -1323,6 +1323,28 @@ def build_app(
         return {"invite": invite, "fingerprint": idn.key_id,
                 "fingerprint_phrase": fingerprint_phrase(idn.public_bytes)}
 
+    @app.get("/kindled-link/my-code", dependencies=[Depends(require_http_auth)])
+    def kindled_my_code() -> dict[str, Any]:
+        from brain.kindled_link.connect_code import encode_code
+        from brain.kindled_link.identity import KindledIdentity, fingerprint_phrase
+        from brain.kindled_link.pairing import create_invite
+        from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+        from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
+
+        idn = KindledIdentity.load_or_create(persona_dir)  # mkdirs kindled_link/
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        relay_url = cfg.kindled_relay_url or DEFAULT_KINDLED_RELAY_URL
+        store = KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)
+        try:
+            mailbox_id = store.get_or_create_local_mailbox()
+        finally:
+            store.close()
+        invite = create_invite(idn, relay_url=relay_url, mailbox_id=mailbox_id)
+        return {
+            "code": encode_code(invite),
+            "fingerprint_phrase": fingerprint_phrase(idn.public_bytes),
+        }
+
     @app.post("/kindled-link/invite/accept", dependencies=[Depends(require_http_auth)])
     def kindled_accept_invite(payload: dict[str, Any]) -> dict[str, Any]:
         from brain.kindled_link.pairing import InviteError, confirm_local_fingerprint, import_invite
