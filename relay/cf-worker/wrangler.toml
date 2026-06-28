@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "kindled-relay"
-database_id = "PLACEHOLDER_SET_IN_TASK_7"   # filled by `wrangler d1 create` at deploy
+database_id = "d4d129df-0541-4942-8b18-97ceb168124f"
 
 # CF native fixed-window rate limiting (free). 60 requests / 60s per key.
 [[unsafe.bindings]]
