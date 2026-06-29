@@ -35,6 +35,16 @@ def _active_conversations_dir(persona_dir: Path) -> Path:
     return d
 
 
+def _archived_conversations_dir(persona_dir: Path) -> Path:
+    """Sibling of active_conversations/ — the lossless, append-only, NEVER
+    size-rotated archive of compacted raw turns + faded summaries. Kept a
+    sibling (not nested) so list_active_sessions / snapshot_stale_sessions
+    never glob it as a live session."""
+    d = persona_dir / "archived_conversations"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _validate_session_id(session_id: str) -> None:
     """Raise ValueError unless session_id matches _SESSION_ID_RE.
 
@@ -226,6 +236,132 @@ def delete_backoff(persona_dir: Path, session_id: str) -> None:
     """Idempotent unlink of the backoff sidecar."""
     path = _backoff_path(persona_dir, session_id)
     path.unlink(missing_ok=True)
+
+
+def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]) -> None:
+    """Atomically replace the active buffer with ``turns`` (verbatim).
+
+    Unlike ``ingest_turn`` this writes each record EXACTLY as given — no
+    ``.strip()``, no key rebuild — so nested fields (e.g. a summary row's
+    ``compaction`` provenance object) and exact byte content survive. Used by
+    compaction to install ``[summary, *retained_tail]``. Temp file + os.replace
+    mirrors ``write_cursor`` so a reader never sees a torn buffer.
+    """
+    path = _session_path(persona_dir, session_id)
+    tmp = path.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for rec in turns:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _archive_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/archived_conversations/<session_id>.jsonl."""
+    _validate_session_id(session_id)
+    return _archived_conversations_dir(persona_dir) / f"{session_id}.jsonl"
+
+
+def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> int:
+    """Append ``records`` to the conversation archive, fsync, return byte count.
+
+    Append-only and NEVER size-rotated (a truncating rotation would destroy the
+    provenance chain and no multi-segment reader exists). The returned byte
+    count lets the caller verify the write landed before mutating the live
+    buffer (the archive-before-rewrite atomicity contract).
+    """
+    if not records:
+        return 0
+    path = _archive_path(persona_dir, session_id)
+    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    data = payload.encode("utf-8")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(data)
+
+
+def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
+    """Return archived records (raw turns + faded summaries), skipping corrupt lines."""
+    return read_jsonl_skipping_corrupt(_archive_path(persona_dir, session_id))
+
+
+def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.compacting.
+
+    A `.jsonl`-suffixed glob (list_active_sessions) never picks this up, and
+    _validate_session_id keeps it inside the dir."""
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.compacting"
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with ``pid`` exists (signal 0 probe)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    return True
+
+
+def acquire_compaction_lock(
+    persona_dir: Path, session_id: str, *, stale_s: float = 600.0
+) -> bool:
+    """Try to acquire the per-session compaction lock. Return True on success.
+
+    Re-entrancy guard for the daily tick vs a manual tool call. A leftover lock
+    from a crash must not disable compaction forever, so a held lock is REAPED
+    when the recorded pid is dead (primary signal) OR its mtime is older than
+    ``stale_s`` (backstop for pid reuse). A live, recent lock → return False
+    (skip). The caller releases via release_compaction_lock in a finally.
+    """
+    path = _compacting_lock_path(persona_dir, session_id)
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        return True
+    except FileExistsError:
+        # Held — decide whether it is stale and reapable.
+        reap = False
+        try:
+            holder = json.loads(path.read_text(encoding="utf-8"))
+            holder_pid = int(holder.get("pid", -1))
+        except (OSError, ValueError, TypeError):
+            holder_pid = -1
+        if not _pid_alive(holder_pid):
+            reap = True
+        else:
+            try:
+                age = datetime.now(UTC).timestamp() - path.stat().st_mtime
+                if age > stale_s:
+                    reap = True
+            except OSError:
+                reap = False
+        if not reap:
+            return False
+        # Reap and re-acquire. unlink+re-create (not a plain overwrite) so two
+        # racers can't both believe they won — the O_EXCL re-create arbitrates.
+        try:
+            path.unlink(missing_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            return True
+        except FileExistsError:
+            return False
+
+
+def release_compaction_lock(persona_dir: Path, session_id: str) -> None:
+    """Idempotent unlink of the compaction lock sidecar."""
+    _compacting_lock_path(persona_dir, session_id).unlink(missing_ok=True)
 
 
 def read_session_after(persona_dir: Path, session_id: str, after_ts: str | None) -> list[dict]:
