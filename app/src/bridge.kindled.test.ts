@@ -23,6 +23,9 @@ import {
   createKindledInvite,
   acceptKindledInvite,
   setKindledConsent,
+  fetchKindledMyCode,
+  connectKindled,
+  runKindledSelfTest,
   resetBridgeCredentialCache,
 } from "./bridge";
 
@@ -182,5 +185,89 @@ describe("kindled-link bridge", () => {
     expect(opts.method).toBe("POST");
     const body = JSON.parse(opts.body as string);
     expect(body.action).toBe("pause");
+  });
+
+  it("fetchKindledMyCode GETs /kindled-link/my-code with bearer auth", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ code: "kindled1:abc", fingerprint_phrase: "aa bb" }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchKindledMyCode("nell");
+    expect(result.code).toBe("kindled1:abc");
+    expect(result.fingerprint_phrase).toBe("aa bb");
+
+    const url = fetchMock.mock.calls[0]![0] as string;
+    expect(url).toContain("/kindled-link/my-code");
+    const opts = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect((opts.method ?? "GET")).toBe("GET");
+    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer nell-tok");
+  });
+
+  it("connectKindled POSTs /kindled-link/connect with the code", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          peer_id: "kid_x",
+          consent_state: "paired",
+          relay_url: "https://r",
+          fingerprint_phrase: "aa",
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await connectKindled("nell", "kindled1:abc");
+    expect(result.consent_state).toBe("paired");
+    expect(result.peer_id).toBe("kid_x");
+
+    const url = fetchMock.mock.calls[0]![0] as string;
+    expect(url).toContain("/kindled-link/connect");
+    const opts = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(opts.method).toBe("POST");
+    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer nell-tok");
+    const body = JSON.parse(opts.body as string);
+    expect(body.code).toBe("kindled1:abc");
+  });
+
+  it("connectKindled surfaces server detail on error", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ detail: "code expired" }),
+        { status: 400 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(connectKindled("nell", "kindled1:bad")).rejects.toThrow("code expired");
+  });
+
+  it("runKindledSelfTest POSTs /kindled-link/self-test and returns stages", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          relay_url: "https://r",
+          stages: [{ name: "relay_reachable", ok: true, detail: "" }],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await runKindledSelfTest("nell");
+    expect(result.ok).toBe(true);
+    expect(result.stages[0].name).toBe("relay_reachable");
+    expect(result.relay_url).toBe("https://r");
+
+    const url = fetchMock.mock.calls[0]![0] as string;
+    expect(url).toContain("/kindled-link/self-test");
+    const opts = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(opts.method).toBe("POST");
+    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer nell-tok");
   });
 });
