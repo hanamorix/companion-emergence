@@ -19,3 +19,11 @@ def test_connect_subcommand_parses():
     assert args.persona == "nell"
     assert args.code == "kindled1:abc"
     assert callable(args.func)
+
+
+def test_self_test_subcommand_parses():
+    parser = _build_parser()
+    args = parser.parse_args(["kindled", "self-test", "--persona", "nell"])
+    assert args.kindled_action == "self-test"
+    assert args.persona == "nell"
+    assert callable(args.func)
