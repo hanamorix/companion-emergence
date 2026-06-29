@@ -1244,3 +1244,32 @@ def test_chat_without_tools_unchanged(persona_dir: Path) -> None:
     cmd = mock_run.call_args.args[0]
     assert "--mcp-config" not in cmd
 
+
+def test_chat_with_mcp_tools_calls_log_usage(persona_dir: Path) -> None:
+    """_chat_with_mcp_tools must call log_usage(call_type="chat") after a successful reply.
+
+    Closes the gap where the production tool-bearing chat path logged no usage,
+    so chat_usage.jsonl missed the bulk of real chat turns (48133dba).
+    """
+    from unittest.mock import patch as _patch
+
+    provider = ClaudeCliProvider(model="sonnet")
+
+    with _patch(
+        "brain.bridge.provider.subprocess.run",
+        return_value=_fake_proc(json.dumps({"result": "tool reply"})),
+    ), _patch("brain.bridge.provider.log_usage") as mock_log_usage:
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "search_memories"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    mock_log_usage.assert_called_once()
+    call_kwargs = mock_log_usage.call_args
+    # First positional arg is persona_dir (a Path).
+    assert call_kwargs.args[0] == persona_dir
+    # call_type must be "chat" to match the other CLI paths.
+    assert call_kwargs.kwargs["call_type"] == "chat"
+    assert call_kwargs.kwargs["model"] == "sonnet"
+

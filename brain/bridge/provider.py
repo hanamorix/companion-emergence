@@ -1291,6 +1291,16 @@ class ClaudeCliProvider(LLMProvider):
                     f"unexpected output format: {result.stdout[:200]!r}",
                 ) from exc
 
+            # Log per-call token usage (incl. cache_creation/cache_read) like the
+            # other CLI paths — this is the production tool-bearing chat path, so
+            # without this chat_usage.jsonl misses the bulk of real chat turns.
+            log_usage(
+                persona_dir,
+                call_type="chat",
+                model=self._model,
+                frame=payload,
+            )
+
             dispatched = _read_audit_lines_since(
                 audit_log_path,
                 audit_offset_before,
@@ -1430,11 +1440,23 @@ def _maybe_log_cache_debug(
     ``volatile_suffix`` is recorded for the later Option A+ work (volatile pushed to
     the stdin tail); it is ``None`` until that lands, so ``volatile_present`` reads
     False today. See ``docs/guarded-change/prompt-caching-adopt/``.
+
+    Enabled by EITHER ``NELL_CACHE_DEBUG=1`` in the environment OR a marker file
+    ``<persona_dir>/cache_debug.on``. The file trigger exists because env vars
+    don't reliably survive a GUI launch (e.g. nellface starting the bridge), so
+    ``touch <persona_dir>/cache_debug.on`` turns logging on regardless of how the
+    app was started; delete it to turn off.
     """
-    if os.environ.get("NELL_CACHE_DEBUG") != "1":
-        return
     pd = (options or {}).get("persona_dir")
     if not pd:
+        return
+    enabled = os.environ.get("NELL_CACHE_DEBUG") == "1"
+    if not enabled:
+        try:
+            enabled = (Path(pd) / "cache_debug.on").exists()
+        except Exception:  # noqa: BLE001
+            enabled = False
+    if not enabled:
         return
     try:
         sys_text = system_prompt or ""
