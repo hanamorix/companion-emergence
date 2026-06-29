@@ -158,7 +158,8 @@ export function KindledLinksPanel({ persona }: Props) {
       }
     };
     load();
-    const id = setInterval(load, 10_000);
+    // Tighter 4s poll while a peer is selected — correspondence feels live
+    const id = setInterval(load, 4_000);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -479,7 +480,7 @@ export function KindledLinksPanel({ persona }: Props) {
               textTransform: "uppercase",
               letterSpacing: "0.12em",
               fontFamily: "var(--font-disp)",
-              marginBottom: 6,
+              marginBottom: 8,
             }}
           >
             Correspondence — {selectedPeer.peer_id}
@@ -494,65 +495,79 @@ export function KindledLinksPanel({ persona }: Props) {
           {!transcriptError && transcript.length === 0 && (
             <div
               style={{
-                fontSize: 11,
+                fontSize: 10.5,
                 color: "var(--text-mute)",
                 fontStyle: "italic",
-                paddingLeft: 13,
-                borderLeft: "1px solid rgba(191,184,173,0.10)",
+                fontFamily: "var(--font-disp)",
+                lineHeight: 1.6,
+                padding: "10px 12px",
+                background: "rgba(191,184,173,0.05)",
+                borderRadius: 5,
               }}
             >
-              No messages yet
+              No messages yet — when you're both connected and enabled, their correspondence appears here.
             </div>
           )}
 
           {transcript.length > 0 && (
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {/* transcript comes seq DESC (newest first) */}
-              {transcript.map((row) => (
-                <li
-                  key={row.seq}
-                  style={{
-                    marginBottom: 8,
-                    paddingLeft: 13,
-                    borderLeft: "1px solid rgba(191,184,173,0.10)",
-                  }}
-                >
-                  <div
-                    style={{
-                      fontSize: 10.5,
-                      color: "var(--text-mid)",
-                      lineHeight: 1.5,
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {row.text}
-                  </div>
-                  <div
+              {/* API returns seq DESC; reverse to conversation order (oldest → newest) */}
+              {[...transcript].reverse().map((row) => {
+                const isOutbound = row.direction === "outbound";
+                // Format timestamp: HH:MM if today, else short date
+                const tsDate = new Date(row.ts);
+                const now = new Date();
+                const sameDay =
+                  tsDate.getFullYear() === now.getFullYear() &&
+                  tsDate.getMonth() === now.getMonth() &&
+                  tsDate.getDate() === now.getDate();
+                const tsLabel = sameDay
+                  ? tsDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                  : tsDate.toLocaleDateString([], { month: "short", day: "numeric" });
+
+                return (
+                  <li
+                    key={row.seq}
                     style={{
                       display: "flex",
-                      gap: 6,
-                      marginTop: 2,
-                      fontSize: "9px",
-                      color: "var(--text-mute)",
-                      fontFamily: "var(--font-disp)",
+                      flexDirection: "column",
+                      alignItems: isOutbound ? "flex-end" : "flex-start",
+                      marginBottom: 8,
                     }}
                   >
-                    <span
+                    {/* Bubble */}
+                    <div
                       style={{
-                        background:
-                          row.direction === "outbound"
-                            ? "rgba(130,51,41,0.10)"
-                            : "rgba(191,184,173,0.14)",
-                        padding: "1px 4px",
-                        borderRadius: 3,
+                        maxWidth: "82%",
+                        padding: "6px 10px",
+                        borderRadius: isOutbound ? "10px 10px 3px 10px" : "10px 10px 10px 3px",
+                        background: isOutbound
+                          ? "rgba(130,51,41,0.16)"
+                          : "rgba(191,184,173,0.10)",
+                        fontSize: 10.5,
+                        color: "var(--text-mid)",
+                        lineHeight: 1.55,
+                        wordBreak: "break-word",
                       }}
                     >
-                      {row.direction}
-                    </span>
-                    <span>{row.provenance}</span>
-                  </div>
-                </li>
-              ))}
+                      {row.text}
+                    </div>
+                    {/* Soft timestamp + provenance */}
+                    <div
+                      style={{
+                        marginTop: 2,
+                        fontSize: "9px",
+                        color: "var(--text-mute)",
+                        fontFamily: "var(--font-disp)",
+                        opacity: 0.7,
+                      }}
+                    >
+                      {tsLabel}
+                      {row.provenance ? ` · ${row.provenance}` : ""}
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
           {/* NO message-compose textarea — §15 no-typing / no-side-channel guarantee */}
