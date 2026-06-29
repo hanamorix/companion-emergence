@@ -134,6 +134,7 @@ def run_folded(
     maker_enabled: bool = True,
     notes_enabled: bool = True,
     kindled_link_enabled: bool = True,
+    compaction_interval_s: float | None = 86400.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -200,6 +201,11 @@ def run_folded(
     voice_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "voice_reflection_cadence.json")
         if voice_reflection_interval_s is not None
+        else None
+    )
+    compaction_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "compaction_cadence.json")
+        if compaction_interval_s is not None
         else None
     )
 
@@ -572,6 +578,31 @@ def run_folded(
                 _maybe_run_kindled_link_tick(persona_dir, provider=provider)
             except Exception:
                 logger.exception("supervisor kindled-link tick raised")
+
+        # Conversation-compaction cadence — daily by default (86400s).
+        # Folds aged, already-extracted turns into a persisted summary block at
+        # the head of each session buffer (lossless: raw turns archived first).
+        # PERSISTED via persisted_cadence.json — mirrors voice/maintenance so the
+        # daily interval fires correctly after a restart or system sleep (the
+        # exact class of bug #21 fixed for the other cadences). Uses a dedicated
+        # `compaction_cadence.json` (own file, even though the interval matches
+        # voice reflection) so its advance is always unconditional and independent.
+        # Cost: pinned to COMPACTION_MODEL (haiku) via build_compaction_provider.
+        if compaction_cadence_state is not None and persisted_cadence.is_due(
+            compaction_cadence_state, now=datetime.now(UTC)
+        ):
+            try:
+                from brain.chat.compaction import build_compaction_provider
+                _run_compaction_tick(persona_dir, build_compaction_provider(persona_dir))
+            except Exception:
+                logger.exception("supervisor compaction tick raised")
+            finally:
+                compaction_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=compaction_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "compaction_cadence.json", compaction_cadence_state
+                )
 
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
@@ -1505,6 +1536,36 @@ def _run_narrative_memory_pass(
             embeddings=embeddings_view,
             felt_time_state=felt_time_state,
         )
+
+
+def _run_compaction_tick(persona_dir: Path, provider: LLMProvider) -> None:
+    """Fold each active conversation's aged, extracted turns into its summary.
+
+    Iterates active_conversations buffers and calls the shared compaction core
+    with a 24h cutoff and fold_existing_summary=True (fade). Per-session
+    failures are logged and do not stop the sweep — autonomous-behaviour
+    recipe: defer cleanly, don't fail loudly.
+
+    Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
+    stays off the chat model. Called from the persisted_cadence block in
+    run_folded (daily default, survives restart/sleep per #21).
+    """
+    from datetime import timedelta
+
+    from brain.chat.compaction import compact_conversation
+    from brain.ingest.buffer import list_active_sessions
+
+    for session_id in list_active_sessions(persona_dir):
+        try:
+            compact_conversation(
+                persona_dir,
+                session_id,
+                older_than=timedelta(hours=24),
+                fold_existing_summary=True,
+                provider=provider,
+            )
+        except Exception:
+            logger.exception("compaction tick: session=%s raised", session_id)
 
 
 def _run_finalize_tick(

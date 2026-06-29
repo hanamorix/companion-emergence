@@ -874,6 +874,30 @@ def build_app(
         finally:
             _vocab_store.close()
 
+        # Backwards-compat backlog migration — one-time, before the supervisor's
+        # first daily compaction tick can fold a never-compacted backlog cold.
+        # Runs in a daemon thread (best-effort, must not hold up startup or
+        # shutdown); fully fault-isolated, so a migration failure can never break
+        # the bridge coming up. The run-once marker (archived_conversations/
+        # .compat_migrated) makes restarts cheap no-ops once drained.
+        def _run_backlog_migration() -> None:
+            try:
+                from brain.chat.compaction import build_compaction_provider
+                from brain.chat.compaction_migration import run_backlog_migration
+
+                # Migration folds with COMPACTION_MODEL (haiku), not the chat model.
+                run_backlog_migration(
+                    persona_dir, provider=build_compaction_provider(persona_dir)
+                )
+            except Exception:  # noqa: BLE001 — startup must not break on the migration
+                logger.exception("compaction backlog migration thread crashed")
+
+        threading.Thread(
+            target=_run_backlog_migration,
+            name="compaction-backlog-migration",
+            daemon=True,
+        ).start()
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
