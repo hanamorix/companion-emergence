@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, act } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KindledLinksPanel } from "./KindledLinksPanel";
@@ -27,6 +27,17 @@ vi.mock("../../bridge", () => ({
     recovered: false,
   })),
   createKindledInvite: vi.fn(), acceptKindledInvite: vi.fn(), setKindledConsent: vi.fn(),
+  fetchKindledMyCode: vi.fn(async () => ({ code: "test-code", fingerprint_phrase: "a b c" })),
+  connectKindled: vi.fn(async () => ({})),
+  rotateKindledIdentity: vi.fn(async () => ({ new_key_id: "k1", fingerprint_phrase: "x y z" })),
+  runKindledSelfTest: vi.fn(async () => ({
+    ok: true,
+    relay_url: "https://relay.test",
+    stages: [
+      { name: "identity", ok: true, detail: "" },
+      { name: "relay_connect", ok: true, detail: "" },
+    ],
+  })),
 }));
 
 afterEach(cleanup);
@@ -84,5 +95,56 @@ describe("KindledLinksPanel", () => {
     render(<KindledLinksPanel persona="nell" />);
     // relay-health line must be visible somewhere
     expect(await screen.findByText(/relay/i)).toBeInTheDocument();
+  });
+});
+
+describe("KindledLinksPanel — self-test section", () => {
+  it("renders a Test my setup button", async () => {
+    render(<KindledLinksPanel persona="nell" />);
+    expect(await screen.findByRole("button", { name: /test my setup/i })).toBeInTheDocument();
+  });
+
+  it("shows PASS verdict and per-stage rows after a successful self-test", async () => {
+    const { runKindledSelfTest } = await import("../../bridge");
+    vi.mocked(runKindledSelfTest).mockResolvedValueOnce({
+      ok: true,
+      relay_url: "https://relay.test",
+      stages: [
+        { name: "identity", ok: true, detail: "" },
+        { name: "relay_connect", ok: true, detail: "" },
+      ],
+    });
+    render(<KindledLinksPanel persona="nell" />);
+    const btn = await screen.findByRole("button", { name: /test my setup/i });
+    await act(async () => { fireEvent.click(btn); });
+    expect(await screen.findByText(/pass/i)).toBeInTheDocument();
+    expect(screen.getByText("identity")).toBeInTheDocument();
+    expect(screen.getByText("relay_connect")).toBeInTheDocument();
+  });
+
+  it("shows FAIL verdict and failing stage detail on a failed self-test", async () => {
+    const { runKindledSelfTest } = await import("../../bridge");
+    vi.mocked(runKindledSelfTest).mockResolvedValueOnce({
+      ok: false,
+      relay_url: "https://relay.test",
+      stages: [
+        { name: "identity", ok: true, detail: "" },
+        { name: "relay_connect", ok: false, detail: "connection refused" },
+      ],
+    });
+    render(<KindledLinksPanel persona="nell" />);
+    const btn = await screen.findByRole("button", { name: /test my setup/i });
+    await act(async () => { fireEvent.click(btn); });
+    expect(await screen.findByText(/fail/i)).toBeInTheDocument();
+    expect(screen.getByText(/connection refused/i)).toBeInTheDocument();
+  });
+
+  it("shows inline error when runKindledSelfTest throws", async () => {
+    const { runKindledSelfTest } = await import("../../bridge");
+    vi.mocked(runKindledSelfTest).mockRejectedValueOnce(new Error("network error"));
+    render(<KindledLinksPanel persona="nell" />);
+    const btn = await screen.findByRole("button", { name: /test my setup/i });
+    await act(async () => { fireEvent.click(btn); });
+    expect(await screen.findByText(/network error/i)).toBeInTheDocument();
   });
 });

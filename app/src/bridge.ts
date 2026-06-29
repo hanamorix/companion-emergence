@@ -1004,3 +1004,86 @@ export async function rotateKindledIdentity(persona: string): Promise<KindledRot
   if (!r.ok) throw new Error(`/kindled-link/identity/rotate ${r.status}`);
   return (await r.json()) as KindledRotateResult;
 }
+
+// ── Phase 4: connect-flow + self-test client fns ──────────────────────────
+
+/** Response from GET /kindled-link/my-code. */
+export interface KindledMyCode {
+  code: string;
+  fingerprint_phrase: string;
+}
+
+/**
+ * Fetch this companion's shareable connect-code + fingerprint phrase.
+ * GET /kindled-link/my-code. Throws on non-2xx.
+ */
+export async function fetchKindledMyCode(persona: string): Promise<KindledMyCode> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/my-code`, { headers: authHeaders(creds) }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/my-code ${r.status}`);
+  return (await r.json()) as KindledMyCode;
+}
+
+/** Response from POST /kindled-link/connect. */
+export interface KindledConnectResult {
+  peer_id: string;
+  consent_state: string;
+  relay_url: string;
+  fingerprint_phrase: string;
+}
+
+/**
+ * Connect to a peer using their shareable code.
+ * POST /kindled-link/connect {code}.
+ * On error surfaces the server's {detail} field so the panel can show
+ * human-readable messages like "code expired".
+ * Throws on non-2xx.
+ */
+export async function connectKindled(persona: string, code: string): Promise<KindledConnectResult> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/connect`, {
+      method: "POST",
+      headers: { ...authHeaders(creds), "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    }),
+  );
+  if (!r.ok) {
+    let detail = `${r.status}`;
+    try { detail = (await r.json()).detail ?? detail; } catch { /* keep status */ }
+    throw new Error(detail);
+  }
+  return (await r.json()) as KindledConnectResult;
+}
+
+/** One stage entry from POST /kindled-link/self-test. */
+export interface KindledSelfTestStage {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** Response from POST /kindled-link/self-test. */
+export interface KindledSelfTestResult {
+  ok: boolean;
+  stages: KindledSelfTestStage[];
+  relay_url: string;
+}
+
+/**
+ * Run the end-to-end self-test for the Kindled link relay.
+ * POST /kindled-link/self-test with empty body.
+ * Returns per-stage results plus an overall ok flag.
+ * Throws on non-2xx.
+ */
+export async function runKindledSelfTest(persona: string): Promise<KindledSelfTestResult> {
+  const r = await bridgeFetch(persona, (creds) =>
+    fetch(`${creds.url}/kindled-link/self-test`, {
+      method: "POST",
+      headers: { ...authHeaders(creds), "Content-Type": "application/json" },
+      body: "{}",
+    }),
+  );
+  if (!r.ok) throw new Error(`/kindled-link/self-test ${r.status}`);
+  return (await r.json()) as KindledSelfTestResult;
+}
