@@ -293,6 +293,7 @@ def run_tool_loop(
     max_iterations: int = MAX_TOOL_ITERATIONS,
     signal=None,
     chat_options: dict | None = None,
+    session_id: str | None = None,
 ) -> tuple[ChatResponse, list[dict]]:
     """Loop: provider.chat() → if tool_calls, dispatch each → retry.
 
@@ -403,6 +404,8 @@ def run_tool_loop(
                     store=store,
                     hebbian=hebbian,
                     persona_dir=persona_dir,
+                    provider=provider,
+                    session_id=session_id,
                 )
                 record["result_summary"] = _summarize_result(result)
                 # record_monologue returns {"ok": True, "monologue_text": ...} on

@@ -45,24 +45,14 @@ from brain.soul.store import SoulStore
 
 logger = logging.getLogger(__name__)
 
-# Replayed conversation history is capped to the last _HISTORY_WINDOW_MSGS
-# messages (~40 user+assistant turns) verbatim. The caching spike (2026-06-06)
-# confirmed the Claude CLI re-creates the whole prompt every turn, so an
-# unbounded buffer is re-billed each turn (driver #1). Older turns are dropped
-# from the replay — NOT summarised (re-summarising a growing head every turn is
-# its own cost) — and resurfaced by the per-turn recall block + ingest memories.
-_HISTORY_WINDOW_MSGS = 80
-
-
-def _window_history(history_msgs: list[ChatMessage]) -> list[ChatMessage]:
-    """Keep only the most-recent _HISTORY_WINDOW_MSGS messages of replayed history.
-
-    Strips any leading non-user message so the window opens on a user turn
-    (avoids an assistant reply to a now-dropped question / user-first ordering)."""
-    windowed = history_msgs[-_HISTORY_WINDOW_MSGS:]
-    while windowed and windowed[0].role != "user":
-        windowed = windowed[1:]
-    return windowed
+# Replayed conversation history is NO LONGER per-turn windowed. The old
+# sliding window (_window_history, last 80 msgs) re-shaped the FRONT of the
+# replayed history every turn, which busted prompt caching (a prefix match) on
+# every turn once a conversation exceeded the window (hunt cache-rewrite-5min).
+# History is now bounded by *compaction* (brain/chat/compaction.py): old, already
+# -extracted turns fade into a persisted summary block at the head on a daily
+# cadence (or the apply_budget backstop), so between compactions the buffer only
+# grows at the tail and the replayed prefix is byte-stable.
 
 
 @dataclass
@@ -234,18 +224,24 @@ def respond(
         )
         history_msgs = list(session.history)
 
-    history_msgs = _window_history(history_msgs)
+    # No per-turn windowing (see comment at _HISTORY_WINDOW removal): the buffer
+    # is sent as-is so the replayed prefix stays byte-stable between compactions.
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_msg),
         *history_msgs,
         user_msg,
     ]
+    # apply_budget is the last-resort backstop: only when the in-prompt estimate
+    # exceeds the cap does it compact (persist + archive, mirroring the daily
+    # cadence) via the shared core — which needs persona_dir + session_id to
+    # rewrite the buffer.
     messages = apply_budget(
         messages,
         max_tokens=80_000,
-        preserve_tail_msgs=40,  # backstop only — _window_history already caps to 80 msgs;
-                                # apply_budget now fires only for unusually large individual messages
+        preserve_tail_msgs=40,
         provider=provider,
+        persona_dir=persona_dir,
+        session_id=session.session_id,
     )
 
     # 7. Tool loop — salience-gated recruitment
@@ -284,6 +280,7 @@ def respond(
         recruited_allowed=allowed,
         signal=signal,
         chat_options=chat_options or None,
+        session_id=session.session_id,
     )
     content = response.content or ""
 
@@ -362,6 +359,7 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
     _build_user_message's defensive behaviour.
     """
     out: list[ChatMessage] = []
+    summary_text: str | None = None
     for t in turns:
         speaker = t.get("speaker")
         text = t.get("text", "")
@@ -369,6 +367,14 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
             role = "user"
         elif speaker == "assistant":
             role = "assistant"
+        elif speaker == "summary":
+            # Persisted compaction block. Hoist to the HEAD as a system message
+            # regardless of where it sits in the file, and emit at most one — so
+            # a torn/legacy write can never place a system msg mid-history. The
+            # first summary row wins (the writer keeps exactly one, newest gen).
+            if summary_text is None:
+                summary_text = text
+            continue
         else:
             continue  # skip unknown speakers defensively
 
@@ -395,6 +401,11 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
             continue
 
         out.append(ChatMessage(role=role, content=text, ts=ts))
+
+    if summary_text:
+        # Compaction block at the oldest end (head), before the retained raw
+        # turns — kept out of the volatile tail; byte-stable until recompaction.
+        out.insert(0, ChatMessage(role="system", content=f"[Earlier in this conversation: {summary_text}]"))
     return out
 
 
