@@ -1,6 +1,7 @@
 import { canonicalJson } from "./canonical";
 
 export const NONCE_TTL_MS = 120_000;
+export const ENVELOPE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const MAX_ENVELOPE_BYTES = 65_536;
 export const MAX_QUEUE_DEPTH = 256;
 export const MAX_REGISTERED = 1024;
@@ -163,5 +164,29 @@ export class Store {
       .prepare(`DELETE FROM envelopes WHERE mailbox_id=? AND id IN (${ph})`)
       .bind(mailboxId, ...ids)
       .run();
+  }
+
+  async gc(nowMs: number): Promise<{ envelopes: number; nonces: number; mailboxes: number }> {
+    const cutoff = nowMs - ENVELOPE_TTL_MS;
+    const envResult = await this.db
+      .prepare("DELETE FROM envelopes WHERE queued_at < ?")
+      .bind(cutoff)
+      .run();
+    const nonceResult = await this.db
+      .prepare("DELETE FROM nonces WHERE expires_at < ?")
+      .bind(nowMs)
+      .run();
+    const mbxResult = await this.db
+      .prepare(
+        "DELETE FROM mailboxes WHERE registered=0 AND created_at < ? " +
+        "AND NOT EXISTS (SELECT 1 FROM envelopes e WHERE e.mailbox_id=mailboxes.mailbox_id)"
+      )
+      .bind(cutoff)
+      .run();
+    return {
+      envelopes: envResult.meta.changes ?? 0,
+      nonces: nonceResult.meta.changes ?? 0,
+      mailboxes: mbxResult.meta.changes ?? 0,
+    };
   }
 }

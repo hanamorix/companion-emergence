@@ -8,6 +8,9 @@ binding = "DB"
 database_name = "kindled-relay"
 database_id = "d4d129df-0541-4942-8b18-97ceb168124f"
 
+[triggers]
+crons = ["0 */6 * * *"]
+
 # CF native fixed-window rate limiting (free). 60 requests / 60s per key.
 [[unsafe.bindings]]
 name = "RATE_LIMITER"

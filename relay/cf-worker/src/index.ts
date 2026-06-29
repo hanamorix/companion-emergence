@@ -12,4 +12,10 @@ export default {
     if (request.method === "GET" && url.pathname === "/healthz") return Response.json({ ok: true });
     return handle(request, env, new Store(env.DB), Date.now());
   },
+
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const store = new Store(env.DB);
+    const summary = await store.gc(Date.now());
+    console.log("[gc]", JSON.stringify(summary));
+  },
 };
