@@ -5,8 +5,8 @@ import {
   fetchKindledTranscript,
   fetchKindledHolds,
   fetchKindledLinkStatus,
-  createKindledInvite,
-  acceptKindledInvite,
+  fetchKindledMyCode,
+  connectKindled,
   setKindledConsent,
   rotateKindledIdentity,
 } from "../../bridge";
@@ -70,15 +70,16 @@ export function KindledLinksPanel({ persona }: Props) {
   const [transcript, setTranscript] = useState<KindledTranscriptRow[]>([]);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
 
-  // Invite flows
-  const [inviteFingerprint, setInviteFingerprint] = useState<string | null>(null);
-  const [inviteBusy, setInviteBusy] = useState(false);
-  const [inviteError, setInviteError] = useState<string | null>(null);
+  // Your code flow
+  const [myCode, setMyCode] = useState<string | null>(null);
+  const [myCodePhrase, setMyCodePhrase] = useState<string | null>(null);
+  const [codeBusy, setCodeBusy] = useState(false);
+  const [codeError, setCodeError] = useState<string | null>(null);
 
-  const [acceptPacket, setAcceptPacket] = useState("");
-  const [acceptPhrase, setAcceptPhrase] = useState<string | null>(null);
-  const [acceptBusy, setAcceptBusy] = useState(false);
-  const [acceptError, setAcceptError] = useState<string | null>(null);
+  // Connect flow
+  const [pasteCode, setPasteCode] = useState("");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   // Consent action busy state (keyed by peer_id)
   const [consentBusy, setConsentBusy] = useState<Record<string, boolean>>({});
@@ -88,6 +89,19 @@ export function KindledLinksPanel({ persona }: Props) {
   const [rotateBusy, setRotateBusy] = useState(false);
   const [rotateResult, setRotateResult] = useState<KindledRotateResult | null>(null);
   const [rotateError, setRotateError] = useState<string | null>(null);
+
+  // Peers/holds/status loader — also called imperatively by handleConnect
+  const refreshPeers = async () => {
+    const [p, h, s] = await Promise.all([
+      fetchKindledPeers(persona),
+      fetchKindledHolds(persona),
+      fetchKindledLinkStatus(persona),
+    ]);
+    setPeers(p);
+    setHolds(h);
+    setStatus(s);
+    setError(null);
+  };
 
   // Load peers + holds + status on mount + periodic refresh
   useEffect(() => {
@@ -162,42 +176,31 @@ export function KindledLinksPanel({ persona }: Props) {
     }
   };
 
-  const handleCreateInvite = async () => {
-    setInviteBusy(true);
-    setInviteError(null);
-    setInviteFingerprint(null);
+  const handleGenerateCode = async () => {
+    setCodeBusy(true);
+    setCodeError(null);
     try {
-      const result = await createKindledInvite(persona);
-      setInviteFingerprint(result.fingerprint);
+      const result = await fetchKindledMyCode(persona);
+      setMyCode(result.code);
+      setMyCodePhrase(result.fingerprint_phrase);
     } catch (e) {
-      setInviteError(errString(e));
+      setCodeError(errString(e));
     } finally {
-      setInviteBusy(false);
+      setCodeBusy(false);
     }
   };
 
-  const handleAcceptInvite = async () => {
-    if (!acceptPacket.trim()) return;
-    setAcceptBusy(true);
-    setAcceptError(null);
-    setAcceptPhrase(null);
+  const handleConnect = async () => {
+    setConnectBusy(true);
+    setConnectError(null);
     try {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(acceptPacket.trim());
-      } catch {
-        throw new Error("Invite packet must be valid JSON");
-      }
-      const result = await acceptKindledInvite(persona, parsed);
-      setAcceptPhrase(result.fingerprint_phrase);
-      setAcceptPacket("");
-      // Refresh peers after accepting
-      const updated = await fetchKindledPeers(persona);
-      setPeers(updated);
+      await connectKindled(persona, pasteCode.trim());
+      setPasteCode("");
+      await refreshPeers();
     } catch (e) {
-      setAcceptError(errString(e));
+      setConnectError(errString(e));
     } finally {
-      setAcceptBusy(false);
+      setConnectBusy(false);
     }
   };
 
@@ -537,7 +540,7 @@ export function KindledLinksPanel({ persona }: Props) {
         </section>
       )}
 
-      {/* ── Create invite ─────────────────────────────────────────────── */}
+      {/* ── Your code ─────────────────────────────────────────────── */}
       <section style={{ marginBottom: 14 }}>
         <div
           style={{
@@ -549,12 +552,12 @@ export function KindledLinksPanel({ persona }: Props) {
             marginBottom: 6,
           }}
         >
-          Create invite
+          Your code
         </div>
 
         <button
-          onClick={() => void handleCreateInvite()}
-          disabled={inviteBusy}
+          onClick={() => void handleGenerateCode()}
+          disabled={codeBusy}
           style={{
             fontSize: 10.5,
             padding: "4px 10px",
@@ -562,50 +565,87 @@ export function KindledLinksPanel({ persona }: Props) {
             border: "1px solid rgba(130,51,41,0.25)",
             background: "rgba(130,51,41,0.08)",
             color: "var(--text-mid)",
-            cursor: inviteBusy ? "default" : "pointer",
-            opacity: inviteBusy ? 0.6 : 1,
+            cursor: codeBusy ? "default" : "pointer",
+            opacity: codeBusy ? 0.6 : 1,
             fontFamily: "var(--font-disp)",
           }}
         >
-          {inviteBusy ? "Generating…" : "Generate invite"}
+          {codeBusy ? "Generating…" : "Generate"}
         </button>
 
-        {inviteError && (
-          <div style={{ fontSize: 10.5, color: "var(--text-mute)", fontStyle: "italic", marginTop: 4 }}>
-            {inviteError}
+        {codeError && (
+          <div
+            style={{
+              fontSize: 10.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              marginTop: 4,
+            }}
+          >
+            {codeError}
           </div>
         )}
 
-        {inviteFingerprint !== null && (
-          <div
-            style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              background: "rgba(200,152,144,0.12)",
-              border: "1px solid rgba(200,152,144,0.25)",
-              borderRadius: 4,
-              fontSize: 10.5,
-              color: "var(--text-mid)",
-              fontFamily: "var(--font-disp)",
-              lineHeight: 1.5,
-            }}
-          >
-            <div style={{ fontWeight: 600, marginBottom: 2 }}>Read aloud to your peer:</div>
+        {myCode !== null && (
+          <div style={{ marginTop: 8 }}>
+            {/* Code block */}
             <div
               style={{
+                padding: "6px 8px",
+                background: "rgba(200,152,144,0.12)",
+                border: "1px solid rgba(200,152,144,0.25)",
+                borderRadius: 4,
+                fontSize: 10.5,
                 fontFamily: "var(--font-mono, monospace)",
-                fontSize: 11,
+                color: "var(--text-mid)",
                 wordBreak: "break-all",
+                userSelect: "text",
+                lineHeight: 1.5,
               }}
             >
-              {inviteFingerprint}
+              {myCode}
             </div>
+
+            {/* Copy button */}
+            <button
+              onClick={() => void navigator.clipboard.writeText(myCode)}
+              style={{
+                marginTop: 5,
+                fontSize: 10.5,
+                padding: "3px 8px",
+                borderRadius: 4,
+                border: "1px solid rgba(130,51,41,0.25)",
+                background: "rgba(130,51,41,0.08)",
+                color: "var(--text-mid)",
+                cursor: "pointer",
+                fontFamily: "var(--font-disp)",
+              }}
+            >
+              Copy
+            </button>
+
+            {/* Fingerprint phrase */}
+            {myCodePhrase !== null && (
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: "9.5px",
+                  color: "var(--text-mute)",
+                  fontStyle: "italic",
+                  fontFamily: "var(--font-disp)",
+                  lineHeight: 1.5,
+                }}
+              >
+                <span style={{ fontStyle: "normal" }}>verify out loud if you like (optional) — </span>
+                {myCodePhrase}
+              </div>
+            )}
           </div>
         )}
       </section>
 
-      {/* ── Accept invite ─────────────────────────────────────────────── */}
-      <section>
+      {/* ── Connect ───────────────────────────────────────────────── */}
+      <section style={{ marginBottom: 14 }}>
         <div
           style={{
             fontSize: "9.5px",
@@ -616,21 +656,24 @@ export function KindledLinksPanel({ persona }: Props) {
             marginBottom: 6,
           }}
         >
-          Accept invite
+          Connect
         </div>
 
-        {/* Labelled textarea for paste — accessible name is "Invite packet", not "message/reply/compose" */}
         <label
-          htmlFor="kindled-accept-packet"
-          style={{ fontSize: "9.5px", color: "var(--text-mute)", fontFamily: "var(--font-disp)" }}
+          htmlFor="kindled-connect-code"
+          style={{
+            fontSize: "9.5px",
+            color: "var(--text-mute)",
+            fontFamily: "var(--font-disp)",
+          }}
         >
-          Paste invite packet (JSON)
+          Paste your friend's code
         </label>
         <textarea
-          id="kindled-accept-packet"
-          aria-label="Invite packet"
-          value={acceptPacket}
-          onChange={(e) => setAcceptPacket(e.target.value)}
+          id="kindled-connect-code"
+          aria-label="Friend's connect code"
+          value={pasteCode}
+          onChange={(e) => setPasteCode(e.target.value)}
           rows={3}
           style={{
             display: "block",
@@ -650,8 +693,8 @@ export function KindledLinksPanel({ persona }: Props) {
         />
 
         <button
-          onClick={() => void handleAcceptInvite()}
-          disabled={acceptBusy || !acceptPacket.trim()}
+          onClick={() => void handleConnect()}
+          disabled={connectBusy || !pasteCode.trim()}
           style={{
             fontSize: 10.5,
             padding: "4px 10px",
@@ -659,36 +702,24 @@ export function KindledLinksPanel({ persona }: Props) {
             border: "1px solid rgba(130,51,41,0.25)",
             background: "rgba(130,51,41,0.08)",
             color: "var(--text-mid)",
-            cursor: acceptBusy || !acceptPacket.trim() ? "default" : "pointer",
-            opacity: acceptBusy || !acceptPacket.trim() ? 0.6 : 1,
+            cursor: connectBusy || !pasteCode.trim() ? "default" : "pointer",
+            opacity: connectBusy || !pasteCode.trim() ? 0.6 : 1,
             fontFamily: "var(--font-disp)",
           }}
         >
-          {acceptBusy ? "Accepting…" : "Accept"}
+          {connectBusy ? "Connecting…" : "Connect"}
         </button>
 
-        {acceptError && (
-          <div style={{ fontSize: 10.5, color: "var(--text-mute)", fontStyle: "italic", marginTop: 4 }}>
-            {acceptError}
-          </div>
-        )}
-
-        {acceptPhrase !== null && (
+        {connectError && (
           <div
             style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              background: "rgba(200,152,144,0.12)",
-              border: "1px solid rgba(200,152,144,0.25)",
-              borderRadius: 4,
               fontSize: 10.5,
-              color: "var(--text-mid)",
-              fontFamily: "var(--font-disp)",
-              lineHeight: 1.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              marginTop: 4,
             }}
           >
-            <div style={{ fontWeight: 600, marginBottom: 2 }}>Verification phrase:</div>
-            <div style={{ fontSize: 11 }}>{acceptPhrase}</div>
+            {connectError}
           </div>
         )}
       </section>
