@@ -104,7 +104,9 @@ def count_chat_turns_since(persona_dir: Path, since_iso: str) -> int:
             continue
         try:
             turns = read_session_after(persona_dir, session_id, since_iso)
-            total += len(turns)
+            # Count real conversation turns only — a compaction `summary` row is
+            # not a turn (other speaker values remain real turns).
+            total += sum(1 for t in turns if t.get("speaker") != "summary")
         except Exception:
             log.debug("count_chat_turns_since: error reading %s", buf_path, exc_info=True)
     return total
