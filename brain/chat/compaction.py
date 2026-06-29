@@ -1,7 +1,7 @@
 """Conversation compaction — the one core that fades old history into a
 persisted, archived summary block at the head of the buffer.
 
-Callers drive it (see changes/timed-conversation-compaction/1-spec.md):
+Callers drive it (see docs/integration/2026-06-29-pr52-compaction-conflict-analysis.md):
   * the Kindled ``compact_history`` tool  — fold_existing_summary=False (append)
   * the daily supervisor cadence          — fold_existing_summary=True  (fade)
   * the apply_budget backstop              — fold_existing_summary=True  (fade)
