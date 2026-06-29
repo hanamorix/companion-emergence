@@ -48,7 +48,12 @@ def test_apply_budget_below_threshold_is_passthrough() -> None:
     assert out == msgs
 
 
-def test_apply_budget_above_threshold_compresses_head() -> None:
+
+def test_apply_budget_above_threshold_uses_deterministic_truncation_no_llm() -> None:
+    """Without persona_dir/session_id, apply_budget uses the deterministic
+    truncation note (no LLM call). The per-turn provider.generate summarise was
+    removed when compaction delegation landed — it busted prompt caching every turn.
+    """
     huge_text = "x" * 8_000  # ~2K tokens estimate (len // 4)
     msgs: list[ChatMessage] = [ChatMessage(role="system", content="be Nell")]
     for i in range(60):
@@ -61,15 +66,14 @@ def test_apply_budget_above_threshold_compresses_head() -> None:
     provider = _StubProvider(response="lots of x")
     out = apply_budget(msgs, max_tokens=10_000, preserve_tail_msgs=40, provider=provider)
 
-    # Structure: original system + compressed-head system note + 40 tail msgs.
+    # Structure: original system + deterministic truncation note + 40 tail msgs.
     assert out[0] == msgs[0]
     assert out[1].role == "system"
-    # The compressed-head system note should mention either "Earlier" or
-    # "earlier" — case-insensitive contains is enough.
     note_text = out[1].content if isinstance(out[1].content, str) else out[1].content_text()
-    assert "earlier" in note_text.lower()
+    assert "truncated" in note_text.lower()
     assert list(out[-40:]) == list(msgs[-40:])
-    assert len(provider.calls) == 1
+    # No LLM call — compaction path requires persona_dir+session_id (absent here).
+    assert len(provider.calls) == 0
 
 
 def test_apply_budget_compression_failure_falls_back_to_truncation() -> None:

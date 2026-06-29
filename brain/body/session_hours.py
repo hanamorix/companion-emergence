@@ -62,6 +62,10 @@ def _entry_timestamps(buffer: Path) -> list[datetime]:
                 entry = json.loads(stripped)
             except json.JSONDecodeError:
                 continue
+            # A compaction `summary` row carries a compaction-time ts, not a turn
+            # timestamp — exclude it from live session-age.
+            if entry.get("speaker") == "summary":
+                continue
             dt = _parse_ts(entry.get("ts") or entry.get("timestamp"))
             if dt is not None:
                 stamps.append(dt)

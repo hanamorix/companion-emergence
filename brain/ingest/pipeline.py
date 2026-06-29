@@ -316,6 +316,12 @@ def extract_session_snapshot(
 
     cursor = read_cursor(persona_dir, session_id)
     turns = read_session_after(persona_dir, session_id, cursor)
+    # Drop compaction `summary` blocks before transcription AND before the cursor
+    # advance below — a faded summary must never be re-extracted as memory, and
+    # its compaction-time ts must not move the ingest cursor past un-extracted
+    # turns. Only the new summary type is excluded (arbitrary name-speakers, e.g.
+    # "Hana", remain valid conversation turns).
+    turns = [t for t in turns if t.get("speaker") != "summary"]
 
     if not turns:
         logger.info(

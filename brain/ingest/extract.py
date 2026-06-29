@@ -96,6 +96,12 @@ def format_transcript(
     lines = []
     for t in turns:
         speaker = t.get("speaker", "?")
+        # A compaction `summary` row is a faded recap of the conversation, NOT a
+        # turn to extract — skip it here (the single chokepoint feeding the
+        # extractor) so NO extraction path (extract_session_snapshot OR
+        # close_session) ever re-ingests the summary as memory.
+        if speaker == "summary":
+            continue
         if speaker == "user":
             label = user_label
         elif speaker == "assistant":

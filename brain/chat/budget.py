@@ -1,36 +1,29 @@
-"""Prompt-size guard for engine.respond.
+"""Prompt-size guard for engine.respond — the last-resort backstop.
 
-apply_budget inspects the message list, estimates its size via
-len(content_text) // 4 per message, and when it exceeds ``max_tokens``:
-  1. Splits into [system, *head_to_compress, *preserved_tail] where the
-     preserved tail is the last ``preserve_tail_msgs`` messages.
-  2. Concatenates the head into a transcript and asks the provider to
-     summarise.
-  3. Returns [system, compressed_head_system_note, *preserved_tail].
+apply_budget estimates the assembled prompt size (len(content_text) // 4 per
+message) and, only when it exceeds ``max_tokens``:
+  1. Fires the PERSISTED compaction core (brain/chat/compaction.py) on the
+     conversation buffer — folding old, already-extracted turns into the head
+     summary block and archiving them. This mirrors the daily cadence and shrinks
+     the buffer so the NEXT turn is back under cap (so apply_budget does not fire
+     again until growth re-crosses the cap — not every turn).
+  2. For the CURRENT over-cap prompt, applies a DETERMINISTIC truncation note as
+     the in-prompt floor — a non-LLM trim (the per-turn provider.generate summary
+     this module used to insert is removed; it busted prompt caching every turn).
 
-On provider failure, falls back to a deterministic truncation note. The
-original system message is never compressed.
+The original system message is never compressed.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
+from pathlib import Path
 
 from brain.bridge.chat import ChatMessage
 from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
-
-_COMPRESSION_PROMPT = """Summarize the following conversation for context preservation.
-Preserve: names of people and places, decisions made, emotional beats,
-unresolved threads, anything that would be referenced later.
-Drop: pleasantries, repetition, formatting noise.
-Output prose only, no headers or lists.
-
-CONVERSATION:
-{transcript}
-
-SUMMARY:"""
 
 
 def _estimate_tokens(messages: list[ChatMessage]) -> int:
@@ -47,42 +40,61 @@ def apply_budget(
     max_tokens: int = 190_000,
     preserve_tail_msgs: int = 40,
     provider: LLMProvider,
+    persona_dir: Path | None = None,
+    session_id: str | None = None,
 ) -> list[ChatMessage]:
-    """Return a message list that fits inside ``max_tokens``.
+    """Return a message list that fits inside ``max_tokens`` (last-resort backstop).
 
-    Identity transform when the estimate is below max_tokens OR when the
-    message list is too short to have a head to compress (i.e. fewer than
-    2 + preserve_tail_msgs entries: system + preserved tail).
+    Identity transform when the estimate is below max_tokens OR when the message
+    list is too short to have a head to compress (fewer than 2 + preserve_tail_msgs
+    entries: system + preserved tail).
 
-    The original system message is never compressed. Only the
-    head-between-system-and-preserved-tail gets summarised.
+    When over cap, fires the persisted compaction core on the buffer (so the
+    fade is durable + archived and the next turn is back under cap) and applies a
+    deterministic in-prompt truncation note for the current turn. The original
+    system message is never compressed; only the head-between-system-and-tail is
+    replaced by the note.
     """
     if _estimate_tokens(messages) <= max_tokens:
         return messages
 
+    # 1. Persisted fade of the buffer (mirrors the daily cadence). Best-effort:
+    #    a failure here must not break the turn — the deterministic note below
+    #    still bounds the current prompt. older_than=0 ⇒ cutoff = ingest cursor,
+    #    so all *extracted* turns past the tail fold in (un-extracted ones are
+    #    left intact by the core's cursor guard).
+    if persona_dir is not None and session_id:
+        try:
+            from brain.chat.compaction import (
+                build_compaction_provider,
+                compact_conversation,
+            )
+
+            compact_conversation(
+                persona_dir,
+                session_id,
+                older_than=timedelta(0),
+                fold_existing_summary=True,
+                # Compaction always folds with COMPACTION_MODEL, not the chat model.
+                provider=build_compaction_provider(persona_dir),
+                min_keep_tail=preserve_tail_msgs,
+            )
+        except Exception:
+            logger.exception(
+                "apply_budget: persisted compaction failed session=%s; using in-prompt floor",
+                session_id,
+            )
+
+    # 2. Deterministic in-prompt floor for the current over-cap turn (no LLM).
     if len(messages) < 2 + preserve_tail_msgs:
         return messages
-
     system_msg = messages[0]
     head = messages[1 : len(messages) - preserve_tail_msgs]
     tail = messages[-preserve_tail_msgs:]
-
     if not head:
         return messages
-
-    transcript = "\n".join(f"{m.role}: {m.content_text()}" for m in head)
-    summary_msg: ChatMessage
-    try:
-        summary = provider.generate(prompt=_COMPRESSION_PROMPT.format(transcript=transcript))
-        summary_msg = ChatMessage(
-            role="system",
-            content=f"[Earlier in this conversation: {summary.strip()}]",
-        )
-    except Exception:
-        logger.exception("apply_budget: provider summarisation failed; falling back")
-        summary_msg = ChatMessage(
-            role="system",
-            content=f"[truncated {len(head)} earlier messages]",
-        )
-
+    summary_msg = ChatMessage(
+        role="system",
+        content=f"[truncated {len(head)} earlier messages]",
+    )
     return [system_msg, summary_msg, *tail]

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.tools.dispatch import _DISPATCH, ToolDispatchError, dispatch
+from brain.tools.dispatch import _DISPATCH, _PROVIDER_TOOLS, ToolDispatchError, dispatch
 
 
 def _make_ctx(tmp_path: Path) -> dict:
@@ -306,6 +306,11 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
     }
 
     for tool_name in _DISPATCH:
+        if tool_name in _PROVIDER_TOOLS:
+            # Provider tools require a live LLM provider injected via the
+            # _PROVIDER_TOOLS path — they are exercised in the compaction
+            # integration tests, not here.
+            continue
         args = minimal_args.get(tool_name, {})
         result = dispatch(tool_name, args, **ctx)
         assert isinstance(result, dict) or isinstance(result, list), (
