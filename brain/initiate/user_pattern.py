@@ -49,7 +49,12 @@ def _compute_silence_days(persona_dir: Path, *, _now: datetime | None = None) ->
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in read_jsonl_skipping_corrupt(jsonl_file):
-            if str(row.get("speaker", "")).lower() == companion_name:
+            speaker = str(row.get("speaker", "")).lower()
+            if speaker == companion_name:
+                continue
+            # A compaction `summary` row is not a real user turn — its
+            # compaction-time ts must not corrupt the "last user message" signal.
+            if speaker == "summary":
                 continue
             ts_str = row.get("ts")
             if not ts_str:
@@ -107,7 +112,13 @@ def _compute_likely_active(  # noqa: PLR0912
     total = 0
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in read_jsonl_skipping_corrupt(jsonl_file):
-            if str(row.get("speaker", "")).lower() == persona_dir.name.lower():
+            speaker = str(row.get("speaker", "")).lower()
+            if speaker == persona_dir.name.lower():
+                continue
+            # A compaction `summary` row is not a real user turn — exclude from
+            # hour-distribution so the active-window inference isn't skewed by
+            # compaction-time timestamps.
+            if speaker == "summary":
                 continue
             ts_str = row.get("ts")
             if not ts_str:

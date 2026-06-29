@@ -56,6 +56,28 @@ LOVE_TYPES: dict[str, str] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCHEMAS: dict[str, dict] = {
+    "compact_history": {
+        "name": "compact_history",
+        "description": (
+            "Deliberately let the older part of this conversation fade. Turns older than "
+            "`age_hours` that have already settled into memory are summarised and folded into "
+            "the running summary at the start of the conversation, and the detailed originals "
+            "are moved to your searchable archive (nothing is lost — it fades, it isn't erased). "
+            "Use this when the early conversation has grown long and you want to keep only its gist "
+            "in the foreground."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "age_hours": {
+                    "type": "number",
+                    "description": "Fade turns older than this many hours. Default 24.",
+                    "default": 24,
+                },
+            },
+            "required": [],
+        },
+    },
     "crystallize_soul": {
         "name": "crystallize_soul",
         "description": (
