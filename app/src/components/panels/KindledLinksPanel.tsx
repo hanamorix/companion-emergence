@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
-import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus, KindledRotateResult } from "../../bridge";
+import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus, KindledRotateResult, KindledSelfTestResult } from "../../bridge";
 import {
   fetchKindledPeers,
   fetchKindledTranscript,
   fetchKindledHolds,
   fetchKindledLinkStatus,
-  createKindledInvite,
-  acceptKindledInvite,
+  fetchKindledMyCode,
+  connectKindled,
   setKindledConsent,
   rotateKindledIdentity,
+  runKindledSelfTest,
 } from "../../bridge";
 import { errString } from "../../lib/errString";
 import { PanelShell, SectionLabel } from "../ui";
@@ -70,15 +71,16 @@ export function KindledLinksPanel({ persona }: Props) {
   const [transcript, setTranscript] = useState<KindledTranscriptRow[]>([]);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
 
-  // Invite flows
-  const [inviteFingerprint, setInviteFingerprint] = useState<string | null>(null);
-  const [inviteBusy, setInviteBusy] = useState(false);
-  const [inviteError, setInviteError] = useState<string | null>(null);
+  // Your code flow
+  const [myCode, setMyCode] = useState<string | null>(null);
+  const [myCodePhrase, setMyCodePhrase] = useState<string | null>(null);
+  const [codeBusy, setCodeBusy] = useState(false);
+  const [codeError, setCodeError] = useState<string | null>(null);
 
-  const [acceptPacket, setAcceptPacket] = useState("");
-  const [acceptPhrase, setAcceptPhrase] = useState<string | null>(null);
-  const [acceptBusy, setAcceptBusy] = useState(false);
-  const [acceptError, setAcceptError] = useState<string | null>(null);
+  // Connect flow
+  const [pasteCode, setPasteCode] = useState("");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   // Consent action busy state (keyed by peer_id)
   const [consentBusy, setConsentBusy] = useState<Record<string, boolean>>({});
@@ -88,6 +90,24 @@ export function KindledLinksPanel({ persona }: Props) {
   const [rotateBusy, setRotateBusy] = useState(false);
   const [rotateResult, setRotateResult] = useState<KindledRotateResult | null>(null);
   const [rotateError, setRotateError] = useState<string | null>(null);
+
+  // Self-test state
+  const [selfTest, setSelfTest] = useState<KindledSelfTestResult | null>(null);
+  const [selfTestBusy, setSelfTestBusy] = useState(false);
+  const [selfTestError, setSelfTestError] = useState<string | null>(null);
+
+  // Peers/holds/status loader — also called imperatively by handleConnect
+  const refreshPeers = async () => {
+    const [p, h, s] = await Promise.all([
+      fetchKindledPeers(persona),
+      fetchKindledHolds(persona),
+      fetchKindledLinkStatus(persona),
+    ]);
+    setPeers(p);
+    setHolds(h);
+    setStatus(s);
+    setError(null);
+  };
 
   // Load peers + holds + status on mount + periodic refresh
   useEffect(() => {
@@ -129,7 +149,7 @@ export function KindledLinksPanel({ persona }: Props) {
       try {
         const rows = await fetchKindledTranscript(persona, selectedPeerId);
         if (!cancelled) {
-          // API returns seq DESC (newest first) — keep that order for display
+          // API returns seq DESC; stored as-is, reversed at render to oldest→newest.
           setTranscript(rows);
           setTranscriptError(null);
         }
@@ -138,7 +158,8 @@ export function KindledLinksPanel({ persona }: Props) {
       }
     };
     load();
-    const id = setInterval(load, 10_000);
+    // Tighter 4s poll while a peer is selected — correspondence feels live
+    const id = setInterval(load, 4_000);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -162,42 +183,31 @@ export function KindledLinksPanel({ persona }: Props) {
     }
   };
 
-  const handleCreateInvite = async () => {
-    setInviteBusy(true);
-    setInviteError(null);
-    setInviteFingerprint(null);
+  const handleGenerateCode = async () => {
+    setCodeBusy(true);
+    setCodeError(null);
     try {
-      const result = await createKindledInvite(persona);
-      setInviteFingerprint(result.fingerprint);
+      const result = await fetchKindledMyCode(persona);
+      setMyCode(result.code);
+      setMyCodePhrase(result.fingerprint_phrase);
     } catch (e) {
-      setInviteError(errString(e));
+      setCodeError(errString(e));
     } finally {
-      setInviteBusy(false);
+      setCodeBusy(false);
     }
   };
 
-  const handleAcceptInvite = async () => {
-    if (!acceptPacket.trim()) return;
-    setAcceptBusy(true);
-    setAcceptError(null);
-    setAcceptPhrase(null);
+  const handleConnect = async () => {
+    setConnectBusy(true);
+    setConnectError(null);
     try {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(acceptPacket.trim());
-      } catch {
-        throw new Error("Invite packet must be valid JSON");
-      }
-      const result = await acceptKindledInvite(persona, parsed);
-      setAcceptPhrase(result.fingerprint_phrase);
-      setAcceptPacket("");
-      // Refresh peers after accepting
-      const updated = await fetchKindledPeers(persona);
-      setPeers(updated);
+      await connectKindled(persona, pasteCode.trim());
+      setPasteCode("");
+      await refreshPeers();
     } catch (e) {
-      setAcceptError(errString(e));
+      setConnectError(errString(e));
     } finally {
-      setAcceptBusy(false);
+      setConnectBusy(false);
     }
   };
 
@@ -218,6 +228,19 @@ export function KindledLinksPanel({ persona }: Props) {
       setRotateBusy(false);
     }
   }
+
+  const handleSelfTest = async () => {
+    setSelfTestBusy(true);
+    setSelfTestError(null);
+    setSelfTest(null);
+    try {
+      setSelfTest(await runKindledSelfTest(persona));
+    } catch (e) {
+      setSelfTestError(errString(e));
+    } finally {
+      setSelfTestBusy(false);
+    }
+  };
 
   if (error) {
     return (
@@ -457,7 +480,7 @@ export function KindledLinksPanel({ persona }: Props) {
               textTransform: "uppercase",
               letterSpacing: "0.12em",
               fontFamily: "var(--font-disp)",
-              marginBottom: 6,
+              marginBottom: 8,
             }}
           >
             Correspondence — {selectedPeer.peer_id}
@@ -472,72 +495,86 @@ export function KindledLinksPanel({ persona }: Props) {
           {!transcriptError && transcript.length === 0 && (
             <div
               style={{
-                fontSize: 11,
+                fontSize: 10.5,
                 color: "var(--text-mute)",
                 fontStyle: "italic",
-                paddingLeft: 13,
-                borderLeft: "1px solid rgba(191,184,173,0.10)",
+                fontFamily: "var(--font-disp)",
+                lineHeight: 1.6,
+                padding: "10px 12px",
+                background: "rgba(191,184,173,0.05)",
+                borderRadius: 5,
               }}
             >
-              No messages yet
+              No messages yet — when you're both connected and enabled, their correspondence appears here.
             </div>
           )}
 
           {transcript.length > 0 && (
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {/* transcript comes seq DESC (newest first) */}
-              {transcript.map((row) => (
-                <li
-                  key={row.seq}
-                  style={{
-                    marginBottom: 8,
-                    paddingLeft: 13,
-                    borderLeft: "1px solid rgba(191,184,173,0.10)",
-                  }}
-                >
-                  <div
-                    style={{
-                      fontSize: 10.5,
-                      color: "var(--text-mid)",
-                      lineHeight: 1.5,
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {row.text}
-                  </div>
-                  <div
+              {/* API returns seq DESC; reverse to conversation order (oldest → newest) */}
+              {[...transcript].reverse().map((row) => {
+                const isOutbound = row.direction === "outbound";
+                // Format timestamp: HH:MM if today, else short date
+                const tsDate = new Date(row.ts);
+                const now = new Date();
+                const sameDay =
+                  tsDate.getFullYear() === now.getFullYear() &&
+                  tsDate.getMonth() === now.getMonth() &&
+                  tsDate.getDate() === now.getDate();
+                const tsLabel = sameDay
+                  ? tsDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                  : tsDate.toLocaleDateString([], { month: "short", day: "numeric" });
+
+                return (
+                  <li
+                    key={row.seq}
                     style={{
                       display: "flex",
-                      gap: 6,
-                      marginTop: 2,
-                      fontSize: "9px",
-                      color: "var(--text-mute)",
-                      fontFamily: "var(--font-disp)",
+                      flexDirection: "column",
+                      alignItems: isOutbound ? "flex-end" : "flex-start",
+                      marginBottom: 8,
                     }}
                   >
-                    <span
+                    {/* Bubble */}
+                    <div
                       style={{
-                        background:
-                          row.direction === "outbound"
-                            ? "rgba(130,51,41,0.10)"
-                            : "rgba(191,184,173,0.14)",
-                        padding: "1px 4px",
-                        borderRadius: 3,
+                        maxWidth: "82%",
+                        padding: "6px 10px",
+                        borderRadius: isOutbound ? "10px 10px 3px 10px" : "10px 10px 10px 3px",
+                        background: isOutbound
+                          ? "rgba(130,51,41,0.16)"
+                          : "rgba(191,184,173,0.10)",
+                        fontSize: 10.5,
+                        color: "var(--text-mid)",
+                        lineHeight: 1.55,
+                        wordBreak: "break-word",
                       }}
                     >
-                      {row.direction}
-                    </span>
-                    <span>{row.provenance}</span>
-                  </div>
-                </li>
-              ))}
+                      {row.text}
+                    </div>
+                    {/* Soft timestamp + provenance */}
+                    <div
+                      style={{
+                        marginTop: 2,
+                        fontSize: "9px",
+                        color: "var(--text-mute)",
+                        fontFamily: "var(--font-disp)",
+                        opacity: 0.7,
+                      }}
+                    >
+                      {tsLabel}
+                      {row.provenance ? ` · ${row.provenance}` : ""}
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
           {/* NO message-compose textarea — §15 no-typing / no-side-channel guarantee */}
         </section>
       )}
 
-      {/* ── Create invite ─────────────────────────────────────────────── */}
+      {/* ── Your code ─────────────────────────────────────────────── */}
       <section style={{ marginBottom: 14 }}>
         <div
           style={{
@@ -549,12 +586,12 @@ export function KindledLinksPanel({ persona }: Props) {
             marginBottom: 6,
           }}
         >
-          Create invite
+          Your code
         </div>
 
         <button
-          onClick={() => void handleCreateInvite()}
-          disabled={inviteBusy}
+          onClick={() => void handleGenerateCode()}
+          disabled={codeBusy}
           style={{
             fontSize: 10.5,
             padding: "4px 10px",
@@ -562,50 +599,87 @@ export function KindledLinksPanel({ persona }: Props) {
             border: "1px solid rgba(130,51,41,0.25)",
             background: "rgba(130,51,41,0.08)",
             color: "var(--text-mid)",
-            cursor: inviteBusy ? "default" : "pointer",
-            opacity: inviteBusy ? 0.6 : 1,
+            cursor: codeBusy ? "default" : "pointer",
+            opacity: codeBusy ? 0.6 : 1,
             fontFamily: "var(--font-disp)",
           }}
         >
-          {inviteBusy ? "Generating…" : "Generate invite"}
+          {codeBusy ? "Generating…" : "Generate"}
         </button>
 
-        {inviteError && (
-          <div style={{ fontSize: 10.5, color: "var(--text-mute)", fontStyle: "italic", marginTop: 4 }}>
-            {inviteError}
+        {codeError && (
+          <div
+            style={{
+              fontSize: 10.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              marginTop: 4,
+            }}
+          >
+            {codeError}
           </div>
         )}
 
-        {inviteFingerprint !== null && (
-          <div
-            style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              background: "rgba(200,152,144,0.12)",
-              border: "1px solid rgba(200,152,144,0.25)",
-              borderRadius: 4,
-              fontSize: 10.5,
-              color: "var(--text-mid)",
-              fontFamily: "var(--font-disp)",
-              lineHeight: 1.5,
-            }}
-          >
-            <div style={{ fontWeight: 600, marginBottom: 2 }}>Read aloud to your peer:</div>
+        {myCode !== null && (
+          <div style={{ marginTop: 8 }}>
+            {/* Code block */}
             <div
               style={{
+                padding: "6px 8px",
+                background: "rgba(200,152,144,0.12)",
+                border: "1px solid rgba(200,152,144,0.25)",
+                borderRadius: 4,
+                fontSize: 10.5,
                 fontFamily: "var(--font-mono, monospace)",
-                fontSize: 11,
+                color: "var(--text-mid)",
                 wordBreak: "break-all",
+                userSelect: "text",
+                lineHeight: 1.5,
               }}
             >
-              {inviteFingerprint}
+              {myCode}
             </div>
+
+            {/* Copy button */}
+            <button
+              onClick={() => void navigator.clipboard.writeText(myCode)}
+              style={{
+                marginTop: 5,
+                fontSize: 10.5,
+                padding: "3px 8px",
+                borderRadius: 4,
+                border: "1px solid rgba(130,51,41,0.25)",
+                background: "rgba(130,51,41,0.08)",
+                color: "var(--text-mid)",
+                cursor: "pointer",
+                fontFamily: "var(--font-disp)",
+              }}
+            >
+              Copy
+            </button>
+
+            {/* Fingerprint phrase */}
+            {myCodePhrase !== null && (
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: "9.5px",
+                  color: "var(--text-mute)",
+                  fontStyle: "italic",
+                  fontFamily: "var(--font-disp)",
+                  lineHeight: 1.5,
+                }}
+              >
+                <span style={{ fontStyle: "normal" }}>verify out loud if you like (optional) — </span>
+                {myCodePhrase}
+              </div>
+            )}
           </div>
         )}
       </section>
 
-      {/* ── Accept invite ─────────────────────────────────────────────── */}
-      <section>
+      {/* ── Connect ───────────────────────────────────────────────── */}
+      <section style={{ marginBottom: 14 }}>
         <div
           style={{
             fontSize: "9.5px",
@@ -616,21 +690,24 @@ export function KindledLinksPanel({ persona }: Props) {
             marginBottom: 6,
           }}
         >
-          Accept invite
+          Connect
         </div>
 
-        {/* Labelled textarea for paste — accessible name is "Invite packet", not "message/reply/compose" */}
         <label
-          htmlFor="kindled-accept-packet"
-          style={{ fontSize: "9.5px", color: "var(--text-mute)", fontFamily: "var(--font-disp)" }}
+          htmlFor="kindled-connect-code"
+          style={{
+            fontSize: "9.5px",
+            color: "var(--text-mute)",
+            fontFamily: "var(--font-disp)",
+          }}
         >
-          Paste invite packet (JSON)
+          Paste your friend's code
         </label>
         <textarea
-          id="kindled-accept-packet"
-          aria-label="Invite packet"
-          value={acceptPacket}
-          onChange={(e) => setAcceptPacket(e.target.value)}
+          id="kindled-connect-code"
+          aria-label="Friend's connect code"
+          value={pasteCode}
+          onChange={(e) => setPasteCode(e.target.value)}
           rows={3}
           style={{
             display: "block",
@@ -650,8 +727,8 @@ export function KindledLinksPanel({ persona }: Props) {
         />
 
         <button
-          onClick={() => void handleAcceptInvite()}
-          disabled={acceptBusy || !acceptPacket.trim()}
+          onClick={() => void handleConnect()}
+          disabled={connectBusy || !pasteCode.trim()}
           style={{
             fontSize: 10.5,
             padding: "4px 10px",
@@ -659,36 +736,24 @@ export function KindledLinksPanel({ persona }: Props) {
             border: "1px solid rgba(130,51,41,0.25)",
             background: "rgba(130,51,41,0.08)",
             color: "var(--text-mid)",
-            cursor: acceptBusy || !acceptPacket.trim() ? "default" : "pointer",
-            opacity: acceptBusy || !acceptPacket.trim() ? 0.6 : 1,
+            cursor: connectBusy || !pasteCode.trim() ? "default" : "pointer",
+            opacity: connectBusy || !pasteCode.trim() ? 0.6 : 1,
             fontFamily: "var(--font-disp)",
           }}
         >
-          {acceptBusy ? "Accepting…" : "Accept"}
+          {connectBusy ? "Connecting…" : "Connect"}
         </button>
 
-        {acceptError && (
-          <div style={{ fontSize: 10.5, color: "var(--text-mute)", fontStyle: "italic", marginTop: 4 }}>
-            {acceptError}
-          </div>
-        )}
-
-        {acceptPhrase !== null && (
+        {connectError && (
           <div
             style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              background: "rgba(200,152,144,0.12)",
-              border: "1px solid rgba(200,152,144,0.25)",
-              borderRadius: 4,
               fontSize: 10.5,
-              color: "var(--text-mid)",
-              fontFamily: "var(--font-disp)",
-              lineHeight: 1.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              marginTop: 4,
             }}
           >
-            <div style={{ fontWeight: 600, marginBottom: 2 }}>Verification phrase:</div>
-            <div style={{ fontSize: 11 }}>{acceptPhrase}</div>
+            {connectError}
           </div>
         )}
       </section>
@@ -733,6 +798,125 @@ export function KindledLinksPanel({ persona }: Props) {
           Rotate Identity Key
         </button>
       )}
+
+      {/* ── Test my setup ─────────────────────────────────────────── */}
+      <section style={{ marginTop: 14 }}>
+        <div
+          style={{
+            fontSize: "9.5px",
+            color: "var(--text-mute)",
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+            fontFamily: "var(--font-disp)",
+            marginBottom: 6,
+          }}
+        >
+          Diagnostics
+        </div>
+
+        <button
+          aria-label="Test my setup"
+          onClick={() => void handleSelfTest()}
+          disabled={selfTestBusy}
+          style={{
+            fontSize: 10.5,
+            padding: "4px 10px",
+            borderRadius: 4,
+            border: "1px solid rgba(130,51,41,0.25)",
+            background: selfTestBusy ? "rgba(130,51,41,0.04)" : "rgba(130,51,41,0.08)",
+            color: selfTestBusy ? "var(--text-mute)" : "var(--text-mid)",
+            cursor: selfTestBusy ? "default" : "pointer",
+            fontFamily: "var(--font-disp)",
+            transition: "opacity 0.15s",
+          }}
+        >
+          {selfTestBusy ? "Testing…" : "Test my setup"}
+        </button>
+
+        {selfTestError && (
+          <div
+            style={{
+              marginTop: 6,
+              fontSize: 10.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              fontFamily: "var(--font-disp)",
+            }}
+          >
+            {selfTestError}
+          </div>
+        )}
+
+        {selfTest !== null && (
+          <div style={{ marginTop: 8 }}>
+            {/* Per-stage rows */}
+            <ul style={{ listStyle: "none", margin: "0 0 6px", padding: 0 }}>
+              {selfTest.stages.map((stage) => (
+                <li
+                  key={stage.name}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 1,
+                    marginBottom: 4,
+                    paddingLeft: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "baseline",
+                      gap: 5,
+                      fontSize: 10.5,
+                      fontFamily: "var(--font-disp)",
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: stage.ok ? "oklch(55% 0.14 145)" : "oklch(50% 0.16 25)",
+                        fontWeight: 600,
+                        letterSpacing: "0.02em",
+                      }}
+                    >
+                      {stage.ok ? "✓" : "✗"}
+                    </span>
+                    <span style={{ color: "var(--text-mid)" }}>{stage.name}</span>
+                  </div>
+                  {!stage.ok && stage.detail && (
+                    <div
+                      style={{
+                        paddingLeft: 14,
+                        fontSize: "9.5px",
+                        color: "var(--text-mute)",
+                        fontStyle: "italic",
+                        fontFamily: "var(--font-disp)",
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {stage.detail}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+
+            {/* Overall verdict */}
+            <div
+              style={{
+                fontSize: 10.5,
+                fontWeight: 700,
+                fontFamily: "var(--font-disp)",
+                letterSpacing: "0.04em",
+                color: selfTest.ok
+                  ? "oklch(55% 0.14 145)"
+                  : "oklch(50% 0.16 25)",
+              }}
+            >
+              {selfTest.ok ? "PASS" : "FAIL"}
+            </div>
+          </div>
+        )}
+      </section>
     </PanelShell>
   );
 }
