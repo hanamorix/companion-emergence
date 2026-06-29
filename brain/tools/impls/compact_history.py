@@ -17,7 +17,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
-from brain.chat.compaction import compact_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +42,13 @@ def compact_history(
         hours = 24.0
     if hours < 0:
         hours = 0.0
+
+    # Lazy import: brain.chat.compaction pulls in brain.chat.__init__ → engine →
+    # tool_loop → tool_recruit → brain.tools, which cycles if this module is
+    # imported (via dispatch) before brain.tools finishes initialising (e.g. the
+    # mcp_server subprocess imports brain.tools first). Deferring to call time
+    # breaks the cycle.
+    from brain.chat.compaction import compact_conversation
 
     result = compact_conversation(
         persona_dir,
