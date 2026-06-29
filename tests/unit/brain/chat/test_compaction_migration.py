@@ -47,7 +47,7 @@ def _raw(turns: list[dict]) -> list[dict]:
 
 def _load_fixture(persona_dir: Path) -> list[dict]:
     """Copy the real chatlog into active_conversations/, cursor at the last ts."""
-    rows = [json.loads(l) for l in FIXTURE.read_text().splitlines() if l.strip()]
+    rows = [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
     dest_dir = persona_dir / "active_conversations"
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / f"{FIXTURE_SID}.jsonl").write_text(
@@ -119,7 +119,8 @@ def test_time_stepping_one_fold_per_24h_cohort(tmp_path: Path) -> None:
             rows.append({"session_id": sid,
                          "speaker": "user" if len(rows) % 2 == 0 else "assistant",
                          "text": f"day{d} turn{i}", "ts": ts})
-    ac = tmp_path / "active_conversations"; ac.mkdir(parents=True)
+    ac = tmp_path / "active_conversations"
+    ac.mkdir(parents=True)
     (ac / f"{sid}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     write_cursor(tmp_path, sid, rows[-1]["ts"])
     prov = _StubProvider()

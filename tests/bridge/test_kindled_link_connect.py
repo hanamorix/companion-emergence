@@ -86,7 +86,7 @@ def test_connect_uses_own_default_relay_not_peer_code_relay(tmp_path: Path):
         # The code now carries A's hostile relay URL. B should NOT adopt it.
         r = b.post("/kindled-link/connect", headers=_AUTH, json={"code": code})
     assert r.status_code == 200, r.text
-    from brain.persona_config import PersonaConfig, DEFAULT_KINDLED_RELAY_URL
+    from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
     cfg = PersonaConfig.load(b_dir / "persona_config.json")
     assert cfg.kindled_relay_url == DEFAULT_KINDLED_RELAY_URL  # own default, not adopted from code
 
