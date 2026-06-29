@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus, KindledRotateResult } from "../../bridge";
+import type { KindledPeer, KindledTranscriptRow, KindledHolds, KindledLinkStatus, KindledRotateResult, KindledSelfTestResult } from "../../bridge";
 import {
   fetchKindledPeers,
   fetchKindledTranscript,
@@ -9,6 +9,7 @@ import {
   connectKindled,
   setKindledConsent,
   rotateKindledIdentity,
+  runKindledSelfTest,
 } from "../../bridge";
 import { errString } from "../../lib/errString";
 import { PanelShell, SectionLabel } from "../ui";
@@ -89,6 +90,11 @@ export function KindledLinksPanel({ persona }: Props) {
   const [rotateBusy, setRotateBusy] = useState(false);
   const [rotateResult, setRotateResult] = useState<KindledRotateResult | null>(null);
   const [rotateError, setRotateError] = useState<string | null>(null);
+
+  // Self-test state
+  const [selfTest, setSelfTest] = useState<KindledSelfTestResult | null>(null);
+  const [selfTestBusy, setSelfTestBusy] = useState(false);
+  const [selfTestError, setSelfTestError] = useState<string | null>(null);
 
   // Peers/holds/status loader — also called imperatively by handleConnect
   const refreshPeers = async () => {
@@ -221,6 +227,19 @@ export function KindledLinksPanel({ persona }: Props) {
       setRotateBusy(false);
     }
   }
+
+  const handleSelfTest = async () => {
+    setSelfTestBusy(true);
+    setSelfTestError(null);
+    setSelfTest(null);
+    try {
+      setSelfTest(await runKindledSelfTest(persona));
+    } catch (e) {
+      setSelfTestError(errString(e));
+    } finally {
+      setSelfTestBusy(false);
+    }
+  };
 
   if (error) {
     return (
@@ -764,6 +783,125 @@ export function KindledLinksPanel({ persona }: Props) {
           Rotate Identity Key
         </button>
       )}
+
+      {/* ── Test my setup ─────────────────────────────────────────── */}
+      <section style={{ marginTop: 14 }}>
+        <div
+          style={{
+            fontSize: "9.5px",
+            color: "var(--text-mute)",
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+            fontFamily: "var(--font-disp)",
+            marginBottom: 6,
+          }}
+        >
+          Diagnostics
+        </div>
+
+        <button
+          aria-label="Test my setup"
+          onClick={() => void handleSelfTest()}
+          disabled={selfTestBusy}
+          style={{
+            fontSize: 10.5,
+            padding: "4px 10px",
+            borderRadius: 4,
+            border: "1px solid rgba(130,51,41,0.25)",
+            background: selfTestBusy ? "rgba(130,51,41,0.04)" : "rgba(130,51,41,0.08)",
+            color: selfTestBusy ? "var(--text-mute)" : "var(--text-mid)",
+            cursor: selfTestBusy ? "default" : "pointer",
+            fontFamily: "var(--font-disp)",
+            transition: "opacity 0.15s",
+          }}
+        >
+          {selfTestBusy ? "Testing…" : "Test my setup"}
+        </button>
+
+        {selfTestError && (
+          <div
+            style={{
+              marginTop: 6,
+              fontSize: 10.5,
+              color: "var(--text-mute)",
+              fontStyle: "italic",
+              fontFamily: "var(--font-disp)",
+            }}
+          >
+            {selfTestError}
+          </div>
+        )}
+
+        {selfTest !== null && (
+          <div style={{ marginTop: 8 }}>
+            {/* Per-stage rows */}
+            <ul style={{ listStyle: "none", margin: "0 0 6px", padding: 0 }}>
+              {selfTest.stages.map((stage) => (
+                <li
+                  key={stage.name}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 1,
+                    marginBottom: 4,
+                    paddingLeft: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "baseline",
+                      gap: 5,
+                      fontSize: 10.5,
+                      fontFamily: "var(--font-disp)",
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: stage.ok ? "oklch(55% 0.14 145)" : "oklch(50% 0.16 25)",
+                        fontWeight: 600,
+                        letterSpacing: "0.02em",
+                      }}
+                    >
+                      {stage.ok ? "✓" : "✗"}
+                    </span>
+                    <span style={{ color: "var(--text-mid)" }}>{stage.name}</span>
+                  </div>
+                  {!stage.ok && stage.detail && (
+                    <div
+                      style={{
+                        paddingLeft: 14,
+                        fontSize: "9.5px",
+                        color: "var(--text-mute)",
+                        fontStyle: "italic",
+                        fontFamily: "var(--font-disp)",
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {stage.detail}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+
+            {/* Overall verdict */}
+            <div
+              style={{
+                fontSize: 10.5,
+                fontWeight: 700,
+                fontFamily: "var(--font-disp)",
+                letterSpacing: "0.04em",
+                color: selfTest.ok
+                  ? "oklch(55% 0.14 145)"
+                  : "oklch(50% 0.16 25)",
+              }}
+            >
+              {selfTest.ok ? "PASS" : "FAIL"}
+            </div>
+          </div>
+        )}
+      </section>
     </PanelShell>
   );
 }
