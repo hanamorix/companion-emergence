@@ -15,6 +15,7 @@ import json
 from brain.kindled_link.codec import canonical_json
 
 _PREFIX = "kindled1:"
+_MAX_CODE_LEN = 8192  # a real kindled1: code is ~340 chars; cap well above that, below abuse.
 
 
 class ConnectCodeError(ValueError):
@@ -29,6 +30,8 @@ def encode_code(invite: dict) -> str:
 def decode_code(code: str) -> dict:
     if not isinstance(code, str) or not code.startswith(_PREFIX):
         raise ConnectCodeError("missing kindled1: prefix")
+    if len(code) > _MAX_CODE_LEN:
+        raise ConnectCodeError("connect-code too large")
     b64 = code[len(_PREFIX):].strip()
     try:
         raw = base64.urlsafe_b64decode(b64.encode("ascii"))
