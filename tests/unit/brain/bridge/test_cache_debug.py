@@ -77,5 +77,35 @@ def test_fail_soft_on_bad_persona_dir(monkeypatch):
     )  # no exception = pass
 
 
+def test_file_trigger_enables_cache_debug_without_env_var(tmp_path, monkeypatch):
+    """touch <persona_dir>/cache_debug.on enables logging even without NELL_CACHE_DEBUG=1.
+
+    This is the GUI-bridge use case: env vars don't survive a NellFace launch,
+    so the marker file is the reliable way to enable the log on a live bridge.
+    """
+    monkeypatch.delenv("NELL_CACHE_DEBUG", raising=False)
+    (tmp_path / "cache_debug.on").touch()
+    opts = {"persona_dir": str(tmp_path), "session_id": "sess-file-trigger"}
+    _maybe_log_cache_debug(opts, call_type="chat", system_prompt="static", volatile_suffix=None)
+
+    log_path = tmp_path / "cache_debug.jsonl"
+    assert log_path.exists(), "cache_debug.jsonl must be written when marker file is present"
+    rows = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "sess-file-trigger"
+
+
+def test_no_marker_file_and_no_env_var_is_no_op(tmp_path, monkeypatch):
+    """Without env var AND without the marker file: writes nothing (double-guard check)."""
+    monkeypatch.delenv("NELL_CACHE_DEBUG", raising=False)
+    _maybe_log_cache_debug(
+        {"persona_dir": str(tmp_path)},
+        call_type="chat",
+        system_prompt="volatile",
+        volatile_suffix=None,
+    )
+    assert not (tmp_path / "cache_debug.jsonl").exists()
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
