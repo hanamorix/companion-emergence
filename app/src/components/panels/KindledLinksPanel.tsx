@@ -149,7 +149,7 @@ export function KindledLinksPanel({ persona }: Props) {
       try {
         const rows = await fetchKindledTranscript(persona, selectedPeerId);
         if (!cancelled) {
-          // API returns seq DESC (newest first) — keep that order for display
+          // API returns seq DESC; stored as-is, reversed at render to oldest→newest.
           setTranscript(rows);
           setTranscriptError(null);
         }
