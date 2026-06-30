@@ -668,6 +668,14 @@ def _run_kindled_link_tick(persona_dir, *, provider, now=None):
 
     The httpx.Client is built INSIDE this function (not at import time)
     so the supervisor never holds a live HTTP handle between ticks.
+
+    Also opens the persona's MemoryStore (mirrors the maker/notes tick's
+    per-tick store-ownership pattern — opened + closed inside this call,
+    never held across ticks) and threads it into run_kindled_link_tick as
+    mem_store= (§14 wire-back: forms a kindled_peer memory + moves capped
+    emotion from the relationship reflection). Fail-soft: if the
+    MemoryStore fails to open, the tick still runs with mem_store=None
+    (no peer-memory/emotion this round; everything else unaffected).
     """
     import httpx
 
@@ -675,6 +683,7 @@ def _run_kindled_link_tick(persona_dir, *, provider, now=None):
     from brain.kindled_link.relay_client import RelayClient
     from brain.kindled_link.store import KindledLinkStore, kindled_db_path
     from brain.kindled_link.tick import run_kindled_link_tick
+    from brain.memory.store import MemoryStore
 
     now = now or datetime.now(UTC)
     config = PersonaConfig.load(persona_dir / "persona_config.json")
@@ -698,6 +707,17 @@ def _run_kindled_link_tick(persona_dir, *, provider, now=None):
                 "supervisor kindled-link relay register failed — skipping tick this round"
             )
             return
+
+        mem_store = None
+        try:
+            mem_store = MemoryStore(persona_dir / "memories.db")
+            _kl_stack.callback(mem_store.close)
+        except Exception:
+            logger.warning(
+                "supervisor kindled-link: MemoryStore open failed — "
+                "peer-memory/emotion wire-back skipped this round", exc_info=True
+            )
+
         run_kindled_link_tick(
             persona_dir,
             store=store,
@@ -706,6 +726,7 @@ def _run_kindled_link_tick(persona_dir, *, provider, now=None):
             provider=provider,
             config=config,
             now=now,
+            mem_store=mem_store,
         )
 
 

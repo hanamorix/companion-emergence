@@ -71,7 +71,10 @@ _VOLATILE_MARKERS = (
     "felt time",
     "── recent journal",
     "── recent growth ──",
-    "inner monologue",
+    # NOTE: "inner monologue" is NOT a volatile marker — the monologue frame now
+    # lives in the FROZEN static block (its "record_monologue first" directive must
+    # be read before composing). With empty per-turn hints it carries no volatile
+    # state, so it does not bust byte-stability. See test_monologue_directive_in_static.
     "visible reply",
     "Current time",
     "current time:",
@@ -301,6 +304,15 @@ def test_information_completeness_every_block_survives(
     # the ambient framing line + the relocated clock block; that's repositioning/
     # rewording, allowed by C4 — we only check nothing is LOST.)
     for block in full_blocks:
+        # The monologue frame is the one block that intentionally DIVERGES between
+        # the legacy combined builder (full per-turn hints) and the A/A+ split (the
+        # frame moved to the FROZEN static block with EMPTY hints, for byte-stability
+        # + so its "record_monologue first" directive is read before composing). Its
+        # directive is checked by test_monologue_directive_in_static; the per-turn
+        # texture it used to embed (emotions / soul / narrative) still survives in
+        # its OWN volatile blocks, which this loop verifies. Skip the verbatim check.
+        if "── inner monologue" in block:
+            continue
         assert block in combined, f"block dropped in the A/A+ split: {block[:80]!r}"
 
 
@@ -320,8 +332,23 @@ def test_volatile_context_reply_frame_is_last(
     )
     blocks = volatile.split("\n\n")
     assert "visible reply" in blocks[-1], "reply frame must be the last block of the volatile tail"
-    # The monologue (interior) frame must sit ABOVE the reply frame.
-    assert volatile.index("inner monologue") < volatile.index("visible reply")
+    # The monologue frame moved to the FROZEN static block (its "record_monologue
+    # first, then reply" directive must be read before composing — the volatile
+    # tail fired it too late). So it must NOT appear in the volatile tail anymore.
+    assert "inner monologue" not in volatile
+
+
+def test_monologue_directive_in_static(persona_dir: Path) -> None:
+    """Regression (ToT cache/monologue-ordering bug): the "record_monologue FIRST,
+    then reply" directive must live in the FROZEN static block so it is read BEFORE
+    the model composes — not the volatile tail (read after the conversation), where
+    it fired too late and the monologue recorded after the reply instead of before.
+    Empty per-turn hints keep the static block byte-stable for caching."""
+    static = build_static_system_message(persona_dir, voice_md="# Nell\n\nvoice body.")
+    assert "record_monologue" in static, "monologue directive missing from the static block"
+    assert "── inner monologue" in static, "monologue frame missing from the static block"
+    # Byte-stable across calls (empty hints → no per-turn state → cache unit reads).
+    assert static == build_static_system_message(persona_dir, voice_md="# Nell\n\nvoice body.")
 
 
 def test_volatile_context_starts_with_ambient_framing(
