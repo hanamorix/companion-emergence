@@ -1,6 +1,9 @@
 """Kindled peer relationship maturation (parent design §13/§14). State + the
-reflection pass + the §14 wire-backs (emotion, kindled_peer memory). DORMANT in
-Phase 5: the reflection cadence is built but not supervisor-registered.
+reflection pass + the §14 wire-backs (emotion, kindled_peer memory). LIVE as of
+2026-06-30: the reflection cadence is supervisor-registered (tick.py via the
+enabled tick), and the §14 wire-backs fire from run_relationship_reflection when
+a MemoryStore is threaded in — peer conversations now form provenance-marked
+`kindled_peer` memories + move capped peer emotion.
 
 Tool-path isolation: imports only stdlib + allowlisted brain modules; the only
 model entry is provider.complete (tool-less). The conformance oracle enforces it."""
@@ -298,6 +301,11 @@ def run_relationship_reflection(
                     {str(k): float(v) for k, v in emotion_raw.items()}
                     if isinstance(emotion_raw, dict) else {}
                 )
+                # Vocab-filter BEFORE the cap (M1): apply_peer_emotion charges the
+                # per-peer leaky bucket on raw magnitude, so an unregistered name the
+                # model invents would consume headroom while seeding no felt state.
+                from brain.chat.extractor import _filter_to_registered
+                emotion_delta = _filter_to_registered(emotion_delta)
                 applied = apply_peer_emotion(store, peer_id, emotion_delta, now)
                 write_kindled_peer_memory(
                     mem_store, peer_id=peer_id, session_id=session_id,
