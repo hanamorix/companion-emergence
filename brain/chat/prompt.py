@@ -298,15 +298,21 @@ def build_system_message(
 
 
 def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
-    """The frozen system-prompt-file content: preamble + voice.md + epistemic.
+    """The frozen system-prompt-file content: preamble + voice.md + epistemic +
+    the inner-monologue frame.
 
     Contains NO per-turn state, so two same-session turns produce byte-identical
     output (the cache unit can read instead of re-create). The epistemic
     instruction is static text; here it is emitted unconditionally — chat always
     supplies user_input, so this matches the pre-change behaviour where the
     ``user_input is not None`` gate in build_system_message() fired on every
-    chat turn. The only thing that busts this block is the user editing voice.md
-    (or changing user_name), both rare and expected.
+    chat turn. The inner-monologue frame is emitted here too (with EMPTY per-turn
+    hints, so it stays byte-stable) because its "record_monologue FIRST, then
+    reply" directive must be read BEFORE the model composes — placing it in the
+    volatile tail (read after the conversation) fires it too late, so the
+    monologue records after the reply instead of before it. The only thing that
+    busts this block is the user editing voice.md (or changing user_name), both
+    rare and expected.
     """
     persona_name = persona_dir.name
     user_name = _load_user_name(persona_dir)
@@ -323,6 +329,21 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
         parts.append(voice_md.strip())
 
     parts.append(_EPISTEMIC_INSTRUCTION)
+
+    # Inner-monologue framing ("record_monologue FIRST, then reply") lives in the
+    # FROZEN prefix, not the volatile tail: a "do this before composing" directive
+    # has to be read before the conversation, or the model records the monologue
+    # after the reply. EMPTY per-turn hints keep this byte-stable for caching;
+    # live emotion/soul/narrative texture is not needed for the directive itself.
+    parts.append(
+        build_monologue_frame(
+            persona_name=persona_name,
+            emotion_summary="",
+            voice_excerpt="",
+            soul_hints=(),
+            narrative_hints=(),
+        )
+    )
 
     return "\n\n".join(parts)
 
@@ -453,18 +474,11 @@ def build_volatile_context(
     except Exception:  # noqa: BLE001
         pass
 
-    # 8. Inner monologue framing — embeds emotion_summary computed above.
-    soul_hints = _collect_soul_hints(soul_store, limit=3)
-    narrative_hints = _collect_narrative_hints(persona_dir, limit=3)
-    parts.append(
-        build_monologue_frame(
-            persona_name=persona_name,
-            emotion_summary=emotion_summary,
-            voice_excerpt=voice_md[:300],
-            soul_hints=soul_hints,
-            narrative_hints=narrative_hints,
-        )
-    )
+    # 8. Inner-monologue framing moved to build_static_system_message (the frozen
+    # prefix): its "record_monologue FIRST, then reply" directive must be read
+    # before the model composes, so the volatile tail (read after the
+    # conversation) was the wrong home — it fired too late. The reply frame (§9)
+    # is now the last directive in the tail, as intended.
 
     # 8b. Ambient clock anchor + elapsed-time explainer (moved here from the top
     # of the JSONL context block). Worded as ambient context, not an instruction,

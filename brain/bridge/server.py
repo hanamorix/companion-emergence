@@ -1389,6 +1389,21 @@ def build_app(
         )
         from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
 
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        # Gate: never dial / adopt the default relay for a never-enabled,
+        # never-configured install — connecting is opt-in, but it must follow
+        # the explicit enable, not bypass it.
+        if cfg.kindled_relay_url is None and not cfg.kindled_link_enabled:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "kindled_link_not_enabled",
+                    "detail": "Enable Kindled Links (or set a relay) before connecting — "
+                              "connect contacts the relay and adopts it into your config.",
+                },
+            )
+
         code = (payload or {}).get("code")
         if not code:
             raise HTTPException(status_code=400, detail="missing code")
@@ -1538,6 +1553,18 @@ def build_app(
         from brain.persona_config import DEFAULT_KINDLED_RELAY_URL, PersonaConfig
 
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        # Gate: never dial the default relay for a never-enabled, never-configured
+        # install — "off by default" must mean nothing phones home until opt-in.
+        if cfg.kindled_relay_url is None and not cfg.kindled_link_enabled:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "kindled_link_not_enabled",
+                    "detail": "Enable Kindled Links (or set a relay) before testing — "
+                              "the self-test contacts the relay.",
+                },
+            )
         relay_url = cfg.kindled_relay_url or DEFAULT_KINDLED_RELAY_URL
         # trust_env=False: a dev-shell proxy must not intercept the relay call.
         with httpx.Client(base_url=relay_url, timeout=30, trust_env=False) as http:
