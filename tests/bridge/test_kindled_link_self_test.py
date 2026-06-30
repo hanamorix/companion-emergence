@@ -14,7 +14,11 @@ _AUTH = {"Authorization": f"Bearer {_TOK}"}
 def _client(tmp_path: Path):
     persona = tmp_path / "personas" / "nell"
     persona.mkdir(parents=True)
-    (persona / "persona_config.json").write_text('{"provider": "fake"}', encoding="utf-8")
+    # kindled_link_enabled=True: self-test is gated behind explicit opt-in (the
+    # relay-gate fix) — this suite exercises the self-test mechanics, not the gate.
+    (persona / "persona_config.json").write_text(
+        '{"provider": "fake", "kindled_link_enabled": true}', encoding="utf-8"
+    )
     return TestClient(build_app(persona_dir=persona, client_origin="tests", auth_token=_TOK)), persona
 
 
