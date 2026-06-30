@@ -105,6 +105,7 @@ def run_kindled_link_tick(
     now: datetime,
     gate=None,
     throttle=None,
+    mem_store=None,
 ) -> dict:
     """Drive one kindled-link tick.
 
@@ -186,6 +187,7 @@ def run_kindled_link_tick(
                     now=now,
                     today=today,
                     persona_dir=persona_dir,
+                    mem_store=mem_store,
                 )
                 peers_processed += 1
             except Exception:  # noqa: BLE001 — fault-isolated per-peer
@@ -226,6 +228,7 @@ def _tick_peer(
     now: datetime,
     today: str,
     persona_dir: Path,
+    mem_store=None,
 ) -> None:
     """Drive one tick cycle for a single paired peer.
 
@@ -342,6 +345,10 @@ def _tick_peer(
             transcript_rows = store.recent_transcript(peer_id)
             transcript_text = " | ".join(row["text"] for row in reversed(transcript_rows))
             hold_count = _count_recent_holds(store, peer_id)
+            # session_id for the §14 peer-memory write-back: the most recent
+            # transcript row's session, or "" if there is no transcript yet
+            # (mem_store write is skipped anyway when memory_summary is empty).
+            reflection_session_id = transcript_rows[0]["session_id"] if transcript_rows else ""
             run_relationship_reflection(
                 store=store,
                 provider=provider,
@@ -351,6 +358,9 @@ def _tick_peer(
                 today=today,
                 regression_signal={"hold_count": hold_count},
                 persona_dir=persona_dir,
+                mem_store=mem_store,
+                persona_name=persona_dir.name,
+                session_id=reflection_session_id,
             )
             save_reflection_cadence(persona_dir, now)
         except Exception:  # noqa: BLE001 — fault-isolated; reflection is best-effort
