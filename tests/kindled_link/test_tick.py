@@ -417,6 +417,58 @@ def test_d4_disabled_inbound_still_ingested(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# §B — mem_store threaded through the tick → reflection forms a kindled_peer
+# memory (through-test, mirrors the no-flow idiom).
+# ---------------------------------------------------------------------------
+
+def test_through_path_mem_store_threaded_forms_kindled_peer_memory(tmp_path):
+    """§B through-test: an enabled tick with a due reflection, given mem_store=,
+    forms a kindled_peer memory in mem_store when the spy provider's verdict
+    carries memory_summary + emotion."""
+    from brain.memory.store import MemoryStore
+
+    idn_a, idn_b = _make_identities()
+
+    persona_dir_b = tmp_path / "b"
+    persona_dir_b.mkdir(parents=True, exist_ok=True)
+
+    sb = KindledLinkStore(tmp_path / "b.db")
+    sb.upsert_peer(
+        peer_id=idn_a.key_id, identity_pub_hex=idn_a.public_bytes.hex(),
+        fingerprint=idn_a.key_id, consent_state="paired",
+        relay_url="https://relay.test", relay_mailbox="mbx_a", now=_NOW,
+    )
+    ms = MemoryStore(tmp_path / "mem.db")
+
+    verdict = (
+        '{"proposed_stage":"acquaintance","trust_score":0.3,'
+        '"affinity_tags":["trust"],"boundaries_seen":[],"evidence":[],'
+        '"hard_breach":false,'
+        '"memory_summary":"A quiet exchange with a peer today.",'
+        '"emotion":{"tenderness":0.05}}'
+    )
+
+    class _NullRelay:
+        def fetch(self): return []
+        def push(self, _): pass
+
+    run_kindled_link_tick(
+        persona_dir_b,
+        store=sb,
+        identity=idn_b,
+        relay_client=_NullRelay(),
+        provider=_spy_provider(draft=verdict),
+        config=_enabled_config(),
+        now=_NOW,
+        mem_store=ms,
+    )
+
+    rows = ms.list_by_type("kindled_peer")
+    assert len(rows) == 1, "tick must thread mem_store into the reflection and form a kindled_peer memory"
+    assert rows[0].metadata.get("peer_id") == idn_a.key_id
+
+
+# ---------------------------------------------------------------------------
 # T11.3 — reflection fired on tick when enabled + due; skipped when disabled
 # ---------------------------------------------------------------------------
 

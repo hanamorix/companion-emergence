@@ -72,6 +72,42 @@ def test_maybe_run_kindled_link_tick_calls_tick_when_relay_configured(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Test 2b — §B: the supervisor opens + threads a MemoryStore into the tick
+# ---------------------------------------------------------------------------
+
+def test_maybe_run_kindled_link_tick_threads_mem_store(tmp_path):
+    """§B: _run_kindled_link_tick opens the persona's MemoryStore and passes it
+    to run_kindled_link_tick as mem_store= (the §14 peer-memory/emotion
+    wire-back needs it). Mirrors the maker/notes tick's store-ownership
+    pattern — opened + closed inside this call, not held across ticks."""
+    from brain.memory.store import MemoryStore
+
+    cfg_path = tmp_path / "persona_config.json"
+    PersonaConfig(
+        kindled_link_enabled=True,
+        kindled_relay_url="https://relay.example.com",
+    ).save(cfg_path)
+
+    tick_calls = []
+
+    def _fake_tick(persona_dir, *, store, identity, relay_client, provider, config, now, **kw):
+        tick_calls.append({"mem_store": kw.get("mem_store")})
+
+    with (
+        patch("brain.kindled_link.tick.run_kindled_link_tick", side_effect=_fake_tick),
+        patch("brain.kindled_link.relay_client.RelayClient.register"),
+        patch("httpx.Client") as mock_http_cls,
+    ):
+        mock_http_cls.return_value.close = MagicMock()
+        mock_http_cls.return_value.post = MagicMock(return_value=MagicMock(status_code=200))
+
+        supervisor._maybe_run_kindled_link_tick(tmp_path, provider=MagicMock())
+
+    assert len(tick_calls) == 1
+    assert isinstance(tick_calls[0]["mem_store"], MemoryStore)
+
+
+# ---------------------------------------------------------------------------
 # Test 3 — relay register() error is caught; block does not raise
 # ---------------------------------------------------------------------------
 
