@@ -469,3 +469,94 @@ def test_two_personas_exchange_content(tmp_path):
         f"B (responder) must have replied at least once; drafts: "
         f"{[dict(d) for d in sb._conn.execute('SELECT * FROM outbound_drafts WHERE peer_id=?', (idn_a.key_id,)).fetchall()]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: held opener retries on the next tick — NOT permanently wedged
+# ---------------------------------------------------------------------------
+
+def test_held_opener_retries_until_sent(tmp_path):
+    """A gate 'hold' on the first opener must NOT permanently block future ticks.
+
+    Red-team finding (Important): _should_open_first_content previously keyed
+    idempotency on ANY outbound_drafts row for the session — so a 'hold' draft
+    blocked all future opener attempts (hold draft exists → already_opened=True
+    → never retried). engine.recover() only retries 'pending', not 'hold'.
+
+    Correct behaviour: idempotency keys on a 'send'-status draft. A held draft
+    means "not yet sent" → NOT already_opened → next tick re-attempts → when
+    the gate eventually flips to 'send', the opener goes out.
+
+    Tick 1: gate=hold → save_draft+set_draft_status('hold'). No 'send' draft,
+             no outbound transcript row.
+    Tick 2: gate=send → _should_open_first_content must return True (no 'send'
+             draft yet) → opener retried → 'send' draft saved.
+    """
+    from datetime import timedelta
+
+    idn_a, idn_b = _make_identities()
+    rc_a, rc_b = _make_relay(idn_a, idn_b)
+    sa, sb = _paired_stores(tmp_path, idn_a, idn_b)
+
+    session_id = _run_handshake(sa, idn_a, sb, idn_b, rc_a, rc_b, tmp_path=tmp_path)
+
+    # Sanity: A is initiator
+    sk = sa.get_session_key(idn_b.key_id, session_id)
+    assert sk is not None and sk["my_role"] == ROLE_INITIATOR
+
+    persona_dir_a = tmp_path / "a"
+    persona_dir_a.mkdir(parents=True, exist_ok=True)
+
+    provider = _spy_provider()
+    throttle = _spy_throttle()
+
+    # --- Tick 1: gate holds the opener ---
+    run_kindled_link_tick(
+        persona_dir_a,
+        store=sa,
+        identity=idn_a,
+        relay_client=rc_a,
+        provider=provider,
+        gate=_spy_gate(action="hold"),
+        throttle=throttle,
+        config=_enabled_config(),
+        now=_NOW,
+    )
+
+    # After tick 1: a 'hold' draft exists, NO 'send' draft, no outbound transcript
+    all_drafts_t1 = sa._conn.execute(
+        "SELECT * FROM outbound_drafts WHERE peer_id = ? AND session_id = ?",
+        (idn_b.key_id, session_id),
+    ).fetchall()
+    send_drafts_t1 = [d for d in all_drafts_t1 if dict(d)["status"] == "send"]
+    hold_drafts_t1 = [d for d in all_drafts_t1 if dict(d)["status"] == "hold"]
+    assert len(hold_drafts_t1) >= 1, (
+        f"Tick 1 (gate=hold) must leave a 'hold' draft; got: {[dict(d) for d in all_drafts_t1]}"
+    )
+    assert send_drafts_t1 == [], (
+        f"Tick 1 (gate=hold) must NOT produce a 'send' draft; got: {[dict(d) for d in send_drafts_t1]}"
+    )
+
+    # --- Tick 2: gate now sends — opener must be retried ---
+    now2 = _NOW + timedelta(minutes=6)  # past pacing cooldown
+    run_kindled_link_tick(
+        persona_dir_a,
+        store=sa,
+        identity=idn_a,
+        relay_client=rc_a,
+        provider=provider,
+        gate=_spy_gate(action="send"),
+        throttle=throttle,
+        config=_enabled_config(),
+        now=now2,
+    )
+
+    send_drafts_t2 = sa._conn.execute(
+        "SELECT * FROM outbound_drafts WHERE peer_id = ? AND session_id = ? AND status = 'send'",
+        (idn_b.key_id, session_id),
+    ).fetchall()
+    assert len(send_drafts_t2) >= 1, (
+        "Tick 2 (gate=send after prior hold) must produce a 'send' draft — "
+        "the held opener must be retried, not permanently wedged. "
+        f"All drafts: {[dict(d) for d in sa._conn.execute('SELECT * FROM outbound_drafts WHERE peer_id=?', (idn_b.key_id,)).fetchall()]}"
+    )
