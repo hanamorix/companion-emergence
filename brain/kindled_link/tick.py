@@ -19,6 +19,7 @@ from pathlib import Path
 from brain.kindled_link.audit import log_transport
 from brain.kindled_link.cadence import save_tick_cadence, tick_is_due
 from brain.kindled_link.gate import OutboundPayload
+from brain.kindled_link.protocol import ROLE_INITIATOR
 from brain.kindled_link.relationship import (
     reflection_is_due,
     run_relationship_reflection,
@@ -287,6 +288,43 @@ def _tick_peer(
                     transcript_summary=transcript_summary,
                 )
                 store.set_draft_status(draft_id, action)
+        elif _should_open_first_content(store, peer_id, session_id):
+            # Initiator-only, once-per-session autonomous opener.
+            # Fires when: active session, no inbound, no prior outbound on this
+            # session, and this side is the session INITIATOR.  Routes through
+            # process_outbound (same privacy gate + pacing + caps as replies).
+            send_fn = _make_send_fn(
+                store=store, identity=identity, relay_client=relay_client,
+                peer_id=peer_id, session_id=session_id,
+                now=now, persona_dir=persona_dir,
+            )
+            rel_row = store.get_relationship_row(peer_id)
+            draft = engine.generate_draft(
+                peer_id=peer_id,
+                session_id=session_id,
+                persona_voice="",
+                ambient="",
+                peer_stage=rel_row["stage"] if rel_row else "stranger",
+                transcript_summary="",  # stranger guidance → first-contact opener
+                today=today,
+            )
+            if draft is not None:
+                payload = OutboundPayload(body=draft)
+                draft_id = store.save_draft(
+                    peer_id=peer_id, session_id=session_id,
+                    payload_json=json.dumps({"body": draft}), now=now,
+                )
+                action = engine.process_outbound(
+                    peer_id=peer_id,
+                    session_id=session_id,
+                    payload=payload,
+                    reason="autonomous-open",
+                    now=now,
+                    today=today,
+                    send_fn=send_fn,
+                    transcript_summary="",
+                )
+                store.set_draft_status(draft_id, action)
         return
 
     # No active session — try autonomous start
@@ -317,6 +355,38 @@ def _tick_peer(
             save_reflection_cadence(persona_dir, now)
         except Exception:  # noqa: BLE001 — fault-isolated; reflection is best-effort
             log.warning("kindled tick: reflection failed for %s", peer_id, exc_info=True)
+
+
+def _should_open_first_content(store, peer_id: str, session_id: str) -> bool:
+    """Return True iff this side is the INITIATOR and the opener has not yet
+    been *sent* on this session.
+
+    Idempotency gate: keys on a 'send'-status draft (meaning the message
+    actually left), NOT on "any draft row".  A 'hold' or 'pending' draft means
+    the privacy gate blocked the attempt → the opener has NOT been sent yet →
+    this side should retry on the next tick.
+
+    Why not "any draft row"? save_draft writes BEFORE process_outbound, so a
+    gate HOLD leaves a terminal 'hold' row with no 'send' counterpart.
+    engine.recover() only retries 'pending' rows (not 'hold'), so the old
+    predicate permanently wedged the opener: hold draft exists → already_opened
+    → never retried.  Since PrivacyGate fails-closed-to-hold (provider error,
+    cap, conservative first-contact verdict), this was the COMMON case.
+
+    Bounded retry is safe: each re-attempt goes through generate_draft
+    (provider cap) + process_outbound (daily send cap + pacing cooldown), so
+    retries cannot spam.  A new session_id always starts fresh (correct: each
+    session gets exactly one opener attempt once sent).
+    """
+    sk = store.get_session_key(peer_id, session_id)
+    if sk is None or sk["my_role"] != ROLE_INITIATOR:
+        return False
+    already_sent = store._conn.execute(
+        "SELECT 1 FROM outbound_drafts"
+        " WHERE peer_id = ? AND session_id = ? AND status = 'send' LIMIT 1",
+        (peer_id, session_id),
+    ).fetchone() is not None
+    return not already_sent
 
 
 def _count_recent_holds(store, peer_id: str) -> int:
