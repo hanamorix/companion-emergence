@@ -15,15 +15,29 @@ _AUTH = {"Authorization": f"Bearer {_TOK}"}
 def _client(tmp_path: Path, name: str):
     persona = tmp_path / "personas" / name
     persona.mkdir(parents=True)
-    (persona / "persona_config.json").write_text('{"provider": "fake"}', encoding="utf-8")
+    # kindled_link_enabled=True: connect is gated behind explicit opt-in (the
+    # relay-gate fix) — these tests exercise the pairing mechanics, not the gate.
+    (persona / "persona_config.json").write_text(
+        '{"provider": "fake", "kindled_link_enabled": true}', encoding="utf-8"
+    )
     app = build_app(persona_dir=persona, client_origin="tests", auth_token=_TOK)
     return TestClient(app), persona
 
 
 def test_connect_pairs_in_one_call_and_adopts_relay(tmp_path: Path):
     # Persona A generates a code; persona B connects with it.
+    # B opts in via an explicit relay (not the enabled toggle) — proves the
+    # relay-gate accepts either form of opt-in, and keeps the "connect doesn't
+    # auto-flip the toggle" assertion below meaningful.
     a, _ = _client(tmp_path, "a")
-    b, b_dir = _client(tmp_path, "b")
+    b_dir = tmp_path / "personas" / "b"
+    b_dir.mkdir(parents=True)
+    import json as _json
+    (b_dir / "persona_config.json").write_text(
+        _json.dumps({"provider": "fake", "kindled_relay_url": "https://relay-b.example.com"}),
+        encoding="utf-8",
+    )
+    b = TestClient(build_app(persona_dir=b_dir, client_origin="tests", auth_token=_TOK))
     with a, b:
         code = a.get("/kindled-link/my-code", headers=_AUTH).json()["code"]
         r = b.post("/kindled-link/connect", headers=_AUTH, json={"code": code})
