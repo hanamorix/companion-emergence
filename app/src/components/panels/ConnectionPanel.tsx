@@ -10,6 +10,7 @@ import { ModelPicker } from "./ModelPicker";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
+import { CleanConnectionSection } from "./CleanConnectionSection";
 import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
 import { errString } from "../../lib/errString";
@@ -354,6 +355,10 @@ export function ConnectionPanel({
         enabled={conn?.kindled_link_enabled ?? false}
         relayUrl={conn?.kindled_relay_url ?? null}
       />
+
+      <Divider />
+      <SectionLabel>Clean connection</SectionLabel>
+      <CleanConnectionSection />
 
       <Divider />
       <SectionLabel>Updates</SectionLabel>

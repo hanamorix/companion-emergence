@@ -21,14 +21,23 @@ vi.mock("@tauri-apps/api/core", () => ({
 // ── appConfig — boot logic under test ────────────────────────────────────────
 // vi.mock() is hoisted to the top of the file, so factory-referenced vars
 // must be created with vi.hoisted() to be available when the factory runs.
-const { readAppConfig, writeAppConfig, listPersonas, ensureBridgeRunning, setAlwaysOnTop } =
-  vi.hoisted(() => ({
-    readAppConfig: vi.fn(),
-    writeAppConfig: vi.fn(async () => undefined),
-    listPersonas: vi.fn(),
-    ensureBridgeRunning: vi.fn(async () => undefined),
-    setAlwaysOnTop: vi.fn(async () => undefined),
-  }));
+const {
+  readAppConfig,
+  writeAppConfig,
+  listPersonas,
+  ensureBridgeRunning,
+  setAlwaysOnTop,
+  brainLoginStatus,
+} = vi.hoisted(() => ({
+  readAppConfig: vi.fn(),
+  writeAppConfig: vi.fn(async () => undefined),
+  listPersonas: vi.fn(),
+  ensureBridgeRunning: vi.fn(async () => undefined),
+  setAlwaysOnTop: vi.fn(async () => undefined),
+  // Default authorized:true so these boot-routing tests never see the
+  // brain-login banner — that's covered separately in App.brainLogin.test.tsx.
+  brainLoginStatus: vi.fn(async () => ({ authorized: true })),
+}));
 
 vi.mock("./appConfig", () => ({
   readAppConfig,
@@ -36,6 +45,7 @@ vi.mock("./appConfig", () => ({
   listPersonas,
   ensureBridgeRunning,
   setAlwaysOnTop,
+  brainLoginStatus,
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
@@ -119,6 +129,7 @@ describe("App boot routing", () => {
     // Default: bridge hangs in-flight so "starting-bridge" phase is observable.
     ensureBridgeRunning.mockReset().mockReturnValue(new Promise(() => undefined));
     setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
   });
 
   afterEach(cleanup);
@@ -203,6 +214,7 @@ describe("App pending-write cards", () => {
     ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
     ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
     setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
     approvePendingWrite.mockClear();
     declinePendingWrite.mockClear();
     fetchPersonaState.mockReset().mockResolvedValue({

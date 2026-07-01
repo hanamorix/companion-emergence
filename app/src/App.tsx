@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  brainLoginStatus,
   ensureBridgeRunning,
   listPersonas,
   nellbrainHomePath,
@@ -27,8 +28,10 @@ import { ensureBridgeCurrent } from "./bridgeVersionCheck";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
 import { PendingWriteCard } from "./components/PendingWriteCard";
+import { BrainLoginPrompt } from "./components/panels/BrainLoginPrompt";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
+import { useRestartBridge } from "./hooks/useRestartBridge";
 import { Wizard } from "./wizard/Wizard";
 import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
@@ -332,6 +335,30 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [resolvingWrites, setResolvingWrites] = useState<Set<string>>(new Set());
   const soulFlashing = useSoulFlash(state);
 
+  // Brain clean-login banner — an offer, never a gate. LOAD-BEARING
+  // INVARIANT: chat renders unconditionally regardless of these values.
+  // null = unknown/still-checking (no banner); session-only dismissal
+  // means the offer is re-shown next app open while still unauthorized.
+  const [brainAuthorized, setBrainAuthorized] = useState<boolean | null>(null);
+  const [brainPromptDismissed, setBrainPromptDismissed] = useState(false);
+  const restartBridge = useRestartBridge(persona, state?.mode ?? "live");
+
+  useEffect(() => {
+    let cancelled = false;
+    brainLoginStatus()
+      .then((res) => {
+        if (!cancelled) setBrainAuthorized(res.authorized);
+      })
+      .catch(() => {
+        // Swallow — absence of a status is treated as "no banner", never
+        // a crash and never a block on chat.
+        if (!cancelled) setBrainAuthorized(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [persona]);
+
   const refetchState = useCallback(async () => {
     try {
       const s = await fetchPersonaState(persona);
@@ -456,6 +483,25 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
                 onDecline={(id) => void resolveWrite(id, declinePendingWrite)}
               />
             ))}
+          </div>
+        )}
+        {brainAuthorized === false && !brainPromptDismissed && (
+          <div
+            data-testid="brain-login-banner"
+            style={{
+              border: "1px solid var(--panel-border, rgba(234,222,218,0.18))",
+              borderRadius: 8,
+              padding: 10,
+              background: "var(--panel-bg)",
+            }}
+          >
+            <BrainLoginPrompt
+              onAuthorized={() => {
+                setBrainAuthorized(true);
+                restartBridge.restart();
+              }}
+              onDismiss={() => setBrainPromptDismissed(true)}
+            />
           </div>
         )}
         <ChatPanel
