@@ -1504,6 +1504,7 @@ async fn start_brain_login(
     if let Ok(mut guard) = state.0.lock() {
         if let Some(mut prev) = guard.take() {
             let _ = prev.child.kill();
+            let _ = prev.child.wait();
         }
     }
     let dir = brain_claude_config_dir()?;
@@ -1531,7 +1532,7 @@ async fn start_brain_login(
 
     // Read stdout lines until the authorize URL appears (bounded), WITHOUT
     // waiting for exit — the process blocks on stdin awaiting the code.
-    let url = tokio::task::spawn_blocking(move || {
+    let maybe_url = tokio::task::spawn_blocking(move || {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines().take(40).map_while(Result::ok) {
@@ -1542,8 +1543,18 @@ async fn start_brain_login(
         None
     })
     .await
-    .map_err(|e| format!("read task: {e}"))?
-    .ok_or_else(|| "could not read sign-in URL from claude".to_string())?;
+    .map_err(|e| format!("read task: {e}"))?;
+    let url = match maybe_url {
+        Some(u) => u,
+        None => {
+            // No URL found in the bounded scan — the child is otherwise
+            // unreachable (never stored in state), so kill it here or it
+            // leaks as an orphaned `claude auth login` process.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("could not read sign-in URL from claude".to_string());
+        }
+    };
 
     if let Ok(mut guard) = state.0.lock() {
         *guard = Some(BrainLoginProc { child, stdin });
@@ -1570,7 +1581,12 @@ async fn submit_brain_login_code(
         proc.stdin.flush().ok();
     }
     drop(proc.stdin);
-    // Bounded wait for the process to finish the exchange.
+    // Bounded wait for the process to finish the exchange. `proc` (and its
+    // child) is moved into the blocking closure, so `wait()` reaps it in the
+    // normal case. The only residual leak is if `spawn_blocking` itself fails
+    // to join (e.g. runtime shutdown/panic) — the child is then dropped
+    // inside the panicked task and left for the OS to reap on teardown.
+    // Narrow, best-effort, and not worth restructuring around.
     let status = tokio::task::spawn_blocking(move || proc.child.wait())
         .await
         .map_err(|e| format!("wait task: {e}"))?
@@ -1613,6 +1629,7 @@ fn cancel_brain_login(state: tauri::State<'_, BrainLoginState>) -> Result<(), St
     if let Ok(mut guard) = state.0.lock() {
         if let Some(mut proc) = guard.take() {
             let _ = proc.child.kill();
+            let _ = proc.child.wait();
         }
     }
     Ok(())
