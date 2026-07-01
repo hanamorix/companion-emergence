@@ -119,6 +119,39 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 
+def _brain_claude_config_dir() -> str | None:
+    """Return a dedicated, brain-owned ``CLAUDE_CONFIG_DIR`` to isolate Nell's
+    ``claude`` spawns from the user's *global* interactive config — or ``None``
+    to leave the default behaviour untouched.
+
+    Why: the ``claude`` CLI injects the user's global config into every ``-p``
+    invocation as context (the superpowers ``using-superpowers`` block, the
+    agent-types list, the enabled-skills catalogue, and the whole
+    ``~/.claude/CLAUDE.md``). None of that is Nell's persona or her
+    conversation, but she receives it every turn and sometimes narrates it. It
+    can't be flag-stripped without breaking her MCP tools or auth. A dedicated
+    ``CLAUDE_CONFIG_DIR`` with its own one-time ``claude auth login`` and no
+    plugins/hooks/CLAUDE.md is the one clean escape (``--mcp-config`` is
+    unaffected by the config dir, so tool-calling is preserved).
+
+    **Safety spine:** used ONLY when ``<KINDLED_HOME>/claude-config`` exists AND
+    carries the ``.brain-authed`` marker (written by the setup helper after it
+    confirms ``claude auth status`` reports logged-in). Absent the marker this
+    returns ``None`` → the spawn inherits the current default config, so a
+    not-yet-set-up or removed brain login can never break chat/tools; it just
+    keeps the (noisy) status quo. Fail-soft on any path error.
+    """
+    try:
+        from brain.paths import get_home
+
+        cfg = get_home() / "claude-config"
+        if (cfg / ".brain-authed").is_file():
+            return str(cfg)
+    except Exception:  # noqa: BLE001 — never let config isolation break a spawn
+        return None
+    return None
+
+
 def _subprocess_env() -> dict[str, str]:
     """Environment for every ``claude`` CLI spawn.
 
@@ -129,9 +162,18 @@ def _subprocess_env() -> dict[str, str]:
     process env at spawn time, and every subsequent ``claude`` subprocess it
     forks inherits it — including calls made on Nell's behalf, injecting the
     caveman ruleset into her replies. See project memory for the incident.
+
+    Also points ``CLAUDE_CONFIG_DIR`` at a dedicated brain-owned config dir when
+    one has been set up + authed (see :func:`_brain_claude_config_dir`), to keep
+    the user's global plugins/skills/CLAUDE.md out of Nell's context. If an
+    explicit ``CLAUDE_CONFIG_DIR`` is already set upstream, it is respected.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("CAVEMAN_")}
     env["CAVEMAN_DEFAULT_MODE"] = "off"
+    if "CLAUDE_CONFIG_DIR" not in env:
+        brain_cfg = _brain_claude_config_dir()
+        if brain_cfg is not None:
+            env["CLAUDE_CONFIG_DIR"] = brain_cfg
     return env
 
 
