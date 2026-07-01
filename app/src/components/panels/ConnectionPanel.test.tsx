@@ -42,6 +42,7 @@ import { ConnectionPanel } from "./ConnectionPanel";
 import type { PersonaState } from "../../bridge";
 import { getClientPlatform, detectInstallShape } from "../../platform";
 import type { Update } from "@tauri-apps/plugin-updater";
+import { invoke } from "@tauri-apps/api/core";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
   return {
@@ -414,5 +415,28 @@ describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(screen.getByText(/install Task Scheduler supervisor/i)).toBeInTheDocument();
+  });
+});
+
+// ── Clean connection / brain login (Task 4) ─────────────────────────
+
+describe("ConnectionPanel — Clean connection section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows an Authorize control when the brain is not yet authorized", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "brain_login_status") return { authorized: false };
+      return { success: true, stdout: "", stderr: "", exit_code: 0 };
+    });
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(
+      await screen.findByRole("button", { name: /authorize/i }),
+    ).toBeInTheDocument();
   });
 });
