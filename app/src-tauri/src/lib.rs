@@ -1360,6 +1360,105 @@ fn path_hint(target_dir: &std::path::Path) -> String {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Brain clean-login — dedicated CLAUDE_CONFIG_DIR isolation
+//
+// The `claude` CLI injects the user's global interactive config (superpowers
+// block, agent-types, enabled-skills catalogue, ~/.claude/CLAUDE.md) into every
+// brain call as context. The daemon already isolates that via a dedicated
+// CLAUDE_CONFIG_DIR (`_subprocess_env()` in brain/bridge/provider.py), used ONLY
+// when the marker `<KINDLED_HOME>/claude-config/.brain-authed` exists. These
+// helpers + commands let NellFace create + validate that marker in-app.
+// Path + marker name MUST match the Python side (`_brain_claude_config_dir`).
+// ────────────────────────────────────────────────────────────────────────────
+
+fn brain_claude_config_dir() -> Result<PathBuf, String> {
+    Ok(nellbrain_home()?.join("claude-config"))
+}
+
+fn brain_marker_path() -> Result<PathBuf, String> {
+    Ok(brain_claude_config_dir()?.join(".brain-authed"))
+}
+
+/// Parse `claude auth status`'s `loggedIn` boolean (it emits JSON by default —
+/// `--output json` is NOT a valid flag). `None` when the field is absent or the
+/// payload isn't valid JSON with it, so callers can distinguish "definitively
+/// logged out" from "couldn't tell".
+fn parse_logged_in(status_json: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(status_json).ok()?;
+    v.get("loggedIn").and_then(|b| b.as_bool())
+}
+
+/// Env for a `claude` spawn scoped to the brain's dedicated config dir. Mirrors
+/// `nell_command`'s PATH augmentation (GUI/launchd inherit a stripped PATH) via
+/// the shared `path_with_claude_cli_dirs`, isolates config via
+/// CLAUDE_CONFIG_DIR, and forces caveman off.
+fn claude_login_env() -> Vec<(String, String)> {
+    let path = path_with_claude_cli_dirs(
+        std::env::var("PATH").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    );
+    let mut out = vec![
+        ("PATH".to_string(), path),
+        ("CAVEMAN_DEFAULT_MODE".to_string(), "off".to_string()),
+    ];
+    if let Ok(dir) = brain_claude_config_dir() {
+        out.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+    }
+    out
+}
+
+#[derive(Debug, Serialize)]
+pub struct BrainLoginStatus {
+    pub authorized: bool,
+}
+
+/// Called on app open. If the marker is absent → unauthorized. If present →
+/// verify it's still valid with one `claude auth status`; self-heal (remove the
+/// marker → daemon falls back to the default config, never stranded) ONLY on a
+/// definitive `loggedIn:false`. On any transient/parse/spawn error, LEAVE the
+/// marker alone (bias: a stale marker only costs noise; wiping a good one costs
+/// a re-login).
+#[tauri::command]
+async fn brain_login_status() -> Result<BrainLoginStatus, String> {
+    let marker = match brain_marker_path() {
+        Ok(m) => m,
+        Err(_) => return Ok(BrainLoginStatus { authorized: false }),
+    };
+    if !marker.is_file() {
+        return Ok(BrainLoginStatus { authorized: false });
+    }
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(["auth", "status"]);
+    // Inherit the parent env (HOME/USER/etc. that `claude` needs) and only
+    // OVERRIDE the three keys — mirrors Python `_subprocess_env()`, which does
+    // not clear. env_clear() here would strip HOME and break claude.
+    for (k, v) in claude_login_env() {
+        cmd.env(k, v);
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(CLAUDE_VERSION_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            match parse_logged_in(&stdout) {
+                Some(false) => {
+                    let _ = std::fs::remove_file(&marker);
+                    Ok(BrainLoginStatus { authorized: false })
+                }
+                _ => Ok(BrainLoginStatus { authorized: true }),
+            }
+        }
+        _ => Ok(BrainLoginStatus { authorized: true }), // transient → keep marker
+    }
+}
+
 /// Result of probing the host for Anthropic's ``claude`` CLI.
 ///
 /// Powers the wizard's prerequisites step: when ``found`` is false the
@@ -1542,6 +1641,7 @@ pub fn run() {
             install_supervisor_service,
             install_nell_cli_symlink,
             check_claude_cli,
+            brain_login_status,
             detect_install_shape,
             set_always_on_top,
             show_initiate_notification,
@@ -1601,6 +1701,14 @@ mod tests {
         assert!(dirs.contains(&PathBuf::from("/Users/test/.local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
+    }
+
+    #[test]
+    fn parse_logged_in_reads_true_false_and_garbage() {
+        assert_eq!(parse_logged_in(r#"{"loggedIn": true, "email":"x"}"#), Some(true));
+        assert_eq!(parse_logged_in(r#"{"loggedIn": false}"#), Some(false));
+        assert_eq!(parse_logged_in("not json"), None);
+        assert_eq!(parse_logged_in(r#"{"other": 1}"#), None);
     }
 
     #[test]
