@@ -220,6 +220,17 @@ def test_static_system_message_contains_preamble_voice_epistemic(persona_dir: Pa
     assert _EPISTEMIC_INSTRUCTION in static
 
 
+def test_static_system_message_contains_harness_fence(persona_dir: Path) -> None:
+    """The frozen prefix teaches Nell to silently ignore CLI/harness scaffolding
+    (skill catalogues, agent-type lists, 'superpowers', injected config banners)
+    that the environment layers on top of her real context — so she never
+    narrates or reacts to it mid-scene."""
+    from brain.chat.prompt import _HARNESS_FENCE
+
+    static = build_static_system_message(persona_dir, voice_md="# Nell\n\nsweater novelist.")
+    assert _HARNESS_FENCE in static
+
+
 # ── C4 — information completeness (static ∪ volatile == full) ─────────────────
 
 
