@@ -1411,6 +1411,14 @@ fn claude_login_env() -> Vec<(String, String)> {
     out
 }
 
+/// Pull the first https URL out of a line of `claude auth login` output.
+fn extract_login_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let rest = &line[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
 #[derive(Debug, Serialize)]
 pub struct BrainLoginStatus {
     pub authorized: bool,
@@ -1457,6 +1465,157 @@ async fn brain_login_status() -> Result<BrainLoginStatus, String> {
         }
         _ => Ok(BrainLoginStatus { authorized: true }), // transient → keep marker
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Brain clean-login — interactive `claude auth login` flow
+//
+// Drives `claude auth login --claudeai`, which opens a browser then blocks
+// on stdin awaiting a pasted authorization code. The child + its stdin
+// handle live in managed state between `start_brain_login` (spawn + read the
+// URL off stdout) and `submit_brain_login_code` (write the code, wait for
+// exit, verify + write the marker on success).
+// ────────────────────────────────────────────────────────────────────────────
+
+struct BrainLoginProc {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+}
+
+#[derive(Default)]
+struct BrainLoginState(std::sync::Mutex<Option<BrainLoginProc>>);
+
+#[derive(Debug, Serialize)]
+pub struct StartBrainLogin {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubmitBrainLogin {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+async fn start_brain_login(
+    state: tauri::State<'_, BrainLoginState>,
+) -> Result<StartBrainLogin, String> {
+    // Single-flight: kill any prior in-progress login.
+    if let Ok(mut guard) = state.0.lock() {
+        if let Some(mut prev) = guard.take() {
+            let _ = prev.child.kill();
+        }
+    }
+    let dir = brain_claude_config_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    let mut cmd = std::process::Command::new("claude");
+    cmd.args(["auth", "login", "--claudeai"]);
+    // Inherit the parent env (HOME/USER/etc. that `claude` needs) and only
+    // OVERRIDE the login-scoped keys — mirrors `brain_login_status` above.
+    // env_clear() here would strip HOME and break claude.
+    for (k, v) in claude_login_env() {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn claude: {e}"))?;
+    let stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+
+    // Read stdout lines until the authorize URL appears (bounded), WITHOUT
+    // waiting for exit — the process blocks on stdin awaiting the code.
+    let url = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().take(40).map_while(Result::ok) {
+            if let Some(u) = extract_login_url(&line) {
+                return Some(u);
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|e| format!("read task: {e}"))?
+    .ok_or_else(|| "could not read sign-in URL from claude".to_string())?;
+
+    if let Ok(mut guard) = state.0.lock() {
+        *guard = Some(BrainLoginProc { child, stdin });
+    }
+    Ok(StartBrainLogin { url })
+}
+
+#[tauri::command]
+async fn submit_brain_login_code(
+    code: String,
+    state: tauri::State<'_, BrainLoginState>,
+) -> Result<SubmitBrainLogin, String> {
+    let mut proc = state
+        .0
+        .lock()
+        .map_err(|_| "lock".to_string())?
+        .take()
+        .ok_or("no login in progress")?;
+    {
+        use std::io::Write;
+        proc.stdin
+            .write_all(format!("{}\n", code.trim()).as_bytes())
+            .map_err(|e| format!("write code: {e}"))?;
+        proc.stdin.flush().ok();
+    }
+    drop(proc.stdin);
+    // Bounded wait for the process to finish the exchange.
+    let status = tokio::task::spawn_blocking(move || proc.child.wait())
+        .await
+        .map_err(|e| format!("wait task: {e}"))?
+        .map_err(|e| format!("wait: {e}"))?;
+    if !status.success() {
+        return Ok(SubmitBrainLogin {
+            ok: false,
+            error: Some("sign-in did not complete".into()),
+        });
+    }
+    // Verify + write marker. `--output json` is not a valid flag — plain
+    // `claude auth status` emits JSON by default; `parse_logged_in` handles it.
+    let mut status_cmd = tokio::process::Command::new("claude");
+    status_cmd.args(["auth", "status"]);
+    for (k, v) in claude_login_env() {
+        status_cmd.env(k, v);
+    }
+    let out = status_cmd
+        .output()
+        .await
+        .map_err(|e| format!("status: {e}"))?;
+    let logged_in = parse_logged_in(&String::from_utf8_lossy(&out.stdout)) == Some(true);
+    if logged_in {
+        let marker = brain_marker_path()?;
+        std::fs::write(&marker, b"ok").map_err(|e| format!("write marker: {e}"))?;
+        Ok(SubmitBrainLogin {
+            ok: true,
+            error: None,
+        })
+    } else {
+        Ok(SubmitBrainLogin {
+            ok: false,
+            error: Some("code rejected or sign-in incomplete".into()),
+        })
+    }
+}
+
+#[tauri::command]
+fn cancel_brain_login(state: tauri::State<'_, BrainLoginState>) -> Result<(), String> {
+    if let Ok(mut guard) = state.0.lock() {
+        if let Some(mut proc) = guard.take() {
+            let _ = proc.child.kill();
+        }
+    }
+    Ok(())
 }
 
 /// Result of probing the host for Anthropic's ``claude`` CLI.
@@ -1624,6 +1783,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(BrainLoginState::default())
         .invoke_handler(tauri::generate_handler![
             get_bridge_credentials,
             read_app_config,
@@ -1642,6 +1802,9 @@ pub fn run() {
             install_nell_cli_symlink,
             check_claude_cli,
             brain_login_status,
+            start_brain_login,
+            submit_brain_login_code,
+            cancel_brain_login,
             detect_install_shape,
             set_always_on_top,
             show_initiate_notification,
@@ -1709,6 +1872,22 @@ mod tests {
         assert_eq!(parse_logged_in(r#"{"loggedIn": false}"#), Some(false));
         assert_eq!(parse_logged_in("not json"), None);
         assert_eq!(parse_logged_in(r#"{"other": 1}"#), None);
+    }
+
+    #[test]
+    fn brain_login_state_default_has_no_in_progress_login() {
+        let state = BrainLoginState::default();
+        assert!(state.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_login_url_pulls_authorize_url() {
+        let line = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&x=1";
+        assert_eq!(
+            extract_login_url(line).as_deref(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc&x=1")
+        );
+        assert_eq!(extract_login_url("no url here"), None);
     }
 
     #[test]
