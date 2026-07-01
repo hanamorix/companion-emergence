@@ -350,16 +350,57 @@ fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> 
     })
 }
 
+/// Build a `PATH` value that includes `existing` plus the directories
+/// Anthropic's installer and common package managers use for `claude`
+/// (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), appended only
+/// if not already present. Mirrors the candidate list `check_claude_cli`
+/// already probes directly — this is the same list, applied to the PATH
+/// the bridge daemon (and everything it later spawns) actually runs with.
+fn path_with_claude_cli_dirs(existing: Option<&str>, home: Option<&str>) -> String {
+    let mut dirs: Vec<PathBuf> = existing
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let mut extra: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        extra.push(PathBuf::from(home).join(".local/bin"));
+    }
+    extra.push(PathBuf::from("/opt/homebrew/bin"));
+    extra.push(PathBuf::from("/usr/local/bin"));
+    for dir in extra {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| existing.unwrap_or_default().to_string())
+}
+
 /// Resolution order:
 ///   1. Bundled per-OS path (production)
 ///   2. uv run nell (dev fallback)
+///
+/// GUI/launchd-launched processes inherit a stripped PATH (macOS: often
+/// just `/usr/bin:/bin:/usr/sbin:/sbin`) that omits where `claude` lives.
+/// The bridge daemon spawned here shells out to a bare `claude` command for
+/// every chat/dream/reflex/research call — without augmenting PATH here,
+/// those calls fail with "couldn't reach Claude" even though `claude` is
+/// installed (the wizard's `check_claude_cli` probe finds it fine, but that
+/// check never fixed the PATH the daemon itself runs with).
 fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
-    if let Some(bundled) = bundled_nell_path(app)? {
-        return Ok(Command::new(bundled));
-    }
-    // Dev fallback — uv on PATH against the source tree.
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("nell");
+    let mut cmd = if let Some(bundled) = bundled_nell_path(app)? {
+        Command::new(bundled)
+    } else {
+        // Dev fallback — uv on PATH against the source tree.
+        let mut c = Command::new("uv");
+        c.arg("run").arg("nell");
+        c
+    };
+    let augmented = path_with_claude_cli_dirs(
+        std::env::var("PATH").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    );
+    cmd.env("PATH", augmented);
     Ok(cmd)
 }
 
@@ -1549,6 +1590,17 @@ mod tests {
         assert!(validate_persona_name("nell;semi").is_err());
         assert!(validate_persona_name("nell$dollar").is_err());
         assert!(validate_persona_name("nell!bang").is_err());
+    }
+
+    #[test]
+    fn path_with_claude_cli_dirs_appends_known_locations() {
+        let result = path_with_claude_cli_dirs(Some("/usr/bin:/bin"), Some("/Users/test"));
+        let dirs: Vec<_> = std::env::split_paths(&result).collect();
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        assert!(dirs.contains(&PathBuf::from("/bin")));
+        assert!(dirs.contains(&PathBuf::from("/Users/test/.local/bin")));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
     }
 
     #[test]
