@@ -269,3 +269,33 @@ export async function installSupervisorService(persona: string): Promise<InitRes
 export async function installNellCliSymlink(): Promise<InitResult> {
   return await invoke<InitResult>("install_nell_cli_symlink");
 }
+
+/**
+ * Give the brain its own clean `claude` login, separate from whatever
+ * CLI session the user has open in their own terminal — keeps plugin/
+ * skill noise from the user's setup out of the brain's provider calls.
+ *
+ * Three-step flow, mirrored by `BrainLoginPrompt`:
+ * 1. `brainLoginStatus` — is the brain already authorized?
+ * 2. `startBrainLogin` — spawns `claude auth login`; the process opens
+ *    the browser itself, and returns the sign-in URL as a fallback link.
+ * 3. `submitBrainLoginCode` — pastes the code back to finish the flow.
+ * `cancelBrainLogin` tears down an in-flight attempt (e.g. "Not now").
+ */
+export async function brainLoginStatus(): Promise<{ authorized: boolean }> {
+  return await invoke<{ authorized: boolean }>("brain_login_status");
+}
+
+export async function startBrainLogin(): Promise<{ url: string }> {
+  return await invoke<{ url: string }>("start_brain_login");
+}
+
+export async function submitBrainLoginCode(
+  code: string,
+): Promise<{ ok: boolean; error: string | null }> {
+  return await invoke<{ ok: boolean; error: string | null }>("submit_brain_login_code", { code });
+}
+
+export async function cancelBrainLogin(): Promise<void> {
+  await invoke("cancel_brain_login");
+}
