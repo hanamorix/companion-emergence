@@ -119,6 +119,22 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 
+def _subprocess_env() -> dict[str, str]:
+    """Environment for every ``claude`` CLI spawn.
+
+    Scrubs ``CAVEMAN_*`` vars and forces ``CAVEMAN_DEFAULT_MODE=off``. Without
+    this, a bridge daemon that was ever launched from inside a Claude Code
+    session scoped to a project with a coding-session caveman override (e.g.
+    this repo's ``.claude/settings.local.json``) bakes that var into its own
+    process env at spawn time, and every subsequent ``claude`` subprocess it
+    forks inherits it — including calls made on Nell's behalf, injecting the
+    caveman ruleset into her replies. See project memory for the incident.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CAVEMAN_")}
+    env["CAVEMAN_DEFAULT_MODE"] = "off"
+    return env
+
+
 _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
     # Internal context-routing keys threaded through the provider `options` dict by
     # engine.respond — NOT generation params. They must be stripped before options are
@@ -456,6 +472,7 @@ class ClaudeCliProvider(LLMProvider):
                     encoding="utf-8",
                     errors="replace",
                     timeout=self._timeout,
+                    env=_subprocess_env(),
                     check=False,
                     creationflags=_NO_WINDOW,
                 )
@@ -596,6 +613,7 @@ class ClaudeCliProvider(LLMProvider):
                     encoding="utf-8",
                     errors="replace",
                     timeout=self._timeout,
+                    env=_subprocess_env(),
                     check=False,
                     creationflags=_NO_WINDOW,
                 )
@@ -796,6 +814,7 @@ class ClaudeCliProvider(LLMProvider):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env=_subprocess_env(),
                     creationflags=_NO_WINDOW,
                 )
             except OSError as exc:
@@ -1034,7 +1053,7 @@ class ClaudeCliProvider(LLMProvider):
         # for image-bearing turns.
         tmp_mcp_path: str | None = None
         request_id = uuid.uuid4().hex
-        env_overrides = {**os.environ, "NELL_MCP_AUDIT_REQUEST_ID": request_id}
+        env_overrides = {**_subprocess_env(), "NELL_MCP_AUDIT_REQUEST_ID": request_id}
         audit_offset_before = 0
         audit_log_path = persona_dir / "tool_invocations.log.jsonl"
         if tools_enabled:
@@ -1251,6 +1270,7 @@ class ClaudeCliProvider(LLMProvider):
                         cmd,
                         input=flat_prompt,
                         capture_output=True,
+                        env=_subprocess_env(),
                         text=True,
                         encoding="utf-8",
                         errors="replace",
