@@ -47,3 +47,20 @@ def test_future_next_at_not_due_until_wall_clock_passes_it():
         state = pc.load_cadence(pd, "v.json")
         assert pc.is_due(state, now=base + timedelta(hours=1)) is False
         assert pc.is_due(state, now=base + timedelta(hours=25)) is True
+
+
+def test_save_cadence_is_fail_soft_on_oserror(monkeypatch):
+    # A cadence save runs inside supervisor finally-blocks; a raised OSError
+    # (disk full / EACCES / Windows AV holding the .tmp during rename) would
+    # escape run_folded and kill the whole supervisor. save_cadence must
+    # swallow it (best-effort persistence, like load_cadence).
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        state = pc.advance(now=datetime(2026, 6, 23, 12, tzinfo=UTC), interval_s=3600.0)
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        # Must NOT raise.
+        pc.save_cadence(pd, "v.json", state)
