@@ -91,13 +91,25 @@ def _lived_hours_since(anchor: datetime, felt_time_state: FeltTimeState | None) 
         return None
     if felt_time_state.last_tick_ts is None:
         return wall_delta_s / 3600.0
-    wall_clock_since_first_tick_s = (
+    # KNOWN DEFECT (interim clamp, bug-hunt finding #3): this denominator is
+    # named "since_first_tick" but last_tick_ts is the MOST-RECENT tick
+    # (felt_time resets it every heartbeat), so in production it is seconds-to-
+    # minutes, not the wall age of felt-time. That inflated rate_lived_per_wall
+    # ~1000x and collapsed freshness → premature FADE/LOSE of days-old memories.
+    # Until FeltTimeState carries a real first-tick anchor (deferred), clamp the
+    # rate to <= 1.0: lived-time cannot age a memory faster than wall-clock. This
+    # exactly matches the intended horizon calibration (the peak/freshness
+    # constants + tests all assume rate ~= 1) and is purely memory-preserving
+    # (a lower rate only raises freshness). Felt-time ACCELERATION (>1x) is
+    # disabled until the anchor fix restores a correct denominator.
+    wall_since_last_tick_s = (
         now - datetime.fromisoformat(felt_time_state.last_tick_ts)
     ).total_seconds()
-    if wall_clock_since_first_tick_s <= 0:
+    if wall_since_last_tick_s <= 0:
         return None
-    rate_lived_per_wall = felt_time_state.lived_age_hours / max(
-        wall_clock_since_first_tick_s / 3600.0, 1e-6
+    rate_lived_per_wall = min(
+        1.0,
+        felt_time_state.lived_age_hours / max(wall_since_last_tick_s / 3600.0, 1e-6),
     )
     return (wall_delta_s / 3600.0) * rate_lived_per_wall
 
