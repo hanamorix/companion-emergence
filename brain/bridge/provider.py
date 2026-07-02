@@ -1402,9 +1402,36 @@ def _read_audit_lines_since(
     are skipped silently — telemetry should never break a chat response.
     """
     try:
-        with audit_log_path.open("rb") as fh:
-            fh.seek(offset)
-            new_bytes = fh.read()
+        # Rotation guard (bug #5): audit._rotate_if_needed renames the log to
+        # `.1` and starts a fresh (empty) file once it exceeds ~1MB. If that
+        # happens mid-turn, the current file is SMALLER than the pre-turn
+        # `offset`, so a plain seek(offset) lands past EOF and drops the whole
+        # turn's invocations. Detect the shrink and stitch: the `.1` tail from
+        # `offset` (entries written before the rotation) + the entire new file
+        # (entries written after). Single-rotation recovery — a turn writing
+        # >1MB of audit (multiple rotations) is pathological and out of scope.
+        try:
+            current_size = audit_log_path.stat().st_size
+        except OSError:
+            current_size = 0
+        if current_size < offset:
+            new_bytes = b""
+            backup = audit_log_path.with_name(f"{audit_log_path.name}.1")
+            try:
+                with backup.open("rb") as fh:
+                    fh.seek(min(offset, backup.stat().st_size))
+                    new_bytes += fh.read()
+            except (FileNotFoundError, OSError):
+                pass
+            try:
+                with audit_log_path.open("rb") as fh:
+                    new_bytes += fh.read()
+            except FileNotFoundError:
+                pass
+        else:
+            with audit_log_path.open("rb") as fh:
+                fh.seek(offset)
+                new_bytes = fh.read()
     except FileNotFoundError:
         return []
     except OSError as exc:
