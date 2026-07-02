@@ -325,10 +325,20 @@ class _StreamingProxy:
         # Regression: the v0.0.34 "got the tag but no image data" live bug.
         from brain.bridge.provider import _message_has_image
 
+        # suppress_stream (bug #4): run_tool_loop sets this on a recruitable
+        # first pass so its text is NOT pushed to the WS (only the recruit rerun
+        # — or a single emit_text flush — streams). Pop it so the real provider
+        # never sees an unknown option.
+        suppress = False
+        if options is not None and "suppress_stream" in options:
+            options = {k: v for k, v in options.items() if k != "suppress_stream"}
+            suppress = True
+
         if any(_message_has_image(m) for m in messages):
             resp = self._real.chat(messages, tools=tools, options=options)
-            for word in _word_chunks(resp.content):
-                self._loop.call_soon_threadsafe(self._q.put_nowait, word)
+            if not suppress:
+                for word in _word_chunks(resp.content):
+                    self._loop.call_soon_threadsafe(self._q.put_nowait, word)
             return resp
 
         # Capture the MCP audit-log offset BEFORE the stream so we can read
@@ -350,15 +360,17 @@ class _StreamingProxy:
             # Provider has no streaming support; call chat() and forward the
             # full content as word tokens so the WS still emits reply_chunk frames.
             resp = self._real.chat(messages, tools=tools, options=options)
-            for word in _word_chunks(resp.content):
-                self._loop.call_soon_threadsafe(self._q.put_nowait, word)
+            if not suppress:
+                for word in _word_chunks(resp.content):
+                    self._loop.call_soon_threadsafe(self._q.put_nowait, word)
             return resp
 
         chunks: list[str] = []
         for ev in chat_stream(messages, tools=tools, options=options):
             if isinstance(ev, TextDelta):
                 chunks.append(ev.text)
-                self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
+                if not suppress:
+                    self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
             elif isinstance(ev, StreamDone):
                 if ev.content and not chunks:
                     # No per-token deltas arrived (result-frame-only path
@@ -368,7 +380,8 @@ class _StreamingProxy:
                     # renders empty until reopen. Bug surfaced in
                     # v0.0.15-alpha.2; fix landed v0.0.16.1.
                     chunks = [ev.content]
-                    self._loop.call_soon_threadsafe(self._q.put_nowait, ev.content)
+                    if not suppress:
+                        self._loop.call_soon_threadsafe(self._q.put_nowait, ev.content)
             elif isinstance(ev, StreamError):
                 raise ProviderError(ev.stage, ev.detail)
 
@@ -387,6 +400,13 @@ class _StreamingProxy:
             raw=None,
             dispatched_invocations=dispatched,
         )
+
+    def emit_text(self, text: str) -> None:
+        """Push `text` to the WS as word chunks. Used by run_tool_loop to flush
+        a buffered (stream-suppressed) reply on a recruitable turn that did NOT
+        reach — so exactly one reply reaches the client (bug #4)."""
+        for word in _word_chunks(text):
+            self._loop.call_soon_threadsafe(self._q.put_nowait, word)
 
 
 def _apply_replied_explicit_transition(
