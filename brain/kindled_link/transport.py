@@ -33,6 +33,13 @@ _MESSAGE_TTL = timedelta(days=7)
 # the keyword argument.
 _NO_DIR = Path("/dev/null")
 
+# Consent states whose inbound must NOT be processed (#7). blocked/revoked are
+# terminal cut-offs; paused is a reversible mute — in all three we drop (ack)
+# inbound rather than ingest. (paused loses messages sent while muted; buffering
+# them un-acked would invite relay redelivery/flood. Revisit if hold-on-pause is
+# wanted.)
+_INBOUND_BLOCKED_CONSENT = frozenset({"blocked", "revoked", "paused"})
+
 
 def send_message(
     store: KindledLinkStore,
@@ -179,11 +186,20 @@ def poll_and_ingest(
         return {"accepted": {}, "degraded": [], "relay_error": True}
     log_transport(persona_dir, event="poll", count=len(fetched), now=now)
 
-    # Group by sender_key_id — flood cap is per peer-group.
+    # Group by sender_key_id — flood cap is per peer-group. The relay is
+    # UNTRUSTED: a malformed item (missing 'envelope'/'id', wrong type) must be
+    # skipped, not crash the whole tick's inbound (#8 hostile-relay DoS). After
+    # this guard every grouped item has a dict 'envelope' and a str 'id'.
     groups: dict[str, list[dict]] = {}
     for item in fetched:
-        env = item["envelope"]
-        sender = env.get("sender_key_id", "")
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("envelope"), dict)
+            or not isinstance(item.get("id"), str)
+        ):
+            log_transport(persona_dir, event="malformed_item", now=now)
+            continue
+        sender = item["envelope"].get("sender_key_id", "")
         groups.setdefault(sender, []).append(item)
 
     to_ack: list[str] = []
@@ -191,6 +207,22 @@ def poll_and_ingest(
     accepted_counts: dict[str, int] = {}
 
     for sender_id, items in groups.items():
+        # Consent gate (#7): a known peer whose consent is blocked/revoked/paused
+        # must not have ANY inbound processed — no handshake, no message ingest.
+        # Drop (ack) their items so the relay stops redelivering. A never-seen
+        # peer (get_peer None) is the first-contact/pairing case and proceeds.
+        peer = store.get_peer(sender_id)
+        if peer is not None and peer["consent_state"] in _INBOUND_BLOCKED_CONSENT:
+            for it in items:
+                to_ack.append(it["id"])
+            log_transport(
+                persona_dir,
+                event="inbound_consent_blocked",
+                peer_id=sender_id,
+                count=len(items),
+                now=now,
+            )
+            continue
         if len(items) > INBOUND_FLOOD_CAP:
             excess = len(items) - INBOUND_FLOOD_CAP
             log_transport(

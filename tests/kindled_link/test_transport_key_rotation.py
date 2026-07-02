@@ -65,7 +65,10 @@ def test_rotation_notice_updates_peer_identity(store: KindledLinkStore, tmp_path
     local_idn = _idn(99)
     poll_and_ingest(store, local_idn, rc, now=_NOW, persona_dir=tmp_path)
 
-    peer = store.get_peer("kid_old")
+    # #6: rotation rekeys peer_id to the new key id; the peer resolves by new,
+    # not the old id.
+    assert store.get_peer("kid_old") is None
+    peer = store.get_peer(new.key_id)
     assert peer["identity_pub"] == new.public_bytes.hex()
     assert peer["previous_identity_pub"] == old.public_bytes.hex()
 
@@ -89,9 +92,12 @@ def test_rotation_notice_idempotent(store: KindledLinkStore, tmp_path: Path) -> 
     rc = _make_relay([notice])
     local_idn = _idn(99)
     poll_and_ingest(store, local_idn, rc, now=_NOW, persona_dir=tmp_path)
-    # Second delivery — peer now has new key; idempotent path silently skips.
+    # Second delivery — peer is now rekeyed to new.key_id (#6); the re-delivered
+    # notice (sender_key_id=kid_old) finds no peer and is silently dropped. No
+    # error, no double-apply.
     poll_and_ingest(store, local_idn, rc, now=_NOW, persona_dir=tmp_path)
-    peer = store.get_peer("kid_old")
+    assert store.get_peer("kid_old") is None
+    peer = store.get_peer(new.key_id)
     assert peer["identity_pub"] == new.public_bytes.hex()
 
 
@@ -111,12 +117,13 @@ def test_rotation_notice_rollback_rejected(store: KindledLinkStore, tmp_path: Pa
         now=_NOW,
         ttl=_TTL,
     )
-    # sender_key_id = new.key_id; the store peer_id is still "kid_old"
-    # so transport's lookup by sender_id=new.key_id finds no peer -> unknown peer path
+    # sender_key_id = new.key_id; after #6 the peer is rekeyed to new.key_id, so
+    # the notice FINDS the peer and hits the rollback guard (new_identity_pub ==
+    # previous_identity_pub → rejected).
     rollback_notice["sender_key_id"] = new.key_id
     rc = _make_relay([rollback_notice])
     local_idn = _idn(99)
     poll_and_ingest(store, local_idn, rc, now=_NOW, persona_dir=tmp_path)
-    peer = store.get_peer("kid_old")
+    peer = store.get_peer(new.key_id)
     # Still has the new key; rollback did not apply
     assert peer["identity_pub"] == new.public_bytes.hex()
