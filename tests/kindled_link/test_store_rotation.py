@@ -67,7 +67,10 @@ def test_update_peer_identity_sets_previous(store: KindledLinkStore) -> None:
     _add_peer(store, pub=old_pub)
     now = datetime(2026, 6, 27, tzinfo=UTC)
     store.update_peer_identity("peer_1", new_pub, "kid_new", now)
-    peer = store.get_peer("peer_1")
+    # peer_id (== fingerprint) is rekeyed on rotation (#6): resolvable by the
+    # NEW key id; the old id no longer resolves.
+    assert store.get_peer("peer_1") is None
+    peer = store.get_peer("kid_new")
     assert peer["identity_pub"] == new_pub
     assert peer["fingerprint"] == "kid_new"
     assert peer["previous_identity_pub"] == old_pub
