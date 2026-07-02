@@ -906,6 +906,13 @@ const INIT_TIMEOUT_SECS: u64 = 30;
 const MIGRATING_INIT_TIMEOUT_SECS: u64 = 300;
 const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
 
+// Interactive brain-login submit path (foreground UX action). Generous — the
+// token exchange after the pasted code is a network round-trip; the status
+// verify is quicker. On timeout the UI shows a retry error instead of hanging
+// in "verifying".
+const BRAIN_LOGIN_SUBMIT_TIMEOUT_SECS: u64 = 60;
+const BRAIN_LOGIN_STATUS_TIMEOUT_SECS: u64 = 15;
+
 /// Build the argv for `nell init`. Extracted so argument construction
 /// (especially the always-present `--model`) is covered by a unit test,
 /// mirroring `build_service_install_args`. `--user-name` stays optional;
@@ -1581,16 +1588,29 @@ async fn submit_brain_login_code(
         proc.stdin.flush().ok();
     }
     drop(proc.stdin);
-    // Bounded wait for the process to finish the exchange. `proc` (and its
-    // child) is moved into the blocking closure, so `wait()` reaps it in the
-    // normal case. The only residual leak is if `spawn_blocking` itself fails
-    // to join (e.g. runtime shutdown/panic) — the child is then dropped
-    // inside the panicked task and left for the OS to reap on teardown.
-    // Narrow, best-effort, and not worth restructuring around.
-    let status = tokio::task::spawn_blocking(move || proc.child.wait())
-        .await
-        .map_err(|e| format!("wait task: {e}"))?
-        .map_err(|e| format!("wait: {e}"))?;
+    // Bounded wait for the process to finish the token exchange. `proc` (and
+    // its child) is moved into the blocking closure, so `wait()` reaps it in
+    // the normal case. On TIMEOUT we return a clean error rather than hang the
+    // "verifying" UI — the blocking task keeps running and still reaps the
+    // child whenever `claude` eventually exits, so no orphan is left. (A
+    // spawn_blocking join failure — runtime shutdown/panic — drops the child in
+    // the panicked task for the OS to reap; narrow, best-effort.)
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(BRAIN_LOGIN_SUBMIT_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || proc.child.wait()),
+    )
+    .await
+    {
+        Ok(join) => join
+            .map_err(|e| format!("wait task: {e}"))?
+            .map_err(|e| format!("wait: {e}"))?,
+        Err(_) => {
+            return Ok(SubmitBrainLogin {
+                ok: false,
+                error: Some("sign-in timed out — please try again".into()),
+            })
+        }
+    };
     if !status.success() {
         return Ok(SubmitBrainLogin {
             ok: false,
@@ -1599,15 +1619,28 @@ async fn submit_brain_login_code(
     }
     // Verify + write marker. `--output json` is not a valid flag — plain
     // `claude auth status` emits JSON by default; `parse_logged_in` handles it.
+    // kill_on_drop + a bounded timeout so a hung status check can't wedge the
+    // UI: on timeout the dropped future kills the status child.
     let mut status_cmd = tokio::process::Command::new("claude");
     status_cmd.args(["auth", "status"]);
+    status_cmd.kill_on_drop(true);
     for (k, v) in claude_login_env() {
         status_cmd.env(k, v);
     }
-    let out = status_cmd
-        .output()
-        .await
-        .map_err(|e| format!("status: {e}"))?;
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(BRAIN_LOGIN_STATUS_TIMEOUT_SECS),
+        status_cmd.output(),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| format!("status: {e}"))?,
+        Err(_) => {
+            return Ok(SubmitBrainLogin {
+                ok: false,
+                error: Some("could not confirm sign-in — please try again".into()),
+            })
+        }
+    };
     let logged_in = parse_logged_in(&String::from_utf8_lossy(&out.stdout)) == Some(true);
     if logged_in {
         let marker = brain_marker_path()?;
