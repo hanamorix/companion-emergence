@@ -1273,3 +1273,31 @@ def test_chat_with_mcp_tools_calls_log_usage(persona_dir: Path) -> None:
     assert call_kwargs.kwargs["call_type"] == "chat"
     assert call_kwargs.kwargs["model"] == "sonnet"
 
+
+
+def test_read_audit_lines_since_recovers_across_rotation(tmp_path: Path) -> None:
+    """Bug #5: if the audit log rotates (renamed to .1, fresh file started)
+    mid-turn, seeking `offset` in the new (smaller) file returns nothing and the
+    turn's dispatched invocations are silently dropped. The reader must detect
+    the shrink and stitch the .1 tail (from offset) + the new file."""
+    from brain.bridge.provider import _read_audit_lines_since
+
+    audit_path = tmp_path / "tool_invocations.log.jsonl"
+    # Pre-turn content — this is the byte offset captured before the subprocess.
+    pre = json.dumps({"name": "pre_turn", "arguments": {}, "result_summary": "old"}) + "\n"
+    audit_path.write_text(pre, encoding="utf-8")
+    offset = audit_path.stat().st_size
+
+    # During the turn: one entry appended, THEN rotation, THEN another entry.
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"name": "before_rot", "arguments": {}, "result_summary": "a"}) + "\n")
+    # Rotate: move current file to .1, start a fresh empty log (mirrors
+    # audit._rotate_if_needed).
+    audit_path.replace(audit_path.with_name(audit_path.name + ".1"))
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"name": "after_rot", "arguments": {}, "result_summary": "b"}) + "\n")
+
+    records = _read_audit_lines_since(audit_path, offset)
+    names = [r["name"] for r in records]
+    assert names == ["before_rot", "after_rot"], f"lost invocations across rotation: {names}"
+    assert "pre_turn" not in names, "pre-turn entry must not leak"
