@@ -195,3 +195,27 @@ def test_score_handles_missing_hebbian_entry():
     assert s >= 0.0
     store.close()
     hebbian.close()
+
+
+def test_freshness_rate_capped_so_recent_tick_does_not_collapse_freshness():
+    """Production shape: last_tick_ts is ~now (updated every heartbeat) while
+    lived_age_hours is large. The old code divided lived_age by the tiny
+    wall-since-LAST-tick → rate ~1000x → a days-old memory's freshness collapsed
+    to 0 and it was faded/lost prematurely (bug-hunt finding #3). The rate is now
+    clamped to <=1.0, so a memory anchored a couple of wall-days ago stays fresh."""
+    from brain.forgetting.salience import _freshness_input
+
+    now = datetime.now(UTC)
+    # 500 lived-hours accrued, last tick 5 minutes ago (the production reality).
+    state = FeltTimeState(
+        lived_age_hours=500.0,
+        last_tick_ts=(now - timedelta(minutes=5)).isoformat(),
+    )
+    mem = _make_memory()
+    object.__setattr__(mem, "created_at", now - timedelta(hours=48))
+    object.__setattr__(mem, "last_accessed_at", None)
+
+    fresh = _freshness_input(mem, state)
+    # With the old ~6000x rate, lived≈288000h → freshness 0. Capped at rate 1,
+    # lived≈48h → freshness ≈ 1 - 48/2160 ≈ 0.978.
+    assert fresh > 0.9, f"recent-tick rate inflation collapsed freshness: {fresh}"
