@@ -991,6 +991,13 @@ class ClaudeCliProvider(LLMProvider):
                         else:
                             yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
+                        # The result frame is terminal — stop here. Looping back
+                        # to q.get would re-arm the idle-timeout watchdog and, if
+                        # the subprocess is slow to close stdout (EOF), fire a
+                        # spurious StreamError on top of the already-successful
+                        # reply (bug-hunt finding #2). The reader thread still
+                        # drains + reaps in the finally (reader.join).
+                        break
 
                 # EOF: emit terminal event if result frame never arrived.
                 if not done_emitted:
