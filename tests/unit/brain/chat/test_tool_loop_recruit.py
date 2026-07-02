@@ -259,3 +259,86 @@ def test_no_reach_no_expansion(tmp_path: Path) -> None:
 
     assert len(provider.chat_calls) == 1, f"Expected 1 chat call, got {len(provider.chat_calls)}"
     assert final_resp.content == "Simple answer"
+
+
+class _OptionsRecordingProvider(ScriptedProvider):
+    """ScriptedProvider that also records each call's options + emit_text calls.
+    emit_text mimics _StreamingProxy.emit_text (the WS word-chunk push)."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.options_seen: list[dict] = []
+        self.emit_text_calls: list[str] = []
+
+    def chat(self, messages, *, tools=None, options=None):
+        self.options_seen.append(dict(options or {}))
+        return super().chat(messages, tools=tools, options=options)
+
+    def emit_text(self, text: str) -> None:
+        self.emit_text_calls.append(text)
+
+
+def test_recruitable_reach_turn_buffers_pass1_and_only_reruns_streams(tmp_path: Path) -> None:
+    """Bug #4: on a slim (recruitable) turn the first pass must be stream-
+    suppressed so it isn't streamed to the WS, while the recruit rerun streams
+    the real answer — otherwise the user sees pass-1 preamble + rerun answer
+    concatenated. Pass-1 options carry suppress_stream=True; the rerun does not."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim = ["record_monologue", "reach_for_capability"]
+    r1 = ChatResponse(
+        content="let me check", tool_calls=(),
+        dispatched_invocations=({"name": "reach_for_capability", "arguments": {"capability": "memory"}},),
+        raw=None,
+    )
+    r2 = ChatResponse(content="the real answer", tool_calls=(), dispatched_invocations=(), raw=None)
+    provider = _OptionsRecordingProvider([r1, r2])
+
+    run_tool_loop(
+        [ChatMessage(role="system", content="You are Nell."),
+         ChatMessage(role="user", content="remember?")],
+        provider=provider, tools=build_tools_list("Nell", allowed=slim),
+        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        companion_name="Nell", recruited_allowed=slim,
+    )
+    assert provider.options_seen[0].get("suppress_stream") is True, "pass-1 must be buffered"
+    assert not provider.options_seen[1].get("suppress_stream"), "rerun must stream"
+    # rerun streamed the answer; buffered pass-1 must NOT have been flushed.
+    assert provider.emit_text_calls == [], f"unexpected flush: {provider.emit_text_calls}"
+
+
+def test_recruitable_no_reach_flushes_buffered_reply_once(tmp_path: Path) -> None:
+    """Bug #4 corollary: a recruitable turn with NO reach still buffered pass-1,
+    so the final reply must be flushed to the WS exactly once via emit_text."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim = ["record_monologue", "reach_for_capability"]
+    r1 = ChatResponse(content="a plain answer", tool_calls=(), dispatched_invocations=(), raw=None)
+    provider = _OptionsRecordingProvider([r1])
+    run_tool_loop(
+        [ChatMessage(role="system", content="You are Nell."),
+         ChatMessage(role="user", content="hi")],
+        provider=provider, tools=build_tools_list("Nell", allowed=slim),
+        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        companion_name="Nell", recruited_allowed=slim,
+    )
+    assert provider.options_seen[0].get("suppress_stream") is True
+    assert provider.emit_text_calls == ["a plain answer"]
+
+
+def test_full_toolset_turn_does_not_suppress_streaming(tmp_path: Path) -> None:
+    """Non-recruitable (full toolset) turns are unchanged: pass-1 streams live,
+    no buffering, no emit_text."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    r1 = ChatResponse(content="answer", tool_calls=(), dispatched_invocations=(), raw=None)
+    provider = _OptionsRecordingProvider([r1])
+    run_tool_loop(
+        [ChatMessage(role="system", content="You are Nell."),
+         ChatMessage(role="user", content="hi")],
+        provider=provider, tools=build_tools_list("Nell"),
+        store=store, hebbian=hebbian, persona_dir=tmp_path,
+        companion_name="Nell", recruited_allowed=None,
+    )
+    assert not provider.options_seen[0].get("suppress_stream")
+    assert provider.emit_text_calls == []
