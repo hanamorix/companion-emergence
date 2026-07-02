@@ -467,3 +467,50 @@ def test_normal_stream_writes_no_timeout_log(tmp_path):
         )
     assert any(isinstance(e, StreamDone) for e in events)
     assert not (persona / "stream_timeouts.jsonl").exists()
+
+
+def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatch):
+    """A fully-emitted result frame must END the stream — the loop must not keep
+    polling for EOF and fire a spurious idle-timeout StreamError on top of an
+    already-successful reply (bug-hunt finding #2). Models a subprocess that
+    emits the result line then holds stdout open briefly before EOF."""
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+
+    class _ResultThenHang:
+        def __init__(self):
+            self._sent = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return _result_line("done")
+            # Hold the pipe open past the (shrunk) idle budget before EOF.
+            import time
+
+            time.sleep(1.0)
+            raise StopIteration
+
+    proc = MagicMock()
+    proc.stdout = _ResultThenHang()
+    proc.stdin = MagicMock()
+    proc.poll.return_value = None
+    proc.wait.return_value = 0
+    proc.returncode = 0
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.stderr = MagicMock()
+    proc.stderr.read.return_value = ""
+
+    monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
+    monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
+
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+
+    dones = [e for e in events if isinstance(e, StreamDone)]
+    errs = [e for e in events if isinstance(e, StreamError)]
+    assert len(dones) == 1 and dones[0].content == "done"
+    assert errs == [], f"result frame should terminate cleanly, got {errs}"
