@@ -135,6 +135,24 @@ CREATE TABLE IF NOT EXISTS pending_rotation_notices (
 CONSENT_STATES = frozenset(
     {"pending_local", "pending_remote", "paired", "paused", "revoked", "blocked"}
 )
+
+# Every table (besides `peers` itself) whose rows are keyed on peer_id. Used by
+# update_peer_identity to rekey a rotated peer across the whole DB (#6). Keep in
+# sync with the schema — any new peer_id-keyed table must be added here.
+_PEER_ID_CHILD_TABLES = (
+    "seq_high_water",
+    "sessions",
+    "peer_counters",
+    "outbound_drafts",
+    "transcript",
+    "disclosure_budget",
+    "relationship_state",
+    "peer_emotion_window",
+    "outbound_seq",
+    "pending_handshakes",
+    "session_keys",
+    "pending_rotation_notices",
+)
 _ALLOWED_TRANSITIONS = {
     "pending_local": {"pending_remote", "paired", "revoked", "blocked"},
     "pending_remote": {"paired", "revoked", "blocked"},
@@ -782,17 +800,35 @@ class KindledLinkStore:
         new_fingerprint: str,
         now: datetime,
     ) -> None:
-        """Rotate a peer's stored identity: save old pub in previous_identity_pub."""
-        self._conn.execute(
+        """Rotate a peer's stored identity: save old pub in previous_identity_pub.
+
+        peer_id IS the peer's key fingerprint (== key_id), and rotation changes
+        it, so the PRIMARY KEY must move too — otherwise every post-rotation
+        lookup (the peer's next envelopes carry sender_key_id = new fingerprint,
+        and get_peer(new_fingerprint) queries WHERE peer_id = new_fingerprint)
+        misses the row and correspondence breaks permanently (bug #6). Rekey the
+        peers PK AND every peer_id-keyed child table in one transaction. There
+        are no FK constraints, so these are plain UPDATEs; _PEER_ID_CHILD_TABLES
+        must stay in sync with the schema's peer_id columns.
+        """
+        cur = self._conn
+        cur.execute(
             "UPDATE peers SET "
             "previous_identity_pub = identity_pub, "
             "identity_pub = ?, "
             "fingerprint = ?, "
+            "peer_id = ?, "
             "updated_at = ? "
             "WHERE peer_id = ?",
-            (new_pub_hex, new_fingerprint, now.isoformat(), peer_id),
+            (new_pub_hex, new_fingerprint, new_fingerprint, now.isoformat(), peer_id),
         )
-        self._conn.commit()
+        if new_fingerprint != peer_id:
+            for table in _PEER_ID_CHILD_TABLES:
+                cur.execute(
+                    f"UPDATE {table} SET peer_id = ? WHERE peer_id = ?",  # noqa: S608 — fixed constant, not user input
+                    (new_fingerprint, peer_id),
+                )
+        cur.commit()
 
     def close(self) -> None:
         """Close the underlying SQLite connection. Callers should invoke this in a
