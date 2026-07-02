@@ -25,6 +25,11 @@ from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
+# Head marker of the persisted compaction-summary system block that
+# engine._buffer_turns_to_messages inserts at index 1 ("[Earlier in this
+# conversation: ...]"). Must stay in sync with that f-string (engine.py).
+_COMPACTION_SUMMARY_PREFIX = "[Earlier in this conversation:"
+
 
 def _estimate_tokens(messages: list[ChatMessage]) -> int:
     """Crude char-based token estimate matching brain.ingest.extract."""
@@ -89,7 +94,20 @@ def apply_budget(
     if len(messages) < 2 + preserve_tail_msgs:
         return messages
     system_msg = messages[0]
-    head = messages[1 : len(messages) - preserve_tail_msgs]
+    # Preserve the persisted compaction-summary block if present. engine inserts
+    # it as a role="system" ChatMessage at index 1 ("[Earlier in this
+    # conversation: ...]"); it carries the faded old context and must survive the
+    # truncation instead of being swallowed into the "[truncated N]" note (#11).
+    preserved_head = [system_msg]
+    body_start = 1
+    if (
+        len(messages) > 1
+        and messages[1].role == "system"
+        and messages[1].content_text().startswith(_COMPACTION_SUMMARY_PREFIX)
+    ):
+        preserved_head.append(messages[1])
+        body_start = 2
+    head = messages[body_start : len(messages) - preserve_tail_msgs]
     tail = messages[-preserve_tail_msgs:]
     if not head:
         return messages
@@ -97,4 +115,4 @@ def apply_budget(
         role="system",
         content=f"[truncated {len(head)} earlier messages]",
     )
-    return [system_msg, summary_msg, *tail]
+    return [*preserved_head, summary_msg, *tail]

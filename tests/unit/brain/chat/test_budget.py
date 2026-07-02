@@ -136,3 +136,48 @@ def test_apply_budget_with_no_head_to_compress_returns_unchanged() -> None:
 
     out = apply_budget(msgs, max_tokens=1_000, preserve_tail_msgs=40, provider=_StubProvider())
     assert out == msgs
+
+
+def test_apply_budget_preserves_compaction_summary_block() -> None:
+    """Bug #11: engine inserts the persisted compaction summary as a system
+    ChatMessage at index 1 ("[Earlier in this conversation: ...]"). The over-cap
+    truncation must NOT discard it — it carries the faded old context."""
+    huge = "x" * 8_000
+    summary = ChatMessage(
+        role="system",
+        content="[Earlier in this conversation: they discussed the dog's name, Biscuit.]",
+    )
+    msgs: list[ChatMessage] = [ChatMessage(role="system", content="be Nell"), summary]
+    for i in range(60):
+        msgs.append(ChatMessage(role="user" if i % 2 == 0 else "assistant", content=huge))
+    for i in range(40):
+        msgs.append(ChatMessage(role="user" if i % 2 == 0 else "assistant", content="tail"))
+
+    out = apply_budget(msgs, max_tokens=10_000, preserve_tail_msgs=40, provider=_StubProvider())
+
+    assert out[0] == msgs[0], "real system prompt must be first"
+    # The compaction summary must survive the truncation.
+    assert any(
+        m.content_text().startswith("[Earlier in this conversation:") for m in out
+    ), "compaction summary block was discarded by the budget truncation"
+    # The truncation note is still present + tail preserved.
+    assert any("truncated" in m.content_text().lower() for m in out)
+    assert list(out[-40:]) == list(msgs[-40:])
+
+
+def test_compaction_summary_prefix_matches_engine_output(tmp_path) -> None:
+    """Canary for the engine↔budget coupling: budget preserves the summary block
+    by its prefix, which must match what engine actually emits. If either the
+    engine f-string or the budget constant drifts, this breaks loudly."""
+    from brain.chat.budget import _COMPACTION_SUMMARY_PREFIX
+    from brain.chat.engine import _buffer_turns_to_messages
+
+    out = _buffer_turns_to_messages(
+        tmp_path,
+        [{"speaker": "summary", "text": "they named the dog Biscuit"},
+         {"speaker": "user", "text": "hi"}],
+    )
+    assert out[0].role == "system"
+    assert out[0].content_text().startswith(_COMPACTION_SUMMARY_PREFIX), (
+        "engine's compaction-summary prefix drifted from budget._COMPACTION_SUMMARY_PREFIX"
+    )
