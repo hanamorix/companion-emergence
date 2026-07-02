@@ -912,6 +912,9 @@ const CLAUDE_VERSION_TIMEOUT_SECS: u64 = 2;
 // in "verifying".
 const BRAIN_LOGIN_SUBMIT_TIMEOUT_SECS: u64 = 60;
 const BRAIN_LOGIN_STATUS_TIMEOUT_SECS: u64 = 15;
+// The authorize URL is printed near-instantly; a claude that emits diagnostic
+// lines without the URL and then blocks would otherwise hang the read forever.
+const BRAIN_LOGIN_START_TIMEOUT_SECS: u64 = 30;
 
 /// Build the argv for `nell init`. Extracted so argument construction
 /// (especially the always-present `--model`) is covered by a unit test,
@@ -1539,7 +1542,11 @@ async fn start_brain_login(
 
     // Read stdout lines until the authorize URL appears (bounded), WITHOUT
     // waiting for exit — the process blocks on stdin awaiting the code.
-    let maybe_url = tokio::task::spawn_blocking(move || {
+    // `reader.lines().take(40)` bounds the line COUNT but each read still
+    // BLOCKS, so a claude that emits <40 lines without the URL and then holds
+    // stdout open would hang the read forever — wrap it in a timeout (the
+    // sibling submit/status paths are already bounded).
+    let read_task = tokio::task::spawn_blocking(move || {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines().take(40).map_while(Result::ok) {
@@ -1548,9 +1555,22 @@ async fn start_brain_login(
             }
         }
         None
-    })
+    });
+    let maybe_url = match tokio::time::timeout(
+        std::time::Duration::from_secs(BRAIN_LOGIN_START_TIMEOUT_SECS),
+        read_task,
+    )
     .await
-    .map_err(|e| format!("read task: {e}"))?;
+    {
+        Ok(join) => join.map_err(|e| format!("read task: {e}"))?,
+        Err(_) => {
+            // Timed out. Kill the child so the blocked reader gets EOF and the
+            // spawn_blocking task ends (no orphan); the child isn't in state yet.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("timed out reading sign-in URL from claude".to_string());
+        }
+    };
     let url = match maybe_url {
         Some(u) => u,
         None => {
@@ -1564,7 +1584,16 @@ async fn start_brain_login(
     };
 
     if let Ok(mut guard) = state.0.lock() {
-        *guard = Some(BrainLoginProc { child, stdin });
+        // Concurrent starts race here (Tauri does NOT serialize async commands,
+        // and the App banner + Connection-panel can each fire one): the lock was
+        // dropped across the spawn+read, so a sibling call may have stored its
+        // own child meanwhile. `replace` swaps ours in and hands back any
+        // displaced child so we kill+reap it instead of dropping it un-killed
+        // (Child::drop does NOT terminate the process → orphan).
+        if let Some(mut displaced) = guard.replace(BrainLoginProc { child, stdin }) {
+            let _ = displaced.child.kill();
+            let _ = displaced.child.wait();
+        }
     }
     Ok(StartBrainLogin { url })
 }
