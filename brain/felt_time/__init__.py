@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from brain.felt_time.anchors import scan_since
-from brain.felt_time.lived_age import IntensityDrivers, advance
+from brain.felt_time.lived_age import _MIGRATION_SEED_RATE, IntensityDrivers, advance
 from brain.felt_time.pressure import TickInput, apply_horizon_tick, apply_tick
 from brain.felt_time.state import (
     Anchor,
@@ -45,6 +45,27 @@ def _iso_to_seconds_delta(a: str | None, b: str) -> float:
     from datetime import datetime
 
     return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
+
+
+def _compute_first_tick_ts(prev: FeltTimeState, now_iso: str) -> str:
+    """Seed/carry the felt-time start anchor (#67).
+
+    - already set → carry it forward;
+    - last_tick None (fresh persona, true first tick) → now;
+    - else (existing persona that predates the anchor) → back-date at the
+      midpoint rate so the computed rate starts at ~_MIGRATION_SEED_RATE and
+      self-corrects as new ticks accumulate.
+    """
+    from datetime import datetime, timedelta
+
+    if prev.first_tick_ts is not None:
+        return prev.first_tick_ts
+    if prev.last_tick_ts is None:
+        return now_iso
+    wall_hours = prev.lived_age_hours / _MIGRATION_SEED_RATE
+    return (
+        datetime.fromisoformat(now_iso) - timedelta(hours=wall_hours)
+    ).isoformat()
 
 
 class FeltTime:
@@ -128,11 +149,13 @@ class FeltTime:
             drivers=ctx.drivers,
         )
 
+        first_tick_ts = _compute_first_tick_ts(self._state, ctx.now_iso)
         self._state = FeltTimeState(
             lived_age_hours=lived,
             anchors=anchors,
             pressure=pressure,
             last_tick_ts=ctx.now_iso,
+            first_tick_ts=first_tick_ts,
             weather_baselines=self._state.weather_baselines,
             replayed=False,  # first real tick clears the recovery banner
             horizon_pressure=horizon_pressure,
@@ -167,6 +190,7 @@ def _replay_from_logs(persona_dir: Path) -> FeltTimeState:
         anchors=anchors_by_type,
         pressure=PressureCounters(),
         last_tick_ts=None,
+        first_tick_ts=None,
         weather_baselines={},
         replayed=True,
         horizon_pressure={},
