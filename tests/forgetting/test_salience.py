@@ -197,25 +197,47 @@ def test_score_handles_missing_hebbian_entry():
     hebbian.close()
 
 
-def test_freshness_rate_capped_so_recent_tick_does_not_collapse_freshness():
-    """Production shape: last_tick_ts is ~now (updated every heartbeat) while
-    lived_age_hours is large. The old code divided lived_age by the tiny
-    wall-since-LAST-tick → rate ~1000x → a days-old memory's freshness collapsed
-    to 0 and it was faded/lost prematurely (bug-hunt finding #3). The rate is now
-    clamped to <=1.0, so a memory anchored a couple of wall-days ago stays fresh."""
+def test_freshness_survives_recent_tick_with_seeded_first_tick():
+    """#3 real fix (replaces the interim clamp canary): production shape — a
+    recent last_tick + large lived_age — no longer collapses freshness, because
+    the rate is computed against first_tick_ts (felt-time start), not last_tick."""
     from brain.forgetting.salience import _freshness_input
 
     now = datetime.now(UTC)
-    # 500 lived-hours accrued, last tick 5 minutes ago (the production reality).
     state = FeltTimeState(
         lived_age_hours=500.0,
-        last_tick_ts=(now - timedelta(minutes=5)).isoformat(),
+        last_tick_ts=(now - timedelta(minutes=5)).isoformat(),   # recent (the trap)
+        first_tick_ts=(now - timedelta(hours=500.0)).isoformat(),  # felt-time began ~500h ago → rate ≈ 1
     )
     mem = _make_memory()
     object.__setattr__(mem, "created_at", now - timedelta(hours=48))
     object.__setattr__(mem, "last_accessed_at", None)
 
     fresh = _freshness_input(mem, state)
-    # With the old ~6000x rate, lived≈288000h → freshness 0. Capped at rate 1,
-    # lived≈48h → freshness ≈ 1 - 48/2160 ≈ 0.978.
-    assert fresh > 0.9, f"recent-tick rate inflation collapsed freshness: {fresh}"
+    assert fresh > 0.9, f"recent-tick no longer collapses freshness: {fresh}"
+
+
+def test_lived_rate_clamped_to_max_when_first_tick_too_recent():
+    """A first_tick_ts far more recent than lived_age implies (skew / bad seed)
+    → rate clamps to MAX_LIVED_RATE, not an inflated value."""
+    from brain.felt_time.lived_age import MAX_LIVED_RATE
+    from brain.forgetting.salience import _lived_hours_since
+
+    now = datetime.now(UTC)
+    state = FeltTimeState(
+        lived_age_hours=1000.0,
+        last_tick_ts=now.isoformat(),
+        first_tick_ts=(now - timedelta(hours=1)).isoformat(),  # 1000/1 → clamp
+    )
+    lived = _lived_hours_since(now - timedelta(hours=10), state)
+    # 10 wall-hours × clamped rate MAX_LIVED_RATE.
+    assert abs(lived - 10.0 * MAX_LIVED_RATE) < 0.01
+
+
+def test_lived_rate_falls_back_to_one_when_first_tick_missing():
+    from brain.forgetting.salience import _lived_hours_since
+
+    now = datetime.now(UTC)
+    state = FeltTimeState(lived_age_hours=500.0, last_tick_ts=now.isoformat(), first_tick_ts=None)
+    lived = _lived_hours_since(now - timedelta(hours=10), state)
+    assert abs(lived - 10.0) < 0.01  # rate 1.0
