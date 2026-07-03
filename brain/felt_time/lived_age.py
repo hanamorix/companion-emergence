@@ -1,10 +1,10 @@
 """Intensity-weighted lived-age scalar.
 
-advance() integrates lived_age over wall-clock dt with three named drivers
-(emotional_intensity, body_strain, chat_activity), each normalized to [0, 1]
-and weighted by intuition-driven default coefficients α=0.5 β=0.4 γ=0.3.
-Quiet baseline (all drivers ≈ 0) collapses to lived-hours == wall-hours;
-max drivers age 2.2× as fast.
+advance() integrates lived_age over wall-clock dt with four named drivers
+(emotional_intensity, body_strain, chat_activity, narrative_weight), each
+normalized to [0, 1] and weighted by intuition-driven default coefficients
+α=0.5 β=0.4 γ=0.3 δ=0.5. Quiet baseline (all drivers ≈ 0) collapses to
+lived-hours == wall-hours; max drivers age 2.7× as fast (= MAX_LIVED_RATE).
 
 Clock-skew safety per spec §5: negative dt returns prev unchanged (handles
 clock rollback), forward jumps >6h treated as "system was asleep" — pause,
