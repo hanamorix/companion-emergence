@@ -27,7 +27,7 @@ def _mem(peak: float, days_old: float, emotions: dict | None = None) -> Memory:
 def _fts(rate_one_hours: float = 24 * 200) -> FeltTimeState:
     """FeltTimeState whose lived/wall rate ≈ 1 (lived hours == wall hours)."""
     anchor = (datetime.now(UTC) - timedelta(hours=rate_one_hours)).isoformat()
-    return FeltTimeState(lived_age_hours=rate_one_hours, last_tick_ts=anchor)
+    return FeltTimeState(lived_age_hours=rate_one_hours, last_tick_ts=anchor, first_tick_ts=anchor)
 
 
 def _emotion_term(mem: Memory) -> float:
