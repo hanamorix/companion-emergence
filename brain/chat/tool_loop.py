@@ -331,11 +331,22 @@ def run_tool_loop(
     # pre-change no-usage-log behaviour — see there.)
     call_options: dict[str, Any] = {"persona_dir": str(persona_dir), **(chat_options or {})}
 
+    # Recruit-on-reach double-stream guard (bug #4): only a slim (recruitable)
+    # toolset can trigger a recruit re-invoke, and in the live WS path BOTH the
+    # first pass and the rerun stream their text to the client → the user sees
+    # pass-1 preamble + rerun answer concatenated. On recruitable turns we
+    # SUPPRESS the first pass's streaming (buffer it) so exactly one reply
+    # reaches the WS: if a reach re-invoke happens the rerun streams the real
+    # answer; if not, we flush the buffered reply once via emit_text. Full-
+    # toolset turns are unchanged (no rerun is ever possible → stream live).
+    recruitable = recruited_allowed is not None and set(recruited_allowed) < set(NELL_TOOL_NAMES)
+    loop_options = {**call_options, "suppress_stream": True} if recruitable else call_options
+
     for _iteration in range(max_iterations):
         last_response = provider.chat(
             messages,
             tools=tools,
-            options=call_options,
+            options=loop_options,
         )
         # Provider-dispatched invocations (claude-cli MCP path): tools
         # already ran inside the subprocess. Surface them for telemetry
@@ -359,6 +370,14 @@ def run_tool_loop(
             )
             if recruited is not None:
                 last_response = recruited
+            elif recruitable:
+                # No reach happened, so the buffered (stream-suppressed) first
+                # pass is the final reply — flush it to the WS exactly once.
+                # emit_text is the _StreamingProxy word-chunk push; on the
+                # non-WS/real-provider path it's absent and this is a no-op.
+                emit_text = getattr(provider, "emit_text", None)
+                if callable(emit_text):
+                    emit_text(last_response.content or "")
             # Pass-2 spawns fire against the FINAL response (after any recruit re-invoke).
             monologue_text = _find_monologue_text(invocations)
             if monologue_text:
