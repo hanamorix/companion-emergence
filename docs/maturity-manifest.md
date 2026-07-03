@@ -85,7 +85,7 @@ These run but aren't fully closed loops. Labelled here so the half-wired state i
 
 ## Standing wire-back cadence (per minor release: after merge, before tag)
 
-Re-run the wire-back audit and refresh this manifest each minor. Two cheap mechanizable greps seed it (audit §6):
+Re-run the wire-back audit and refresh this manifest each minor. Two cheap mechanizable greps seed it (audit §6) — now codified in `python scripts/organ_wireback_audit.py` (advisory; `--strict` to gate):
 
 1. **Write-only detector** — any new `*.jsonl`/`*.md`/store writer whose read API has zero non-test callers (caught draft_space W1, reflex-crystallizer W2).
 2. **`emotions={}` detector** — any new `Memory.create_new(...)` without an `emotions=` argument (caught the W7 ingest gap).
