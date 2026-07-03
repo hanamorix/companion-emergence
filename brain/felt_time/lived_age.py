@@ -68,10 +68,10 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def rate_per_hour(drivers: IntensityDrivers, *, coef: Coefficients = DEFAULTS) -> float:
     """Rate at which lived_age advances per wall-hour.
 
-    lived_rate = 1.0 + α·emotional_intensity + β·body_strain + γ·chat_activity
+    lived_rate = 1.0 + α·emotional_intensity + β·body_strain + γ·chat_activity + δ·narrative_weight
 
     Each driver clamped to [0, 1]. Quiet baseline (all ≈ 0) => rate = 1.0
-    (lived-hours == wall-hours). Max drivers => rate = 1 + α + β + γ.
+    (lived-hours == wall-hours). Max drivers => rate = 1 + α + β + γ + δ (= 2.7 with DEFAULTS).
 
     Args:
         drivers: IntensityDrivers with emotional_intensity, body_strain, chat_activity.
@@ -92,6 +92,17 @@ def rate_per_hour(drivers: IntensityDrivers, *, coef: Coefficients = DEFAULTS) -
         + coef.gamma * activity
         + coef.delta * narrative
     )
+
+
+# Maximum lived/wall rate — DERIVED from rate_per_hour with all drivers maxed
+# (not hardcoded: the function includes δ·narrative_weight, so the real max is
+# 2.7, which the docstring above historically omitted). Used to clamp the
+# forgetting rate to its provable range and to derive the migration seed.
+MAX_LIVED_RATE = rate_per_hour(IntensityDrivers(1.0, 1.0, 1.0, 1.0))
+
+# Midpoint rate used to back-date first_tick_ts for personas that predate the
+# anchor (a balanced guess for the lost pre-anchor history).
+_MIGRATION_SEED_RATE = (1.0 + MAX_LIVED_RATE) / 2
 
 
 def advance(
