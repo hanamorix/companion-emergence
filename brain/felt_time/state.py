@@ -54,6 +54,7 @@ class FeltTimeState:
     anchors: dict[str, Anchor] = field(default_factory=dict)  # type -> most recent
     pressure: PressureCounters = field(default_factory=PressureCounters)
     last_tick_ts: str | None = None  # ISO 8601 UTC of last tick()
+    first_tick_ts: str | None = None  # ISO 8601 UTC of the FIRST tick (felt-time start anchor). None => not yet seeded.
     weather_baselines: dict[str, dict] = field(default_factory=dict)  # per-channel rolling baseline
     replayed: bool = False  # True iff state was rebuilt from JSONLs, not loaded from state file.
     horizon_pressure: dict[str, HorizonBucket] = field(default_factory=dict)
@@ -76,6 +77,7 @@ def persist(state: FeltTimeState, persona_dir: Path) -> None:
         "anchors": {k: asdict(v) for k, v in state.anchors.items()},
         "pressure": asdict(state.pressure),
         "last_tick_ts": state.last_tick_ts,
+        "first_tick_ts": state.first_tick_ts,
         "weather_baselines": state.weather_baselines,
         "replayed": state.replayed,
         "horizon_pressure": {
@@ -156,6 +158,7 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
         anchors=anchors,
         pressure=PressureCounters(**(data.get("pressure") or {})),
         last_tick_ts=data.get("last_tick_ts"),
+        first_tick_ts=data.get("first_tick_ts"),
         weather_baselines=data.get("weather_baselines") or {},
         replayed=bool(data.get("replayed", False)),
         horizon_pressure=horizon_pressure,
