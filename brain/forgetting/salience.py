@@ -89,29 +89,30 @@ def _lived_hours_since(anchor: datetime, felt_time_state: FeltTimeState | None) 
     wall_delta_s = (now - anchor).total_seconds()
     if felt_time_state.lived_age_hours <= 0.0:
         return None
-    if felt_time_state.last_tick_ts is None:
-        return wall_delta_s / 3600.0
-    # KNOWN DEFECT (interim clamp, bug-hunt finding #3): this denominator is
-    # named "since_first_tick" but last_tick_ts is the MOST-RECENT tick
-    # (felt_time resets it every heartbeat), so in production it is seconds-to-
-    # minutes, not the wall age of felt-time. That inflated rate_lived_per_wall
-    # ~1000x and collapsed freshness → premature FADE/LOSE of days-old memories.
-    # Until FeltTimeState carries a real first-tick anchor (deferred), clamp the
-    # rate to <= 1.0: lived-time cannot age a memory faster than wall-clock. This
-    # exactly matches the intended horizon calibration (the peak/freshness
-    # constants + tests all assume rate ~= 1) and is purely memory-preserving
-    # (a lower rate only raises freshness). Felt-time ACCELERATION (>1x) is
-    # disabled until the anchor fix restores a correct denominator.
-    wall_since_last_tick_s = (
-        now - datetime.fromisoformat(felt_time_state.last_tick_ts)
-    ).total_seconds()
-    if wall_since_last_tick_s <= 0:
-        return None
-    rate_lived_per_wall = min(
-        1.0,
-        felt_time_state.lived_age_hours / max(wall_since_last_tick_s / 3600.0, 1e-6),
-    )
-    return (wall_delta_s / 3600.0) * rate_lived_per_wall
+    # Rate = accumulated lived-age / wall time since felt-time BEGAN
+    # (first_tick_ts). last_tick_ts is reset every heartbeat, so it is NOT a
+    # usable denominator (#3). The model bounds the instantaneous rate to
+    # [1.0, MAX_LIVED_RATE], so the average is too — clamp defensively: a value
+    # outside that range is an artefact (skew / not-yet-seeded anchor), and the
+    # floor 1.0 = wall speed (rate can never be < 1). Fail toward preserving
+    # memory: anything unusable → rate 1.0.
+    from brain.felt_time.lived_age import MAX_LIVED_RATE
+
+    if felt_time_state.first_tick_ts is None:
+        rate = 1.0
+    else:
+        wall_since_first_tick_s = (
+            now - datetime.fromisoformat(felt_time_state.first_tick_ts)
+        ).total_seconds()
+        if wall_since_first_tick_s <= 0:
+            rate = 1.0
+        else:
+            rate = _clamp(
+                felt_time_state.lived_age_hours / (wall_since_first_tick_s / 3600.0),
+                1.0,
+                MAX_LIVED_RATE,
+            )
+    return (wall_delta_s / 3600.0) * rate
 
 
 def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
