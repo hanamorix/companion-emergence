@@ -569,8 +569,6 @@ function PresenceIdentity({
           borderRadius: 999,
           color: "var(--text-mid)",
           background: "var(--panel)",
-          backdropFilter: "blur(20px) saturate(1.5)",
-          WebkitBackdropFilter: "blur(20px) saturate(1.5)",
           border: "1px solid var(--hairline)",
         }}
       >

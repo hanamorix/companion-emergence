@@ -38,12 +38,15 @@
   --font-disp: Georgia, serif;   /* now only for quotes/aphorisms — see §5 */
 }
 
-/* Shared glass utility — background/blur/border recipe used by panels,
- * rail, chat card, wizard card. See DESIGN-SPEC §2. */
+/* Shared glass utility — background/border recipe used by panels,
+ * rail, chat card, wizard card. See DESIGN-SPEC §2.
+ * NO backdrop-filter: over a transparent Tauri window WKWebView renders
+ * blur layers with black edge fringes and transparent↔solid flicker
+ * (live-validated 2026-07-04), and the blur can't sample the desktop
+ * anyway — the translucent fill alone carries the frosted look
+ * (IMPLEMENTATION §6 two-layer strategy, layer 1). */
 .glass {
   background: var(--panel);
-  backdrop-filter: blur(32px) saturate(1.5);
-  -webkit-backdrop-filter: blur(32px) saturate(1.5);
   border: 1px solid var(--hairline);
 }
 

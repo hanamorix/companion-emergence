@@ -57,8 +57,6 @@ export function WizardShell({
         style={{
           width: 432,
           background: "var(--panel-strong)",
-          backdropFilter: "blur(36px) saturate(1.5)",
-          WebkitBackdropFilter: "blur(36px) saturate(1.5)",
           border: "1px solid var(--hairline)",
           borderRadius: 26,
           boxShadow: "var(--shadow)",

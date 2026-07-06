@@ -76,8 +76,6 @@ export function LeftPanel({
           gap: 5,
           padding: 7,
           borderRadius: 18,
-          backdropFilter: "blur(28px) saturate(1.5)",
-          WebkitBackdropFilter: "blur(28px) saturate(1.5)",
           boxShadow: "var(--shadow-mid)",
           flexShrink: 0,
         }}

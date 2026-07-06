@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Companion Emergence",
-        "width": 900,
-        "height": 560,
+        "width": 1176,
+        "height": 680,
         "minWidth": 720,
         "minHeight": 460,
         "decorations": true,
