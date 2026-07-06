@@ -237,19 +237,17 @@ html[data-reduced-motion="true"] *::after {
   transition: none !important;
 }
 
-/* Chat panel — vertical fill + responsive width */
+/* Chat card (DESIGN-SPEC §6) — fixed 398x566 glass card, not a
+ * stretching flex child. flex: 0 0 auto so it holds its own dimensions
+ * inside the main-app row's flex layout (avatar column | chat card)
+ * instead of growing to fill leftover vertical space (the pre-glass
+ * layout was full-bleed and needed to flex-grow; the card layout does
+ * not). Width/height/radius/etc. are inline on the component per the
+ * "explicit height so messages scroll, not the panel" invariant. */
 .chat-panel {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-@media (min-width: 900px) {
-  .chat-panel {
-    max-width: 820px;
-    margin-inline: auto;
-  }
+  flex: 0 0 auto;
 }
 
 /* ── InitiateBanner — soft-rose reach-out card ── */

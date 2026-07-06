@@ -129,6 +129,19 @@ vi.mock("./streamChat", () => ({
   streamChat: vi.fn(async () => () => undefined),
 }));
 
+// ChatPanel's new glass header (Phase 4) resolves an avatar thumb via
+// expressions.ts, whose import.meta.glob eagerly pulls every expression
+// PNG at module-load time. Under this worktree's checkout, Vite's
+// fs.allow root-detection (searchForWorkspaceRoot) stops at the worktree
+// root because .git there is a file, not a directory — so it never
+// widens to include the sibling `expressions/` dir, and the eager glob's
+// fetch is denied. Stub the module so this behavior-focused test doesn't
+// depend on that asset pipeline at all (this test doesn't render real
+// ChatPanel/NellAvatar art either way).
+vi.mock("./expressions", () => ({
+  resolveFrameUrl: () => "",
+}));
+
 // ── Heavy UI components that spawn their own effects ─────────────────────────
 vi.mock("./components/NellAvatar", () => ({
   NellAvatar: () => <div data-testid="nell-avatar" />,
