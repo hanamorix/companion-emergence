@@ -159,7 +159,7 @@ export function ConnectionPanel({
   return (
     <PanelShell>
       <SectionLabel>Connection</SectionLabel>
-      <Row label="Bridge" value={modeLabel(mode)} accent={mode !== "live"} />
+      <Row label="Bridge" value={modeLabel(mode)} accent={mode !== "live"} live={mode === "live"} />
       <Row label="Provider" value={conn?.provider ?? "—"} />
       <Row label="Model" value={conn?.model ?? "—"} />
       <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
@@ -363,6 +363,21 @@ export function ConnectionPanel({
       <Divider />
       <SectionLabel>Updates</SectionLabel>
       <UpdateSection upd={upd} shape={shape} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
+
+      <Divider />
+      <div
+        style={{
+          fontFamily: "var(--font-disp)",
+          fontStyle: "italic",
+          fontSize: 11,
+          color: "var(--text-mute)",
+          lineHeight: 1.5,
+          textAlign: "center",
+          marginTop: 4,
+        }}
+      >
+        You configure the room. {capitalize(persona)} owns the weather.
+      </div>
     </PanelShell>
   );
 }
@@ -391,9 +406,9 @@ function UpdateSection({
           padding: "7px 10px",
           fontSize: 11,
           fontFamily: "var(--font-ui)",
-          background: "var(--accent-dim)",
+          background: "color-mix(in srgb, var(--accent) 15%, transparent)",
           color: "var(--text)",
-          border: "1px solid rgba(130, 51, 41, 0.30)",
+          border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)",
           borderRadius: 6,
           cursor: "pointer",
         }}
@@ -440,9 +455,9 @@ function UpdateSection({
             padding: "5px 10px",
             fontSize: 10.5,
             fontFamily: "var(--font-ui)",
-            background: "rgba(178, 42, 42, 0.10)",
+            background: "rgba(224,122,106,0.10)",
             color: "var(--crimson)",
-            border: "1px solid rgba(178, 42, 42, 0.35)",
+            border: "1px solid rgba(224,122,106,0.35)",
             borderRadius: 6,
             cursor: "pointer",
           }}
@@ -498,9 +513,9 @@ function UpdateSection({
               padding: "7px 10px",
               fontSize: 11,
               fontFamily: "var(--font-ui)",
-              background: "rgba(60, 130, 90, 0.15)",
+              background: "rgba(79,168,118,0.15)",
               color: "var(--text)",
-              border: "1px solid rgba(60, 130, 90, 0.45)",
+              border: "1px solid rgba(79,168,118,0.45)",
               borderRadius: 6,
               cursor: "pointer",
             }}
@@ -580,13 +595,13 @@ function StatusBanner({
   const palette =
     kind === "error"
       ? {
-          bg: "rgba(178, 42, 42, 0.10)",
-          border: "rgba(178, 42, 42, 0.40)",
+          bg: "rgba(224,122,106,0.10)",
+          border: "rgba(224,122,106,0.40)",
           headline: "var(--crimson)",
         }
       : {
-          bg: "rgba(216, 154, 88, 0.14)",
-          border: "rgba(216, 154, 88, 0.45)",
+          bg: "rgba(216,154,88,0.14)",
+          border: "rgba(216,154,88,0.45)",
           headline: "#a07434",
         };
 
@@ -626,6 +641,10 @@ function StatusBanner({
       )}
     </div>
   );
+}
+
+function capitalize(s: string): string {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
 function modeLabel(mode: PersonaState["mode"]): string {
@@ -682,10 +701,10 @@ function InstallActionButton({
           fontSize: 11,
           fontFamily: "var(--font-ui)",
           background: success
-            ? "rgba(60, 130, 90, 0.15)"
+            ? "rgba(79,168,118,0.15)"
             : failed
-              ? "rgba(178, 42, 42, 0.15)"
-              : "var(--accent-dim)",
+              ? "rgba(224,122,106,0.15)"
+              : "color-mix(in srgb, var(--accent) 15%, transparent)",
           color: success
             ? "var(--text)"
             : failed
@@ -693,10 +712,10 @@ function InstallActionButton({
               : "var(--text)",
           border: `1px solid ${
             success
-              ? "rgba(60, 130, 90, 0.45)"
+              ? "rgba(79,168,118,0.45)"
               : failed
-                ? "rgba(178, 42, 42, 0.45)"
-                : "rgba(130, 51, 41, 0.30)"
+                ? "rgba(224,122,106,0.45)"
+                : "color-mix(in srgb, var(--accent) 30%, transparent)"
           }`,
           borderRadius: 6,
           cursor: running ? "wait" : "pointer",
@@ -713,7 +732,7 @@ function InstallActionButton({
             color: failed ? "var(--crimson)" : "var(--text-mute)",
             marginTop: 6,
             lineHeight: 1.45,
-            fontFamily: "var(--font-disp)",
+            fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace",
             wordBreak: "break-word",
             whiteSpace: "pre-wrap",
           }}
@@ -732,8 +751,8 @@ function UnsupportedActionNote({ children }: { children: ReactNode }) {
         padding: "7px 10px",
         fontSize: 10.5,
         color: "var(--text-mid)",
-        background: "rgba(130, 51, 41, 0.06)",
-        border: "1px solid rgba(130, 51, 41, 0.16)",
+        background: "color-mix(in srgb, var(--accent) 6%, transparent)",
+        border: "1px solid color-mix(in srgb, var(--accent) 16%, transparent)",
         borderRadius: 6,
         lineHeight: 1.45,
       }}
@@ -747,10 +766,15 @@ function Row({
   label,
   value,
   accent,
+  live,
 }: {
   label: string;
   value: string;
   accent?: boolean;
+  /** Renders a small health dot before the value — used for the Bridge
+   *  row so "Live" reads with the same green signal as the rest of the
+   *  app (WIRING §3: health dots are #5fbe8b). */
+  live?: boolean;
 }) {
   return (
     <div
@@ -765,11 +789,26 @@ function Row({
       <span style={{ color: "var(--text-mid)" }}>{label}</span>
       <span
         style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
           color: accent ? "var(--accent)" : "var(--text)",
-          fontFamily: "var(--font-disp)",
           fontWeight: accent ? 500 : 400,
         }}
       >
+        {live && (
+          <span
+            aria-hidden="true"
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "#5fbe8b",
+              boxShadow: "0 0 8px rgba(95,190,139,0.7)",
+              flexShrink: 0,
+            }}
+          />
+        )}
         {value}
       </span>
     </div>

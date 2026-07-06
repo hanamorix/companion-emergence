@@ -18,15 +18,29 @@ export function SoulPanel({ state }: Props) {
         <>
           <div
             style={{
-              fontSize: 12,
+              fontSize: 13.5,
               color: "var(--text)",
-              lineHeight: 1.6,
+              lineHeight: 1.65,
               fontStyle: "italic",
-              marginBottom: 10,
               fontFamily: "var(--font-disp)",
+              background: "color-mix(in srgb, var(--accent) 9%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--accent) 24%, transparent)",
+              borderRadius: 16,
+              padding: "12px 14px",
+              marginBottom: 10,
             }}
           >
             "{soul.moment}"
+          </div>
+          <div
+            style={{
+              fontSize: 9.5,
+              fontStyle: "italic",
+              color: "var(--text-mute)",
+              marginBottom: 10,
+            }}
+          >
+            crystallized · protected
           </div>
           <div
             style={{
@@ -40,7 +54,7 @@ export function SoulPanel({ state }: Props) {
             <Tag>{soul.love_type}</Tag>
             <span style={{ color: "var(--text-mute)" }}>Resonance {soul.resonance}</span>
             <span style={{ color: "var(--text-mute)" }}>·</span>
-            <span style={{ color: "var(--text-mute)", fontFamily: "var(--font-disp)" }}>
+            <span style={{ color: "var(--text-mute)" }}>
               {formatDate(soul.crystallized_at)}
             </span>
           </div>
@@ -76,13 +90,14 @@ function Tag({ children }: { children: React.ReactNode }) {
   return (
     <span
       style={{
-        background: "rgba(130,51,41,0.12)",
-        color: "var(--accent)",
+        background: "color-mix(in srgb, var(--accent) 22%, transparent)",
+        color: "var(--accent-text)",
         padding: "2px 7px",
         borderRadius: 9,
-        fontSize: 10,
-        fontFamily: "var(--font-disp)",
-        letterSpacing: "0.04em",
+        fontSize: 9.5,
+        fontWeight: 700,
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
       }}
     >
       {display}

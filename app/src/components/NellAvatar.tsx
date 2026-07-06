@@ -62,7 +62,7 @@ export function NellAvatar({
   isSpeaking = false,
   soulFlashing = false,
   reducedMotion = false,
-  size = 280,
+  size = 300,
 }: Props) {
   const mode = state?.mode ?? "live";
   const dimmed = mode === "offline";
