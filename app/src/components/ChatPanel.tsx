@@ -743,7 +743,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         height: "566px",
         borderRadius: 26,
         boxShadow: "var(--shadow)",
-        background: "rgba(36,26,29,0.50)",
+        background: "rgba(36,26,29,0.75)",
         outline: dragOver ? "2px dashed var(--accent)" : "none",
         outlineOffset: 4,
         transition: "outline 0.15s ease",
@@ -909,7 +909,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             alignItems: "center",
             background: "var(--field)",
             border: "1px solid var(--hairline)",
-            borderRadius: 999,
+            // 20, not 999: a single-line row (~38px tall) still renders as a
+            // pill, but a grown multi-line draft stays a rounded rect instead
+            // of a stadium whose curve swallows the text (live report).
+            borderRadius: 20,
             padding: "10px 17px",
           }}
         >
@@ -936,7 +939,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
               resize: "none",
               minHeight: 18,
               maxHeight: 192,
-              overflow: "hidden",
+              overflowY: "auto",
               outline: "none",
             }}
           />

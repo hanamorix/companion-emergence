@@ -9,8 +9,11 @@
   --text: #f4ece6;
   --text-mid: rgba(244,236,230,0.72);
   --text-mute: rgba(244,236,230,0.45);
-  --panel: rgba(36,26,29,0.55);
-  --panel-strong: rgba(42,31,34,0.72);
+  /* Alphas raised 2026-07-04 (0.55/0.72 → 0.78/0.88): with no backdrop
+   * blur on the transparent window, busy/dark wallpapers bled through
+   * enough to hurt readability (live report). */
+  --panel: rgba(36,26,29,0.78);
+  --panel-strong: rgba(42,31,34,0.88);
   --hairline: rgba(255,255,255,0.12);
   --hairline-soft: rgba(255,255,255,0.07);
   --field: rgba(255,255,255,0.06);

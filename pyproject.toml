@@ -74,6 +74,9 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# wizard-validation holds a staged .app whose bundled python-runtime
+# (stdlib + site-packages) must never count against the repo gate.
+extend-exclude = ["wizard-validation", "migrated-nell"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "C4", "UP"]
