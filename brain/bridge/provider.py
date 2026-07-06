@@ -37,6 +37,7 @@ from typing import Any
 
 import httpx
 
+from brain import tunables
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -190,14 +191,30 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
 # this many seconds, the subprocess is treated as wedged: it gets terminated
 # and the stream yields StreamError(stage="claude_cli_idle_timeout"). This
 # is deliberately not bounded by total wall-clock duration — long Opus
-# runs can take time.
-_STREAM_PER_EVENT_IDLE_SECONDS: float = 60.0
+# runs can take time. Overridable via $KINDLED_HOME/tunables.json (#55).
+_STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
+    "provider.stream_per_event_idle_seconds", 60.0
+)
 
 # First-event budget. Wider than the per-event budget because Opus can
 # take time before emitting any stream_event frames. Also bounds the
 # initial subprocess spawn +
 # system-prompt-file write + MCP server boot.
-_STREAM_FIRST_EVENT_SECONDS: float = 120.0
+_STREAM_FIRST_EVENT_SECONDS: float = tunables.register(
+    "provider.stream_first_event_seconds", 120.0
+)
+
+
+def _stream_per_event_idle_seconds() -> float:
+    return tunables.get_tunable(
+        "provider.stream_per_event_idle_seconds", _STREAM_PER_EVENT_IDLE_SECONDS
+    )
+
+
+def _stream_first_event_seconds() -> float:
+    return tunables.get_tunable(
+        "provider.stream_first_event_seconds", _STREAM_FIRST_EVENT_SECONDS
+    )
 
 # A sentinel object pushed onto the stdout queue by the reader thread
 # when the subprocess closes its stdout (normal exit, error, etc.). Lets
@@ -885,7 +902,7 @@ class ClaudeCliProvider(LLMProvider):
             delta_chunks: list[str] = []
             assistant_snapshot: str | None = None
             done_emitted = False
-            timeout = _STREAM_FIRST_EVENT_SECONDS
+            timeout = _stream_first_event_seconds()
 
             # Idle-timeout instrumentation (spec 2026-06-01). Recomputed per
             # frame so they reflect the last frame seen when a gap trips the
@@ -926,7 +943,7 @@ class ClaudeCliProvider(LLMProvider):
                     if item is _STREAM_EOF:
                         break
 
-                    timeout = _STREAM_PER_EVENT_IDLE_SECONDS
+                    timeout = _stream_per_event_idle_seconds()
 
                     line = str(item).strip()
                     if not line:
