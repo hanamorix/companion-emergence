@@ -867,6 +867,16 @@ def build_app(
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
 
+        # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
+        # write_defaults_section swallows its own errors; belt-and-braces here so
+        # an import problem can't block startup either.
+        try:
+            from brain.tunables import write_defaults_section
+
+            write_defaults_section()
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("tunables boot rewrite skipped: %s", _exc)
+
         # Touch last_opened_at so PersonaPicker can sort by recency (v0.0.18+)
         try:
             cfg_path = persona_dir / "persona_config.json"
