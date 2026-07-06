@@ -257,4 +257,18 @@ describe("App brain-login banner", () => {
     await waitFor(() => expect(brainLoginStatus).toHaveBeenCalled());
     expect(screen.queryByRole("button", { name: /authorize/i })).not.toBeInTheDocument();
   });
+
+  it("chat header pill falls back to bridge_down when the state poll has failed, matching GlobalStatusDot", async () => {
+    // fetchPersonaState rejecting is what sets App's `stateError` — the
+    // same signal GlobalStatusDot already renders crimson for. The chat
+    // header pill must not default to green "live" in this state; it
+    // doubles as a health readout and should agree with the status dot.
+    fetchPersonaState.mockRejectedValue(new Error("network down"));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByTestId("chat-messages")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("● bridge down")).toBeInTheDocument());
+    expect(screen.queryByText("● live")).not.toBeInTheDocument();
+  });
 });
