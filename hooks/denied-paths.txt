@@ -1,0 +1,5 @@
+# Leak-guard path-arm: retired private trees — no new files here on public.
+docs/superpowers/
+docs/audits/
+.public-sync/
+docs/guarded-change/

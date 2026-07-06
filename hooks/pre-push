@@ -1,0 +1,78 @@
+#!/bin/sh
+# Leak-guard pre-push hook (public-sync-reroot P1).
+#
+# Fires for any public GitHub remote of this project (URL-matched, not
+# remote-name-matched). Scans the pushed range with all five arms via
+# hooks/leak_guard.py. Local plaintext rules (hooks/leak-rules.local,
+# gitignored) are the PRIMARY defense; this hook is advisory-strength only
+# (`git push --no-verify` skips it) — the server-side CI marker-scan is the
+# real boundary.
+#
+# Install (once per clone; hooks don't clone):
+#   git config core.hooksPath hooks
+# or run scripts/dev_bootstrap.sh.
+#
+# stdin: <local ref> SP <local sha> SP <remote ref> SP <remote sha> LF ...
+
+remote="$1"
+url="$2"
+
+# LEAK_GUARD_FORCE=1 scans regardless of URL (test harness + ad-hoc drills).
+if [ "${LEAK_GUARD_FORCE:-0}" != "1" ]; then
+  case "$url" in
+    *github.com[:/]hanamorix/companion-emergence*|*github.com[:/]ThinkerOfThoughts/companion-emergence*)
+      ;;
+    *)
+      exit 0  # not a public boundary — no scan
+      ;;
+  esac
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+guard="$repo_root/hooks/leak_guard.py"
+zero=0000000000000000000000000000000000000000
+
+# Pick a python (stdlib only needed).
+if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue  # branch deletion — nothing to scan
+  if [ "$remote_sha" = "$zero" ]; then
+    # New ref: scan commits not already on origin/main. FAIL CLOSED (red-team
+    # B3): if origin/main is unknown (fresh init + remote add — no fetch yet),
+    # scan the ENTIRE history reachable from the pushed sha rather than
+    # skipping the ref unguarded.
+    if base_sha="$(git rev-parse --verify -q origin/main)"; then
+      range_start="$(git merge-base "$local_sha" "$base_sha" 2>/dev/null)"
+      if [ -n "$range_start" ]; then
+        if [ "$range_start" = "$local_sha" ]; then
+          continue  # local sha already reachable from origin/main — nothing new
+        fi
+        range="$range_start..$local_sha"
+      else
+        range="$local_sha"  # disjoint lineage — scan all reachable
+      fi
+    else
+      range="$local_sha"    # no known base — scan all reachable
+    fi
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  "$PY" "$guard" check \
+    --range "$range" \
+    --repo "$repo_root" \
+    --rules "$repo_root/hooks/leak-rules.local" \
+    --allowlist "$repo_root/hooks/allowed-identities.txt" \
+    --denied-paths "$repo_root/hooks/denied-paths.txt" \
+    --allowed-binary "$repo_root/hooks/allowed-binary-paths.txt" \
+    || status=1
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "" >&2
+  echo "leak-guard: push to $remote REJECTED (findings above)." >&2
+  echo "Fix the flagged commits (git rebase -i / amend), then push again." >&2
+fi
+exit "$status"
