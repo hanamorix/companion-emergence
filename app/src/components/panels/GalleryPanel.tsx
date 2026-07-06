@@ -249,7 +249,6 @@ function Lightbox({
         inset: 0,
         zIndex: 9999,
         background: "rgba(24, 18, 18, 0.85)",
-        backdropFilter: "blur(4px)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",

@@ -744,8 +744,6 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         borderRadius: 26,
         boxShadow: "var(--shadow)",
         background: "rgba(36,26,29,0.50)",
-        backdropFilter: "blur(36px) saturate(1.5)",
-        WebkitBackdropFilter: "blur(36px) saturate(1.5)",
         outline: dragOver ? "2px dashed var(--accent)" : "none",
         outlineOffset: 4,
         transition: "outline 0.15s ease",
