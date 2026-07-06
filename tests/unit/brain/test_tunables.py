@@ -70,3 +70,35 @@ def test_hot_reload_on_mtime_change(tunables, tmp_path):
     # ensure mtime actually advances on coarse-granularity filesystems
     os.utime(tmp_path / "tunables.json", (time.time() + 2, time.time() + 2))
     assert tunables.get_tunable("a.b", 60.0) == 240.0
+
+
+def test_write_defaults_creates_file(tunables, tmp_path):
+    tunables.register("a.b", 60.0)
+    tunables.write_defaults_section()
+    data = json.loads((tmp_path / "tunables.json").read_text(encoding="utf-8"))
+    assert data["defaults"] == {"a.b": 60.0}
+    assert data["overrides"] == {}
+    assert "_readme" in data
+
+
+def test_write_defaults_refreshes_stale_default_preserves_overrides(tunables, tmp_path):
+    # Simulates a code-default change on upgrade: file has old default 60.0,
+    # code now registers 180.0. Boot must refresh defaults, keep overrides.
+    (tmp_path / "tunables.json").write_text(
+        json.dumps({"defaults": {"a.b": 60.0}, "overrides": {"user.key": 7}}),
+        encoding="utf-8",
+    )
+    tunables.register("a.b", 180.0)
+    tunables.write_defaults_section()
+    data = json.loads((tmp_path / "tunables.json").read_text(encoding="utf-8"))
+    assert data["defaults"] == {"a.b": 180.0}
+    assert data["overrides"] == {"user.key": 7}
+
+
+def test_write_defaults_survives_corrupt_file(tunables, tmp_path):
+    (tmp_path / "tunables.json").write_text("{corrupt", encoding="utf-8")
+    tunables.register("a.b", 60.0)
+    tunables.write_defaults_section()  # must not raise; rebuilds file, empty overrides
+    data = json.loads((tmp_path / "tunables.json").read_text(encoding="utf-8"))
+    assert data["defaults"] == {"a.b": 60.0}
+    assert data["overrides"] == {}

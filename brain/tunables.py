@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -125,3 +126,37 @@ def _reset_for_tests() -> None:
         _registry.clear()
         _warned_keys.clear()
         _overrides_cache, _cache_mtime, _warned_file = {}, None, False
+
+
+_README = (
+    "Edit 'overrides' only. 'defaults' is rewritten by the brain at boot — "
+    "it documents the current code defaults and is never read back."
+)
+
+
+def write_defaults_section() -> None:
+    """Rewrite the defaults section from the registry; preserve overrides.
+
+    Called once at bridge boot. Creates the file if missing. Atomic write.
+    Fail-open: any error is logged and swallowed — boot must not break.
+    """
+    path = _file_path()
+    try:
+        overrides: dict[str, Any] = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("overrides"), dict):
+                overrides = data["overrides"]
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — corrupt file: rebuild, drop nothing readable
+            logger.warning("tunables: %s unreadable at boot (%s) — rebuilding", path, exc)
+        with _lock:
+            defaults = dict(_registry)
+        payload = {"_readme": _README, "defaults": defaults, "overrides": overrides}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 — never break bridge startup
+        logger.exception("tunables: write_defaults_section failed (ignored)")
