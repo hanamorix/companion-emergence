@@ -19,11 +19,15 @@ const TYPE_LABEL: Record<FeedEntryType, string> = {
   pronoun_nudge: "Pronouns",
 };
 
+// TYPE_DOT hexes are kept verbatim per the glass-redesign handoff — the
+// only exception is `outreach`, which was hardcoded to the OLD project
+// accent (#823329) and is now retargeted to `var(--accent)` so it tracks
+// the current ember accent instead of drifting from it.
 const TYPE_DOT: Record<FeedEntryType, string> = {
   dream: "#6b95b8",
   research: "#b89c6b",
   soul: "#b87fa3",
-  outreach: "#823329",         // project accent
+  outreach: "var(--accent)",   // project accent
   voice_edit: "#7fa37f",
   monologue: "#9b8ab8",        // soft violet — inner thought
   attunement_backfill: "#c89890",  // soft rose — attunement
@@ -128,10 +132,10 @@ function FeedItem({ entry }: { entry: FeedEntry }) {
         <span
           style={{
             fontSize: "9.5px",
+            fontWeight: 600,
             color: "var(--text-mute)",
             textTransform: "uppercase",
             letterSpacing: "0.14em",
-            fontFamily: "var(--font-disp)",
             flex: 1,
           }}
         >
@@ -142,7 +146,6 @@ function FeedItem({ entry }: { entry: FeedEntry }) {
             style={{
               fontSize: "9.5px",
               color: "var(--text-mute)",
-              fontFamily: "var(--font-disp)",
               fontStyle: "italic",
               letterSpacing: "0.04em",
             }}
@@ -155,7 +158,7 @@ function FeedItem({ entry }: { entry: FeedEntry }) {
       <div
         style={{
           paddingLeft: 13,
-          borderLeft: "1px solid rgba(191, 184, 173, 0.10)",
+          borderLeft: "1px solid var(--hairline-soft)",
           fontSize: 11,
           color: "var(--text-mid)",
           lineHeight: 1.55,
@@ -165,7 +168,6 @@ function FeedItem({ entry }: { entry: FeedEntry }) {
         <em
           style={{
             color: "var(--text-mid)",
-            fontFamily: "var(--font-disp)",
           }}
         >
           {entry.opener}

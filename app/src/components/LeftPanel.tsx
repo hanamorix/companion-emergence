@@ -56,10 +56,10 @@ export function LeftPanel({
     <div
       style={{
         position: "relative",
-        // rail (38px) + gap (6px) + panel (238px) = 282px reserved width.
+        // panel (272px) + gap (10px) + rail (~48px) = 330px reserved width.
         // Rail anchors to the left edge; panel expands rightward so toggle
         // icons never sit on top of stats content in small windows.
-        width: 282,
+        width: 330,
         display: "flex",
         justifyContent: "flex-start",
         alignItems: "flex-start",
@@ -67,18 +67,18 @@ export function LeftPanel({
     >
       {/* Rail — anchored to left edge, always painted on top */}
       <div
+        className="glass"
         style={{
           position: "relative",
           zIndex: 2,
           display: "flex",
           flexDirection: "column",
-          gap: 6,
-          padding: 6,
-          background: "var(--panel-bg)",
-          border: "1px solid var(--border)",
-          borderRadius: 10,
-          boxShadow:
-            "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+          gap: 5,
+          padding: 7,
+          borderRadius: 18,
+          backdropFilter: "blur(28px) saturate(1.5)",
+          WebkitBackdropFilter: "blur(28px) saturate(1.5)",
+          boxShadow: "var(--shadow-mid)",
           flexShrink: 0,
         }}
       >
@@ -92,16 +92,17 @@ export function LeftPanel({
               aria-label={t.label}
               aria-pressed={active}
               style={{
-                width: 26,
-                height: 26,
-                borderRadius: 6,
+                width: 36,
+                height: 36,
+                borderRadius: 11,
                 background: active ? "var(--accent)" : "transparent",
-                color: active ? "var(--linen)" : "var(--text-mid)",
-                border: active
-                  ? "1px solid var(--accent)"
-                  : "1px solid rgba(130,51,41,0.18)",
-                fontSize: 13,
-                transition: "all 0.18s ease",
+                color: active ? "#ffffff" : "var(--text-mid)",
+                border: "none",
+                boxShadow: active
+                  ? "0 6px 16px color-mix(in srgb, var(--accent) 40%, transparent)"
+                  : "none",
+                fontSize: 15,
+                transition: "all 0.2s ease",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -112,9 +113,9 @@ export function LeftPanel({
           );
         })}
       </div>
-      {/* Panel — opens to the right of the rail (rail=38px + 6px gap) */}
+      {/* Panel — opens to the left of the rail (rail 48 + gap 6 = 54) */}
       {tab !== null && (
-        <div style={{ position: "absolute", left: 44, top: 0, zIndex: 1 }}>
+        <div style={{ position: "absolute", left: 54, top: 0, zIndex: 1 }}>
           {renderPanel(tab, state, {
             persona,
             stateError,

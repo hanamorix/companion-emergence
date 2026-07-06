@@ -54,9 +54,9 @@ const ACTION_LABEL: Record<string, string> = {
 };
 
 const ACTION_COLOR: Record<string, string> = {
-  pause: "rgba(130,51,41,0.12)",
+  pause: "color-mix(in srgb, var(--accent) 12%, transparent)",
   resume: "rgba(60,120,60,0.12)",
-  revoke: "rgba(130,51,41,0.20)",
+  revoke: "color-mix(in srgb, var(--accent) 20%, transparent)",
   block: "rgba(160,20,20,0.18)",
 };
 
@@ -272,7 +272,6 @@ export function KindledLinksPanel({ persona }: Props) {
             borderRadius: 4,
             padding: "5px 8px",
             marginBottom: 10,
-            fontFamily: "var(--font-disp)",
           }}
         >
           Session data was recovered on startup.
@@ -284,7 +283,6 @@ export function KindledLinksPanel({ persona }: Props) {
         style={{
           fontSize: "9.5px",
           color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
           marginBottom: 6,
           letterSpacing: "0.04em",
         }}
@@ -303,7 +301,6 @@ export function KindledLinksPanel({ persona }: Props) {
         style={{
           fontSize: "9.5px",
           color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
           marginBottom: 10,
           letterSpacing: "0.04em",
         }}
@@ -360,13 +357,12 @@ export function KindledLinksPanel({ persona }: Props) {
                     flexWrap: "wrap",
                     fontSize: "9.5px",
                     color: "var(--text-mute)",
-                    fontFamily: "var(--font-disp)",
                     marginBottom: 4,
                   }}
                 >
                   <span
                     style={{
-                      background: "rgba(130,51,41,0.18)",
+                      background: "color-mix(in srgb, var(--accent) 18%, transparent)",
                       padding: "1px 5px",
                       borderRadius: 3,
                     }}
@@ -375,7 +371,7 @@ export function KindledLinksPanel({ persona }: Props) {
                   </span>
                   <span
                     style={{
-                      background: "rgba(130,51,41,0.10)",
+                      background: "color-mix(in srgb, var(--accent) 10%, transparent)",
                       padding: "1px 5px",
                       borderRadius: 3,
                     }}
@@ -418,7 +414,6 @@ export function KindledLinksPanel({ persona }: Props) {
                       flexWrap: "wrap",
                       fontSize: "9px",
                       color: "var(--text-mute)",
-                      fontFamily: "var(--font-disp)",
                       marginBottom: 5,
                     }}
                   >
@@ -452,12 +447,11 @@ export function KindledLinksPanel({ persona }: Props) {
                         fontSize: "9px",
                         padding: "2px 6px",
                         borderRadius: 3,
-                        border: "1px solid rgba(130,51,41,0.18)",
+                        border: "1px solid color-mix(in srgb, var(--accent) 18%, transparent)",
                         background: ACTION_COLOR[action] ?? "transparent",
                         color: "var(--text-mid)",
                         cursor: busy ? "default" : "pointer",
                         opacity: busy ? 0.55 : 1,
-                        fontFamily: "var(--font-disp)",
                       }}
                     >
                       {ACTION_LABEL[action]}
@@ -479,7 +473,6 @@ export function KindledLinksPanel({ persona }: Props) {
               color: "var(--text-mute)",
               textTransform: "uppercase",
               letterSpacing: "0.12em",
-              fontFamily: "var(--font-disp)",
               marginBottom: 8,
             }}
           >
@@ -498,7 +491,6 @@ export function KindledLinksPanel({ persona }: Props) {
                 fontSize: 10.5,
                 color: "var(--text-mute)",
                 fontStyle: "italic",
-                fontFamily: "var(--font-disp)",
                 lineHeight: 1.6,
                 padding: "10px 12px",
                 background: "rgba(191,184,173,0.05)",
@@ -542,7 +534,7 @@ export function KindledLinksPanel({ persona }: Props) {
                         padding: "6px 10px",
                         borderRadius: isOutbound ? "10px 10px 3px 10px" : "10px 10px 10px 3px",
                         background: isOutbound
-                          ? "rgba(130,51,41,0.16)"
+                          ? "color-mix(in srgb, var(--accent) 16%, transparent)"
                           : "rgba(191,184,173,0.10)",
                         fontSize: 10.5,
                         color: "var(--text-mid)",
@@ -558,7 +550,6 @@ export function KindledLinksPanel({ persona }: Props) {
                         marginTop: 2,
                         fontSize: "9px",
                         color: "var(--text-mute)",
-                        fontFamily: "var(--font-disp)",
                         opacity: 0.7,
                       }}
                     >
@@ -582,7 +573,6 @@ export function KindledLinksPanel({ persona }: Props) {
             color: "var(--text-mute)",
             textTransform: "uppercase",
             letterSpacing: "0.12em",
-            fontFamily: "var(--font-disp)",
             marginBottom: 6,
           }}
         >
@@ -596,12 +586,11 @@ export function KindledLinksPanel({ persona }: Props) {
             fontSize: 10.5,
             padding: "4px 10px",
             borderRadius: 4,
-            border: "1px solid rgba(130,51,41,0.25)",
-            background: "rgba(130,51,41,0.08)",
+            border: "1px solid color-mix(in srgb, var(--accent) 25%, transparent)",
+            background: "color-mix(in srgb, var(--accent) 8%, transparent)",
             color: "var(--text-mid)",
             cursor: codeBusy ? "default" : "pointer",
             opacity: codeBusy ? 0.6 : 1,
-            fontFamily: "var(--font-disp)",
           }}
         >
           {codeBusy ? "Generating…" : "Generate"}
@@ -648,11 +637,10 @@ export function KindledLinksPanel({ persona }: Props) {
                 fontSize: 10.5,
                 padding: "3px 8px",
                 borderRadius: 4,
-                border: "1px solid rgba(130,51,41,0.25)",
-                background: "rgba(130,51,41,0.08)",
+                border: "1px solid color-mix(in srgb, var(--accent) 25%, transparent)",
+                background: "color-mix(in srgb, var(--accent) 8%, transparent)",
                 color: "var(--text-mid)",
                 cursor: "pointer",
-                fontFamily: "var(--font-disp)",
               }}
             >
               Copy
@@ -666,7 +654,6 @@ export function KindledLinksPanel({ persona }: Props) {
                   fontSize: "9.5px",
                   color: "var(--text-mute)",
                   fontStyle: "italic",
-                  fontFamily: "var(--font-disp)",
                   lineHeight: 1.5,
                 }}
               >
@@ -686,7 +673,6 @@ export function KindledLinksPanel({ persona }: Props) {
             color: "var(--text-mute)",
             textTransform: "uppercase",
             letterSpacing: "0.12em",
-            fontFamily: "var(--font-disp)",
             marginBottom: 6,
           }}
         >
@@ -698,7 +684,6 @@ export function KindledLinksPanel({ persona }: Props) {
           style={{
             fontSize: "9.5px",
             color: "var(--text-mute)",
-            fontFamily: "var(--font-disp)",
           }}
         >
           Paste your friend's code
@@ -718,7 +703,7 @@ export function KindledLinksPanel({ persona }: Props) {
             fontFamily: "var(--font-mono, monospace)",
             color: "var(--text)",
             background: "var(--panel-bg)",
-            border: "1px solid rgba(130,51,41,0.20)",
+            border: "1px solid color-mix(in srgb, var(--accent) 20%, transparent)",
             borderRadius: 4,
             padding: "4px 6px",
             resize: "vertical",
@@ -733,12 +718,11 @@ export function KindledLinksPanel({ persona }: Props) {
             fontSize: 10.5,
             padding: "4px 10px",
             borderRadius: 4,
-            border: "1px solid rgba(130,51,41,0.25)",
-            background: "rgba(130,51,41,0.08)",
+            border: "1px solid color-mix(in srgb, var(--accent) 25%, transparent)",
+            background: "color-mix(in srgb, var(--accent) 8%, transparent)",
             color: "var(--text-mid)",
             cursor: connectBusy || !pasteCode.trim() ? "default" : "pointer",
             opacity: connectBusy || !pasteCode.trim() ? 0.6 : 1,
-            fontFamily: "var(--font-disp)",
           }}
         >
           {connectBusy ? "Connecting…" : "Connect"}
@@ -762,7 +746,7 @@ export function KindledLinksPanel({ persona }: Props) {
       <SectionLabel>Identity Key</SectionLabel>
       {rotateResult ? (
         <div style={{ fontSize: "0.82rem", color: "var(--text-mute)", marginBottom: 8 }}>
-          <div style={{ color: "var(--text-primary)", marginBottom: 4 }}>
+          <div style={{ color: "var(--text)", marginBottom: 4 }}>
             Key rotated. New ID: <code>{rotateResult.new_key_id}</code>
           </div>
           <div>Phrase: <code>{rotateResult.fingerprint_phrase}</code></div>
@@ -782,7 +766,7 @@ export function KindledLinksPanel({ persona }: Props) {
           <button
             disabled={rotateBusy}
             onClick={() => void handleRotateKey()}
-            style={{ marginRight: 8, color: "var(--error)" }}
+            style={{ marginRight: 8, color: "#e07a6a" }}
           >
             {rotateBusy ? "Rotating…" : "Yes, rotate key"}
           </button>
@@ -790,7 +774,7 @@ export function KindledLinksPanel({ persona }: Props) {
             Cancel
           </button>
           {rotateError && (
-            <div style={{ color: "var(--error)", marginTop: 4 }}>{rotateError}</div>
+            <div style={{ color: "#e07a6a", marginTop: 4 }}>{rotateError}</div>
           )}
         </div>
       ) : (
@@ -807,7 +791,6 @@ export function KindledLinksPanel({ persona }: Props) {
             color: "var(--text-mute)",
             textTransform: "uppercase",
             letterSpacing: "0.12em",
-            fontFamily: "var(--font-disp)",
             marginBottom: 6,
           }}
         >
@@ -822,11 +805,10 @@ export function KindledLinksPanel({ persona }: Props) {
             fontSize: 10.5,
             padding: "4px 10px",
             borderRadius: 4,
-            border: "1px solid rgba(130,51,41,0.25)",
-            background: selfTestBusy ? "rgba(130,51,41,0.04)" : "rgba(130,51,41,0.08)",
+            border: "1px solid color-mix(in srgb, var(--accent) 25%, transparent)",
+            background: selfTestBusy ? "color-mix(in srgb, var(--accent) 4%, transparent)" : "color-mix(in srgb, var(--accent) 8%, transparent)",
             color: selfTestBusy ? "var(--text-mute)" : "var(--text-mid)",
             cursor: selfTestBusy ? "default" : "pointer",
-            fontFamily: "var(--font-disp)",
             transition: "opacity 0.15s",
           }}
         >
@@ -840,7 +822,6 @@ export function KindledLinksPanel({ persona }: Props) {
               fontSize: 10.5,
               color: "var(--text-mute)",
               fontStyle: "italic",
-              fontFamily: "var(--font-disp)",
             }}
           >
             {selfTestError}
@@ -868,7 +849,6 @@ export function KindledLinksPanel({ persona }: Props) {
                       alignItems: "baseline",
                       gap: 5,
                       fontSize: 10.5,
-                      fontFamily: "var(--font-disp)",
                     }}
                   >
                     <span
@@ -889,7 +869,6 @@ export function KindledLinksPanel({ persona }: Props) {
                         fontSize: "9.5px",
                         color: "var(--text-mute)",
                         fontStyle: "italic",
-                        fontFamily: "var(--font-disp)",
                         lineHeight: 1.4,
                       }}
                     >
@@ -905,7 +884,6 @@ export function KindledLinksPanel({ persona }: Props) {
               style={{
                 fontSize: 10.5,
                 fontWeight: 700,
-                fontFamily: "var(--font-disp)",
                 letterSpacing: "0.04em",
                 color: selfTest.ok
                   ? "oklch(55% 0.14 145)"

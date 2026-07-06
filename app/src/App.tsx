@@ -456,15 +456,20 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           is taller (380) than the avatar (280), so avatar's bottom
           floats ~50px above the chat input. translateY drops the
           avatar so her silhouette ends at the same line as the
-          textbox without disturbing layout flow for the panels. */}
-      <div style={{ transform: "translateY(50px)" }}>
-        <NellAvatar
-          state={state}
-          persona={persona}
-          isSpeaking={isSpeaking}
-          soulFlashing={soulFlashing}
-          reducedMotion={config.reduced_motion}
-        />
+          textbox without disturbing layout flow for the panels. The
+          identity block (name/status/heartbeat) sits under the avatar
+          in its own column. */}
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+        <div style={{ transform: "translateY(50px)" }}>
+          <NellAvatar
+            state={state}
+            persona={persona}
+            isSpeaking={isSpeaking}
+            soulFlashing={soulFlashing}
+            reducedMotion={config.reduced_motion}
+          />
+        </div>
+        <PresenceIdentity persona={persona} state={state} isSpeaking={isSpeaking} />
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {pendingWrites.length > 0 && (
@@ -513,6 +518,106 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       </div>
     </div>
   );
+}
+
+/**
+ * PresenceIdentity — the identity block under the avatar: a live dot,
+ * the persona name, a humanized status line derived from her top-2
+ * emotions (swaps to "thinking…" while a reply is in flight), and a
+ * heartbeat chip. Purely presentational — reads only from PersonaState
+ * already polled by Ready.
+ */
+function PresenceIdentity({
+  persona,
+  state,
+  isSpeaking,
+}: {
+  persona: string;
+  state: PersonaState | null;
+  isSpeaking: boolean;
+}) {
+  const statusLine = isSpeaking ? "thinking…" : humanizeEmotionStatus(state?.emotions ?? null);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18, marginTop: 18 }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span
+            aria-hidden="true"
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: "#5fbe8b",
+              boxShadow: "0 0 8px rgba(95,190,139,0.7)",
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ fontSize: 19, fontWeight: 700, letterSpacing: "-0.01em", color: "var(--text)" }}>
+            {capitalize(persona)}
+          </span>
+        </div>
+        {statusLine && (
+          <div style={{ fontSize: 12, color: "var(--text-mute)" }}>{statusLine}</div>
+        )}
+      </div>
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 500,
+          padding: "5px 13px",
+          borderRadius: 999,
+          color: "var(--text-mid)",
+          background: "var(--panel)",
+          backdropFilter: "blur(20px) saturate(1.5)",
+          WebkitBackdropFilter: "blur(20px) saturate(1.5)",
+          border: "1px solid var(--hairline)",
+        }}
+      >
+        ♥ {nextHeartbeatLabel(state?.connection?.last_heartbeat_at)}
+      </div>
+    </div>
+  );
+}
+
+/** Persisted supervisor cadence — see brain/bridge/supervisor.py
+ *  heartbeat_interval_s default. Not exposed on PersonaState today, so
+ *  this mirrors the known server-side constant to derive a "next
+ *  heartbeat in Xm" display from the same last_heartbeat_at field
+ *  ConnectionPanel's heartbeat row already reads (that row shows time
+ *  SINCE the last heartbeat; this derives time UNTIL the next one from
+ *  the same timestamp + the fixed interval). */
+const HEARTBEAT_INTERVAL_MINUTES = 15;
+
+function nextHeartbeatLabel(iso: string | null | undefined): string {
+  if (!iso) return "next heartbeat soon";
+  try {
+    const ts = new Date(iso).getTime();
+    const elapsedMin = (Date.now() - ts) / 60_000;
+    const remaining = Math.max(0, Math.ceil(HEARTBEAT_INTERVAL_MINUTES - elapsedMin));
+    if (remaining <= 0) return "next heartbeat any moment";
+    return `next heartbeat in ${remaining}m`;
+  } catch {
+    return "next heartbeat soon";
+  }
+}
+
+/** Humanizes the top-2 emotion channels into a short status phrase, e.g.
+ *  "creative hunger climbing · rest need underneath". Snake_case channel
+ *  names become space-separated lowercase phrases; exact adjective framing
+ *  is a visual/creative choice, kept short. */
+function humanizeEmotionStatus(emotions: Record<string, number> | null): string | null {
+  if (!emotions) return null;
+  const top = Object.entries(emotions)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 2)
+    .map(([name]) => name.replace(/_/g, " ").toLowerCase());
+  if (top.length === 0) return null;
+  if (top.length === 1) return `${top[0]} climbing`;
+  return `${top[0]} climbing · ${top[1]} underneath`;
+}
+
+function capitalize(s: string): string {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
 /**
