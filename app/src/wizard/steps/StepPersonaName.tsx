@@ -76,19 +76,19 @@ export function StepPersonaName({
           style={{
             marginTop: 10,
             padding: "8px 11px",
-            borderRadius: 7,
-            background: "rgba(130,51,41,0.07)",
-            border: "1px solid rgba(130,51,41,0.18)",
+            borderRadius: 14,
+            background: "color-mix(in srgb, var(--accent) 9%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--accent) 24%, transparent)",
           }}
         >
           <div
             style={{
               fontSize: 10,
+              fontWeight: 600,
               color: "var(--text-mute)",
               marginBottom: 3,
-              fontFamily: "var(--font-disp)",
               textTransform: "uppercase",
-              letterSpacing: "0.08em",
+              letterSpacing: "0.12em",
             }}
           >
             Will be installed at

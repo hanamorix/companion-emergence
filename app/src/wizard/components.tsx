@@ -28,34 +28,23 @@ export function WizardShell({
         justifyContent: "center",
         width: "100vw",
         height: "100vh",
-        gap: 48,
+        gap: 56,
       }}
     >
       {showLeftPanel && (
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}>
           {avatar}
           {step != null && totalSteps != null && (
-            <div
-              style={{
-                width: 220,
-                padding: "10px 14px",
-                borderRadius: 9,
-                background: "var(--panel-bg)",
-                border: "1px solid var(--border)",
-                boxShadow:
-                  "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
-              }}
-            >
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
               <ProgressBar current={step} total={totalSteps} />
               <div
                 style={{
                   textAlign: "center",
-                  marginTop: 6,
-                  fontSize: 10.5,
-                  color: "var(--text-mid)",
-                  fontFamily: "var(--font-disp)",
-                  letterSpacing: "0.08em",
+                  fontSize: 11,
                   fontWeight: 500,
+                  color: "var(--text-mute)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.09em",
                 }}
               >
                 Step {step} of {totalSteps}
@@ -66,57 +55,59 @@ export function WizardShell({
       )}
       <div
         style={{
-          width: 380,
-          background: "rgba(234,222,218,0.97)",
-          border: "1px solid var(--border)",
-          borderRadius: 12,
-          // Soft chrome — matches the panel-shell shadow used by the
-          // main app's Inner Weather / chat input / icon rail. The
-          // previous "0 4px 32px rgba(42,31,31,0.28)" cast a 32px-spread
-          // dark halo that read as a black ring against any bright
-          // wallpaper through the transparent window.
-          boxShadow:
-            "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+          width: 432,
+          background: "var(--panel-strong)",
+          backdropFilter: "blur(36px) saturate(1.5)",
+          WebkitBackdropFilter: "blur(36px) saturate(1.5)",
+          border: "1px solid var(--hairline)",
+          borderRadius: 26,
+          boxShadow: "var(--shadow)",
           overflow: "hidden",
           color: "var(--text)",
-          animation: "msg-in 0.22s ease",
+          animation: "msg-in 0.28s ease",
         }}
       >
         <div
           style={{
-            padding: "16px 18px 14px",
-            borderBottom: "1px solid var(--border)",
-            background: "rgba(234,222,218,0.5)",
+            padding: "22px 26px 16px",
+            borderBottom: "1px solid var(--hairline)",
           }}
         >
           <div
             style={{
-              fontSize: 9.5,
+              fontSize: 10,
               color: "var(--text-mute)",
               textTransform: "uppercase",
-              letterSpacing: "0.1em",
-              fontFamily: "var(--font-disp)",
+              letterSpacing: "0.18em",
+              fontWeight: 600,
               marginBottom: 4,
             }}
           >
             Companion Emergence
           </div>
-          <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)", lineHeight: 1.3 }}>
+          <div
+            style={{
+              fontSize: 21,
+              fontWeight: 700,
+              color: "var(--text)",
+              lineHeight: 1.25,
+              letterSpacing: "-0.01em",
+            }}
+          >
             {title}
           </div>
           {subtitle && (
-            <div style={{ fontSize: 11, color: "var(--text-mid)", marginTop: 3, lineHeight: 1.5 }}>
+            <div style={{ fontSize: 12.5, color: "var(--text-mid)", marginTop: 3, lineHeight: 1.55 }}>
               {subtitle}
             </div>
           )}
         </div>
-        <div style={{ padding: "16px 18px", maxHeight: 460, overflowY: "auto" }}>{children}</div>
+        <div style={{ padding: "18px 26px 20px", maxHeight: 430, overflowY: "auto" }}>{children}</div>
         {footer && (
           <div
             style={{
-              padding: "12px 18px",
-              borderTop: "1px solid var(--border)",
-              background: "rgba(234,222,218,0.4)",
+              padding: "15px 26px",
+              borderTop: "1px solid var(--hairline)",
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
@@ -132,7 +123,6 @@ export function WizardShell({
 }
 
 export function ProgressBar({ current, total }: { current: number; total: number }) {
-  const pct = (current / total) * 100;
   return (
     <div
       role="progressbar"
@@ -141,20 +131,23 @@ export function ProgressBar({ current, total }: { current: number; total: number
       aria-valuemax={total}
       aria-valuenow={current}
       style={{
-        height: 5,
-        background: "rgba(130,51,41,0.18)",
-        borderRadius: 3,
-        overflow: "hidden",
+        display: "flex",
+        flexDirection: "row",
+        gap: 5,
       }}
     >
-      <div
-        style={{
-          height: "100%",
-          width: `${pct}%`,
-          background: "var(--accent)",
-          transition: "width 0.4s ease",
-        }}
-      />
+      {Array.from({ length: total }, (_, i) => (
+        <div
+          key={i}
+          style={{
+            width: 24,
+            height: 5,
+            borderRadius: 3,
+            background: i < current ? "var(--accent)" : "rgba(255,255,255,0.14)",
+            transition: "background 0.35s",
+          }}
+        />
+      ))}
     </div>
   );
 }
@@ -178,14 +171,21 @@ export function WButton({
       onClick={onClick}
       disabled={disabled}
       style={{
-        background: isPrimary ? "var(--accent)" : "transparent",
-        color: isPrimary ? "var(--linen)" : "var(--text-mid)",
-        padding: small ? "5px 11px" : "8px 16px",
-        borderRadius: 6,
-        fontSize: small ? 11 : 12,
-        fontWeight: 500,
-        border: isPrimary ? "1px solid var(--accent)" : "1px solid var(--border)",
-        opacity: disabled ? 0.4 : 1,
+        background: isPrimary
+          ? disabled
+            ? "color-mix(in srgb, var(--accent) 35%, transparent)"
+            : "var(--accent)"
+          : "var(--field)",
+        color: isPrimary ? (disabled ? "rgba(255,255,255,0.5)" : "var(--linen)") : "var(--text-mid)",
+        padding: small ? "9px 16px" : "10px 22px",
+        borderRadius: 999,
+        fontSize: small ? 13 : 13.5,
+        fontWeight: isPrimary ? 700 : 600,
+        border: isPrimary ? "none" : "1px solid var(--hairline)",
+        boxShadow:
+          isPrimary && !disabled
+            ? "0 8px 22px color-mix(in srgb, var(--accent) 42%, transparent)"
+            : "none",
         cursor: disabled ? "not-allowed" : "pointer",
         transition: "opacity 0.18s, transform 0.18s",
       }}
@@ -229,11 +229,11 @@ export function WInput({
       maxLength={maxLength}
       style={{
         width: "100%",
-        padding: "9px 12px",
-        background: "rgba(255,255,255,0.6)",
-        border: `1px solid ${error ? "var(--crimson)" : "var(--border)"}`,
-        borderRadius: 6,
-        fontSize: 12,
+        padding: "12px 16px",
+        background: "var(--field)",
+        border: `1px solid ${error ? "#e07a6a" : "var(--hairline)"}`,
+        borderRadius: 14,
+        fontSize: 14,
         fontFamily: mono ? "DM Mono, Courier New, monospace" : "var(--font-ui)",
         color: "var(--text)",
         outline: "none",
@@ -248,10 +248,10 @@ export function FieldLabel({ children }: { children: ReactNode }) {
     <div
       style={{
         fontSize: 10.5,
+        fontWeight: 600,
         color: "var(--text-mute)",
-        fontFamily: "var(--font-disp)",
         textTransform: "uppercase",
-        letterSpacing: "0.08em",
+        letterSpacing: "0.12em",
         marginBottom: 5,
       }}
     >
@@ -281,10 +281,10 @@ export function SectionLabel({ children }: { children: ReactNode }) {
     <div
       style={{
         fontSize: 10.5,
+        fontWeight: 600,
         color: "var(--text-mute)",
-        fontFamily: "var(--font-disp)",
         textTransform: "uppercase",
-        letterSpacing: "0.08em",
+        letterSpacing: "0.12em",
         marginBottom: 8,
         marginTop: 4,
       }}
@@ -299,8 +299,7 @@ export function Divider() {
     <div
       style={{
         height: 1,
-        background: "var(--border)",
-        opacity: 0.5,
+        background: "var(--hairline-soft)",
         margin: "16px 0 12px",
       }}
     />
@@ -333,12 +332,16 @@ export function OptionCard({
         }
       }}
       style={{
-        padding: "11px 14px",
-        background: selected ? "rgba(130,51,41,0.08)" : "rgba(255,255,255,0.4)",
-        border: `1px solid ${selected ? "var(--accent)" : "var(--border)"}`,
-        borderRadius: 7,
+        padding: "14px 16px",
+        background: selected
+          ? "color-mix(in srgb, var(--accent) 13%, transparent)"
+          : "var(--field)",
+        border: `1px solid ${
+          selected ? "color-mix(in srgb, var(--accent) 50%, transparent)" : "var(--hairline)"
+        }`,
+        borderRadius: 16,
         cursor: "pointer",
-        marginBottom: 8,
+        marginBottom: 10,
         transition: "background 0.18s, border 0.18s",
       }}
     >
@@ -353,28 +356,29 @@ export function OptionCard({
         <div
           aria-hidden="true"
           style={{
-            width: 12,
-            height: 12,
+            width: 15,
+            height: 15,
             borderRadius: "50%",
             border: `1.5px solid ${selected ? "var(--accent)" : "var(--text-mute)"}`,
             background: selected ? "var(--accent)" : "transparent",
+            boxShadow: selected ? "inset 0 0 0 3px var(--panel-strong)" : "none",
             transition: "all 0.18s",
             flexShrink: 0,
           }}
         />
-        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)", flex: 1 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)", flex: 1 }}>
           {title}
         </div>
         {badge && (
           <div
             style={{
-              fontSize: 9,
-              color: "var(--accent)",
-              background: "rgba(130,51,41,0.12)",
+              fontSize: 9.5,
+              fontWeight: 700,
+              color: "var(--accent-text)",
+              background: "color-mix(in srgb, var(--accent) 22%, transparent)",
               padding: "2px 7px",
-              borderRadius: 9,
-              fontFamily: "var(--font-disp)",
-              letterSpacing: "0.04em",
+              borderRadius: 999,
+              letterSpacing: "0.08em",
               textTransform: "uppercase",
             }}
           >
@@ -384,10 +388,10 @@ export function OptionCard({
       </div>
       <div
         style={{
-          fontSize: 11,
+          fontSize: 12,
           color: "var(--text-mid)",
           lineHeight: 1.5,
-          paddingLeft: 20,
+          paddingLeft: 25,
         }}
       >
         {description}
