@@ -137,7 +137,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
         <>
           <span
             style={{
-              fontSize: 10.5,
+              fontSize: 11.5,
               color: "var(--text-mute)",
               fontFamily: "var(--font-disp)",
               fontStyle: "italic",
@@ -159,7 +159,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
           <div
             style={{
               padding: "10px 12px",
-              borderRadius: 7,
+              borderRadius: 16,
               background: "rgba(216,154,88,0.10)",
               border: "1px solid rgba(216,154,88,0.40)",
               fontSize: 11,
@@ -187,7 +187,7 @@ function Row({ stage, last }: { stage: Stage; last: boolean }) {
         alignItems: "flex-start",
         gap: 10,
         padding: "8px 0",
-        borderBottom: last ? "none" : "1px solid rgba(191,184,173,0.25)",
+        borderBottom: last ? "none" : "1px solid var(--hairline-soft)",
       }}
     >
       <StatusGlyph status={stage.status} />
@@ -222,17 +222,17 @@ function StatusGlyph({ status }: { status: StageStatus }) {
     fontSize: 12,
     fontWeight: 600,
   };
-  if (status === "ok") return <span style={{ ...common, color: "#3a8a5e" }}>✓</span>;
+  if (status === "ok") return <span style={{ ...common, color: "#4fa876" }}>✓</span>;
   if (status === "error") return <span style={{ ...common, color: "var(--crimson)" }}>✗</span>;
   if (status === "running") {
     return (
       <span style={{ ...common }} aria-label="working">
         <span
           style={{
-            width: 12,
-            height: 12,
+            width: 15,
+            height: 15,
             borderRadius: "50%",
-            border: "2px solid rgba(130,51,41,0.2)",
+            border: "2px solid rgba(255,255,255,0.15)",
             borderTopColor: "var(--accent)",
             animation: "spin 0.9s linear infinite",
           }}
