@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { setPersonaNotes } from "../../bridge";
 
 interface Props {
@@ -21,6 +21,17 @@ export function NotesToggle({ persona, enabled, folder }: Props) {
   const [localFolder, setLocalFolder] = useState<string | null>(folder);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // The enabled/folder props arrive from the 5s state poll and can change
+  // after mount (e.g. first poll lands after the panel opens). Re-sync the
+  // local optimistic state whenever they do — but not mid-toggle.
+  useEffect(() => {
+    if (!busy) {
+      setOn(enabled);
+      setLocalFolder(folder);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, folder]);
 
   async function onToggle() {
     const next = !on;
