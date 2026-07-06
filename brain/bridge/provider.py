@@ -732,8 +732,10 @@ class ClaudeCliProvider(LLMProvider):
     ) -> Iterator[ChatStreamEvent]:
         """Yield ChatStreamEvent values as the claude subprocess streams.
 
-        Per-event idle timeout: _STREAM_PER_EVENT_IDLE_SECONDS (60s default).
-        First-event timeout: _STREAM_FIRST_EVENT_SECONDS (120s default).
+        Per-event idle timeout: _stream_per_event_idle_seconds() (default 60s,
+        overridable via tunables key provider.stream_per_event_idle_seconds).
+        First-event timeout: _stream_first_event_seconds() (default 120s,
+        key provider.stream_first_event_seconds).
         Both can be monkeypatched in tests for fast verification.
 
         Yields:
