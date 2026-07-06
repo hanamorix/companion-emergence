@@ -438,8 +438,8 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         alignItems: "center",
         justifyContent: "center",
         gap: 28,
-        width: "100vw",
-        height: "100vh",
+        width: "100%",
+        height: "100%",
       }}
     >
       <GlobalStatusDot mode={state?.mode ?? "live"} stateError={stateError} />
@@ -514,7 +514,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           onSpeakingChange={setIsSpeaking}
           recovering={state?.recovering ?? false}
           feltTimeRecovered={state?.felt_time_recovered ?? false}
-          mode={state?.mode ?? "live"}
+          mode={stateError ? "bridge_down" : (state?.mode ?? "live")}
         />
       </div>
     </div>
