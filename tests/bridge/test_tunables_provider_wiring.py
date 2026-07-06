@@ -36,3 +36,17 @@ def test_stream_timeouts_default_without_file(tunables_home):
 
     assert p._stream_per_event_idle_seconds() == 60.0
     assert p._stream_first_event_seconds() == 120.0
+
+
+def test_turn_budget_override_per_tier(tunables_home):
+    (tunables_home / "tunables.json").write_text(
+        json.dumps({"defaults": {}, "overrides": {
+            "provider.max_turn_budget_usd.sonnet": 2.50,
+        }}),
+        encoding="utf-8",
+    )
+    from brain.bridge import provider as p
+
+    assert p._MAX_TURN_BUDGET_USD("claude-sonnet-4-6") == 2.50
+    assert p._MAX_TURN_BUDGET_USD("opus") == 3.00      # untouched tier
+    assert p._MAX_TURN_BUDGET_USD("mystery-model") == 1.50  # fallback untouched
