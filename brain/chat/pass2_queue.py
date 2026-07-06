@@ -38,6 +38,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
+from brain import tunables
 from brain.bridge import cli_throttle
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,11 @@ _POLL_SECONDS: float = 0.5
 # SHORTER chat-idle window than the cadence engines' cli_throttle default (300s):
 # it waits out the in-flight turn (a reply takes ~15-20s) then drains ~30s after
 # the last turn, keeping attunement/traces fresh without contending mid-turn.
-_PASS2_IDLE_SECONDS: float = 30.0
+_PASS2_IDLE_SECONDS: float = tunables.register("chat.pass2_min_idle_seconds", 30.0)
+
+
+def _pass2_idle_seconds() -> float:
+    return tunables.get_tunable("chat.pass2_min_idle_seconds", _PASS2_IDLE_SECONDS)
 
 _lock = threading.Lock()
 _queue: deque[tuple[Callable[[], None], str]] = deque()  # (fn, label)
@@ -85,7 +90,7 @@ def _drain_one() -> bool:
     with _lock:
         if not _queue:
             return False
-    if not cli_throttle.acquire_background(min_idle=_PASS2_IDLE_SECONDS):
+    if not cli_throttle.acquire_background(min_idle=_pass2_idle_seconds()):
         return False  # yield to chat / cap — leave the item queued for later
     try:
         with _lock:
