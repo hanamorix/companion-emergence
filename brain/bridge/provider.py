@@ -71,11 +71,11 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Matched by substring of the model id so short aliases ("sonnet") and
 # fully-qualified ids ("claude-sonnet-4-6") both resolve.
 _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
-    ("haiku", 0.30),
-    ("sonnet", 0.75),
-    ("opus", 3.00),
+    ("haiku", tunables.register("provider.max_turn_budget_usd.haiku", 0.30)),
+    ("sonnet", tunables.register("provider.max_turn_budget_usd.sonnet", 0.75)),
+    ("opus", tunables.register("provider.max_turn_budget_usd.opus", 3.00)),
 )
-_BUDGET_FALLBACK: float = 1.50
+_BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
 
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
@@ -97,8 +97,8 @@ def _MAX_TURN_BUDGET_USD(model: str) -> float:  # noqa: N802  (module-level cons
     low = model.lower()
     for tier, usd in _BUDGET_BY_TIER:
         if tier in low:
-            return usd
-    return _BUDGET_FALLBACK
+            return tunables.get_tunable(f"provider.max_turn_budget_usd.{tier}", usd)
+    return tunables.get_tunable("provider.max_turn_budget_usd.fallback", _BUDGET_FALLBACK)
 
 
 def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> None:
