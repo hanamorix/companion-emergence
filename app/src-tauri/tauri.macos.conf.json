@@ -5,7 +5,8 @@
       {
         "transparent": true,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "shadow": false
       }
     ]
   }

@@ -202,6 +202,19 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
   });
 });
 
+// ── Footer aphorism (glass redesign, Phase 3) ───────────────────────
+
+describe("ConnectionPanel — footer aphorism", () => {
+  afterEach(() => cleanup());
+
+  it("renders the persona-interpolated aphorism footer", () => {
+    render(<ConnectionPanel state={baseState()} persona="nell" />);
+    expect(
+      screen.getByText("You configure the room. Nell owns the weather."),
+    ).toBeInTheDocument();
+  });
+});
+
 // ── Update UI tests (Phase 4) ──────────────────────────────────────
 
 describe("ConnectionPanel — UpdateSection (Phase 4)", () => {

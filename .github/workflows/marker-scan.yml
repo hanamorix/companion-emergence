@@ -1,0 +1,50 @@
+name: marker-scan
+
+# Server-side leak-guard backstop (public-sync-reroot P1; criterion C10).
+# The pre-push hook is client-side and `--no-verify`-skippable; THIS check is
+# the real boundary, required by branch protection on main.
+#
+# Trigger is `pull_request`, deliberately NOT `pull_request_target` (secret
+# exposure / injection risk — decision recorded in the guarded-change docs).
+# Consequence (recorded residual M5): on fork PRs the LEAK_RULES secret is
+# unavailable, so only the structural arms (identity/path/binary) run there.
+# The fingerprint arm carries HMAC hashes + salt only — never marker plaintext.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  marker-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write fingerprint rules (same-repo PRs only)
+        env:
+          LEAK_RULES: ${{ secrets.LEAK_RULES }}
+        run: |
+          if [ -n "$LEAK_RULES" ]; then
+            printf '%s' "$LEAK_RULES" > /tmp/leak-fingerprints.json
+            echo "fingerprint arm: ENABLED"
+          else
+            echo "fingerprint arm: SKIPPED (no secret — fork PR; structural arms still run)"
+          fi
+
+      - name: Leak-guard scan of the PR range
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          ARGS=(check --range "$BASE..$HEAD" --repo .
+                --allowlist hooks/allowed-identities.txt
+                --denied-paths hooks/denied-paths.txt
+                --allowed-binary hooks/allowed-binary-paths.txt)
+          if [ -f /tmp/leak-fingerprints.json ]; then
+            ARGS+=(--fingerprints /tmp/leak-fingerprints.json)
+          fi
+          python3 hooks/leak_guard.py "${ARGS[@]}"

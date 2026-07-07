@@ -193,11 +193,11 @@ function Thumbnail({
       }}
       style={{
         aspectRatio: "1 / 1",
-        borderRadius: 4,
+        borderRadius: 12,
         overflow: "hidden",
         cursor: "pointer",
-        background: "var(--ash)",
-        border: "1px solid var(--border)",
+        background: "var(--field)",
+        border: "1px solid var(--hairline)",
         opacity: visible ? 1 : 0.3,
         transition: "opacity 0.2s",
       }}
@@ -249,7 +249,6 @@ function Lightbox({
         inset: 0,
         zIndex: 9999,
         background: "rgba(24, 18, 18, 0.85)",
-        backdropFilter: "blur(4px)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",

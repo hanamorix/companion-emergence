@@ -255,3 +255,38 @@ describe("App pending-write cards", () => {
     );
   });
 });
+
+describe("App presence column (glass redesign)", () => {
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  it("derives a humanized status line from the top-2 emotions", async () => {
+    fetchPersonaState.mockReset().mockResolvedValue({
+      persona: "nell",
+      emotions: { creative_hunger: 8.2, rest_need: 6.1, joy: 1.0 },
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+    });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/creative hunger/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/rest need/)).toBeInTheDocument();
+  });
+});

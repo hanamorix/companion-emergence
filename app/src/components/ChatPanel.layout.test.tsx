@@ -7,6 +7,16 @@ vi.mock("../streamChat", () => ({
   streamChat: vi.fn(async () => () => undefined),
 }));
 
+// ChatPanel's glass header (Phase 4) resolves an avatar thumb via
+// expressions.ts, whose import.meta.glob eagerly loads every expression
+// PNG at module-load time. This worktree checkout's .git is a file (not
+// a directory), which breaks Vite's fs.allow root-detection and denies
+// that glob's fetch outside the app/ dir. Stub the module — these tests
+// exercise chat layout, not expression art.
+vi.mock("../expressions", () => ({
+  resolveFrameUrl: () => "",
+}));
+
 beforeAll(() => {
   if (!Element.prototype.scrollTo) {
     Element.prototype.scrollTo = function () {} as Element["scrollTo"];
