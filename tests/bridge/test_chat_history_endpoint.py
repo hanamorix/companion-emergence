@@ -168,3 +168,49 @@ def test_history_rejects_invalid_session_id(persona_dir: Path) -> None:
     with _make_client(persona_dir) as c:
         r = c.get("/chat/history", params={"session_id": "../../etc/passwd"})
         assert r.status_code == 400
+
+
+def test_history_early_break_closes_reader_generator(
+    persona_dir: Path, monkeypatch
+) -> None:
+    """Windows-deletability hazard: the endpoint breaks out of the buffer
+    iteration when ``before_turn`` is hit. An abandoned generator keeps the
+    file handle open until GC — on Windows that blocks close_session's
+    buffer unlink (WinError 32). Pin that the endpoint closes the reader
+    deterministically."""
+    import brain.bridge.server as server_mod
+
+    _seed_buffer(
+        persona_dir,
+        "s_close",
+        [
+            {"session_id": "s_close", "speaker": "user", "text": f"t{i}", "ts": "x"}
+            for i in range(10)
+        ],
+    )
+
+    closed = {"v": False}
+    real_iter = server_mod.iter_jsonl_skipping_corrupt
+
+    def tracking_iter(path):
+        gen = real_iter(path)
+
+        class _Wrap:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(gen)
+
+            def close(self):
+                closed["v"] = True
+                gen.close()
+
+        return _Wrap()
+
+    monkeypatch.setattr(server_mod, "iter_jsonl_skipping_corrupt", tracking_iter)
+
+    with _make_client(persona_dir) as c:
+        r = c.get("/chat/history", params={"session_id": "s_close", "before_turn": 3})
+    assert r.status_code == 200
+    assert closed["v"], "endpoint abandoned the buffer reader without closing it"

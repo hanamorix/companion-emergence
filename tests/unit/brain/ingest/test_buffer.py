@@ -119,6 +119,38 @@ def test_delete_session_buffer_is_idempotent(tmp_path: Path) -> None:
     delete_session_buffer(tmp_path, "sess_del")
 
 
+def test_delete_session_buffer_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Windows CI regression (WinError 32): unlink of a freshly-written buffer
+    can hit a transient PermissionError (antivirus/indexer or a not-yet-GC'd
+    reader handle — Windows can't delete open files). delete_session_buffer
+    must retry briefly instead of failing close_session with ingest_failed."""
+    from pathlib import Path as _PathCls
+
+    from brain.ingest import buffer as buffer_mod
+
+    ingest_turn(tmp_path, {"session_id": "sess_retry", "speaker": "x", "text": "y"})
+    path = tmp_path / "active_conversations" / "sess_retry.jsonl"
+    assert path.exists()
+
+    real_unlink = _PathCls.unlink
+    attempts = {"n": 0}
+
+    def flaky_unlink(self, missing_ok=False):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(_PathCls, "unlink", flaky_unlink)
+    monkeypatch.setattr(buffer_mod.time, "sleep", lambda _s: None)
+
+    delete_session_buffer(tmp_path, "sess_retry")
+    assert attempts["n"] == 3
+    assert not path.exists()
+
+
 # ---- I-2 follow-up audit: session_id validation ----
 
 
