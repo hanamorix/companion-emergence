@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -135,10 +136,33 @@ def session_silence_minutes(turns: list[dict]) -> float:
     return delta.total_seconds() / 60.0
 
 
+_UNLINK_RETRIES = 8
+_UNLINK_RETRY_SLEEP_S = 0.05
+
+
+def _unlink_with_retry(path: Path) -> None:
+    """Unlink with a short bounded retry on transient PermissionError.
+
+    Windows cannot delete a file another handle holds open (WinError 32) —
+    a just-flushed writer, a not-yet-GC'd reader generator, or the CI
+    runner's antivirus/indexer briefly pins freshly-written files. On POSIX
+    the retry never triggers. Re-raises after the budget so a *real*
+    permission problem still surfaces (fail-loud, matching the ingest
+    pipeline's error counters)."""
+    for attempt in range(_UNLINK_RETRIES):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt == _UNLINK_RETRIES - 1:
+                raise
+            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
+
+
 def delete_session_buffer(persona_dir: Path, session_id: str) -> None:
     """Unlink the buffer file. Idempotent — no-op when file is missing."""
     path = _session_path(persona_dir, session_id)
-    path.unlink(missing_ok=True)
+    _unlink_with_retry(path)
 
 
 def _cursor_path(persona_dir: Path, session_id: str) -> Path:
@@ -181,9 +205,9 @@ def write_cursor(persona_dir: Path, session_id: str, ts: str) -> None:
 
 
 def delete_cursor(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the cursor file."""
+    """Idempotent unlink of the cursor file (retry — see _unlink_with_retry)."""
     path = _cursor_path(persona_dir, session_id)
-    path.unlink(missing_ok=True)
+    _unlink_with_retry(path)
 
 
 def _backoff_path(persona_dir: Path, session_id: str) -> Path:
@@ -233,9 +257,9 @@ def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failu
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the backoff sidecar."""
+    """Idempotent unlink of the backoff sidecar (retry — see _unlink_with_retry)."""
     path = _backoff_path(persona_dir, session_id)
-    path.unlink(missing_ok=True)
+    _unlink_with_retry(path)
 
 
 def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]) -> None:
@@ -298,16 +322,20 @@ def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists (signal 0 probe)."""
+    """True if a process with ``pid`` exists.
+
+    Delegates to state_file.pid_is_alive, which carries the Windows-safe
+    branch. NEVER use a raw ``os.kill(pid, 0)`` probe here: on Windows,
+    signal 0 is CTRL_C_EVENT, and probing a bogus pid delivers a real
+    Ctrl+C to our OWN console group (this aborted the whole pytest session
+    on windows-latest CI, and in production would interrupt whatever
+    console hosts the bridge). Lazy import: ingest is a lower layer than
+    bridge, so the dependency stays function-local."""
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by another user
-    return True
+    from brain.bridge.state_file import pid_is_alive
+
+    return pid_is_alive(pid)
 
 
 def acquire_compaction_lock(
