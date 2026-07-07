@@ -1124,6 +1124,20 @@ def test_cmd_stop_returns_0_when_pid_already_dead(
     assert "bridge not running" in capsys.readouterr().out
 
 
+def _pin_daemon_posix(monkeypatch: pytest.MonkeyPatch, kill) -> None:
+    """Swap the daemon module's ``os`` for a posix-shaped proxy exposing only
+    what cmd_stop touches (``name`` + ``kill``).
+
+    Patching the GLOBAL ``os.name`` breaks platform code in both directions —
+    pathlib explodes on macOS when pinned to "nt" (see the note near the
+    task-scheduler tests) and ``os.O_DIRECTORY`` doesn't exist on Windows when
+    pinned to "posix" (state_file's fsync path; broke windows-latest CI). So
+    the pin is scoped to ``brain.bridge.daemon`` alone."""
+    import types
+
+    monkeypatch.setattr(daemon, "os", types.SimpleNamespace(name="posix", kill=kill))
+
+
 def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1131,7 +1145,11 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
 ) -> None:
     """HTTP shutdown attempt fails (ConnectError), so cmd_stop falls back to
     POSIX SIGTERM. pid_is_alive returns True initially, False after SIGTERM.
-    cmd_stop polls and exits 0. No real subprocess or network call made."""
+    cmd_stop polls and exits 0. No real subprocess or network call made.
+
+    The daemon's os is pinned posix-shaped (via _pin_daemon_posix) so this
+    exercises the POSIX branch on every platform — on real Windows cmd_stop
+    deliberately refuses the kill (see the windows-branch tests below)."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
@@ -1165,7 +1183,7 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
         # Simulate the child dying after SIGTERM.
         alive_state["alive"] = False
 
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", fake_kill)
+    _pin_daemon_posix(monkeypatch, fake_kill)
     # Replace sleep so test runs instantly.
     monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
 
@@ -1183,7 +1201,9 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """SIGTERM sent but pid never dies within timeout → return 1."""
+    """SIGTERM sent but pid never dies within timeout → return 1.
+
+    Daemon os pinned posix-shaped — the SIGTERM fallback only exists there."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
@@ -1203,7 +1223,7 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
 
     # Stays alive forever.
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", lambda pid, sig: None)
+    _pin_daemon_posix(monkeypatch, lambda pid, sig: None)
     monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
     # Force the deadline to be exceeded immediately.
     times = iter([0.0, 10.0, 20.0])
@@ -1220,7 +1240,9 @@ def test_cmd_stop_handles_processlookuperror_during_kill(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """If the process dies between liveness probe and SIGTERM, os.kill raises
-    ProcessLookupError — cmd_stop must catch and report no-op."""
+    ProcessLookupError — cmd_stop must catch and report no-op.
+
+    Daemon os pinned posix-shaped — the SIGTERM fallback only exists there."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
@@ -1242,7 +1264,7 @@ def test_cmd_stop_handles_processlookuperror_during_kill(
     def fake_kill(pid, sig):
         raise ProcessLookupError()
 
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", fake_kill)
+    _pin_daemon_posix(monkeypatch, fake_kill)
 
     rc = daemon.cmd_stop(_args("nell"))
     assert rc == 0
