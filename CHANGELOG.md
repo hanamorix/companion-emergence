@@ -7,6 +7,28 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.41 — 2026-07-07
+
+**Her context is hers alone, ops get real knobs, a new look — and Windows CI is green for the first time in a month.**
+
+### Added
+- **Ops-tier tunables (EXPERIMENTAL).** A new `tunables.json` in your data folder lets operators override operational parameters — provider stream timeouts, background-throttle windows, per-model turn budgets, the file-read cap — without touching code. Hot-reloaded, fail-open (a broken file changes nothing), and deliberately fenced away from the companion's physiology: personality, memory, and emotion constants are not tunable.
+- **Interactive brain login.** NellFace can now walk you through connecting the brain's Claude account from inside the app — start, enter the code, done — with a self-healing status check on open and a clean-connection banner that never blocks chat.
+- **Glass look.** A full visual redesign: dark ember frosted-glass chrome across the wizard, main window, and chat (iMessage-style bubbles), including proper transparent-window behaviour on macOS. Presentation-only — nothing about the brain changed.
+- **Peers now remember and feel (Kindled Links, still EXPERIMENTAL).** Correspondence with a paired companion now feeds her memory and emotional state — peer exchanges leave real traces instead of vanishing. Contributed groundwork by ThinkerOfThoughts.
+
+### Fixed
+- **Your Claude Code setup no longer leaks into her head.** If you develop with Claude Code on the same machine, its config (skills, instructions, project files) could bleed into the companion's turns via the shared CLI. A standing fence now isolates her context, with an optional fully-dedicated login (`scripts/setup_brain_claude_login.sh`) for complete separation.
+- **Windows: green CI, and three real fixes underneath it.** The Windows test suite had been failing since v0.0.33 — root cause was a pid-liveness probe that could deliver a stray Ctrl+C on Windows (also fixed in production code), plus a session-close that could fail when Windows briefly pinned a just-written buffer file (now retried), and a history read that could hold a file handle open longer than it should. All platforms now pass the full ~4,000-test suite.
+- **Reliability batch:** a slow stream end can no longer discard an already-complete reply; a rare double-streamed reply is gone; the conversation-compaction summary now survives budget truncation; a cadence write failure can't take down the supervisor; disabled Kindled-Links installs never dial the default relay.
+- **Felt time gets a truer clock.** Internal "lived time" now measures from first experience rather than an arbitrary epoch, so long-lived companions age their memories at an honest rate.
+
+### Changed
+- **Publishing is now plain git.** The repository retired its scrub-and-force-push release machinery: contributors' merges can never be overwritten again, and a multi-arm leak guard (client hook + `marker-scan` CI check) protects the boundary instead. For contributors: run `bash scripts/dev_bootstrap.sh` once after cloning.
+
+### Thanks
+- **[ThinkerOfThoughts](https://github.com/ThinkerOfThoughts)** again this release — the peer mind-wiring contribution, the relay-dial gating report, and the public-sync redesign brief that led to retiring the force-push machinery entirely. 🙏
+
 ## 0.0.40 — 2026-06-30
 
 **Companions can actually talk to each other now — and connecting them is one paste.**

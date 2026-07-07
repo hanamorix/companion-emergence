@@ -34,10 +34,11 @@ function formatBytes(n: number): string {
 const preStyle: React.CSSProperties = {
   fontSize: 10.5,
   fontFamily: "DM Mono, Courier New, monospace",
-  background: "rgba(0,0,0,0.05)",
+  background: "rgba(0,0,0,0.25)",
+  border: "1px solid var(--hairline)",
   color: "var(--text-mid)",
   padding: 10,
-  borderRadius: 6,
+  borderRadius: 14,
   margin: 0,
   maxHeight: 220,
   overflowY: "auto",
@@ -59,9 +60,9 @@ function CopySummary({ report }: { report: MigrationReport }) {
     <div
       style={{
         padding: "10px 12px",
-        borderRadius: 7,
-        background: "rgba(40, 120, 60, 0.07)",
-        border: "1px solid rgba(40, 120, 60, 0.35)",
+        borderRadius: 16,
+        background: "rgba(79,168,118,0.10)",
+        border: "1px solid rgba(79,168,118,0.35)",
       }}
     >
       <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text)", marginBottom: 6 }}>
@@ -95,9 +96,9 @@ function MigrateSummary({ report }: { report: MigrationReport }) {
     <div
       style={{
         padding: "10px 12px",
-        borderRadius: 7,
-        background: "rgba(40, 120, 60, 0.07)",
-        border: "1px solid rgba(40, 120, 60, 0.35)",
+        borderRadius: 16,
+        background: "rgba(79,168,118,0.10)",
+        border: "1px solid rgba(79,168,118,0.35)",
       }}
     >
       <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text)", marginBottom: 6 }}>
@@ -115,11 +116,10 @@ function MigrateSummary({ report }: { report: MigrationReport }) {
               style={{
                 fontSize: 10.5,
                 color: "#a07434",
-                fontFamily: "var(--font-disp)",
                 textTransform: "uppercase",
-                letterSpacing: "0.07em",
+                letterSpacing: "0.12em",
                 marginBottom: 4,
-                fontWeight: 500,
+                fontWeight: 600,
               }}
             >
               {skipped.length} skipped
@@ -210,7 +210,7 @@ export function StepInstalling({ step, totalSteps, result, onRetry, onBack, avat
         ) : (
           <span
             style={{
-              fontSize: 10.5,
+              fontSize: 11.5,
               color: "var(--text-mute)",
               fontFamily: "var(--font-disp)",
               fontStyle: "italic",
@@ -247,10 +247,10 @@ function Spinner() {
     <div style={{ display: "flex", justifyContent: "center", padding: "30px 0" }}>
       <div
         style={{
-          width: 28,
-          height: 28,
+          width: 15,
+          height: 15,
           borderRadius: "50%",
-          border: "2px solid rgba(130,51,41,0.2)",
+          border: "2px solid rgba(255,255,255,0.15)",
           borderTopColor: "var(--accent)",
           animation: "spin 0.9s linear infinite",
         }}

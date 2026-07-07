@@ -73,7 +73,7 @@ function KeyValue({ label, value }: { label: string; value: string }) {
       }}
     >
       <span style={{ color: "var(--text-mid)" }}>{label}</span>
-      <span style={{ color: "var(--text)", fontFamily: "var(--font-disp)" }}>{value}</span>
+      <span style={{ color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>{value}</span>
     </div>
   );
 }

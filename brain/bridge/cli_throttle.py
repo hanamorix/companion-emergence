@@ -16,10 +16,21 @@ import logging
 import threading
 import time
 
+from brain import tunables
+
 log = logging.getLogger(__name__)
 
-_IDLE_SECONDS = 300.0          # match emotion_backfill _ACTIVE_CHAT_IDLE_MINUTES (5 min)
-_MAX_CONCURRENT_BACKGROUND = 1
+_IDLE_SECONDS = tunables.register("throttle.background_min_idle_seconds", 300.0)          # match emotion_backfill _ACTIVE_CHAT_IDLE_MINUTES (5 min)
+_MAX_CONCURRENT_BACKGROUND = tunables.register("throttle.max_concurrent_background", 1)
+
+
+def _idle_seconds() -> float:
+    return tunables.get_tunable("throttle.background_min_idle_seconds", _IDLE_SECONDS)
+
+
+def _max_concurrent_background() -> int:
+    return tunables.get_tunable("throttle.max_concurrent_background", _MAX_CONCURRENT_BACKGROUND)
+
 
 _lock = threading.Lock()
 _last_interactive_monotonic: float = -1e9
@@ -55,7 +66,7 @@ def should_yield(*, now: float | None = None) -> bool:
     inside a held background_slot to decide whether to break mid-batch."""
     with _lock:
         t = time.monotonic() if now is None else now
-        return (t - _last_interactive_monotonic) < _IDLE_SECONDS
+        return (t - _last_interactive_monotonic) < _idle_seconds()
 
 
 def slot_available(*, now: float | None = None, min_idle: float | None = None) -> bool:
@@ -67,10 +78,10 @@ def slot_available(*, now: float | None = None, min_idle: float | None = None) -
     try:
         with _lock:
             t = time.monotonic() if now is None else now
-            idle = _IDLE_SECONDS if min_idle is None else min_idle
+            idle = _idle_seconds() if min_idle is None else min_idle
             if (t - _last_interactive_monotonic) < idle:
                 return False
-            return _inflight_background < _MAX_CONCURRENT_BACKGROUND
+            return _inflight_background < _max_concurrent_background()
     except Exception:  # noqa: BLE001 — fail open
         log.warning("cli_throttle.slot_available failed; reporting available (fail-open)", exc_info=True)
         return True
@@ -88,11 +99,11 @@ def acquire_background(*, now: float | None = None, min_idle: float | None = Non
     global _inflight_background
     try:
         t = time.monotonic() if now is None else now
-        idle = _IDLE_SECONDS if min_idle is None else min_idle
+        idle = _idle_seconds() if min_idle is None else min_idle
         with _lock:
             if (t - _last_interactive_monotonic) < idle:
                 return False
-            if _inflight_background >= _MAX_CONCURRENT_BACKGROUND:
+            if _inflight_background >= _max_concurrent_background():
                 return False
             _inflight_background += 1
             return True

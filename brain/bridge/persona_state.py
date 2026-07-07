@@ -216,6 +216,8 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         "user_pronouns": None,
         "kindled_link_enabled": False,
         "kindled_relay_url": None,
+        "notes_enabled": False,
+        "notes_folder": None,
     }
     try:
         from brain.persona_config import PersonaConfig
@@ -227,6 +229,8 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         out["user_pronouns"] = preset_key_for(cfg.user_pronouns)
         out["kindled_link_enabled"] = cfg.kindled_link_enabled
         out["kindled_relay_url"] = cfg.kindled_relay_url
+        out["notes_enabled"] = cfg.notes_enabled
+        out["notes_folder"] = cfg.notes_folder
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: persona_config read failed", exc_info=True)
     try:

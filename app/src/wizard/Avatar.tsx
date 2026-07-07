@@ -4,11 +4,11 @@ import { expressionPath } from "../expressions";
 const STEP_TO_EXPRESSION: Record<string, string> = {
   welcome: expressionPath("smile", 4),
   name: expressionPath("shy", 1),
-  user: expressionPath("happy", 1),
-  voice: expressionPath("smile", 1),
+  user: expressionPath("scared", 1),
+  voice: expressionPath("awe", 1),
   migrate: expressionPath("exhausted", 2),
   review: expressionPath("happy", 3),
-  installing: expressionPath("happy", 2),
+  installing: expressionPath("flushed", 1),
   done: expressionPath("happy", 1),
   error: expressionPath("scared", 1),
 };
@@ -22,7 +22,7 @@ interface Props {
  * Wizard avatar — fades between expressions as the user moves through
  * the steps. Same breathing animation as the main app.
  */
-export function WizardAvatar({ step, size = 200 }: Props) {
+export function WizardAvatar({ step, size = 256 }: Props) {
   const [current, setCurrent] = useState(step);
   const [fading, setFading] = useState(false);
 

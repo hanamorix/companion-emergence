@@ -24,4 +24,15 @@ describe("NotesToggle", () => {
     await waitFor(() => expect(screen.getByText(/Nell Notes/)).toBeInTheDocument());
     expect(bridge.setPersonaNotes).toHaveBeenCalledWith("nell", true);
   });
+
+  test("re-syncs when the enabled prop arrives from a later state poll", () => {
+    // Live report 2026-07-04: the toggle mounted before the poll delivered
+    // notes_enabled=true and stayed unchecked forever. The checked state
+    // must follow prop updates, not just the initial value.
+    const { rerender } = render(<NotesToggle persona="nell" enabled={false} folder={null} />);
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
+    rerender(<NotesToggle persona="nell" enabled={true} folder="/Users/x/Documents/Nell Notes" />);
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByText(/Nell Notes/)).toBeInTheDocument();
+  });
 });

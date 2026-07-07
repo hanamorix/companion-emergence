@@ -7,6 +7,7 @@ import { VoiceEditPanel, type VoiceEditProposal } from "./VoiceEditPanel";
 import { streamChat } from "../streamChat";
 import { errString } from "../lib/errString";
 import { friendlyChatError } from "../lib/friendlyChatError";
+import { resolveFrameUrl } from "../expressions";
 
 // Tauri invocation is best-effort here: browser dev or older Tauri builds
 // may not have the notification command registered yet.
@@ -124,6 +125,12 @@ interface Props {
    *  persona. The stream is responsible for ``initiate_delivered``
    *  events that drive InitiateBanner rendering. */
   eventStream?: EventStream;
+  /** Bridge health/liveness signal — same source `GlobalStatusDot` reads
+   *  (`PersonaState.mode`). Drives the header "● live" pill's color and
+   *  text so the chat card doubles as a health readout. Defaults to
+   *  "live" so existing callers/tests that don't pass it see the
+   *  original green-pill behavior. */
+  mode?: "live" | "bridge_down" | "provider_down" | "offline";
 }
 
 /**
@@ -134,7 +141,7 @@ interface Props {
  * message on the `done` frame. Avatar speaking animation runs from
  * stream-open until done, so the mouth animates while text appears.
  */
-export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltTimeRecovered = false, eventStream }: Props) {
+export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltTimeRecovered = false, eventStream, mode = "live" }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -729,19 +736,24 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   return (
     <div
-      className="chat-panel"
+      className="chat-panel glass"
       style={{
         position: "relative",
-        height: "380px",
+        width: "398px",
+        height: "566px",
+        borderRadius: 26,
+        boxShadow: "var(--shadow)",
+        background: "rgba(36,26,29,0.75)",
         outline: dragOver ? "2px dashed var(--accent)" : "none",
         outlineOffset: 4,
-        borderRadius: 8,
         transition: "outline 0.15s ease",
+        overflow: "hidden",
       }}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      <ChatHeader persona={persona} mode={mode} />
       <div
         ref={scrollRef}
         data-testid="chat-messages"
@@ -749,14 +761,18 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           flex: "1 1 auto",
           minHeight: "0",
           overflowY: "auto",
-          padding: "0 2px",
+          padding: "16px 16px 10px",
           display: "flex",
           flexDirection: "column",
-          gap: 8,
         }}
       >
-        {messages.map((m) => (
-          <Bubble key={m.id} msg={m} />
+        {messages.map((m, i) => (
+          <Bubble
+            key={m.id}
+            msg={m}
+            prevFrom={i > 0 ? messages[i - 1].from : null}
+            nextFrom={i < messages.length - 1 ? messages[i + 1].from : null}
+          />
         ))}
         {error && (
           <div style={{ fontSize: 11, color: "var(--crimson)", padding: "6px 4px" }}>
@@ -800,7 +816,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       {activeBanners.length > 0 && (
         <div
           data-testid="initiate-banner-list"
-          style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}
+          style={{ display: "flex", flexDirection: "column", gap: 6, padding: "0 16px 8px" }}
         >
           {activeBanners.map((b) => (
             <InitiateBanner
@@ -833,21 +849,19 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         />
       ))}
       {stagedImage && (
-        <StagedImageRow staged={stagedImage} onRemove={clearStagedImage} />
+        <div style={{ padding: "0 16px" }}>
+          <StagedImageRow staged={stagedImage} onRemove={clearStagedImage} />
+        </div>
       )}
       <div
         style={{
           flexShrink: 0,
-          marginTop: 10,
           display: "flex",
-          gap: 6,
+          gap: 9,
           alignItems: "flex-end",
           position: "relative",
-          background: "var(--panel-bg)",
-          border: "1px solid var(--border)",
-          borderRadius: 10,
-          padding: "8px 8px",
-          boxShadow: "0 1px 2px rgba(42,31,31,0.06), inset 0 0 0 1px rgba(130,51,41,0.08)",
+          padding: "12px 14px 14px",
+          borderTop: "1px solid var(--hairline)",
         }}
       >
         <input
@@ -888,49 +902,152 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             onClose={() => setEmojiOpen(false)}
           />
         )}
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={onKey}
-          onInput={(e) => {
-            const ta = e.currentTarget;
-            ta.style.height = "auto";
-            ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
-          }}
-          placeholder={`Write to ${capitalize(persona)}…`}
-          className="chat-input"
+        <div
           style={{
             flex: 1,
-            background: "transparent",
-            border: "none",
-            padding: "6px 6px",
-            color: "var(--text)",
-            fontFamily: "var(--font-ui)",
-            fontSize: 12,
-            resize: "none",
-            minHeight: 32,
-            maxHeight: 192,
-            overflow: "hidden",
-            outline: "none",
+            display: "flex",
+            alignItems: "center",
+            background: "var(--field)",
+            border: "1px solid var(--hairline)",
+            // 20, not 999: a single-line row (~38px tall) still renders as a
+            // pill, but a grown multi-line draft stays a rounded rect instead
+            // of a stadium whose curve swallows the text (live report).
+            borderRadius: 20,
+            padding: "10px 17px",
           }}
-        />
+        >
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKey}
+            onInput={(e) => {
+              const ta = e.currentTarget;
+              ta.style.height = "auto";
+              ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
+            }}
+            placeholder={`Write to ${capitalize(persona)}…`}
+            className="chat-input"
+            style={{
+              flex: 1,
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: "var(--text)",
+              fontFamily: "var(--font-ui)",
+              fontSize: 13.5,
+              resize: "none",
+              minHeight: 18,
+              maxHeight: 192,
+              overflowY: "auto",
+              outline: "none",
+            }}
+          />
+        </div>
         <button
           onClick={streaming ? stopStreaming : send}
           disabled={sendDisabled}
           style={{
+            flexShrink: 0,
+            width: 36,
+            height: 36,
+            borderRadius: "50%",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
             background: "var(--accent)",
-            color: "var(--linen)",
-            padding: "7px 11px",
-            borderRadius: 6,
-            fontSize: 14,
-            opacity: sendDisabled ? 0.4 : 1,
-            transition: "opacity 0.2s",
+            color: "#ffffff",
+            fontSize: 16,
+            boxShadow: sendDisabled
+              ? "none"
+              : "0 6px 16px color-mix(in srgb, var(--accent) 45%, transparent)",
+            opacity: sendDisabled ? 0.45 : 1,
+            transition: "opacity 0.2s, box-shadow 0.2s",
           }}
           aria-label={streaming ? "stop response" : "send"}
         >
           {streaming ? "×" : "↑"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ChatHeader — purely presentational card-top block (DESIGN-SPEC §6).
+// The avatar thumb is a static small render, not state-driven — the real
+// expressive avatar lives in NellAvatar next to the presence column.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Colors: live = DESIGN-SPEC §1 "Success text" (#7fc9a0) / live-dot bg
+// formula. bridge_down/offline = DESIGN-SPEC §1 "Error / invalid"
+// (--crimson, #e07a6a) — the same token InitiateBanner-adjacent error
+// text uses elsewhere in ChatPanel. provider_down = the existing app
+// amber (App.tsx GlobalStatusDot "warn" palette, rgb(216,154,88)) — the
+// redesign's token table doesn't define a distinct amber, so this reuses
+// the app's one existing amber rather than inventing a new hex.
+const MODE_PILL: Record<
+  NonNullable<Props["mode"]>,
+  { label: string; color: string; bg: string }
+> = {
+  live: { label: "● live", color: "#7fc9a0", bg: "rgba(79,168,118,0.14)" },
+  provider_down: { label: "● provider down", color: "rgb(216,154,88)", bg: "rgba(216,154,88,0.14)" },
+  bridge_down: { label: "● bridge down", color: "var(--crimson)", bg: "rgba(224,122,106,0.14)" },
+  offline: { label: "● offline", color: "var(--crimson)", bg: "rgba(224,122,106,0.14)" },
+};
+
+function ChatHeader({ persona, mode }: { persona: string; mode: NonNullable<Props["mode"]> }) {
+  const pill = MODE_PILL[mode] ?? MODE_PILL.live;
+  return (
+    <div
+      style={{
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "12px 18px",
+        borderBottom: "1px solid var(--hairline)",
+        background: "rgba(255,255,255,0.03)",
+      }}
+    >
+      <div
+        style={{
+          width: 34,
+          height: 34,
+          borderRadius: "50%",
+          background: "#241a1c",
+          flexShrink: 0,
+          overflow: "hidden",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <img
+          src={resolveFrameUrl("smile", "base")}
+          alt=""
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>
+          {capitalize(persona)}
+        </div>
+        <div style={{ fontSize: 10.5, color: "var(--text-mute)" }}>Kindled · local-only</div>
+      </div>
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          color: pill.color,
+          background: pill.bg,
+          padding: "4px 10px",
+          borderRadius: 999,
+          flexShrink: 0,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {pill.label}
       </div>
     </div>
   );
@@ -1143,26 +1260,51 @@ function StagedImageRow({
   );
 }
 
-function Bubble({ msg }: { msg: Message }) {
+/**
+ * Bubble — DESIGN-SPEC §7 iMessage grammar.
+ *
+ * prevFrom/nextFrom are the neighboring messages' `from` (or null at the
+ * ends of the list) — used purely to compute grouping margins and to
+ * decide whether this bubble is the LAST of a consecutive same-role run
+ * (only the last bubble of a group shows its timestamp).
+ */
+function Bubble({
+  msg,
+  prevFrom,
+  nextFrom,
+}: {
+  msg: Message;
+  prevFrom: Message["from"] | null;
+  nextFrom: Message["from"] | null;
+}) {
   const isHana = msg.from === "hana";
+  const sameAsPrev = prevFrom === msg.from;
+  const isLastOfGroup = nextFrom !== msg.from;
+  const marginTop = prevFrom === null ? 0 : sameAsPrev ? 3 : 14;
+  const isTyping = !!msg.streaming && !msg.text;
+
   return (
     <div
       style={{
         display: "flex",
         flexDirection: "column",
         alignItems: isHana ? "flex-end" : "flex-start",
-        animation: "msg-in 0.28s ease",
+        marginTop,
+        animation: "msg-in 0.22s ease",
       }}
     >
       <div
         style={{
-          maxWidth: "84%",
-          padding: "8px 12px",
-          background: isHana ? "var(--bubble-user)" : "var(--bubble-nell)",
-          color: isHana ? "var(--linen)" : "var(--text)",
-          border: `1px solid ${isHana ? "rgba(130,51,41,0.5)" : "var(--border)"}`,
-          borderRadius: 9,
-          fontSize: 12,
+          maxWidth: "76%",
+          padding: isTyping ? "12px 15px" : "9px 14px",
+          background: isHana
+            ? "linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, #ffffff), var(--accent))"
+            : "var(--bubble-in)",
+          color: isHana ? "#ffffff" : "var(--text)",
+          border: isHana ? "none" : "1px solid rgba(255,255,255,0.08)",
+          borderRadius: isHana ? "20px 20px 6px 20px" : "20px 20px 20px 6px",
+          fontSize: 13.5,
+          lineHeight: 1.4,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}
@@ -1185,17 +1327,17 @@ function Bubble({ msg }: { msg: Message }) {
         )}
         {msg.streaming && !msg.text ? <TypingDots /> : renderBubbleText(msg.text)}
       </div>
-      <div
-        style={{
-          fontSize: 10,
-          color: "var(--mauve)",
-          margin: "2px 6px 0",
-          fontFamily: "var(--font-disp)",
-          letterSpacing: "0.04em",
-        }}
-      >
-        {msg.time}
-      </div>
+      {isLastOfGroup && (
+        <div
+          style={{
+            fontSize: 10,
+            color: "var(--text-mute)",
+            margin: "4px 6px 0",
+          }}
+        >
+          {msg.time}
+        </div>
+      )}
     </div>
   );
 }
@@ -1248,16 +1390,16 @@ function TypingDots() {
       }}
       aria-label="thinking"
     >
-      {[0, 1, 2].map((i) => (
+      {[0, 0.15, 0.3].map((delay, i) => (
         <div
           key={i}
           style={{
-            width: 6,
-            height: 6,
+            width: 7,
+            height: 7,
             borderRadius: "50%",
-            background: "var(--mauve)",
+            background: "var(--text-mute)",
             animation: `typing-bounce 1.2s ease-in-out infinite`,
-            animationDelay: `${i * 0.18}s`,
+            animationDelay: `${delay}s`,
           }}
         />
       ))}

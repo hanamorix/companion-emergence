@@ -1,0 +1,4 @@
+# Leak-guard binary-arm: new images allowed ONLY under these prefixes.
+expressions/
+app/src-tauri/icons/
+app/public/

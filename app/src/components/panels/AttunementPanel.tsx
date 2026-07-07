@@ -87,10 +87,10 @@ export function AttunementPanel({ persona }: Props) {
           <div
             style={{
               fontSize: "9.5px",
+              fontWeight: 600,
               color: "var(--text-mute)",
               textTransform: "uppercase",
               letterSpacing: "0.12em",
-              fontFamily: "var(--font-disp)",
               marginBottom: 6,
             }}
           >
@@ -99,10 +99,12 @@ export function AttunementPanel({ persona }: Props) {
           <div
             style={{
               paddingLeft: 13,
-              borderLeft: "1px solid rgba(191, 184, 173, 0.10)",
+              borderLeft: "1px solid var(--hairline-soft)",
               fontSize: 11,
               color: "var(--text-mid)",
               lineHeight: 1.55,
+              fontFamily: "var(--font-disp)",
+              fontStyle: "italic",
             }}
           >
             <p style={{ margin: "0 0 4px" }}>
@@ -129,10 +131,10 @@ export function AttunementPanel({ persona }: Props) {
           <div
             style={{
               fontSize: "9.5px",
+              fontWeight: 600,
               color: "var(--text-mute)",
               textTransform: "uppercase",
               letterSpacing: "0.12em",
-              fontFamily: "var(--font-disp)",
               marginBottom: 6,
             }}
           >
@@ -156,7 +158,6 @@ export function AttunementPanel({ persona }: Props) {
             marginTop: 12,
             fontSize: 10.5,
             color: "var(--text-mid)",
-            fontFamily: "var(--font-disp)",
             lineHeight: 1.5,
           }}
         >
@@ -179,7 +180,7 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
       style={{
         marginBottom: 10,
         paddingLeft: 13,
-        borderLeft: "1px solid rgba(191, 184, 173, 0.10)",
+        borderLeft: "1px solid var(--hairline-soft)",
       }}
     >
       <div
@@ -189,6 +190,8 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
           fontSize: 11,
           color: "var(--text-mid)",
           lineHeight: 1.5,
+          fontFamily: "var(--font-disp)",
+          fontStyle: "italic",
         }}
       >
         {pattern.description}
@@ -199,13 +202,13 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
           gap: 6,
           marginTop: 2,
           fontSize: "9.5px",
+          fontWeight: 600,
           color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
         }}
       >
         <span
           style={{
-            background: "rgba(130, 51, 41, 0.10)",
+            background: "color-mix(in srgb, var(--accent) 10%, transparent)",
             padding: "1px 5px",
             borderRadius: 3,
           }}
@@ -215,10 +218,10 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
         <span
           style={{
             background: isFalsified
-              ? "rgba(130, 51, 41, 0.06)"
+              ? "color-mix(in srgb, var(--accent) 6%, transparent)"
               : pattern.maturity === "known"
-                ? "rgba(130, 51, 41, 0.18)"
-                : "rgba(130, 51, 41, 0.10)",
+                ? "color-mix(in srgb, var(--accent) 18%, transparent)"
+                : "color-mix(in srgb, var(--accent) 10%, transparent)",
             padding: "1px 5px",
             borderRadius: 3,
           }}
@@ -230,7 +233,6 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
         style={{
           fontSize: "9.5px",
           color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
           marginTop: 3,
         }}
       >
@@ -244,8 +246,8 @@ function PatternItem({ pattern }: { pattern: LearnedPattern }) {
           <summary
             style={{
               fontSize: "9.5px",
+              fontWeight: 600,
               color: "var(--text-mute)",
-              fontFamily: "var(--font-disp)",
               cursor: "pointer",
               userSelect: "none",
             }}

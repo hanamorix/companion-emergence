@@ -30,6 +30,9 @@ def test_large_file_without_max_lines_is_head_capped(tmp_path):
 
 def test_small_file_returned_whole(tmp_path):
     p = tmp_path / "s.txt"
-    p.write_text("a\nb\nc", encoding="utf-8")
+    # newline="\n": write_text otherwise translates \n → os.linesep, and
+    # read_file is deliberately byte-faithful — on Windows the fixture would
+    # become CRLF on disk and the assertion would compare the wrong bytes.
+    p.write_text("a\nb\nc", encoding="utf-8", newline="\n")
     out = read_file(str(p), persona_dir=tmp_path / "x")
     assert out["content"] == "a\nb\nc" and out.get("truncated", False) is False
