@@ -50,6 +50,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
+from brain.diag import turn_logger
 
 logger = logging.getLogger(__name__)
 
@@ -663,6 +664,7 @@ class ClaudeCliProvider(LLMProvider):
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
 
+            _tl_sent_ts = turn_logger.now_iso()
             try:
                 result = subprocess.run(
                     cmd,
@@ -701,6 +703,12 @@ class ClaudeCliProvider(LLMProvider):
                 text = (
                     f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                 )
+                turn_logger.log_turn(
+                    (options or {}).get("persona_dir"), path="text-budget",
+                    system=system_prompt, messages=conversation_messages,
+                    volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                    received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                )
                 return ChatResponse(content=text, tool_calls=(), raw=payload)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -715,6 +723,12 @@ class ClaudeCliProvider(LLMProvider):
             call_type="chat",
             model=self._model,
             frame=payload,
+        )
+        turn_logger.log_turn(
+            persona_dir_opt, path="text",
+            system=system_prompt, messages=conversation_messages,
+            volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+            received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
         )
 
         return ChatResponse(
@@ -896,6 +910,7 @@ class ClaudeCliProvider(LLMProvider):
             # Send prompt via stdin then close so the subprocess can start.
             try:
                 assert proc.stdin is not None
+                _tl_sent_ts = turn_logger.now_iso()
                 proc.stdin.write(flat_prompt)
                 proc.stdin.close()
             except OSError:
@@ -1006,8 +1021,20 @@ class ClaudeCliProvider(LLMProvider):
                                 if partial
                                 else _BUDGET_EXCEEDED_MSG
                             )
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=cutoff,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=cutoff, metadata=metadata)
                         else:
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=result_text,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
@@ -1029,6 +1056,12 @@ class ClaudeCliProvider(LLMProvider):
                         )
                     else:
                         content = "".join(delta_chunks) or (assistant_snapshot or "")
+                        turn_logger.log_turn(
+                            persona_dir, path="stream", system=system_prompt,
+                            messages=None, volatile=None, sent_blob=flat_prompt,
+                            sent_ts=_tl_sent_ts, received_raw=content,
+                            received_ts=turn_logger.now_iso(), usage_frame=None,
+                        )
                         yield StreamDone(content=content, metadata={})
 
             except GeneratorExit:
@@ -1175,6 +1208,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(full_system) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
+                _tl_sent_ts = turn_logger.now_iso()
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1210,6 +1244,12 @@ class ClaudeCliProvider(LLMProvider):
                         if partial
                         else _BUDGET_EXCEEDED_MSG
                     )
+                    turn_logger.log_turn(
+                        persona_dir, path="image-budget",
+                        system=full_system, messages=conversation_messages,
+                        volatile=None, sent_blob=stdin_payload, sent_ts=_tl_sent_ts,
+                        received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=None,
+                    )
                     return ChatResponse(content=text, tool_calls=(), raw=None)
                 raise
             dispatched: tuple[dict[str, Any], ...] = ()
@@ -1219,6 +1259,12 @@ class ClaudeCliProvider(LLMProvider):
                         audit_log_path, audit_offset_before, request_id=request_id
                     )
                 )
+            turn_logger.log_turn(
+                persona_dir, path="image",
+                system=full_system, messages=conversation_messages,
+                volatile=None, sent_blob=stdin_payload, sent_ts=_tl_sent_ts,
+                received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=None,
+            )
             return ChatResponse(
                 content=_truncate_at_role_leak(content),
                 tool_calls=(),
@@ -1333,6 +1379,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
+                _tl_sent_ts = turn_logger.now_iso()
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1371,6 +1418,12 @@ class ClaudeCliProvider(LLMProvider):
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
+                    turn_logger.log_turn(
+                        persona_dir, path="mcp-budget",
+                        system=system_prompt, messages=None,
+                        volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                        received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                    )
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -1387,6 +1440,12 @@ class ClaudeCliProvider(LLMProvider):
                 call_type="chat",
                 model=self._model,
                 frame=payload,
+            )
+            turn_logger.log_turn(
+                persona_dir, path="mcp",
+                system=system_prompt, messages=None,
+                volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
             )
 
             dispatched = _read_audit_lines_since(
