@@ -1,29 +1,56 @@
-/* Companion Emergence — anime palette + shoji panel design language.
- * Lifted from mock-ups/app-interface/NellFace_mock.html. */
+/* Companion Emergence — glass redesign design language.
+ * Dark-only, ember accent, transparent-window glass surfaces.
+ * See redesign_04_07_2026/handoff/{DESIGN-SPEC,IMPLEMENTATION}.md. */
 
 :root {
-  --linen: #eadeda;
-  --ash: #bfb8ad;
-  --mauve: #998888;
-  --rose: #c89890;
-  --lacquer: #823329;
-  --crimson: #8a3033;
+  /* new glass tokens (DESIGN-SPEC §1) */
+  --accent: #C2604E;
+  --accent-text: color-mix(in srgb, #C2604E 55%, #ffe6da);
+  --text: #f4ece6;
+  --text-mid: rgba(244,236,230,0.72);
+  --text-mute: rgba(244,236,230,0.45);
+  /* Alphas raised 2026-07-04 (0.55/0.72 → 0.78/0.88): with no backdrop
+   * blur on the transparent window, busy/dark wallpapers bled through
+   * enough to hurt readability (live report). */
+  --panel: rgba(36,26,29,0.78);
+  --panel-strong: rgba(42,31,34,0.88);
+  --hairline: rgba(255,255,255,0.12);
+  --hairline-soft: rgba(255,255,255,0.07);
+  --field: rgba(255,255,255,0.06);
+  --bubble-in: rgba(255,255,255,0.10);
+  --track: rgba(255,255,255,0.10);
+  --shadow: 0 24px 64px rgba(0,0,0,0.40);
+  --shadow-mid: 0 16px 44px rgba(0,0,0,0.35);
+  --shadow-sm: 0 12px 36px rgba(0,0,0,0.35);
 
-  --bg-scene: #2a1f1f;
-  --surface: #eadeda;
-  --surface-2: #f0eae8;
-  --border: #bfb8ad;
-  --border-dk: rgba(130, 51, 41, 0.22);
-  --accent: #823329;
-  --accent-dim: rgba(130, 51, 41, 0.15);
-  --text: #2a1f1f;
-  --text-mid: #4a3535;
-  --text-mute: #998888;
-  --bubble-nell: rgba(234, 222, 218, 0.97);
-  --bubble-user: rgba(130, 51, 41, 0.88);
-  --panel-bg: rgba(234, 222, 218, 0.97);
-  --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-disp: ui-serif, Georgia, "Times New Roman", serif;
+  /* legacy aliases so untouched call-sites keep working */
+  --panel-bg: var(--panel);
+  --border: var(--hairline);
+  --accent-dim: color-mix(in srgb, var(--accent) 15%, transparent);
+  --border-dk: var(--hairline);
+  --linen: #ffffff;              /* was button text on accent */
+  --crimson: #e07a6a;            /* error tone, brightened for dark glass */
+  --lacquer: var(--accent);
+  --rose: #c89890;               /* keep: initiate-banner / pending-write family */
+  --mauve: var(--text-mute);
+  --ash: var(--track);
+  --bg-scene: transparent;
+  --bubble-nell: var(--bubble-in);
+  --bubble-user: var(--accent);
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  --font-disp: Georgia, serif;   /* now only for quotes/aphorisms — see §5 */
+}
+
+/* Shared glass utility — background/border recipe used by panels,
+ * rail, chat card, wizard card. See DESIGN-SPEC §2.
+ * NO backdrop-filter: over a transparent Tauri window WKWebView renders
+ * blur layers with black edge fringes and transparent↔solid flicker
+ * (live-validated 2026-07-04), and the blur can't sample the desktop
+ * anyway — the translucent fill alone carries the frosted look
+ * (IMPLEMENTATION §6 two-layer strategy, layer 1). */
+.glass {
+  background: var(--panel);
+  border: 1px solid var(--hairline);
 }
 
 *,
@@ -70,9 +97,11 @@ body,
 }
 
 .chat-input::placeholder {
-  /* --mauve (#998888) at 0.85 opacity on --panel-bg gives ~2.6:1 contrast,
-   * below WCAG AA (4.5:1). Using --text-mid (#4a3535) at full opacity
-   * gives ≈ 7:1 — comfortably readable without altering the palette. */
+  /* DESIGN-SPEC §1/§4 calls for --text-mute here, but measured against the
+   * darkest realistic glass fill (--field over --panel-strong) it lands
+   * ~3.8:1 — below the 4.5:1 AA floor the spec itself asks us to check
+   * for. Falling back to --text-mid (~7.4:1+) per the spec's own
+   * fallback instruction (IMPLEMENTATION §1 / DESIGN-SPEC §4). */
   color: var(--text-mid);
   opacity: 1;
 }
@@ -118,11 +147,9 @@ textarea {
   0%,
   100% {
     transform: scale(1);
-    opacity: 0.82;
   }
   50% {
-    transform: scale(1.04);
-    opacity: 1;
+    transform: scale(1.028);
   }
 }
 
@@ -145,11 +172,11 @@ textarea {
 @keyframes msg-in {
   from {
     opacity: 0;
-    transform: translateX(-10px) scale(0.96);
+    transform: translateY(10px) scale(0.97);
   }
   to {
     opacity: 1;
-    transform: translateX(0) scale(1);
+    transform: none;
   }
 }
 
@@ -160,7 +187,7 @@ textarea {
     opacity: 0.4;
   }
   50% {
-    transform: translateY(-4px);
+    transform: translateY(-3px);
     opacity: 1;
   }
 }
@@ -180,7 +207,9 @@ textarea {
   }
 }
 
-@media (max-width: 900px), (max-height: 620px) {
+/* Stage floors (DESIGN-SPEC §9) — the app never squeezes below its
+ * design size; it scrolls instead. Main app floor: 1176x680. */
+@media (max-width: 1176px), (max-height: 680px) {
   html,
   body,
   #root {
@@ -190,8 +219,8 @@ textarea {
   #root {
     align-items: flex-start;
     justify-content: flex-start;
-    min-width: 900px;
-    min-height: 620px;
+    min-width: 1176px;
+    min-height: 680px;
   }
 }
 
@@ -214,26 +243,26 @@ html[data-reduced-motion="true"] *::after {
   transition: none !important;
 }
 
-/* Chat panel — vertical fill + responsive width */
+/* Chat card (DESIGN-SPEC §6) — fixed 398x566 glass card, not a
+ * stretching flex child. flex: 0 0 auto so it holds its own dimensions
+ * inside the main-app row's flex layout (avatar column | chat card)
+ * instead of growing to fill leftover vertical space (the pre-glass
+ * layout was full-bleed and needed to flex-grow; the card layout does
+ * not). Width/height/radius/etc. are inline on the component per the
+ * "explicit height so messages scroll, not the panel" invariant. */
 .chat-panel {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-@media (min-width: 900px) {
-  .chat-panel {
-    max-width: 820px;
-    margin-inline: auto;
-  }
+  flex: 0 0 auto;
 }
 
 /* ── InitiateBanner — soft-rose reach-out card ── */
 .initiate-banner {
-  border-left: 3px solid var(--rose);
-  background: rgba(200, 152, 144, 0.12);
-  border-radius: 8px;
+  background:
+    linear-gradient(rgba(200, 152, 144, 0.14), rgba(200, 152, 144, 0.14)),
+    var(--panel);
+  border: 1px solid rgba(200, 152, 144, 0.4);
+  border-radius: 14px;
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
@@ -242,7 +271,7 @@ html[data-reduced-motion="true"] *::after {
 .initiate-banner__header {
   font-size: 12px;
   font-weight: 600;
-  color: var(--lacquer);
+  color: var(--rose);
   letter-spacing: 0.02em;
 }
 .initiate-banner__body {
@@ -302,15 +331,14 @@ html[data-reduced-motion="true"] *::after {
   max-width: 380px;
 }
 .pending-write-card {
-  border-left: 3px solid var(--rose);
-  /* Solid panel surface + a rose wash on top. The initiate-banner uses a 12%
-     rose over its parent panel's opaque --panel-bg; this card renders directly
-     over the dark --bg-scene, so it needs its own opaque base or it reads as
-     transparent/unreadable. */
+  /* Rose-glass wash over the standard glass fill — same recipe as
+   * .initiate-banner so the two "she's asking you something" surfaces
+   * read as one family (DESIGN-SPEC family note, IMPLEMENTATION §1). */
   background:
     linear-gradient(rgba(200, 152, 144, 0.14), rgba(200, 152, 144, 0.14)),
-    var(--panel-bg);
-  border-radius: 8px;
+    var(--panel);
+  border: 1px solid rgba(200, 152, 144, 0.4);
+  border-radius: 14px;
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
@@ -335,7 +363,7 @@ html[data-reduced-motion="true"] *::after {
 .pending-write-card__path {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  color: var(--lacquer);
+  color: var(--rose);
   word-break: break-all;
 }
 .pending-write-card__preview {

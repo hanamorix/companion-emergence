@@ -92,10 +92,11 @@ export function StepReview({ step, totalSteps, state, preflight, onInstall, onBa
         style={{
           fontSize: 10.5,
           fontFamily: "DM Mono, Courier New, monospace",
-          background: "rgba(0,0,0,0.05)",
+          background: "rgba(0,0,0,0.25)",
+          border: "1px solid var(--hairline)",
           color: "var(--text-mid)",
           padding: 10,
-          borderRadius: 6,
+          borderRadius: 14,
           margin: 0,
           whiteSpace: "pre-wrap",
           lineHeight: 1.5,
@@ -126,7 +127,7 @@ function Row({
         alignItems: "baseline",
         gap: 12,
         padding: "5px 0",
-        borderBottom: "1px solid rgba(191,184,173,0.4)",
+        borderBottom: "1px solid var(--hairline-soft)",
         fontSize: small ? 10.5 : 12,
       }}
     >

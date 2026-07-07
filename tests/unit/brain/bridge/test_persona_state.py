@@ -270,6 +270,36 @@ def test_build_persona_state_connection_block_missing_files_safe(tmp_path: Path)
     assert conn["last_heartbeat_at"] is None
 
 
+def test_build_persona_state_connection_block_includes_notes_fields(tmp_path: Path) -> None:
+    """The Connection panel's NotesToggle reads notes_enabled/notes_folder from
+    the state poll. A persisted notes_enabled=True must survive into the
+    connection block, or the toggle silently resets to off on every app load
+    (live user report, 2026-07-04)."""
+    from brain.persona_config import PersonaConfig
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    PersonaConfig(
+        provider="claude-cli",
+        user_name="Hana",
+        notes_enabled=True,
+        notes_folder=str(tmp_path / "Nell Notes"),
+    ).save(persona_dir / "persona_config.json")
+
+    conn = build_persona_state(persona_dir)["connection"]
+    assert conn["notes_enabled"] is True
+    assert conn["notes_folder"] == str(tmp_path / "Nell Notes")
+
+
+def test_build_persona_state_connection_block_notes_default_off(tmp_path: Path) -> None:
+    """Fresh persona (no config file) → notes fields present and off/None."""
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    conn = build_persona_state(persona_dir)["connection"]
+    assert conn["notes_enabled"] is False
+    assert conn["notes_folder"] is None
+
+
 # ── recovering flag (Phase 3.A) ───────────────────────────────────────────────
 
 

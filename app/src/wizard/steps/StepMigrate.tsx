@@ -104,7 +104,7 @@ export function StepMigrate({
       )}
 
       {onRecover && (
-        <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-subtle, rgba(128,128,128,0.2))" }}>
+        <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--hairline-soft)" }}>
           <button
             onClick={onRecover}
             style={{
@@ -184,11 +184,10 @@ function NellBrainPath({
           style={{
             fontSize: 10.5,
             color: "#a07434",
-            fontFamily: "var(--font-disp)",
             textTransform: "uppercase",
-            letterSpacing: "0.08em",
+            letterSpacing: "0.12em",
             marginBottom: 6,
-            fontWeight: 500,
+            fontWeight: 600,
           }}
         >
           One safety check
@@ -266,9 +265,9 @@ function EmergenceKitGuide({
         style={{
           marginTop: 14,
           padding: "10px 12px",
-          borderRadius: 7,
-          background: "rgba(60, 130, 90, 0.08)",
-          border: "1px solid rgba(60, 130, 90, 0.40)",
+          borderRadius: 16,
+          background: "rgba(79,168,118,0.10)",
+          border: "1px solid rgba(79,168,118,0.35)",
           fontSize: 11,
           color: "var(--text-mid)",
           lineHeight: 1.7,
@@ -351,9 +350,9 @@ function ExistingCEPath({
           style={{
             marginTop: 8,
             padding: "10px 12px",
-            borderRadius: 7,
-            background: "rgba(160, 30, 30, 0.07)",
-            border: "1px solid rgba(160, 30, 30, 0.35)",
+            borderRadius: 16,
+            background: "rgba(224,122,106,0.08)",
+            border: "1px solid rgba(224,122,106,0.35)",
           }}
         >
           {preflight.errors.map((e) => (
@@ -369,11 +368,11 @@ function ExistingCEPath({
               <div
                 style={{
                   fontSize: 10.5,
+                  fontWeight: 600,
                   color: "var(--text-mute)",
                   marginBottom: 4,
-                  fontFamily: "var(--font-disp)",
                   textTransform: "uppercase",
-                  letterSpacing: "0.07em",
+                  letterSpacing: "0.12em",
                 }}
               >
                 Did you mean:
@@ -388,7 +387,7 @@ function ExistingCEPath({
                     style={{
                       fontSize: 10.5,
                       fontFamily: "DM Mono, Courier New, monospace",
-                      background: "rgba(130,51,41,0.10)",
+                      background: "color-mix(in srgb, var(--accent) 13%, transparent)",
                       border: "1px solid var(--accent)",
                       borderRadius: 5,
                       padding: "3px 8px",
@@ -411,9 +410,9 @@ function ExistingCEPath({
           style={{
             marginTop: 8,
             padding: "10px 12px",
-            borderRadius: 7,
-            background: "rgba(40, 120, 60, 0.07)",
-            border: "1px solid rgba(40, 120, 60, 0.35)",
+            borderRadius: 16,
+            background: "rgba(79,168,118,0.10)",
+            border: "1px solid rgba(79,168,118,0.35)",
           }}
         >
           <div style={{ fontSize: 11, color: "var(--text)", marginBottom: 6, fontWeight: 500 }}>

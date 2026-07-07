@@ -46,16 +46,16 @@ export function StepUserName({ step, totalSteps, value, onChange, onNext, onBack
           lineHeight: 1.5,
         }}
       >
-        Stored as <code style={{ background: "rgba(0,0,0,0.05)", padding: "0 3px", borderRadius: 3 }}>user_name</code> in
+        Stored as <code style={{ background: "rgba(0,0,0,0.25)", padding: "0 3px", borderRadius: 3 }}>user_name</code> in
         persona_config.json. Only used locally for memory attribution.
       </div>
       <div
         style={{
           marginTop: 14,
           padding: "10px 12px",
-          borderRadius: 7,
-          background: "rgba(130,51,41,0.06)",
-          border: "1px solid rgba(130,51,41,0.18)",
+          borderRadius: 14,
+          background: "color-mix(in srgb, var(--accent) 9%, transparent)",
+          border: "1px solid color-mix(in srgb, var(--accent) 24%, transparent)",
         }}
       >
         <div style={{ fontSize: 11.5, color: "var(--text)", lineHeight: 1.6 }}>
@@ -74,15 +74,18 @@ export function StepUserName({ step, totalSteps, value, onChange, onNext, onBack
               aria-pressed={pronouns === opt}
               onClick={() => onPronounsChange(opt)}
               style={{
-                padding: "6px 14px",
+                padding: "8px 16px",
                 borderRadius: 999,
                 fontSize: 12,
                 cursor: "pointer",
                 border:
                   pronouns === opt
-                    ? "1px solid rgba(130,51,41,0.55)"
-                    : "1px solid rgba(0,0,0,0.15)",
-                background: pronouns === opt ? "rgba(130,51,41,0.10)" : "transparent",
+                    ? "1px solid color-mix(in srgb, var(--accent) 55%, transparent)"
+                    : "1px solid var(--hairline)",
+                background:
+                  pronouns === opt
+                    ? "color-mix(in srgb, var(--accent) 16%, transparent)"
+                    : "var(--field)",
                 color: "var(--text)",
               }}
             >
