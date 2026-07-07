@@ -1131,10 +1131,15 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
 ) -> None:
     """HTTP shutdown attempt fails (ConnectError), so cmd_stop falls back to
     POSIX SIGTERM. pid_is_alive returns True initially, False after SIGTERM.
-    cmd_stop polls and exits 0. No real subprocess or network call made."""
+    cmd_stop polls and exits 0. No real subprocess or network call made.
+
+    os.name is pinned to "posix" so this exercises the POSIX branch on every
+    platform — on real Windows cmd_stop deliberately refuses the kill (see the
+    windows-branch tests below); without the pin this fails on Windows CI."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "name", "posix")
     persona_dir = tmp_path / "home" / "personas" / "nell"
     state_file.write(
         persona_dir,
@@ -1183,10 +1188,13 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """SIGTERM sent but pid never dies within timeout → return 1."""
+    """SIGTERM sent but pid never dies within timeout → return 1.
+
+    os.name pinned to "posix" — the SIGTERM fallback only exists there."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "name", "posix")
     persona_dir = tmp_path / "home" / "personas" / "nell"
     state_file.write(
         persona_dir,
@@ -1220,10 +1228,13 @@ def test_cmd_stop_handles_processlookuperror_during_kill(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """If the process dies between liveness probe and SIGTERM, os.kill raises
-    ProcessLookupError — cmd_stop must catch and report no-op."""
+    ProcessLookupError — cmd_stop must catch and report no-op.
+
+    os.name pinned to "posix" — the SIGTERM fallback only exists there."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "name", "posix")
     persona_dir = tmp_path / "home" / "personas" / "nell"
     state_file.write(
         persona_dir,

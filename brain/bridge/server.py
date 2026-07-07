@@ -20,6 +20,7 @@ Singletons are constructed once at lifespan startup and held on app.state.bridge
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -2330,19 +2331,24 @@ def build_app(
         # 1-based line index = turn cursor. Corrupt lines are dropped by
         # the reader, so ``idx`` advances over surviving lines only —
         # paging stays stable as long as the file isn't rewritten.
-        for idx, raw in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
-            # ``idx`` is monotonic — once it crosses the cursor we're done
-            # reading; ``break`` avoids paying O(buffer size) per page.
-            if before_turn is not None and idx >= before_turn:
-                break
-            entries.append(
-                ChatHistoryEntry(
-                    role=str(raw.get("speaker", "user")),
-                    content=str(raw.get("text", "")),
-                    ts=raw.get("ts"),
-                    turn=idx,
+        # ``closing`` is load-bearing: the ``break`` below abandons the
+        # generator, and an unclosed reader keeps the buffer file handle
+        # alive until GC — on Windows that blocks close_session's unlink
+        # (WinError 32). contextlib.closing closes it deterministically.
+        with contextlib.closing(iter_jsonl_skipping_corrupt(path)) as reader:
+            for idx, raw in enumerate(reader, start=1):
+                # ``idx`` is monotonic — once it crosses the cursor we're done
+                # reading; ``break`` avoids paying O(buffer size) per page.
+                if before_turn is not None and idx >= before_turn:
+                    break
+                entries.append(
+                    ChatHistoryEntry(
+                        role=str(raw.get("speaker", "user")),
+                        content=str(raw.get("text", "")),
+                        ts=raw.get("ts"),
+                        turn=idx,
+                    )
                 )
-            )
 
         # Tail — most recent ``limit`` turns. Renderer paints them in the
         # order returned; older pages come back via ``before_turn``.
