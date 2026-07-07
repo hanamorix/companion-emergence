@@ -89,7 +89,7 @@ def test_reflex_audit_writes_to_reflex_audit_jsonl(persona_dir: Path):
 
     log = persona_dir / "reflex_audit.jsonl"
     assert log.exists()
-    entry = json.loads(log.read_text().splitlines()[0])
+    entry = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
     assert entry["tool"] == "search_memories"
 
 
@@ -138,7 +138,7 @@ def test_crystallisation_queues_soul_candidate(persona_dir: Path):
 
     candidates_path = persona_dir / "soul_candidates.jsonl"
     assert candidates_path.exists(), "soul_candidates.jsonl should be written"
-    entry = json.loads(candidates_path.read_text().splitlines()[0])
+    entry = json.loads(candidates_path.read_text(encoding="utf-8").splitlines()[0])
     assert "grief as connection" in entry.get("text", ""), (
         f"expected theme text in candidate, got: {entry}"
     )
@@ -191,7 +191,7 @@ def test_partial_failure_is_isolated(persona_dir: Path):
     # Error log should have an entry for the failed memory write step.
     error_log = persona_dir / "extractor_errors.jsonl"
     assert error_log.exists()
-    entry = json.loads(error_log.read_text().splitlines()[0])
+    entry = json.loads(error_log.read_text(encoding="utf-8").splitlines()[0])
     assert entry["step"] == "memory_writes"
 
 
@@ -313,7 +313,7 @@ def test_crystallisation_queues_theme_and_evidence_combined(persona_dir: Path):
     # soul_candidates.jsonl must carry the combined string.
     candidates_path = persona_dir / "soul_candidates.jsonl"
     assert candidates_path.exists(), "soul_candidates.jsonl should be written"
-    entry = json.loads(candidates_path.read_text().splitlines()[0])
+    entry = json.loads(candidates_path.read_text(encoding="utf-8").splitlines()[0])
     assert entry.get("text") == expected_text, (
         f"queued text should be 'theme — evidence'; got: {entry.get('text')!r}"
     )
@@ -428,7 +428,7 @@ def test_crystallisation_importance_at_threshold_is_queued(persona_dir: Path):
 
     candidates_path = persona_dir / "soul_candidates.jsonl"
     assert candidates_path.exists(), "soul_candidates.jsonl must exist for importance == 8"
-    entry = json.loads(candidates_path.read_text().splitlines()[0])
+    entry = json.loads(candidates_path.read_text(encoding="utf-8").splitlines()[0])
     assert entry.get("status") == "auto_pending"
     assert "at threshold theme" in entry.get("text", "")
 
@@ -458,7 +458,7 @@ def test_crystallisation_within_batch_dedup_same_theme(persona_dir: Path):
 
     candidates_path = persona_dir / "soul_candidates.jsonl"
     assert candidates_path.exists()
-    lines = candidates_path.read_text().strip().splitlines()
+    lines = candidates_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1, (
         f"Expected 1 queued candidate (dedup), got {len(lines)}: {lines}"
     )
@@ -494,7 +494,7 @@ def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path
     )
     apply_side_effects(out, persona_dir=persona_dir)
 
-    lines = candidates_path.read_text().strip().splitlines()
+    lines = candidates_path.read_text(encoding="utf-8").strip().splitlines()
     # Original rejected + 1 new auto_pending = 2 lines total
     assert len(lines) == 2, (
         f"Expected 2 lines (rejected + new auto_pending), got {len(lines)}: {lines}"
