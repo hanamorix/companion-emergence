@@ -322,16 +322,20 @@ def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists (signal 0 probe)."""
+    """True if a process with ``pid`` exists.
+
+    Delegates to state_file.pid_is_alive, which carries the Windows-safe
+    branch. NEVER use a raw ``os.kill(pid, 0)`` probe here: on Windows,
+    signal 0 is CTRL_C_EVENT, and probing a bogus pid delivers a real
+    Ctrl+C to our OWN console group (this aborted the whole pytest session
+    on windows-latest CI, and in production would interrupt whatever
+    console hosts the bridge). Lazy import: ingest is a lower layer than
+    bridge, so the dependency stays function-local."""
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by another user
-    return True
+    from brain.bridge.state_file import pid_is_alive
+
+    return pid_is_alive(pid)
 
 
 def acquire_compaction_lock(

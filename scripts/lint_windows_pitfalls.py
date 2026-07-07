@@ -58,18 +58,29 @@ def scan() -> list[str]:
                     f"Windows default is not UTF-8. Pass encoding='utf-8'."
                 )
 
-        # 2. os.kill() with a real signal (not a `, 0)` liveness probe, which
-        #    Python emulates cross-platform; and not a mention inside a string/
-        #    comment).
+        # 2. os.kill() — BOTH forms are Windows pitfalls:
+        #    - a real signal is TerminateProcess (no cleanup);
+        #    - a `, 0)` "liveness probe" is WORSE: signal 0 is CTRL_C_EVENT on
+        #      Windows, and probing a bogus pid delivers a real Ctrl+C to our
+        #      OWN console group (aborted the whole pytest session on
+        #      windows-latest CI, 2026-07-07). The ONLY sanctioned liveness
+        #      probe is state_file.pid_is_alive, which os.name-guards it.
         for i, line in enumerate(lines):
             idx = line.find("os.kill(")
             if idx == -1:
                 continue
             before = line[:idx]
-            if '"' in before or "'" in before or "#" in before:
-                continue  # docstring / comment mention
+            if '"' in before or "'" in before or "#" in before or "``" in line:
+                continue  # docstring / comment / backtick-doc mention
             if re.search(r"os\.kill\([^,]+,\s*0\s*\)", line[idx:]):
-                continue  # liveness probe (fine on Windows)
+                if rel.endswith("bridge/state_file.py"):
+                    continue  # the sanctioned, os.name-guarded probe
+                findings.append(
+                    f"{rel}:{i + 1}: os.kill(pid, 0) liveness probe — signal 0 is "
+                    f"CTRL_C_EVENT on Windows and can Ctrl+C our own console "
+                    f"group. Delegate to state_file.pid_is_alive instead."
+                )
+                continue
             findings.append(
                 f"{rel}:{i + 1}: os.kill() with a signal — TerminateProcess on "
                 f"Windows (no cleanup, no shutdown_clean). Route bridge shutdown "
