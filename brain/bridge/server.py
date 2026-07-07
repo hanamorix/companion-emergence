@@ -20,6 +20,7 @@ Singletons are constructed once at lifespan startup and held on app.state.bridge
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool, field_validator
 
 from brain import __version__ as _brain_version
+from brain import tunables
 from brain.bridge import events
 from brain.bridge.chat import (
     ChatMessage,
@@ -565,7 +567,11 @@ _CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 # The client (app/src/streamChat.ts) kills the WS after 60s with no frame, so
 # the forward loop emits a `keepalive` frame on each silent interval to reset
 # that idle timer. 15s gives a 4x margin under the client's 60s budget.
-_STREAM_KEEPALIVE_SECONDS = 15.0
+_STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds", 15.0)
+
+
+def _stream_keepalive_seconds() -> float:
+    return tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS)
 
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
@@ -866,6 +872,16 @@ def build_app(
             shutdown_controller=shutdown_controller,
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
+
+        # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
+        # write_defaults_section swallows its own errors; belt-and-braces here so
+        # an import problem can't block startup either.
+        try:
+            from brain.tunables import write_defaults_section
+
+            write_defaults_section()
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("tunables boot rewrite skipped: %s", _exc)
 
         # Touch last_opened_at so PersonaPicker can sort by recency (v0.0.18+)
         try:
@@ -2315,19 +2331,24 @@ def build_app(
         # 1-based line index = turn cursor. Corrupt lines are dropped by
         # the reader, so ``idx`` advances over surviving lines only —
         # paging stays stable as long as the file isn't rewritten.
-        for idx, raw in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
-            # ``idx`` is monotonic — once it crosses the cursor we're done
-            # reading; ``break`` avoids paying O(buffer size) per page.
-            if before_turn is not None and idx >= before_turn:
-                break
-            entries.append(
-                ChatHistoryEntry(
-                    role=str(raw.get("speaker", "user")),
-                    content=str(raw.get("text", "")),
-                    ts=raw.get("ts"),
-                    turn=idx,
+        # ``closing`` is load-bearing: the ``break`` below abandons the
+        # generator, and an unclosed reader keeps the buffer file handle
+        # alive until GC — on Windows that blocks close_session's unlink
+        # (WinError 32). contextlib.closing closes it deterministically.
+        with contextlib.closing(iter_jsonl_skipping_corrupt(path)) as reader:
+            for idx, raw in enumerate(reader, start=1):
+                # ``idx`` is monotonic — once it crosses the cursor we're done
+                # reading; ``break`` avoids paying O(buffer size) per page.
+                if before_turn is not None and idx >= before_turn:
+                    break
+                entries.append(
+                    ChatHistoryEntry(
+                        role=str(raw.get("speaker", "user")),
+                        content=str(raw.get("text", "")),
+                        ts=raw.get("ts"),
+                        turn=idx,
+                    )
                 )
-            )
 
         # Tail — most recent ``limit`` turns. Renderer paints them in the
         # order returned; older pages come back via ``before_turn``.
@@ -2538,7 +2559,7 @@ def build_app(
             while True:
                 try:
                     chunk = await asyncio.wait_for(
-                        chunk_q.get(), timeout=_STREAM_KEEPALIVE_SECONDS
+                        chunk_q.get(), timeout=_stream_keepalive_seconds()
                     )
                 except TimeoutError:
                     if respond_task.done():

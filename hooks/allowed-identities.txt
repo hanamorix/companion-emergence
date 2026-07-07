@@ -1,0 +1,10 @@
+# Leak-guard metadata-arm allowlist (tracked, structural — no secrets).
+# Formats:
+#   exact:  Name <email>
+#   glob:<email-glob>        — matches the email part of any identity
+#   committer-only:<entry>   — valid as committer, never as author (N5)
+Hana Mori <214302556+hanamorix@users.noreply.github.com>
+ThinkerOfThoughts <thinkerofthoughts42@gmail.com>
+ThinkerOfThoughts <47190876+ThinkerOfThoughts@users.noreply.github.com>
+glob:*@users.noreply.github.com
+committer-only:GitHub <noreply@github.com>

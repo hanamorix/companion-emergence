@@ -110,13 +110,13 @@ function CheckCard({
   const found = check?.found === true;
   const palette = found
     ? {
-        bg: "rgba(60, 130, 90, 0.10)",
-        border: "rgba(60, 130, 90, 0.45)",
-        accent: "#3a8a5e",
+        bg: "rgba(79,168,118,0.10)",
+        border: "rgba(79,168,118,0.35)",
+        accent: "#4fa876",
       }
     : {
-        bg: "rgba(178, 42, 42, 0.08)",
-        border: "rgba(178, 42, 42, 0.40)",
+        bg: "rgba(224,122,106,0.08)",
+        border: "rgba(224,122,106,0.35)",
         accent: "var(--crimson)",
       };
 
@@ -124,7 +124,7 @@ function CheckCard({
     <div
       style={{
         padding: "12px 14px",
-        borderRadius: 8,
+        borderRadius: 16,
         background: palette.bg,
         border: `1px solid ${palette.border}`,
       }}
@@ -167,7 +167,6 @@ function CheckCard({
           style={{
             fontSize: 10.5,
             color: "var(--text-mute)",
-            fontFamily: "var(--font-disp)",
             marginTop: 2,
           }}
         >
@@ -229,10 +228,10 @@ function Platform({ name, children }: { name: string; children: ReactNode }) {
       <div
         style={{
           fontSize: 10,
+          fontWeight: 600,
           color: "var(--text-mute)",
-          fontFamily: "var(--font-disp)",
           textTransform: "uppercase",
-          letterSpacing: "0.08em",
+          letterSpacing: "0.12em",
           marginBottom: 4,
         }}
       >
@@ -251,10 +250,11 @@ function CodeBlock({ children }: { children: string }) {
       style={{
         fontSize: 10.5,
         fontFamily: "DM Mono, Courier New, monospace",
-        background: "rgba(0,0,0,0.06)",
+        background: "rgba(0,0,0,0.25)",
+        border: "1px solid var(--hairline)",
         color: "var(--text)",
         padding: "8px 10px",
-        borderRadius: 5,
+        borderRadius: 14,
         margin: "6px 0 0",
         whiteSpace: "pre-wrap",
         wordBreak: "break-all",
@@ -271,7 +271,7 @@ function Code({ children }: { children: ReactNode }) {
       style={{
         fontFamily: "DM Mono, Courier New, monospace",
         fontSize: "0.92em",
-        background: "rgba(0,0,0,0.05)",
+        background: "rgba(0,0,0,0.25)",
         padding: "1px 4px",
         borderRadius: 3,
       }}

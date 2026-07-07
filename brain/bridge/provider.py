@@ -37,6 +37,7 @@ from typing import Any
 
 import httpx
 
+from brain import tunables
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -70,11 +71,11 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Matched by substring of the model id so short aliases ("sonnet") and
 # fully-qualified ids ("claude-sonnet-4-6") both resolve.
 _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
-    ("haiku", 0.30),
-    ("sonnet", 0.75),
-    ("opus", 3.00),
+    ("haiku", tunables.register("provider.max_turn_budget_usd.haiku", 0.30)),
+    ("sonnet", tunables.register("provider.max_turn_budget_usd.sonnet", 0.75)),
+    ("opus", tunables.register("provider.max_turn_budget_usd.opus", 3.00)),
 )
-_BUDGET_FALLBACK: float = 1.50
+_BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
 
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
@@ -96,8 +97,8 @@ def _MAX_TURN_BUDGET_USD(model: str) -> float:  # noqa: N802  (module-level cons
     low = model.lower()
     for tier, usd in _BUDGET_BY_TIER:
         if tier in low:
-            return usd
-    return _BUDGET_FALLBACK
+            return tunables.get_tunable(f"provider.max_turn_budget_usd.{tier}", usd)
+    return tunables.get_tunable("provider.max_turn_budget_usd.fallback", _BUDGET_FALLBACK)
 
 
 def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> None:
@@ -190,14 +191,30 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
 # this many seconds, the subprocess is treated as wedged: it gets terminated
 # and the stream yields StreamError(stage="claude_cli_idle_timeout"). This
 # is deliberately not bounded by total wall-clock duration — long Opus
-# runs can take time.
-_STREAM_PER_EVENT_IDLE_SECONDS: float = 60.0
+# runs can take time. Overridable via $KINDLED_HOME/tunables.json (#55).
+_STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
+    "provider.stream_per_event_idle_seconds", 60.0
+)
 
 # First-event budget. Wider than the per-event budget because Opus can
 # take time before emitting any stream_event frames. Also bounds the
 # initial subprocess spawn +
 # system-prompt-file write + MCP server boot.
-_STREAM_FIRST_EVENT_SECONDS: float = 120.0
+_STREAM_FIRST_EVENT_SECONDS: float = tunables.register(
+    "provider.stream_first_event_seconds", 120.0
+)
+
+
+def _stream_per_event_idle_seconds() -> float:
+    return tunables.get_tunable(
+        "provider.stream_per_event_idle_seconds", _STREAM_PER_EVENT_IDLE_SECONDS
+    )
+
+
+def _stream_first_event_seconds() -> float:
+    return tunables.get_tunable(
+        "provider.stream_first_event_seconds", _STREAM_FIRST_EVENT_SECONDS
+    )
 
 # A sentinel object pushed onto the stdout queue by the reader thread
 # when the subprocess closes its stdout (normal exit, error, etc.). Lets
@@ -715,8 +732,10 @@ class ClaudeCliProvider(LLMProvider):
     ) -> Iterator[ChatStreamEvent]:
         """Yield ChatStreamEvent values as the claude subprocess streams.
 
-        Per-event idle timeout: _STREAM_PER_EVENT_IDLE_SECONDS (60s default).
-        First-event timeout: _STREAM_FIRST_EVENT_SECONDS (120s default).
+        Per-event idle timeout: _stream_per_event_idle_seconds() (default 60s,
+        overridable via tunables key provider.stream_per_event_idle_seconds).
+        First-event timeout: _stream_first_event_seconds() (default 120s,
+        key provider.stream_first_event_seconds).
         Both can be monkeypatched in tests for fast verification.
 
         Yields:
@@ -885,7 +904,7 @@ class ClaudeCliProvider(LLMProvider):
             delta_chunks: list[str] = []
             assistant_snapshot: str | None = None
             done_emitted = False
-            timeout = _STREAM_FIRST_EVENT_SECONDS
+            timeout = _stream_first_event_seconds()
 
             # Idle-timeout instrumentation (spec 2026-06-01). Recomputed per
             # frame so they reflect the last frame seen when a gap trips the
@@ -926,7 +945,7 @@ class ClaudeCliProvider(LLMProvider):
                     if item is _STREAM_EOF:
                         break
 
-                    timeout = _STREAM_PER_EVENT_IDLE_SECONDS
+                    timeout = _stream_per_event_idle_seconds()
 
                     line = str(item).strip()
                     if not line:

@@ -7,11 +7,16 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain import tunables
 from brain.tools.impls import _read_cache
 
-_FILE_READ_MAX_BYTES = 256 * 1024
+_FILE_READ_MAX_BYTES = tunables.register("files.read_max_bytes", 256 * 1024)
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
+
+
+def _file_read_max_bytes() -> int:
+    return tunables.get_tunable("files.read_max_bytes", _FILE_READ_MAX_BYTES)
 
 
 def _suggest(target: Path) -> list[str]:
@@ -94,8 +99,9 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
         )
         return {"error": f"not a readable file: {p}", "did_you_mean": suggestions}
 
+    cap = _file_read_max_bytes()
     size = p.stat().st_size
-    if size > _FILE_READ_MAX_BYTES:
+    if size > cap:
         _audit(
             persona_dir,
             tool="read_file",
@@ -105,7 +111,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             ok=False,
             error="too large",
         )
-        return {"error": f"file too large ({size} bytes > {_FILE_READ_MAX_BYTES} cap) — not shown"}
+        return {"error": f"file too large ({size} bytes > {cap} cap) — not shown"}
 
     # Platform-correct case handling: normcase lowercases on Windows (case-
     # insensitive FS) and is a no-op on macOS/Linux, where realpath already

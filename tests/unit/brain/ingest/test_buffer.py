@@ -119,6 +119,73 @@ def test_delete_session_buffer_is_idempotent(tmp_path: Path) -> None:
     delete_session_buffer(tmp_path, "sess_del")
 
 
+def test_delete_session_buffer_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Windows CI regression (WinError 32): unlink of a freshly-written buffer
+    can hit a transient PermissionError (antivirus/indexer or a not-yet-GC'd
+    reader handle — Windows can't delete open files). delete_session_buffer
+    must retry briefly instead of failing close_session with ingest_failed."""
+    from pathlib import Path as _PathCls
+
+    from brain.ingest import buffer as buffer_mod
+
+    ingest_turn(tmp_path, {"session_id": "sess_retry", "speaker": "x", "text": "y"})
+    path = tmp_path / "active_conversations" / "sess_retry.jsonl"
+    assert path.exists()
+
+    real_unlink = _PathCls.unlink
+    attempts = {"n": 0}
+
+    def flaky_unlink(self, missing_ok=False):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(_PathCls, "unlink", flaky_unlink)
+    monkeypatch.setattr(buffer_mod.time, "sleep", lambda _s: None)
+
+    delete_session_buffer(tmp_path, "sess_retry")
+    assert attempts["n"] == 3
+    assert not path.exists()
+
+
+def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
+    """Windows CI regression: the compaction lock's dead-pid probe used a raw
+    ``os.kill(pid, 0)`` — on Windows signal 0 is CTRL_C_EVENT, and probing a
+    bogus pid delivers a REAL Ctrl+C to our own console group (this aborted
+    the whole pytest session at ~42% on windows-latest). The probe must
+    delegate to state_file.pid_is_alive, which carries the Windows-safe
+    branch — and brain/ingest must contain no direct os.kill at all."""
+    import subprocess
+
+    from brain.bridge import state_file
+    from brain.ingest import buffer as buffer_mod
+
+    # Through-path: the delegate is what answers.
+    sentinel_calls = []
+    monkeypatch.setattr(
+        state_file, "pid_is_alive", lambda pid: sentinel_calls.append(pid) or True
+    )
+    assert buffer_mod._pid_alive(4242) is True
+    assert sentinel_calls == [4242]
+    # pid <= 0 short-circuits without touching the delegate.
+    assert buffer_mod._pid_alive(0) is False
+    assert sentinel_calls == [4242]
+
+    # Grep-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
+    # class). Doc mentions (backtick-quoted) are allowed; .pyc excluded.
+    result = subprocess.run(
+        ["grep", "-rn", "--include=*.py", r"os\.kill(", "brain/ingest/"],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[4]),
+    )
+    code_hits = [ln for ln in result.stdout.splitlines() if "``" not in ln]
+    assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
+
+
 # ---- I-2 follow-up audit: session_id validation ----
 
 
