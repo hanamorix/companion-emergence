@@ -34,7 +34,12 @@
   --rose: #c89890;               /* keep: initiate-banner / pending-write family */
   --mauve: var(--text-mute);
   --ash: var(--track);
-  --bg-scene: transparent;
+  /* Opaque ember-dark base. Was transparent — which relied on the webview's
+   * default page background being dark (true on macOS dark-mode, WHITE on
+   * Linux GTK-webkit / light appearance). Panel-less screens (BootScreen,
+   * BridgeErrorScreen) then rendered light text on white. Dark-only design →
+   * paint our own base so every platform reads dark. */
+  --bg-scene: #191214;
   --bubble-nell: var(--bubble-in);
   --bubble-user: var(--accent);
   --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
@@ -66,7 +71,7 @@ body,
 #root {
   width: 100%;
   height: 100%;
-  background: transparent;
+  background: var(--bg-scene);
   font-family: var(--font-ui);
   font-size: 13px;
   line-height: 1.5;
