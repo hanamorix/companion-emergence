@@ -51,6 +51,28 @@ class SandboxLeak(RuntimeError):  # noqa: N818 — owner-specified public API na
     """Raised when a guarded real-home root was mutated during a sandboxed run."""
 
 
+class LiveServiceDetected(RuntimeError):  # noqa: N818 — owner-specified public API name (Phase 2)
+    """Raised (default policy) when a live companion bridge is detected BEFORE a run starts.
+
+    Distinct from :class:`SandboxLeak` (NOT a subclass), so a caller catching ``SandboxLeak`` for a
+    real containment failure does not accidentally swallow this, and vice-versa. The pre-check that
+    raises it detects a running bridge UP FRONT so the run fails with an actionable "quit your
+    companion first" message instead of dying later with a misleading *spurious* ``SandboxLeak``
+    (its concurrent writes tripping the post-run fingerprint).
+    """
+
+
+# live_check policy values (Phase 2).
+LIVE_CHECK_RAISE = "raise"
+LIVE_CHECK_WARN = "warn"
+LIVE_CHECK_OFF = "off"
+_LIVE_CHECK_POLICIES = (LIVE_CHECK_RAISE, LIVE_CHECK_WARN, LIVE_CHECK_OFF)
+
+# The double-fingerprint probe's default wait window (seconds). Small — the probe is opt-in and the
+# pidfile scan carries default detection, so this only costs when a caller passes probe=True.
+_PROBE_WAIT_S = 0.4
+
+
 @dataclass
 class SandboxHandle:
     """Handle yielded to the run: the sandbox root + the env it installed."""
@@ -95,6 +117,20 @@ def _guarded_roots(extra: list[Path] | None = None) -> list[Path]:
         home / "Library" / "LaunchAgents",        # Mac autostart
         home / "Library" / "Application Support" / _APP,  # Mac data (redundant w/ platformdirs; safe)
     ]
+    # Stage-3 F1: PlatformDirs(_APP) above drops the appauthor the ENGINE uses
+    # (brain/paths.py: PlatformDirs(appname=..., appauthor="hanamorix")), so on Windows/macOS it
+    # points at a DIFFERENT dir than the real bridge writes. Add the engine's appauthor-correct
+    # DEFAULT home so the leak fingerprint covers the dir the real bridge actually uses. NOTE: we use
+    # the engine's un-overridden ``_dirs.user_data_path`` — NOT ``get_home()`` — because inside a
+    # sandbox ``KINDLED_HOME`` makes ``get_home()`` return the SANDBOX root, and fingerprinting the
+    # sandbox's own root would (correctly-written) in-sandbox persona files trip a false SandboxLeak.
+    # We want the REAL user's home regardless of the sandbox override. Import-only use of brain.
+    try:
+        from brain.paths import _dirs as _brain_dirs
+
+        roots.append(Path(_brain_dirs.user_data_path))
+    except Exception:  # noqa: BLE001 — never let a resolver hiccup break the guard-root set
+        pass
     if extra:
         roots.extend(Path(p) for p in extra)
     # De-dup while preserving order.
@@ -188,6 +224,118 @@ def _shallow_notes_fingerprint(docs: Path) -> dict:
     return fp
 
 
+def _live_bridges() -> list[tuple[int, str]]:
+    """Scan for RUNNING companion bridges (the load-bearing live-service detector, Phase 2).
+
+    A live bridge writes ``bridge.json`` into its ``persona_dir`` carrying its ``pid``
+    (``brain/bridge/state_file.py``). We glob ``<home>/personas/*/bridge.json`` where ``<home>`` is
+    the engine's REAL resolver ``brain.paths.get_home()`` — NOT a re-derived ``PlatformDirs`` (which
+    drops the ``appauthor`` the engine uses and so points at the WRONG dir on Windows/macOS,
+    stage-3 F1). Liveness is decided by the REAL, side-effect-free ``state_file.pid_is_alive``.
+
+    **Read-only, deliberately:** we parse ``bridge.json`` bytes directly and never call
+    ``state_file.read()`` — ``read()`` heals-on-read (``attempt_heal`` can ``os.replace`` a ``.bak``
+    over a corrupt primary), which would WRITE to the developer's real files. The cost is a known,
+    accepted gap: a live bridge whose primary ``bridge.json`` is corrupt-but-``.bak``-recoverable is
+    NOT detected here (backstopped by the post-run :class:`SandboxLeak`).
+
+    Returns a list of ``(pid, persona_name)`` for each live bridge found (empty = none live).
+    Tolerant: a missing home, a missing/corrupt/unreadable ``bridge.json`` is skipped, never raised.
+    """
+    import json
+
+    from brain.bridge import state_file
+    from brain.paths import get_home
+
+    live: list[tuple[int, str]] = []
+    try:
+        personas = get_home() / "personas"
+        candidates = list(personas.glob("*/bridge.json"))
+    except OSError:
+        return live
+    for path in candidates:
+        try:
+            data = json.loads(path.read_bytes())
+        except (OSError, ValueError):  # ValueError ⊇ json.JSONDecodeError
+            continue
+        if not isinstance(data, dict):
+            continue
+        pid = data.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            continue
+        try:
+            alive = state_file.pid_is_alive(pid)
+        except OSError:
+            continue
+        if alive:
+            persona = path.parent.name
+            live.append((pid, persona))
+    return live
+
+
+def _probe_external_writer(snapshot_fn, wait_s: float) -> bool:
+    """Double-fingerprint probe (OPT-IN, default OFF — stage-3 M1): snapshot the guarded roots,
+    wait, snapshot again; return True if anything changed (an external writer is live).
+
+    Complementary to :func:`_live_bridges` — catches a live writer with no discoverable pidfile.
+    Off by default because the pidfile scan carries normal detection and the post-run
+    :class:`SandboxLeak` already backstops the no-pidfile case; a probe-only hit is reported with a
+    GENERIC message (it is NOT necessarily a companion bridge).
+    """
+    import time
+
+    before = snapshot_fn()
+    if wait_s > 0:
+        time.sleep(wait_s)
+    after = snapshot_fn()
+    return before != after
+
+
+def _run_live_check(
+    policy: str, snapshot_fn, *, probe: bool, probe_wait: float
+) -> str | None:
+    """Run the live-service pre-check and dispatch by ``policy`` (stage-3 M1/L4).
+
+    ``"off"`` → skip entirely (no scan, no probe, no cost) and return ``None``.
+    ``"raise"`` → raise :class:`LiveServiceDetected` if a live service is found.
+    ``"warn"`` → emit a ``RuntimeWarning`` and return the message (so a later :class:`SandboxLeak`
+    can be annotated), continuing the run.
+
+    An invalid ``policy`` raises ``ValueError`` (fail-fast on a typo, never silent-off).
+    """
+    if policy not in _LIVE_CHECK_POLICIES:
+        raise ValueError(
+            f"live_check must be one of {_LIVE_CHECK_POLICIES!r}, got {policy!r}"
+        )
+    if policy == LIVE_CHECK_OFF:
+        return None
+
+    parts: list[str] = []
+    bridges = _live_bridges()
+    if bridges:
+        listed = ", ".join(f"pid {pid} (persona {name})" for pid, name in bridges)
+        parts.append(
+            "a live companion service was detected at pre-check: " + listed
+        )
+    if probe and _probe_external_writer(snapshot_fn, probe_wait):
+        # A probe-only hit is NOT necessarily a companion bridge — keep the message GENERIC (M1/L4).
+        parts.append(
+            "an external process mutated a guarded root during the pre-check probe window"
+        )
+    if not parts:
+        return None
+
+    msg = (
+        "; ".join(parts)
+        + ". Quit your companion bridge (and any launchd/systemd/task-scheduler service) "
+        "before running the harness, then retry."
+    )
+    if policy == LIVE_CHECK_RAISE:
+        raise LiveServiceDetected(msg)
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    return msg
+
+
 def _seed_auth(claude_config_dir: Path) -> str:
     """Auth-only seed: copy ONLY ~/.claude/.credentials.json. Return the auth source.
 
@@ -223,6 +371,9 @@ def sandbox(
     *,
     keep: bool = False,
     extra_guard_roots: list[Path] | None = None,
+    live_check: str = LIVE_CHECK_RAISE,
+    probe: bool = False,
+    probe_wait: float = _PROBE_WAIT_S,
 ) -> Iterator[SandboxHandle]:
     """Confine a behavioral run to a fresh temp sandbox; assert no guarded root was mutated.
 
@@ -230,8 +381,18 @@ def sandbox(
         keep: leave the tempdir on disk after exit (post-mortem). Default: ``rmtree``.
         extra_guard_roots: additional roots to fingerprint. Used by the isolation test's negative
             control to prove the leak oracle fires on a real mutation.
+        live_check: live-companion-service pre-check policy (Phase 2):
+            ``"raise"`` (default) → raise :class:`LiveServiceDetected` up front if a live bridge is
+            found; ``"warn"`` → warn + continue (and annotate any later :class:`SandboxLeak`);
+            ``"off"`` → skip the pre-check entirely (for CI, where no live bridge exists). An
+            invalid value raises ``ValueError``.
+        probe: opt-in double-fingerprint probe (default ``False``) — a complementary net for a live
+            external writer with no discoverable ``bridge.json`` (a probe-only hit gets a GENERIC
+            message, not a companion-specific one).
+        probe_wait: the probe's wait window in seconds (only used when ``probe=True``).
 
-    Yields a :class:`SandboxHandle`. Raises :class:`SandboxLeak` if any guarded root changed.
+    Yields a :class:`SandboxHandle`. Raises :class:`SandboxLeak` if any guarded root changed, or
+    :class:`LiveServiceDetected` (before yielding) if the pre-check finds a live service.
     """
     root = Path(tempfile.mkdtemp(prefix="ce-harness-"))
     claude_config_dir = root / "claude-config"
@@ -272,6 +433,15 @@ def sandbox(
                 snap[f"notes:{nr}"] = _shallow_notes_fingerprint(nr)
             return snap
 
+        # Live-service pre-check (Phase 2). Runs BEFORE the "before" fingerprint and before yield —
+        # so a running bridge fails fast with an actionable message instead of a misleading
+        # post-run SandboxLeak. On "raise" this throws here (inside the outer try, so _restore_env
+        # + rmtree in the finally still run — no stale KINDLED_HOME leaks; P14). "warn" returns a
+        # message we use to annotate a later SandboxLeak (P5); "off" is a no-op.
+        live_note = _run_live_check(
+            live_check, _snapshot, probe=probe, probe_wait=probe_wait
+        )
+
         before = _snapshot()
 
         handle = SandboxHandle(
@@ -287,10 +457,17 @@ def sandbox(
             after = _snapshot()
             changed = [g for g in before if before[g] != after.get(g)]
             if changed:
-                raise SandboxLeak(
+                msg = (
                     "guarded real-home root(s) mutated during a sandboxed run: "
                     + ", ".join(changed)
                 )
+                if live_note is not None:
+                    # warn-mode pre-check saw a live service — attribute the leak correctly (P5).
+                    msg += (
+                        " — NOTE: " + live_note + " This leak is probably that service's "
+                        "concurrent writes, not a sandbox escape."
+                    )
+                raise SandboxLeak(msg)
     finally:
         _restore_env()
         if not keep:
