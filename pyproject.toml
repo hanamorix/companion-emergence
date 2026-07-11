@@ -69,6 +69,7 @@ markers = [
     "unit: unit tests",
     "integration: integration tests (deselect with '-m \"not integration\"')",
     "requires_claude_cli: marks tests that require the claude CLI to be on PATH",
+    "behavioral: token-spending behavioral-harness runs (needs claude auth; exclude from default CI with -m 'not behavioral')",
 ]
 
 [tool.ruff]
