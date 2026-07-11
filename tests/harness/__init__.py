@@ -15,4 +15,55 @@ root outside the sandbox was mutated.
 Public API is exported here as the modules land (see README.md for status + usage).
 """
 
-__all__: list[str] = []
+from .bob import AgentBob, Bob, BobContext, BobTurn, DumbBob, is_usage_limit
+from .config import (
+    DEFAULT_MODELS,
+    DEFAULT_TIMEOUTS,
+    EXIT_DONE,
+    EXIT_INVALID,
+    EXIT_LIMIT,
+    EXIT_REVIEW,
+    PERSONA_NAME,
+    SYNTHETIC_USER,
+    ModelConfig,
+    Timeouts,
+)
+from .detector import (
+    DEFAULT_USER_NAME,
+    Detector,
+    DetectorGateError,
+    RegisterLeakDetector,
+    Score,
+    TurnContext,
+    assert_detector_gate,
+)
+from .engine import BridgeServer, atomic_write, collect_reply, parse_ws_frame
+from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
+from .incident import IncidentResult, IncidentSpec, build_compacted_state
+from .runner import ArmSpec, Runner, RunnerState
+from .sandbox import SandboxHandle, SandboxLeak, sandbox
+from .speech import CLEAN, REALISTIC, dyslexify
+from .watchdog import Watchdog, real_ping_fn, watchdog_ping_argv
+
+__all__: list[str] = [
+    # sandbox (safety core)
+    "sandbox", "SandboxHandle", "SandboxLeak",
+    # config
+    "ModelConfig", "Timeouts", "DEFAULT_MODELS", "DEFAULT_TIMEOUTS",
+    "SYNTHETIC_USER", "PERSONA_NAME",
+    "EXIT_DONE", "EXIT_REVIEW", "EXIT_LIMIT", "EXIT_INVALID",
+    # fixture / incident
+    "PersonaSpec", "MemorySeed", "LiveEnv", "build_persona",
+    "IncidentSpec", "IncidentResult", "build_compacted_state",
+    # bob
+    "Bob", "BobTurn", "BobContext", "DumbBob", "AgentBob", "is_usage_limit",
+    # speech
+    "dyslexify", "CLEAN", "REALISTIC",
+    # detector
+    "Detector", "Score", "TurnContext", "assert_detector_gate", "DetectorGateError",
+    "RegisterLeakDetector", "DEFAULT_USER_NAME",
+    # engine
+    "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply",
+    # runner / watchdog
+    "ArmSpec", "Runner", "RunnerState", "Watchdog", "real_ping_fn", "watchdog_ping_argv",
+]
