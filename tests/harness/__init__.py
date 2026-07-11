@@ -41,13 +41,22 @@ from .engine import BridgeServer, atomic_write, collect_reply, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
 from .runner import ArmSpec, Runner, RunnerState
-from .sandbox import SandboxHandle, SandboxLeak, sandbox
+from .sandbox import (
+    LIVE_CHECK_OFF,
+    LIVE_CHECK_RAISE,
+    LIVE_CHECK_WARN,
+    LiveServiceDetected,
+    SandboxHandle,
+    SandboxLeak,
+    sandbox,
+)
 from .speech import CLEAN, REALISTIC, dyslexify
 from .watchdog import Watchdog, real_ping_fn, watchdog_ping_argv
 
 __all__: list[str] = [
     # sandbox (safety core)
-    "sandbox", "SandboxHandle", "SandboxLeak",
+    "sandbox", "SandboxHandle", "SandboxLeak", "LiveServiceDetected",
+    "LIVE_CHECK_RAISE", "LIVE_CHECK_WARN", "LIVE_CHECK_OFF",
     # config
     "ModelConfig", "Timeouts", "DEFAULT_MODELS", "DEFAULT_TIMEOUTS",
     "SYNTHETIC_USER", "PERSONA_NAME",

@@ -61,13 +61,30 @@ Every run is a `with sandbox() as sb:` block. Inside it:
 nestable, and assumes serial use in a process. pytest-xdist workers are separate processes, so
 parallel CI is fine.
 
-**Operational caveat — quit your own companion first.** The leak assertion fingerprints the *real*
-companion-emergence data/cache/state dirs. If your **own companion's bridge/service is running**
-during a harness run, it writes to those dirs concurrently and will trip a **spurious `SandboxLeak`**
-(a false positive — it's *safe*, nothing is corrupted, but it aborts the run). Stop your companion
-(and any `launchd`/`systemd` service) before running the behavioral example. The token-free unit
-tests run in well under a second, so the window is tiny; longer behavioral runs are the exposure.
-_(Follow-up: a runtime pre-check could detect a live service and warn/skip instead of false-tripping.)_
+**Operational caveat — quit your own companion first (now auto-detected).** The leak assertion
+fingerprints the *real* companion-emergence data/cache/state dirs. If your **own companion's
+bridge/service is running** during a harness run, it writes to those dirs concurrently and would
+trip a **spurious `SandboxLeak`** (a false positive — it's *safe*, nothing is corrupted, but it
+aborts the run).
+
+To make that failure clear instead of misleading, `sandbox()` runs an **automatic live-service
+pre-check** at entry: it scans the engine's real home (`brain.paths.get_home()/personas/*/bridge.json`)
+and uses the real `state_file.pid_is_alive` to detect a running bridge **up front**, raising a
+distinct **`LiveServiceDetected`** with a "quit your companion bridge (and any
+`launchd`/`systemd`/task-scheduler service) first" message — *before* the run starts, rather than
+dying later with a confusing `SandboxLeak`. It is **read-only** (it parses `bridge.json` bytes
+directly and never calls the heal-on-read `state_file.read()`), so it never writes to your real
+files.
+
+Control it with the `live_check=` kwarg: `"raise"` (default) fails fast; `"warn"` warns and
+continues (and annotates any later `SandboxLeak` so you know it was your bridge); `"off"` skips the
+check (use in CI, where no live bridge exists). An optional `probe=True` adds a double-fingerprint
+liveness probe as a complementary net for an external writer that has no discoverable `bridge.json`
+(a probe-only hit reports a generic "external writer" message, not a companion-specific one).
+
+Known limit: a live bridge whose `bridge.json` is *currently corrupt but recoverable from a `.bak`*
+is not detected by the read-only scan (detecting it would require the heal-on-read path, which
+writes) — the post-run `SandboxLeak` remains the backstop for that rare case.
 
 ## Usage — authoring a behavioral test
 
