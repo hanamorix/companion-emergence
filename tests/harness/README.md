@@ -147,7 +147,78 @@ uv run pytest tests/harness/examples/test_register_leak.py -v -m behavioral
 
 Exclude behavioral runs from a full-suite CI invocation with `-m "not behavioral"`.
 
+## Phase 3 — Agent-Bob (agent-drives-the-loop)
+
+Agent-Bob is the **same substitute-USER role as Dumb-Bob**, but the cheaper / continuous-context /
+sometimes-more-capable variant: a spawned **Agent-tool subagent** that holds the whole conversation
+in its own context and **drives the loop itself**, calling a send-script each turn and stopping on a
+trip/limit/max-turns. Because the Agent tool is a claude-code-runtime capability (not importable),
+the live run is **orchestrator-driven — it spends tokens and is NOT a pytest / NOT in CI.** The
+checked-in, token-free surface is the *mechanism*: the send-script (`agent_send.py`) and the
+spawn-prompt/param renderer (`AgentBob`).
+
+**Who runs this: the orchestrating claude-code SESSION, not a human.** The human only launches a run
+and reviews results; the session stands up the bridge, spawns Agent-Bob, and **adjudicates each trip
+programmatically** from the on-disk transcript.
+
+### The orchestration protocol (what the session executes)
+
+```python
+from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, AGENT_MOODS, ModelConfig
+from tests.harness.engine import BridgeServer
+import json, pathlib
+
+with sandbox() as sb:                                   # server-side containment (unchanged)
+    live = build_persona(PersonaSpec(memories=[MemorySeed(content="Bob's dog Biscuit is a border collie.")]), sb)
+    server = BridgeServer(live.persona_dir, port=8931)  # stood up with auth_token=None (engine.py)
+    server.start()
+    try:
+        # 1. write the LIVE_ENV the send-script reads (port/kindled_home/persona_dir/user[/token]).
+        live_env = sb.root / "live_env.json"
+        live_env.write_text(json.dumps({
+            "port": 8931, "kindled_home": str(sb.root),
+            "persona_dir": str(live.persona_dir), "user": live.user,
+        }))
+        # 2. LOOPBACK SMOKE (A3): the session itself runs one send BEFORE spawning Bob — confirm a
+        #    CANARY:/RESULT line comes back (proves loopback reachability under network isolation).
+        #    A connection error => the agent needs sandbox-disabled Bash; abort before Agent tokens.
+        #       LIVE_ENV=<live_env> ./tests/harness/agent_send.sh --new "hey"
+        # 3. render the spawn contract + spawn Agent-Bob via the Agent tool.
+        spec = AgentBob(
+            mood=AGENT_MOODS["bait"], harness_dir=str(pathlib.Path.cwd()),
+            live_env_path=str(live_env), max_turns=30, models=ModelConfig(bob="sonnet"),
+        ).spawn_params()
+        # Agent tool: prompt=spec.prompt, model=spec.model, effort=spec.effort  (== "low")
+        # 4. Agent-Bob drives via ./tests/harness/agent_send.sh; on `RESULT ... trip=true` it STOPS + reports.
+        # 5. ADJUDICATE PROGRAMMATICALLY: read sb.root/transcript.jsonl row N — rule fp/real from
+        #    `canary` + `signals` + `interior_present`: an `interior_quote` signal (the reply overlaps
+        #    the interior-continuity block) = a REAL interior leak; Canary quoting the USER's own words
+        #    / a scare-quote with no interior overlap = a false positive. SendMessage the agent
+        #    "false positive, continue" or "real, stop".
+    finally:
+        server.stop()
+```
+
+Token accounting: Canary = the transcript rows; Bob = the subagent's own reported usage (much
+cheaper than the per-turn `claude -p` DumbBob — continuous context, no system-prompt reload).
+
+The send-script ships with a **bash wrapper** (`agent_send.sh`) that locates the repo venv python and
+runs the module from the repo root. Smoke it on a bash host:
+`LIVE_ENV=<env.json> ./tests/harness/agent_send.sh --new "hi"`.
+
+`AgentBob` is a **driver/renderer, NOT a `Bob`** — it renders the spawn prompt + params and does not
+implement `next_message` (calling it raises). The pull-based `Runner`/`DumbBob` path is unchanged.
+
+**Scope note for `AGENT_MOODS["file-reconcile"]`.** In that mood Agent-Bob issues real `Write`/`Edit`
+tool calls to the notes file it owns. Those writes are the **agent's own** filesystem actions — they
+are NOT covered by the send-script's sandbox guard (which only owns the transcript/sid/gate files).
+It is the **orchestrator's responsibility** to scope where the agent may write (spawn it with a doc
+path INSIDE the sandbox, and rely on the claude-code runtime's own permissions) — the server-side
+`sandbox()` guarantee does not extend to the client agent's Write/Edit cwd.
+
 ## Status
 
-Phase 1 (Dumb-Bob, end-to-end + sandbox isolation) — **built.** AgentBob (Phase 3) is a documented
-stub; the authoring skill (Phase 4) is later.
+Phase 1 (Dumb-Bob, end-to-end + sandbox isolation) — **built.** Phase 2 (live-service pre-check) —
+**built.** Phase 3 (Agent-Bob renderer + `agent_send.py` send-script + interior-leak detector) —
+**built**; the live run is orchestrator-driven (marker-gated, not in CI). The authoring skill
+(Phase 4) is later.

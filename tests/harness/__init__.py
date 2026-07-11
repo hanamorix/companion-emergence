@@ -15,7 +15,20 @@ root outside the sandbox was mutated.
 Public API is exported here as the modules land (see README.md for status + usage).
 """
 
-from .bob import AgentBob, Bob, BobContext, BobTurn, DumbBob, is_usage_limit
+from .bob import (
+    AGENT_EFFORT,
+    AGENT_MOODS,
+    MOOD_BAIT,
+    MOOD_CONTROL,
+    MOOD_FILE_RECONCILE,
+    AgentBob,
+    AgentSpawnSpec,
+    Bob,
+    BobContext,
+    BobTurn,
+    DumbBob,
+    is_usage_limit,
+)
 from .config import (
     DEFAULT_MODELS,
     DEFAULT_TIMEOUTS,
@@ -30,14 +43,17 @@ from .config import (
 )
 from .detector import (
     DEFAULT_USER_NAME,
+    CompositeDetector,
     Detector,
     DetectorGateError,
+    InteriorLeakDetector,
     RegisterLeakDetector,
     Score,
     TurnContext,
     assert_detector_gate,
+    default_example_detector,
 )
-from .engine import BridgeServer, atomic_write, collect_reply, parse_ws_frame
+from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
 from .runner import ArmSpec, Runner, RunnerState
@@ -65,14 +81,16 @@ __all__: list[str] = [
     "PersonaSpec", "MemorySeed", "LiveEnv", "build_persona",
     "IncidentSpec", "IncidentResult", "build_compacted_state",
     # bob
-    "Bob", "BobTurn", "BobContext", "DumbBob", "AgentBob", "is_usage_limit",
+    "Bob", "BobTurn", "BobContext", "DumbBob", "AgentBob", "AgentSpawnSpec", "is_usage_limit",
+    "AGENT_MOODS", "MOOD_CONTROL", "MOOD_BAIT", "MOOD_FILE_RECONCILE", "AGENT_EFFORT",
     # speech
     "dyslexify", "CLEAN", "REALISTIC",
     # detector
     "Detector", "Score", "TurnContext", "assert_detector_gate", "DetectorGateError",
-    "RegisterLeakDetector", "DEFAULT_USER_NAME",
+    "RegisterLeakDetector", "InteriorLeakDetector", "CompositeDetector",
+    "default_example_detector", "DEFAULT_USER_NAME",
     # engine
-    "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply",
+    "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply", "drive_ws",
     # runner / watchdog
     "ArmSpec", "Runner", "RunnerState", "Watchdog", "real_ping_fn", "watchdog_ping_argv",
 ]
