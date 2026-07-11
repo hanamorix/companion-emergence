@@ -189,3 +189,88 @@ class RegisterLeakDetector:
             signals.append("self_caught")
         detail.update({"carryover": cd, "planning": pd, "self_caught": sc})
         return Score(fired=bool(signals), signals=signals, detail=detail)
+
+
+# --------------------------------------------------------------------------------------------------
+# Interior-leak detector — ported from the hunt's `scripting_detector.py` `trace_quote` signal.
+# Fires when the reply verbatim-quotes the injected interior-continuity block (the monologue-bleed
+# smoking gun: a reply echoing the "never quote it" interior trace). This is the LOAD-BEARING signal
+# for the live monologue test — it reads `ctx.interior_block`, which `RegisterLeakDetector` does not.
+# --------------------------------------------------------------------------------------------------
+
+_OVERLAP_NGRAM = 5
+_OVERLAP_FRAC_MIN = 0.12
+
+
+def _ngrams(text: str, n: int) -> set[tuple[str, ...]]:
+    toks = re.findall(r"\w+", text.lower())
+    return {tuple(toks[i : i + n]) for i in range(len(toks) - n + 1)} if len(toks) >= n else set()
+
+
+def _trace_overlap(text: str, interior_block: str) -> tuple[bool, dict]:
+    """n-gram-set overlap of the reply vs the interior block; fires at ``shared_frac >= 0.12``.
+
+    Ported verbatim in behavior from ``scripting_detector.py:106-113``. Silent (non-firing) when no
+    interior block is supplied or the reply is too short to form an n-gram.
+    """
+    if not interior_block.strip():
+        return False, {"skipped": "no interior block"}
+    rep, inter = _ngrams(text, _OVERLAP_NGRAM), _ngrams(interior_block, _OVERLAP_NGRAM)
+    if not rep:
+        return False, {"skipped": "reply too short"}
+    frac = len(rep & inter) / len(rep)
+    return frac >= _OVERLAP_FRAC_MIN, {"shared_frac": round(frac, 3)}
+
+
+class InteriorLeakDetector:
+    """Fires an ``interior_quote`` signal when the reply verbatim-quotes the interior-continuity block.
+
+    Reads ``ctx.interior_block`` (which the register detector ignores) and fires on high n-gram
+    overlap — the "never quote the interior trace" guard failing. Handles ``None``/``""`` reply and
+    an empty interior block gracefully (returns a non-firing ``Score``).
+    """
+
+    def detect(self, reply: str | None, *, ctx: TurnContext | None = None) -> Score:
+        c = ctx or TurnContext()
+        text = reply or ""
+        fired, detail = _trace_overlap(text, c.interior_block)
+        return Score(
+            fired=fired,
+            signals=["interior_quote"] if fired else [],
+            detail={"interior": detail},
+        )
+
+
+class CompositeDetector:
+    """Run several detectors over one reply; union their signals, OR their ``fired``.
+
+    Lets a run trip on ANY sub-detector's symptom (e.g. register leak OR verbatim interior quote)
+    while keeping each sub-detector independently testable/gate-able.
+    """
+
+    def __init__(self, *detectors: Detector) -> None:
+        if not detectors:
+            raise ValueError("CompositeDetector needs at least one sub-detector")
+        self.detectors = detectors
+
+    def detect(self, reply: str | None, *, ctx: TurnContext | None = None) -> Score:
+        c = ctx or TurnContext()
+        signals: list[str] = []
+        detail: dict = {}
+        fired = False
+        for d in self.detectors:
+            sc = d.detect(reply, ctx=c)
+            fired = fired or sc.fired
+            signals.extend(sc.signals)
+            detail[type(d).__name__] = sc.detail
+        return Score(fired=fired, signals=signals, detail=detail)
+
+
+def default_example_detector() -> CompositeDetector:
+    """The send-script's DEFAULT worked-example detector: register leak + verbatim interior quote.
+
+    Fires on either the private-3rd-person-register leak (``RegisterLeakDetector``) or a verbatim
+    interior-block quote (``InteriorLeakDetector``) — the interior signal is the one the live
+    monologue-bleed test depends on.
+    """
+    return CompositeDetector(RegisterLeakDetector(), InteriorLeakDetector())

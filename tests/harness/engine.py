@@ -58,6 +58,48 @@ def collect_reply(frames: list[dict]) -> tuple[str, list[str], str | None, bool]
     return "".join(reply), tools, err, got_done
 
 
+def drive_ws(
+    host: str,
+    port: int,
+    sid: str,
+    message: str,
+    *,
+    timeout: float = 300.0,
+    open_timeout: float = 30.0,
+    token: str | None = None,
+) -> tuple[str, list[str], str | None]:  # pragma: no cover - needs a live bridge / socket
+    """Drive ONE turn over ``ws://{host}:{port}/stream/{sid}``; return (reply, tools, error).
+
+    The single bounded recv loop reused by both :meth:`BridgeServer.drive_turn` and the Agent-Bob
+    send-script (``agent_send.py``) — so there is one WS drive path, not two. Bounds the receive on
+    ``timeout`` wall-clock; reduces frames with :func:`parse_ws_frame` + :func:`collect_reply`.
+
+    When ``token`` is given, the WS is opened with the ``bearer, <token>`` **subprotocol** — the
+    form the bridge's WS auth reads (``brain/bridge/server.py:_ws_subprotocol_token`` /
+    ``_ws_accept_subprotocol``). Without a token the subprotocol is omitted (an ``auth_token=None``
+    bridge — the sandbox default — needs none), so :meth:`BridgeServer.drive_turn` is unchanged.
+    """
+    from websockets.sync.client import connect
+
+    base = f"{host}:{port}"
+    subprotocols = ["bearer", token] if token else None
+    frames: list[dict] = []
+    t0 = time.time()
+    try:
+        with connect(
+            f"ws://{base}/stream/{sid}", open_timeout=open_timeout, subprotocols=subprotocols
+        ) as ws:
+            ws.send(json.dumps({"message": message}))
+            while time.time() - t0 < timeout:
+                frames.append(parse_ws_frame(ws.recv()))
+                if frames[-1].get("type") in ("done", "error"):
+                    break
+    except Exception as e:
+        return "", [], f"ws:{type(e).__name__}"
+    reply, tools, err, _ = collect_reply(frames)
+    return reply, tools, err
+
+
 class BridgeServer:
     """Start/stop the REAL bridge on a background uvicorn thread inside the sandbox.
 
@@ -104,20 +146,11 @@ class BridgeServer:
     def drive_turn(
         self, sid: str, message: str, *, timeout: float = 300.0, open_timeout: float = 30.0
     ) -> tuple[str, list[str], str | None]:  # pragma: no cover - needs live bridge
-        """Drive one turn over ``/stream/{sid}``; return (reply, tools, error)."""
-        from websockets.sync.client import connect
+        """Drive one turn over ``/stream/{sid}``; return (reply, tools, error).
 
-        base = f"{self.host}:{self.port}"
-        frames: list[dict] = []
-        t0 = time.time()
-        try:
-            with connect(f"ws://{base}/stream/{sid}", open_timeout=open_timeout) as ws:
-                ws.send(json.dumps({"message": message}))
-                while time.time() - t0 < timeout:
-                    frames.append(parse_ws_frame(ws.recv()))
-                    if frames[-1].get("type") in ("done", "error"):
-                        break
-        except Exception as e:
-            return "", [], f"ws:{type(e).__name__}"
-        reply, tools, err, _ = collect_reply(frames)
-        return reply, tools, err
+        Delegates to the shared :func:`drive_ws` — the ONE bounded recv loop (the send-script uses
+        the same helper), so there is a single WS drive path.
+        """
+        return drive_ws(
+            self.host, self.port, sid, message, timeout=timeout, open_timeout=open_timeout
+        )
