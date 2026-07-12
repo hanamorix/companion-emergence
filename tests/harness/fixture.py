@@ -53,6 +53,7 @@ class PersonaSpec:
     model: str | None = None  # overrides ModelConfig.canary
     name: str = PERSONA_NAME
     user_name: str = SYNTHETIC_USER
+    editable_paths: list[Path] = field(default_factory=list)  # F5 sandbox-extension; see LiveEnv
 
 
 @dataclass
@@ -65,6 +66,12 @@ class LiveEnv:
     model: str
     sid: str | None = None
     interior_block_chars: int = 0
+    # F5: the declared editable paths (resolved), recorded here so the driver has ONE source of truth
+    # to pass to ``bob.confirm_writes(persona_dir, live.editable_paths)`` — the SAME set it must also
+    # hand to ``sandbox(editable_paths=...)``. A mismatch (committing to a path the sandbox did not
+    # exclude) is caught fail-safe by the post-run SandboxLeak. Notes stay OFF regardless (the reframe
+    # lands writes via Bob-confirms, not by enabling the persona's notes feature).
+    editable_paths: list[Path] = field(default_factory=list)
 
 
 def _force_safe_persona_config(persona_dir: Path) -> None:
@@ -124,7 +131,13 @@ def build_persona(
     finally:
         store.close()
 
-    live = LiveEnv(persona_dir=persona_dir, persona=spec.name, user=spec.user_name, model=model)
+    live = LiveEnv(
+        persona_dir=persona_dir,
+        persona=spec.name,
+        user=spec.user_name,
+        model=model,
+        editable_paths=[Path(p).expanduser().resolve() for p in spec.editable_paths],
+    )
 
     if spec.incident is not None:
         from .incident import build_compacted_state

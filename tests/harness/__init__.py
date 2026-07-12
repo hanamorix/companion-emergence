@@ -51,9 +51,11 @@ from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
 from .runner import ArmSpec, Runner, RunnerState
 from .sandbox import (
+    HARNESS_EDITABLE_SENTINEL,
     LIVE_CHECK_OFF,
     LIVE_CHECK_RAISE,
     LIVE_CHECK_WARN,
+    EditablePathRefused,
     LiveServiceDetected,
     SandboxHandle,
     SandboxLeak,
@@ -65,6 +67,7 @@ from .watchdog import Watchdog, real_ping_fn, watchdog_ping_argv
 __all__: list[str] = [
     # sandbox (safety core)
     "sandbox", "SandboxHandle", "SandboxLeak", "LiveServiceDetected",
+    "EditablePathRefused", "HARNESS_EDITABLE_SENTINEL",
     "LIVE_CHECK_RAISE", "LIVE_CHECK_WARN", "LIVE_CHECK_OFF",
     # config
     "ModelConfig", "Timeouts", "DEFAULT_MODELS", "DEFAULT_TIMEOUTS",
