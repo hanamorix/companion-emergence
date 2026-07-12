@@ -1,10 +1,10 @@
-# Behavioral-test harness
+# Live-test harness
 
-A permanent, **sandboxed** framework for behavioral tests that drive the **real**
-companion-emergence engine — as opposed to unit tests that mock it. It generalizes the ad-hoc
-harness built during the monologue-bleed bug hunt.
+A permanent, **sandboxed** framework for live tests that drive the **real** companion-emergence
+engine — as opposed to unit tests that mock it. ("Live" because it exercises everything except the
+GUI, not only model *behavior*.) It generalizes an ad-hoc harness built during a prior bug hunt.
 
-The shape of a behavioral test:
+The shape of a live test:
 
 > seed a throwaway persona (**Canary**) → stand up the real bridge → drive it with an
 > LLM-simulated human (**Bob**) → run a **detector** over the replies → optionally orchestrate
@@ -32,7 +32,7 @@ sandbox**. Every run goes through the `sandbox()` context manager, which:
 (a real multiply-folded compaction/incident regime) as fixtures; plug in your own symptom detector;
 run multi-arm A/B matrices; survive usage-limit stalls and resume.
 
-**Can't (yet):** test the GUI; run the token-spending behavioral runs in CI (they need real `claude`
+**Can't (yet):** test the GUI; run the token-spending live runs in CI (they need real `claude`
 auth and cost money — they're marker-gated and run manually/locally); Agent-Bob (a persistent-agent
 user-sim) lands in a later phase.
 
@@ -86,23 +86,36 @@ Known limit: a live bridge whose `bridge.json` is *currently corrupt but recover
 is not detected by the read-only scan (detecting it would require the heal-on-read path, which
 writes) — the post-run `SandboxLeak` remains the backstop for that rare case.
 
-## Usage — authoring a behavioral test
+## Usage — authoring a live test
+
+**You supply the detector.** The framework ships NO detector and makes no assumption about what a
+detector inspects. A detector is any object with `detect(reply, *, ctx) -> Score`; validate it on
+anchors before trusting it (B-REP-3), then score each reply. If a detector needs domain-specific
+per-turn context, it reads it from `ctx.extra` (an author-namespaced bag) — core never touches `extra`.
 
 ```python
 from tests.harness import (
     sandbox, PersonaSpec, MemorySeed, build_persona,
-    DumbBob, BobContext, RegisterLeakDetector, TurnContext, assert_detector_gate,
+    DumbBob, BobContext, Score, TurnContext, assert_detector_gate,
 )
 from tests.harness.engine import BridgeServer
 
+
+# 0. Author your own detector (this trivial one just flags a banned keyword).
+class KeywordDetector:
+    def __init__(self, banned): self.banned = tuple(b.lower() for b in banned)
+    def detect(self, reply, *, ctx=None):
+        hits = [b for b in self.banned if b in (reply or "").lower()]
+        return Score(fired=bool(hits), signals=[f"keyword:{h}" for h in hits])
+
 # 1. Validate your detector on anchors BEFORE trusting it (B-REP-3).
-detector = RegisterLeakDetector()
-assert_detector_gate(detector, known_true="note to self: land it lightly.", known_clean="yeah, how's the knee?")
+detector = KeywordDetector(banned=("secret_token",))
+assert_detector_gate(detector, known_true="here is the SECRET_TOKEN", known_clean="how's your evening?")
 
 # 2. Run inside the sandbox.
 with sandbox() as sb:
     live = build_persona(
-        PersonaSpec(memories=[MemorySeed(content="Bob's dog Biscuit is a border collie.")]),
+        PersonaSpec(memories=[MemorySeed(content="Bob is teaching himself sourdough.")]),
         sb,
     )
     server = BridgeServer(live.persona_dir, port=8931)
@@ -124,6 +137,8 @@ with sandbox() as sb:
         server.stop()
 ```
 
+The worked example `examples/test_generic_run.py` runs exactly this loop end-to-end (marker-gated).
+
 An "aged persona" fixture (a real multiply-folded compaction regime) is built by passing a
 `PersonaSpec(incident=IncidentSpec(...))` + a compaction provider to `build_persona`.
 
@@ -141,11 +156,11 @@ checkpoints on a usage stall (exit 20) and resumes, parks a detector trip (exit 
 uv run pytest tests/unit/harness/ -v
 uv run ruff check tests/harness tests/unit/harness
 
-# The worked behavioral example — SPENDS TOKENS, needs claude auth (NOT in default CI):
-uv run pytest tests/harness/examples/test_register_leak.py -v -m behavioral
+# The worked generic example — SPENDS TOKENS, needs claude auth (NOT in default CI):
+uv run pytest tests/harness/examples/test_generic_run.py -v -m live
 ```
 
-Exclude behavioral runs from a full-suite CI invocation with `-m "not behavioral"`.
+Exclude live runs from a full-suite CI invocation with `-m "not live"`.
 
 ## Phase 3 — Agent-Bob (agent-drives-the-loop)
 
@@ -164,36 +179,39 @@ programmatically** from the on-disk transcript.
 ### The orchestration protocol (what the session executes)
 
 ```python
-from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, AGENT_MOODS, ModelConfig
+from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, ModelConfig
 from tests.harness.engine import BridgeServer
 import json, pathlib
 
 with sandbox() as sb:                                   # server-side containment (unchanged)
-    live = build_persona(PersonaSpec(memories=[MemorySeed(content="Bob's dog Biscuit is a border collie.")]), sb)
+    live = build_persona(PersonaSpec(memories=[MemorySeed(content="Bob is teaching himself sourdough.")]), sb)
     server = BridgeServer(live.persona_dir, port=8931)  # stood up with auth_token=None (engine.py)
     server.start()
     try:
-        # 1. write the LIVE_ENV the send-script reads (port/kindled_home/persona_dir/user[/token]).
+        # 1. write the LIVE_ENV the send-script reads. You MUST attach your own detector via a
+        #    "module.path:factory" dotted path — the framework ships NO default detector. Optionally
+        #    attach a turn_context hook (factory(env) -> dict) to populate ctx.extra with domain data.
         live_env = sb.root / "live_env.json"
         live_env.write_text(json.dumps({
             "port": 8931, "kindled_home": str(sb.root),
             "persona_dir": str(live.persona_dir), "user": live.user,
+            "detector": "my_pkg.my_detectors:make_detector",       # REQUIRED — your own detector
+            "turn_context": "my_pkg.my_context:make_extra",        # OPTIONAL — domain ctx.extra
         }))
         # 2. LOOPBACK SMOKE (A3): the session itself runs one send BEFORE spawning Bob — confirm a
         #    CANARY:/RESULT line comes back (proves loopback reachability under network isolation).
         #    A connection error => the agent needs sandbox-disabled Bash; abort before Agent tokens.
         #       LIVE_ENV=<live_env> ./tests/harness/agent_send.sh --new "hey"
-        # 3. render the spawn contract + spawn Agent-Bob via the Agent tool.
+        # 3. render the spawn contract + spawn Agent-Bob via the Agent tool. `mood` is YOUR string.
         spec = AgentBob(
-            mood=AGENT_MOODS["bait"], harness_dir=str(pathlib.Path.cwd()),
+            mood="...your author-supplied test-user mood...", harness_dir=str(pathlib.Path.cwd()),
             live_env_path=str(live_env), max_turns=30, models=ModelConfig(bob="sonnet"),
         ).spawn_params()
         # Agent tool: prompt=spec.prompt, model=spec.model, effort=spec.effort  (== "low")
         # 4. Agent-Bob drives via ./tests/harness/agent_send.sh; on `RESULT ... trip=true` it STOPS + reports.
         # 5. ADJUDICATE PROGRAMMATICALLY: read sb.root/transcript.jsonl row N — rule fp/real from
-        #    `canary` + `signals` + `interior_present`: an `interior_quote` signal (the reply overlaps
-        #    the interior-continuity block) = a REAL interior leak; Canary quoting the USER's own words
-        #    / a scare-quote with no interior overlap = a false positive. SendMessage the agent
+        #    `canary` + `signals` + `extra_keys` (which of your turn_context keys were present that turn).
+        #    Interpret the signals with knowledge of YOUR detector. SendMessage the agent
         #    "false positive, continue" or "real, stop".
     finally:
         server.stop()
@@ -209,16 +227,17 @@ runs the module from the repo root. Smoke it on a bash host:
 `AgentBob` is a **driver/renderer, NOT a `Bob`** — it renders the spawn prompt + params and does not
 implement `next_message` (calling it raises). The pull-based `Runner`/`DumbBob` path is unchanged.
 
-**Scope note for `AGENT_MOODS["file-reconcile"]`.** In that mood Agent-Bob issues real `Write`/`Edit`
-tool calls to the notes file it owns. Those writes are the **agent's own** filesystem actions — they
-are NOT covered by the send-script's sandbox guard (which only owns the transcript/sid/gate files).
-It is the **orchestrator's responsibility** to scope where the agent may write (spawn it with a doc
-path INSIDE the sandbox, and rely on the claude-code runtime's own permissions) — the server-side
-`sandbox()` guarantee does not extend to the client agent's Write/Edit cwd.
+**Scope note — a file-editing mood.** If your author-supplied mood has Agent-Bob issue real
+`Write`/`Edit` tool calls (e.g. it owns a notes file it reworks with Canary), those writes are the
+**agent's own** filesystem actions — they are NOT covered by the send-script's sandbox guard (which
+only owns the transcript/sid/gate files). It is the **orchestrator's responsibility** to scope where
+the agent may write (spawn it with a doc path INSIDE the sandbox, and rely on the claude-code runtime's
+own permissions) — the server-side `sandbox()` guarantee does not extend to the client agent's
+Write/Edit cwd.
 
 ## Status
 
 Phase 1 (Dumb-Bob, end-to-end + sandbox isolation) — **built.** Phase 2 (live-service pre-check) —
-**built.** Phase 3 (Agent-Bob renderer + `agent_send.py` send-script + interior-leak detector) —
-**built**; the live run is orchestrator-driven (marker-gated, not in CI). The authoring skill
+**built.** Phase 3 (Agent-Bob renderer + `agent_send.py` send-script + the general detector-attachment
+seam) — **built**; the live run is orchestrator-driven (marker-gated, not in CI). The authoring skill
 (Phase 4) is later.

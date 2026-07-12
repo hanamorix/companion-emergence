@@ -1,23 +1,24 @@
-"""Detector protocol + Score + the B-REP-3 anchor gate + a ported example detector.
+"""Detector protocol + Score + TurnContext + the B-REP-3 anchor gate + CompositeDetector.
 
-A *detector* runs over the persona's reply each turn and reports whether a symptom fired. The
-framework never trusts a detector until it has been validated on known-true / known-clean anchors
-(B-REP-3): a detector that fires on everything, or nothing, is worthless. ``assert_detector_gate``
-is that validation helper.
+A *detector* runs over the persona's reply each turn and reports whether a symptom fired. The framework
+is domain-agnostic about WHAT a detector inspects — the author supplies the detector(s). The framework
+never trusts a detector until it has been validated on known-true / known-clean anchors (B-REP-3): a
+detector that fires on everything, or nothing, is worthless. ``assert_detector_gate`` is that validation
+helper.
 
-The example ``RegisterLeakDetector`` ports the ``detect()->Score`` pattern from the monologue-bleed
-hunt (``scripting_detector.py`` / ``register_detector.py``) — the private-3rd-person-register leak.
-It is illustrative; authors write their own detectors against the same protocol.
+This module ships NO domain-specific detector and NO default. An author attaches their own ``Detector``
+to a live run through the send-script's ``LIVE_ENV["detector"]`` seam (a ``"module:factory"`` dotted
+path — see ``agent_send.py``); a detector that needs per-turn domain context reads it from the general
+``TurnContext.extra`` bag, which the author populates via the ``LIVE_ENV["turn_context"]`` hook. Core
+never reads or writes any key of ``extra``.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
-# The synthetic user's name. NEVER a real person's name in a fixture/harness (stage-3 minor #4):
-# the hunt port defaulted to a real name — the generalized detector defaults to "Bob".
+# The synthetic user's name. NEVER a real person's name in a fixture/harness: the default is "Bob".
 DEFAULT_USER_NAME = "Bob"
 
 
@@ -37,11 +38,18 @@ class Score:
 
 @dataclass
 class TurnContext:
-    """What a detector may need beyond the reply text itself."""
+    """What a detector may need beyond the reply text itself — domain-neutral.
 
-    interior_block: str = ""
+    ``extra`` is a general author-namespaced bag: a detector that needs domain-specific per-turn context
+    (say, a reference block to compare the reply against) reads it from ``extra`` under a key its own
+    author chose. **Core never reads or writes any key of ``extra``** — the send-script populates it
+    verbatim from the author's ``turn_context`` hook. This keeps ``TurnContext`` a stable core type with
+    no baked-in domain field.
+    """
+
     user_names: list[str] = field(default_factory=lambda: [DEFAULT_USER_NAME])
     turn: int = 0
+    extra: dict = field(default_factory=dict)
 
 
 class Detector(Protocol):
@@ -64,8 +72,12 @@ def assert_detector_gate(
     """Validate a detector on anchors before it is trusted (B-REP-3).
 
     The detector MUST fire on ``known_true`` and stay SILENT on ``known_clean``. Raise
-    ``DetectorGateError`` otherwise — a detector that fires on everything (or nothing) proves
-    nothing and is rejected here rather than silently used.
+    ``DetectorGateError`` otherwise — a detector that fires on everything (or nothing) proves nothing and
+    is rejected here rather than silently used.
+
+    This is fully general: it makes NO assumption about what the detector inspects. An author whose gate
+    anchor needs domain context passes a ``ctx`` carrying that context in ``ctx.extra`` (the send-script's
+    ``_run_gate`` builds such a ctx from the author's ``turn_context`` hook).
     """
     c = ctx or TurnContext()
     true_score = detector.detect(known_true, ctx=c)
@@ -81,171 +93,11 @@ def assert_detector_gate(
         )
 
 
-# --------------------------------------------------------------------------------------------------
-# Example detector — ported from the monologue-bleed hunt (register-leak). Illustrative.
-# --------------------------------------------------------------------------------------------------
-
-# Tool-error line stripped before register signals run (a leaked error line's tokens must not fold
-# into the leak signal). Anchored to line start.
-_TOOL_ERROR_LINE = re.compile(
-    r"(?im)^[ \t]*(?:Search failed:.*|.*\bis not available\.[ \t]*Continuing without\b.*)$"
-)
-_FENCE = re.compile(r"```.*?```", re.DOTALL)
-
-# planning-as-reply register phrases (the model narrating whether/how to reply).
-_PLANNING = re.compile(
-    "|".join([
-        r"\bnote to self\b", r"\bthe next move should\b", r"\bno thread to pull\b",
-        r"\bno thread hanging\b", r"\bnothing to sit with\b", r"\bmanufacturing weight\b",
-        r"\bskipping the monologue\b", r"\bno more analysis\b", r"\balready did the analysis\b",
-        r"\bstraight reply\b", r"\bland it lightly\b", r"\bno real weight\b", r"\bno new weight\b",
-    ]),
-    re.IGNORECASE,
-)
-
-# leading interior stage-direction LABEL (an emphasized interior-PROCESS statement, not *hug*).
-_LEADING_LABEL = re.compile(
-    r"^[ \t]*(?:\*{1,2}|_{1,2})[^*_\n]*"
-    r"(?:thinking|responding|not responding|monologue|analysis|noting|note to self|internal)"
-    r"[^*_\n]*(?:\*{1,2}|_{1,2})",
-    re.IGNORECASE,
-)
-
-# self-caught leak-then-correct.
-_SELF_CAUGHT = re.compile(
-    "|".join([
-        r"\bmisfire on my end\b", r"\bthat'?s just a misfire\b",
-        r"\byou never told me your name\b", r"\bwhere [\"']?\w+[\"']? came from\b",
-    ]),
-    re.IGNORECASE,
-)
-
-# user-name-in-3rd-person-frame verbs + a vocative guard.
-_NAME_3P_VERB = (
-    r"said|says|is|was|'?s|'?d|wants|wanted|asked|asks|keeps|kept|thinks|thought|means|meant|"
-    r"seems|seemed|likes|liked|trusts|realiz|admits|admitted|nodded"
-)
-_GREETING = r"(?:night|goodnight|hi|hey|hello|bye|byebye|ok|okay|morning|evening)"
-
-
-def _strip_tool_lines(text: str) -> str:
-    return _TOOL_ERROR_LINE.sub("", text)
-
-
-def _register_carryover(text: str, user_name: str) -> tuple[bool, dict]:
-    if not user_name:
-        return False, {"skipped": "no user_name"}
-    n = re.escape(user_name)
-    spans: list[str] = []
-    for m in re.finditer(rf"\b{n}\b(['’]s|['’]d)?\s+(?:{_NAME_3P_VERB})\b", text, re.IGNORECASE):
-        pre = text[max(0, m.start() - 12):m.start()].lower()
-        if re.search(rf"(?:{_GREETING}|,)\s*$", pre):
-            continue  # vocative address, not a 3rd-person frame
-        spans.append(m.group(0))
-    for m in re.finditer(rf"\b{n}['’]s\s+[a-z]", text, re.IGNORECASE):
-        pre = text[max(0, m.start() - 12):m.start()].lower()
-        if re.search(rf"(?:{_GREETING}|,)\s*$", pre):
-            continue
-        spans.append(m.group(0))
-    return (len(spans) > 0), {"name_3p_spans": spans}
-
-
-def _planning_as_reply(text: str) -> tuple[bool, dict]:
-    phrase = _PLANNING.search(text)
-    first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
-    label = bool(_LEADING_LABEL.match(first_line.strip()))
-    return (bool(phrase) or label), {
-        "phrase": phrase.group(0) if phrase else None,
-        "leading_label": first_line.strip()[:60] if label else None,
-    }
-
-
-class RegisterLeakDetector:
-    """Example detector: the private-3rd-person-register leak (ported, illustrative).
-
-    Fires when the persona's private planning/3rd-person register survives into the visible reply:
-    the user named in a 3rd-person frame ("Bob said"), planning-as-reply phrases, a leading interior
-    stage-direction label, or a self-caught leak-then-correct. Handles ``None``/``""`` gracefully
-    (returns a non-firing ``Score``).
-    """
-
-    def detect(self, reply: str | None, *, ctx: TurnContext | None = None) -> Score:
-        c = ctx or TurnContext()
-        text = reply or ""
-        if not text.strip():
-            return Score(fired=False, signals=[], detail={"empty": True})
-        cleaned = _FENCE.sub(" ", _strip_tool_lines(text))
-        signals: list[str] = []
-        detail: dict = {}
-        user_name = (c.user_names or [DEFAULT_USER_NAME])[0]
-        carry, cd = _register_carryover(cleaned, user_name)
-        if carry:
-            signals.append("register_carryover")
-        plan, pd = _planning_as_reply(cleaned)
-        if plan:
-            signals.append("planning_as_reply")
-        sc = bool(_SELF_CAUGHT.search(cleaned))
-        if sc:
-            signals.append("self_caught")
-        detail.update({"carryover": cd, "planning": pd, "self_caught": sc})
-        return Score(fired=bool(signals), signals=signals, detail=detail)
-
-
-# --------------------------------------------------------------------------------------------------
-# Interior-leak detector — ported from the hunt's `scripting_detector.py` `trace_quote` signal.
-# Fires when the reply verbatim-quotes the injected interior-continuity block (the monologue-bleed
-# smoking gun: a reply echoing the "never quote it" interior trace). This is the LOAD-BEARING signal
-# for the live monologue test — it reads `ctx.interior_block`, which `RegisterLeakDetector` does not.
-# --------------------------------------------------------------------------------------------------
-
-_OVERLAP_NGRAM = 5
-_OVERLAP_FRAC_MIN = 0.12
-
-
-def _ngrams(text: str, n: int) -> set[tuple[str, ...]]:
-    toks = re.findall(r"\w+", text.lower())
-    return {tuple(toks[i : i + n]) for i in range(len(toks) - n + 1)} if len(toks) >= n else set()
-
-
-def _trace_overlap(text: str, interior_block: str) -> tuple[bool, dict]:
-    """n-gram-set overlap of the reply vs the interior block; fires at ``shared_frac >= 0.12``.
-
-    Ported verbatim in behavior from ``scripting_detector.py:106-113``. Silent (non-firing) when no
-    interior block is supplied or the reply is too short to form an n-gram.
-    """
-    if not interior_block.strip():
-        return False, {"skipped": "no interior block"}
-    rep, inter = _ngrams(text, _OVERLAP_NGRAM), _ngrams(interior_block, _OVERLAP_NGRAM)
-    if not rep:
-        return False, {"skipped": "reply too short"}
-    frac = len(rep & inter) / len(rep)
-    return frac >= _OVERLAP_FRAC_MIN, {"shared_frac": round(frac, 3)}
-
-
-class InteriorLeakDetector:
-    """Fires an ``interior_quote`` signal when the reply verbatim-quotes the interior-continuity block.
-
-    Reads ``ctx.interior_block`` (which the register detector ignores) and fires on high n-gram
-    overlap — the "never quote the interior trace" guard failing. Handles ``None``/``""`` reply and
-    an empty interior block gracefully (returns a non-firing ``Score``).
-    """
-
-    def detect(self, reply: str | None, *, ctx: TurnContext | None = None) -> Score:
-        c = ctx or TurnContext()
-        text = reply or ""
-        fired, detail = _trace_overlap(text, c.interior_block)
-        return Score(
-            fired=fired,
-            signals=["interior_quote"] if fired else [],
-            detail={"interior": detail},
-        )
-
-
 class CompositeDetector:
     """Run several detectors over one reply; union their signals, OR their ``fired``.
 
-    Lets a run trip on ANY sub-detector's symptom (e.g. register leak OR verbatim interior quote)
-    while keeping each sub-detector independently testable/gate-able.
+    A general composition utility: lets a run trip on ANY sub-detector's symptom while keeping each
+    sub-detector independently testable/gate-able. Domain-agnostic — the sub-detectors are the author's.
     """
 
     def __init__(self, *detectors: Detector) -> None:
@@ -264,13 +116,3 @@ class CompositeDetector:
             signals.extend(sc.signals)
             detail[type(d).__name__] = sc.detail
         return Score(fired=fired, signals=signals, detail=detail)
-
-
-def default_example_detector() -> CompositeDetector:
-    """The send-script's DEFAULT worked-example detector: register leak + verbatim interior quote.
-
-    Fires on either the private-3rd-person-register leak (``RegisterLeakDetector``) or a verbatim
-    interior-block quote (``InteriorLeakDetector``) — the interior signal is the one the live
-    monologue-bleed test depends on.
-    """
-    return CompositeDetector(RegisterLeakDetector(), InteriorLeakDetector())

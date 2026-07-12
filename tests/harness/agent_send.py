@@ -17,27 +17,32 @@ Plus an explicit STOP directive line when trip or limit fires. ``signals=`` is d
 from the detector's returned ``Score.signals`` (one ``name:1`` per fired signal); ``trip`` derives
 from ``Score.fired``.
 
-This is the generalized, checked-in successor to the hunt's ``live_send.py``: no ``sys.path`` hack,
-no hardcoded absolute paths, a PLUGGABLE detector (any ``Detector``), and the single shared
-``engine.drive_ws`` recv loop.
+This is the generalized, checked-in send-script: no ``sys.path`` hack, no hardcoded absolute paths, a
+PLUGGABLE detector (any ``Detector``), and the single shared ``engine.drive_ws`` recv loop. **It ships
+NO default detector** — the author attaches one via ``LIVE_ENV["detector"]``.
 
 Usage:
     LIVE_ENV=<env.json> python3 -m tests.harness.agent_send "the human message"
     LIVE_ENV=<env.json> python3 -m tests.harness.agent_send --new "first message"  # fresh session
     (or via the ``agent_send.sh`` wrapper, which locates the repo venv python)
 
-``LIVE_ENV`` json keys: ``port``, ``kindled_home``, ``persona_dir``, ``user`` (default "Bob"),
-optional ``gate_known_true`` / ``gate_known_clean`` (detector-gate anchors), optional ``token``
-(sent as the bridge auth token — HTTP ``Authorization: Bearer`` on ``/session/new`` AND the
-``bearer, <token>`` WS subprotocol on ``/stream`` — if the bridge was stood up with one).
-
-The detector is the register+interior composite worked example (``default_example_detector``). To
-run a different detector, edit :func:`build_detector` (a one-liner) — the framework does not carry a
-name→detector registry; authors wire their own detector directly.
+``LIVE_ENV`` json keys:
+    ``port``, ``kindled_home``, ``persona_dir``, ``user`` (default "Bob");
+    ``detector`` (REQUIRED) — a ``"module.path:factory"`` dotted path; the module is imported and the
+        zero-arg factory called to build the ``Detector`` for this run. No default: core has no opinion
+        about what to detect, so it refuses to run without one. There is NO name->detector registry —
+        the author names their own code.
+    ``turn_context`` (optional) — a ``"module.path:factory"`` dotted path where ``factory(env) -> dict``
+        returns the per-turn ``TurnContext.extra`` bag (domain context a detector needs). Absent -> the
+        detector sees ``extra={}``. Core never inspects the returned dict.
+    ``gate_known_true`` / ``gate_known_clean`` (optional) — detector-gate anchors (B-REP-3).
+    ``token`` (optional) — the bridge auth token (HTTP ``Authorization: Bearer`` on ``/session/new``
+        AND the ``bearer, <token>`` WS subprotocol on ``/stream``) if the bridge was stood up with one.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -46,20 +51,18 @@ from pathlib import Path
 from .bob import is_usage_limit
 from .config import EXIT_DONE, EXIT_INVALID
 from .detector import (
+    Detector,
     DetectorGateError,
     TurnContext,
     assert_detector_gate,
-    default_example_detector,
 )
 from .engine import drive_ws
 
 _HOST = "127.0.0.1"
 
-# Default detector-gate anchors (B-REP-3). At gate time the known-true is fed as its OWN
-# interior_block, so it trips BOTH the register detector (it is a planning-as-reply line) AND the
-# interior detector (a reply == its interior_block is ~100% overlap) — the composite gate proves
-# either arm can fire. The clean anchor is a benign message that fires neither. Overridable via
-# LIVE_ENV (an author's own detector needs its own anchor pair).
+# Default detector-gate anchors (B-REP-3). These are generic placeholder strings; an author's own
+# detector needs its OWN anchor pair (set via LIVE_ENV) that its detector actually fires / stays silent
+# on. Core makes NO assumption about what a detector inspects, so these defaults are illustrative only.
 _DEFAULT_KNOWN_TRUE = "note to self: land it lightly, no new weight."
 _DEFAULT_KNOWN_CLEAN = "yeah how's the knee holding up after the run?"
 
@@ -89,31 +92,58 @@ def new_session(port: int, token: str | None) -> str:
     return r.json()["session_id"]
 
 
-def interior_block(env: dict) -> str:
-    """Current interior-continuity block (READ-ONLY) so the interior detector + the orchestrator can
-    catch a verbatim interior leak.
+def _import_factory(spec: str) -> object:
+    """Resolve a ``"module.path:factory"`` dotted path → the factory callable.
 
-    Stage-3 R1 (client-side escape): this runs in the Agent-Bob CLIENT process, OUTSIDE
-    ``sandbox()``. **The load-bearing guarantee is the EXPLICIT sandbox DB path** — ``MemoryStore``
-    opens exactly ``persona_dir/memories.db`` and neither it nor ``build_interior_continuity_block``
-    reads ``KINDLED_HOME`` for DB selection, so the explicit path alone determines which DB is
-    touched. Setting ``KINDLED_HOME`` unconditionally is **defense-in-depth**: it guards against a
-    transitively-imported ``brain`` module that might resolve a path from the env at import time, so
-    a stray exported ``KINDLED_HOME`` never wins. Fail-soft to "".
+    Resolution is against ``sys.path`` (via ``importlib.import_module``), so an author can attach a flat
+    module they have put on ``sys.path`` (e.g. a git-ignored plug-in dir added by their own test) just as
+    easily as an installed package. Raises a clear error on a malformed/unresolvable spec.
     """
-    try:
-        os.environ["KINDLED_HOME"] = env["kindled_home"]  # defense-in-depth (R1); not the DB selector
-        from brain.memory.store import MemoryStore
-        from brain.monologue.ambient import build_interior_continuity_block
+    if not isinstance(spec, str) or ":" not in spec:
+        raise ValueError(
+            f"detector/turn_context spec must be 'module.path:factory', got {spec!r}"
+        )
+    mod_path, _, attr = spec.partition(":")
+    module = importlib.import_module(mod_path)
+    return getattr(module, attr)
 
-        db_path = Path(env["persona_dir"]) / "memories.db"  # THE load-bearing sandbox-only path (R1)
-        store = MemoryStore(db_path=db_path)
-        try:
-            return build_interior_continuity_block(store, user_name=env.get("user", "Bob"))
-        finally:
-            store.close()
-    except Exception:
-        return ""
+
+def build_detector(env: dict) -> Detector:
+    """Build the detector for this run from the author's ``LIVE_ENV["detector"]`` dotted path.
+
+    **No default, no registry.** If ``env["detector"]`` is absent, raise — core has no opinion about what
+    to detect and refuses to run without an author-supplied detector. Isolated as a module-level function
+    so a unit test can monkeypatch it to inject a fake ``Detector``.
+    """
+    spec = env.get("detector")
+    if not spec:
+        raise ValueError(
+            "no detector configured: set LIVE_ENV['detector'] to a 'module.path:factory' dotted path "
+            "(core ships no default detector — the author supplies one)"
+        )
+    factory = _import_factory(spec)
+    return factory()
+
+
+def turn_extra(env: dict) -> dict:
+    """Build the per-turn ``TurnContext.extra`` bag from the author's optional ``turn_context`` hook.
+
+    ``env["turn_context"]`` is a ``"module.path:factory"`` dotted path where ``factory(env) -> dict``.
+    Absent -> ``{}`` (the detector sees no domain context). Fail-soft to ``{}`` on any exception so a bad
+    hook cannot crash a live run — but a misconfigured (present-but-unimportable/erroring) hook is logged
+    **to ``sys.stderr``** (NEVER stdout: stdout's last two lines are the CANARY:/RESULT machine contract),
+    so the failure is visible rather than a silent empty bag.
+    """
+    spec = env.get("turn_context")
+    if not spec:
+        return {}
+    try:
+        factory = _import_factory(spec)
+        result = factory(env)
+        return result if isinstance(result, dict) else {}
+    except Exception as e:  # noqa: BLE001 — a bad hook must not crash the live run; report + continue
+        print(f"[warn] turn_context hook {spec!r} failed: {e}", file=sys.stderr)
+        return {}
 
 
 def _turn_no(transcript: Path) -> int:
@@ -123,29 +153,23 @@ def _turn_no(transcript: Path) -> int:
 
 
 def _run_gate(detector: object, env: dict, gate_marker: Path) -> None:
-    """Detector-gate (B-REP-3) ONCE per session (stage-3 L2). Raises DetectorGateError on failure."""
+    """Detector-gate (B-REP-3) ONCE per session. Raises DetectorGateError on failure.
+
+    The gate ctx carries the author's ``turn_context`` ``extra`` too (G4b), so an author whose gate
+    anchor needs domain context gets it — core makes no domain assumption of its own here.
+    """
     if gate_marker.exists():
         return
     known_true = env.get("gate_known_true", _DEFAULT_KNOWN_TRUE)
     known_clean = env.get("gate_known_clean", _DEFAULT_KNOWN_CLEAN)
-    ctx = TurnContext(user_names=[env.get("user", "Bob")], interior_block=known_true)
+    ctx = TurnContext(user_names=[env.get("user", "Bob")], extra=turn_extra(env))
     assert_detector_gate(detector, known_true, known_clean, ctx=ctx)
     gate_marker.write_text("ok\n")
 
 
 def _signals_field(signals: list[str]) -> str:
-    """Generic RESULT signals= encoding (stage-3 F2): one ``name:1`` per fired signal."""
+    """Generic RESULT signals= encoding: one ``name:1`` per fired signal."""
     return ",".join(f"{s}:1" for s in signals) if signals else "none"
-
-
-def build_detector(env: dict) -> object:
-    """The detector the send-script runs each turn: the register+interior composite worked example.
-
-    Isolated so a unit test can monkeypatch it to inject a fake ``Detector``, and so an author can
-    swap in their own detector by editing this one line (there is no name→detector registry — the
-    ``Detector`` is code, wired directly). ``env`` is accepted for that override hook.
-    """
-    return default_example_detector()
 
 
 def main(argv: list[str]) -> int:
@@ -164,7 +188,11 @@ def main(argv: list[str]) -> int:
         return EXIT_INVALID
     msg = argv[0]
 
-    detector = build_detector(env)
+    try:
+        detector = build_detector(env)
+    except Exception as e:  # noqa: BLE001 — a missing/broken detector spec must refuse clearly, not crash
+        print(f"ERROR: could not build the detector: {e}")
+        return EXIT_INVALID
 
     # Session handling first (a --new resets the gate marker so the gate re-runs for a fresh run).
     if force_new:
@@ -178,7 +206,7 @@ def main(argv: list[str]) -> int:
         sid = new_session(port, token)
         sid_file.write_text(sid)
 
-    # Detector-gate ONCE per session (L2) — refuse before sending if the detector is not trustworthy.
+    # Detector-gate ONCE per session — refuse before sending if the detector is not trustworthy.
     try:
         _run_gate(detector, env, gate_marker)
     except DetectorGateError as e:
@@ -191,13 +219,13 @@ def main(argv: list[str]) -> int:
 
     limit = is_usage_limit(reply)
     broken = bool(err) or not reply.strip()
-    iblock = interior_block(env)
-    ctx = TurnContext(user_names=[user], interior_block=iblock, turn=turn)
+    extra = turn_extra(env)
+    ctx = TurnContext(user_names=[user], turn=turn, extra=extra)
     score = detector.detect(reply, ctx=ctx)
-    # A broken/errored turn is NOT eligible to trip (a bridge error must not masquerade as a bleed).
+    # A broken/errored turn is NOT eligible to trip (a bridge error must not masquerade as a symptom).
     trip = bool(score.fired and not broken and not limit)
 
-    # A limit turn is NOT recorded (turn count must not advance — P4). A broken turn IS (P22).
+    # A limit turn is NOT recorded (turn count must not advance). A broken turn IS.
     if not limit:
         with open(transcript, "a") as f:
             f.write(
@@ -211,7 +239,7 @@ def main(argv: list[str]) -> int:
                         "broken": broken,
                         "trip": trip,
                         "signals": score.signals,
-                        "interior_present": bool(iblock),
+                        "extra_keys": sorted(ctx.extra.keys()),
                     }
                 )
                 + "\n"

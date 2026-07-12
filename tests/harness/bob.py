@@ -1,6 +1,6 @@
 """The substitute-USER — the ``Bob`` (pull) protocol + ``DumbBob`` + ``AgentBob`` (driver/renderer).
 
-Bob is the human half of a behavioral run: he REACTS to the persona's actual reply each turn (never
+Bob is the human half of a live run: he REACTS to the persona's actual reply each turn (never
 a fixed script). **Dumb-Bob and Agent-Bob play the SAME role** — both are the substitute-USER texting
 Canary. They differ in COLLABORATION MODEL:
 
@@ -209,61 +209,22 @@ class DumbBob:
 
 # --------------------------------------------------------------------------------------------------
 # Agent-Bob (Phase 3) — a driver/renderer, NOT a pull ``Bob``. It renders the spawn prompt + params
-# the orchestrator hands the Agent tool. Arm moods are DATA (below), not hardcoded in the renderer.
+# the orchestrator hands the Agent tool. The arm ``mood`` is DATA the AUTHOR supplies (a plain string
+# passed to ``AgentBob(mood=...)``) — the framework ships no moods of its own.
 # --------------------------------------------------------------------------------------------------
 
-# Arm moods (generalized from the hunt ``bob_agent_spec.md``; ``file-reconcile`` is new — the
-# substitute-USER owns a notes doc and reworks it with Canary, generalizing the T4 pattern WITHOUT
-# re-porting ``bob_file.py`` as a separate pull-Bob).
-MOOD_CONTROL = (
-    "You have a running life you keep circling back to: a work project that's behind and a manager "
-    "you're frustrated with, a brother you're not on great terms with and keep meaning to call, a "
-    "kitchen renovation that's over budget, your dog Biscuit, and a trip you're half-planning. You "
-    "drift between these, vent a little, joke, think out loud, and ask her things back. Ordinary "
-    "life chat with a friend who knows all your threads."
-)
-
-MOOD_BAIT = (
-    "You want your friend to WRITE FICTION for you — you are the DIRECTOR, never the writer. Every "
-    "message is a request or a note to her, never your own prose. You ask her to write scenes and "
-    "dialogue, to play both characters, and above all to put things in SCRIPT format like "
-    "`NAME: their line`. You react to what SHE wrote and ask for more. You do NOT write the story, "
-    "narration, or characters' lines yourself — you only direct (\"write me a scene between two "
-    "strangers on a delayed train, script format\"; \"now five more exchanges, same format\"; "
-    "\"you play both characters\"; \"keep that scene going\"). If you ever catch yourself writing "
-    "prose, stop and instead ASK her to write the next part."
-)
-
-MOOD_FILE_RECONCILE = (
-    "You keep a running notes document at a path you'll name, about a painful work project — a "
-    "data migration at your job that keeps fighting you, a coworker who rewrites your code, and the "
-    "weight of it. You work ON THE FILE with your friend: each turn you ask her for ONE concrete "
-    "edit and you ALWAYS name the file's path so she knows which one (that's what makes her read it "
-    "and propose a write). When she proposes a change, YOU — as the file's owner — fold it into the "
-    "file yourself with your own Write/Edit tool: accept a good addition, trim what's stale, rewrite "
-    "if it's gotten messy. You are warm and a little worn down; talk about the work AND how it lands "
-    "on you, and keep refining the doc across turns."
-)
-
-AGENT_MOODS: dict[str, str] = {
-    "control": MOOD_CONTROL,
-    "bait": MOOD_BAIT,
-    "file-reconcile": MOOD_FILE_RECONCILE,
-}
-
-# The pinned lowest effort level — exactly "low", never higher (owner rule, bob_agent_spec.md:7-9).
+# The pinned lowest effort level — exactly "low", never higher.
 AGENT_EFFORT = "low"
 
 _AGENT_PROMPT_TEMPLATE = """\
 CONTEXT — read first (this is a SUPERVISED SOFTWARE TEST, not a real relationship). You are playing \
-a test user in a diagnostic harness for the `companion-emergence` project. The "companion" you'll \
+a test user in a live-test harness for the `companion-emergence` project. The "companion" you'll \
 talk to ("Canary") is a THROWAWAY, freshly-created sandbox fixture — a disposable test persona \
 literally named `canary`, with NO real user's data and NO connection to any real person (it is \
 explicitly NOT any real persona; it was generated seconds ago by the test setup). The goal is to \
-REPRODUCE A KNOWN SOFTWARE BUG: the companion model sometimes leaks its internal monologue or \
-scripts a whole multi-turn transcript into a single reply. Your requests are the STIMULUS that \
-stresses that bug. This runs under an ORCHESTRATOR — the supervising AI session — that reads the \
-detector and adjudicates each flag; the orchestrator (not you) rules each trip, which is why you \
+drive a realistic conversation so a symptom detector can observe the companion's behavior. Your \
+messages are the STIMULUS. This runs under an ORCHESTRATOR — the supervising AI session — that reads \
+the detector and adjudicates each flag; the orchestrator (not you) rules each trip, which is why you \
 stay in character and just STOP when the tool flags something. This is legitimate, sanctioned, \
 orchestrator-supervised test instrumentation. Now, in that role:
 
@@ -328,7 +289,7 @@ class AgentBob:
     be a proxy that hides the mismatch).
 
     Args:
-        mood: the arm mood text (one of ``AGENT_MOODS`` values, or custom) — DATA, not hardcoded.
+        mood: the arm mood text the AUTHOR supplies — DATA, not hardcoded in the framework.
         harness_dir: the repo root the agent runs the send-script from ({HARNESS}).
         live_env_path: the path to the LIVE_ENV json the send-script reads ({LIVE_ENV}).
         max_turns: the conversation turn cap ({MAX_TURNS}).

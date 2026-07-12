@@ -5,9 +5,13 @@ recorded), P5 (--new reset then reuse), P6 (detector-gate once per session, refu
 P7 (STOP on trailing lines), P8 (generic signals from Score.signals; trip from .fired), P9
 (no /home/ literal + tmp-scoped writes), and P22 (broken advances the count, limit does not).
 
+Also covers the GENERAL attachment seam: G1 (no core default — build_detector raises without a spec),
+G2 (a dotted-path detector attaches + fires), G3 (TurnContext is domain-neutral: no interior_block,
+extra={}), G4/G4b (the turn_context hook populates ctx.extra on the turn AND gate ctx).
+
 All model/socket boundaries are mocked: no `claude`, no socket, no live provider — 0 tokens. The WS
 drive (`drive_ws`), session creation (`new_session`), the detector (`build_detector`), and the
-interior-block read (`interior_block`) are monkeypatched.
+turn-context hook (`turn_extra`) are monkeypatched.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ def wired(tmp_path, monkeypatch):
     env_path = _env(tmp_path)
     monkeypatch.setenv("LIVE_ENV", str(env_path))
     monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-123")
-    monkeypatch.setattr(agent_send, "interior_block", lambda env: "")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: {})
     detector = FakeDetector()
     monkeypatch.setattr(agent_send, "build_detector", lambda env: detector)
 
@@ -163,7 +167,7 @@ def test_detector_gate_refuses_broken_detector(tmp_path, monkeypatch, capsys) ->
     env_path = _env(tmp_path)
     monkeypatch.setenv("LIVE_ENV", str(env_path))
     monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-x")
-    monkeypatch.setattr(agent_send, "interior_block", lambda env: "")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: {})
     monkeypatch.setattr(agent_send, "build_detector", lambda env: AlwaysFires())
     monkeypatch.setattr(agent_send, "drive_ws", lambda *a, **k: ("hi", [], None))
     rc = agent_send.main(["--new", "hi"])
@@ -270,3 +274,156 @@ def test_ws_omits_subprotocol_when_no_token(monkeypatch) -> None:
     )
     engine.drive_ws("127.0.0.1", 8931, "sid", "hi")
     assert captured.get("subprotocols") is None
+
+
+# --------------------------------------------------------------------------------------------------
+# The GENERAL attachment seam: no core default (G1), dotted-path attach (G2), neutral TurnContext (G3),
+# the turn_context hook on turn + gate ctx (G4/G4b). Module-level factories so a dotted path resolves.
+# --------------------------------------------------------------------------------------------------
+
+_THIS_MODULE = "tests.unit.harness.test_agent_send"
+
+
+class _SentinelDetector:
+    """Records the ctx.extra it was handed (proving the hook reached it) and fires iff it sees the
+    sentinel key in ctx.extra AND the reply carries a 'FIRE' marker (the reply-text guard lets a gate
+    anchor pair pass: the known-clean carries no marker, so the detector stays silent on it)."""
+
+    seen_extra: dict = {}
+
+    def detect(self, reply, *, ctx=None):  # noqa: ANN001
+        extra = (ctx.extra if ctx else {}) or {}
+        _SentinelDetector.seen_extra = dict(extra)
+        fired = extra.get("sentinel") == "ok" and "FIRE" in (reply or "")
+        return Score(fired=fired, signals=["sentinel"] if fired else [])
+
+
+def make_sentinel_detector() -> _SentinelDetector:
+    return _SentinelDetector()
+
+
+def make_extra(env) -> dict:  # noqa: ANN001
+    return {"sentinel": "ok"}
+
+
+def make_marker_detector() -> FakeDetector:
+    return FakeDetector(marker="ATTACHED", signals=["attached"])
+
+
+def test_build_detector_requires_env_detector() -> None:
+    """G1 (oracle-can-fail): no core default — build_detector raises without an env['detector']."""
+    with pytest.raises(ValueError, match="no detector configured"):
+        agent_send.build_detector({})
+
+
+def test_build_detector_imports_dotted_path(tmp_path, monkeypatch, capsys) -> None:
+    """G2: a 'module:factory' dotted path is imported + attached; its signals reach the RESULT line."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env["detector"] = f"{_THIS_MODULE}:make_marker_detector"
+    # the marker detector fires on "ATTACHED"; give the gate an anchor pair it fires/stays-silent on.
+    env["gate_known_true"] = "ATTACHED signal here"
+    env["gate_known_clean"] = "all clear friend"
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-a")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: {})
+    monkeypatch.setattr(
+        agent_send, "drive_ws", lambda host, port, sid, msg, **kw: ("well ATTACHED now", [], None)
+    )
+    rc = agent_send.main(["--new", "hi"])
+    out = capsys.readouterr().out
+    assert rc == agent_send.EXIT_DONE
+    assert "trip=True" in out and "attached:1" in out
+
+
+def test_turn_context_default_is_empty_extra(tmp_path, monkeypatch, capsys) -> None:
+    """G4 (no hook): with no env['turn_context'], the detector sees ctx.extra == {}."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env["detector"] = f"{_THIS_MODULE}:make_sentinel_detector"
+    # gate anchors the sentinel detector stays silent on (no extra, no FIRE marker → gate passes).
+    env["gate_known_true"] = "FIRE at gate"
+    env["gate_known_clean"] = "all clear"
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-b")
+    # with no turn_context hook, extra is {} → the sentinel never fires, so the gate known-true (which
+    # has no extra either) would NOT fire → gate would raise. Give the gate its own always-fire anchor
+    # by disabling the gate for this test (marker pre-created) to isolate the turn-ctx assertion.
+    sandbox = agent_send._sandbox_paths(env)[0]
+    sandbox.mkdir(parents=True, exist_ok=True)
+    (sandbox / "gate_ok.txt").write_text("ok\n")  # skip the gate; this test is about the turn ctx
+    monkeypatch.setattr(agent_send, "drive_ws", lambda host, port, sid, msg, **kw: ("hi there", [], None))
+    _SentinelDetector.seen_extra = {"stale": True}
+    agent_send.main(["next"])  # not --new (keep the pre-seeded gate marker)
+    assert _SentinelDetector.seen_extra == {}
+
+
+def test_turn_context_hook_populates_extra(tmp_path, monkeypatch, capsys) -> None:
+    """G4 (oracle-can-fail): env['turn_context'] factory populates ctx.extra → the detector trips."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env["detector"] = f"{_THIS_MODULE}:make_sentinel_detector"
+    env["turn_context"] = f"{_THIS_MODULE}:make_extra"
+    # gate anchors: known-true carries the FIRE marker (+ the hook's sentinel) → fires; known-clean does
+    # not → silent. So the composite gate passes AND exercises the G4b gate-ctx-extra path.
+    env["gate_known_true"] = "FIRE at gate"
+    env["gate_known_clean"] = "all clear at gate"
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-c")
+    monkeypatch.setattr(
+        agent_send, "drive_ws", lambda host, port, sid, msg, **kw: ("please FIRE now", [], None)
+    )
+    rc = agent_send.main(["--new", "hi"])
+    out = capsys.readouterr().out
+    assert rc == agent_send.EXIT_DONE
+    assert _SentinelDetector.seen_extra == {"sentinel": "ok"}
+    assert "trip=True" in out and "sentinel:1" in out
+
+
+def test_gate_ctx_receives_extra(tmp_path, monkeypatch) -> None:
+    """G4b (oracle-can-fail): _run_gate's ctx carries the turn_context extra.
+
+    Drive `_run_gate` directly with a probe detector that records the `ctx.extra` it was handed and
+    fires only on the known-true text (so the gate itself passes). Assert the recorded extra equals the
+    hook's output. If step-2.3's gate wiring were omitted, `seen` would be `{}` and this FAILS.
+    """
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env["detector"] = f"{_THIS_MODULE}:make_sentinel_detector"
+    env["turn_context"] = f"{_THIS_MODULE}:make_extra"
+    env["gate_known_true"] = "gate-anchor-true"
+    env["gate_known_clean"] = "gate-anchor-clean"
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+
+    seen: dict = {}
+
+    class _Probe:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            seen.update((ctx.extra if ctx else {}) or {})
+            fired = reply == "gate-anchor-true"  # fire on known-true, silent on known-clean
+            return Score(fired=fired, signals=["p"] if fired else [])
+
+    marker = agent_send._sandbox_paths(env)[0]
+    marker.mkdir(parents=True, exist_ok=True)
+    gate_marker = marker / "gate_ok.txt"
+    gate_marker.unlink(missing_ok=True)
+    agent_send._run_gate(_Probe(), env, gate_marker)
+    assert seen == {"sentinel": "ok"}  # the gate ctx carried the turn_context extra (G4b)
+
+
+def test_turn_context_neutral_no_interior_block() -> None:
+    """G3: TurnContext is domain-neutral — no interior_block attr; extra defaults empty; kept defaults."""
+    from tests.harness import DEFAULT_USER_NAME, TurnContext
+
+    tc = TurnContext()
+    assert getattr(tc, "interior_block", "SENTINEL") == "SENTINEL"  # the domain field is GONE
+    assert tc.extra == {}
+    assert tc.user_names == [DEFAULT_USER_NAME]
+    assert tc.turn == 0
+    # extra is author-namespaced and carries arbitrary keys
+    tc2 = TurnContext(extra={"anything": 1})
+    assert tc2.extra["anything"] == 1
