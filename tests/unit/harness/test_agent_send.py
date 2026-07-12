@@ -427,3 +427,111 @@ def test_turn_context_neutral_no_interior_block() -> None:
     # extra is author-namespaced and carries arbitrary keys
     tc2 = TurnContext(extra={"anything": 1})
     assert tc2.extra["anything"] == 1
+
+
+# --- F1: opt-in log_extra_values transcript allowlist ----------------------------------------------
+
+
+def _f1_wire(tmp_path, monkeypatch, *, extra: dict, log_extra_values=None):
+    """Wire a run with a given turn_context extra + optional log_extra_values; return the sandbox dir."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    if log_extra_values is not None:
+        env["log_extra_values"] = log_extra_values
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-f1")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: dict(extra))
+    monkeypatch.setattr(agent_send, "build_detector", lambda env: FakeDetector())
+    monkeypatch.setattr(
+        agent_send, "drive_ws",
+        lambda host, port, sid, msg, **kw: ("hey how are you", [], None),
+    )
+    return Path(env["kindled_home"]).parent
+
+
+def _last_row(sandbox: Path) -> dict:
+    lines = (sandbox / "transcript.jsonl").read_text().splitlines()
+    return json.loads(lines[-1])
+
+
+def test_f1_value_present_when_opted_in(tmp_path, monkeypatch, capsys) -> None:
+    """C1: with log_extra_values=['k'], the transcript row carries k's VALUE under extra_values."""
+    sandbox = _f1_wire(tmp_path, monkeypatch, extra={"k": "payload-42"}, log_extra_values=["k"])
+    agent_send.main(["--new", "hi"])
+    row = _last_row(sandbox)
+    assert row["extra_values"] == {"k": "payload-42"}
+    assert row["extra_keys"] == ["k"]  # names still logged too
+
+
+def test_f1_byte_identical_row_when_unset(tmp_path, monkeypatch, capsys) -> None:
+    """C2 (behavior preservation): no log_extra_values -> row has NO extra_values field (byte-identical)."""
+    sandbox = _f1_wire(tmp_path, monkeypatch, extra={"k": "payload-42"}, log_extra_values=None)
+    agent_send.main(["--new", "hi"])
+    row = _last_row(sandbox)
+    assert "extra_values" not in row
+    # the exact pre-change field set (oracle-can-fail: a dumped-values row would add a key)
+    assert set(row.keys()) == {
+        "turn", "bob", "canary", "tools", "err", "broken", "trip", "signals", "extra_keys",
+    }
+    assert row["extra_keys"] == ["k"]  # names still present, values are not
+
+
+def test_f1_unserializable_value_degrades_gracefully(tmp_path, monkeypatch, capsys) -> None:
+    """C3: an un-serializable named value -> no crash, valid-JSON row, CANARY/RESULT contract intact."""
+
+    class Weird:
+        pass
+
+    sandbox = _f1_wire(
+        tmp_path, monkeypatch, extra={"bad": Weird(), "s": {1, 2}}, log_extra_values=["bad", "s"]
+    )
+    rc = agent_send.main(["--new", "hi"])  # must NOT raise
+    assert rc == agent_send.EXIT_DONE
+    row = _last_row(sandbox)  # still valid JSON (json.loads succeeded)
+    assert row["extra_values"]["bad"] == "<unserializable Weird>"
+    assert row["extra_values"]["s"] == "<unserializable set>"
+    lines = _out(capsys)
+    assert lines[0].startswith("CANARY: ")
+    assert any(line.startswith("RESULT ") for line in lines)
+
+
+def test_f1_nan_value_degrades_to_placeholder(tmp_path, monkeypatch, capsys) -> None:
+    """C3 (strict JSON): NaN/Infinity degrade to the placeholder, not bare NaN/Infinity tokens.
+
+    json.dumps writes NaN/Infinity by default (accepted by Python's json.loads but INVALID per RFC 8259
+    and rejected by strict/external parsers). _json_safe probes with allow_nan=False so they degrade.
+    Oracle-can-fail: without allow_nan=False the raw float passes through and this assertion fails.
+    """
+    sandbox = _f1_wire(
+        tmp_path, monkeypatch,
+        extra={"n": float("nan"), "i": float("inf")}, log_extra_values=["n", "i"],
+    )
+    rc = agent_send.main(["--new", "hi"])
+    assert rc == agent_send.EXIT_DONE
+    # the raw transcript line must be STRICT JSON (reject the RFC-invalid NaN/Infinity tokens)
+    raw = (sandbox / "transcript.jsonl").read_text().splitlines()[-1]
+    assert "NaN" not in raw and "Infinity" not in raw
+    row = json.loads(raw)
+    assert row["extra_values"]["n"] == "<unserializable float>"
+    assert row["extra_values"]["i"] == "<unserializable float>"
+
+
+def test_f1_only_named_keys_are_dumped(tmp_path, monkeypatch, capsys) -> None:
+    """C4 (domain-agnostic invariant): only NAMED keys' values appear; an un-named key is excluded."""
+    sandbox = _f1_wire(
+        tmp_path, monkeypatch, extra={"k": 1, "secret": 2}, log_extra_values=["k"]
+    )
+    agent_send.main(["--new", "hi"])
+    row = _last_row(sandbox)
+    assert row["extra_values"] == {"k": 1}
+    assert "secret" not in row["extra_values"]  # the un-named key's value is NOT dumped
+    assert row["extra_keys"] == ["k", "secret"]  # names still listed (unchanged behavior)
+
+
+def test_f1_named_but_absent_key_adds_no_field(tmp_path, monkeypatch, capsys) -> None:
+    """C2-adjacent: an opted-in run whose named keys are all absent this turn -> no extra_values field."""
+    sandbox = _f1_wire(tmp_path, monkeypatch, extra={"other": 1}, log_extra_values=["k"])
+    agent_send.main(["--new", "hi"])
+    row = _last_row(sandbox)
+    assert "extra_values" not in row  # non-empty guard -> byte-identical row
