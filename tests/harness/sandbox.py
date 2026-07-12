@@ -1,8 +1,8 @@
-"""The safety core — a context manager that confines a behavioral run to a temp sandbox.
+"""The safety core — a context manager that confines a live run to a temp sandbox.
 
 **This is the #1 requirement.** The harness runs on developer laptops where a REAL companion lives
-(a Mac with no VM, in Hana's case). Nothing a run does may touch or corrupt anything outside its
-temp sandbox. Every run passes through :func:`sandbox`.
+(sometimes a Mac with no VM). Nothing a run does may touch or corrupt anything outside its temp
+sandbox. Every run passes through :func:`sandbox`.
 
 What it does (see the module ``README.md`` for the guarantees):
 
@@ -358,7 +358,7 @@ def _seed_auth(claude_config_dir: Path) -> str:
     if sys.platform == "darwin":
         return "keychain-or-inherited"
     warnings.warn(
-        "sandbox: no ~/.claude/.credentials.json found and not on macOS — a live behavioral run "
+        "sandbox: no ~/.claude/.credentials.json found and not on macOS — a live run "
         "will be UNAUTHENTICATED and fail at the provider. Authenticate the claude CLI first.",
         RuntimeWarning,
         stacklevel=2,
@@ -375,7 +375,7 @@ def sandbox(
     probe: bool = False,
     probe_wait: float = _PROBE_WAIT_S,
 ) -> Iterator[SandboxHandle]:
-    """Confine a behavioral run to a fresh temp sandbox; assert no guarded root was mutated.
+    """Confine a live run to a fresh temp sandbox; assert no guarded root was mutated.
 
     Args:
         keep: leave the tempdir on disk after exit (post-mortem). Default: ``rmtree``.

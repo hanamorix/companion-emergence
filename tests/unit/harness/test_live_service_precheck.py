@@ -515,7 +515,7 @@ def test_every_run_path_routes_through_sandbox() -> None:
     """P13 (A2 promoted): a source assert that the run entrypoints reach `sandbox()`. The worked
     example calls `sandbox(`; no harness helper stands up a BridgeServer outside a `sandbox()`."""
     harness_dir = Path(__file__).resolve().parents[2] / "harness"
-    example = harness_dir / "examples" / "test_register_leak.py"
+    example = harness_dir / "examples" / "test_generic_run.py"
     assert "sandbox(" in example.read_text(), "the worked example must run inside sandbox()"
 
     # No module under tests/harness/ should construct BridgeServer without importing sandbox.

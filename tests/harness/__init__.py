@@ -1,10 +1,10 @@
-"""companion-emergence behavioral-test harness.
+"""companion-emergence live-test harness.
 
-A permanent, sandboxed framework for behavioral tests that drive the REAL engine:
+A permanent, sandboxed framework for live tests that drive the REAL engine:
 seed a throwaway persona ("Canary") -> stand up the real bridge -> drive it with an
 LLM-simulated human ("Bob") -> detect symptoms in the replies -> orchestrate multi-arm
-runs that survive usage-limit stalls. Generalizes the ad-hoc harness built during the
-monologue-bleed hunt. Can exercise ~anything except the GUI.
+runs that survive usage-limit stalls. Generalizes an ad-hoc harness built during a prior
+bug hunt. Can exercise ~anything except the GUI.
 
 Design goal #1 is STRONG SANDBOX ISOLATION: the harness runs on developer laptops where a
 real companion lives, so nothing it does may touch anything outside its temp sandbox. Every
@@ -17,10 +17,6 @@ Public API is exported here as the modules land (see README.md for status + usag
 
 from .bob import (
     AGENT_EFFORT,
-    AGENT_MOODS,
-    MOOD_BAIT,
-    MOOD_CONTROL,
-    MOOD_FILE_RECONCILE,
     AgentBob,
     AgentSpawnSpec,
     Bob,
@@ -46,12 +42,9 @@ from .detector import (
     CompositeDetector,
     Detector,
     DetectorGateError,
-    InteriorLeakDetector,
-    RegisterLeakDetector,
     Score,
     TurnContext,
     assert_detector_gate,
-    default_example_detector,
 )
 from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
@@ -82,13 +75,12 @@ __all__: list[str] = [
     "IncidentSpec", "IncidentResult", "build_compacted_state",
     # bob
     "Bob", "BobTurn", "BobContext", "DumbBob", "AgentBob", "AgentSpawnSpec", "is_usage_limit",
-    "AGENT_MOODS", "MOOD_CONTROL", "MOOD_BAIT", "MOOD_FILE_RECONCILE", "AGENT_EFFORT",
+    "AGENT_EFFORT",
     # speech
     "dyslexify", "CLEAN", "REALISTIC",
     # detector
     "Detector", "Score", "TurnContext", "assert_detector_gate", "DetectorGateError",
-    "RegisterLeakDetector", "InteriorLeakDetector", "CompositeDetector",
-    "default_example_detector", "DEFAULT_USER_NAME",
+    "CompositeDetector", "DEFAULT_USER_NAME",
     # engine
     "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply", "drive_ws",
     # runner / watchdog

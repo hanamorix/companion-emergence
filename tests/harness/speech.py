@@ -1,10 +1,10 @@
 """Speech-mode engine — the deterministic dyslexic-typing injector.
 
-Extracted (generalized) from the hunt harness ``bob.py`` ``_dyslexify``. Pure PRNG, no LLM, no
+Extracted (generalized) from a prior ad-hoc harness's ``_dyslexify``. Pure PRNG, no LLM, no
 tokens. ``speech_mode`` styles the *human*'s (Bob's) input; a detector always scores the persona's
 reply, so styling Bob's line can never perturb detection.
 
-Safety contract (load-bearing — a bleed-hunt must not have its own synthetic input read as a
+Safety contract (load-bearing — a live test must not have its own synthetic input misread as a real
 symptom): the output NEVER contains an injected newline, a ``Word:`` role label, a ``</s>``
 delimiter, or a trailing bare ``/``. ``protect`` tokens (e.g. a recall nonce) pass byte-intact.
 ``rate <= 0`` is the identity transform.
@@ -46,7 +46,7 @@ def dyslexify(
     classes: adjacent-char transposition, word-merge (drop a space), fixed phonetic swaps.
 
     ``protect`` tokens pass byte-intact. ``rate <= 0`` or empty ``text`` → identity. The final
-    safety sweep guarantees no S1 marker (newline / role label / ``</s>`` / trailing ``/``).
+    safety sweep guarantees no injected marker (newline / role label / ``</s>`` / trailing ``/``).
     """
     if rate <= 0 or not text:
         return text
@@ -82,7 +82,7 @@ def dyslexify(
                 continue
         out.append(w)
     merged = " ".join(x for x in out if x != "")
-    # Safety sweep: strip anything that could read as an S1 marker in a recorded transcript.
+    # Safety sweep: strip anything that could read as an injected transcript marker.
     merged = merged.replace("\n", " ").replace("</s>", "")
     merged = _ROLE_LABEL_LEAD.sub(r"\1", merged)
     return merged.rstrip("/ ").strip() or text

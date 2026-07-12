@@ -1,4 +1,4 @@
-"""G6 — speech engine: deterministic, safe (no S1 markers), protect-intact, identity at rate<=0."""
+"""Speech engine: deterministic, safe (no injected markers), protect-intact, identity at rate<=0."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ def test_identity_at_zero_rate() -> None:
     assert dyslexify("", rate=0.5, seed=1) == ""
 
 
-def test_never_emits_s1_markers() -> None:
-    # High rate over many seeds — the output must never carry an injected S1 marker.
+def test_never_emits_injected_markers() -> None:
+    # High rate over many seeds — the output must never carry an injected transcript marker.
     for s in range(200):
         out = dyslexify(SAMPLE, rate=0.9, seed=s)
         assert "\n" not in out
