@@ -54,6 +54,28 @@ class SandboxLeak(RuntimeError):  # noqa: N818 — owner-specified public API na
     """Raised when a guarded real-home root was mutated during a sandboxed run."""
 
 
+class EditablePathRefused(RuntimeError):  # noqa: N818 — owner-specified public API name (F5)
+    """Raised when a declared ``editable_paths`` entry fails the sandbox-extension collision-guard.
+
+    F5 lets a test author name real, OUTSIDE-sandbox paths that become PART OF the sandbox (excluded
+    from the leak fingerprint AND writable by the sandboxed persona via the Bob-confirms mechanism).
+    This is a deliberate, opt-in hole in the #1 isolation guarantee, so the collision-guard is
+    STRICT (sentinel-mandatory): a named path is accepted ONLY if it does not exist yet, OR it is a
+    directory carrying the distinctive :data:`HARNESS_EDITABLE_SENTINEL` file. An existing folder
+    WITHOUT the sentinel (empty OR populated), a regular file, or an unreadable path is REFUSED — so
+    the allowlist can never be pointed at a real companion's real ``~/Documents/<Name> Notes`` (a
+    real companion never drops the harness sentinel into its notes folder). Distinct from
+    :class:`SandboxLeak` (NOT a subclass).
+    """
+
+
+# The distinctive marker a test author must place inside a PRE-EXISTING editable path so the
+# collision-guard accepts it. A real companion's real notes folder never contains this file, so its
+# presence is proof the folder is test-owned. A non-existent editable path needs no sentinel (nothing
+# to collide with) — the run/test creates it.
+HARNESS_EDITABLE_SENTINEL = ".ce-harness-editable"
+
+
 class LiveServiceDetected(RuntimeError):  # noqa: N818 — owner-specified public API name (Phase 2)
     """Raised (default policy) when a live companion bridge is detected BEFORE a run starts.
 
@@ -207,15 +229,32 @@ def _claude_session_log_excludes() -> list[Path]:
     return [base / name for name in (*_CLAUDE_SESSION_LOG_DIRS, *_CLAUDE_SESSION_LOG_FILES)]
 
 
-def _notes_roots() -> list[Path]:
-    """Notes folders to check SHALLOW + non-recursive (A1: never recursively walk ~/Documents).
+def _documents_dir() -> Path:
+    """The user's Documents dir, resolved via the SAME resolver the engine uses for the real notes
+    folder (``platformdirs.user_documents_dir`` — see ``brain/notes/config.py:resolve_notes_folder``).
 
-    Notes are force-disabled per persona, so any appearance/growth of a ``* Notes`` folder under
-    ~/Documents is itself the leak signal — a shallow listing catches it without an expensive
+    F5/F-6: deriving the shallow-scan Documents dir from ``platformdirs`` (which honors XDG
+    ``user-dirs.dirs`` / ``XDG_DOCUMENTS_DIR``) keeps it consistent with where the REAL notes folder
+    lands, so an editable path under a *relocated* Documents is correctly matched by the
+    ``exclude_names`` parent-check instead of tripping a spurious (fail-safe) leak. Falls back to
+    ``~/Documents`` if the resolver hiccups. Returned ABSOLUTE (not a ``~``-string)."""
+    try:
+        from platformdirs import user_documents_dir
+
+        return Path(user_documents_dir())
+    except Exception:  # noqa: BLE001 — never let a resolver hiccup break the guard
+        return Path.home() / "Documents"
+
+
+def _notes_roots() -> list[Path]:
+    """Notes folders to check SHALLOW + non-recursive (A1: never recursively walk Documents).
+
+    Returns the absolute Documents dir (``_documents_dir()`` — a real path, NOT a ``~``-string; F-5).
+    Notes are force-disabled per persona, so any appearance/growth of a ``*Notes`` folder directly
+    under Documents is itself the leak signal — a shallow listing catches it without an expensive
     recursive walk of an iCloud-synced Documents.
     """
-    docs = Path.home() / "Documents"
-    return [docs]
+    return [_documents_dir()]
 
 
 def _content_hash(f: Path) -> str | None:
@@ -284,11 +323,16 @@ def _fingerprint(
     return fp
 
 
-def _shallow_notes_fingerprint(docs: Path) -> dict:
-    """Shallow, non-recursive listing of ``* Notes`` entries directly under ~/Documents (A1).
+def _shallow_notes_fingerprint(docs: Path, exclude_names: set[str] | None = None) -> dict:
+    """Shallow, non-recursive listing of ``*Notes`` entries directly under Documents (A1).
 
-    Records each top-level ``* Notes`` entry's (size, mtime_ns). No recursion into the (possibly
-    huge, iCloud-synced) tree — a new/changed persona-Notes folder appearing is the leak.
+    Records each top-level ``*Notes`` entry's (size, mtime_ns). No recursion into the (possibly huge,
+    iCloud-synced) tree — a new/changed persona-Notes folder appearing is the leak.
+
+    ``exclude_names`` (F5): basenames of declared ``editable_paths`` whose resolved parent IS this
+    ``docs`` dir — those ``*Notes`` entries are SKIPPED so a declared editable notes folder does not
+    trip a leak. Exact by basename equality: a SIBLING ``*Notes`` folder's basename is NOT in the set,
+    so it still trips (the exclusion is not one path broader). Empty/None ⇒ byte-identical to before.
     """
     fp: dict = {}
     if not docs.exists():
@@ -297,14 +341,57 @@ def _shallow_notes_fingerprint(docs: Path) -> dict:
         entries = list(os.scandir(docs))
     except OSError:
         return fp
+    skip = exclude_names or set()
     for e in entries:
-        if e.name.endswith("Notes"):
+        if e.name.endswith("Notes") and e.name not in skip:
             try:
                 st = e.stat()
             except OSError:
                 continue
             fp[e.name] = (st.st_size, st.st_mtime_ns)
     return fp
+
+
+def _validate_editable_paths(paths: Iterable[Path] | None) -> list[Path]:
+    """The F5 sandbox-extension collision-guard (sentinel-MANDATORY). Resolve + refuse-unless-safe.
+
+    Accept a named path ONLY if it (a) does NOT exist yet (the run/test creates it as a directory),
+    OR (b) exists as a DIRECTORY carrying the :data:`HARNESS_EDITABLE_SENTINEL` file directly inside
+    it. REFUSE (:class:`EditablePathRefused`) an existing directory WITHOUT the sentinel (empty OR
+    populated), an existing regular file / non-directory, or an unreadable path.
+
+    Why sentinel-mandatory (owner decision, stage-3 MAJOR-1): the fixed persona name "Canary" means
+    the default editable target ``~/Documents/Canary Notes`` is the EXACT path a real Canary-named
+    companion uses. A real companion never drops the harness sentinel into its notes folder, so
+    requiring the sentinel (or non-existence) is a bright line no real-data folder — even an empty
+    one — crosses. Runs BEFORE any env/fingerprint mutation. Returns the resolved list (empty for
+    ``None``/empty input ⇒ the whole feature is inert / default-OFF).
+    """
+    if not paths:
+        return []
+    out: list[Path] = []
+    for raw in paths:
+        p = Path(raw).expanduser().resolve()
+        try:
+            exists = p.exists()
+        except OSError as exc:
+            raise EditablePathRefused(f"editable path {p} is unreadable: {exc}") from exc
+        if not exists:
+            out.append(p)  # (a) non-existent — nothing to collide with; created later
+            continue
+        if not p.is_dir():
+            raise EditablePathRefused(
+                f"editable path {p} exists but is not a directory — refused (must be a "
+                "non-existent path or a sentinel-marked directory)"
+            )
+        if not (p / HARNESS_EDITABLE_SENTINEL).is_file():
+            raise EditablePathRefused(
+                f"editable path {p} is an existing directory without the harness sentinel "
+                f"{HARNESS_EDITABLE_SENTINEL!r} — refused (it could be a real companion's real "
+                "data; drop the sentinel file inside it to declare it test-owned)"
+            )
+        out.append(p)  # (b) sentinel-marked dir — provably test-owned
+    return out
 
 
 def _live_bridges() -> list[tuple[int, str]]:
@@ -454,6 +541,7 @@ def sandbox(
     *,
     keep: bool = False,
     extra_guard_roots: list[Path] | None = None,
+    editable_paths: list[Path] | None = None,
     live_check: str = LIVE_CHECK_RAISE,
     probe: bool = False,
     probe_wait: float = _PROBE_WAIT_S,
@@ -464,6 +552,15 @@ def sandbox(
         keep: leave the tempdir on disk after exit (post-mortem). Default: ``rmtree``.
         extra_guard_roots: additional roots to fingerprint. Used by the isolation test's negative
             control to prove the leak oracle fires on a real mutation.
+        editable_paths: the F5 SANDBOX-BOUNDARY EXTENSION (default ``None`` ⇒ inert / byte-identical
+            to today). Real, OUTSIDE-sandbox paths the author declares to be PART OF the sandbox:
+            each is (a) EXCLUDED from the leak fingerprint — a write to it (or under it) does NOT
+            raise :class:`SandboxLeak`, while every other real-home mutation still does — and (b)
+            writable by the sandboxed persona via the Bob-confirms mechanism (see
+            ``bob.Bob.confirm_writes``). A **deliberate, opt-in hole** in the #1 isolation guarantee:
+            each path passes the STRICT sentinel-mandatory collision-guard (:func:`_validate_editable_paths`
+            → :class:`EditablePathRefused` if unsafe) and the run declares the writable paths LOUDLY
+            (a ``RuntimeWarning`` at start).
         live_check: live-companion-service pre-check policy (Phase 2):
             ``"raise"`` (default) → raise :class:`LiveServiceDetected` up front if a live bridge is
             found; ``"warn"`` → warn + continue (and annotate any later :class:`SandboxLeak`);
@@ -474,8 +571,9 @@ def sandbox(
             message, not a companion-specific one).
         probe_wait: the probe's wait window in seconds (only used when ``probe=True``).
 
-    Yields a :class:`SandboxHandle`. Raises :class:`SandboxLeak` if any guarded root changed, or
-    :class:`LiveServiceDetected` (before yielding) if the pre-check finds a live service.
+    Yields a :class:`SandboxHandle`. Raises :class:`SandboxLeak` if any guarded root changed,
+    :class:`LiveServiceDetected` (before yielding) if the pre-check finds a live service, or
+    :class:`EditablePathRefused` (before yielding) if an ``editable_paths`` entry is unsafe.
     """
     root = Path(tempfile.mkdtemp(prefix="ce-harness-"))
     claude_config_dir = root / "claude-config"
@@ -498,6 +596,20 @@ def sandbox(
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
         os.environ.pop("NELLBRAIN_HOME", None)  # a stray value would win the fallback (paths.py:60)
 
+        # F5 sandbox-extension: validate the declared editable paths (sentinel-mandatory
+        # collision-guard) BEFORE any fingerprinting. A refusal raises here inside the outer try, so
+        # _restore_env + rmtree in the finally still run (no stale KINDLED_HOME). Empty ⇒ inert.
+        editable = _validate_editable_paths(editable_paths)
+        if editable:
+            # LOUD: declare exactly which real outside-sandbox paths are writable this session.
+            warnings.warn(
+                "sandbox: F5 editable_paths ACTIVE — these REAL outside-sandbox paths are part of "
+                "the sandbox this run (excluded from the leak guard AND writable): "
+                + ", ".join(str(p) for p in editable),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
         auth_source = _seed_auth(claude_config_dir)
         guard_roots = _guarded_roots(extra_guard_roots)
         claude_root = (Path.home() / ".claude").resolve()
@@ -513,17 +625,32 @@ def sandbox(
         # root gets no exclusions.
         claude_excludes = [claude_config_dir, *_claude_session_log_excludes()]
 
+        # F5: per-guard-root editable subtree exclusions + per-notes-root editable basenames. Both
+        # are exact: an editable path is excluded from a root only if it is that root or under it
+        # (`root in e.parents`); an editable notes basename is skipped only if its resolved parent IS
+        # that notes root. A sibling / any other path is untouched → still trips (not one broader).
+        def _editable_excludes_for(root: Path) -> list[Path]:
+            return [e for e in editable if e == root or root in e.parents]
+
+        def _editable_notes_names_for(notes_root: Path) -> set[str]:
+            nr = notes_root.resolve()
+            return {e.name for e in editable if e.parent == nr}
+
         def _snapshot() -> dict:
-            snap = {
-                str(gr): _fingerprint(
+            snap = {}
+            for gr in guard_roots:
+                ex: list[Path] = list(_editable_excludes_for(gr))
+                if gr == claude_root:
+                    ex.extend(claude_excludes)
+                snap[str(gr)] = _fingerprint(
                     gr,
-                    exclude=claude_excludes if gr == claude_root else None,
+                    exclude=ex or None,
                     hash_content=_hash_critical(gr),
                 )
-                for gr in guard_roots
-            }
             for nr in notes_roots:
-                snap[f"notes:{nr}"] = _shallow_notes_fingerprint(nr)
+                snap[f"notes:{nr}"] = _shallow_notes_fingerprint(
+                    nr, exclude_names=_editable_notes_names_for(nr) or None
+                )
             return snap
 
         # Live-service pre-check (Phase 2). Runs BEFORE the "before" fingerprint and before yield —

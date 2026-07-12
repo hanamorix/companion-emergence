@@ -25,7 +25,12 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Protocol
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from .config import DEFAULT_MODELS, DEFAULT_TIMEOUTS, ModelConfig, Timeouts
 from .speech import REALISTIC, dyslexify
@@ -78,6 +83,25 @@ class Bob(Protocol):
     def next_message(
         self, history: list[tuple[str, str]], *, turn: int, ctx: BobContext
     ) -> BobTurn: ...
+
+    def confirm_writes(
+        self,
+        persona_dir: Path,
+        editable_paths: Iterable[Path],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """The F5 sandbox-extension confirm step — Bob (the substitute USER) plays the confirming
+        human for the persona's pending file writes.
+
+        When a sandboxed persona proposes a write to a declared editable path, notes are OFF so the
+        write is queued as a PENDING record (never auto-committed). Bob commits it — mirroring a real
+        user approving a write in NellFace — but ONLY for pending writes whose resolved target is
+        inside a declared ``editable_path`` (the scope guard; an out-of-scope proposal is left
+        pending, never landed). Uses UNMODIFIED brain's pending→commit surface. Returns the list of
+        rids actually committed.
+        """
+        ...
 
 
 def _pick_usage(obj: dict) -> dict:
@@ -205,6 +229,67 @@ class DumbBob:
         if ctx.speech_mode == REALISTIC:
             msg = dyslexify(msg, self.dyslexia_rate, ctx.protect, seed=turn)
         return BobTurn(msg, False, usage)
+
+    def confirm_writes(
+        self,
+        persona_dir: Path,
+        editable_paths: Iterable[Path],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """DumbBob's real F5 confirm: commit the persona's in-scope pending writes.
+
+        See :meth:`Bob.confirm_writes`. Real implementation via UNMODIFIED brain (``brain.files.pending``
+        + ``brain.files.commit.commit_write`` + ``brain.memory.store.MemoryStore`` — the exact surface
+        the bridge's ``/persona/writes/{rid}/approve`` route uses). SCOPE GUARD: a pending write is
+        committed only if its resolved target is at/under a declared editable path; anything else is
+        left pending, never landed. An ``op=append`` to a not-yet-existent target is refused by brain's
+        write guard (append requires the target to exist) — its rid is NOT returned (fail-safe
+        "confirmed but nothing landed"). Returns the rids actually committed.
+        """
+        return _commit_editable_pending(persona_dir, editable_paths, now=now)
+
+
+def _commit_editable_pending(
+    persona_dir: Path,
+    editable_paths: Iterable[Path],
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Commit the persona's PENDING writes whose resolved target is inside a declared editable path.
+
+    Import-only use of UNMODIFIED brain (the harness NEVER modifies brain/ — drop-in invariant).
+    ``brain.files.commit.commit_write`` re-runs the write guard (TOCTOU) as a second safety layer and
+    performs the real write; we only ever hand it a pending rid whose target we have confirmed is
+    inside an editable path. Returns the list of committed rids (order: newest-pending first, per
+    ``pending.list_pending``).
+    """
+    from brain.files import pending
+    from brain.files.commit import commit_write
+    from brain.memory.store import MemoryStore
+
+    editable = [Path(p).expanduser().resolve() for p in editable_paths]
+    if not editable:
+        return []
+    when = now or datetime.now(UTC)
+    committed: list[str] = []
+    recs = pending.list_pending(persona_dir, now=when)
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        for rec in recs:
+            try:
+                target = Path(rec["resolved_path"]).resolve()
+            except (KeyError, OSError, ValueError, TypeError):
+                continue
+            in_scope = any(target == e or e in target.parents for e in editable)
+            if not in_scope:
+                continue  # scope guard — never commit a write outside a declared editable path
+            res = commit_write(persona_dir, rec["id"], store=store)
+            if res.get("ok"):
+                committed.append(rec["id"])
+    finally:
+        store.close()
+    return committed
 
 
 # --------------------------------------------------------------------------------------------------
@@ -335,4 +420,24 @@ class AgentBob:
         raise TypeError(
             "AgentBob drives its own loop; it is not a pull Bob — "
             "use render_prompt()/spawn_params() to spawn it via the Agent tool."
+        )
+
+    def confirm_writes(
+        self,
+        persona_dir: Path,
+        editable_paths: Iterable[Path],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """DOCUMENTED STUB (Phase 3). AgentBob drives its own agent-tool loop and would confirm
+        pending writes from INSIDE that loop (e.g. an ``agent_send``-style confirm step it invokes),
+        not through this in-process method. Building that path is deferred with the rest of the
+        Agent-Bob driver; the DumbBob path is the one exercised today. Raises (like
+        :meth:`next_message`) rather than silently returning ``[]`` — a silent no-op would be a proxy
+        that hides the missing mechanism. The confirm LOGIC itself is available as the module-level
+        :func:`_commit_editable_pending` if an AgentBob loop needs it later."""
+        raise NotImplementedError(
+            "AgentBob confirms pending writes from within its own agent-driven loop (Phase 3), not "
+            "via this in-process method; use DumbBob for the in-process confirm path, or call "
+            "_commit_editable_pending directly."
         )
