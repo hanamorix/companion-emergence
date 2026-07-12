@@ -36,6 +36,11 @@ Usage:
         returns the per-turn ``TurnContext.extra`` bag (domain context a detector needs). Absent -> the
         detector sees ``extra={}``. Core never inspects the returned dict.
     ``gate_known_true`` / ``gate_known_clean`` (optional) — detector-gate anchors (B-REP-3).
+    ``log_extra_values`` (optional) — a list of ``extra`` key NAMES whose VALUES to persist into each
+        transcript row under an ``extra_values`` field (for post-run adjudication). Opt-in and
+        author-named: absent/empty -> the row is byte-identical to today (only ``extra_keys`` names).
+        Core reads ONLY the named keys (never the whole ``extra`` bag). Un-serializable values degrade
+        to a ``"<unserializable T>"`` placeholder — an author's value never crashes the run.
     ``token`` (optional) — the bridge auth token (HTTP ``Authorization: Bearer`` on ``/session/new``
         AND the ``bearer, <token>`` WS subprotocol on ``/stream``) if the bridge was stood up with one.
 """
@@ -172,6 +177,33 @@ def _signals_field(signals: list[str]) -> str:
     return ",".join(f"{s}:1" for s in signals) if signals else "none"
 
 
+def _json_safe(value: object) -> object:
+    """Return ``value`` if it serializes to STRICT JSON, else a graceful placeholder string.
+
+    An author's ``extra`` value must NEVER crash the run or corrupt the ``CANARY:``/``RESULT`` stdout
+    contract. Probed with ``allow_nan=False`` so that not only unencodable types (``TypeError``) but also
+    ``NaN``/``Infinity`` floats (``ValueError`` under strict mode — otherwise written as bare ``NaN``/
+    ``Infinity`` tokens that are invalid per RFC 8259) degrade to ``"<unserializable T>"`` — itself
+    always JSON-safe — so the transcript row stays valid strict JSON for any external parser.
+    """
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return f"<unserializable {type(value).__name__}>"
+    return value
+
+
+def _extra_values(ctx_extra: dict, allow: list) -> dict:
+    """Opt-in F1 seam: the VALUES of the author-NAMED ``extra`` keys, JSON-safed.
+
+    Core stays domain-agnostic: it reads ONLY the keys the author named in ``LIVE_ENV['log_extra_values']``
+    (same "author directs it" posture as the ``turn_context`` hook), never the whole ``extra`` bag. A named
+    key absent this turn is silently skipped (not an error). Absent/empty allowlist -> ``{}`` (no field
+    added; the transcript row stays byte-identical to today).
+    """
+    return {k: _json_safe(ctx_extra[k]) for k in allow if k in ctx_extra}
+
+
 def main(argv: list[str]) -> int:
     env = _load_env()
     port = int(env["port"])
@@ -227,23 +259,26 @@ def main(argv: list[str]) -> int:
 
     # A limit turn is NOT recorded (turn count must not advance). A broken turn IS.
     if not limit:
+        row = {
+            "turn": turn,
+            "bob": msg,
+            "canary": reply,
+            "tools": tools,
+            "err": err,
+            "broken": broken,
+            "trip": trip,
+            "signals": score.signals,
+            "extra_keys": sorted(ctx.extra.keys()),
+        }
+        # F1 (opt-in): if the author named keys in LIVE_ENV['log_extra_values'], append their VALUES
+        # under a distinct field. Absent/empty allowlist (or no named keys present this turn) -> the row
+        # is byte-identical to today (no 'extra_values' field). Core reads ONLY the author-named keys.
+        allow = env.get("log_extra_values") or []
+        extra_values = _extra_values(ctx.extra, allow)
+        if extra_values:
+            row["extra_values"] = extra_values
         with open(transcript, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "turn": turn,
-                        "bob": msg,
-                        "canary": reply,
-                        "tools": tools,
-                        "err": err,
-                        "broken": broken,
-                        "trip": trip,
-                        "signals": score.signals,
-                        "extra_keys": sorted(ctx.extra.keys()),
-                    }
-                )
-                + "\n"
-            )
+            f.write(json.dumps(row) + "\n")
 
     print(f"CANARY: {reply}")
     print(

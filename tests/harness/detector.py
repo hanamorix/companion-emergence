@@ -62,10 +62,32 @@ class DetectorGateError(AssertionError):
     """Raised by ``assert_detector_gate`` when a detector fails an anchor (B-REP-3)."""
 
 
+GateAnchor = str | tuple[str, "TurnContext"]
+
+
+def _split_anchor(anchor: GateAnchor, shared: TurnContext) -> tuple[str, TurnContext]:
+    """Normalize a gate anchor to ``(anchor_text, ctx)``.
+
+    A bare ``str`` uses the ``shared`` context (today's behavior, byte-for-byte). A
+    ``(anchor_str, ctx)`` 2-tuple carries its OWN context, overriding ``shared`` for THAT anchor only —
+    so an arm whose stimulus lives in ``ctx.extra`` can be gated (the sentinel that makes the true anchor
+    fire is no longer forced onto the clean anchor). A malformed tuple raises a clear error rather than a
+    bare unpack ``ValueError`` (matching the framework's clear-error posture for author-supplied inputs).
+    """
+    if isinstance(anchor, tuple):
+        if len(anchor) != 2:
+            raise ValueError(
+                f"anchor tuple must be (str, TurnContext), got {len(anchor)}-tuple: {anchor!r}"
+            )
+        text, actx = anchor
+        return text, actx
+    return anchor, shared
+
+
 def assert_detector_gate(
     detector: Detector,
-    known_true: str,
-    known_clean: str,
+    known_true: GateAnchor,
+    known_clean: GateAnchor,
     *,
     ctx: TurnContext | None = None,
 ) -> None:
@@ -78,17 +100,24 @@ def assert_detector_gate(
     This is fully general: it makes NO assumption about what the detector inspects. An author whose gate
     anchor needs domain context passes a ``ctx`` carrying that context in ``ctx.extra`` (the send-script's
     ``_run_gate`` builds such a ctx from the author's ``turn_context`` hook).
+
+    Each anchor may be a bare ``str`` (detected with the shared ``ctx=`` context — the original behavior,
+    unchanged) OR a ``(anchor_str, ctx)`` tuple that carries its own per-anchor context. The tuple form
+    lets an author gate an ``extra``-driven detector arm whose true/clean stimulus must differ per call:
+    a sentinel placed in the true anchor's ``ctx.extra`` no longer leaks onto the clean anchor.
     """
     c = ctx or TurnContext()
-    true_score = detector.detect(known_true, ctx=c)
+    true_text, true_ctx = _split_anchor(known_true, c)
+    clean_text, clean_ctx = _split_anchor(known_clean, c)
+    true_score = detector.detect(true_text, ctx=true_ctx)
     if not true_score.fired:
         raise DetectorGateError(
-            f"detector did not fire on the known-true anchor: {known_true[:80]!r}"
+            f"detector did not fire on the known-true anchor: {true_text[:80]!r}"
         )
-    clean_score = detector.detect(known_clean, ctx=c)
+    clean_score = detector.detect(clean_text, ctx=clean_ctx)
     if clean_score.fired:
         raise DetectorGateError(
-            f"detector fired on the known-clean anchor (false positive): {known_clean[:80]!r} "
+            f"detector fired on the known-clean anchor (false positive): {clean_text[:80]!r} "
             f"signals={clean_score.signals}"
         )
 
