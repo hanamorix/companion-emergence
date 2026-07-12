@@ -16,7 +16,10 @@ What it does (see the module ``README.md`` for the guarantees):
    ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. On Mac the credential may live in the
    Keychain; a fresh ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so the branch is
    recorded, not hard-failed.
-4. Fingerprint the real guarded roots (broad, platformdirs-derived) BEFORE the run.
+4. Fingerprint the real guarded roots (broad, platformdirs-derived) BEFORE the run. For ``~/.claude``
+   the orchestrator's own claude-code session-runtime logs are pruned (F4; see
+   ``_claude_session_log_excludes``) — the sandboxed subject cannot reach those (its CLI runs under
+   the tempdir ``CLAUDE_CONFIG_DIR``), so pruning them drops only the live driving session's noise.
 5. ``yield`` a :class:`SandboxHandle`.
 6. AFTER the run, re-fingerprint; if any guarded root changed, raise :class:`SandboxLeak`.
 7. Restore env (in a ``finally``, even on ``SandboxLeak``) and ``rmtree`` the root (unless ``keep``).
@@ -33,7 +36,7 @@ import os
 import shutil
 import tempfile
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -144,6 +147,66 @@ def _guarded_roots(extra: list[Path] | None = None) -> list[Path]:
     return unique
 
 
+# --- claude-code ORCHESTRATOR session-runtime logs (F4) ------------------------------------------
+# In the Agent-Bob orchestration model the process DRIVING the harness is itself a live claude-code
+# session, and it (plus any spawned subagent) writes its normal session/subagent runtime logs under
+# the developer's REAL ~/.claude DURING the run. Those writes are the ORCHESTRATOR's own logging —
+# never companion/Canary state — so a recursive fingerprint of ~/.claude trips a GUARANTEED SPURIOUS
+# SandboxLeak on every orchestrator-driven run (F4). We prune these session-log subtrees/files from
+# the ~/.claude fingerprint.
+#
+# WHY THIS OPENS NO ESCAPE HOLE: the sandboxed subject's own `claude` CLI subprocesses inherit
+# CLAUDE_CONFIG_DIR=<tempdir>/claude-config (set into os.environ at `sandbox()` startup) because
+# brain/bridge/provider.py:_subprocess_env RESPECTS an already-set upstream CLAUDE_CONFIG_DIR
+# ("if 'CLAUDE_CONFIG_DIR' not in env"). So the SUBJECT's projects/todos/shell-snapshots/... land in
+# the tempdir, NOT the real ~/.claude — only the ORCHESTRATOR (running under the real, unset-by-us
+# config dir) writes the real paths below. Pruning them drops only orchestrator noise.
+#
+# FAIL-CLOSED ALLOWLIST, not a denylist: only the NAMED entries below are excluded; everything else
+# under ~/.claude stays guarded (.credentials.json, settings*, CLAUDE.md, skills/, plugins/, hooks/,
+# cache/, and any FUTURE/unknown dir). A future claude-code release that adds a new session-log dir
+# would re-trip a SAFE spurious leak (fail-closed) until that name is added here — never a silent
+# hole. The set is complete for the claude-code version observed on the dev boxes (see the run's
+# 8-harness.md live-session churn reconciliation); it is a manual/advisory completeness check
+# because it can only be observed with a REAL live claude session, not a fake-HOME unit test.
+_CLAUDE_SESSION_LOG_DIRS = (
+    "projects",         # session + subagent transcripts (the core F4 case)
+    "todos",            # per-session todo state
+    "shell-snapshots",  # per-shell env snapshots
+    "statsig",          # feature-flag / telemetry gate cache
+    "sessions",         # session runtime state
+    "session-env",      # per-session env dirs
+    "telemetry",        # usage telemetry
+    "backups",          # rotated ~/.claude.json snapshots (churn every session)
+    "paste-cache",      # transient paste cache
+    "downloads",        # CLI download cache
+    "file-history",     # CLI's own edit-history log (NOT companion files)
+    "tasks",            # per-session task/subagent bookkeeping
+    "plans",            # plan-mode scratch
+    "ide",              # IDE lock/handshake files (per session)
+)
+_CLAUDE_SESSION_LOG_FILES = (
+    "history.jsonl",              # CLI command history
+    ".last-cleanup",             # housekeeping marker
+    ".last-update-result.json",  # updater result marker
+    "mcp-needs-auth-cache.json",  # transient MCP-auth hint cache
+)
+
+
+def _claude_session_log_excludes() -> list[Path]:
+    """Session-runtime log subtrees + files under ~/.claude to prune from the leak fingerprint (F4).
+
+    Orchestrator's OWN claude-code logs — pruning them stops the guaranteed-spurious SandboxLeak on
+    every orchestrator-driven run WITHOUT opening a hole (the sandboxed subject writes only into the
+    tempdir; see the module comment above and provider.py:_subprocess_env). Derived by NAME as
+    ``Path.home()/".claude"/<name>`` so an absent entry is a harmless no-op (the prune simply never
+    matches) → correct on Linux and macOS alike. Fail-closed allowlist: only these names are
+    excluded; every other ~/.claude path stays guarded.
+    """
+    base = Path.home() / ".claude"
+    return [base / name for name in (*_CLAUDE_SESSION_LOG_DIRS, *_CLAUDE_SESSION_LOG_FILES)]
+
+
 def _notes_roots() -> list[Path]:
     """Notes folders to check SHALLOW + non-recursive (A1: never recursively walk ~/Documents).
 
@@ -171,25 +234,45 @@ def _hash_critical(root: Path) -> bool:
     return root.resolve() == (Path.home() / ".claude").resolve()
 
 
-def _fingerprint(root: Path, exclude: Path | None = None, *, hash_content: bool = False) -> dict:
+def _fingerprint(
+    root: Path, exclude: Iterable[Path] | None = None, *, hash_content: bool = False
+) -> dict:
     """Recursive {relpath -> (size, mtime_ns[, sha256])} for a root. Missing root -> empty map.
 
-    ``exclude`` (resolved) prunes a subtree — used so ``~/.claude`` fingerprinting ignores the
-    sandbox's own claude-config if it ever nested under it (it does not, but be defensive).
-    ``hash_content`` adds a content sha256 for small files so a same-size+same-mtime in-place
-    overwrite is still detected (M1).
+    ``exclude`` is a set of paths to prune — each may name a **directory** (its whole subtree is
+    skipped) or an individual **file** (that file is skipped). Used so ``~/.claude`` fingerprinting
+    ignores (a) the sandbox's own claude-config subtree if it ever nested under it — defensive, it
+    does not — and (b) the orchestrator's own claude-code session-runtime logs (F4; see
+    :func:`_claude_session_log_excludes`). A single-subtree caller passes a one-element iterable.
+    Paths are compared **resolved on both sides** — deliberately more symlink-robust than an
+    unresolved equality; the equivalence at the one pre-existing (canonical, non-symlinked) call
+    site is unchanged. ``hash_content`` adds a content sha256 for small files so a
+    same-size+same-mtime in-place overwrite is still detected (M1).
     """
     fp: dict = {}
     if not root.exists():
         return fp
-    excl = exclude.resolve() if exclude else None
+    excludes = {e.resolve() for e in exclude} if exclude else set()
+    # Cheap pre-filter for the per-FILE exclusion: only the basenames of excluded paths can match a
+    # file, so we skip the expensive f.resolve() syscall for every file whose name isn't even a
+    # candidate. A name collision (a kept file sharing a basename with an excluded path elsewhere) is
+    # then disambiguated by the resolve() confirm — so behavior is identical, minus the syscall on the
+    # (overwhelming) majority of files. Empty when ``exclude`` is None.
+    exclude_names = {ex.name for ex in excludes}
     for dirpath, dirnames, filenames in os.walk(root):
         dp = Path(dirpath)
-        if excl is not None and (dp == excl or excl in dp.resolve().parents):
+        rp = dp.resolve()
+        # Prune a whole DIRECTORY subtree named in ``excludes`` (dir at, or under, an excluded path).
+        if any(rp == ex or ex in rp.parents for ex in excludes):
             dirnames[:] = []
             continue
         for name in filenames:
             f = dp / name
+            # Skip an individual excluded FILE (e.g. a top-level ~/.claude/history.jsonl, seen on the
+            # first os.walk iteration where dirpath == root and no dir-prune applies). Name-match
+            # first (cheap), resolve() only to confirm a candidate (MINOR-2: no per-file syscall).
+            if name in exclude_names and f.resolve() in excludes:
+                continue
             try:
                 st = f.stat()
             except OSError:
@@ -418,13 +501,23 @@ def sandbox(
         auth_source = _seed_auth(claude_config_dir)
         guard_roots = _guarded_roots(extra_guard_roots)
         claude_root = (Path.home() / ".claude").resolve()
+        # INVARIANT (MINOR-1): the `gr == claude_root` gate below identifies the real ~/.claude root
+        # by RESOLVED-path equality — it works only because `_guarded_roots` resolves every entry
+        # (sandbox.py: `rr = r.resolve()`) and `claude_root` is resolved just above. If a future edit
+        # stored an unresolved root, the gate would silently fail to match and the F4 session-log
+        # exclusion would not apply (fail-SAFE: a spurious leak, not a hole) — so we assert it here.
+        assert all(gr == gr.resolve() for gr in guard_roots), "guard_roots must be resolved"
         notes_roots = _notes_roots()
+        # For the real ~/.claude root, prune (a) the sandbox's own claude-config subtree (defensive)
+        # AND (b) the orchestrator's own claude-code session-runtime logs (F4). Any OTHER guarded
+        # root gets no exclusions.
+        claude_excludes = [claude_config_dir, *_claude_session_log_excludes()]
 
         def _snapshot() -> dict:
             snap = {
                 str(gr): _fingerprint(
                     gr,
-                    exclude=claude_config_dir if gr == claude_root else None,
+                    exclude=claude_excludes if gr == claude_root else None,
                     hash_content=_hash_critical(gr),
                 )
                 for gr in guard_roots
