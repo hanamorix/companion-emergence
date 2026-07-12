@@ -21,8 +21,9 @@ sandbox**. Every run goes through the `sandbox()` context manager, which:
 - redirects `KINDLED_HOME` (all persona state) and `CLAUDE_CONFIG_DIR` (the `claude` CLI) into a
   fresh temp dir;
 - seeds **only** the claude auth credential (never your global `CLAUDE.md` / skills / settings);
-- forces the test persona to `notes_enabled=false` + `kindled_relay_url=null` (the only gated
-  external write / phone-home paths);
+- keeps the test persona's config at its safe brain defaults (`notes_enabled=false` +
+  `kindled_relay_url=null`) — it does NOT force them; the real guard is the isolation layer below,
+  and an author may opt in per `PersonaSpec` (see "Persona config knobs");
 - **fingerprints guarded real-home roots before the run and asserts they are unchanged after** —
   a leak fails the test loudly.
 
@@ -49,8 +50,10 @@ Every run is a `with sandbox() as sb:` block. Inside it:
 - **Auth-only seed:** only `~/.claude/.credentials.json` is copied in — never your `CLAUDE.md`,
   settings, skills, or plugins. On a Mac the credential may be in the Keychain; a fresh
   `CLAUDE_CONFIG_DIR` still authenticates via Keychain (recorded on `sb.auth_source`).
-- Every persona is forced to `notes_enabled=false` + `kindled_relay_url=null` — the only two gated
-  external-write / phone-home paths.
+- The persona's config stays at its safe brain defaults (`notes_enabled=false` +
+  `kindled_relay_url=null`) — the harness does **not** force them. The real guard is the isolation
+  layer (this redirect + the leak fingerprint), not forcing config values. An author may opt in:
+  see "Persona config knobs" below.
 - The real guarded home roots (the whole platformdirs data/cache/state/log/config family for
   `companion-emergence`, `~/.claude`, plus OS autostart/notes dirs) are **fingerprinted before and
   after** the run; any change raises `SandboxLeak`.
@@ -144,6 +147,15 @@ An "aged persona" fixture (a real multiply-folded compaction regime) is built by
 
 **Model toggle:** pass a `ModelConfig(canary=..., bob=..., watchdog=...)` to `build_persona` /
 `DumbBob` / `Watchdog` to override the defaults (`sonnet`/`sonnet`/`haiku`).
+
+**Persona config knobs (author-controlled, safe defaults):** the two externally-facing config
+values default OFF (== the brain defaults) and are opt-in via `PersonaSpec`, not forced:
+- `PersonaSpec(notes_enabled=True)` — enables the persona's notes feature and sets a
+  `notes_folder` (`<Documents>/<name> Notes`). A real notes write there is caught by the post-run
+  `SandboxLeak` fingerprint **unless** that folder is a declared F5 `editable_path` (the backstop).
+- `PersonaSpec(kindled_relay_url="https://…")` — allows a Kindled-link relay (sets
+  `kindled_link_enabled=True`). A relay is a **network phone-home the filesystem leak guard cannot
+  catch**, so setting it emits a loud `RuntimeWarning` at build and it stays off by default.
 
 **Multi-arm + usage stalls:** `Runner(arms, state_path, drive_fn)` runs a list of `ArmSpec`s,
 checkpoints on a usage stall (exit 20) and resumes, parks a detector trip (exit 10) and continues.
