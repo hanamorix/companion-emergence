@@ -420,28 +420,47 @@ class ResearchEngine:
     def _seed_interests_from_voice(self) -> bool:
         """Bootstrap starter interests from voice.md when interests.json is empty.
 
-        Reads voice.md (capped at 2000 chars), calls the provider to extract 5
-        topic strings as a JSON array, writes them as Interest records to
-        interests_path.
+        Reads voice.md (capped at 2000 chars), optionally includes up to 10 recent
+        conversation memories, calls the provider to extract 5 topic strings as a
+        JSON array, writes them as Interest records to interests_path.
 
         Returns True if at least one interest was written, False on any failure
         (missing file, LLM error, parse error).  Never raises.
         """
+        from brain.utils.memory import list_conversation_memories
+
         voice_path = self.interests_path.parent / "voice.md"
         if not voice_path.exists():
             return False
         voice_text = voice_path.read_text(encoding="utf-8").strip()
         if not voice_text:
             return False
+
+        # Gather recent conversation memories (fail-soft).
+        convo_section = ""
+        try:
+            recent = list_conversation_memories(self.store, active_only=True, limit=10)
+            if recent:
+                lines = "\n".join(f"- {m.content[:140]}" for m in recent)
+                convo_section = f"\n\nRecent conversations with the user:\n{lines}"
+        except Exception:  # noqa: BLE001
+            convo_section = ""
+
         prompt = (
-            "Based on this companion's personality and voice, suggest 5 specific "
-            "topics they would genuinely find fascinating to research. Return ONLY "
-            "a JSON array of 5 short topic strings (2-5 words each), no explanation."
-            f"\n\n{voice_text[:2000]}"
+            "Based on this companion's personality and voice, AND what has actually "
+            "come up in conversation, suggest 5 specific topics they would genuinely "
+            "find fascinating to research. Prefer topics grounded in the conversations "
+            "when any exist. Return ONLY a JSON array of 5 short topic strings "
+            "(2-5 words each), no explanation."
+            f"\n\n{voice_text[:2000]}{convo_section}"
         )
         try:
             raw = self.provider.generate(prompt, system=None)
-            topics = json.loads(raw)
+            # Harden JSON parsing: find first [ and last ], parse that slice
+            start, end = raw.find("["), raw.rfind("]")
+            if start == -1 or end <= start:
+                return False
+            topics = json.loads(raw[start : end + 1])
             if not isinstance(topics, list):
                 return False
             str_topics = [str(t).strip() for t in topics if str(t).strip()]

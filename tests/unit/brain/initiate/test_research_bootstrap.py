@@ -154,3 +154,76 @@ def test_bootstrap_bad_llm_response_falls_back(tmp_path: Path):
 
     result = engine._seed_interests_from_voice()
     assert result is False
+
+
+def test_bootstrap_prompt_includes_conversation_memories(tmp_path: Path):
+    """Prompt should include up to 10 recent conversation memories."""
+    # Arrange: add conversation memories to the store
+    store = MemoryStore(":memory:")
+    from brain.memory.store import Memory
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    # Add a memory with distinctive content that we'll search for in the prompt
+    mem1 = Memory.create_new(
+        content="the user talked about wulfsyarn at length yesterday",
+        memory_type="conversation",
+        domain="us",
+        emotions={},
+    )
+    store.create(mem1)
+
+    # Build engine with this store and capturing provider
+    provider = _BootstrapProvider()
+    engine = ResearchEngine(
+        store=store,
+        provider=provider,
+        searcher=NoopWebSearcher(),
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
+        interests_path=tmp_path / "interests.json",
+        research_log_path=tmp_path / "research_log.json",
+        default_interests_path=DEFAULT_INTERESTS_PATH,
+    )
+    (tmp_path / "interests.json").write_text(
+        json.dumps({"version": 1, "interests": []}), encoding="utf-8"
+    )
+    (tmp_path / "voice.md").write_text("Nell is a novelist.", encoding="utf-8")
+
+    # Act
+    engine._seed_interests_from_voice()
+
+    # Assert: captured prompt should include the conversation memory content
+    assert provider._calls, "Provider should have been called"
+    bootstrap_prompt = provider._calls[0]
+    assert "wulfsyarn" in bootstrap_prompt.lower(), (
+        f"Prompt should include conversation memory content; got: {bootstrap_prompt}"
+    )
+
+
+def test_bootstrap_parses_json_with_preamble(tmp_path: Path):
+    """Parser should handle preamble before JSON array (e.g., 'Sure! Here you go:\\n[...]')."""
+
+    class _PreambleProvider(FakeProvider):
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            # First call is bootstrap — return JSON with preamble
+            if "suggest 5 specific" in prompt:
+                return f'Sure! Here you go:\n{_BOOTSTRAP_JSON}'
+            return super().generate(prompt, system=system)
+
+        def name(self) -> str:
+            return "preamble_test"
+
+    (tmp_path / "interests.json").write_text(
+        json.dumps({"version": 1, "interests": []}), encoding="utf-8"
+    )
+    (tmp_path / "voice.md").write_text("Nell loves books.", encoding="utf-8")
+    engine = _build_engine(tmp_path, _PreambleProvider())
+
+    # Act
+    result = engine._seed_interests_from_voice()
+
+    # Assert: should successfully parse despite the preamble
+    assert result is True, "Should successfully parse JSON with preamble"
+    loaded = InterestSet.load(tmp_path / "interests.json", default_path=DEFAULT_INTERESTS_PATH)
+    assert len(loaded.interests) == 5
