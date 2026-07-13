@@ -191,27 +191,44 @@ def _guarded_roots(extra: list[Path] | None = None) -> list[Path]:
 # hole. The set is complete for the claude-code version observed on the dev boxes (see the run's
 # 8-harness.md live-session churn reconciliation); it is a manual/advisory completeness check
 # because it can only be observed with a REAL live claude session, not a fake-HOME unit test.
+#
+# PER-DIR SAFETY (AF2, 2026-07-12): every entry below is excluded on ONE mechanical argument, not a
+# per-entry judgement about "companion vs not": the sandboxed Canary's `claude` CLI runs under the
+# tempdir CLAUDE_CONFIG_DIR (provider.py:174 / _subprocess_env respects the upstream value we set),
+# so the CANARY CANNOT WRITE ANY REAL ~/.claude SUBDIR — its projects/todos/file-history/... all land
+# in the tempdir. Therefore EVERY real ~/.claude write during a run is the ORCHESTRATOR's own claude
+# session, and excluding an orchestrator session-runtime dir hides NO Canary leak. The per-entry
+# comments below name WHICH orchestrator-runtime artifact each is (why it churns every session), but
+# the safety rests on the shared confinement mechanism, not on any entry being intrinsically benign.
+# This is pinned by test_af2_canary_claude_writes_confined_to_tempdir + the provider-guard test.
 _CLAUDE_SESSION_LOG_DIRS = (
-    "projects",         # session + subagent transcripts (the core F4 case)
-    "todos",            # per-session todo state
-    "shell-snapshots",  # per-shell env snapshots
-    "statsig",          # feature-flag / telemetry gate cache
-    "sessions",         # session runtime state
-    "session-env",      # per-session env dirs
-    "telemetry",        # usage telemetry
-    "backups",          # rotated ~/.claude.json snapshots (churn every session)
-    "paste-cache",      # transient paste cache
-    "downloads",        # CLI download cache
-    "file-history",     # CLI's own edit-history log (NOT companion files)
-    "tasks",            # per-session task/subagent bookkeeping
-    "plans",            # plan-mode scratch
-    "ide",              # IDE lock/handshake files (per session)
+    "projects",         # orchestrator session + subagent transcripts (the core F4 case)
+    "todos",            # orchestrator per-session todo state
+    "shell-snapshots",  # orchestrator per-shell env snapshots
+    "statsig",          # orchestrator feature-flag / telemetry gate cache
+    "sessions",         # orchestrator session runtime state
+    "session-env",      # orchestrator per-session env dirs
+    "telemetry",        # orchestrator usage telemetry
+    "backups",          # orchestrator's rotated ~/.claude.json snapshots (churn every session)
+    "paste-cache",      # orchestrator transient paste cache
+    "downloads",        # orchestrator CLI download cache
+    # file-history: the CLI's OWN edit-history/backup log of files THE ORCHESTRATOR'S claude session
+    # edited this run — on a real dev box those can be real project files. It is excluded NOT because
+    # its contents are "not companion files" (they may be real files) but because the CANARY cannot
+    # write it: the Canary's CLI file-history lands in the tempdir CLAUDE_CONFIG_DIR, never real
+    # ~/.claude/file-history. So every entry here is the orchestrator's own edit log → excluding it
+    # hides no Canary leak. (This is the entry the AF2 audit flagged as asserted-not-proven; the
+    # proof is the confinement mechanism above, test-backed.)
+    "file-history",
+    "tasks",            # orchestrator per-session task/subagent bookkeeping
+    "plans",            # orchestrator plan-mode scratch
+    "ide",              # orchestrator IDE lock/handshake files (per session)
 )
 _CLAUDE_SESSION_LOG_FILES = (
-    "history.jsonl",              # CLI command history
-    ".last-cleanup",             # housekeeping marker
-    ".last-update-result.json",  # updater result marker
-    "mcp-needs-auth-cache.json",  # transient MCP-auth hint cache
+    "history.jsonl",              # orchestrator CLI command history
+    ".last-cleanup",             # orchestrator housekeeping marker
+    ".last-update-result.json",  # orchestrator updater result marker
+    "mcp-needs-auth-cache.json",  # orchestrator transient MCP-auth hint cache
 )
 
 

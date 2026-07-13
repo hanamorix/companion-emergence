@@ -373,3 +373,80 @@ def test_tempdir_cleanup_and_keep_semantics_on_leak(
         import shutil as _sh
 
         _sh.rmtree(captured_b["root"], ignore_errors=True)  # test cleanup
+
+
+# --- AF2: F4 exclusion per-dir justification + mechanism proof -------------------------------------
+
+
+def test_af2_exclusion_set_unchanged() -> None:
+    """C-AF2-JUSTIFY (automated half): the exclusion set membership is UNCHANGED (the AF2 widening is
+    justified, NOT narrowed). Pinned by a hard-coded literal here (no on-disk baseline file); guards
+    against a silent narrowing sneaking in under 'add a per-dir justification comment'.
+    file-history is explicitly asserted present (the AF2-flagged entry).
+    """
+    expected_dirs = (
+        "projects", "todos", "shell-snapshots", "statsig", "sessions", "session-env",
+        "telemetry", "backups", "paste-cache", "downloads", "file-history", "tasks", "plans", "ide",
+    )
+    expected_files = (
+        "history.jsonl", ".last-cleanup", ".last-update-result.json", "mcp-needs-auth-cache.json",
+    )
+    assert _CLAUDE_SESSION_LOG_DIRS == expected_dirs
+    assert _CLAUDE_SESSION_LOG_FILES == expected_files
+    assert "file-history" in _CLAUDE_SESSION_LOG_DIRS  # the AF2-flagged entry, still excluded
+
+
+def test_af2_canary_claude_writes_confined_to_tempdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-AF2-MECHANISM / C-AF2-FH: the exclusion is safe BY MECHANISM, not by an asserted comment.
+
+    Inside a real sandbox() run, the sandboxed subject's `claude` CLI subprocess env
+    (`brain.bridge.provider._subprocess_env`) has CLAUDE_CONFIG_DIR pointing UNDER the tempdir
+    claude-config — so a Canary `claude` (which writes projects/, todos/, file-history/, ... under its
+    CLAUDE_CONFIG_DIR) writes into the tempdir, NEVER the real ~/.claude. This is dir-agnostic: it
+    confines EVERY ~/.claude subdir the CLI writes, `file-history` included → excluding those dirs from
+    the leak fingerprint hides no Canary leak. Token-free (`_subprocess_env` builds an env dict only).
+
+    Oracle-can-fail: the sibling test_provider_respects_upstream_claude_config_dir shows removing the
+    provider guard breaks the read-through (here it would point outside the tempdir).
+    """
+    _seed_fake_cred(monkeypatch, tmp_path)
+    from brain.bridge.provider import _subprocess_env
+
+    with sandbox() as sb:
+        cfg = _subprocess_env().get("CLAUDE_CONFIG_DIR")
+        assert cfg is not None
+        # normalize str -> Path (avoid the Path-vs-str hazard) and confirm confinement to the tempdir.
+        cfg_path = Path(cfg).resolve()
+        assert cfg_path == sb.claude_config_dir.resolve() or cfg_path.is_relative_to(
+            sb.claude_config_dir.resolve()
+        )
+        # ...and the tempdir config dir is itself under the sandbox root (not the real ~/.claude).
+        assert cfg_path.is_relative_to(sb.root.resolve())
+        real_claude = (Path.home() / ".claude").resolve()
+        assert not cfg_path.is_relative_to(real_claude)  # a Canary write never reaches real ~/.claude
+
+
+def test_af2_file_history_write_by_canary_would_land_in_tempdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-AF2-FH (observed): a file-history-shaped write the CANARY makes (under its CLAUDE_CONFIG_DIR)
+    lands under the tempdir, NOT the real ~/.claude/file-history — so the exclusion of file-history
+    from the real-home fingerprint hides no Canary leak. Complements the dir-agnostic mechanism test
+    with a concrete file-history observation (closes the audit's 'asserted not proven' gap for the
+    specific dir it flagged)."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    from brain.bridge.provider import _subprocess_env
+
+    with sandbox() as sb:
+        canary_cfg = Path(_subprocess_env()["CLAUDE_CONFIG_DIR"]).resolve()
+        # Simulate the Canary CLI writing its own file-history under ITS config dir (the tempdir one).
+        fh = canary_cfg / "file-history" / "edit-123.json"
+        fh.parent.mkdir(parents=True, exist_ok=True)
+        fh.write_text('{"canary": "edit log"}')
+        # It landed under the tempdir, NOT the real ~/.claude/file-history.
+        assert fh.is_relative_to(sb.root.resolve())
+        real_fh = (Path.home() / ".claude" / "file-history").resolve()
+        assert not fh.is_relative_to(real_fh)
+    # Clean exit: this in-tempdir write did NOT raise SandboxLeak (it is inside the sandbox).
