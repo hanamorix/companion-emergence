@@ -161,9 +161,7 @@ def test_bootstrap_prompt_includes_conversation_memories(tmp_path: Path):
     # Arrange: add conversation memories to the store
     store = MemoryStore(":memory:")
     from brain.memory.store import Memory
-    from datetime import UTC, datetime
 
-    now = datetime.now(UTC)
     # Add a memory with distinctive content that we'll search for in the prompt
     mem1 = Memory.create_new(
         content="the user talked about wulfsyarn at length yesterday",
