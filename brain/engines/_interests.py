@@ -198,30 +198,35 @@ class InterestSet:
                 return i
         return None
 
-    def bump(self, topic: str, *, amount: float, now: datetime) -> InterestSet:
+    def bump(
+        self, topic: str, *, amount: float, now: datetime, revive_threshold: float = 6.0
+    ) -> InterestSet:
         """Return a new InterestSet with topic's pull_score nudged.
 
         Unknown topics return self unchanged (caller decides whether to add).
+
+        If the interest is dormant and its new pull_score >= revive_threshold,
+        it will be revived to active status.
         """
+        from dataclasses import replace
+
         out: list[Interest] = []
         matched = False
         lower = topic.lower()
         for i in self.interests:
             if i.topic.lower() == lower:
                 matched = True
+                new_score = i.pull_score + amount
+                new_status = i.status
+                if i.status == "dormant" and new_score >= revive_threshold:
+                    new_status = "active"
                 out.append(
-                    Interest(
-                        id=i.id,
-                        topic=i.topic,
-                        pull_score=i.pull_score + amount,
-                        scope=i.scope,
-                        related_keywords=i.related_keywords,
-                        notes=i.notes,
-                        first_seen=i.first_seen,
+                    replace(
+                        i,
+                        pull_score=new_score,
                         last_fed=now,
-                        last_researched_at=i.last_researched_at,
                         feed_count=i.feed_count + 1,
-                        source_types=i.source_types,
+                        status=new_status,
                     )
                 )
             else:
@@ -240,6 +245,8 @@ class InterestSet:
         """
         out: list[Interest] = []
         for i in self.interests:
+            if i.status != "active":
+                continue
             if i.pull_score < pull_threshold:
                 continue
             if i.last_researched_at is not None:
