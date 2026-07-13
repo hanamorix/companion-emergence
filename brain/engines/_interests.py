@@ -268,3 +268,42 @@ class InterestSet:
         out = [i for i in self.interests if i.id != interest.id]
         out.append(interest)
         return InterestSet(interests=tuple(out))
+
+
+def spawn_interest(
+    interests: InterestSet,
+    *,
+    topic: str,
+    keywords: tuple[str, ...],
+    why: str,
+    origin: str,
+    now: datetime,
+    pull_threshold: float = 6.0,
+) -> tuple[InterestSet, bool]:
+    """Dedup-guarded interest creation. Returns (new_set, created).
+
+    Casefold topic match vs ALL existing (active + dormant): a dormant match
+    is bumped (revive path) instead of duplicated; an active match is a no-op
+    (returns created=False). New interests seed at pull_threshold - 1.0 so
+    they need organic bumps before firing.
+    """
+    key = topic.strip().casefold()
+    if not key:
+        return interests, False
+    for i in interests.interests:
+        if i.topic.strip().casefold() == key:
+            if i.status == "dormant":
+                return interests.bump(i.topic, amount=0.1, now=now,
+                                      revive_threshold=pull_threshold), False
+            return interests, False
+    new = Interest(
+        id=f"{origin}-{abs(hash(key)):016x}",
+        topic=topic.strip(),
+        pull_score=pull_threshold - 1.0,
+        scope="either",
+        related_keywords=tuple(k.strip() for k in keywords if k.strip())[:5],
+        notes=why.strip()[:280],
+        first_seen=now, last_fed=now, last_researched_at=None,
+        feed_count=0, source_types=(origin,), status="active", origin=origin,
+    )
+    return InterestSet(interests=interests.interests + (new,)), True
