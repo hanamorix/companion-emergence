@@ -36,6 +36,16 @@ Usage:
         returns the per-turn ``TurnContext.extra`` bag (domain context a detector needs). Absent -> the
         detector sees ``extra={}``. Core never inspects the returned dict.
     ``gate_known_true`` / ``gate_known_clean`` (optional) — detector-gate anchors (B-REP-3).
+    ``gate_true_context`` / ``gate_clean_context`` (optional) — a ``"module.path:factory"`` dotted
+        path (same shape as ``turn_context``: ``factory(env) -> dict``) supplying the ``extra`` bag
+        for the KNOWN-TRUE / KNOWN-CLEAN gate anchor RESPECTIVELY. This lets an author gate a detector
+        arm whose stimulus lives in ``ctx.extra`` (a proposed file, a retrieved doc, a tool payload)
+        THROUGH THIS SHIPPED SEAM instead of a side-assertion: a sentinel placed in the true anchor's
+        ``extra`` no longer leaks onto the clean anchor (the F3 primitive's per-anchor ctx, wired here).
+        An anchor whose key is UNSET falls back to the shared ``turn_context`` ``extra``, so setting
+        just ``gate_true_context`` is valid (true supplies the sentinel, clean does not). **When
+        NEITHER key is set, ``_run_gate`` is byte-identical to before this seam existed** (bare-string
+        anchors + one shared ctx whose ``extra`` is ``turn_context``'s output).
     ``log_extra_values`` (optional) — a list of ``extra`` key NAMES whose VALUES to persist into each
         transcript row under an ``extra_values`` field (for post-run adjudication). Opt-in and
         author-named: absent/empty -> the row is byte-identical to today (only ``extra_keys`` names).
@@ -130,16 +140,18 @@ def build_detector(env: dict) -> Detector:
     return factory()
 
 
-def turn_extra(env: dict) -> dict:
-    """Build the per-turn ``TurnContext.extra`` bag from the author's optional ``turn_context`` hook.
+def _extra_from_hook(env: dict, key: str) -> dict:
+    """Resolve the author's optional ``env[key]`` dotted-path hook to an ``extra`` dict.
 
-    ``env["turn_context"]`` is a ``"module.path:factory"`` dotted path where ``factory(env) -> dict``.
-    Absent -> ``{}`` (the detector sees no domain context). Fail-soft to ``{}`` on any exception so a bad
-    hook cannot crash a live run — but a misconfigured (present-but-unimportable/erroring) hook is logged
-    **to ``sys.stderr``** (NEVER stdout: stdout's last two lines are the CANARY:/RESULT machine contract),
-    so the failure is visible rather than a silent empty bag.
+    ``env[key]`` is a ``"module.path:factory"`` dotted path where ``factory(env) -> dict``. Absent (or a
+    non-dict return) -> ``{}``. Fail-soft to ``{}`` on any exception so a bad hook cannot crash a live run
+    — but a misconfigured (present-but-unimportable/erroring) hook is logged **to ``sys.stderr``** (NEVER
+    stdout: stdout's last two lines are the CANARY:/RESULT machine contract), so the failure is visible
+    rather than a silent empty bag. Shared by the per-turn ``turn_context`` hook and the per-anchor
+    gate-context hooks (``gate_true_context`` / ``gate_clean_context``) so the fail-soft/stderr contract
+    lives in ONE place.
     """
-    spec = env.get("turn_context")
+    spec = env.get(key)
     if not spec:
         return {}
     try:
@@ -147,8 +159,31 @@ def turn_extra(env: dict) -> dict:
         result = factory(env)
         return result if isinstance(result, dict) else {}
     except Exception as e:  # noqa: BLE001 — a bad hook must not crash the live run; report + continue
-        print(f"[warn] turn_context hook {spec!r} failed: {e}", file=sys.stderr)
+        print(f"[warn] {key} hook {spec!r} failed: {e}", file=sys.stderr)
         return {}
+
+
+def turn_extra(env: dict) -> dict:
+    """Build the per-turn ``TurnContext.extra`` bag from the author's optional ``turn_context`` hook.
+
+    Thin delegator to :func:`_extra_from_hook` — behavior unchanged (a ``"module.path:factory"`` dotted
+    path in ``env["turn_context"]`` where ``factory(env) -> dict``; absent -> ``{}``; fail-soft +
+    stderr-logged). Kept as a named function because the send-script + its tests monkeypatch it directly.
+    """
+    return _extra_from_hook(env, "turn_context")
+
+
+def _gate_extra(env: dict, key: str) -> dict | None:
+    """Resolve an optional PER-ANCHOR gate-context hook, distinguishing 'absent' from 'empty'.
+
+    Returns ``None`` when ``env[key]`` is **absent** (so ``_run_gate`` can take the byte-identical
+    both-``None`` fast path) — versus ``{}`` from a present-but-empty (or erroring) factory, which is a
+    real per-anchor ctx of ``{}``. When the key is present, delegates to :func:`_extra_from_hook` (same
+    fail-soft/stderr contract as ``turn_context``).
+    """
+    if not env.get(key):
+        return None
+    return _extra_from_hook(env, key)
 
 
 def _turn_no(transcript: Path) -> int:
@@ -162,13 +197,40 @@ def _run_gate(detector: object, env: dict, gate_marker: Path) -> None:
 
     The gate ctx carries the author's ``turn_context`` ``extra`` too (G4b), so an author whose gate
     anchor needs domain context gets it — core makes no domain assumption of its own here.
+
+    **Per-anchor gate context (AF1).** If the author sets ``gate_true_context`` and/or
+    ``gate_clean_context`` (dotted-path ``factory(env) -> dict`` hooks, like ``turn_context``), each gate
+    anchor is detected with its OWN ``extra`` — so an ``extra``-anchored detector arm (one whose stimulus
+    lives in ``ctx.extra``, not the reply string) can be gated THROUGH THIS SEAM: the sentinel that makes
+    the true anchor fire is no longer forced onto the clean anchor (the F3 primitive's per-anchor tuple
+    form, wired here). An anchor whose key is UNSET falls back to the shared ``turn_context`` ``extra``.
+    When NEITHER key is set, this is byte-identical to the pre-seam behavior: bare-string anchors + one
+    shared ctx whose ``extra`` is ``turn_extra(env)``.
     """
     if gate_marker.exists():
         return
     known_true = env.get("gate_known_true", _DEFAULT_KNOWN_TRUE)
     known_clean = env.get("gate_known_clean", _DEFAULT_KNOWN_CLEAN)
-    ctx = TurnContext(user_names=[env.get("user", "Bob")], extra=turn_extra(env))
-    assert_detector_gate(detector, known_true, known_clean, ctx=ctx)
+    user = env.get("user", "Bob")
+    shared_extra = turn_extra(env)
+    true_extra = _gate_extra(env, "gate_true_context")
+    clean_extra = _gate_extra(env, "gate_clean_context")
+
+    if true_extra is None and clean_extra is None:
+        # No per-anchor context configured -> byte-identical to the pre-AF1 behavior (bare-string
+        # anchors detected with one shared ctx whose extra is the turn_context output).
+        ctx = TurnContext(user_names=[user], extra=shared_extra)
+        assert_detector_gate(detector, known_true, known_clean, ctx=ctx)
+    else:
+        # Per-anchor: an anchor whose key is unset falls back to the shared turn_context extra, so
+        # setting just one key is valid. The (anchor, ctx) tuple form gives each anchor its OWN extra.
+        true_ctx = TurnContext(
+            user_names=[user], extra=true_extra if true_extra is not None else shared_extra
+        )
+        clean_ctx = TurnContext(
+            user_names=[user], extra=clean_extra if clean_extra is not None else shared_extra
+        )
+        assert_detector_gate(detector, (known_true, true_ctx), (known_clean, clean_ctx))
     gate_marker.write_text("ok\n")
 
 

@@ -535,3 +535,174 @@ def test_f1_named_but_absent_key_adds_no_field(tmp_path, monkeypatch, capsys) ->
     agent_send.main(["--new", "hi"])
     row = _last_row(sandbox)
     assert "extra_values" not in row  # non-empty guard -> byte-identical row
+
+
+# --- AF1: _run_gate per-anchor gate context (finish the F3 seam) -----------------------------------
+# These tests drive `agent_send._run_gate` DIRECTLY and do NOT reuse the `wired` fixture (whose
+# `turn_extra -> {}` monkeypatch would shadow a turn_context hook and make an ORACLE/BC test silently
+# vacuous — stage-3 Lens-1 trap). Template: test_gate_ctx_receives_extra above. Module-level factories
+# so a dotted path resolves.
+
+
+class _ExtraArm:
+    """A detector arm whose stimulus lives ONLY in ctx.extra: fires iff extra['k'] == 'ok'.
+
+    This is the class the single-shared-ctx gate could not gate (F3/AF1): the anchor that makes it fire
+    (a sentinel in extra) is seen on BOTH anchors when one shared ctx is used.
+    """
+
+    def detect(self, reply, *, ctx=None):  # noqa: ANN001
+        extra = (ctx.extra if ctx else {}) or {}
+        fired = extra.get("k") == "ok"
+        return Score(fired=fired, signals=["k"] if fired else [])
+
+
+def make_extra_arm() -> _ExtraArm:
+    return _ExtraArm()
+
+
+def make_gate_true_extra(env) -> dict:  # noqa: ANN001
+    return {"k": "ok"}
+
+
+def make_gate_t_extra(env) -> dict:  # noqa: ANN001
+    return {"t": "T"}
+
+
+def make_gate_c_extra(env) -> dict:  # noqa: ANN001
+    return {"c": "C"}
+
+
+def _af1_env(tmp_path, monkeypatch, **overrides) -> dict:
+    """Write a LIVE_ENV for a direct _run_gate drive; return the parsed env dict."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env.update(overrides)
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    return env
+
+
+def _fresh_gate_marker(env) -> Path:
+    sandbox = agent_send._sandbox_paths(env)[0]
+    sandbox.mkdir(parents=True, exist_ok=True)
+    gm = sandbox / "gate_ok.txt"
+    gm.unlink(missing_ok=True)
+    return gm
+
+
+def test_af1_run_gate_per_anchor_ctx_gates_extra_arm(tmp_path, monkeypatch) -> None:
+    """C-AF1-E2E: an extra-anchored arm is gated THROUGH _run_gate — true fires (gate_true_context
+    supplies k), clean silent (gate_clean_context unset -> falls back to shared, no k). No raise."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true="true anchor text",
+        gate_known_clean="clean anchor text",
+        gate_true_context=f"{_THIS_MODULE}:make_gate_true_extra",
+        # gate_clean_context intentionally UNSET
+    )
+    gm = _fresh_gate_marker(env)
+    # real turn_extra runs (no monkeypatch): turn_context is unset -> shared extra is {} -> clean silent.
+    agent_send._run_gate(_ExtraArm(), env, gm)  # must NOT raise
+    assert gm.exists()  # gate passed -> marker written
+
+
+def test_af1_run_gate_single_shared_ctx_spuriously_fails() -> None:
+    """C-AF1-ORACLE (oracle-can-fail): the OLD single-shared-ctx form spuriously FAILS the same arm.
+
+    Fixture-independent direct form (mirrors test_gate_single_shared_ctx_spuriously_fails_extra_driven_detector):
+    one shared ctx carrying k -> the arm fires on the clean anchor too -> spurious DetectorGateError.
+    Proves the per-anchor wiring in _run_gate is load-bearing.
+    """
+    shared = agent_send.TurnContext(extra={"k": "ok"})
+    with pytest.raises(agent_send.DetectorGateError):
+        agent_send.assert_detector_gate(_ExtraArm(), "true", "clean", ctx=shared)
+
+
+def test_af1_run_gate_backward_compat_shared_ctx(tmp_path, monkeypatch) -> None:
+    """C-AF1-BC (behavior preservation): with NO per-anchor keys, both anchors get the SAME shared ctx
+    whose extra == turn_extra(env). Uses a REAL non-empty turn_context hook so the assertion is
+    non-vacuous ({"sentinel":"ok"}, not {})."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true="gate-true",
+        gate_known_clean="gate-clean",
+        turn_context=f"{_THIS_MODULE}:make_extra",  # returns {"sentinel": "ok"}
+        # NO gate_true_context / gate_clean_context -> both-None fast path
+    )
+    gm = _fresh_gate_marker(env)
+    seen: list = []
+
+    class _Probe:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            seen.append(dict((ctx.extra if ctx else {}) or {}))
+            return Score(fired=(reply == "gate-true"), signals=["p"] if reply == "gate-true" else [])
+
+    agent_send._run_gate(_Probe(), env, gm)
+    # both anchors saw the SAME shared extra == the real turn_context output (non-vacuous).
+    assert seen == [{"sentinel": "ok"}, {"sentinel": "ok"}]
+
+
+def test_af1_run_gate_both_contexts_no_bleed(tmp_path, monkeypatch) -> None:
+    """C-AF1-BOTHKEYS (the headline): BOTH gate-context keys set to DISTINCT factories -> each anchor
+    gets ONLY its own extra; the true sentinel does NOT leak onto the clean anchor (and vice-versa).
+
+    Oracle-can-fail: a wiring bug assigning true-extra to both anchors puts 't' on the clean anchor ->
+    the `"t" not in clean` assertion fails. This is the exact F3-at-the-seam failure AF1 prevents.
+    """
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true="TRUE anchor",
+        gate_known_clean="CLEAN anchor",
+        gate_true_context=f"{_THIS_MODULE}:make_gate_t_extra",   # {"t": "T"}
+        gate_clean_context=f"{_THIS_MODULE}:make_gate_c_extra",  # {"c": "C"}
+    )
+    gm = _fresh_gate_marker(env)
+    per_anchor: dict = {}
+
+    class _RecProbe:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            extra = dict((ctx.extra if ctx else {}) or {})
+            per_anchor[reply] = extra
+            # fire on the true anchor text so the gate passes; silent on clean.
+            fired = reply == "TRUE anchor"
+            return Score(fired=fired, signals=["p"] if fired else [])
+
+    agent_send._run_gate(_RecProbe(), env, gm)  # must NOT raise
+    assert per_anchor["TRUE anchor"] == {"t": "T"}   # true anchor got ONLY its own extra
+    assert "c" not in per_anchor["TRUE anchor"]       # clean's sentinel did NOT leak onto true
+    assert per_anchor["CLEAN anchor"] == {"c": "C"}  # clean anchor got ONLY its own extra
+    assert "t" not in per_anchor["CLEAN anchor"]      # true's sentinel did NOT leak onto clean
+    assert gm.exists()
+
+
+def test_af1_run_gate_true_context_only(tmp_path, monkeypatch) -> None:
+    """C-AF1-TRUEONLY (advisory): only gate_true_context set -> true anchor gets the factory's extra,
+    clean anchor falls back to the shared turn_context extra."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true="TRUE anchor",
+        gate_known_clean="CLEAN anchor",
+        gate_true_context=f"{_THIS_MODULE}:make_gate_t_extra",   # {"t": "T"}
+        turn_context=f"{_THIS_MODULE}:make_extra",               # shared {"sentinel": "ok"}
+        # gate_clean_context UNSET -> clean falls back to shared
+    )
+    gm = _fresh_gate_marker(env)
+    per_anchor: dict = {}
+
+    class _RecProbe:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            per_anchor[reply] = dict((ctx.extra if ctx else {}) or {})
+            fired = reply == "TRUE anchor"
+            return Score(fired=fired, signals=["p"] if fired else [])
+
+    agent_send._run_gate(_RecProbe(), env, gm)
+    assert per_anchor["TRUE anchor"] == {"t": "T"}           # true = its own factory extra
+    assert per_anchor["CLEAN anchor"] == {"sentinel": "ok"}  # clean = shared turn_context fallback
+
+
+def test_af1_live_env_docstring_documents_gate_context() -> None:
+    """C-AF1-DOC (oracle-can-fail): the LIVE_ENV docstring documents both new keys."""
+    doc = agent_send.__doc__ or ""
+    assert "gate_true_context" in doc
+    assert "gate_clean_context" in doc
