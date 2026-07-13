@@ -11,6 +11,7 @@ import pytest
 from brain.bridge.provider import FakeProvider
 from brain.engines._interests import InterestSet
 from brain.engines.research import ResearchEngine
+from brain.engines.research_notes import read_notes_tail
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
 
@@ -68,6 +69,24 @@ def _interest_dict(**overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+class ScriptedProvider(FakeProvider):
+    """Returns replies from a fixed script, in call order.
+
+    Task 6's firing block makes two provider.generate() calls per fire (select,
+    then the research session) — tests script both. Calls past the end of the
+    script repeat the last reply.
+    """
+
+    def __init__(self, replies: list[str]) -> None:
+        self._replies = list(replies)
+        self.calls: list[tuple[str, str | None]] = []
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        self.calls.append((prompt, system))
+        idx = min(len(self.calls) - 1, len(self._replies) - 1)
+        return self._replies[idx]
 
 
 def test_run_tick_no_interests_defined(tmp_path: Path):
@@ -202,7 +221,17 @@ def test_run_tick_fire_writes_research_memory(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select call chooses i1, session call returns a real MEMORY
+        # section so a memory actually gets created (the old flow persisted
+        # the raw reply unconditionally; the new one only persists on MEMORY).
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(days_since_human_override=5.0)
         assert result.fired is not None
         mem = store.get(result.fired.output_memory_id)
@@ -345,6 +374,124 @@ def test_run_tick_renders_prompt_with_context(tmp_path: Path, monkeypatch):
     assert "Nell" in (captured["system"] or "")
 
 
+# ---- Task 6: select call, notes-cumulative sessions, verdict lifecycle ----
+
+
+def test_select_declines_ends_tick_without_cooldown(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.reason == "declined" and res.fired is None
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert all(i.last_researched_at is None for i in saved.interests)
+    finally:
+        store.close()
+
+
+def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None
+        assert "found X" in read_notes_tail(engine.interests_path.parent, res.fired.interest_id)
+        mem = store.get(res.fired.output_memory_id)
+        assert mem.content == "I liked it."
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].last_researched_at is not None
+    finally:
+        store.close()
+
+
+def test_close_verdict_marks_dormant(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "NOTES:\nwrapped up\n\nMEMORY:\nFelt done with this.\n\nVERDICT:\nclose",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].status == "dormant"
+    finally:
+        store.close()
+
+
+def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
+    # Existing interest topic is mixed-case; the spawn verdict names it back in
+    # lowercase — proves the dedup match is casefolded, not exact-string.
+    _write_interests(
+        tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")]
+    )
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "NOTES:\nfound stuff\n\nMEMORY:\nGood session.\n\n"
+                "VERDICT:\nspawn: brand new topic; marine bioluminescence",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        spawned = [i for i in saved.interests if i.origin == "side_quest"]
+        assert len(spawned) == 1 and spawned[0].pull_score == engine.pull_threshold - 1.0
+        assert spawned[0].topic == "brand new topic"
+    finally:
+        store.close()
+
+
+def test_select_parse_failure_falls_back_to_mechanical_winner(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                "not json at all, just rambling prose",
+                "NOTES:\nfound stuff\n\nMEMORY:\nSession happened.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None  # highest-pull fallback fired
+        assert res.fired.topic == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_degraded_reply_appends_notes_but_no_memory(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "just some rambling prose with no markers at all",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None and res.fired.output_memory_id is None
+        assert store.count() == 0
+    finally:
+        store.close()
+
+
 # ---- ResearchLog unit tests ----
 
 
@@ -431,7 +578,16 @@ def test_research_fire_emits_initiate_candidate_when_maturity_passes(
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
     store = MemoryStore(":memory:")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select chooses i1, session returns a real MEMORY section —
+        # candidate emission is gated on a memory existing (mem_id is not None).
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(
             trigger="days_since_human", dry_run=False, days_since_human_override=5.0
         )
@@ -477,7 +633,16 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
     store = MemoryStore(":memory:")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select chooses i1, session returns a real MEMORY section —
+        # a memory must exist for the gate path (and its rejection write) to run.
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(
             trigger="days_since_human", dry_run=False, days_since_human_override=5.0
         )
