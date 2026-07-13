@@ -91,6 +91,8 @@ writes) — the post-run `SandboxLeak` remains the backstop for that rare case.
 
 ## Usage — authoring a live test
 
+> Authoring a live test step-by-step? The skill at `tests/harness/live-test-authoring/` walks the ordered flow (fixture → detector → validate-before-trust → Bob → sandbox → adjudicate); this README is the API reference it points at. To invoke it as a skill, copy or symlink `tests/harness/live-test-authoring/` into your `~/.claude/skills/` (or a project `.claude/skills/`).
+
 **You supply the detector.** The framework ships NO detector and makes no assumption about what a
 detector inspects. A detector is any object with `detect(reply, *, ctx) -> Score`; validate it on
 anchors before trusting it (B-REP-3), then score each reply. If a detector needs domain-specific
