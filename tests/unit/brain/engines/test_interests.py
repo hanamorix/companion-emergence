@@ -11,6 +11,7 @@ import pytest
 from brain.engines._interests import Interest, InterestSet
 
 DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_interests.json"
+NOW = datetime(2026, 7, 13, 10, 0, 0, tzinfo=UTC)
 
 
 def _sample_dict(**overrides) -> dict:
@@ -317,3 +318,77 @@ def test_bump_below_threshold_stays_dormant():
     dorm = replace(make_interest(topic="b", pull_score=1.0), status="dormant")
     s2 = InterestSet(interests=(dorm,)).bump("b", amount=0.1, now=now, revive_threshold=6.0)
     assert s2.interests[0].status == "dormant"
+
+
+# ---- Task 3: spawn_interest ----
+
+
+@pytest.fixture
+def empty_set() -> InterestSet:
+    """Empty InterestSet for spawn_interest tests."""
+    return InterestSet(interests=())
+
+
+@pytest.fixture
+def set_with_topic() -> InterestSet:
+    """InterestSet with one active Interest (Art Restoration)."""
+    interest = make_interest(topic="Art Restoration", pull_score=6.5)
+    return InterestSet(interests=(interest,))
+
+
+@pytest.fixture
+def set_with_dormant_topic() -> InterestSet:
+    """InterestSet with one dormant Interest (Art Restoration)."""
+    from dataclasses import replace
+
+    interest = replace(make_interest(topic="Art Restoration", pull_score=3.0), status="dormant")
+    return InterestSet(interests=(interest,))
+
+
+def test_spawn_creates_below_threshold(empty_set):
+    from brain.engines._interests import spawn_interest
+
+    s, created = spawn_interest(
+        empty_set,
+        topic="Art restoration",
+        keywords=("restoration",),
+        why="came up",
+        origin="side_quest",
+        now=NOW,
+        pull_threshold=6.0,
+    )
+    assert created
+    i = s.interests[0]
+    assert i.pull_score == 5.0 and i.origin == "side_quest" and i.status == "active"
+    assert i.notes == "came up"
+
+
+def test_spawn_dedupes_casefold_active(set_with_topic):
+    from brain.engines._interests import spawn_interest
+
+    # set_with_topic: contains active Interest topic="Art Restoration"
+    s, created = spawn_interest(
+        set_with_topic,
+        topic="art restoration",
+        keywords=(),
+        why="",
+        origin="sweep",
+        now=NOW,
+    )
+    assert not created and len(s.interests) == len(set_with_topic.interests)
+
+
+def test_spawn_on_dormant_match_bumps_not_duplicates(set_with_dormant_topic):
+    from brain.engines._interests import spawn_interest
+
+    s, created = spawn_interest(
+        set_with_dormant_topic,
+        topic="ART RESTORATION",
+        keywords=(),
+        why="",
+        origin="conversation",
+        now=NOW,
+    )
+    assert not created
+    assert len(s.interests) == len(set_with_dormant_topic.interests)
+    assert s.interests[0].feed_count == set_with_dormant_topic.interests[0].feed_count + 1
