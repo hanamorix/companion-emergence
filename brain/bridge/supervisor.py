@@ -55,10 +55,11 @@ from brain.attunement.backfill import (
 from brain.attunement.backfill import (
     should_run_supplementary_backfill as _attunement_should_run_supplementary_backfill,
 )
-from brain.bridge import persisted_cadence
+from brain.bridge import cli_throttle, persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
+from brain.engines import interest_sweep
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.forgetting import run_pass as forgetting_run_pass
@@ -181,6 +182,15 @@ def run_folded(
         persisted_cadence.load_cadence(persona_dir, "maintenance_cadence.json")
         if soul_review_interval_s is not None
         else None
+    )
+    # Interest sweep — weekly persisted wall-clock cadence (Task 10). No
+    # dedicated run_folded knob: the interval is a spec-fixed constant in
+    # interest_sweep.py (SWEEP_INTERVAL_HOURS), not a user-facing setting —
+    # matches the User-surface principle (the brain owns cadence, not a
+    # param). Always loaded, mirroring maintenance's persisted-wall-clock
+    # shape below.
+    interest_sweep_cadence_state = persisted_cadence.load_cadence(
+        persona_dir, interest_sweep.SWEEP_CADENCE_FILE
     )
     _last_intensity_drivers: IntensityDrivers | None = None
     finalize_cadence_state = (
@@ -437,6 +447,48 @@ def run_folded(
             )
             persisted_cadence.save_cadence(
                 persona_dir, "maintenance_cadence.json", maintenance_cadence_state
+            )
+
+        # Interest sweep — weekly, persisted wall-clock (Task 10). Safety net
+        # behind the per-turn extractor inlet (spec 2026-07-13 §6.3): proposes
+        # <=3 new interests + <=3 retirements from recent lived material.
+        # run_sweep_tick is a leaf engine call (not a supervisor _run_X_tick
+        # wrapper) that owns neither cadence nor throttle by design — this
+        # block owns both. Own per-tick MemoryStore (ExitStack, mirrors the
+        # maker/notes store-ownership pattern) since run_sweep_tick takes
+        # store= directly. Throttled via cli_throttle.background_slot; the
+        # returned dict (spawned/retired/error) is caller-facing only, so it
+        # is ignored here.
+        if persisted_cadence.is_due(interest_sweep_cadence_state, now=datetime.now(UTC)):
+            try:
+                with (
+                    ExitStack() as _sweep_stack,
+                    cli_throttle.background_slot() as _sweep_slot,
+                ):
+                    if _sweep_slot:
+                        _sweep_store = MemoryStore(persona_dir / "memories.db")
+                        _sweep_stack.callback(_sweep_store.close)
+                        interest_sweep.run_sweep_tick(
+                            store=_sweep_store,
+                            provider=provider,
+                            interests_path=persona_dir / "interests.json",
+                            default_interests_path=(
+                                Path(__file__).resolve().parent.parent
+                                / "engines"
+                                / "default_interests.json"
+                            ),
+                            now=datetime.now(UTC),
+                        )
+            except Exception:
+                logger.exception("supervisor interest-sweep tick raised")
+            # End-of-block advance+save: body above is fully wrapped, so this
+            # is unconditionally reached (cadence invariant, defer #21 pattern).
+            interest_sweep_cadence_state = persisted_cadence.advance(
+                now=datetime.now(UTC),
+                interval_s=interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+            )
+            persisted_cadence.save_cadence(
+                persona_dir, interest_sweep.SWEEP_CADENCE_FILE, interest_sweep_cadence_state
             )
 
         # Finalize cadence — 24h silence (default) or explicit. Each pass
