@@ -61,6 +61,28 @@ def test_interest_to_dict_roundtrip():
     assert restored == original
 
 
+def test_from_dict_defaults_status_and_origin():
+    """from_dict without status/origin keys applies defaults (back-compat)."""
+    i = Interest.from_dict(_sample_dict())
+    assert i.status == "active"
+    assert i.origin == "bootstrap"
+
+
+def test_roundtrip_preserves_status_and_origin():
+    """to_dict emits status/origin; roundtrip preserves both."""
+    d = dict(_sample_dict(), status="dormant", origin="side_quest")
+    i = Interest.from_dict(d)
+    out = i.to_dict()
+    assert out["status"] == "dormant"
+    assert out["origin"] == "side_quest"
+
+
+def test_invalid_status_rejected():
+    """from_dict rejects status values not in (active, dormant)."""
+    with pytest.raises(ValueError):
+        Interest.from_dict(dict(_sample_dict(), status="zombie"))
+
+
 # ---- InterestSet: load / save ----
 
 
