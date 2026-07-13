@@ -413,6 +413,48 @@ def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
         store.close()
 
 
+def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
+    tmp_path: Path, caplog
+) -> None:
+    """§5.3 fail-soft: store.create raising (SQLite lock, disk full, ...) must not
+    abort the tick. Cooldown still burns (last_researched_at updates) so the same
+    interest doesn't re-fire + duplicate on the next cadence tick, and the fire
+    correctly records no memory was persisted."""
+    import logging
+
+    class RaisingStore(MemoryStore):
+        def create(self, memory):
+            raise RuntimeError("simulated disk full")
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = RaisingStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        caplog.set_level(logging.WARNING)
+
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+
+        # (a) exception did not propagate out of run_tick
+        assert res.fired is not None
+        # (c) no research memory exists
+        assert res.fired.output_memory_id is None
+        assert store.count() == 0
+        # (b) cooldown burned — won't re-fire + duplicate next tick
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].last_researched_at is not None
+        assert any(
+            "research memory create failed" in r.getMessage() for r in caplog.records
+        ), "expected a logged warning naming the failed step"
+    finally:
+        store.close()
+
+
 def test_close_verdict_marks_dormant(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
