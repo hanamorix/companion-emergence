@@ -300,19 +300,26 @@ class ResearchEngine:
             # Persist memory — only when the session actually produced one.
             # The degraded (no-markers) path still counts as a fire (notes may
             # have been captured above) but leaves output_memory_id None.
+            # Fail-soft per spec §5.3: a create failure (SQLite lock past
+            # busy_timeout, disk full, ...) must not abort the tick — the
+            # cooldown burn + log append below still need to run, or the same
+            # interest stays eligible and re-fires (a duplicate) next tick.
             mem_id = None
             if session.memory:
-                mem = _create_research_memory(
-                    content=session.memory,
-                    interest=winner,
-                    web_results=web_results,
-                    web_used=web_used,
-                    trigger=trigger,
-                    provider_name=self.provider.name(),
-                    searcher_name=self.searcher.name() if web_used else None,
-                )
-                self.store.create(mem)
-                mem_id = mem.id
+                try:
+                    mem = _create_research_memory(
+                        content=session.memory,
+                        interest=winner,
+                        web_results=web_results,
+                        web_used=web_used,
+                        trigger=trigger,
+                        provider_name=self.provider.name(),
+                        searcher_name=self.searcher.name() if web_used else None,
+                    )
+                    self.store.create(mem)
+                    mem_id = mem.id
+                except Exception as exc:
+                    logger.warning("research memory create failed for %r: %s", winner.id, exc)
 
             # Update interest — status flips to dormant on 'close'; 'spawn'
             # keeps this thread going while seeding tangents below.
