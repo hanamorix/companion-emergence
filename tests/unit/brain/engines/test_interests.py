@@ -270,3 +270,50 @@ def test_interestset_list_eligible_sorted_pull_desc_then_oldest_research():
     eligible = s.list_eligible(pull_threshold=6.0, cooldown_hours=24.0, now=now)
     # b first (highest pull), then c (older research than a), then a
     assert [i.id for i in eligible] == ["b", "c", "a"]
+
+
+# ---- Task 2: Dormant interests ----
+
+
+def make_interest(*, topic: str = "Test", pull_score: float = 6.5, **overrides) -> Interest:
+    """Helper factory for creating an Interest for testing."""
+    base_dict = dict(
+        _sample_dict(),
+        topic=topic,
+        pull_score=pull_score,
+    )
+    base_dict.update(overrides)
+    return Interest.from_dict(base_dict)
+
+
+def test_list_eligible_excludes_dormant():
+    """list_eligible should skip interests with status == 'dormant'."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    active = make_interest(topic="a", pull_score=9.0)
+    dorm = replace(make_interest(topic="b", pull_score=9.0), status="dormant")
+    s = InterestSet(interests=(active, dorm))
+    got = s.list_eligible(pull_threshold=6.0, cooldown_hours=24.0, now=now)
+    assert [i.topic for i in got] == ["a"]
+
+
+def test_bump_revives_dormant_past_threshold():
+    """bump() should flip status from 'dormant' to 'active' when pull_score crosses revive_threshold."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    dorm = replace(make_interest(topic="b", pull_score=5.95), status="dormant")
+    s = InterestSet(interests=(dorm,))
+    s2 = s.bump("b", amount=0.1, now=now, revive_threshold=6.0)
+    assert s2.interests[0].status == "active"
+
+
+def test_bump_below_threshold_stays_dormant():
+    """bump() should keep status as 'dormant' if pull_score stays below revive_threshold."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    dorm = replace(make_interest(topic="b", pull_score=1.0), status="dormant")
+    s2 = InterestSet(interests=(dorm,)).bump("b", amount=0.1, now=now, revive_threshold=6.0)
+    assert s2.interests[0].status == "dormant"
