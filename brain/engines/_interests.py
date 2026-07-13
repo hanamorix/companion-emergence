@@ -40,6 +40,8 @@ class Interest:
     last_researched_at: datetime | None
     feed_count: int
     source_types: tuple[str, ...]
+    status: str = "active"  # "active" | "dormant"
+    origin: str = "bootstrap"  # bootstrap | conversation | side_quest | sweep
 
     @classmethod
     def from_dict(cls, data: dict) -> Interest:
@@ -68,6 +70,12 @@ class Interest:
         last_researched_raw = data.get("last_researched_at")
         last_researched = parse_iso_utc(last_researched_raw) if last_researched_raw else None
 
+        status = str(data.get("status", "active"))
+        if status not in ("active", "dormant"):
+            raise ValueError(
+                f"Interest {data.get('topic')!r}: status must be active|dormant, got {status!r}"
+            )
+
         return cls(
             id=str(data["id"]),
             topic=str(data["topic"]),
@@ -80,6 +88,8 @@ class Interest:
             last_researched_at=last_researched,
             feed_count=int(data["feed_count"]),
             source_types=tuple(str(s) for s in data["source_types"]),
+            status=status,
+            origin=str(data.get("origin", "bootstrap")),
         )
 
     def to_dict(self) -> dict:
@@ -97,6 +107,8 @@ class Interest:
             ),
             "feed_count": self.feed_count,
             "source_types": list(self.source_types),
+            "status": self.status,
+            "origin": self.origin,
         }
 
 
