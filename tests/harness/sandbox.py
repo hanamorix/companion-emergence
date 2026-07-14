@@ -336,7 +336,12 @@ def _fingerprint(
             entry: tuple = (st.st_size, st.st_mtime_ns)
             if hash_content:
                 entry = (st.st_size, st.st_mtime_ns, _content_hash(f))
-            fp[str(f.relative_to(root))] = entry
+            # as_posix(), not str(): str(Path) gives OS-native separators, so the same tree
+            # keyed 'keep/present.txt' here and 'keep\present.txt' on Windows. The map is only
+            # ever compared against another map from the same run, so the logic never cared —
+            # but the spelling leaked into assertions, and a platform-dependent key is a trap
+            # for anything that ever reports or persists one. No-op off Windows.
+            fp[f.relative_to(root).as_posix()] = entry
     return fp
 
 
@@ -608,6 +613,26 @@ def sandbox(
             else:
                 os.environ[k] = v
 
+    # Snapshot brain's process-global emotion state so a sandboxed run that reconstructs a persona
+    # vocabulary (which register()s persona-extension emotions like "warmth" into the process-global
+    # brain.emotion.vocabulary._REGISTRY) does NOT leak that registration to the rest of the pytest
+    # process. brain mutates these at load time by design; the harness imports brain read-only, so it
+    # must isolate the mutation itself. Restored in the OUTER finally below, symmetric with
+    # _restore_env, so it runs even when SandboxLeak is raised. See
+    # hunts/harness-vocab-registry-leak/diagnosis.md.
+    import brain.emotion.aggregate as _agg
+    import brain.emotion.vocabulary as _vocab
+
+    _saved_registry = dict(_vocab._REGISTRY)
+    _saved_warned = set(_agg._warned_unregistered)
+
+    def _restore_emotion_globals() -> None:
+        # Mutate contents in place (clear + update), NOT a rebind — keeps any held reference valid.
+        _vocab._REGISTRY.clear()
+        _vocab._REGISTRY.update(_saved_registry)
+        _agg._warned_unregistered.clear()
+        _agg._warned_unregistered.update(_saved_warned)
+
     try:
         os.environ["KINDLED_HOME"] = str(root)
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -707,5 +732,6 @@ def sandbox(
                 raise SandboxLeak(msg)
     finally:
         _restore_env()
+        _restore_emotion_globals()
         if not keep:
             shutil.rmtree(root, ignore_errors=True)
