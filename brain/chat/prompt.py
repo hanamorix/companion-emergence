@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
+from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.store import MemoryStore
@@ -347,6 +348,12 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
     # lists, "superpowers", copied CLAUDE.md, mode banners). Static text → stays in
     # the frozen prefix, byte-stable for caching. See the caveman/skill-leak work.
     parts.append(_HARNESS_FENCE)
+
+    # The toolset, derived from the registry rather than hand-written into
+    # voice.md. Static text → frozen prefix, byte-stable for caching, same as
+    # the fence above. This is what reaches EXISTING personas: their voice.md is
+    # a frozen copy taken at creation and the framework never edits it (#69).
+    parts.append(build_tool_inventory(persona_name))
 
     # Inner-monologue framing ("record_monologue FIRST, then reply") lives in the
     # FROZEN prefix, not the volatile tail: a "do this before composing" directive
