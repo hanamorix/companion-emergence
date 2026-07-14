@@ -112,25 +112,6 @@ def test_install_voice_template_nell_example_copies_packaged_file(
     assert len(content) > 1000  # not an empty file
 
 
-def test_nell_voice_template_lists_all_brain_tools() -> None:
-    """The packaged nell-voice.md must name every brain-tool.
-
-    Mirrors test_default_voice_template_lists_all_brain_tools (which guards
-    DEFAULT_VOICE_TEMPLATE). Without an equivalent gate here, this file drifted
-    for ~28 versions: it was frozen at 2026-05-17 and silently lost 14 of 27
-    tools, so a persona installed from the "nell-example" choice — the one
-    labelled canonical — didn't know it had filesystem hands and confabulated
-    not having them (#69). The unguarded copy was the WORSE one.
-    """
-    from brain.tools import NELL_TOOL_NAMES
-
-    template = (
-        Path(__file__).resolve().parents[3] / "brain" / "voice_templates" / "nell-voice.md"
-    ).read_text(encoding="utf-8")
-    for name in NELL_TOOL_NAMES:
-        assert f"`{name}`" in template, f"missing brain-tool {name!r} in nell-voice.md"
-
-
 def test_install_voice_template_unknown_raises(tmp_path: Path) -> None:
     persona_dir = tmp_path / "nell"
     with pytest.raises(ValueError, match="unknown voice template"):

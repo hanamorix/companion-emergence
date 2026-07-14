@@ -72,20 +72,6 @@ def test_default_voice_template_coaches_refusal_isnt_reassurance() -> None:
     assert "the actual reason" in template
 
 
-def test_default_voice_template_lists_all_brain_tools() -> None:
-    """Every brain-tool must be named in the template's tools section.
-
-    Without this, a fresh persona starts with no explicit tool-use guidance
-    and reproduces the 2026-04-27 confabulation failure (Nell's casual prompt
-    role-played a tool failure instead of calling search_memories).
-    """
-    from brain.tools import NELL_TOOL_NAMES
-
-    template = DEFAULT_VOICE_TEMPLATE
-    for name in NELL_TOOL_NAMES:
-        assert f"`{name}`" in template, f"missing brain-tool {name!r} in default voice template"
-
-
 def test_default_voice_template_states_load_bearing_rules() -> None:
     """The three load-bearing tool-use rules must be present.
 

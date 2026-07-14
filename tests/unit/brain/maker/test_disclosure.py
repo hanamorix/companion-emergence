@@ -52,7 +52,6 @@ def test_no_works_db_returns_empty(tmp_path):
 
 
 def test_surface_makings_registered_at_all_contract_sites():
-    from brain.chat.voice import DEFAULT_VOICE_TEMPLATE
     from brain.tools import NELL_TOOL_NAMES
     from brain.tools.dispatch import _DISPATCH
     from brain.tools.schemas import SCHEMAS
@@ -60,4 +59,6 @@ def test_surface_makings_registered_at_all_contract_sites():
     assert "surface_makings" in SCHEMAS
     assert "surface_makings" in _DISPATCH
     assert "surface_makings" in NELL_TOOL_NAMES
-    assert "surface_makings" in DEFAULT_VOICE_TEMPLATE
+    # DEFAULT_VOICE_TEMPLATE no longer hand-lists tool names (the generated
+    # inventory replaced it — see tests/unit/brain/chat/test_prompt.py's
+    # test_inventory_names_every_registered_tool for that guard).
