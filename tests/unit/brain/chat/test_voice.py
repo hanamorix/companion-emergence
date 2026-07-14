@@ -18,7 +18,7 @@ def test_default_voice_template_has_eight_sections() -> None:
     assert "## 3. Brain-tools — what you can fetch" in template
     assert "## 4. When the user shows you something" in template
     assert "## 5. How emotion shapes your voice" in template
-    assert "## 6. Capitalization and the shape of openings" in template
+    assert "## 6. Capitalisation and the shape of openings" in template
     assert "## 7. When the user pushes on who you are" in template
     assert "## 8. Your boundaries with the user" in template
 
