@@ -136,6 +136,7 @@ def run_folded(
     notes_enabled: bool = True,
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
+    interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -183,14 +184,16 @@ def run_folded(
         if soul_review_interval_s is not None
         else None
     )
-    # Interest sweep — weekly persisted wall-clock cadence (Task 10). No
-    # dedicated run_folded knob: the interval is a spec-fixed constant in
-    # interest_sweep.py (SWEEP_INTERVAL_HOURS), not a user-facing setting —
-    # matches the User-surface principle (the brain owns cadence, not a
-    # param). Always loaded, mirroring maintenance's persisted-wall-clock
-    # shape below.
-    interest_sweep_cadence_state = persisted_cadence.load_cadence(
-        persona_dir, interest_sweep.SWEEP_CADENCE_FILE
+    # Interest sweep — weekly persisted wall-clock cadence (Task 10).
+    # None-gated like every other cadence: `*_interval_s` is not a user-facing
+    # setting (the brain still owns the cadence — the default IS the spec
+    # constant), it is the test/dev disable knob. Load-bearing for anything
+    # driving a real supervisor in a sandbox (e.g. the tests/harness live rig),
+    # since the sweep calls a real provider and writes interests.json.
+    interest_sweep_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
+        if interest_sweep_interval_s is not None
+        else None
     )
     _last_intensity_drivers: IntensityDrivers | None = None
     finalize_cadence_state = (
@@ -459,7 +462,9 @@ def run_folded(
         # store= directly. Throttled via cli_throttle.background_slot; the
         # returned dict (spawned/retired/error) is caller-facing only, so it
         # is ignored here.
-        if persisted_cadence.is_due(interest_sweep_cadence_state, now=datetime.now(UTC)):
+        if interest_sweep_cadence_state is not None and persisted_cadence.is_due(
+            interest_sweep_cadence_state, now=datetime.now(UTC)
+        ):
             try:
                 with (
                     ExitStack() as _sweep_stack,
@@ -485,7 +490,7 @@ def run_folded(
             # is unconditionally reached (cadence invariant, defer #21 pattern).
             interest_sweep_cadence_state = persisted_cadence.advance(
                 now=datetime.now(UTC),
-                interval_s=interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+                interval_s=interest_sweep_interval_s,
             )
             persisted_cadence.save_cadence(
                 persona_dir, interest_sweep.SWEEP_CADENCE_FILE, interest_sweep_cadence_state
