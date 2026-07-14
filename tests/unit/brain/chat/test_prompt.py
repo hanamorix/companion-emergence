@@ -340,7 +340,11 @@ def test_recall_block_omitted_when_user_input_none(
         store=store,
         # user_input deliberately omitted
     )
-    assert "recall" not in msg.lower()
+    # "recall" alone now also appears in tool names in the (always-on) tool
+    # inventory block (`recall_forgotten`, `recall_arc`, `recall_monologue`) —
+    # check for the structured recall block specifically, same fix already
+    # applied in test_recall_block_handles_no_match below.
+    assert "recall\n  " not in msg
 
 
 def test_recall_block_omitted_when_user_input_too_short(
@@ -1256,3 +1260,24 @@ def test_static_system_message_stays_byte_stable_with_the_inventory(
     a = build_static_system_message(persona_dir, voice_md="# voice")
     b = build_static_system_message(persona_dir, voice_md="# voice")
     assert a == b
+
+
+# ── Tool inventory (image path, parity with the static builder) ──────────────
+
+
+def test_image_path_system_message_also_contains_the_inventory(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Image turns build via build_system_message, not the static builder. They
+    must see the same toolset — otherwise she has hands in text and not in
+    pictures. (Parity only; the #72 framing divergence is NOT touched here.)"""
+    out = build_system_message(
+        persona_dir,
+        voice_md="# voice",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="hi",
+    )
+    assert "`reach_for_capability`" in out
+    assert "`propose_write`" in out
