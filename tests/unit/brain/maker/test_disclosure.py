@@ -60,5 +60,6 @@ def test_surface_makings_registered_at_all_contract_sites():
     assert "surface_makings" in _DISPATCH
     assert "surface_makings" in NELL_TOOL_NAMES
     # DEFAULT_VOICE_TEMPLATE no longer hand-lists tool names (the generated
-    # inventory replaced it — see tests/unit/brain/chat/test_prompt.py's
-    # test_inventory_names_every_registered_tool for that guard).
+    # inventory replaced it). That contract site is now guarded against the
+    # registry itself, in tests/unit/brain/chat/test_tool_inventory.py's
+    # test_inventory_names_every_registered_tool.
