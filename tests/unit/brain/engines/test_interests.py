@@ -11,6 +11,7 @@ import pytest
 from brain.engines._interests import Interest, InterestSet
 
 DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_interests.json"
+NOW = datetime(2026, 7, 13, 10, 0, 0, tzinfo=UTC)
 
 
 def _sample_dict(**overrides) -> dict:
@@ -59,6 +60,28 @@ def test_interest_to_dict_roundtrip():
     original = Interest.from_dict(_sample_dict())
     restored = Interest.from_dict(original.to_dict())
     assert restored == original
+
+
+def test_from_dict_defaults_status_and_origin():
+    """from_dict without status/origin keys applies defaults (back-compat)."""
+    i = Interest.from_dict(_sample_dict())
+    assert i.status == "active"
+    assert i.origin == "bootstrap"
+
+
+def test_roundtrip_preserves_status_and_origin():
+    """to_dict emits status/origin; roundtrip preserves both."""
+    d = dict(_sample_dict(), status="dormant", origin="side_quest")
+    i = Interest.from_dict(d)
+    out = i.to_dict()
+    assert out["status"] == "dormant"
+    assert out["origin"] == "side_quest"
+
+
+def test_invalid_status_rejected():
+    """from_dict rejects status values not in (active, dormant)."""
+    with pytest.raises(ValueError):
+        Interest.from_dict(dict(_sample_dict(), status="zombie"))
 
 
 # ---- InterestSet: load / save ----
@@ -248,3 +271,124 @@ def test_interestset_list_eligible_sorted_pull_desc_then_oldest_research():
     eligible = s.list_eligible(pull_threshold=6.0, cooldown_hours=24.0, now=now)
     # b first (highest pull), then c (older research than a), then a
     assert [i.id for i in eligible] == ["b", "c", "a"]
+
+
+# ---- Task 2: Dormant interests ----
+
+
+def make_interest(*, topic: str = "Test", pull_score: float = 6.5, **overrides) -> Interest:
+    """Helper factory for creating an Interest for testing."""
+    base_dict = dict(
+        _sample_dict(),
+        topic=topic,
+        pull_score=pull_score,
+    )
+    base_dict.update(overrides)
+    return Interest.from_dict(base_dict)
+
+
+def test_list_eligible_excludes_dormant():
+    """list_eligible should skip interests with status == 'dormant'."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    active = make_interest(topic="a", pull_score=9.0)
+    dorm = replace(make_interest(topic="b", pull_score=9.0), status="dormant")
+    s = InterestSet(interests=(active, dorm))
+    got = s.list_eligible(pull_threshold=6.0, cooldown_hours=24.0, now=now)
+    assert [i.topic for i in got] == ["a"]
+
+
+def test_bump_revives_dormant_past_threshold():
+    """bump() should flip status from 'dormant' to 'active' when pull_score crosses revive_threshold."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    dorm = replace(make_interest(topic="b", pull_score=5.95), status="dormant")
+    s = InterestSet(interests=(dorm,))
+    s2 = s.bump("b", amount=0.1, now=now, revive_threshold=6.0)
+    assert s2.interests[0].status == "active"
+
+
+def test_bump_below_threshold_stays_dormant():
+    """bump() should keep status as 'dormant' if pull_score stays below revive_threshold."""
+    from dataclasses import replace
+
+    now = datetime.now(UTC)
+    dorm = replace(make_interest(topic="b", pull_score=1.0), status="dormant")
+    s2 = InterestSet(interests=(dorm,)).bump("b", amount=0.1, now=now, revive_threshold=6.0)
+    assert s2.interests[0].status == "dormant"
+
+
+# ---- Task 3: spawn_interest ----
+
+
+@pytest.fixture
+def empty_set() -> InterestSet:
+    """Empty InterestSet for spawn_interest tests."""
+    return InterestSet(interests=())
+
+
+@pytest.fixture
+def set_with_topic() -> InterestSet:
+    """InterestSet with one active Interest (Art Restoration)."""
+    interest = make_interest(topic="Art Restoration", pull_score=6.5)
+    return InterestSet(interests=(interest,))
+
+
+@pytest.fixture
+def set_with_dormant_topic() -> InterestSet:
+    """InterestSet with one dormant Interest (Art Restoration)."""
+    from dataclasses import replace
+
+    interest = replace(make_interest(topic="Art Restoration", pull_score=3.0), status="dormant")
+    return InterestSet(interests=(interest,))
+
+
+def test_spawn_creates_below_threshold(empty_set):
+    from brain.engines._interests import spawn_interest
+
+    s, created = spawn_interest(
+        empty_set,
+        topic="Art restoration",
+        keywords=("restoration",),
+        why="came up",
+        origin="side_quest",
+        now=NOW,
+        pull_threshold=6.0,
+    )
+    assert created
+    i = s.interests[0]
+    assert i.pull_score == 5.0 and i.origin == "side_quest" and i.status == "active"
+    assert i.notes == "came up"
+
+
+def test_spawn_dedupes_casefold_active(set_with_topic):
+    from brain.engines._interests import spawn_interest
+
+    # set_with_topic: contains active Interest topic="Art Restoration"
+    s, created = spawn_interest(
+        set_with_topic,
+        topic="art restoration",
+        keywords=(),
+        why="",
+        origin="sweep",
+        now=NOW,
+    )
+    assert not created and len(s.interests) == len(set_with_topic.interests)
+
+
+def test_spawn_on_dormant_match_bumps_not_duplicates(set_with_dormant_topic):
+    from brain.engines._interests import spawn_interest
+
+    s, created = spawn_interest(
+        set_with_dormant_topic,
+        topic="ART RESTORATION",
+        keywords=(),
+        why="",
+        origin="conversation",
+        now=NOW,
+    )
+    assert not created
+    assert len(s.interests) == len(set_with_dormant_topic.interests)
+    assert s.interests[0].feed_count == set_with_dormant_topic.interests[0].feed_count + 1

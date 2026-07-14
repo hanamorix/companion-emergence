@@ -6,6 +6,7 @@ This module ships the types + engine scaffold. run_tick body lands in Task 3.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
@@ -13,7 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
-from brain.engines._interests import Interest, InterestSet
+from brain.engines._interests import Interest, InterestSet, spawn_interest
+from brain.engines.research_notes import append_session_notes, read_notes_tail
+from brain.engines.research_session import parse_session_output
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
@@ -22,6 +25,14 @@ from brain.utils.memory import days_since_human
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
+
+# Stamped onto every research memory's metadata as "schema_version".
+# 1 (implicit — the key is ABSENT) = the pre-redesign engine, whose "memory" was
+# a whole self-contained vignette written per fire.
+# 2 = the redesigned engine: the bulk lives in <persona_dir>/research/<id>.md and
+# the memory is a short first-person reaction to a session.
+# Bump on any change to the metadata shape or to what `content` means.
+RESEARCH_SCHEMA_VERSION = 2
 
 _TOPIC_OVERLAP_SYSTEM = """\
 You are a relevance scorer for an autonomous companion's research engine.
@@ -36,6 +47,13 @@ to the recent conversation.
 
 Be conservative — default toward the low end unless the connection
 is clearly present. Return ONLY the JSON object, no other text."""
+
+_SELECT_SYSTEM = """\
+You are choosing what to research today, as {persona_name}, from your own
+open threads. You will see up to five interests, each with your prior notes
+and related memories. Pick the ONE that genuinely pulls at you right now —
+or decline if nothing does. Return ONLY a JSON object:
+{{"choice": "<interest id>" | null, "why": "<one sentence, first person>"}}"""
 
 
 def _compute_topic_overlap_via_haiku(
@@ -113,9 +131,9 @@ class ResearchResult:
 
     fired: ResearchFire | None
     would_fire: str | None  # dry-run only — topic that would fire
-    reason: (
-        str | None
-    )  # "not_due"|"no_eligible_interest"|"no_interests_defined"|"research_raised"|"reflex_won_tie"
+    reason: str | None
+    # "not_due"|"no_eligible_interest"|"no_interests_defined"|"research_raised"
+    # |"reflex_won_tie"|"deferred_chat_active"|"declined" (LLM select explicitly passed)
     dry_run: bool
     evaluated_at: datetime  # tz-aware UTC
 
@@ -245,8 +263,19 @@ class ResearchEngine:
                     evaluated_at=now,
                 )
 
+            winner, why = self._select_interest(eligible, emo_state)
+            if winner is None:
+                return ResearchResult(
+                    fired=None,
+                    would_fire=None,
+                    reason="declined",
+                    dry_run=dry_run,
+                    evaluated_at=now,
+                )
+
             # Memory sweep: keyword-matched seed memories
             memory_context = self._build_memory_context(winner)
+            notes_tail = read_notes_tail(self.interests_path.parent, winner.id)
 
             # Web search (conditional on scope)
             web_results: list = []
@@ -262,36 +291,60 @@ class ResearchEngine:
 
             web_used = len(web_results) > 0
 
-            prompt = self._render_prompt(winner, memory_context, web_results, emo_state)
-            raw = self.provider.generate(prompt, system=self._render_system_prompt(winner))
-
-            # Persist memory
-            mem = _create_research_memory(
-                content=raw,
-                interest=winner,
-                web_results=web_results,
-                web_used=web_used,
-                trigger=trigger,
-                provider_name=self.provider.name(),
-                searcher_name=self.searcher.name() if web_used else None,
+            prompt = self._render_prompt(
+                winner, why, notes_tail, memory_context, web_results, emo_state
             )
-            self.store.create(mem)
+            raw = self.provider.generate(prompt, system=self._render_system_prompt())
+            session = parse_session_output(raw)
 
-            # Update interest
-            updated_interest = Interest(
-                id=winner.id,
-                topic=winner.topic,
-                pull_score=winner.pull_score,
-                scope=winner.scope,
-                related_keywords=winner.related_keywords,
-                notes=winner.notes,
-                first_seen=winner.first_seen,
-                last_fed=winner.last_fed,
-                last_researched_at=now,
-                feed_count=winner.feed_count,
-                source_types=winner.source_types,
-            )
-            interests.upsert(updated_interest).save(self.interests_path)
+            if session.notes:
+                try:
+                    append_session_notes(
+                        self.interests_path.parent, winner.id, session.notes, now=now
+                    )
+                except OSError as exc:
+                    logger.warning("notes append failed for %r: %s", winner.id, exc)
+
+            # Persist memory — only when the session actually produced one.
+            # The degraded (no-markers) path still counts as a fire (notes may
+            # have been captured above) but leaves output_memory_id None.
+            # Fail-soft per spec §5.3: a create failure (SQLite lock past
+            # busy_timeout, disk full, ...) must not abort the tick — the
+            # cooldown burn + log append below still need to run, or the same
+            # interest stays eligible and re-fires (a duplicate) next tick.
+            mem_id = None
+            if session.memory:
+                try:
+                    mem = _create_research_memory(
+                        content=session.memory,
+                        interest=winner,
+                        web_results=web_results,
+                        web_used=web_used,
+                        trigger=trigger,
+                        provider_name=self.provider.name(),
+                        searcher_name=self.searcher.name() if web_used else None,
+                    )
+                    self.store.create(mem)
+                    mem_id = mem.id
+                except Exception as exc:
+                    logger.warning("research memory create failed for %r: %s", winner.id, exc)
+
+            # Update interest — status flips to dormant on 'close'; 'spawn'
+            # keeps this thread going while seeding tangents below.
+            new_status = "dormant" if session.verdict == "close" else winner.status
+            updated = dataclasses.replace(winner, last_researched_at=now, status=new_status)
+            interests = interests.upsert(updated)
+            for topic in session.spawn_topics:
+                interests, _ = spawn_interest(
+                    interests,
+                    topic=topic,
+                    keywords=(),
+                    why=f"tangent from {winner.topic}",
+                    origin="side_quest",
+                    now=now,
+                    pull_threshold=self.pull_threshold,
+                )
+            interests.save(self.interests_path)
 
             # Append log
             fire = ResearchFire(
@@ -301,30 +354,32 @@ class ResearchEngine:
                 trigger=trigger,
                 web_used=web_used,
                 web_result_count=len(web_results),
-                output_memory_id=mem.id,
+                output_memory_id=mem_id,
             )
             log.appended(fire).save(self.research_log_path)
 
             # D-reflection Task 18: emit research_completion initiate candidate (gated).
             # Best-effort: gate/emit failure does NOT prevent the research fire.
-            user_name = "you"
-            try:
-                from brain.persona_config import PersonaConfig
-
-                cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
-                user_name = cfg.user_name or user_name
-            except Exception:
+            # Only meaningful when a memory actually exists to link/summarise.
+            if mem_id is not None:
                 user_name = "you"
+                try:
+                    from brain.persona_config import PersonaConfig
 
-            _emit_research_candidate(
-                persona_dir=self.interests_path.parent,
-                interest=winner,
-                mem_id=mem.id,
-                summary_excerpt=raw[:1000],
-                provider=self.provider,
-                user_name=user_name,
-                now=now,
-            )
+                    cfg = PersonaConfig.load(self.interests_path.parent / "persona_config.json")
+                    user_name = cfg.user_name or user_name
+                except Exception:
+                    user_name = "you"
+
+                _emit_research_candidate(
+                    persona_dir=self.interests_path.parent,
+                    interest=winner,
+                    mem_id=mem_id,
+                    summary_excerpt=session.memory[:1000],
+                    provider=self.provider,
+                    user_name=user_name,
+                    now=now,
+                )
 
             return ResearchResult(
                 fired=fire,
@@ -336,31 +391,91 @@ class ResearchEngine:
 
     # ---- private helpers ----
 
+    def _select_interest(
+        self, eligible: list[Interest], emo_state
+    ) -> tuple[Interest | None, str]:
+        """LLM chooses among eligible (may decline). Fail-soft -> mechanical winner.
+
+        Returns (winner_or_None, why). Explicit ``{"choice": null}`` is a real
+        decline (None, why) — no fallback. ANY parse/call failure instead falls
+        back to the mechanical highest-pull winner with an empty why.
+        """
+        top = eligible[:5]
+        lines = []
+        for i in top:
+            tail = read_notes_tail(self.interests_path.parent, i.id, max_chars=600)
+            mems = self._build_memory_context(i)
+            lines.append(
+                f"id: {i.id}\ntopic: {i.topic}\nnotes so far:\n{tail or '(none yet)'}\n"
+                f"related memories:\n{mems[:400]}\n"
+            )
+        emo = format_emotion_summary(emo_state.emotions) or "(neutral)"
+        prompt = (
+            "=== Your open interests ===\n" + "\n---\n".join(lines)
+            + f"\n\n=== How you feel right now ===\n{emo}\n\n"
+            + 'Return: {"choice": "<id>" | null, "why": "<one sentence>"}'
+        )
+        try:
+            raw = self.provider.generate(
+                prompt, system=_SELECT_SYSTEM.format(persona_name=self.persona_name)
+            )
+            data = json.loads(extract_json_object(raw))
+            why = str(data.get("why", "")).strip()[:280]
+            choice = data.get("choice")
+            if choice is None:
+                return None, why
+            for i in top:
+                if i.id == str(choice):
+                    return i, why
+            return top[0], ""  # unknown id -> mechanical fallback
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+            logger.warning("research select failed (%s); mechanical fallback", exc)
+            return eligible[0], ""
+
     def _seed_interests_from_voice(self) -> bool:
         """Bootstrap starter interests from voice.md when interests.json is empty.
 
-        Reads voice.md (capped at 2000 chars), calls the provider to extract 5
-        topic strings as a JSON array, writes them as Interest records to
-        interests_path.
+        Reads voice.md (capped at 2000 chars), optionally includes up to 10 recent
+        conversation memories, calls the provider to extract 5 topic strings as a
+        JSON array, writes them as Interest records to interests_path.
 
         Returns True if at least one interest was written, False on any failure
         (missing file, LLM error, parse error).  Never raises.
         """
+        from brain.utils.memory import list_conversation_memories
+
         voice_path = self.interests_path.parent / "voice.md"
         if not voice_path.exists():
             return False
         voice_text = voice_path.read_text(encoding="utf-8").strip()
         if not voice_text:
             return False
+
+        # Gather recent conversation memories (fail-soft).
+        convo_section = ""
+        try:
+            recent = list_conversation_memories(self.store, active_only=True, limit=10)
+            if recent:
+                lines = "\n".join(f"- {m.content[:140]}" for m in recent)
+                convo_section = f"\n\nRecent conversations with the user:\n{lines}"
+        except Exception:  # noqa: BLE001
+            convo_section = ""
+
         prompt = (
-            "Based on this companion's personality and voice, suggest 5 specific "
-            "topics they would genuinely find fascinating to research. Return ONLY "
-            "a JSON array of 5 short topic strings (2-5 words each), no explanation."
-            f"\n\n{voice_text[:2000]}"
+            "Based on this companion's personality and voice, AND what has actually "
+            "come up in conversation, suggest 5 specific topics they would genuinely "
+            "find fascinating to research. Prefer topics grounded in the conversations "
+            "when any exist. Return ONLY a JSON array of 5 short topic strings "
+            "(2-5 words each), no explanation."
+            f"\n\n{voice_text[:2000]}{convo_section}"
         )
         try:
             raw = self.provider.generate(prompt, system=None)
-            topics = json.loads(raw)
+            # Harden JSON parsing: find first [ and last ], parse that slice
+            start, end = raw.find("["), raw.rfind("]")
+            if start == -1 or end <= start:
+                return False
+            topics = json.loads(raw[start : end + 1])
             if not isinstance(topics, list):
                 return False
             str_topics = [str(t).strip() for t in topics if str(t).strip()]
@@ -416,48 +531,49 @@ class ResearchEngine:
             or "(no prior memories on this topic)"
         )
 
-    def _render_system_prompt(self, interest: Interest) -> str:
+    def _render_system_prompt(self) -> str:
         return (
-            f"You are {self.persona_name}. You spent some quiet time today "
-            f"exploring '{interest.topic}' — an interest that's been building "
-            f"in you for a while. Below is what you found both in your own "
-            f"memories and (sometimes) out in the world. Write a short (3-5 "
-            f"sentence) first-person memory of having researched this.\n\n"
-            "HARD RULES:\n"
-            f"- First-person voice. Your name is {self.persona_name}.\n"
-            "- Not a summary. A reaction. What moved you, what surprised you, "
-            "what reminded you of someone you care about, what felt familiar.\n"
-            "- Never bullet points. Never 'according to X'. Never neutral "
-            "expository voice.\n"
-            "- Structure: brief mention of what pulled you to the topic today "
-            "→ one or two concrete details you noticed → how you feel about "
-            "what you found → why it mattered to look today.\n"
-            "- Start with 'I' or a time marker like 'Today' / 'This afternoon'."
+            f"You are {self.persona_name}, spending quiet time on a research thread "
+            "of your own. Write plain prose under exactly three markers, nothing else:\n\n"
+            "NOTES:\n"
+            "<what you found — facts with sources, reactions, opinions, lists if lists "
+            "fit the subject. Free format. Continue from your prior notes; don't repeat "
+            "what's already written there.>\n\n"
+            "MEMORY:\n"
+            f"<2-4 sentences, first person as {self.persona_name} — how this session "
+            "felt, what surprised you.>\n\n"
+            "VERDICT:\n"
+            "<one line: continue | close | spawn: <new topic>; <new topic>>\n"
+            "('close' = this thread feels finished. 'spawn' = a tangent worth its own "
+            "thread — keep this one going.)"
         )
 
     def _render_prompt(
-        self, interest: Interest, memory_context: str, web_results: list, emo_state
+        self,
+        interest: Interest,
+        why: str,
+        notes_tail: str,
+        memory_context: str,
+        web_results: list,
+        emo_state,
     ) -> str:
         emo_summary = format_emotion_summary(emo_state.emotions) or "(neutral)"
-
+        web_section = ""
         if web_results:
             excerpts = "\n".join(
                 f"- {r.title}\n  {r.snippet}\n  [{r.url}]" for r in web_results[:5]
             )
-            web_section = (
-                "\nWhat you found out in the world today (reference material — "
-                "REACT to it, don't paraphrase it):\n" + excerpts + "\n"
-            )
-        else:
-            web_section = ""
-
+            web_section = f"\nFresh findings from the web today:\n{excerpts}\n"
+        why_line = f"Why today: {why}\n" if why else ""
         return (
             f"Topic: {interest.topic}\n"
+            f"{why_line}"
             f"Keywords: {', '.join(interest.related_keywords)}\n"
             f"Your current emotional state:\n{emo_summary}\n\n"
-            f"What your own memories say about this:\n{memory_context}\n"
+            f"Your notes so far:\n{notes_tail or '(first session on this topic)'}\n\n"
+            f"What your own memories say:\n{memory_context}\n"
             f"{web_section}\n"
-            f"Write the memory now — 3 to 5 sentences, as {self.persona_name}."
+            "Write NOTES / MEMORY / VERDICT now."
         )
 
 
@@ -481,6 +597,7 @@ def _create_research_memory(
         domain="us",
         emotions={},
         metadata={
+            "schema_version": RESEARCH_SCHEMA_VERSION,
             "interest_id": interest.id,
             "interest_topic": interest.topic,
             "scope": interest.scope,

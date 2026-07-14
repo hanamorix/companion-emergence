@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from brain.bridge import persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
@@ -19,6 +20,7 @@ from brain.bridge.supervisor import (
     _run_voice_reflection_tick,  # noqa: F401 — imported to assert symbol exists
     run_folded,
 )
+from brain.engines import interest_sweep
 
 
 def test_audit_logs_registered_for_rotation() -> None:
@@ -868,4 +870,147 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     assert captured.get("is_rest_state") is False, (
         f"fail-open violated: expected is_rest_state=False on body error, got: {captured}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interest sweep (Task 10) — weekly persisted wall-clock cadence. Mirrors the
+# maintenance block's load-at-startup / is_due-gate / fully-wrapped-body /
+# end-of-block-advance+save discipline (defer #21 pattern).
+# ---------------------------------------------------------------------------
+
+
+def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
+    """A fresh persona has no interest_sweep_cadence.json yet, so it's due-now
+    on the very first tick: run_folded must call run_sweep_tick and advance
+    the persisted cadence past now, even though the tick was a no-op."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+    calls: list[dict] = []
+
+    def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        fired.set()
+        return {"spawned": 0, "retired": 0, "error": None}
+
+    def runner():
+        with patch("brain.engines.interest_sweep.run_sweep_tick", side_effect=fake_sweep):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "interest sweep never fired"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert len(calls) == 1
+
+    state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
+    assert state.next_at is not None
+    assert state.next_at > datetime.now(UTC), "cadence must advance past now even on a no-op result"
+
+
+def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_path: Path) -> None:
+    """run_sweep_tick never raises by its own contract, but the supervisor's
+    wrap around it must hold anyway: a raised exception must not stop the
+    end-of-block advance+save, and must not kill the supervisor loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+
+    def fake_sweep(**kwargs):
+        raise RuntimeError("boom")
+
+    def runner():
+        with patch("brain.engines.interest_sweep.run_sweep_tick", side_effect=fake_sweep):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "supervisor loop must not die from a tick exception"
+
+    state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
+    assert state.next_at is not None
+    assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
+
+
+def test_run_folded_interest_sweep_interval_none_disables_it(tmp_path: Path) -> None:
+    """interest_sweep_interval_s=None disables the sweep entirely — no tick, no
+    cadence file. Parity with the other six cadences' None-gate.
+
+    Load-bearing for anything driving a real supervisor in a sandbox (e.g. the
+    tests/harness live rig): the sweep calls a real provider and writes
+    interests.json, so a run that hasn't opted in must be able to switch it off.
+    """
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    calls: list[dict] = []
+    errors: list[BaseException] = []
+
+    def runner():
+        try:
+            with patch(
+                "brain.engines.interest_sweep.run_sweep_tick",
+                side_effect=lambda **kw: calls.append(kw),
+            ):
+                run_folded(
+                    stop,
+                    persona_dir=persona_dir,
+                    provider=FakeProvider(),
+                    event_bus=bus,
+                    tick_interval_s=0.05,
+                    heartbeat_interval_s=None,
+                    soul_review_interval_s=None,
+                    finalize_interval_s=None,
+                    log_rotation_interval_s=None,
+                    initiate_review_interval_s=None,
+                    voice_reflection_interval_s=None,
+                    interest_sweep_interval_s=None,
+                )
+        except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below
+            errors.append(exc)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    # Guard against a vacuous pass: if run_folded rejected the kwarg the thread
+    # would die and the assertions below would hold for the wrong reason.
+    assert errors == [], f"run_folded raised: {errors}"
+
+    assert calls == [], "sweep must not fire when disabled"
+    assert not (persona_dir / interest_sweep.SWEEP_CADENCE_FILE).exists(), (
+        "disabled sweep must not write its cadence file"
     )

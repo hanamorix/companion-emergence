@@ -105,6 +105,25 @@ class ReflexAuditEntry(BaseModel):
         return v
 
 
+class InterestCandidate(BaseModel):
+    """A topic the user showed real, repeated enthusiasm for this turn.
+
+    Feeds `spawn_interest` (brain.engines._interests) at apply time, capped
+    per-day. Scalar (not a list) — at most one candidate per turn.
+    """
+
+    topic: str
+    keywords: list[str] = Field(default_factory=list)
+    why: str = ""
+
+    @field_validator("topic")
+    @classmethod
+    def _reject_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("interest_candidate.topic must not be blank")
+        return v.strip()[:100]
+
+
 class EmotionDelta(BaseModel):
     """Intentionally empty placeholder.
 
@@ -128,6 +147,7 @@ class ExtractorOutput(BaseModel):
     emotion_delta: dict[str, float] = Field(default_factory=dict)
     crystallisation: list[CrystallisationCandidate] = Field(default_factory=list)
     reflex_audit: list[ReflexAuditEntry] = Field(default_factory=list)
+    interest_candidate: InterestCandidate | None = None
 
     @field_validator("emotion_delta")
     @classmethod
@@ -156,6 +176,7 @@ Return ONLY a JSON object matching this schema:
   "memory_writes":   [{"episode": "<one sentence>", "salience": 0.0-1.0}],
   "emotion_delta":   {"<emotion-channel>": <float in [-1.0, 1.0]>, ...},
   "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it — 1-2 grounded sentences from the monologue>", "importance": <int 1-10, how formative this theme is to who you are>}],
+  "interest_candidate": {"topic": "<2-5 words>", "keywords": [...], "why": "<one line>"} or null,
   "reflex_audit":    [{"tool": "<tool-name>", "reason": "<why they should have called it>"}]
 }
 
@@ -163,6 +184,7 @@ Conservative defaults:
 - Empty arrays if nothing salient surfaced.
 - Salience is how much this matters to the companion's continuity (0.1 = minor, 0.7 = forming).
 - Emotion deltas are SMALL (typically 0.05-0.2 magnitude). One channel max usually.
+- Only propose interest_candidate when the user showed real, repeated enthusiasm for a topic this turn — most turns it is null.
 
 Return ONLY the JSON object. No commentary.
 """
@@ -293,6 +315,12 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
         _safely("memory_writes", persona_dir, lambda: _apply_memory_writes(out.memory_writes, persona_dir))
     if out.emotion_delta:
         _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
+    if out.interest_candidate is not None:
+        _safely(
+            "interest_candidate",
+            persona_dir,
+            lambda: _apply_interest_candidate(out.interest_candidate, persona_dir),
+        )
     if out.crystallisation:
         _safely("crystallisation", persona_dir, lambda: _apply_crystallisation(out.crystallisation, persona_dir))
     if out.reflex_audit:
@@ -380,6 +408,49 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
         store.create(mem)
     finally:
         store.close()
+
+
+_INTEREST_SPAWN_STATE = "interest_spawn_state.json"
+_INTEREST_SPAWN_DAILY_CAP = 3
+
+
+def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -> None:
+    """Spawn a conversation-born interest, capped at `_INTEREST_SPAWN_DAILY_CAP`/day.
+
+    ≤1/turn is structural (the field is scalar). The daily count persists in
+    `<persona_dir>/interest_spawn_state.json` keyed by UTC date; a stale or
+    corrupt state file resets to a fresh day rather than failing.
+    """
+    from brain.engines._interests import InterestSet, spawn_interest
+
+    now = datetime.now(UTC)
+    state_path = persona_dir / _INTEREST_SPAWN_STATE
+    today = f"{now:%Y-%m-%d}"
+    state = {"date": today, "count": 0}
+    try:
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if loaded.get("date") == today:
+            state = loaded
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    if int(state.get("count", 0)) >= _INTEREST_SPAWN_DAILY_CAP:
+        return
+
+    interests_path = persona_dir / "interests.json"
+    default_path = Path(__file__).parent.parent / "engines" / "default_interests.json"
+    interests = InterestSet.load(interests_path, default_path=default_path)
+    interests, created = spawn_interest(
+        interests,
+        topic=candidate.topic,
+        keywords=tuple(candidate.keywords),
+        why=candidate.why,
+        origin="conversation",
+        now=now,
+    )
+    if created:
+        interests.save(interests_path)
+        state["count"] = int(state.get("count", 0)) + 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 def _candidate_text(c: CrystallisationCandidate) -> str:

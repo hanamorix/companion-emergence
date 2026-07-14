@@ -2126,3 +2126,124 @@ def test_try_fire_dream_passes_soul_store(live_engine: HeartbeatEngine) -> None:
         live_engine._try_fire_dream()
 
     assert captured["soul_store"] is not None
+
+
+def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_canary(
+    tmp_path: Path,
+) -> None:
+    """ORGAN-DOD CANARY: one heartbeat-driven research fire must (1) append the
+    notes file, (2) create the research memory, (3) apply the verdict. If this
+    fails, the engine has regressed to a vignette generator (ToT triage 2026-07-13).
+    """
+    import json
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines._interests import InterestSet
+    from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
+    from brain.engines.research_notes import read_notes_tail
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+    from brain.search.base import NoopWebSearcher
+
+    class ScriptedProvider(FakeProvider):
+        """Select-JSON on call 1, session marker reply on call 2 (repeats after)."""
+
+        def __init__(self, replies: list[str]) -> None:
+            self._replies = list(replies)
+            self.calls: list[tuple[str, str | None]] = []
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            self.calls.append((prompt, system))
+            idx = min(len(self.calls) - 1, len(self._replies) - 1)
+            return self._replies[idx]
+
+    interest_id = "i1"
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": interest_id,
+                        "topic": "marine bio",
+                        "pull_score": 8.0,
+                        "scope": "either",
+                        "related_keywords": ["marine", "bio"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 1,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False,
+        research_enabled=True,
+        research_days_since_human_min=1.5,
+    ).save(config_path)
+
+    provider = ScriptedProvider(
+        [
+            f'{{"choice": "{interest_id}", "why": "it connects"}}',
+            "NOTES:\ncanary fact\n\nMEMORY:\nI followed the thread.\n\nVERDICT:\nclose",
+        ]
+    )
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        old_mem = Memory.create_new(
+            content="Hana and I talked long ago",
+            memory_type="conversation",
+            domain="us",
+            emotions={},
+        )
+        store.create(old_mem)
+        store._conn.execute(  # type: ignore[attr-defined]
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=3)).isoformat(), old_mem.id),
+        )
+        store._conn.commit()  # type: ignore[attr-defined]
+
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=provider,
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=tmp_path / "reflex_arcs.json",
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.research_fired == "marine bio"
+
+        persona_dir = interests_path.parent
+        assert "canary fact" in read_notes_tail(persona_dir, interest_id)
+
+        mems = store.list_by_type("research", active_only=True, limit=5)
+        assert any("followed the thread" in m.content for m in mems)
+
+        saved = InterestSet.load(interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].status == "dormant"
+    finally:
+        store.close()
+        hm.close()

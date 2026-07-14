@@ -40,6 +40,8 @@ class Interest:
     last_researched_at: datetime | None
     feed_count: int
     source_types: tuple[str, ...]
+    status: str = "active"  # "active" | "dormant"
+    origin: str = "bootstrap"  # bootstrap | conversation | side_quest | sweep
 
     @classmethod
     def from_dict(cls, data: dict) -> Interest:
@@ -68,6 +70,12 @@ class Interest:
         last_researched_raw = data.get("last_researched_at")
         last_researched = parse_iso_utc(last_researched_raw) if last_researched_raw else None
 
+        status = str(data.get("status", "active"))
+        if status not in ("active", "dormant"):
+            raise ValueError(
+                f"Interest {data.get('topic')!r}: status must be active|dormant, got {status!r}"
+            )
+
         return cls(
             id=str(data["id"]),
             topic=str(data["topic"]),
@@ -80,6 +88,8 @@ class Interest:
             last_researched_at=last_researched,
             feed_count=int(data["feed_count"]),
             source_types=tuple(str(s) for s in data["source_types"]),
+            status=status,
+            origin=str(data.get("origin", "bootstrap")),
         )
 
     def to_dict(self) -> dict:
@@ -97,6 +107,8 @@ class Interest:
             ),
             "feed_count": self.feed_count,
             "source_types": list(self.source_types),
+            "status": self.status,
+            "origin": self.origin,
         }
 
 
@@ -186,30 +198,35 @@ class InterestSet:
                 return i
         return None
 
-    def bump(self, topic: str, *, amount: float, now: datetime) -> InterestSet:
+    def bump(
+        self, topic: str, *, amount: float, now: datetime, revive_threshold: float = 6.0
+    ) -> InterestSet:
         """Return a new InterestSet with topic's pull_score nudged.
 
         Unknown topics return self unchanged (caller decides whether to add).
+
+        If the interest is dormant and its new pull_score >= revive_threshold,
+        it will be revived to active status.
         """
+        from dataclasses import replace
+
         out: list[Interest] = []
         matched = False
         lower = topic.lower()
         for i in self.interests:
             if i.topic.lower() == lower:
                 matched = True
+                new_score = i.pull_score + amount
+                new_status = i.status
+                if i.status == "dormant" and new_score >= revive_threshold:
+                    new_status = "active"
                 out.append(
-                    Interest(
-                        id=i.id,
-                        topic=i.topic,
-                        pull_score=i.pull_score + amount,
-                        scope=i.scope,
-                        related_keywords=i.related_keywords,
-                        notes=i.notes,
-                        first_seen=i.first_seen,
+                    replace(
+                        i,
+                        pull_score=new_score,
                         last_fed=now,
-                        last_researched_at=i.last_researched_at,
                         feed_count=i.feed_count + 1,
-                        source_types=i.source_types,
+                        status=new_status,
                     )
                 )
             else:
@@ -228,6 +245,8 @@ class InterestSet:
         """
         out: list[Interest] = []
         for i in self.interests:
+            if i.status != "active":
+                continue
             if i.pull_score < pull_threshold:
                 continue
             if i.last_researched_at is not None:
@@ -249,3 +268,42 @@ class InterestSet:
         out = [i for i in self.interests if i.id != interest.id]
         out.append(interest)
         return InterestSet(interests=tuple(out))
+
+
+def spawn_interest(
+    interests: InterestSet,
+    *,
+    topic: str,
+    keywords: tuple[str, ...],
+    why: str,
+    origin: str,
+    now: datetime,
+    pull_threshold: float = 6.0,
+) -> tuple[InterestSet, bool]:
+    """Dedup-guarded interest creation. Returns (new_set, created).
+
+    Casefold topic match vs ALL existing (active + dormant): a dormant match
+    is bumped (revive path) instead of duplicated; an active match is a no-op
+    (returns created=False). New interests seed at pull_threshold - 1.0 so
+    they need organic bumps before firing.
+    """
+    key = topic.strip().casefold()
+    if not key:
+        return interests, False
+    for i in interests.interests:
+        if i.topic.strip().casefold() == key:
+            if i.status == "dormant":
+                return interests.bump(i.topic, amount=0.1, now=now,
+                                      revive_threshold=pull_threshold), False
+            return interests, False
+    new = Interest(
+        id=f"{origin}-{abs(hash(key)):016x}",
+        topic=topic.strip(),
+        pull_score=pull_threshold - 1.0,
+        scope="either",
+        related_keywords=tuple(k.strip() for k in keywords if k.strip())[:5],
+        notes=why.strip()[:280],
+        first_seen=now, last_fed=now, last_researched_at=None,
+        feed_count=0, source_types=(origin,), status="active", origin=origin,
+    )
+    return InterestSet(interests=interests.interests + (new,)), True
