@@ -15,6 +15,8 @@ see test_inventory_is_byte_stable.
 
 from __future__ import annotations
 
+import re
+
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.schemas import build_schemas
 
@@ -44,7 +46,7 @@ def _gloss(description: str) -> str:
     inventory's unique job is the tools NOT recruited this turn — name plus
     enough to know it is worth reaching for.
     """
-    first = description.strip().split(". ")[0].strip()
+    first = re.split(r"(?<=\.)\s+(?=[A-Z])", description.strip())[0].strip()
     return first.rstrip(".")
 
 
