@@ -180,6 +180,11 @@ def build_system_message(
     if user_input is not None:
         parts.append(_EPISTEMIC_INSTRUCTION)
 
+    # Toolset parity with the static builder. The image path keeps the combined
+    # builder for byte-equivalence, so it needs its own append. ONE line — the
+    # monologue/reply framing divergence between the two paths is #72, not this.
+    parts.append(build_tool_inventory(persona_name))
+
     # 4b. Recall block — memories matching the current user input.
     # Passes persona_dir so the forgetting-aware path can partition into
     # active / fading / lost via search_with_loss (spec §5).
