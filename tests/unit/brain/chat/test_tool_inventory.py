@@ -56,6 +56,21 @@ def test_inventory_falls_soft_on_a_tool_with_no_schema(monkeypatch) -> None:
     assert "`get_soul`" in out
 
 
+def test_falls_soft_tool_renders_name_only_no_dangling_gloss(monkeypatch) -> None:
+    """Tightens test_inventory_falls_soft_on_a_tool_with_no_schema: that test only
+    checked the schema-less tool's name APPEARED, which would still pass if a
+    stray `None` or gloss got appended. The implementation promises a bare
+    `- `name`` line with no trailing `— gloss` — pin that exactly, and pin that
+    a schema-bearing tool alongside it is unaffected and still gets its gloss."""
+    import brain.chat.tool_inventory as ti
+
+    monkeypatch.setattr(ti, "NELL_TOOL_NAMES", ("get_soul", "ghost_tool"))
+    out = build_tool_inventory("Nell")
+    lines = out.splitlines()
+    assert "- `ghost_tool`" in lines
+    assert any(line.startswith("- `get_soul` — ") for line in lines)
+
+
 def test_inventory_gloss_is_one_sentence_not_the_whole_description() -> None:
     """Full descriptions are ~2194 tokens and duplicate what recruited tools
     already carry in their schemas; the first sentence is ~619."""
@@ -65,3 +80,12 @@ def test_inventory_gloss_is_one_sentence_not_the_whole_description() -> None:
     full = build_schemas("Nell")["compact_history"]["description"]
     assert len(full) > 200  # guard the premise: this description IS long
     assert full.strip() not in out
+
+
+def test_gloss_does_not_truncate_at_an_abbreviation() -> None:
+    """`. ` is not a sentence boundary when it sits inside `e.g. ` — splitting
+    there ships a dangling fragment into the frozen prefix, which the model then
+    reads every turn as its description of a real faculty."""
+    out = build_tool_inventory("Nell")
+    assert "— e.g\n" not in out
+    assert "e.g. ~/Desktop" in out
