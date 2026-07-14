@@ -608,6 +608,26 @@ def sandbox(
             else:
                 os.environ[k] = v
 
+    # Snapshot brain's process-global emotion state so a sandboxed run that reconstructs a persona
+    # vocabulary (which register()s persona-extension emotions like "warmth" into the process-global
+    # brain.emotion.vocabulary._REGISTRY) does NOT leak that registration to the rest of the pytest
+    # process. brain mutates these at load time by design; the harness imports brain read-only, so it
+    # must isolate the mutation itself. Restored in the OUTER finally below, symmetric with
+    # _restore_env, so it runs even when SandboxLeak is raised. See
+    # hunts/harness-vocab-registry-leak/diagnosis.md.
+    import brain.emotion.aggregate as _agg
+    import brain.emotion.vocabulary as _vocab
+
+    _saved_registry = dict(_vocab._REGISTRY)
+    _saved_warned = set(_agg._warned_unregistered)
+
+    def _restore_emotion_globals() -> None:
+        # Mutate contents in place (clear + update), NOT a rebind — keeps any held reference valid.
+        _vocab._REGISTRY.clear()
+        _vocab._REGISTRY.update(_saved_registry)
+        _agg._warned_unregistered.clear()
+        _agg._warned_unregistered.update(_saved_warned)
+
     try:
         os.environ["KINDLED_HOME"] = str(root)
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -707,5 +727,6 @@ def sandbox(
                 raise SandboxLeak(msg)
     finally:
         _restore_env()
+        _restore_emotion_globals()
         if not keep:
             shutil.rmtree(root, ignore_errors=True)
