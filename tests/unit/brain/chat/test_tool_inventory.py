@@ -89,3 +89,23 @@ def test_gloss_does_not_truncate_at_an_abbreviation() -> None:
     out = build_tool_inventory("Nell")
     assert "— e.g\n" not in out
     assert "e.g. ~/Desktop" in out
+
+
+def test_schema_prose_is_british_but_identifiers_are_not() -> None:
+    """Prose is free; identifiers are frozen. `crystallize_soul` is the exact
+    string the model must call — anglicising it invents a tool that isn't there.
+    The .py files never see the britfix hook, so this is done by hand."""
+    import re
+
+    from brain.tools.schemas import build_schemas
+
+    schemas = build_schemas("Nell")
+
+    american = {
+        name: re.findall(r"\b\w*(?:iz|yz)(?:e|es|ed|ing|ation|ations)\b", v["description"])
+        for name, v in schemas.items()
+    }
+    offenders = {n: w for n, w in american.items() if w}
+    assert not offenders, f"American prose left in schema descriptions: {offenders}"
+
+    assert schemas["crystallize_soul"]["name"] == "crystallize_soul"
