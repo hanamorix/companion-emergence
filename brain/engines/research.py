@@ -26,6 +26,14 @@ from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
+# Stamped onto every research memory's metadata as "schema_version".
+# 1 (implicit — the key is ABSENT) = the pre-redesign engine, whose "memory" was
+# a whole self-contained vignette written per fire.
+# 2 = the redesigned engine: the bulk lives in <persona_dir>/research/<id>.md and
+# the memory is a short first-person reaction to a session.
+# Bump on any change to the metadata shape or to what `content` means.
+RESEARCH_SCHEMA_VERSION = 2
+
 _TOPIC_OVERLAP_SYSTEM = """\
 You are a relevance scorer for an autonomous companion's research engine.
 You will be given (1) a research thread that just matured, and (2) recent
@@ -589,6 +597,7 @@ def _create_research_memory(
         domain="us",
         emotions={},
         metadata={
+            "schema_version": RESEARCH_SCHEMA_VERSION,
             "interest_id": interest.id,
             "interest_topic": interest.topic,
             "scope": interest.scope,

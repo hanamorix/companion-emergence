@@ -10,7 +10,7 @@ import pytest
 
 from brain.bridge.provider import FakeProvider
 from brain.engines._interests import InterestSet
-from brain.engines.research import ResearchEngine
+from brain.engines.research import RESEARCH_SCHEMA_VERSION, ResearchEngine
 from brain.engines.research_notes import read_notes_tail
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
@@ -239,6 +239,33 @@ def test_run_tick_fire_writes_research_memory(tmp_path: Path):
         assert mem.memory_type == "research"
         assert mem.metadata["interest_topic"] == "marine bioluminescence"
         assert mem.metadata["web_used"] is False  # Noop searcher returns []
+    finally:
+        store.close()
+
+
+def test_run_tick_fire_stamps_research_schema_version(tmp_path: Path):
+    """Research memories carry schema_version so the dedup pass can tell a
+    redesigned-engine memory from a pre-redesign vignette (absent => v1).
+
+    Requested by ThinkerOfThoughts for the issue #66 memory-system work.
+    """
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        result = engine.run_tick(days_since_human_override=5.0)
+        assert result.fired is not None
+        mem = store.get(result.fired.output_memory_id)
+        assert mem is not None
+        assert mem.metadata["schema_version"] == RESEARCH_SCHEMA_VERSION
+        assert RESEARCH_SCHEMA_VERSION >= 2  # 1 == the pre-redesign vignette engine
     finally:
         store.close()
 
