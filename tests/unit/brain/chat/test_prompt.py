@@ -1235,26 +1235,24 @@ def test_build_system_message_omits_self_model_block_when_no_gap(
 # ── Tool inventory (frozen prefix, text path) ─────────────────────────────────
 
 
-def test_static_system_message_contains_the_tool_inventory(tmp_path) -> None:
+def test_static_system_message_contains_the_tool_inventory(persona_dir: Path) -> None:
     """THROUGH-PATH: the writer is useless if the reader never gets it (the
     draft_space lesson). A built system message must actually carry the block."""
     from brain.chat.prompt import build_static_system_message
 
-    persona_dir = tmp_path / "nell"
-    persona_dir.mkdir()
     out = build_static_system_message(persona_dir, voice_md="# voice")
     assert "`reach_for_capability`" in out
     assert "`propose_write`" in out
     assert "Everything you can reach for" in out
 
 
-def test_static_system_message_stays_byte_stable_with_the_inventory(tmp_path) -> None:
+def test_static_system_message_stays_byte_stable_with_the_inventory(
+    persona_dir: Path,
+) -> None:
     """The frozen-prefix contract, asserted end-to-end rather than on the block
     alone: two same-session builds must be identical or the cache re-creates."""
     from brain.chat.prompt import build_static_system_message
 
-    persona_dir = tmp_path / "nell"
-    persona_dir.mkdir()
     a = build_static_system_message(persona_dir, voice_md="# voice")
     b = build_static_system_message(persona_dir, voice_md="# voice")
     assert a == b
