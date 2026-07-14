@@ -225,9 +225,20 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation even though
-# Nell can't call them (she's restricted to mcp__brain-tools__*). Disallowing
-# them removes the dead-weight definition tokens from cache-creation cost.
+# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
+# the ones she has no business calling removes their definition tokens from
+# cache-creation cost AND keeps them out of her hands.
+#
+# This list is POLICY, not dead weight. --allowedTools is a permission list, not
+# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
+# --dangerously-skip-permissions rides every call — so anything left off this
+# list is genuinely callable. 87bfc692's original comment claimed the opposite
+# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
+# swept out on that false premise, silently removing chat-time web access (#71).
+#
+# Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
+# Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
+# guards that.
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -236,8 +247,6 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Glob",
     "Grep",
     "Task",
-    "WebFetch",
-    "WebSearch",
     "TodoWrite",
     "NotebookEdit",
     "BashOutput",
@@ -246,8 +255,9 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 def _apply_lean_flags(cmd: list[str]) -> None:
-    """Strip the CLI's built-in tool defs (dead weight — Nell only uses MCP tools)
-    and pin to the configured MCP server. Saves ~14K cache-creation tokens/call."""
+    """Disallow the built-in tools she has no business calling and pin to the
+    configured MCP server. Trims their definition tokens from cache-creation
+    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
 
