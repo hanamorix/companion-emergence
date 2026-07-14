@@ -92,18 +92,61 @@ def test_reply_frame_is_last_block(system_message: str):
 
 
 def test_deferred_d2_prompt_size_canary(system_message: str):
-    """Canary (D2): if ambient blocks bloat enough to bury the reply-frame
-    reboot, revisit the deferred compression/reorder pass. Ledger:
-    project_companion_emergence_deferred.md.
+    """Canary (D2), IMAGE path: bound the combined builder, where the reboot
+    really can be buried. Ledger: project_companion_emergence_deferred.md.
 
-    Headroom is mostly spent. The bound of 9_000 was set at ~3x the fixture's
-    then-size (2901 chars, v0.0.33). The generated tool inventory added ~3823
-    chars ABOVE the reply frame — which is the burial this canary watches for —
-    taking the fixture to ~6726, about 1.3x of bound. It still passes, and the
-    inventory is a deliberate trade (a complete toolset in the frozen prefix,
-    paid once per session as cache-create, then cache-read). But the next
-    ambient block of any size trips this. When it does: that is the canary
-    working, not a stale bound to raise — take the compression/reorder pass.
+    `build_system_message` is one blob — inventory, ambient and the reboot in a
+    single string, reboot last — so total length is still a fair proxy for
+    burial here, and this is the only path where it is. Text turns went to
+    build_static_system_message + build_volatile_context in v0.0.39; their guard
+    is test_deferred_d2_volatile_tail_stays_small below.
+
+    9_000 was ~3x the v0.0.33 fixture (2901). It is now ~1.5x. That is real:
+    the tool inventory is ~3.4k of it, deliberately, so she cannot be wrong
+    about her own faculties. If this trips, take the compression pass — do not
+    raise the bound to make it quiet.
     """
     assert len(system_message) < 9_000
     assert system_message.rstrip().endswith("the answer needs room.")
+
+
+def test_deferred_d2_volatile_tail_stays_small(persona_dir: Path):
+    """Canary (D2), TEXT path: bound what actually precedes the reboot.
+
+    D2 was written when there was one builder, so total length was a fair proxy
+    for "ambient bloat buries the reboot". v0.0.39's caching split moved the
+    volatile blocks to the stdin tail — for cache reasons, but the effect is
+    D2's own "ambient block reorder": on this path the reboot now rides at the
+    END of a ~1.5k tail, after the history, and the frozen prefix that grew
+    (voice, fence, inventory) sits before the history where it cannot bury it.
+
+    So the quantity that matters here is the tail, not the total. Growth in the
+    static prefix is a cost question — the prompt-cache pays it once a session.
+    Growth in THIS is the recency question, and it is what pushes the reboot up
+    away from the model's attention.
+    """
+    from brain.chat.prompt import build_volatile_context
+    from brain.engines.daemon_state import DaemonState
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    soul = SoulStore(persona_dir / "crystallizations.db")
+    try:
+        tail = build_volatile_context(
+            persona_dir,
+            voice_md="sweater-wearing novelist",
+            daemon_state=DaemonState(),
+            soul_store=soul,
+            store=store,
+            user_input="hi",
+        )
+    finally:
+        store.close()
+
+    # ~3x the current tail (≈1.5k), the same ratio D2's original bound used.
+    assert len(tail) < 4_500
+    # The reboot is the last thing in the tail, and the tail is the last thing
+    # the model reads. Both halves matter: a bound alone would pass with the
+    # reboot moved to the top of the tail.
+    assert tail.rstrip().endswith("the answer needs room.")
