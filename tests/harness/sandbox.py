@@ -336,7 +336,12 @@ def _fingerprint(
             entry: tuple = (st.st_size, st.st_mtime_ns)
             if hash_content:
                 entry = (st.st_size, st.st_mtime_ns, _content_hash(f))
-            fp[str(f.relative_to(root))] = entry
+            # as_posix(), not str(): str(Path) gives OS-native separators, so the same tree
+            # keyed 'keep/present.txt' here and 'keep\present.txt' on Windows. The map is only
+            # ever compared against another map from the same run, so the logic never cared —
+            # but the spelling leaked into assertions, and a platform-dependent key is a trap
+            # for anything that ever reports or persists one. No-op off Windows.
+            fp[f.relative_to(root).as_posix()] = entry
     return fp
 
 

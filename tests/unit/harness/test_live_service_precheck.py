@@ -516,11 +516,16 @@ def test_every_run_path_routes_through_sandbox() -> None:
     example calls `sandbox(`; no harness helper stands up a BridgeServer outside a `sandbox()`."""
     harness_dir = Path(__file__).resolve().parents[2] / "harness"
     example = harness_dir / "examples" / "test_generic_run.py"
-    assert "sandbox(" in example.read_text(), "the worked example must run inside sandbox()"
+    # encoding= is not optional: read_text() resolves to cp1252 on Windows, and the worked
+    # example has a ⚠️ in its docstring — 0x8F has no cp1252 codepoint, so this raised
+    # UnicodeDecodeError on windows-latest while passing everywhere else.
+    assert "sandbox(" in example.read_text(encoding="utf-8"), (
+        "the worked example must run inside sandbox()"
+    )
 
     # No module under tests/harness/ should construct BridgeServer without importing sandbox.
     for py in harness_dir.rglob("*.py"):
-        text = py.read_text()
+        text = py.read_text(encoding="utf-8")
         if "BridgeServer(" in text and py.name != "engine.py":
             assert "sandbox" in text, f"{py.name} builds a bridge but does not reference sandbox()"
 
