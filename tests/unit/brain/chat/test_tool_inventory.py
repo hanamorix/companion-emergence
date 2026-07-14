@@ -100,6 +100,10 @@ def test_schema_prose_is_british_but_identifiers_are_not() -> None:
     from brain.tools.schemas import build_schemas
 
     schemas = build_schemas("Nell")
+    # Ceiling: this pattern also matches words with no -ise form — size, seize,
+    # prize, capsize, maize. None appear in a description today. If one ever
+    # does, this test will demand a misspelling to pass: add an allow-list then
+    # rather than respelling the word. Don't respell the word.
     american = re.compile(r"\b\w*(?:iz|yz)(?:e|es|ed|ing|ation|ations)\b")
 
     # Every description the model can see, not just the top-level one: a tool's
