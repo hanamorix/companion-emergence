@@ -51,6 +51,24 @@ def test_paths_table_contains_persona_dir_key(tmp_path):
     assert "persona_dir" in result.stdout
 
 
+def test_paths_reports_tunables_location(tmp_path):
+    """`nell paths` must surface tunables.json — it is the ONLY ops-override
+    surface, and it lives under the platformdirs home where nobody would find
+    it by accident (issue #63)."""
+    _setup_persona(tmp_path)
+    result = _nell(tmp_path, "paths")
+    assert result.returncode == 0, result.stderr
+    # Match the KEY column, not a bare substring: pytest names tmp_path after
+    # this test, so "tunables" appears in every printed path regardless.
+    assert any(line.startswith("tunables") for line in result.stdout.splitlines())
+
+    result = _nell(tmp_path, "paths", "--json")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "tunables" in payload
+    assert payload["tunables"]["path"].endswith("tunables.json")
+
+
 def test_paths_json_is_valid_json(tmp_path):
     _setup_persona(tmp_path)
     result = _nell(tmp_path, "paths", "--json")
