@@ -36,8 +36,13 @@ def _build(persona_dir: Path, user_input: str = "hi") -> str:
 
 
 def test_system_message_contains_monologue_tool_invitation(persona_dir: Path):
+    # Assert the frame, not the tool name: `record_monologue` is one of the 27
+    # names the generated tool inventory puts in every system message, so the
+    # bare name is true of any message at all — including one built with no
+    # monologue frame.
     msg = _build(persona_dir)
-    assert "record_monologue" in msg
+    assert "── inner monologue" in msg
+    assert "record_monologue" in msg.split("── inner monologue")[1]
 
 
 def test_system_message_contains_reply_frame_label(persona_dir: Path):
@@ -46,15 +51,24 @@ def test_system_message_contains_reply_frame_label(persona_dir: Path):
 
 
 def test_reply_frame_comes_after_monologue_frame(persona_dir: Path):
-    """Reply frame must be last so the model treats it as the immediate context."""
+    """Reply frame must be last so the model treats it as the immediate context.
+
+    Anchored on the frame marker, NOT on `record_monologue`. The tool inventory
+    names that tool near the top of every message, so indexing on the name
+    measured the inventory's position and would have held with the monologue
+    frame moved after the reply, or gone.
+    """
     msg = _build(persona_dir)
-    assert msg.index("record_monologue") < msg.index("── visible reply")
+    assert msg.index("── inner monologue") < msg.index("── visible reply")
 
 
 def test_monologue_frame_includes_persona_name(persona_dir: Path):
+    # Look inside the frame. The inventory is rendered with the companion's
+    # name in it, so `"nell" in msg` is true however the frame is built — the
+    # same way this test's sibling in test_prompt.py went quietly dead.
     msg = _build(persona_dir)
-    # The persona dir basename is "nell" — case-insensitive check.
-    assert "nell" in msg.lower()
+    frame = msg.split("── inner monologue")[1].split("── visible reply")[0]
+    assert "nell" in frame.lower()
 
 
 def test_existing_voice_block_still_present(persona_dir: Path):
