@@ -141,7 +141,10 @@ def test_build_system_message_preamble_persona_name_substituted(
         soul_store=soul_store,
         store=store,
     )
-    assert "siren" in msg
+    # Assert the preamble sentence, not the bare name: the always-on tool
+    # inventory is rendered with the companion's name in it, so `"siren" in msg`
+    # is true whatever the preamble does — including if it stopped substituting.
+    assert "You are siren" in msg
 
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
