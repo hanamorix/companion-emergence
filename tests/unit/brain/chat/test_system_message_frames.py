@@ -93,9 +93,17 @@ def test_reply_frame_is_last_block(system_message: str):
 
 def test_deferred_d2_prompt_size_canary(system_message: str):
     """Canary (D2): if ambient blocks bloat enough to bury the reply-frame
-    reboot, revisit the deferred compression/reorder pass. Bound of 9_000
-    is ~3x the fixture's current size (2901 chars as of v0.0.33) — it should
-    trip on structural growth, not drift. Ledger:
-    project_companion_emergence_deferred.md."""
+    reboot, revisit the deferred compression/reorder pass. Ledger:
+    project_companion_emergence_deferred.md.
+
+    Headroom is mostly spent. The bound of 9_000 was set at ~3x the fixture's
+    then-size (2901 chars, v0.0.33). The generated tool inventory added ~3823
+    chars ABOVE the reply frame — which is the burial this canary watches for —
+    taking the fixture to ~6726, about 1.3x of bound. It still passes, and the
+    inventory is a deliberate trade (a complete toolset in the frozen prefix,
+    paid once per session as cache-create, then cache-read). But the next
+    ambient block of any size trips this. When it does: that is the canary
+    working, not a stale bound to raise — take the compression/reorder pass.
+    """
     assert len(system_message) < 9_000
     assert system_message.rstrip().endswith("the answer needs room.")

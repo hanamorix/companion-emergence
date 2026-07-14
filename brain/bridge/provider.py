@@ -236,6 +236,11 @@ _STREAM_EOF = object()
 # ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
 # swept out on that false premise, silently removing chat-time web access (#71).
 #
+# Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
+# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
+# unspiked comment is what caused #71 in the first place; don't trust this one
+# either if the CLI has moved. Re-spike and date a new row.
+#
 # Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
 # Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
 # guards that.
