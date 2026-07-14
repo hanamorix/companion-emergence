@@ -39,15 +39,27 @@ _REACH_VALVE = (
 )
 
 
+# A sentence is only short by convention, and some of these aren't: felt_time_now
+# opens with 398 chars of colon-and-parenthesis before it ever reaches a `. `, so
+# "first sentence" bought no economy at all for the one tool that needed it most.
+# 120 leaves the median (76) untouched and truncates 4 of 27.
+_MAX_GLOSS_CHARS = 120
+
+
 def _gloss(description: str) -> str:
-    """First sentence of a schema description.
+    """First sentence of a schema description, bounded to one line.
 
     Not the whole thing: recruited tools already carry their full schema, so the
     inventory's unique job is the tools NOT recruited this turn — name plus
     enough to know it is worth reaching for.
     """
     first = re.split(r"(?<=\.)\s+(?=[A-Z])", description.strip())[0].strip()
-    return first.rstrip(".")
+    first = first.rstrip(".")
+    if len(first) > _MAX_GLOSS_CHARS:
+        # Cut on a word: mid-word reads as a typo, and an unmarked cut reads as
+        # a complete thought that isn't one. The ellipsis says "there is more".
+        first = first[:_MAX_GLOSS_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:—-") + "…"
+    return first
 
 
 def build_tool_inventory(companion_name: str) -> str:

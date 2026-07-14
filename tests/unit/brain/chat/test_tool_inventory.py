@@ -91,6 +91,46 @@ def test_gloss_does_not_truncate_at_an_abbreviation() -> None:
     assert "e.g. ~/Desktop" in out
 
 
+def test_gloss_is_bounded_so_one_sentence_means_one_line() -> None:
+    """A "sentence" is only short by convention. felt_time_now's first sentence
+    is 398 chars — it uses colons and parentheses, never a `. ` boundary — so
+    the one-line economy the gloss exists for missed its single worst offender
+    while every test reported clean. The bound is what makes the promise true.
+    """
+    from brain.chat.tool_inventory import _MAX_GLOSS_CHARS, _gloss
+    from brain.tools.schemas import build_schemas
+
+    # Pin the policy against a literal, not against itself. Asserting only
+    # "no gloss exceeds _MAX_GLOSS_CHARS" passes at any value — set the
+    # constant to 9999 and the bound is gone while the test still reports
+    # clean. That is the failure this whole block exists to prevent.
+    assert _MAX_GLOSS_CHARS <= 160, "the gloss bound was raised past one line"
+
+    schemas = build_schemas("Nell")
+    over = {
+        name: len(_gloss(schemas[name]["description"]))
+        for name in NELL_TOOL_NAMES
+        if len(_gloss(schemas[name]["description"])) > _MAX_GLOSS_CHARS + 1
+    }
+    assert not over, f"glosses over the {_MAX_GLOSS_CHARS}-char bound: {over}"
+
+
+def test_gloss_truncates_on_a_word_and_says_that_it_did() -> None:
+    """Cut mid-word and the model reads a typo; cut silently and it reads a
+    complete thought that isn't one. The ellipsis is the honesty, and the
+    result must stay a real prefix of the source — a gloss that rewords the
+    schema is a second place for the truth to drift."""
+    from brain.chat.tool_inventory import _MAX_GLOSS_CHARS, _gloss
+
+    source = "Return your felt sense of time: " + "lived_age_hours and pressure " * 20
+    out = _gloss(source)
+
+    assert len(out) <= _MAX_GLOSS_CHARS + 1  # +1 for the ellipsis itself
+    assert out.endswith("…")
+    assert not out[:-1].endswith(" ")
+    assert source.startswith(out[:-1]), "the gloss must be a prefix, not a rewrite"
+
+
 def test_schema_prose_is_british_but_identifiers_are_not() -> None:
     """Prose is free; identifiers are frozen. `crystallize_soul` is the exact
     string the model must call — anglicising it invents a tool that isn't there.
