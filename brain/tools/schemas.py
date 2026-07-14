@@ -95,7 +95,7 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "love_type": {
                     "type": "string",
-                    "description": f"The type of love this crystallizes. One of: {', '.join(LOVE_TYPES.keys())}.",
+                    "description": f"The type of love this crystallises. One of: {', '.join(LOVE_TYPES.keys())}.",
                 },
                 "why_it_matters": {
                     "type": "string",
@@ -107,7 +107,7 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "resonance": {
                     "type": "integer",
-                    "description": "Intensity 1-10. Default 8 — if it's worth crystallizing, it should be at least 8.",
+                    "description": "Intensity 1-10. Default 8 — if it's worth crystallising, it should be at least 8.",
                     "default": 8,
                 },
             },

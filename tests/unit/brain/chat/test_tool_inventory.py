@@ -100,12 +100,27 @@ def test_schema_prose_is_british_but_identifiers_are_not() -> None:
     from brain.tools.schemas import build_schemas
 
     schemas = build_schemas("Nell")
+    american = re.compile(r"\b\w*(?:iz|yz)(?:e|es|ed|ing|ation|ations)\b")
 
-    american = {
-        name: re.findall(r"\b\w*(?:iz|yz)(?:e|es|ed|ing|ation|ations)\b", v["description"])
-        for name, v in schemas.items()
-    }
-    offenders = {n: w for n, w in american.items() if w}
+    # Every description the model can see, not just the top-level one: a tool's
+    # parameter descriptions ride along in its schema when it is recruited, so
+    # they are her voice too. Scanning only the top level let two American
+    # strings sit inside crystallize_soul's own parameters while this test
+    # reported clean.
+    offenders: dict[str, list[str]] = {}
+    for name, schema in schemas.items():
+        described = {name: schema.get("description", "")}
+        props = (schema.get("parameters") or {}).get("properties") or {}
+        for param, spec in props.items():
+            described[f"{name}.{param}"] = spec.get("description", "") or ""
+        for where, prose in described.items():
+            hits = american.findall(prose)
+            if hits:
+                offenders[where] = hits
     assert not offenders, f"American prose left in schema descriptions: {offenders}"
 
+    # Identifiers are frozen. Checked separately from the prose sweep above,
+    # which cannot see them: the regex needs a word boundary after the -ize, and
+    # the underscore in crystallize_soul denies it one.
+    assert "crystallize_soul" in schemas, "the tool's dict key was renamed"
     assert schemas["crystallize_soul"]["name"] == "crystallize_soul"
