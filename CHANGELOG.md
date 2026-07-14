@@ -583,8 +583,8 @@ this release going out.
   was a red herring. The real wizard hang was the Windows path mismatch
   (fixed in alpha.2). With the path fix in place, 127.0.0.1 works correctly.
   tauri.localhost introduced a new problem: Tauri's internal proxy intercepts
-  CORS preflight requests carrying an Authorisation header and strips the
-  server's Access-Control-Allow-Headers, breaking all authenticated fetches
+  CORS preflight requests carrying an `Authorization` header and strips the
+  server's `Access-Control-Allow-Headers`, breaking all authenticated fetches
   on Windows.
 
 ## 0.0.12-alpha.2 — 2026-05-14
@@ -695,7 +695,7 @@ and refine outbound thoughts instead of only responding when spoken to.
 This release rolls up the v0.0.9 initiate substrate, v0.0.10 D-reflection,
 and v0.0.11 adaptive-D / recall-resonance work into one public alpha.
 
-- **Autonomous initiate channel.** Dreams, crystallizations, emotion spikes,
+- **Autonomous initiate channel.** Dreams, crystallisations, emotion spikes,
   reflex firings, research completions, voice reflections, and recall-resonance
   activations can emit candidates into an internal review queue. The user still
   only has to install, name, and talk — the brain manages cadence, cooldowns,

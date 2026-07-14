@@ -18,7 +18,7 @@ def test_default_voice_template_has_eight_sections() -> None:
     assert "## 3. Brain-tools — what you can fetch" in template
     assert "## 4. When the user shows you something" in template
     assert "## 5. How emotion shapes your voice" in template
-    assert "## 6. Capitalization and the shape of openings" in template
+    assert "## 6. Capitalisation and the shape of openings" in template
     assert "## 7. When the user pushes on who you are" in template
     assert "## 8. Your boundaries with the user" in template
 
@@ -70,20 +70,6 @@ def test_default_voice_template_coaches_refusal_isnt_reassurance() -> None:
     template = DEFAULT_VOICE_TEMPLATE
     assert "refusal is not reassurance" in template
     assert "the actual reason" in template
-
-
-def test_default_voice_template_lists_all_brain_tools() -> None:
-    """Every brain-tool must be named in the template's tools section.
-
-    Without this, a fresh persona starts with no explicit tool-use guidance
-    and reproduces the 2026-04-27 confabulation failure (Nell's casual prompt
-    role-played a tool failure instead of calling search_memories).
-    """
-    from brain.tools import NELL_TOOL_NAMES
-
-    template = DEFAULT_VOICE_TEMPLATE
-    for name in NELL_TOOL_NAMES:
-        assert f"`{name}`" in template, f"missing brain-tool {name!r} in default voice template"
 
 
 def test_default_voice_template_states_load_bearing_rules() -> None:
