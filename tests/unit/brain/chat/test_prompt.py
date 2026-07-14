@@ -175,7 +175,12 @@ def test_build_system_message_includes_daemon_residue_when_present(
         soul_store=soul_store,
         store=store,
     )
-    assert "dream" in msg.lower()
+    # Assert the residue line itself, not the bare word: the always-on tool
+    # inventory glosses mention dreaming, so `"dream" in msg.lower()` is true of
+    # every message and would pass here even if the residue never rendered.
+    # This is the one line that appears only when the dream fires.
+    assert "Previous dream" in msg
+    assert "Dreamed of the beach where we first talked." in msg
 
 
 def test_build_system_message_no_residue_section_when_empty_state(
@@ -392,8 +397,12 @@ def test_recall_block_surfaces_keyword_match(
         store=store,
         user_input="Tell me what we said about Jordan last time.",
     )
-    # New forgetting-aware format uses "recall\n  active:" instead of "── recall ──"
-    assert "recall" in msg
+    # New forgetting-aware format uses "recall\n  active:" instead of "── recall ──".
+    # Assert the structured block, not the bare word: `recall_forgotten`,
+    # `recall_arc` and `recall_monologue` are tool names in the always-on
+    # inventory, so `"recall" in msg` is true of every message and would pass
+    # here even if the recall block never rendered.
+    assert "recall\n  active:" in msg
     assert "Jordan" in msg
 
 
