@@ -141,7 +141,10 @@ def test_build_system_message_preamble_persona_name_substituted(
         soul_store=soul_store,
         store=store,
     )
-    assert "siren" in msg
+    # Assert the preamble sentence, not the bare name: the always-on tool
+    # inventory is rendered with the companion's name in it, so `"siren" in msg`
+    # is true whatever the preamble does — including if it stopped substituting.
+    assert "You are siren" in msg
 
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
@@ -175,7 +178,12 @@ def test_build_system_message_includes_daemon_residue_when_present(
         soul_store=soul_store,
         store=store,
     )
-    assert "dream" in msg.lower()
+    # Assert the residue line itself, not the bare word: the always-on tool
+    # inventory glosses mention dreaming, so `"dream" in msg.lower()` is true of
+    # every message and would pass here even if the residue never rendered.
+    # This is the one line that appears only when the dream fires.
+    assert "Previous dream" in msg
+    assert "Dreamed of the beach where we first talked." in msg
 
 
 def test_build_system_message_no_residue_section_when_empty_state(
@@ -340,7 +348,11 @@ def test_recall_block_omitted_when_user_input_none(
         store=store,
         # user_input deliberately omitted
     )
-    assert "recall" not in msg.lower()
+    # "recall" alone now also appears in tool names in the (always-on) tool
+    # inventory block (`recall_forgotten`, `recall_arc`, `recall_monologue`) —
+    # check for the structured recall block specifically, same fix already
+    # applied in test_recall_block_handles_no_match below.
+    assert "recall\n  " not in msg
 
 
 def test_recall_block_omitted_when_user_input_too_short(
@@ -388,8 +400,12 @@ def test_recall_block_surfaces_keyword_match(
         store=store,
         user_input="Tell me what we said about Jordan last time.",
     )
-    # New forgetting-aware format uses "recall\n  active:" instead of "── recall ──"
-    assert "recall" in msg
+    # New forgetting-aware format uses "recall\n  active:" instead of "── recall ──".
+    # Assert the structured block, not the bare word: `recall_forgotten`,
+    # `recall_arc` and `recall_monologue` are tool names in the always-on
+    # inventory, so `"recall" in msg` is true of every message and would pass
+    # here even if the recall block never rendered.
+    assert "recall\n  active:" in msg
     assert "Jordan" in msg
 
 
@@ -1230,3 +1246,50 @@ def test_build_system_message_omits_self_model_block_when_no_gap(
         store=store,
     )
     assert "A note on your own read" not in msg
+
+
+# ── Tool inventory (frozen prefix, text path) ─────────────────────────────────
+
+
+def test_static_system_message_contains_the_tool_inventory(persona_dir: Path) -> None:
+    """THROUGH-PATH: the writer is useless if the reader never gets it (the
+    draft_space lesson). A built system message must actually carry the block."""
+    from brain.chat.prompt import build_static_system_message
+
+    out = build_static_system_message(persona_dir, voice_md="# voice")
+    assert "`reach_for_capability`" in out
+    assert "`propose_write`" in out
+    assert "Everything you can reach for" in out
+
+
+def test_static_system_message_stays_byte_stable_with_the_inventory(
+    persona_dir: Path,
+) -> None:
+    """The frozen-prefix contract, asserted end-to-end rather than on the block
+    alone: two same-session builds must be identical or the cache re-creates."""
+    from brain.chat.prompt import build_static_system_message
+
+    a = build_static_system_message(persona_dir, voice_md="# voice")
+    b = build_static_system_message(persona_dir, voice_md="# voice")
+    assert a == b
+
+
+# ── Tool inventory (image path, parity with the static builder) ──────────────
+
+
+def test_image_path_system_message_also_contains_the_inventory(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Image turns build via build_system_message, not the static builder. They
+    must see the same toolset — otherwise she has hands in text and not in
+    pictures. (Parity only; the #72 framing divergence is NOT touched here.)"""
+    out = build_system_message(
+        persona_dir,
+        voice_md="# voice",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="hi",
+    )
+    assert "`reach_for_capability`" in out
+    assert "`propose_write`" in out
