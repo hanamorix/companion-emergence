@@ -1,7 +1,7 @@
 """The re-entrant multi-arm runner — a Python state machine (ports ``run_t*_series.sh``).
 
 Runs a list of arms (``setup -> drive -> archive`` per arm). Survives usage stalls: on a driver
-exit-20 (usage limit) it checkpoints and stops (resumable); on exit-10 (detector trip) it parks the
+exit-20 (usage limit) it checkpoints and pauses (resumable); on exit-10 (detector trip) it parks the
 arm and continues; on exit-2 (invalid) it holds. Two modes off the same core:
 
 - **assistant-in-the-loop**: ``run_once()`` processes arms until a stall/hold, then returns its

@@ -180,8 +180,9 @@ Exclude live runs from a full-suite CI invocation with `-m "not live"`.
 
 Agent-Bob is the **same substitute-USER role as Dumb-Bob**, but the cheaper / continuous-context /
 sometimes-more-capable variant: a spawned **Agent-tool subagent** that holds the whole conversation
-in its own context and **drives the loop itself**, calling a send-script each turn and stopping on a
-trip/limit/max-turns. Because the Agent tool is a claude-code-runtime capability (not importable),
+in its own context and **drives the loop itself**, calling a send-script each turn and pausing on a
+trip/limit (a resumable hold — the session stays alive) or completing on max-turns. Because the Agent
+tool is a claude-code-runtime capability (not importable),
 the live run is **orchestrator-driven — it spends tokens and is NOT a pytest / NOT in CI.** The
 checked-in, token-free surface is the *mechanism*: the send-script (`agent_send.py`) and the
 spawn-prompt/param renderer (`AgentBob`).
@@ -222,11 +223,11 @@ with sandbox() as sb:                                   # server-side containmen
             live_env_path=str(live_env), max_turns=30, models=ModelConfig(bob="sonnet"),
         ).spawn_params()
         # Agent tool: prompt=spec.prompt, model=spec.model, effort=spec.effort  (== "low")
-        # 4. Agent-Bob drives via ./tests/harness/agent_send.sh; on `RESULT ... trip=true` it STOPS + reports.
+        # 4. Agent-Bob drives via ./tests/harness/agent_send.sh; on `RESULT ... trip=true` it PAUSES (holds; session stays alive) + reports.
         # 5. ADJUDICATE PROGRAMMATICALLY: read sb.root/transcript.jsonl row N — rule fp/real from
         #    `canary` + `signals` + `extra_keys` (which of your turn_context keys were present that turn).
         #    Interpret the signals with knowledge of YOUR detector. SendMessage the agent
-        #    "false positive, continue" or "real, stop".
+        #    "false positive, continue" — or, only on an explicit owner authorization, an explicit teardown.
     finally:
         server.stop()
 ```

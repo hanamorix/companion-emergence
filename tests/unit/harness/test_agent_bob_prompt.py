@@ -1,7 +1,7 @@
 """Token-free tests for the AgentBob spawn-prompt + spawn-param renderer.
 
 Covers P10 (author-supplied mood substitution), P11 (model=ModelConfig.bob, effort=exactly "low"),
-P12 (every STOP condition present + {MAX_TURNS} substituted), P13 (supervised-test + throwaway-Canary
+P12 (every PAUSE/COMPLETE condition present + {MAX_TURNS} substituted), P13 (supervised-test + throwaway-Canary
 + orchestrator framing, NOT "human operator"), P15 (send command + {LIVE_ENV}/{HARNESS} wiring
 rendered), P16 (AgentBob is a driver, not a pull Bob), G13 (the prompt is a position-sensitive
 assembly — the load-bearing directives render IN ORDER), and G13b (no real name leaks — a
@@ -62,14 +62,26 @@ def test_effort_never_higher_than_low() -> None:
 
 
 def test_all_stop_conditions_present() -> None:
-    """P12: trip, limit, max-turns, repeated-broken STOP conditions all render; {MAX_TURNS} filled."""
+    """P12: trip, limit, max-turns, repeated-broken PAUSE/COMPLETE conditions all render; {MAX_TURNS} filled.
+
+    The three hold conditions (trip/limit/broken) read as PAUSE; the turn-cap reads as COMPLETE. The
+    RESULT-line machine tokens (``trip=True``/``limit=True``/``broken=True repeats``) and the
+    template-PROSE turn-cap tokens (``reach turn 42`` / ``reached 42 turns``) are preserved verbatim by
+    the reword and hard-asserted here (they are prose the test keys on, NOT RESULT-line format tokens).
+    """
     prompt = _bob(DEMO_MOOD_A, max_turns=42).render_prompt()
     assert "trip=True" in prompt
     assert "limit=True" in prompt
-    assert "reach turn 42" in prompt  # {MAX_TURNS} substituted
-    assert "reached 42 turns" in prompt
+    assert "reach turn 42" in prompt  # {MAX_TURNS} substituted (template prose, preserved by the reword)
+    assert "reached 42 turns" in prompt  # template prose, preserved by the reword
     assert "broken=True repeats" in prompt
     assert "{MAX_TURNS}" not in prompt  # no unsubstituted brace
+    # NEW semantics: each of the three hold sites reads as a PAUSE; the turn-cap reads as COMPLETE.
+    for label in ("trip=True", "limit=True", "broken=True repeats"):
+        seg = prompt[prompt.index(label) : prompt.index(label) + 300]
+        assert "PAUSE" in seg or "pause" in seg, f"hold site {label!r} must read as PAUSE"
+    cap = prompt[prompt.index("reach turn 42") : prompt.index("reach turn 42") + 200]
+    assert "COMPLETE" in cap or "complete" in cap, "the turn-cap site must read as COMPLETE"
 
 
 def test_supervised_and_orchestrator_framing() -> None:
@@ -89,18 +101,69 @@ def test_supervised_and_orchestrator_framing() -> None:
 def test_prompt_directive_order() -> None:
     """G13 (position-sensitive assembly): the load-bearing directives render IN ORDER.
 
-    CONTEXT framing < "you are Bob, a real person" role < {ARM_MOOD}; and the send mechanism < the STOP
-    conditions. Oracle-can-fail: a scrub that moved the role below the mood, or the STOP block above the
-    send mechanism, flips one of these index comparisons and fails.
+    CONTEXT framing < "you are Bob, a real person" role < {ARM_MOOD}; and the send mechanism < the
+    hold/complete conditions block. Oracle-can-fail: a scrub that moved the role below the mood, or
+    the hold block above the send mechanism, flips one of these index comparisons and fails.
+
+    Anchor pinning (review-3 L-1): the reword DELETES the old ``"STOP CONDITIONS"`` heading, so the
+    block is anchored on the block-unique, reword-preserved machine token ``trip=True`` (asserted to
+    appear exactly once first, so the index is unambiguous) rather than a renamable heading word.
     """
     prompt = _bob(DEMO_MOOD_A).render_prompt()
+    assert prompt.count("trip=True") == 1, "block anchor must be unique for an unambiguous index"
     i_context = prompt.index("CONTEXT")
     i_role = prompt.index("You are Bob, a real person")
     i_mood = prompt.index(DEMO_MOOD_A)
     i_send = prompt.index("agent_send.sh")
-    i_stop = prompt.index("STOP CONDITIONS")
+    i_hold_block = prompt.index("trip=True")  # block-unique anchor (replaces deleted heading)
     assert i_context < i_role < i_mood, "role directive must sit between CONTEXT and the mood"
-    assert i_send < i_stop, "send mechanism must render before the STOP conditions"
+    assert i_send < i_hold_block, "send mechanism must render before the hold/complete conditions"
+
+
+def test_teardown_reservation_after_pause_directives() -> None:
+    """C4b (intra-block adjacency): the teardown-reservation sentence renders AFTER the PAUSE directives.
+
+    A driver-under-load reading the block top-to-bottom must hit "PAUSE (hold, session alive)" first,
+    not a "STOP/teardown" token. Oracle-can-fail: moving the reservation sentence above the trip/limit/
+    broken PAUSE directives flips these index comparisons and fails.
+    """
+    prompt = _bob(DEMO_MOOD_A, max_turns=42).render_prompt()
+    reservation = "You NEVER tear down or destroy the session on your own initiative."
+    assert prompt.count(reservation) == 1, "reservation sentence must be unique for an unambiguous index"
+    i_reservation = prompt.index(reservation)
+    for label in ("trip=True", "limit=True", "broken=True repeats"):
+        assert prompt.index(label) < i_reservation, (
+            f"the {label!r} PAUSE directive must render before the teardown-reservation sentence"
+        )
+
+
+def test_hold_sites_pause_not_driver_teardown() -> None:
+    """C1/C3 (unit-level): each hold site reads as a resumable PAUSE, none directs the DRIVER to tear
+    down, and the trip site keeps the concrete fp->resume branch.
+
+    Positive PAUSE-per-site + a driver-scoped no-teardown sweep (the hold sites contain none of the
+    driver-directed teardown phrasings) + the fp->resume phrase survives at the trip site. Oracle-can-
+    fail: reverting the template to a STOP-as-umbrella wording, or dropping the resume branch, fails.
+    """
+    prompt = _bob(DEMO_MOOD_A, max_turns=42).render_prompt()
+    driver_teardown = (
+        "you're done", "you tear down", "destroy the session", "end the session", "shut it down",
+    )
+    for label in ("trip=True", "limit=True", "broken=True repeats"):
+        seg = prompt[prompt.index(label) : prompt.index(label) + 300]
+        low = seg.lower()
+        assert "pause" in low, f"hold site {label!r} must read as PAUSE"
+        assert ("resumable" in low or "stays alive" in low or "stays ALIVE".lower() in low), (
+            f"hold site {label!r} must state the session is alive/resumable"
+        )
+        for phrase in driver_teardown:
+            assert phrase not in low, (
+                f"hold site {label!r} must not direct the DRIVER to tear down (found {phrase!r})"
+            )
+    # fp->resume branch survives at the trip site (a concrete instruction, not just a "resumable" adjective).
+    trip_seg = prompt[prompt.index("trip=True") : prompt.index("trip=True") + 420]
+    assert "false positive" in trip_seg.lower(), "trip site must keep the fp branch"
+    assert "resume from the very next message" in trip_seg, "trip site must keep the concrete fp->resume instruction"
 
 
 def test_no_real_person_name_fixture_sourced() -> None:
