@@ -158,7 +158,8 @@ for turn in range(1, 6):
 
 **Agent-Bob — agent-drives-the-loop.** The cheaper / continuous-context variant: a spawned
 **Agent-tool subagent** holds the whole conversation in its own context and drives the loop
-itself, calling the `agent_send` script each turn and stopping on a trip/limit/max-turns.
+itself, calling the `agent_send` script each turn and pausing on a trip/limit (a resumable hold —
+the session stays alive) or completing on max-turns.
 `AgentBob(mood, *, harness_dir, live_env_path, max_turns, models)` is a **renderer**, not a
 `Bob` — call `.spawn_params()` to get the spawn contract; it does not implement `next_message`.
 Because the Agent tool is a claude-code-runtime capability, an Agent-Bob run is
@@ -224,9 +225,11 @@ rule **false-positive vs. real** — who rules depends on the tier:
 - **DumbBob:** the test code rules inline (it has the `reply`, `signals`, and `ctx` in hand).
 - **Agent-Bob:** the **orchestrator** (the claude-code session) rules **from the on-disk
   transcript** (`<sandbox>/transcript.jsonl`) — each row carries `canary`, `signals`, and
-  `extra_keys` (which of your `turn_context` keys were present that turn). Agent-Bob just STOPS and
-  reports `TRIP at turn N`; the orchestrator SendMessages it "false positive, continue" or "real,
-  stop." Interpret the `signals` with knowledge of YOUR detector.
+  `extra_keys` (which of your `turn_context` keys were present that turn). Agent-Bob just PAUSES
+  (holds; the session stays alive and resumable) and reports `PAUSE (trip) at turn N`; the
+  orchestrator SendMessages it "false positive, continue" — or, only on an explicit owner
+  authorization it relays, an explicit teardown. Interpret the `signals` with knowledge of YOUR
+  detector.
 
 **Hold the discipline — representativeness is held orchestrator-side.** A clean (no-trip) run only
 means something if the stimulus for the symptom actually occurred. If the conversation never
