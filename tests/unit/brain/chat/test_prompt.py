@@ -129,6 +129,30 @@ def test_build_system_message_includes_maker_awareness_block(
     assert "the private content here" not in msg
 
 
+def test_build_system_message_includes_research_awareness_block(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    from brain.memory.store import Memory
+
+    store.create(
+        Memory.create_new(
+            content="Chased the labyrinth thread again today — it is a shape, not a trap.",
+            memory_type="research",
+            domain="us",
+            emotions={},
+        )
+    )
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+    )
+    assert "what you've been turning over" in msg
+    assert "labyrinth" in msg
+
+
 def test_build_system_message_preamble_persona_name_substituted(
     tmp_path: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
