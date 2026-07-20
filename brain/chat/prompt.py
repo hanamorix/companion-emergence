@@ -19,6 +19,7 @@ from pathlib import Path
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
+from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -273,6 +274,16 @@ def build_system_message(
     except Exception:  # noqa: BLE001
         pass
 
+    # 7c. Interior research-awareness — recent research she ran on her own, so it
+    # is present in context (she was previously unaware research had run at all;
+    # it only reached her if she actively searched). Fail-soft.
+    try:
+        research_block = build_research_awareness_block(store, limit=3)
+        if research_block:
+            parts.append(research_block)
+    except Exception:  # noqa: BLE001
+        pass
+
     # 8. Inner monologue framing — names the record_monologue tool, articulates
     # situational trigger criteria. Per spec 2026-05-30 §2.
     soul_hints = _collect_soul_hints(soul_store, limit=3)
@@ -501,6 +512,14 @@ def build_volatile_context(
         maker_block = build_maker_awareness_block(persona_dir, limit=5)
         if maker_block:
             parts.append(maker_block)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 7c. Interior research-awareness — fail-soft (mirrors maker block above).
+    try:
+        research_block = build_research_awareness_block(store, limit=3)
+        if research_block:
+            parts.append(research_block)
     except Exception:  # noqa: BLE001
         pass
 
