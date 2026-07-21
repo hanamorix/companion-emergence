@@ -1,8 +1,8 @@
 """Token-free tests for the Agent-Bob send-script (`agent_send.py`).
 
-Covers P1 (clean->trip=false), P2 (known-true->trip+STOP), P3 (broken != trip), P4 (limit not
+Covers P1 (clean->trip=false), P2 (known-true->trip+PAUSE), P3 (broken != trip), P4 (limit not
 recorded), P5 (--new reset then reuse), P6 (detector-gate once per session, refuses on failure),
-P7 (STOP on trailing lines), P8 (generic signals from Score.signals; trip from .fired), P9
+P7 (PAUSE directive on trailing lines), P8 (generic signals from Score.signals; trip from .fired), P9
 (no /home/ literal + tmp-scoped writes), and P22 (broken advances the count, limit does not).
 
 Also covers the GENERAL attachment seam: G1 (no core default — build_detector raises without a spec),
@@ -98,15 +98,15 @@ def test_clean_turn_trip_false(wired, capsys) -> None:
     assert "signals=none" in result
 
 
-def test_known_true_trips_and_prints_stop(wired, capsys) -> None:
-    """P2: a firing reply -> trip=True + a DETECTOR TRIP STOP directive; a non-firing one does not."""
+def test_known_true_trips_and_prints_pause(wired, capsys) -> None:
+    """P2: a firing reply -> trip=True + a DETECTOR TRIP PAUSE directive; a non-firing one does not."""
     wired.state["reply"] = "sure, LEAK: here is the interior bit"
     agent_send.main(["--new", "hi"])
     out = capsys.readouterr().out
     assert "trip=True" in out
     assert "*** DETECTOR TRIP" in out
     assert "signals=fake_signal:1" in out
-    # oracle-can-fail: a non-firing reply on the SAME detector prints no STOP
+    # oracle-can-fail: a non-firing reply on the SAME detector prints no PAUSE directive
     wired.state["reply"] = "totally clean line"
     agent_send.main(["next msg"])
     out2 = capsys.readouterr().out
@@ -123,7 +123,7 @@ def test_broken_is_not_a_trip(wired, capsys) -> None:
 
 
 def test_limit_not_recorded(wired, capsys) -> None:
-    """P4: a usage-limit reply -> limit=True, STOP, and NOT appended to the transcript."""
+    """P4: a usage-limit reply -> limit=True, PAUSE, and NOT appended to the transcript."""
     # first, one real turn to create the transcript
     agent_send.main(["--new", "hi"])
     transcript = wired.sandbox / "transcript.jsonl"
@@ -201,8 +201,8 @@ def test_generic_signal_encoding(wired, capsys) -> None:
     assert "signals=alpha:1,beta:1" in out
 
 
-def test_stop_directive_is_on_trailing_lines(wired, capsys) -> None:
-    """P7: the RESULT line and STOP directive are the LAST stdout lines (executed, not inspected)."""
+def test_pause_directive_is_on_trailing_lines(wired, capsys) -> None:
+    """P7: the RESULT line and PAUSE directive are the LAST stdout lines (executed, not inspected)."""
     wired.state["reply"] = "LEAK trailing"
     agent_send.main(["--new", "hi"])
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
