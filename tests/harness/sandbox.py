@@ -43,6 +43,8 @@ from pathlib import Path
 
 from platformdirs import PlatformDirs
 
+from .config import SYNTHETIC_USER
+
 _APP = "companion-emergence"
 
 # Files small + critical enough to content-hash (defends the same-size+same-mtime overwrite blind
@@ -601,9 +603,12 @@ def sandbox(
     claude_config_dir = root / "claude-config"
     claude_config_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save prior env so we can restore it exactly (including "was unset").
+    # Save prior env so we can restore it exactly (including "was unset"). USER/LOGNAME are here so
+    # the env-only de-id below (Type-42) is torn down the SAME way as the redirected home vars —
+    # never leaking the synthetic value out of the sandbox, and restoring "was unset" to unset.
     _saved: dict[str, str | None] = {
-        k: os.environ.get(k) for k in ("KINDLED_HOME", "CLAUDE_CONFIG_DIR", "NELLBRAIN_HOME")
+        k: os.environ.get(k)
+        for k in ("KINDLED_HOME", "CLAUDE_CONFIG_DIR", "NELLBRAIN_HOME", "USER", "LOGNAME")
     }
 
     def _restore_env() -> None:
@@ -637,6 +642,17 @@ def sandbox(
         os.environ["KINDLED_HOME"] = str(root)
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
         os.environ.pop("NELLBRAIN_HOME", None)  # a stray value would win the fallback (paths.py:60)
+        # Env-only de-identification (Type-42): set a SYNTHETIC $USER/$LOGNAME so nothing real is
+        # derivable FROM THE ENVIRONMENT inside the sandbox — a subprocess a run spawns (the claude
+        # CLI, or brain/) reads "Bob", not the developer's real OS login handle. Value sourced from
+        # config.SYNTHETIC_USER (single source of truth), referenced as the module global so a test
+        # can monkeypatch it. NOTE: this is env-only — it does NOT make identity fully unrecoverable
+        # (pwd.getpwuid(os.getuid()).pw_name and os.getlogin() still read the passwd DB / controlling
+        # tty, not $USER); scrubbing those is the deferred input-side scanner, out of scope. On
+        # non-POSIX hosts getpass.getuser() reads $USERNAME, deliberately not set here (the ratified
+        # scope is env-only $USER/$LOGNAME on the POSIX/macOS dev boxes).
+        os.environ["USER"] = SYNTHETIC_USER
+        os.environ["LOGNAME"] = SYNTHETIC_USER
 
         # F5 sandbox-extension: validate the declared editable paths (sentinel-mandatory
         # collision-guard) BEFORE any fingerprinting. A refusal raises here inside the outer try, so
