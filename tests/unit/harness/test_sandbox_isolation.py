@@ -25,6 +25,7 @@ from tests.harness import (
     build_persona,
     sandbox,
 )
+from tests.harness.config import SYNTHETIC_USER
 from tests.harness.sandbox import (
     _CLAUDE_SESSION_LOG_DIRS,
     _CLAUDE_SESSION_LOG_FILES,
@@ -456,8 +457,6 @@ def test_af2_file_history_write_by_canary_would_land_in_tempdir(
 # sandbox() sets a SYNTHETIC $USER/$LOGNAME so a subprocess a run spawns cannot read the developer's
 # real OS login handle from the environment (Type 42). Saved/restored the same way as the redirected
 # home vars, including the "was unset" case.
-
-from tests.harness.config import SYNTHETIC_USER
 
 
 def test_user_logname_synthetic_inside_sandbox_and_restored(
