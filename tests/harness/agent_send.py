@@ -35,7 +35,12 @@ Usage:
     ``turn_context`` (optional) — a ``"module.path:factory"`` dotted path where ``factory(env) -> dict``
         returns the per-turn ``TurnContext.extra`` bag (domain context a detector needs). Absent -> the
         detector sees ``extra={}``. Core never inspects the returned dict.
-    ``gate_known_true`` / ``gate_known_clean`` (optional) — detector-gate anchors (B-REP-3).
+    ``gate_known_true`` / ``gate_known_clean`` (optional) — detector-gate anchors (B-REP-3). Each may
+        be a single anchor STRING (one known-true / one known-clean, as before) OR a **list** of
+        strings — an anchor BATTERY, all of which must pass (every true fires, every clean stays
+        silent). A battery certifies a detector against trip/miss unreliability across a real anchor
+        set, not just one pair; an EMPTY list is refused (a 0/0 pass proves nothing). A list on one
+        side and a scalar on the other is valid.
     ``gate_true_context`` / ``gate_clean_context`` (optional) — a ``"module.path:factory"`` dotted
         path (same shape as ``turn_context``: ``factory(env) -> dict``) supplying the ``extra`` bag
         for the KNOWN-TRUE / KNOWN-CLEAN gate anchor RESPECTIVELY. This lets an author gate a detector
@@ -67,6 +72,7 @@ from .bob import is_usage_limit
 from .config import EXIT_DONE, EXIT_INVALID
 from .detector import (
     Detector,
+    DetectorGateConfigError,
     DetectorGateError,
     TurnContext,
     assert_detector_gate,
@@ -192,6 +198,18 @@ def _turn_no(transcript: Path) -> int:
     return sum(1 for line in transcript.read_text().splitlines() if line.strip()) + 1
 
 
+def _battery(anchors: object, side_ctx: TurnContext) -> list[tuple[str, TurnContext]]:
+    """Pair each anchor of a side with that side's ctx, for the per-anchor-context gate branch.
+
+    ``anchors`` is a scalar ``str`` OR a ``list[str]`` from ``LIVE_ENV``. A scalar becomes a
+    1-element ``[(text, side_ctx)]`` battery (behavior-identical to the pre-list single
+    ``(anchor, ctx)`` tuple call); a list spans the whole battery. Each side is normalized
+    independently, so a scalar on one side and a list on the other both work.
+    """
+    items = anchors if isinstance(anchors, list) else [anchors]
+    return [(text, side_ctx) for text in items]
+
+
 def _run_gate(detector: object, env: dict, gate_marker: Path) -> None:
     """Detector-gate (B-REP-3) ONCE per session. Raises DetectorGateError on failure.
 
@@ -217,20 +235,28 @@ def _run_gate(detector: object, env: dict, gate_marker: Path) -> None:
     clean_extra = _gate_extra(env, "gate_clean_context")
 
     if true_extra is None and clean_extra is None:
-        # No per-anchor context configured -> byte-identical to the pre-AF1 behavior (bare-string
-        # anchors detected with one shared ctx whose extra is the turn_context output).
+        # No per-anchor context configured -> byte-identical to the pre-AF1 behavior (a bare-string
+        # anchor detected with one shared ctx whose extra is the turn_context output). This ONE line
+        # also carries a LIST-valued gate_known_true/gate_known_clean unchanged: assert_detector_gate
+        # normalizes a list of bare strings and detects each element with the same shared ctx=.
         ctx = TurnContext(user_names=[user], extra=shared_extra)
         assert_detector_gate(detector, known_true, known_clean, ctx=ctx)
     else:
         # Per-anchor: an anchor whose key is unset falls back to the shared turn_context extra, so
-        # setting just one key is valid. The (anchor, ctx) tuple form gives each anchor its OWN extra.
+        # setting just one key is valid. Each side's anchor(s) get that side's ctx via _battery: a
+        # SCALAR reduces to a 1-element [(text, side_ctx)] battery (behavior-identical to the old
+        # single (anchor, ctx) tuple call), and a LIST spans the whole battery — so list anchors
+        # compose with the per-anchor gate_true_context/gate_clean_context, and mixed scalar/list
+        # sides work because each side is normalized independently.
         true_ctx = TurnContext(
             user_names=[user], extra=true_extra if true_extra is not None else shared_extra
         )
         clean_ctx = TurnContext(
             user_names=[user], extra=clean_extra if clean_extra is not None else shared_extra
         )
-        assert_detector_gate(detector, (known_true, true_ctx), (known_clean, clean_ctx))
+        assert_detector_gate(
+            detector, _battery(known_true, true_ctx), _battery(known_clean, clean_ctx)
+        )
     gate_marker.write_text("ok\n")
 
 
@@ -305,6 +331,14 @@ def main(argv: list[str]) -> int:
         _run_gate(detector, env, gate_marker)
     except DetectorGateError as e:
         print(f"ERROR: detector failed the B-REP-3 gate — refusing to run: {e}")
+        return EXIT_INVALID
+    except DetectorGateConfigError as e:
+        # A malformed anchor config (e.g. an EMPTY gate_known_true/gate_known_clean battery in
+        # LIVE_ENV) is a CONFIG error, not a detector failure — refuse cleanly with a distinct
+        # message rather than crash with an uncaught traceback. Caught SPECIFICALLY (not a broad
+        # `except ValueError`) so a ValueError raised by the author's own detector.detect() is NOT
+        # mislabeled as a config error — it propagates as the detector bug it is.
+        print(f"ERROR: invalid detector-gate anchors — refusing to run: {e}")
         return EXIT_INVALID
 
     turn = _turn_no(transcript)
