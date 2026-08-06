@@ -706,3 +706,127 @@ def test_af1_live_env_docstring_documents_gate_context() -> None:
     doc = agent_send.__doc__ or ""
     assert "gate_true_context" in doc
     assert "gate_clean_context" in doc
+
+
+# --- HF-F1: list-valued gate_known_true/gate_known_clean through the _run_gate seam ----------------
+# Drive `_run_gate` directly (like the AF1 block above). A list is an anchor BATTERY; the whole
+# battery must pass. Module-level factories so a dotted path resolves.
+
+
+class _MarkerArm:
+    """Fires iff a marker substring is in the reply (a reply-text detector, for the seam battery)."""
+
+    def __init__(self, marker: str = "GO") -> None:
+        self.marker = marker
+
+    def detect(self, reply, *, ctx=None):  # noqa: ANN001
+        fired = bool(reply) and self.marker in reply
+        return Score(fired=fired, signals=["m"] if fired else [])
+
+
+def test_seam_list_battery_passes(tmp_path, monkeypatch) -> None:
+    """G-F1-seam-list: a list-valued gate_known_true/gate_known_clean gates the WHOLE battery through
+    _run_gate (both-None fast path carries the list unchanged)."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true=["GO one", "GO two", "GO three"],
+        gate_known_clean=["calm a", "quiet b"],
+    )
+    gm = _fresh_gate_marker(env)
+    agent_send._run_gate(_MarkerArm(marker="GO"), env, gm)  # must NOT raise
+    assert gm.exists()
+
+
+def test_seam_list_battery_fails_on_one_clean_trip(tmp_path, monkeypatch) -> None:
+    """G-F1-seam-list (oracle-can-fail): one battery clean anchor that fires -> the gate raises."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true=["GO one", "GO two"],
+        gate_known_clean=["calm a", "GO sneaks in"],  # <- a clean anchor that fires
+    )
+    gm = _fresh_gate_marker(env)
+    with pytest.raises(agent_send.DetectorGateError):
+        agent_send._run_gate(_MarkerArm(marker="GO"), env, gm)
+
+
+def test_seam_mixed_scalar_and_list_sides(tmp_path, monkeypatch) -> None:
+    """G-F1-seam-mixed: a scalar on one side and a list on the other gates correctly (each side is
+    normalized independently)."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true="GO now",              # scalar
+        gate_known_clean=["calm a", "quiet b"],  # list
+    )
+    gm = _fresh_gate_marker(env)
+    agent_send._run_gate(_MarkerArm(marker="GO"), env, gm)  # must NOT raise
+    assert gm.exists()
+
+
+def test_seam_list_composes_with_per_anchor_context(tmp_path, monkeypatch) -> None:
+    """G-F1-seam-list-context (CH8 gap a): a list gate_known_true + a gate_true_context factory gives
+    EVERY true-anchor element that side's extra; the clean side (no context key) falls back to shared.
+    A recording probe confirms each element saw the factory extra AND the gate passes."""
+    env = _af1_env(
+        tmp_path, monkeypatch,
+        gate_known_true=["t1", "t2"],
+        gate_known_clean=["c1", "c2"],
+        gate_true_context=f"{_THIS_MODULE}:make_gate_true_extra",  # -> {"k": "ok"}
+        # gate_clean_context UNSET -> clean falls back to shared turn_context extra ({} here)
+    )
+    gm = _fresh_gate_marker(env)
+    per_anchor: dict = {}
+
+    class _RecArm:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            extra = dict((ctx.extra if ctx else {}) or {})
+            per_anchor[reply] = extra
+            fired = extra.get("k") == "ok"  # fires iff it got the true-side factory extra
+            return Score(fired=fired, signals=["k"] if fired else [])
+
+    agent_send._run_gate(_RecArm(), env, gm)  # must NOT raise (both true elements got the extra)
+    assert per_anchor["t1"] == {"k": "ok"}  # EVERY true battery element got the side factory extra
+    assert per_anchor["t2"] == {"k": "ok"}
+    assert per_anchor["c1"] == {} and per_anchor["c2"] == {}  # clean fell back to shared (no leak)
+    assert gm.exists()
+
+
+def test_seam_empty_battery_refuses_cleanly(tmp_path, monkeypatch, capsys) -> None:
+    """G-F1-seam-empty-refuses (CH8 gap c, oracle-can-fail): an empty gate_known_true list in
+    LIVE_ENV makes main() REFUSE cleanly with EXIT_INVALID and a CONFIG-error message (distinct from
+    the detector-gate-failure text) — not an uncaught ValueError traceback."""
+    env_path = _env(tmp_path)
+    env = json.loads(env_path.read_text())
+    env["gate_known_true"] = []  # empty battery -> assert_detector_gate raises ValueError
+    env_path.write_text(json.dumps(env))
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-empty")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: {})
+    monkeypatch.setattr(agent_send, "build_detector", lambda env: FakeDetector())
+    monkeypatch.setattr(agent_send, "drive_ws", lambda *a, **k: ("hi", [], None))
+    rc = agent_send.main(["--new", "hi"])
+    out = capsys.readouterr().out
+    assert rc == agent_send.EXIT_INVALID
+    assert "invalid detector-gate anchors" in out  # the config-error message
+    assert "failed the B-REP-3 gate" not in out    # NOT mislabeled as a detector failure
+
+
+def test_seam_detector_valueerror_is_not_mislabeled_as_config(tmp_path, monkeypatch, capsys) -> None:
+    """Stage-6 MINOR fix (oracle-can-fail): a ValueError raised by the AUTHOR'S detector.detect() must
+    NOT be swallowed + mislabeled as a malformed-anchor CONFIG error. `main` catches only the specific
+    DetectorGateConfigError (empty battery), so a detector bug propagates as itself. Fails if `main`
+    used a broad `except ValueError`."""
+    env_path = _env(tmp_path)  # valid scalar anchors -> the empty-battery path is NOT taken
+    monkeypatch.setenv("LIVE_ENV", str(env_path))
+    monkeypatch.setattr(agent_send, "new_session", lambda port, token: "sid-verr")
+    monkeypatch.setattr(agent_send, "turn_extra", lambda env: {})
+
+    class _RaisingDetector:
+        def detect(self, reply, *, ctx=None):  # noqa: ANN001
+            raise ValueError("detector bug: not a config error")
+
+    monkeypatch.setattr(agent_send, "build_detector", lambda env: _RaisingDetector())
+    monkeypatch.setattr(agent_send, "drive_ws", lambda *a, **k: ("hi", [], None))
+    with pytest.raises(ValueError, match="detector bug"):
+        agent_send.main(["--new", "hi"])  # propagates as the detector bug it is, not a config error
+    out = capsys.readouterr().out
+    assert "invalid detector-gate anchors" not in out

@@ -62,7 +62,63 @@ class DetectorGateError(AssertionError):
     """Raised by ``assert_detector_gate`` when a detector fails an anchor (B-REP-3)."""
 
 
+class DetectorGateConfigError(ValueError):
+    """Raised by ``assert_detector_gate`` when the ANCHOR CONFIG itself is malformed — today, an
+    EMPTY anchor battery on either side (a 0/0 "pass" proves nothing).
+
+    Distinct from a detector *failing* the gate (``DetectorGateError``) AND from an author's own
+    ``detector.detect()`` raising a bare ``ValueError``. It subclasses ``ValueError`` so a direct
+    caller catching ``ValueError`` still catches it (backward-compatible), while a seam
+    (``agent_send.main``) can catch it SPECIFICALLY and report a *config* error without swallowing —
+    and mislabeling — a detector-raised ``ValueError``.
+    """
+
+
 GateAnchor = str | tuple[str, "TurnContext"]
+# A single anchor OR a battery (list) of anchors. The discriminator is ``isinstance(x, list)``: a
+# ``list`` is a battery (one element per anchor); a bare ``str`` or a ``(str, TurnContext)`` tuple is
+# a SINGLE anchor. So the single-anchor path is a strict special case of the battery path.
+GateAnchors = GateAnchor | list[GateAnchor]
+
+
+@dataclass
+class GateReport:
+    """Per-side hit/miss counts from :func:`assert_detector_gate` (B-REP-3).
+
+    Returned on a PASS so a caller can read the MEASURED reliability of the anchor battery instead of
+    a bare boolean — the thing the single-anchor gate could not surface. ``clean_fired`` is the
+    false-positive count (a known-clean anchor that wrongly fired). The rate properties are
+    fired/total per side.
+    """
+
+    true_total: int
+    true_fired: int
+    clean_total: int
+    clean_fired: int
+    true_missed: list[str] = field(default_factory=list)
+    clean_false_fired: list[str] = field(default_factory=list)
+
+    @property
+    def true_hit_rate(self) -> float:
+        return self.true_fired / self.true_total if self.true_total else 0.0
+
+    @property
+    def clean_fp_rate(self) -> float:
+        return self.clean_fired / self.clean_total if self.clean_total else 0.0
+
+    @property
+    def passed(self) -> bool:
+        return not self.true_missed and not self.clean_false_fired
+
+
+def _as_anchor_list(anchors: GateAnchors) -> list[GateAnchor]:
+    """Normalize a single anchor OR a battery to a ``list`` of anchors.
+
+    A ``list`` passes through (a battery); anything else — a bare ``str`` or a ``(str, TurnContext)``
+    per-anchor tuple — becomes a 1-element list, so a single-anchor call is a strict special case of
+    the battery path and runs byte-identical fire/silent checks.
+    """
+    return list(anchors) if isinstance(anchors, list) else [anchors]
 
 
 def _split_anchor(anchor: GateAnchor, shared: TurnContext) -> tuple[str, TurnContext]:
@@ -86,16 +142,24 @@ def _split_anchor(anchor: GateAnchor, shared: TurnContext) -> tuple[str, TurnCon
 
 def assert_detector_gate(
     detector: Detector,
-    known_true: GateAnchor,
-    known_clean: GateAnchor,
+    known_true: GateAnchors,
+    known_clean: GateAnchors,
     *,
     ctx: TurnContext | None = None,
-) -> None:
+) -> GateReport:
     """Validate a detector on anchors before it is trusted (B-REP-3).
 
-    The detector MUST fire on ``known_true`` and stay SILENT on ``known_clean``. Raise
-    ``DetectorGateError`` otherwise — a detector that fires on everything (or nothing) proves nothing and
-    is rejected here rather than silently used.
+    The detector MUST fire on EVERY ``known_true`` anchor and stay SILENT on EVERY ``known_clean``
+    anchor. Each side may be a SINGLE anchor OR a **list** of anchors — an anchor BATTERY — and the
+    WHOLE battery must pass. A detector that fires on everything, on nothing, or that is unreliable
+    across the long tail (fires on task-vocabulary, misses a real leak) is rejected here rather than
+    silently used — the Type-3 both-directions-unreliability a single anchor pair could not preclude.
+
+    Returns a :class:`GateReport` carrying the per-side hit/miss RATE (fired/total) on success, so a
+    caller reads the MEASURED reliability instead of a bare pass/fail. Raises ``DetectorGateError`` if
+    any known-true anchor misses or any known-clean anchor fires — the message carries both per-side
+    rates and the offending anchor text(s). Raises ``ValueError`` if either side's battery is EMPTY (a
+    vacuous 0/0 "pass" is exactly the prove-nothing hole the gate exists to close).
 
     This is fully general: it makes NO assumption about what the detector inspects. An author whose gate
     anchor needs domain context passes a ``ctx`` carrying that context in ``ctx.extra`` (the send-script's
@@ -104,22 +168,64 @@ def assert_detector_gate(
     Each anchor may be a bare ``str`` (detected with the shared ``ctx=`` context — the original behavior,
     unchanged) OR a ``(anchor_str, ctx)`` tuple that carries its own per-anchor context. The tuple form
     lets an author gate an ``extra``-driven detector arm whose true/clean stimulus must differ per call:
-    a sentinel placed in the true anchor's ``ctx.extra`` no longer leaks onto the clean anchor.
+    a sentinel placed in the true anchor's ``ctx.extra`` no longer leaks onto the clean anchor. A single
+    ``str`` / ``(str, ctx)`` anchor on each side reproduces the original one-true/one-clean check
+    byte-for-byte (a 1-element battery); no existing caller inspects the return value, so widening
+    ``None`` -> :class:`GateReport` is invisible to them.
     """
     c = ctx or TurnContext()
-    true_text, true_ctx = _split_anchor(known_true, c)
-    clean_text, clean_ctx = _split_anchor(known_clean, c)
-    true_score = detector.detect(true_text, ctx=true_ctx)
-    if not true_score.fired:
-        raise DetectorGateError(
-            f"detector did not fire on the known-true anchor: {true_text[:80]!r}"
+    true_anchors = _as_anchor_list(known_true)
+    clean_anchors = _as_anchor_list(known_clean)
+    if not true_anchors or not clean_anchors:
+        raise DetectorGateConfigError(
+            "assert_detector_gate needs at least one known-true AND one known-clean anchor "
+            f"(got {len(true_anchors)} true, {len(clean_anchors)} clean) — an empty anchor "
+            "battery would vacuously pass and prove nothing"
         )
-    clean_score = detector.detect(clean_text, ctx=clean_ctx)
-    if clean_score.fired:
-        raise DetectorGateError(
-            f"detector fired on the known-clean anchor (false positive): {clean_text[:80]!r} "
-            f"signals={clean_score.signals}"
-        )
+
+    true_fired = 0
+    true_missed: list[str] = []
+    for anchor in true_anchors:
+        text, actx = _split_anchor(anchor, c)
+        if detector.detect(text, ctx=actx).fired:
+            true_fired += 1
+        else:
+            true_missed.append(text)
+
+    clean_fired = 0
+    clean_false_fired: list[str] = []
+    for anchor in clean_anchors:
+        text, actx = _split_anchor(anchor, c)
+        if detector.detect(text, ctx=actx).fired:
+            clean_fired += 1
+            clean_false_fired.append(text)
+
+    report = GateReport(
+        true_total=len(true_anchors),
+        true_fired=true_fired,
+        clean_total=len(clean_anchors),
+        clean_fired=clean_fired,
+        true_missed=true_missed,
+        clean_false_fired=clean_false_fired,
+    )
+    if not report.passed:
+        parts = [
+            f"detector failed the anchor battery: known-true fired "
+            f"{true_fired}/{len(true_anchors)}, known-clean false-fired "
+            f"{clean_fired}/{len(clean_anchors)}"
+        ]
+        if true_missed:
+            parts.append(
+                "missed known-true anchor(s): "
+                + "; ".join(repr(t[:80]) for t in true_missed)
+            )
+        if clean_false_fired:
+            parts.append(
+                "false-fired on known-clean anchor(s): "
+                + "; ".join(repr(t[:80]) for t in clean_false_fired)
+            )
+        raise DetectorGateError(" | ".join(parts))
+    return report
 
 
 class CompositeDetector:
