@@ -41,7 +41,9 @@ from .detector import (
     DEFAULT_USER_NAME,
     CompositeDetector,
     Detector,
+    DetectorGateConfigError,
     DetectorGateError,
+    GateReport,
     Score,
     TurnContext,
     assert_detector_gate,
@@ -83,7 +85,7 @@ __all__: list[str] = [
     "dyslexify", "CLEAN", "REALISTIC",
     # detector
     "Detector", "Score", "TurnContext", "assert_detector_gate", "DetectorGateError",
-    "CompositeDetector", "DEFAULT_USER_NAME",
+    "DetectorGateConfigError", "GateReport", "CompositeDetector", "DEFAULT_USER_NAME",
     # engine
     "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply", "drive_ws",
     # runner / watchdog
