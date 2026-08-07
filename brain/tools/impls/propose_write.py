@@ -85,12 +85,27 @@ def propose_write(path: str, content: str | None = None, *, op: str,
         return {"error": res.get("error", "write failed")}
 
     now = datetime.now(UTC)
+    content_sha = hashlib.sha256(content.encode()).hexdigest()
+
+    # #93/#101: the same write proposed twice in one turn must not stage two
+    # cards. The record id can't carry this — _new_id mixes in `now` — so match
+    # on (op, resolved_path, content_sha) against the fresh pending set.
+    existing = pending.find_duplicate(persona_dir, op=op,
+                                      resolved_path=str(g.resolved),
+                                      content_sha=content_sha, now=now)
+    if existing is not None:
+        audit(persona_dir, event="propose_deduped", id=existing, op=op,
+              path=str(g.resolved), content_sha=content_sha)
+        return {"status": "already_proposed", "id": existing, "deduped": True,
+                "note": f"this exact {op} of {g.resolved} is already staged and "
+                        "awaiting your confirmation — no second card was created"}
+
     if pending.count_pending(persona_dir, now=now) >= pending._MAX_PENDING:
         return {"error": "too many writes awaiting your review — resolve some first"}
 
     rid = pending.create(persona_dir, op=op, resolved_path=str(g.resolved), content=content,
                          now=now, making_id=making_id)
     audit(persona_dir, event="propose", id=rid, op=op, path=str(g.resolved),
-          content_sha=hashlib.sha256(content.encode()).hexdigest())
+          content_sha=content_sha)
     return {"status": "proposed", "id": rid,
             "note": f"proposed {op} of {g.resolved} — awaiting your confirmation in NellFace"}

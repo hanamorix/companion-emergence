@@ -96,3 +96,43 @@ def test_propose_over_queue_cap_refused(tmp_path, monkeypatch):
     out = propose_write(path=str(tmp_path / "home" / "f11.md"), content="x", op="create",
                         persona_dir=_persona(tmp_path))
     assert "error" in out and "awaiting" in out["error"].lower()
+
+
+def test_second_identical_proposal_is_deduped(tmp_path, monkeypatch):
+    """#93/#101: one turn must not stage the same write twice."""
+    from datetime import UTC, datetime
+
+    from brain.files.pending import list_pending
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    target = tmp_path / "home" / "Documents" / "note.md"
+
+    first = propose_write(path=str(target), content="block", op="create",
+                          persona_dir=_persona(tmp_path))
+    second = propose_write(path=str(target), content="block", op="create",
+                           persona_dir=_persona(tmp_path))
+
+    assert first["status"] == "proposed"
+    assert second["status"] == "already_proposed"
+    assert second["deduped"] is True
+    assert second["id"] == first["id"]
+    # The canary: ONE card, not two.
+    assert len(list_pending(_persona(tmp_path), now=datetime.now(UTC))) == 1
+
+
+def test_different_content_still_creates_a_second_card(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from brain.files.pending import list_pending
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    target = tmp_path / "home" / "Documents" / "note.md"
+
+    propose_write(path=str(target), content="block one", op="create",
+                  persona_dir=_persona(tmp_path))
+    second = propose_write(path=str(target), content="block two", op="create",
+                           persona_dir=_persona(tmp_path))
+
+    assert second["status"] == "proposed"
+    assert "deduped" not in second
+    assert len(list_pending(_persona(tmp_path), now=datetime.now(UTC))) == 2

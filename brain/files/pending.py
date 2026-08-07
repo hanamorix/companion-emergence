@@ -75,6 +75,26 @@ def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
     return sorted(fresh, key=lambda r: r["proposed_at"], reverse=True)
 
 
+def find_duplicate(persona_dir: Path, *, op: str, resolved_path: str,
+                   content_sha: str, now: datetime) -> str | None:
+    """Id of a fresh pending record proposing this exact write, or None.
+
+    The record id is not a dedupe key — _new_id mixes in `now`, so two
+    identical proposals moments apart mint different ids and both persist
+    (#93/#101). The dedupe key is (op, resolved_path, content_sha).
+
+    Matches against list_pending, which already filters to status="pending"
+    AND within _TTL_HOURS: a record still marked pending but past the TTL has
+    merely not been swept yet, and must not suppress a legitimate proposal.
+    """
+    for r in list_pending(persona_dir, now=now):
+        if (r.get("op") == op
+                and r.get("resolved_path") == resolved_path
+                and r.get("content_sha") == content_sha):
+            return r["id"]
+    return None
+
+
 def mark(persona_dir: Path, rid: str, *, status: str) -> None:
     rec = get(persona_dir, rid)
     if rec is None:
