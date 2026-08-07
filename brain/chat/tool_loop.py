@@ -345,11 +345,21 @@ def run_tool_loop(
     -------
     (final_response, invocations)
       - final_response: ChatResponse with content set (tool_calls may be empty)
-      - invocations: list of dicts, each:
-        {name, arguments, result_summary, outcome, error?}
-        outcome is one of "ok" (dispatched and returned normally), "refused"
-        (returned an {"error": ...} result — e.g. a write_guard denial — rather
-        than raising), or "error" (dispatch raised; record["error"] is set).
+      - invocations: list of dicts. Two shapes land in this list, and only one
+        of them carries `outcome`:
+        - in-process dispatch (the `for tc in last_response.tool_calls` loop
+          below — the OllamaProvider path):
+          {name, arguments, result_summary, outcome, error?}
+          outcome is one of "ok" (dispatched and returned normally), "refused"
+          (returned an {"error": ...} result — e.g. a write_guard denial —
+          rather than raising), or "error" (dispatch raised; record["error"]
+          is set).
+        - provider-dispatched invocations (`last_response.dispatched_invocations`
+          — the ClaudeCliProvider path, where tools already ran inside the CLI
+          subprocess): built by brain/mcp_server/audit.py::log_invocation as
+          {timestamp, name, audit_level, arguments, result_summary, error}.
+          `outcome` is NOT present on these records — a consumer must not
+          assume it (#102).
     """
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)

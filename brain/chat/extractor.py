@@ -389,8 +389,10 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     the engine's normal accounting.
 
     Deltas are on a [-1.0, 1.0] scale from the extractor. We map them to
-    importance = abs(delta) * 10 so a 0.15 nudge becomes importance 1.5 on
-    the 0..10 MemoryStore scale.
+    importance = abs(delta) * 10, capped at _MAX_DELTA_INTENSITY, so a 0.15
+    nudge becomes importance 1.5 on the 0..10 MemoryStore scale — a maximal
+    1.0 delta caps at _MAX_DELTA_INTENSITY rather than the uncapped 10.0;
+    one extraction can't peg a channel to the full clamp (#94).
 
     Channel names are constrained to the registered emotion vocabulary before
     writing — LLM-invented names are silently dropped here (mirrors the

@@ -524,6 +524,73 @@ def test_emotion_delta_below_cap_is_unchanged(
         store.close()
 
 
+def test_emotion_delta_aggregate_is_capped_at_max_intensity(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """#94: the defect was that one extraction's minted emotion won
+    aggregate_state's max-pool outright — assert the AGGREGATE, not just the
+    minted memory's own vector."""
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+    from brain.emotion.aggregate import aggregate_state
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(emotion_delta={registered_test_emotion: 1.0})
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        state = aggregate_state(store.list_active())
+    finally:
+        store.close()
+
+    intensity = state.emotions.get(registered_test_emotion, 0.0)
+    assert intensity <= _MAX_DELTA_INTENSITY, (
+        f"aggregated {registered_test_emotion} intensity {intensity} exceeds "
+        f"_MAX_DELTA_INTENSITY={_MAX_DELTA_INTENSITY}"
+    )
+    assert intensity < 10.0, (
+        f"aggregated {registered_test_emotion} intensity {intensity} reached "
+        f"the uncapped 10.0 clamp — one extraction won the aggregate outright"
+    )
+
+
+def test_emotion_delta_aggregate_max_pools_not_accumulates(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """Two successive maximal deltas must still max-pool at the aggregate to
+    _MAX_DELTA_INTENSITY, not sum to double it."""
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+    from brain.emotion.aggregate import aggregate_state
+    from brain.memory.store import MemoryStore
+
+    apply_side_effects(
+        ExtractorOutput(emotion_delta={registered_test_emotion: 1.0}), persona_dir=persona_dir
+    )
+    apply_side_effects(
+        ExtractorOutput(emotion_delta={registered_test_emotion: 1.0}), persona_dir=persona_dir
+    )
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        state = aggregate_state(store.list_active())
+    finally:
+        store.close()
+
+    intensity = state.emotions.get(registered_test_emotion, 0.0)
+    assert intensity == _MAX_DELTA_INTENSITY, (
+        f"two successive maximal deltas should max-pool the aggregate to "
+        f"_MAX_DELTA_INTENSITY={_MAX_DELTA_INTENSITY}, got {intensity} "
+        f"(accumulation would reach {2 * _MAX_DELTA_INTENSITY})"
+    )
+    # Same ceiling test_emotion_delta_aggregate_is_capped_at_max_intensity pins
+    # for one delta, restated for two: repetition must not be a back door past
+    # the cap either.
+    assert intensity < 10.0, (
+        f"aggregated {registered_test_emotion} intensity {intensity} reached "
+        f"the uncapped 10.0 clamp after two extractions"
+    )
+
+
 def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path):
     """A candidate whose theme matches a *rejected* record must still be queued.
 
