@@ -25,6 +25,7 @@ from tests.harness import (
     build_persona,
     sandbox,
 )
+from tests.harness.config import SYNTHETIC_USER
 from tests.harness.sandbox import (
     _CLAUDE_SESSION_LOG_DIRS,
     _CLAUDE_SESSION_LOG_FILES,
@@ -450,3 +451,83 @@ def test_af2_file_history_write_by_canary_would_land_in_tempdir(
         real_fh = (Path.home() / ".claude" / "file-history").resolve()
         assert not fh.is_relative_to(real_fh)
     # Clean exit: this in-tempdir write did NOT raise SandboxLeak (it is inside the sandbox).
+
+
+# --- HF-F2: env-only de-identification ($USER / $LOGNAME) -----------------------------------------
+# sandbox() sets a SYNTHETIC $USER/$LOGNAME so a subprocess a run spawns cannot read the developer's
+# real OS login handle from the environment (Type 42). Saved/restored the same way as the redirected
+# home vars, including the "was unset" case.
+
+
+def test_user_logname_synthetic_inside_sandbox_and_restored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G-F2-user/logname-synthetic + G-F2-restore-set: inside the run $USER/$LOGNAME are the synthetic
+    value; a prior host value is restored exactly on exit."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "realdev")
+    monkeypatch.setenv("LOGNAME", "realdev")
+    with sandbox():
+        assert os.environ["USER"] == SYNTHETIC_USER
+        assert os.environ["LOGNAME"] == SYNTHETIC_USER
+        assert os.environ["USER"] == "Bob"  # positive assertion of the synthetic value
+    # restored exactly to the prior host values.
+    assert os.environ["USER"] == "realdev"
+    assert os.environ["LOGNAME"] == "realdev"
+
+
+def test_user_logname_restored_to_unset_when_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G-F2-restore-unset (oracle-can-fail): if $USER/$LOGNAME were UNSET on the host, they are
+    restored to UNSET (not left as the synthetic 'Bob'). Fails if the code set-but-does-not-pop."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    with sandbox():
+        assert os.environ["USER"] == SYNTHETIC_USER  # set inside
+        assert os.environ["LOGNAME"] == SYNTHETIC_USER
+    assert "USER" not in os.environ  # restored to unset, not left as "Bob"
+    assert "LOGNAME" not in os.environ
+
+
+def test_user_restored_even_after_leak_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G-F2-restore-set (on leak): the synthetic $USER/$LOGNAME are restored in the outer finally even
+    when SandboxLeak raises — no synthetic value leaks out of the sandbox."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "realdev")
+    monkeypatch.setenv("LOGNAME", "realdev")
+    guarded = tmp_path / "guarded-user"
+    guarded.mkdir()
+    with pytest.raises(SandboxLeak):
+        with sandbox(extra_guard_roots=[guarded]) as sb:
+            _ = sb.root
+            (guarded / "leak.txt").write_text("x")
+    assert os.environ["USER"] == "realdev"
+    assert os.environ["LOGNAME"] == "realdev"
+
+
+def test_synthetic_user_value_is_not_a_real_name() -> None:
+    """G-F2-no-real-name (i): the synthetic constant is the fixed 'Bob', never a real person's name."""
+    assert SYNTHETIC_USER == "Bob"
+
+
+def test_synthetic_user_sourced_from_config_not_hardcoded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G-F2-no-real-name (ii, discriminating): the env value is sourced from the config binding, not a
+    hardcoded 'Bob' literal. Monkeypatching the sandbox module's SYNTHETIC_USER changes what the run
+    sets — a hardcoded literal in sandbox.py would fail this."""
+    import sys
+
+    _seed_fake_cred(monkeypatch, tmp_path)
+    # NB: `tests.harness.sandbox` the ATTRIBUTE is the re-exported sandbox() FUNCTION (the package
+    # __init__ binds it over the submodule), so patch the module object from sys.modules, whose
+    # SYNTHETIC_USER global is what sandbox() reads at call time.
+    sandbox_module = sys.modules["tests.harness.sandbox"]
+    monkeypatch.setattr(sandbox_module, "SYNTHETIC_USER", "Zzz")
+    with sandbox():
+        assert os.environ["USER"] == "Zzz"
+        assert os.environ["LOGNAME"] == "Zzz"
