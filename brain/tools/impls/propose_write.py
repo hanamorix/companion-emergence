@@ -32,6 +32,21 @@ def _authorised_notes_folder(persona_dir: Path) -> Path | None:
     return None
 
 
+def _block_present(existing: str, content: str) -> bool:
+    """True if `content` appears as a contiguous run of complete lines in `existing`.
+
+    Line-anchored rather than a plain substring test on purpose: a short append
+    ("done") must not be swallowed because it happens to sit inside unrelated
+    text ("well done, truly"). That would silently drop a legitimate note —
+    the same class of harm as the doubling this guards against (#105).
+    """
+    hay = existing.splitlines()
+    needle = content.splitlines()
+    if not needle:
+        return True
+    return any(hay[i:i + len(needle)] == needle for i in range(len(hay) - len(needle) + 1))
+
+
 def propose_write(path: str, content: str | None = None, *, op: str,
                   making_id: str | None = None, persona_dir: Path, **_) -> dict:
     # making_id source (Maker combined-build integration; Task 16b of the maker plan)
@@ -70,6 +85,25 @@ def propose_write(path: str, content: str | None = None, *, op: str,
     if auto is not None and is_within_authorized(g.resolved, auto):
         from brain.files.commit import commit_write
         from brain.memory.store import MemoryStore
+
+        # #105: this branch commits inside the same call, so the pending-record
+        # dedupe (#93) never sees it — an identical block landed on disk twice,
+        # and with no consent card to catch it. Ask the file instead of tracking
+        # recency. `create` cannot double (the guard refuses an existing path),
+        # so only append needs this.
+        # Fail-soft: an unreadable target must never block a legitimate note.
+        if op == "append":
+            try:
+                existing = g.resolved.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                existing = None
+            if existing is not None and _block_present(existing, content):
+                audit(persona_dir, event="write_skipped_present", id="", op=op,
+                      path=str(g.resolved))
+                return {
+                    "status": "already_present", "path": str(g.resolved), "deduped": True,
+                    "note": f"that block is already in {g.resolved} — nothing written",
+                }
 
         rid = pending.create(persona_dir, op=op, resolved_path=str(g.resolved),
                              content=content, now=datetime.now(UTC), making_id=making_id)

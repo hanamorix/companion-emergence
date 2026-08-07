@@ -136,3 +136,95 @@ def test_different_content_still_creates_a_second_card(tmp_path, monkeypatch):
     assert second["status"] == "proposed"
     assert "deduped" not in second
     assert len(list_pending(_persona(tmp_path), now=datetime.now(UTC))) == 2
+
+
+def _notes_persona(tmp_path, monkeypatch):
+    """Notes enabled on an authorised folder. Returns (persona_dir, notes_dir)."""
+    import json
+
+    h = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: h)
+    notes = h / "Documents" / "Notes"
+    notes.mkdir(parents=True)
+    persona = _persona(tmp_path)
+    persona.mkdir(parents=True)
+    (persona / "persona_config.json").write_text(
+        json.dumps({"notes_enabled": True, "notes_folder": str(notes)}), encoding="utf-8"
+    )
+    return persona, notes
+
+
+def test_notes_append_skips_a_block_already_present(tmp_path, monkeypatch):
+    """#105: the autonomous notes branch must not write a block the file already has.
+
+    It commits inside the same call, so the pending-record dedupe (#93) never
+    sees it — before this fix two identical calls produced 'seed\\nBLOCK\\nBLOCK'.
+    """
+    persona, notes = _notes_persona(tmp_path, monkeypatch)
+    target = notes / "note.md"
+    target.write_text("seed\n", encoding="utf-8")
+
+    first = propose_write(path=str(target), content="- a line", op="append", persona_dir=persona)
+    after_first = target.read_text(encoding="utf-8")
+    second = propose_write(path=str(target), content="- a line", op="append", persona_dir=persona)
+
+    assert first.get("status") == "written", first
+    assert second.get("status") == "already_present", second
+    assert second.get("deduped") is True
+    assert target.read_text(encoding="utf-8") == after_first, "the second call must write nothing"
+    assert after_first.count("- a line") == 1
+
+
+def test_notes_append_writes_short_content_that_is_only_an_incidental_substring(
+    tmp_path, monkeypatch
+):
+    """The containment check is line-anchored, not a substring test (#105).
+
+    "done" sitting inside "well done, truly" must NOT count as already present —
+    silently dropping a legitimate short note is the same class of harm as the
+    doubling this guards against.
+    """
+    persona, notes = _notes_persona(tmp_path, monkeypatch)
+    target = notes / "note.md"
+    target.write_text("well done, truly\n", encoding="utf-8")
+
+    out = propose_write(path=str(target), content="done", op="append", persona_dir=persona)
+
+    assert out.get("status") == "written", out
+    assert target.read_text(encoding="utf-8") == "well done, truly\ndone"
+
+
+def test_consent_path_still_commits_content_already_in_the_file(tmp_path, monkeypatch):
+    """CANARY for #105's placement decision — do NOT move the check into commit_write.
+
+    commit_write has two callers: the autonomous notes branch, and the
+    /persona/writes/{rid}/approve consent gate. A containment check inside
+    commit_write would silently refuse a write the USER HAD JUST APPROVED.
+    This asserts the consented path is untouched; it fails if the check ever
+    slides down a layer.
+    """
+    from datetime import UTC, datetime
+
+    from brain.files import pending
+    from brain.files.commit import commit_write
+    from brain.memory.store import MemoryStore
+
+    h = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: h)
+    (h / "Documents").mkdir(parents=True)
+    persona = _persona(tmp_path)
+    target = h / "Documents" / "doc.md"
+    target.write_text("- a line\n", encoding="utf-8")  # content ALREADY present
+
+    rid = pending.create(persona, op="append", resolved_path=str(target.resolve()),
+                         content="- a line", now=datetime.now(UTC))
+    store = MemoryStore(persona / "memories.db")
+    try:
+        res = commit_write(persona, rid, store=store)
+    finally:
+        store.close()
+
+    assert res.get("ok") is True, res
+    assert target.read_text(encoding="utf-8").count("- a line") == 2, (
+        "an approved write must commit even when the content is already present"
+    )
