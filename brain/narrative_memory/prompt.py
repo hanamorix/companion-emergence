@@ -18,13 +18,13 @@ _ALSO_OPEN_CAP = 2
 
 
 def render_current_arc_block(persona_dir: Path) -> str:
-    """Returns the arcs block, or 'arcs: still forming …' on cold start.
+    """Returns the arcs block, or 'arcs: none open' on cold start.
 
     No-cost read of arcs_state.json; never falls through to log replay.
     """
     state = load_or_recover(persona_dir)
     if not state.open:
-        return "arcs\n  still forming — no anchors have seeded threads yet"
+        return "arcs\n  none open"
 
     sorted_arcs = sorted(
         state.open.values(),

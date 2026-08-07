@@ -1,8 +1,8 @@
 """prompt.py — render felt-time as a compact ambient context block.
 
 Spec §4 prompt context render. ≤150-token budget. Honest about cold
-start ("too new to have texture yet"). Anchor labels come from each
-source's existing slug — no LLM call, no generated poetry.
+start ("felt time: no duration tracked yet."). Anchor labels come from
+each source's existing slug — no LLM call, no generated poetry.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def _open_arc_lines(arc_anchors: list, *, now: datetime) -> list[str]:
 
 def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) -> str:
     if not state.anchors and state.lived_age_hours == 0.0:
-        return "felt time: too new to have texture yet."
+        return "felt time: no duration tracked yet."
 
     lines = ["felt time"]
     lived_days = state.lived_age_hours / 24.0
