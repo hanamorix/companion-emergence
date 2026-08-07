@@ -101,6 +101,7 @@ def log_invocation(
     arguments: dict[str, Any],
     result_summary: str,
     error: str | None = None,
+    outcome: str | None = None,
     monologue_text: str | None = None,
 ) -> None:
     """Append one invocation record to <persona_dir>/tool_invocations.log.jsonl.
@@ -120,6 +121,11 @@ def log_invocation(
         Compact preview of the result. Truncated to 140 chars + "…" if longer.
     error:
         ``None`` on success; ``str(exc)`` on dispatch failure.
+    outcome:
+        ``"ok"``, ``"refused"``, or ``"error"`` — mirrors tool_loop.py's
+        in-process outcome semantics (#96/#102), so a write_guard denial
+        (returned as ``{"error": ...}`` rather than raised) is distinguishable
+        from a committed write. ``None`` for callers that don't classify it.
     """
     mode = _audit_mode(persona_dir)
     if mode == "off":
@@ -147,6 +153,7 @@ def log_invocation(
         "arguments": safe_arguments,
         "result_summary": truncated,
         "error": error,
+        "outcome": outcome,
     }
     if monologue_text:
         record["monologue_text"] = monologue_text

@@ -946,6 +946,37 @@ def test_read_audit_lines_since_logs_malformed_lines(tmp_path: Path, caplog) -> 
     assert "malformed" in caplog.text
 
 
+def test_read_audit_lines_since_surfaces_outcome_and_omits_when_absent(tmp_path: Path) -> None:
+    """#96/#102: outcome must ride along when the MCP audit log carries it, and
+    a legacy line written before the field existed must not gain a fabricated
+    key (the caller distinguishes "no outcome recorded" from "outcome=None")."""
+    from brain.bridge.provider import _read_audit_lines_since
+
+    audit_path = tmp_path / "tool_invocations.log.jsonl"
+    audit_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "name": "propose_write",
+                        "arguments": {},
+                        "result_summary": "error: denied",
+                        "outcome": "refused",
+                    }
+                ),
+                json.dumps({"name": "legacy_tool", "arguments": {}, "result_summary": "ok"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = _read_audit_lines_since(audit_path, 0)
+
+    assert records[0]["outcome"] == "refused"
+    assert "outcome" not in records[1]
+
+
 def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
     """The other flags (-p, --output-format, --model, --system-prompt-file)
     must remain — only --json-schema is replaced. system_prompt now travels

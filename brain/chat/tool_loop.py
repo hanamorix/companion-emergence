@@ -345,8 +345,8 @@ def run_tool_loop(
     -------
     (final_response, invocations)
       - final_response: ChatResponse with content set (tool_calls may be empty)
-      - invocations: list of dicts. Two shapes land in this list, and only one
-        of them carries `outcome`:
+      - invocations: list of dicts. Two shapes land in this list; both now
+        carry `outcome` (#96/#102):
         - in-process dispatch (the `for tc in last_response.tool_calls` loop
           below — the OllamaProvider path):
           {name, arguments, result_summary, outcome, error?}
@@ -356,10 +356,14 @@ def run_tool_loop(
           is set).
         - provider-dispatched invocations (`last_response.dispatched_invocations`
           — the ClaudeCliProvider path, where tools already ran inside the CLI
-          subprocess): built by brain/mcp_server/audit.py::log_invocation as
-          {timestamp, name, audit_level, arguments, result_summary, error}.
-          `outcome` is NOT present on these records — a consumer must not
-          assume it (#102).
+          subprocess): written by brain/mcp_server/tools.py::_call_tool via
+          brain/mcp_server/audit.py::log_invocation (same "ok"/"refused"/"error"
+          classification as the in-process path) and read back by
+          brain/bridge/provider.py::_read_audit_lines_since as
+          {name, arguments, result_summary, error?, outcome?}. A legacy log
+          line written before this fix simply omits the `outcome` key rather
+          than carrying it as null — a consumer should check for the key's
+          presence, not assume every record has one.
     """
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
