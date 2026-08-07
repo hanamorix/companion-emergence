@@ -435,6 +435,29 @@ def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
             pass
 
 
+def _cli_error_detail(payload: dict) -> str | None:
+    """Detail for a result frame that reports failure, or None if it is fine.
+
+    The CLI can exit 0 and report the failure *inside* the frame (#92) — e.g.
+    ``{"is_error": true, "result": "Not logged in · Please run /login"}``. The
+    non-zero-exit guard never sees those, so without this check the error
+    string was assigned straight to ChatResponse.content and the user read a
+    system error as something their companion said.
+
+    The over-budget frame is excluded deliberately: it also carries
+    ``is_error`` but holds partial work worth keeping, and has its own
+    graceful path at each call site.
+    """
+    if not payload.get("is_error"):
+        return None
+    if payload.get("subtype") == "error_max_budget_usd" or any(
+        "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
+    ):
+        return None
+    detail = str(payload.get("result") or "").strip()
+    return detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+
+
 def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     """Return a useful error detail for failed Claude CLI subprocesses.
 
@@ -717,6 +740,9 @@ class ClaudeCliProvider(LLMProvider):
                     f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                 )
                 return ChatResponse(content=text, tool_calls=(), raw=payload)
+            cli_err = _cli_error_detail(payload)
+            if cli_err is not None:
+                raise ProviderError("claude_cli_error", cli_err)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ProviderError(
@@ -1023,7 +1049,14 @@ class ClaudeCliProvider(LLMProvider):
                             )
                             yield StreamDone(content=cutoff, metadata=metadata)
                         else:
-                            yield StreamDone(content=result_text, metadata=metadata)
+                            # #92: an exit-0 frame can still report a failure —
+                            # surface it as an error rather than streaming the
+                            # CLI's error text as her reply.
+                            cli_err = _cli_error_detail(obj)
+                            if cli_err is not None:
+                                yield StreamError(stage="claude_cli_error", detail=cli_err)
+                            else:
+                                yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
                         # to q.get would re-arm the idle-timeout watchdog and, if
@@ -1387,6 +1420,9 @@ class ClaudeCliProvider(LLMProvider):
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
+                cli_err = _cli_error_detail(payload)
+                if cli_err is not None:
+                    raise ProviderError("claude_cli_error", cli_err)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 raise ProviderError(
