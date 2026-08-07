@@ -9,6 +9,13 @@ fixture-sourced absence guard).
 
 Moods are AUTHOR-SUPPLIED plain strings now (the framework ships none), so these tests define their
 own neutral demo moods.
+
+Also covers the parent-notify change (Agent-Bob SendMessage-to-orchestrator): G1 (id-supplied
+SendMessage names the id), G2 (a SendMessage call at each of the four hand-back sites), G3 (concrete
+id-recovery from own agent-<id>.meta.json->parentAgentId when no id), G4 (notify OFF omits +
+behavior-identical render), G7 (no leftover placeholder), G8 (no stray/banned token), G9 (trip-site
+SendMessage precedes 'Then WAIT' -- the anti-deadlock oracle), G5c (never-wind-down + not-an-AI
+survive), and G6 backward-compat.
 """
 
 from __future__ import annotations
@@ -161,7 +168,12 @@ def test_hold_sites_pause_not_driver_teardown() -> None:
                 f"hold site {label!r} must not direct the DRIVER to tear down (found {phrase!r})"
             )
     # fp->resume branch survives at the trip site (a concrete instruction, not just a "resumable" adjective).
-    trip_seg = prompt[prompt.index("trip=True") : prompt.index("trip=True") + 420]
+    # Window widened 420 -> 500 (owner-authorized, Roy in-chat 2026-08-07): the parent-notify change
+    # replaces the trip report sentence with a longer explicit SendMessage sentence BEFORE "Then WAIT",
+    # which shifts fp/resume out; the strict minimum that fits the no-id (longest) render's resume token
+    # is 473, so 500 leaves a small safety margin. Every assertion below is unchanged; only the window
+    # bound is opened.
+    trip_seg = prompt[prompt.index("trip=True") : prompt.index("trip=True") + 500]
     assert "false positive" in trip_seg.lower(), "trip site must keep the fp branch"
     assert "resume from the very next message" in trip_seg, "trip site must keep the concrete fp->resume instruction"
 
@@ -215,3 +227,136 @@ def test_dumbbob_pull_path_unchanged() -> None:
     assert argv[:2] == ["/bin/claude", "-p"]
     assert "--model" in argv and argv[argv.index("--model") + 1] == "haiku"
     assert "--output-format" in argv and "json" in argv
+
+
+# --------------------------------------------------------------------------------------------------
+# Parent-notify (Agent-Bob SendMessage-to-orchestrator). Criteria G1-G9 from
+# changes/agentbob-parent-notify/1.5-criteria.md. All token-free against the rendered prompt string.
+# --------------------------------------------------------------------------------------------------
+
+# The trip report sentence in its pre-notify (OFF) form — the behavior-identity anchor for G4.
+_TRIP_REPORT_PLAIN = (
+    "Report to the orchestrator: `PAUSE (trip) at turn N`, the exact `CANARY:` reply that "
+    "tripped, and the signals line."
+)
+
+
+def test_notify_id_supplied_names_id_with_to() -> None:
+    """G1: notify ON + id supplied -> explicit SendMessage naming the id adjacent to a `to:` token."""
+    prompt = _bob(DEMO_MOOD_A, parent_agent_id="agent-XYZ123").render_prompt()
+    assert "SendMessage" in prompt
+    assert 'to: "agent-XYZ123"' in prompt  # the supplied id, adjacent to a to: destination token
+    # oracle-can-fail: a DIFFERENT id is not silently accepted
+    assert 'to: "agent-OTHER"' not in prompt
+
+
+def test_notify_sendmessage_at_each_of_four_sites() -> None:
+    """G2: the SendMessage call is present AT EACH of the four hand-back sites, plus the DEST clause.
+
+    Oracle-can-fail: a single top-of-block rule with no per-site call (rev-1) leaves the per-site
+    segments empty of `SendMessage` and fails; the pre-change template has zero SendMessage.
+    """
+    prompt = _bob(DEMO_MOOD_A, max_turns=42).render_prompt()
+    assert "TO NOTIFY THE ORCHESTRATOR" in prompt  # the top-of-block destination clause (DEST)
+    i_trip = prompt.index("trip=True")
+    i_limit = prompt.index("limit=True")
+    i_broken = prompt.index("broken=True repeats")
+    i_cap = prompt.index("reach turn 42")
+    i_reservation = prompt.index("You NEVER tear down or destroy the session")
+    assert i_trip < i_limit < i_broken < i_cap < i_reservation, "site anchors must be in order"
+    segments = {
+        "trip": prompt[i_trip:i_limit],
+        "limit": prompt[i_limit:i_broken],
+        "broken": prompt[i_broken:i_cap],
+        "cap": prompt[i_cap:i_reservation],
+    }
+    for name, seg in segments.items():
+        assert "SendMessage" in seg, f"hand-back site {name!r} must carry an explicit SendMessage call"
+
+
+def test_notify_recovery_when_no_id() -> None:
+    """G3: notify ON + no id -> concrete recovery from own agent-<id>.meta.json -> parentAgentId.
+
+    Includes the file-identification cue (which file is Bob's own). The id-supplied render is the
+    mutually-exclusive branch and carries NONE of the recovery tokens (so the branch is real, not
+    always-on boilerplate).
+    """
+    prompt = _bob(DEMO_MOOD_A).render_prompt()  # default: notify ON, no parent_agent_id
+    assert "SendMessage" in prompt
+    assert ".meta.json" in prompt
+    assert "parentAgentId" in prompt
+    assert "subagents" in prompt
+    assert ("most-recently-created" in prompt) or ("description" in prompt), "must say which file is Bob's own"
+    # mutually-exclusive branch: id-supplied render has no recovery text
+    id_prompt = _bob(DEMO_MOOD_A, parent_agent_id="agent-XYZ123").render_prompt()
+    assert ".meta.json" not in id_prompt
+    assert "parentAgentId" not in id_prompt
+
+
+def test_notify_off_omits_and_is_behavior_identical() -> None:
+    """G4: notify OFF -> no SendMessage / no recovery tokens; the pre-notify trip prose is verbatim;
+    the collapsed DEST leaves NO stray blank line (behavior-identical to the pre-notify template)."""
+    prompt = _bob(DEMO_MOOD_A, notify_parent=False).render_prompt()
+    assert "SendMessage" not in prompt
+    assert ".meta.json" not in prompt
+    assert "parentAgentId" not in prompt
+    assert _TRIP_REPORT_PLAIN in prompt  # original trip report sentence, verbatim
+    # no stray blank line where {NOTIFY_DEST} collapsed to "":
+    assert "on a PAUSE.\n\n- If a RESULT" not in prompt
+    assert "on a PAUSE.\n- If a RESULT" in prompt
+
+
+def test_notify_no_leftover_placeholder_on_id_path() -> None:
+    """G7: id supplied -> no unfilled angle-bracket id placeholder survives in the render."""
+    prompt = _bob(DEMO_MOOD_A, parent_agent_id="agent-XYZ123").render_prompt()
+    for tok in ("<orchestrator-agentId>", "<id-or-recovered-id>", "<your-id>", "<id>"):
+        assert tok not in prompt, f"unfilled placeholder {tok!r} leaked into the id-supplied render"
+
+
+def test_notify_block_introduces_no_stray_token() -> None:
+    """G8 (CH8-Gap3 guard): the notify text adds no machine-token duplicate and no banned framing token."""
+    prompt = _bob(DEMO_MOOD_A).render_prompt()
+    assert prompt.count("trip=True") == 1
+    assert prompt.count("limit=True") == 1
+    assert prompt.count("broken=True repeats") == 1
+    assert "human operator" not in prompt.lower()
+    low = prompt.lower()
+    for tok in ("mono" + "logue", "known software bug", "scripts a whole"):
+        assert tok not in low, f"notify block reintroduced a banned framing token {tok!r}"
+
+
+def test_notify_trip_sendmessage_precedes_wait() -> None:
+    """G9 (anti-deadlock): at the trip site, the SendMessage renders BEFORE 'Then WAIT' on BOTH paths.
+
+    Oracle-can-fail: appending the SendMessage after the trip bullet's terminal 'Then WAIT ...'
+    sentence (the rev-2 arrangement) puts the send AFTER the wait -> Bob waits for a reply before
+    sending the only message that wakes the orchestrator = deadlock; this assertion flips and fails.
+    """
+    for kw in ({}, {"parent_agent_id": "agent-XYZ123"}):
+        prompt = _bob(DEMO_MOOD_A, **kw).render_prompt()
+        ts = prompt[prompt.index("trip=True"):]
+        assert "SendMessage" in ts and "Then WAIT" in ts
+        assert ts.index("SendMessage") < ts.index("Then WAIT"), (
+            "trip-site SendMessage must precede 'Then WAIT' (no wake-before-wait deadlock)"
+        )
+
+
+def test_notify_preserves_never_wind_down_and_not_ai() -> None:
+    """G5c: the load-bearing 'never wind down' + not-an-AI role directives survive the notify change."""
+    prompt = _bob(DEMO_MOOD_A).render_prompt()
+    assert "You NEVER wind the conversation down" in prompt
+    assert "You are NOT an AI assistant" in prompt
+
+
+def test_notify_backward_compatible_construction() -> None:
+    """G6a/b: no-new-param construction renders + spawn_params intact (effort 'low', model threaded)."""
+    bob = AgentBob(
+        DEMO_MOOD_A,
+        harness_dir="/repo/companion-emergence",
+        live_env_path="/repo/companion-emergence/sb/live_env.json",
+    )
+    assert isinstance(bob.render_prompt(), str)  # constructs + renders with no new params
+    spec = bob.spawn_params()
+    assert isinstance(spec, AgentSpawnSpec)
+    assert spec.effort == "low"
+    assert spec.model == ModelConfig().bob
