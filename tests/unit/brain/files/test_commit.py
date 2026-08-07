@@ -123,3 +123,61 @@ def test_committed_write_surfaces_in_feed(tmp_path, monkeypatch):
     assert entries[0].type == "file_write"
     assert entries[0].opener == "I wrote to a file —"
     assert str(target.resolve()) in entries[0].body
+
+
+def test_append_inserts_separator_when_file_lacks_trailing_newline(tmp_path, monkeypatch):
+    """#100: two appended blocks must not run together into one line."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    persona = _persona(tmp_path)
+    target = tmp_path / "home" / "out" / "n.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("first block")  # no trailing newline
+    rid = pending.create(
+        persona,
+        op="append",
+        resolved_path=str(target.resolve()),
+        content="second block",
+        now=datetime.now(UTC),
+    )
+    store = _store(persona)
+    assert commit_write(persona, rid, store=store)["ok"]
+    assert target.read_text() == "first block\nsecond block"
+
+
+def test_append_does_not_double_newline(tmp_path, monkeypatch):
+    """A file already ending in a newline gets no extra one."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    persona = _persona(tmp_path)
+    target = tmp_path / "home" / "out" / "n.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("first block\n")
+    rid = pending.create(
+        persona,
+        op="append",
+        resolved_path=str(target.resolve()),
+        content="second block",
+        now=datetime.now(UTC),
+    )
+    store = _store(persona)
+    assert commit_write(persona, rid, store=store)["ok"]
+    assert target.read_text() == "first block\nsecond block"
+
+
+def test_append_to_empty_file_adds_no_leading_newline(tmp_path, monkeypatch):
+    """A zero-byte existing file is the only reachable empty case — the guard
+    refuses append to a non-existent path before commit_write ever runs."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    persona = _persona(tmp_path)
+    target = tmp_path / "home" / "out" / "n.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("")
+    rid = pending.create(
+        persona,
+        op="append",
+        resolved_path=str(target.resolve()),
+        content="body",
+        now=datetime.now(UTC),
+    )
+    store = _store(persona)
+    assert commit_write(persona, rid, store=store)["ok"]
+    assert target.read_text() == "body"

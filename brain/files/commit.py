@@ -3,6 +3,7 @@ Wires a file_write memory + feed event either way."""
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from brain.files import pending
@@ -54,7 +55,17 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     try:
         g.resolved.parent.mkdir(parents=True, exist_ok=True)
         mode = "w" if op == "create" else "a"
+        # #100: an append must not run together with the block before it.
+        # write_guard already requires the target to exist for append, so the
+        # only run-together case is a non-empty file with no trailing newline.
+        needs_separator = False
+        if mode == "a" and g.resolved.exists() and g.resolved.stat().st_size > 0:
+            with g.resolved.open("rb") as probe:
+                probe.seek(-1, os.SEEK_END)
+                needs_separator = probe.read(1) != b"\n"
         with g.resolved.open(mode, encoding="utf-8") as f:
+            if needs_separator:
+                f.write("\n")
             f.write(content)
     except OSError as exc:
         pending.mark(persona_dir, rid, status="error")
