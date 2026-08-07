@@ -464,6 +464,66 @@ def test_crystallisation_within_batch_dedup_same_theme(persona_dir: Path):
     )
 
 
+def test_emotion_delta_is_capped_at_max_intensity(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """#94: a maximal delta is a strong nudge, not a peak. One extraction must
+    not be able to peg a channel to the full 10.0 clamp."""
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+    from brain.memory.store import MemoryStore
+
+    # Pin the constant meaningfully below the uncapped 10.0 clamp — otherwise
+    # a regression that reset _MAX_DELTA_INTENSITY back to 10.0 would still
+    # satisfy the equality assertion below by coincidence, and this canary
+    # could never fail.
+    assert _MAX_DELTA_INTENSITY < 10.0
+
+    out = ExtractorOutput(emotion_delta={registered_test_emotion: 1.0})
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        mems = [
+            m for m in store.list_active()
+            if m.emotions.get(registered_test_emotion, 0.0) > 0
+        ]
+        assert len(mems) == 1, f"expected exactly one emotion memory, got {len(mems)}"
+        m = mems[0]
+        assert m.emotions[registered_test_emotion] == _MAX_DELTA_INTENSITY, (
+            f"delta 1.0 must mint {_MAX_DELTA_INTENSITY}, got "
+            f"{m.emotions[registered_test_emotion]}"
+        )
+        # The coupling is deliberate: importance is derived from the vector and
+        # must stay consistent with it. Asserted so a later edit can't decouple.
+        assert m.importance == _MAX_DELTA_INTENSITY, (
+            f"importance must track the capped vector, got {m.importance}"
+        )
+    finally:
+        store.close()
+
+
+def test_emotion_delta_below_cap_is_unchanged(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """The x10 mapping is preserved for the whole range under the ceiling —
+    the documented '0.15 nudge becomes 1.5' behaviour must not move."""
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(emotion_delta={registered_test_emotion: 0.15})
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        mems = [
+            m for m in store.list_active()
+            if m.emotions.get(registered_test_emotion, 0.0) > 0
+        ]
+        assert len(mems) == 1
+        assert abs(mems[0].emotions[registered_test_emotion] - 1.5) < 0.001
+    finally:
+        store.close()
+
+
 def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path):
     """A candidate whose theme matches a *rejected* record must still be queued.
 

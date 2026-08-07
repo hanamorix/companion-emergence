@@ -367,6 +367,16 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
         return emotions
 
 
+# A pass-2 emotion_delta is a NUDGE, not a set. The x10 mapping below turns the
+# validated [-1.0, 1.0] delta into a 0..10 MemoryStore intensity; without a
+# ceiling a single extraction mints 10.0 and wins aggregate_state's max-pool
+# outright against a whole history (#94). test_extractor_schema.py already
+# states this intent — "so a malformed extractor can't slam the vector" — but
+# bounds the delta, not what the delta becomes. Sustained feeling still climbs
+# across turns; one turn cannot peak her.
+_MAX_DELTA_INTENSITY: float = 3.0
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
     memory is committed per the system's existing aggregation model.
@@ -391,7 +401,11 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     store = MemoryStore(persona_dir / "memories.db")
     try:
         registered_delta = _filter_to_registered(delta)
-        emotions = {ch: abs(v) * 10.0 for ch, v in registered_delta.items() if abs(v) > 1e-9}
+        emotions = {
+            ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
+            for ch, v in registered_delta.items()
+            if abs(v) > 1e-9
+        }
         if not emotions:
             return
         # Build a brief descriptive content string from the non-zero emotion channels.
