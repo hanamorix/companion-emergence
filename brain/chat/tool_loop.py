@@ -50,6 +50,21 @@ MAX_TOOL_ITERATIONS = 4
 # It is independent of the time-based reflection debounce in reflection_gate.py.
 _ATTUNEMENT_WINDOW = 8
 
+# #93: re-offering one of these after it already fired this turn duplicates a
+# real artefact — a second monologue trace, a second pending write, a second
+# memory/journal/work row. Read-only tools are safe to call again with
+# different arguments and stay available. reach_for_capability is here for a
+# different reason: the rerun prompt explicitly tells her not to reach again,
+# so the toolset should agree with the instruction.
+_NEVER_REOFFER: frozenset[str] = frozenset({
+    "add_journal",
+    "add_memory",
+    "propose_write",
+    "record_monologue",
+    "save_work",
+    "reach_for_capability",
+})
+
 
 def _spawn_pass2(
     *,
@@ -256,7 +271,19 @@ def _maybe_recruit_and_rerun(
             None,
         )
         capability = (reach_inv.get("arguments") or {}).get("capability", "") if reach_inv else ""
-        allowed_now = tools_for_capability(capability)
+        # #93: only already-fired tools that are ALSO in _NEVER_REOFFER get
+        # excluded — read-only tools (search_memories, etc.) stay offered even
+        # if already called this turn. tools_for_capability itself is left
+        # alone: its unknown-capability → full-suite branch is the agency
+        # safety-valve, and it still applies, minus whatever must not repeat.
+        already_fired = {inv.get("name") for inv in invocations}
+        allowed_now = [
+            t
+            for t in tools_for_capability(capability)
+            if t not in already_fired or t not in _NEVER_REOFFER
+        ]
+        if not allowed_now:
+            return None
         tools = build_tools_list(companion_name, allowed=allowed_now)
         # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
         rerun_messages = list(messages) + [
@@ -318,7 +345,11 @@ def run_tool_loop(
     -------
     (final_response, invocations)
       - final_response: ChatResponse with content set (tool_calls may be empty)
-      - invocations: list of dicts, each: {name, arguments, result_summary, error?}
+      - invocations: list of dicts, each:
+        {name, arguments, result_summary, outcome, error?}
+        outcome is one of "ok" (dispatched and returned normally), "refused"
+        (returned an {"error": ...} result — e.g. a write_guard denial — rather
+        than raising), or "error" (dispatch raised; record["error"] is set).
     """
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
@@ -427,6 +458,13 @@ def run_tool_loop(
                     session_id=session_id,
                 )
                 record["result_summary"] = _summarize_result(result)
+                # #96: a tool that RETURNS {"error": ...} is a refusal, not a
+                # success — write_guard denials come back this way rather than
+                # raising, so a refused propose_write was indistinguishable
+                # from a committed one in the invocation record.
+                record["outcome"] = (
+                    "refused" if isinstance(result, dict) and result.get("error") else "ok"
+                )
                 # record_monologue returns {"ok": True, "monologue_text": ...} on
                 # success so _find_monologue_text can locate it and spawn pass 2.
                 if isinstance(result, dict) and result.get("monologue_text"):
@@ -436,6 +474,7 @@ def run_tool_loop(
                 logger.warning("tool dispatch error: %s — %s", tc.name, exc)
                 record["error"] = str(exc)
                 record["result_summary"] = f"error: {exc}"
+                record["outcome"] = "error"
                 tool_content = json.dumps({"error": str(exc)})
 
             invocations.append(record)
