@@ -367,6 +367,16 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
         return emotions
 
 
+# A pass-2 emotion_delta is a NUDGE, not a set. The x10 mapping below turns the
+# validated [-1.0, 1.0] delta into a 0..10 MemoryStore intensity; without a
+# ceiling a single extraction mints 10.0 and wins aggregate_state's max-pool
+# outright against a whole history (#94). test_extractor_schema.py already
+# states this intent — "so a malformed extractor can't slam the vector" — but
+# bounds the delta, not what the delta becomes. Sustained feeling still climbs
+# across turns; one turn cannot peak her.
+_MAX_DELTA_INTENSITY: float = 3.0
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
     memory is committed per the system's existing aggregation model.
@@ -379,8 +389,10 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     the engine's normal accounting.
 
     Deltas are on a [-1.0, 1.0] scale from the extractor. We map them to
-    importance = abs(delta) * 10 so a 0.15 nudge becomes importance 1.5 on
-    the 0..10 MemoryStore scale.
+    importance = abs(delta) * 10, capped at _MAX_DELTA_INTENSITY, so a 0.15
+    nudge becomes importance 1.5 on the 0..10 MemoryStore scale — a maximal
+    1.0 delta caps at _MAX_DELTA_INTENSITY rather than the uncapped 10.0;
+    one extraction can't peg a channel to the full clamp (#94).
 
     Channel names are constrained to the registered emotion vocabulary before
     writing — LLM-invented names are silently dropped here (mirrors the
@@ -391,7 +403,11 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     store = MemoryStore(persona_dir / "memories.db")
     try:
         registered_delta = _filter_to_registered(delta)
-        emotions = {ch: abs(v) * 10.0 for ch, v in registered_delta.items() if abs(v) > 1e-9}
+        emotions = {
+            ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
+            for ch, v in registered_delta.items()
+            if abs(v) > 1e-9
+        }
         if not emotions:
             return
         # Build a brief descriptive content string from the non-zero emotion channels.

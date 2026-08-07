@@ -44,7 +44,7 @@ def _arc(
 def test_render_cold_start_no_arcs(tmp_path: Path):
     save_state(tmp_path, ArcsState())
     out = render_current_arc_block(tmp_path)
-    assert "still forming" in out
+    assert "none open" in out
     assert out.startswith("arcs")
 
 
@@ -110,4 +110,4 @@ def test_render_more_than_two_arcs_caps_with_plus_n_more(tmp_path: Path):
 
 def test_render_missing_state_file_returns_cold_start(tmp_path: Path):
     out = render_current_arc_block(tmp_path)
-    assert "still forming" in out
+    assert "none open" in out

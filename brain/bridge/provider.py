@@ -1432,8 +1432,8 @@ def _read_audit_lines_since(
     """Read audit log lines newly appended after `offset` bytes.
 
     Returns a list of invocation records in the engine's tool_invocations
-    shape: ``{name, arguments, result_summary, error?}``. Malformed lines
-    are skipped silently — telemetry should never break a chat response.
+    shape: ``{name, arguments, result_summary, error?, outcome?}``. Malformed
+    lines are skipped silently — telemetry should never break a chat response.
     """
     try:
         # Rotation guard (bug #5): audit._rotate_if_needed renames the log to
@@ -1498,6 +1498,8 @@ def _read_audit_lines_since(
         }
         if entry.get("error"):
             record["error"] = entry["error"]
+        if entry.get("outcome"):
+            record["outcome"] = entry["outcome"]
         if entry.get("monologue_text"):
             record["monologue_text"] = entry["monologue_text"]
         records.append(record)

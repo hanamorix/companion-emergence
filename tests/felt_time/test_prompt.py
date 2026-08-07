@@ -9,7 +9,7 @@ from brain.felt_time.state import Anchor, FeltTimeState, HorizonBucket, Pressure
 def test_render_prompt_context_cold_start():
     s = FeltTimeState.cold_start()
     blob = render_prompt_context(s)
-    assert "too new" in blob.lower()
+    assert "no duration tracked" in blob.lower()
     assert blob.count("\n") < 5
 
 
