@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.memory.store import MemoryStore
-from brain.monologue.trace import write_trace_memory
+from brain.monologue.trace import MONOLOGUE_TRACE_TYPE, write_trace_memory
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,26 @@ def capture_monologue(
         raise CaptureRejected(f"monologue exceeds {MAX_MONOLOGUE_LEN} chars")
     if len(feed_digest) > MAX_FEED_DIGEST_LEN:
         raise CaptureRejected(f"feed_digest exceeds {MAX_FEED_DIGEST_LEN} chars")
+
+    # #93: the recruit-on-reach rerun can call record_monologue twice in one
+    # turn. The narrowed toolset meant to prevent that is inert on
+    # ClaudeCliProvider — the tools argument is a boolean there and
+    # --allowedTools is permissive — so on the real path both calls land and
+    # this ran twice, persisting two identical traces and two digest lines.
+    #
+    # Guard the artefact rather than the timing (same shape as #101/#105): the
+    # duplicate is always immediately adjacent, so comparing against the newest
+    # trace is sufficient, needs no window constant, and leaves her free to
+    # think the same thought again another day.
+    #
+    # Fail-soft: if the lookup raises, capture anyway — never lose her thought
+    # to a dedupe check.
+    try:
+        recent = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True, limit=1)
+        if recent and recent[0].content == monologue:
+            return monologue
+    except Exception:  # noqa: BLE001
+        logger.debug("monologue dedupe lookup failed; capturing anyway", exc_info=True)
 
     # Tier 2 — persist the verbatim trace FIRST (most important; never lose her
     # thought). Best-effort: a failure logs but does not block the reply.
