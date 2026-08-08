@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from brain.bridge import persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
@@ -21,6 +23,51 @@ from brain.bridge.supervisor import (
     run_folded,
 )
 from brain.engines import interest_sweep
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_supervisor_threads():
+    """Fail the test that leaks a live thread, not the innocent one downstream.
+
+    17 tests in this file start a supervisor thread and none used try/finally.
+    An assertion between `t.start()` and `stop.set()` therefore leaves a daemon
+    thread running for the whole session; the heartbeat-failure test's thread
+    logs ERROR every tick, which is how it broke an unrelated maker test on
+    Windows CI (#110). This turns that silent cross-test poisoning into a local
+    failure at the point of the leak.
+    """
+    before = {t.ident for t in threading.enumerate()}
+    yield
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        leaked = [t for t in threading.enumerate()
+                  if t.ident not in before and t.is_alive()]
+        if not leaked:
+            return
+        time.sleep(0.05)
+    assert not leaked, (
+        f"test leaked {len(leaked)} live thread(s): {[t.name for t in leaked]} — "
+        "stop the supervisor thread in a finally so a failed assertion cannot "
+        "leave it running and logging into later tests"
+    )
+
+
+def _wait_until(pred, *, timeout: float = 30.0, interval: float = 0.02) -> bool:
+    """Poll until `pred()` holds or the deadline passes; return the final value.
+
+    Replaces fixed `time.sleep(N)` windows before an assertion (#110). A
+    constant sleep encodes an assumption about how fast the runner is: the
+    Windows CI box is routinely ~25% slower than a local machine, and these
+    supervisor loops then had not finished a pass when the assertion ran.
+    Polling is also FASTER on a quick runner — it stops as soon as the
+    condition holds instead of always burning the full window.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
 
 
 def test_audit_logs_registered_for_rotation() -> None:
@@ -170,9 +217,18 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    assert second_attempt.wait(timeout=5.0), "loop did not survive first heartbeat exception"
-    stop.set()
-    t.join(timeout=5.0)
+    try:
+        # #110: this assertion sits between start and stop. Without the finally,
+        # a failure here skips stop.set() and the daemon thread runs for the rest
+        # of the session — raising every tick and logging ERROR into whatever
+        # test is running later. That is what failed an unrelated maker test
+        # eight minutes downstream on Windows CI.
+        assert second_attempt.wait(timeout=30.0), (
+            "loop did not survive first heartbeat exception"
+        )
+    finally:
+        stop.set()
+        t.join(timeout=30.0)
     assert not t.is_alive()
 
 
@@ -244,9 +300,9 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
+    _wait_until(lambda: "session_snapshot" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=2.0)
+    t.join(timeout=30.0)
 
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     assert buf.exists(), "snapshot sweep must NOT delete the buffer"
@@ -291,11 +347,11 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
-    stop.set()
-    t.join(timeout=2.0)
-
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
+    _wait_until(lambda: not buf.exists())
+    stop.set()
+    t.join(timeout=30.0)
+
     assert not buf.exists(), "finalize must delete the buffer"
     assert get_session(sid) is None, "finalize must remove from _SESSIONS"
     types = [e.get("type") for e in bus.events]
@@ -541,9 +597,9 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    time.sleep(0.3)
+    time.sleep(0.3)  # a window in which it COULD misbehave — not pollable
     stop.set()
-    t.join(timeout=5.0)
+    t.join(timeout=30.0)
     assert not t.is_alive()
     assert fired == [], "self-model tick fired even though disabled"
 
