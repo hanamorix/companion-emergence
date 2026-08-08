@@ -25,6 +25,7 @@ from pathlib import Path
 
 from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
 from brain.bridge.provider import LLMProvider
+from brain.chat import say_vs_do
 from brain.chat.budget import apply_budget
 from brain.chat.prompt import (
     build_static_system_message,
@@ -300,6 +301,17 @@ def respond(
     # not from when the turn started. A long LLM call can exhaust the idle
     # window mid-flight and let a background job fire concurrently otherwise.
     cli_throttle.mark_interactive_active()
+
+    # #78: flag a reply that claims a staged write no tool call backs. Pure
+    # telemetry — it gates nothing and never raises. A candidate surfacer, not
+    # a verdict: silence means "nothing matched", never "this turn was honest".
+    say_vs_do.check_turn(
+        persona_dir=persona_dir,
+        content=content,
+        invocations=invocations,
+        session_id=session.session_id,
+        turn=session.turns,
+    )
 
     return ChatResult(
         content=content,
