@@ -181,3 +181,36 @@ def test_append_to_empty_file_adds_no_leading_newline(tmp_path, monkeypatch):
     store = _store(persona)
     assert commit_write(persona, rid, store=store)["ok"]
     assert target.read_text() == "body"
+
+
+def test_commit_refuses_when_it_cannot_claim_the_record(tmp_path, monkeypatch):
+    """#101/Type 22 root: the write must not land if the status can't be recorded.
+
+    commit_write used to write the file and THEN mark the record. pending.mark
+    is silently fallible — get() swallows OSError/ValueError and returns None,
+    so mark returns without marking. The write landed, the record stayed
+    'pending', and the status guard that makes commit_write idempotent stopped
+    guarding: any retry appended the block again. That is the catalogue's
+    Type 22 (one proposal-log entry, doubled block) plus Type 24 (status never
+    leaves 'pending' while the content is present).
+    """
+    from brain.files import commit as commit_mod
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    persona = _persona(tmp_path)
+    target = tmp_path / "home" / "out" / "n.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("seed\n", encoding="utf-8")
+    rid = pending.create(persona, op="append", resolved_path=str(target.resolve()),
+                         content="BLOCK", now=datetime.now(UTC))
+
+    # Reproduce mark()'s real failure mode: it silently does nothing.
+    monkeypatch.setattr(commit_mod.pending, "mark", lambda *a, **k: None)
+
+    store = _store(persona)
+    res = commit_write(persona, rid, store=store)
+
+    assert res.get("ok") is False, "a write whose status cannot be recorded must not commit"
+    assert target.read_text(encoding="utf-8") == "seed\n", (
+        "nothing may be written when the claim fails — otherwise a retry doubles the block"
+    )

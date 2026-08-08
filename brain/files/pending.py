@@ -95,15 +95,24 @@ def find_duplicate(persona_dir: Path, *, op: str, resolved_path: str,
     return None
 
 
-def mark(persona_dir: Path, rid: str, *, status: str) -> None:
+def mark(persona_dir: Path, rid: str, *, status: str) -> bool:
+    """Set the record's status. Returns True if it took, False if it did not.
+
+    Returning a bool rather than failing mutely is load-bearing (#101): get()
+    swallows OSError/ValueError, so a transient read failure made this a silent
+    no-op. commit_write then wrote the file while the record stayed 'pending',
+    and its status guard — the thing making the commit idempotent — stopped
+    guarding, so a retry appended the block a second time.
+    """
     rec = get(persona_dir, rid)
     if rec is None:
-        return
+        return False
     rec["status"] = status
     p = _dir(persona_dir) / f"{rid}.json"
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec), encoding="utf-8")
     tmp.replace(p)
+    return True
 
 
 def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
