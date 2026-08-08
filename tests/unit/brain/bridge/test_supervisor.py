@@ -23,6 +23,24 @@ from brain.bridge.supervisor import (
 from brain.engines import interest_sweep
 
 
+def _wait_until(pred, *, timeout: float = 30.0, interval: float = 0.02) -> bool:
+    """Poll until `pred()` holds or the deadline passes; return the final value.
+
+    Replaces fixed `time.sleep(N)` windows before an assertion (#110). A
+    constant sleep encodes an assumption about how fast the runner is: the
+    Windows CI box is routinely ~25% slower than a local machine, and these
+    supervisor loops then had not finished a pass when the assertion ran.
+    Polling is also FASTER on a quick runner — it stops as soon as the
+    condition holds instead of always burning the full window.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
+
+
 def test_audit_logs_registered_for_rotation() -> None:
     """The append-only audit logs must be bounded by a rolling policy, not unbounded."""
     registered = {name for name, _ in _ROLLING_LOG_POLICIES}
@@ -170,7 +188,7 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    assert second_attempt.wait(timeout=5.0), "loop did not survive first heartbeat exception"
+    assert second_attempt.wait(timeout=30.0), "loop did not survive first heartbeat exception"
     stop.set()
     t.join(timeout=5.0)
     assert not t.is_alive()
@@ -244,9 +262,9 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
+    _wait_until(lambda: "session_snapshot" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=2.0)
+    t.join(timeout=30.0)
 
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     assert buf.exists(), "snapshot sweep must NOT delete the buffer"
@@ -291,11 +309,11 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
-    stop.set()
-    t.join(timeout=2.0)
-
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
+    _wait_until(lambda: not buf.exists())
+    stop.set()
+    t.join(timeout=30.0)
+
     assert not buf.exists(), "finalize must delete the buffer"
     assert get_session(sid) is None, "finalize must remove from _SESSIONS"
     types = [e.get("type") for e in bus.events]
@@ -541,9 +559,9 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    time.sleep(0.3)
+    time.sleep(0.3)  # a window in which it COULD misbehave — not pollable
     stop.set()
-    t.join(timeout=5.0)
+    t.join(timeout=30.0)
     assert not t.is_alive()
     assert fired == [], "self-model tick fired even though disabled"
 
