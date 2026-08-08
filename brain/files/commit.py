@@ -52,6 +52,16 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
             error=err,
         )
         return {"ok": False, "error": err}
+    # #101: claim the record BEFORE writing. The write used to land first and
+    # the status was set after — but pending.mark is silently fallible, so a
+    # failed mark left the record 'pending' with the content already on disk,
+    # and the status guard above stopped blocking a retry. Claiming first means
+    # a retry can only re-enter if nothing was written.
+    if not pending.mark(persona_dir, rid, status="committing"):
+        audit(persona_dir, event="claim_failed", id=rid, op=op, path=rec["resolved_path"],
+              error="could not record the committing status")
+        return {"ok": False, "error": "could not claim the write for commit"}
+
     try:
         g.resolved.parent.mkdir(parents=True, exist_ok=True)
         mode = "w" if op == "create" else "a"
