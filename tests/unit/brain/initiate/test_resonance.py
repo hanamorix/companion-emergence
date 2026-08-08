@@ -325,6 +325,109 @@ def test_run_resonance_tick_emits_on_spike(tmp_path):
     assert candidates[0].source_id == "mem_y"
 
 
+def test_a_quiet_memory_does_not_write_a_gate_rejection_row(tmp_path):
+    """The z-gate's null result is not an event, so it must not be logged.
+
+    The gate fires on a rare spike (z > 2.5), so "no spike" is the expected
+    outcome for nearly every memory on every tick. Logging it per-memory
+    per-tick wrote 221,616 rows to Hana's live `gate_rejections.jsonl` in 71
+    days — 48 MB, 99.9% of the file, one memory recorded 2,891 separate times
+    — all saying nothing happened. Rejections from the OTHER gates mean a
+    memory did spike and was blocked for a second reason; those are events
+    and are still written (290 rows over the same 71 days).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.resonance import MemoryActivationBaseline, run_resonance_tick
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    h.strengthen("mem_q", "n1", delta=0.1)
+    h.close()
+
+    store = MemoryStore(persona / "memories.db")
+    store.create(
+        Memory(
+            id="mem_q",
+            content="q",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(days=30),
+        )
+    )
+    store.close()
+
+    # Bootstrap the baseline past the minimum count, then leave activation
+    # flat — no spike, so the z-gate rejects with "z_threshold".
+    with MemoryActivationBaseline(persona / "memory_activation_baseline.db") as b:
+        for _ in range(12):
+            b.update("mem_q", 0.1, alpha=0.08)
+
+    run_resonance_tick(persona, now=now)
+
+    rejections = persona / "gate_rejections.jsonl"
+    assert not rejections.exists() or rejections.read_text(encoding="utf-8") == "", (
+        "a quiet memory logged a gate rejection:\n"
+        + rejections.read_text(encoding="utf-8")
+    )
+
+
+def test_a_spiking_but_blocked_memory_still_writes_a_gate_rejection_row(tmp_path):
+    """The other side of the null-result filter: real rejections still log.
+
+    Silencing `z_threshold` must not silence the log. A memory that DID spike
+    and was blocked by a later gate is the case the file exists to record —
+    290 such rows over the 71 days that produced 221,616 noise rows.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.resonance import MemoryActivationBaseline, run_resonance_tick
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    h.strengthen("mem_r", "n1", delta=0.1)
+    h.close()
+
+    store = MemoryStore(persona / "memories.db")
+    store.create(
+        Memory(
+            id="mem_r",
+            content="r",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(days=30),
+            # Touched today, so staleness_min (7 days) blocks it AFTER the
+            # z-gate passes — the exact shape of a real rejection.
+            last_accessed_at=now,
+        )
+    )
+    store.close()
+
+    with MemoryActivationBaseline(persona / "memory_activation_baseline.db") as b:
+        for _ in range(12):
+            b.update("mem_r", 0.1, alpha=0.08)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    for i in range(20):
+        h.strengthen("mem_r", f"new_n{i}", delta=0.4)
+    h.close()
+
+    run_resonance_tick(persona, now=now)
+
+    rows = (persona / "gate_rejections.jsonl").read_text(encoding="utf-8").strip()
+    assert "staleness_min" in rows, f"real rejection was not logged: {rows!r}"
+
+
 def test_baseline_db_uses_wal_and_busy_timeout(tmp_path: Path):
     """Match the WAL + busy_timeout discipline of MemoryStore/HebbianMatrix —
     this DB is opened/written every heartbeat tick and can contend with the

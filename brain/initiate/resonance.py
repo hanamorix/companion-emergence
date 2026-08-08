@@ -168,6 +168,26 @@ def top_n_most_active_memories(
     return sorted_pairs[:n]
 
 
+# The z-gate exists to catch a rare activation spike, so "below threshold" is
+# the expected outcome for nearly every memory on nearly every tick — it is the
+# detector's null result, not a rejection worth recording. Every other gate tag
+# means the memory DID spike and was then blocked for a second reason, which is
+# a real event. See _should_log_rejection.
+_NULL_RESULT_GATE = "z_threshold"
+
+
+def _should_log_rejection(gate_name: str | None) -> bool:
+    """Whether a blocked candidate is worth a `gate_rejections.jsonl` row.
+
+    Measured on Hana's live persona 2026-08-08: 221,616 of 221,906 rows (48 MB,
+    99.9%) were `z_threshold` from `recall_resonance`, and only 578 distinct
+    memories produced them — one memory logged 2,891 separate times across 71
+    days, each row saying its activation was still unremarkable. The remaining
+    290 rows, from the other gates, are the ones that carry information.
+    """
+    return gate_name != _NULL_RESULT_GATE
+
+
 def gate_recall_resonance(
     persona_dir: Path,
     *,
@@ -183,7 +203,7 @@ def gate_recall_resonance(
     the same memory ID.
     """
     if z_score < thresholds.recall_resonance_z_threshold:
-        return False, "z_threshold"
+        return False, _NULL_RESULT_GATE
     if staleness_days < thresholds.recall_resonance_staleness_min_days:
         return False, "staleness_min"
 
@@ -306,15 +326,16 @@ def run_resonance_tick(
                 now=now,
             )
             if not allowed:
-                write_gate_rejection(
-                    persona_dir,
-                    ts=now,
-                    source="recall_resonance",
-                    source_id=memory_id,
-                    gate_name=reason or "unknown",
-                    threshold_value=thresholds.recall_resonance_z_threshold,
-                    observed_value=z_score,
-                )
+                if _should_log_rejection(reason):
+                    write_gate_rejection(
+                        persona_dir,
+                        ts=now,
+                        source="recall_resonance",
+                        source_id=memory_id,
+                        gate_name=reason or "unknown",
+                        threshold_value=thresholds.recall_resonance_z_threshold,
+                        observed_value=z_score,
+                    )
                 continue
 
             meta_ok, meta_reason = check_shared_meta_gates(

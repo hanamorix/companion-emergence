@@ -1871,7 +1871,15 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("chat_usage.jsonl", 5),
     ("file_access.jsonl", 5),
     ("attunement_errors.jsonl", 5),
+    ("gate_rejections.jsonl", 3),
 )
+# This table is deliberately hand-maintained, NOT derived from the jsonl files
+# present on disk. Several persona jsonl files are stores or queues, not logs —
+# soul_candidates and initiate_candidates are review queues, forgotten_memories
+# is the recovery graveyard, and adaptive-D reads every row of initiate_d_calls
+# with no time filter. Rotating any of those silently destroys live state. Add
+# entries here only after confirming the file has no reader, or a reader with a
+# bounded window shorter than the retained history.
 # Yearly-archive logs are kept forever — reader walks active + every archive
 # so every decision / initiation event stays reachable.
 _YEARLY_ARCHIVE_LOGS: tuple[tuple[str, str], ...] = (
