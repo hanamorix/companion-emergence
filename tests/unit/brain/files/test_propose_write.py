@@ -228,3 +228,29 @@ def test_consent_path_still_commits_content_already_in_the_file(tmp_path, monkey
     assert target.read_text(encoding="utf-8").count("- a line") == 2, (
         "an approved write must commit even when the content is already present"
     )
+
+
+def test_notes_skip_event_records_the_content_sha(tmp_path, monkeypatch):
+    """write_audit.jsonl must correlate a skip to its block (#101 analysis).
+
+    Without content_sha a `write_skipped_present` row cannot be tied to a
+    specific block, so the audit trail can't distinguish which write was
+    suppressed — the exact question the #101 discriminating test asks.
+    """
+    import hashlib
+    import json
+
+    persona, notes = _notes_persona(tmp_path, monkeypatch)
+    target = notes / "note.md"
+    target.write_text("- a line\n", encoding="utf-8")
+
+    propose_write(path=str(target), content="- a line", op="append", persona_dir=persona)
+
+    rows = [
+        json.loads(ln)
+        for ln in (persona / "write_audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    skips = [r for r in rows if r["event"] == "write_skipped_present"]
+    assert len(skips) == 1, rows
+    assert skips[0]["content_sha"] == hashlib.sha256(b"- a line").hexdigest()

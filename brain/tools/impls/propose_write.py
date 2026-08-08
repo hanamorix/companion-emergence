@@ -76,6 +76,8 @@ def propose_write(path: str, content: str | None = None, *, op: str,
         audit(persona_dir, event="propose_refused", id="", op=op, path=str(g.resolved), error=s.error)
         return {"error": s.error}
 
+    content_sha = hashlib.sha256(content.encode()).hexdigest()
+
     # Auto-commit into the user-authorised notes folder (no confirmation card):
     # the user enabled "let her leave me notes" for this exact folder, so a tool
     # write whose target resolves inside it is committed directly. It still passes
@@ -99,7 +101,7 @@ def propose_write(path: str, content: str | None = None, *, op: str,
                 existing = None
             if existing is not None and _block_present(existing, content):
                 audit(persona_dir, event="write_skipped_present", id="", op=op,
-                      path=str(g.resolved))
+                      path=str(g.resolved), content_sha=content_sha)
                 return {
                     "status": "already_present", "path": str(g.resolved), "deduped": True,
                     "note": f"that block is already in {g.resolved} — nothing written",
@@ -119,7 +121,6 @@ def propose_write(path: str, content: str | None = None, *, op: str,
         return {"error": res.get("error", "write failed")}
 
     now = datetime.now(UTC)
-    content_sha = hashlib.sha256(content.encode()).hexdigest()
 
     # #93/#101: the same write proposed twice in one turn must not stage two
     # cards. The record id can't carry this — _new_id mixes in `now` — so match
