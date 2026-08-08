@@ -147,3 +147,4 @@ app/src-tauri/python-runtime/
 hooks/leak-rules.local
 docs/guarded-change/
 CLAUDE.local.md
+CLAUDE.local.history.md

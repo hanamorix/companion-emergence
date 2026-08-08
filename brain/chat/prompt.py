@@ -660,8 +660,28 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         from brain.memory.store import _row_to_memory
         from brain.utils.memory import days_since_human
 
+        # #90: filter to memories that actually carry an emotion vector. This is
+        # the SAME fix already applied to _build_emotion_summary below and to
+        # _build_emotions / _build_body in brain/bridge/persona_state.py — this
+        # site and get_body_state were missed when it went in.
+        #
+        # Measured on the real persona 2026-08-08: 48 of the 50 most recent
+        # memories were `heartbeat` rows with empty emotions_json, so this
+        # aggregated to {} — the injected body block carried no emotion at all —
+        # while love:10.0 and belonging:10.0 sat just outside the window.
+        # heartbeat writes ~50-75 emotionless memories a day and is 49% of the
+        # store, so the unfiltered window fills within a day of quiet.
+        #
+        # Filtering cannot change the aggregation: an emotionless memory is a
+        # no-op in aggregate_state's max-pool. It only stops the window being
+        # spent on rows that cannot contribute. LIMIT matches the sibling's 200
+        # so the two emotion surfaces in one prompt cannot disagree.
         rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT 200"
         ).fetchall()
         memories = [_row_to_memory(row) for row in rows]
         state = aggregate_state(memories)
