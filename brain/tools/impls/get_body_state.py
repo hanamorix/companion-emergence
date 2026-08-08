@@ -42,10 +42,25 @@ def get_body_state(
     """
     now = datetime.now(UTC)
 
-    # Aggregate emotion state from the most-recent 50 memories (matches
-    # _build_emotion_summary in chat/prompt.py — same recency window).
+    # Aggregate emotion state from recent EMOTION-BEARING memories — matches
+    # _build_emotion_summary and _build_body_block in chat/prompt.py, and
+    # _build_emotions / _build_body in bridge/persona_state.py.
+    #
+    # #90: the comment here used to claim it matched _build_emotion_summary's
+    # window, but that function had already been filtered to emotion-bearing
+    # rows and this had not — so the two disagreed. Unfiltered, this returned {}
+    # on a steady-state brain: measured on the real persona, 48 of the 50 most
+    # recent memories were emotionless `heartbeat` rows.
+    #
+    # Filtering cannot change the aggregation — an emotionless memory is a no-op
+    # in aggregate_state's max-pool — it only stops the window being spent on
+    # rows that cannot contribute.
     rows = store._conn.execute(  # noqa: SLF001 — internal same-tier access
-        "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
+        "SELECT * FROM memories "
+        "WHERE active = 1 "
+        "AND emotions_json IS NOT NULL "
+        "AND emotions_json != '{}' "
+        "ORDER BY created_at DESC LIMIT 200"
     ).fetchall()
     memories = [_row_to_memory(row) for row in rows]
     state = aggregate_state(memories)  # already applies climax reset
