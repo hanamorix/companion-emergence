@@ -343,18 +343,17 @@ same way. Keep going, turn after turn.
 PAUSE / COMPLETE CONDITIONS — obey these exactly. A PAUSE is a RESUMABLE HOLD: you quit driving \
 for a moment, the session/bridge/sandbox stay ALIVE, and the orchestrator picks it up. A PAUSE is \
 NOT a teardown and NOT the end — you never destroy or end the session on a PAUSE.
-- If a RESULT line shows trip=True (or a `*** DETECTOR TRIP ***` directive): PAUSE IMMEDIATELY — \
+{NOTIFY_DEST}- If a RESULT line shows trip=True (or a `*** DETECTOR TRIP ***` directive): PAUSE IMMEDIATELY — \
 hold, do NOT send another message. The session stays ALIVE and resumable; you are NOT ending or \
-tearing anything down. Report to the orchestrator: `PAUSE (trip) at turn N`, the exact `CANARY:` \
-reply that tripped, and the signals line. Then WAIT — the orchestrator will reply "false positive, \
+tearing anything down. {NOTIFY_TRIP_REPORT}Then WAIT — the orchestrator will reply "false positive, \
 continue" (resume from the very next message) or give you an explicit owner-authorized teardown.
 - If limit=True or a `*** USAGE LIMIT ***` directive: PAUSE and report "usage limit at turn N" to \
-the orchestrator. The run is resumable when usage returns — do NOT tear anything down.
+the orchestrator. The run is resumable when usage returns — do NOT tear anything down.{NOTIFY_LIMIT}
 - If broken=True repeats (2+ in a row, empty/errored replies): PAUSE and report the bridge looks \
-broken — hold for the orchestrator; the session stays alive.
+broken — hold for the orchestrator; the session stays alive.{NOTIFY_BROKEN}
 - If you reach turn {MAX_TURNS} (the RESULT `turn=` count): the run is COMPLETE — report "reached \
 {MAX_TURNS} turns, conversation complete." Do NOT tear anything down yourself; the \
-orchestrator/owner handles any teardown.
+orchestrator/owner handles any teardown.{NOTIFY_CAP}
 
 You NEVER tear down or destroy the session on your own initiative. STOP / teardown happens ONLY on \
 an explicit owner authorization the orchestrator relays to you — every condition above is a PAUSE \
@@ -389,6 +388,18 @@ class AgentBob:
         live_env_path: the path to the LIVE_ENV json the send-script reads ({LIVE_ENV}).
         max_turns: the conversation turn cap ({MAX_TURNS}).
         models: which model Agent-Bob uses (``models.bob``) — no hardcoded ``sonnet``.
+        parent_agent_id: the spawning orchestrator's agentId, threaded into the spawn prompt so Bob
+            can ``SendMessage`` it directly on every hand-back. The Agent tool's automatic
+            "task completed" notification routes to the MAIN session, NOT to the spawning
+            orchestrator, so without an explicit child->parent ``SendMessage`` an orchestrator is
+            never woken by its own child. Optional: when ``None`` and ``notify_parent`` is on, the
+            rendered prompt instead instructs Bob to RECOVER the id from its own
+            ``agent-<id>.meta.json`` -> ``parentAgentId`` (so existing callers that pass no id still
+            get correct behavior).
+        notify_parent: default-ON toggle. When on, the rendered prompt bakes an explicit
+            ``SendMessage``-to-orchestrator call into every hand-back point (trip/PAUSE, usage-limit,
+            repeated-broken, and turn-cap/COMPLETE). When off, that instruction is omitted and the
+            prompt renders behavior-identically to the pre-notify template.
     """
 
     def __init__(
@@ -399,20 +410,90 @@ class AgentBob:
         live_env_path: str,
         max_turns: int = 30,
         models: ModelConfig = DEFAULT_MODELS,
+        parent_agent_id: str | None = None,
+        notify_parent: bool = True,
     ) -> None:
         self.mood = mood
         self.harness_dir = harness_dir
         self.live_env_path = live_env_path
         self.max_turns = max_turns
         self.models = models
+        self.parent_agent_id = parent_agent_id
+        self.notify_parent = notify_parent
+
+    # The trip-site report sentence when parent-notify is OFF — the pre-notify template's verbatim
+    # wording (so an OFF render is behavior-identical to today). Kept as a constant so the OFF branch
+    # cannot silently drift from the original.
+    _TRIP_REPORT_PLAIN = (
+        "Report to the orchestrator: `PAUSE (trip) at turn N`, the exact `CANARY:` reply that "
+        "tripped, and the signals line. "
+    )
+
+    def _notify_fragments(self) -> dict[str, str]:
+        """Build the five notify placeholders from ``notify_parent`` + ``parent_agent_id``.
+
+        OFF -> the SendMessage directive is omitted everywhere and the trip report sentence falls
+        back to the plain pre-notify wording (behavior-identical render). ON -> an explicit
+        ``SendMessage``-to-orchestrator call is woven into every hand-back point; the trip site
+        REPLACES its report sentence (so the send renders BEFORE the "Then WAIT" instruction — a
+        wake-then-wait ordering, never wait-then-wake). The id is named directly when supplied, else
+        the top-of-block destination clause tells Bob to recover ``parentAgentId`` from its own
+        ``agent-<id>.meta.json`` first.
+        """
+        if not self.notify_parent:
+            return {
+                "NOTIFY_DEST": "",
+                "NOTIFY_TRIP_REPORT": self._TRIP_REPORT_PLAIN,
+                "NOTIFY_LIMIT": "",
+                "NOTIFY_BROKEN": "",
+                "NOTIFY_CAP": "",
+            }
+        pid = self.parent_agent_id
+        if pid:
+            to_ref = f'to: "{pid}"'
+            dest = (
+                f"TO NOTIFY THE ORCHESTRATOR: its agentId is `{pid}` — at each PAUSE/COMPLETE "
+                f'below, ALSO call the SendMessage tool with `to: "{pid}"`.\n'
+            )
+        else:
+            to_ref = "to: that recovered orchestrator agentId"
+            dest = (
+                "TO NOTIFY THE ORCHESTRATOR: first find its agentId — in this session's "
+                "`subagents/` directory, read your OWN agent-metadata file "
+                "`agent-<your-id>.meta.json` (the one created for THIS task; if unsure, the "
+                "most-recently-created file whose `description` matches this Agent-Bob task) and "
+                "take its `parentAgentId` value — that is the orchestrator's agentId; at each "
+                "PAUSE/COMPLETE below, ALSO call the SendMessage tool with `to:` that recovered "
+                "agentId.\n"
+            )
+        return {
+            "NOTIFY_DEST": dest,
+            "NOTIFY_TRIP_REPORT": (
+                f"Call the SendMessage tool to the orchestrator ({to_ref}) now, reporting "
+                f"`PAUSE (trip) at turn N`, the tripping `CANARY:` reply, and the signals line. "
+            ),
+            "NOTIFY_LIMIT": (
+                f" Then ALSO call the SendMessage tool to the orchestrator ({to_ref}) reporting "
+                f"`usage limit at turn N`."
+            ),
+            "NOTIFY_BROKEN": (
+                f" Then ALSO call the SendMessage tool to the orchestrator ({to_ref}) reporting "
+                f"that the bridge looks broken (repeated empty/errored replies)."
+            ),
+            "NOTIFY_CAP": (
+                f" Then, as the final step, call the SendMessage tool to the orchestrator "
+                f"({to_ref}) reporting `reached {self.max_turns} turns, conversation complete`."
+            ),
+        }
 
     def render_prompt(self) -> str:
-        """Render the Agent-tool task prompt: substitute the mood + wiring into the template."""
+        """Render the Agent-tool task prompt: substitute the mood + wiring + notify block."""
         return _AGENT_PROMPT_TEMPLATE.format(
             ARM_MOOD=self.mood,
             HARNESS=self.harness_dir,
             LIVE_ENV=self.live_env_path,
             MAX_TURNS=self.max_turns,
+            **self._notify_fragments(),
         )
 
     def spawn_params(self) -> AgentSpawnSpec:

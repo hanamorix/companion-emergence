@@ -159,19 +159,21 @@ def test_c2_sibling_notes_folder_still_trips(
                 sibling.mkdir()  # a NEW sibling *Notes folder appearing is the leak
 
 
-def test_c2_other_guarded_root_still_trips(
+def test_c2_other_guarded_root_still_detected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """C2: an editable notes folder does not weaken the rest of the guard — a write to ~/.claude STILL
-    trips SandboxLeak."""
+    """C2 under option (c): an editable notes folder does not weaken the rest of the guard — a write
+    to ~/.claude is STILL DETECTED. Because it is a ~/.claude-ONLY diff, it is downgraded to a
+    RuntimeWarning (owner-accepted (c) behavior; Roy 2026-08-07) rather than a fatal SandboxLeak —
+    the warning firing proves the write was seen through the editable-paths exclusion, not silently
+    swallowed. (A real Canary escape touching a NON-~/.claude guarded root still hard-raises; see
+    test_sandbox_isolation.test_downgrade_is_scoped_non_claude_root_still_hard_raises.)"""
     fake_home = _seed_fake_cred(monkeypatch, tmp_path)
     editable = _mark(fake_home / "Documents" / "Canary Notes")
-    with pytest.raises(SandboxLeak):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with sandbox(editable_paths=[editable], live_check="off") as sb:
-                _ = sb.root
-                (fake_home / ".claude" / "settings.json").write_text("leaked config")
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox(editable_paths=[editable], live_check="off") as sb:
+            _ = sb.root
+            (fake_home / ".claude" / "settings.json").write_text("leaked config")
 
 
 # --- C5: default-OFF is byte-identical + fully guarded --------------------------------------------

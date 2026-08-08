@@ -21,7 +21,11 @@ What it does (see the module ``README.md`` for the guarantees):
    ``_claude_session_log_excludes``) — the sandboxed subject cannot reach those (its CLI runs under
    the tempdir ``CLAUDE_CONFIG_DIR``), so pruning them drops only the live driving session's noise.
 5. ``yield`` a :class:`SandboxHandle`.
-6. AFTER the run, re-fingerprint; if any guarded root changed, raise :class:`SandboxLeak`.
+6. AFTER the run, re-fingerprint; if any guarded root changed, raise :class:`SandboxLeak` —
+   EXCEPT a diff confined to the real ``~/.claude`` root ALONE, which is DOWNGRADED to a
+   ``RuntimeWarning`` (a concurrent external editor writing ``~/.claude`` mid-run, not the
+   sandboxed subject; see the post-run block + the run's decisions.md OWNER-ACCEPTED risk). Any
+   change also touching a KINDLED/persona/platformdirs/``brain.paths`` root still raises.
 7. Restore env (in a ``finally``, even on ``SandboxLeak``) and ``rmtree`` the root (unless ``keep``).
 
 **Concurrency:** ``sandbox()`` mutates process-global ``os.environ`` — it is NOT thread-safe or
@@ -745,7 +749,41 @@ def sandbox(
                         " — NOTE: " + live_note + " This leak is probably that service's "
                         "concurrent writes, not a sandbox escape."
                     )
-                raise SandboxLeak(msg)
+                # Option (c): a diff confined to the real ~/.claude root ALONE is DOWNGRADED to a
+                # RuntimeWarning instead of a fatal SandboxLeak (reusing the live-check warn
+                # pattern). The observed trigger is a CONCURRENT external editor — a second
+                # claude-code session, the orchestrator, or the user — editing ~/.claude/CLAUDE.md
+                # mid-run; that write is not the sandboxed subject's, yet it tripped a SPURIOUS
+                # SandboxLeak that crashed teardown and stalled a long live run. Detection is
+                # preserved (the change is still surfaced, loudly) — only the fatal raise is
+                # dropped for THIS one root. The moment ANY OTHER guarded root also changed — a
+                # KINDLED/persona root, a platformdirs data/cache/state home, brain.paths' data
+                # home, or a *Notes folder, i.e. a root the sandboxed subject reaches through the
+                # engine's own file mechanisms — `changed` is not [str(claude_root)] alone and we
+                # STILL hard-raise SandboxLeak.
+                #
+                # KNOWN, OWNER-ACCEPTED RISK (Roy, 2026-08-07): unlike the fail-closed session-log
+                # allowlist above, ~/.claude is NOT a root the subject provably cannot write. The
+                # Canary's `claude` CLI runs the generate()/chat() paths with
+                # `--dangerously-skip-permissions` and NO --disallowedTools (the lean disallow-list
+                # is applied only on the MCP paths), so the built-in Write/Bash/Edit tools can
+                # write an ABSOLUTE ~/.claude path (hooks/settings/skills/plugins) — a real escape
+                # this downgrade would render a warning, not a raise. The owner accepted this
+                # tradeoff to stop the concurrent-editor false trip; see the run's decisions.md
+                # named risk-acceptance. Do NOT widen this beyond the claude_root-ONLY case.
+                if changed == [str(claude_root)]:
+                    warnings.warn(
+                        msg
+                        + " — DOWNGRADED to a warning (not SandboxLeak): the change is confined to "
+                        "~/.claude alone, which during a run is almost always a concurrent external "
+                        "editor (another claude-code session / the orchestrator / you), not the "
+                        "sandboxed subject. Any change also touching a KINDLED/persona/platformdirs "
+                        "root still raises SandboxLeak.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                else:
+                    raise SandboxLeak(msg)
     finally:
         _restore_env()
         _restore_emotion_globals()

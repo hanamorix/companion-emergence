@@ -129,8 +129,12 @@ def test_leak_oracle_fires_on_a_real_mutation(
 def test_leak_oracle_catches_same_size_same_mtime_overwrite(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """M1: a same-size + mtime-RESTORED in-place overwrite of a fingerprinted ~/.claude dotfile is
-    still caught (content-hash), not just an add-a-file. Closes the owner-flagged blind spot."""
+    """M1 (still DETECTED, now DOWNGRADED under option (c)): a same-size + mtime-RESTORED in-place
+    overwrite of a fingerprinted ~/.claude dotfile is still CAUGHT by the content-hash — the change
+    the (size, mtime_ns) pair alone would miss is still seen. Under option (c) a ~/.claude-ONLY
+    diff is downgraded from a fatal SandboxLeak to a RuntimeWarning (the warning firing proves the
+    content-hash detected the overwrite); the M1 blind-spot fix is intact, only the response
+    changed."""
     import os
 
     _seed_fake_cred(monkeypatch, tmp_path)
@@ -140,13 +144,15 @@ def test_leak_oracle_catches_same_size_same_mtime_overwrite(
     target.write_text("AAAA")  # 4 bytes
     orig_stat = target.stat()
 
-    with pytest.raises(SandboxLeak):
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
         with sandbox() as sb:
             _ = sb.root
             # Same-size (4 bytes) different content, then restore the mtime so (size, mtime_ns) match.
             target.write_text("BBBB")
             os.utime(target, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
-            # (size, mtime_ns) are now identical to before — only the CONTENT differs.
+            # (size, mtime_ns) are now identical to before — only the CONTENT differs. The
+            # content-hash still detects it (the RuntimeWarning fires); no SandboxLeak is raised
+            # (a ~/.claude-only diff downgrades under option (c)).
 
 
 def test_env_restored_even_after_leak_raise(
@@ -264,22 +270,31 @@ def test_provider_respects_upstream_claude_config_dir(
     )
 
 
-def test_non_excluded_claude_write_still_trips_leak(
+def test_non_excluded_claude_write_now_downgrades_to_warning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """C2 (negative control): writing to a NON-excluded ~/.claude path still raises SandboxLeak —
-    both a known config file (settings.json) and a brand-new NON-allowlisted dir (fail-closed)."""
+    """C2 under option (c): a NON-excluded ~/.claude write is still DETECTED (not on the exclude
+    allowlist — the fingerprint sees it) but, being a ~/.claude-ONLY diff, is DOWNGRADED to a
+    RuntimeWarning instead of raising SandboxLeak — both a known config file (settings.json) and a
+    brand-new NON-allowlisted dir (still fingerprinted, fail-closed detection preserved).
+
+    OWNER-ACCEPTED RISK (Roy, 2026-08-07): this softens hard-detection of a real Canary escape
+    confined to ~/.claude (the subject CAN write these via the built-in tools on the
+    --dangerously-skip-permissions provider paths) to a warning; accepted to stop the concurrent-
+    editor false trip. The negative control that a NON-claude_root escape STILL hard-raises lives in
+    test_downgrade_is_scoped_non_claude_root_still_hard_raises."""
     _seed_fake_cred(monkeypatch, tmp_path)
     fake_home = tmp_path / "fake-home"
 
-    # (a) a kept config file.
-    with pytest.raises(SandboxLeak):
+    # (a) a kept config file — detected, downgraded to a warning (~/.claude-only diff).
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
         with sandbox() as sb:
             _ = sb.root
             (fake_home / ".claude" / "settings.json").write_text("leaked config")
 
-    # (b) an unknown/future dir NOT on the allowlist must stay guarded (fail-closed).
-    with pytest.raises(SandboxLeak):
+    # (b) an unknown/future dir NOT on the allowlist is still fingerprinted (fail-closed DETECTION);
+    #     the ~/.claude-only diff downgrades to a warning, not a hard raise.
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
         with sandbox() as sb:
             _ = sb.root
             newdir = fake_home / ".claude" / "some-future-config"
@@ -287,19 +302,90 @@ def test_non_excluded_claude_write_still_trips_leak(
             (newdir / "x").write_text("a future claude-code dir a real leak could land in")
 
 
-def test_kept_dir_write_still_trips_even_amid_orchestrator_logs(
+def test_kept_dir_write_detected_amid_orchestrator_logs_downgrades_to_warning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """C2 reinforced: a KEPT-dir mutation is still caught even when excluded session logs churn in
-    the same run — proves the exclusion prunes ONLY the allowlist, not the whole ~/.claude."""
+    """C2 reinforced, under option (c): a KEPT-dir mutation (~/.claude/hooks/) is still DETECTED
+    even when excluded session logs churn in the same run — proving the exclusion prunes ONLY the
+    allowlist, not the whole ~/.claude. Because the excluded logs contribute no change, the diff is
+    ~/.claude-ONLY, so it DOWNGRADES to a RuntimeWarning rather than raising SandboxLeak. The
+    warning firing proves the kept-dir write was seen through the excluded churn."""
     _seed_fake_cred(monkeypatch, tmp_path)
     fake_home = tmp_path / "fake-home"
-    with pytest.raises(SandboxLeak):
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
         with sandbox() as sb:
             _ = sb.root
-            _write_orchestrator_session_logs(fake_home)  # excluded churn (benign)
+            _write_orchestrator_session_logs(fake_home)  # excluded churn (benign, no change)
             (fake_home / ".claude" / "hooks").mkdir(parents=True, exist_ok=True)
             (fake_home / ".claude" / "hooks" / "evil.py").write_text("leaked hook code")
+
+
+# --- Option (c): ~/.claude-only diff downgrades to a warning; the negative controls still fire ----
+
+
+def test_concurrent_claude_md_write_downgrades_to_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G1 (option (c) headline): a CONCURRENT write to ~/.claude/CLAUDE.md during a run — a second
+    claude-code session / the orchestrator / the user editing it — is DOWNGRADED to a
+    RuntimeWarning, NOT a fatal SandboxLeak. This is the exact false trip that crashed teardown and
+    stalled a ~44-min live run. Detection is preserved (the warning fires); only the raise is
+    dropped for a ~/.claude-only diff.
+
+    Also pins that option (b) was NOT done: CLAUDE.md stays GUARDED (fingerprinted) and is NOT on
+    the exclude allowlist — so the change is genuinely seen, then downgraded (not made invisible).
+    """
+    _seed_fake_cred(monkeypatch, tmp_path)
+    claude_dir = tmp_path / "fake-home" / ".claude"
+    claude_md = claude_dir / "CLAUDE.md"
+    claude_md.write_text("# user memory (pre-existing)\n")
+
+    # CLAUDE.md is GUARDED (fingerprinted) and NOT excluded — proves (b) was not done and the
+    # change is really detected (oracle-can-see), so the downgrade is not a silent blinding.
+    assert "CLAUDE.md" in _fingerprint(claude_dir, hash_content=True)
+    excluded = {e.resolve() for e in _claude_session_log_excludes()}
+    assert claude_md.resolve() not in excluded  # NOT on the exclude allowlist (option (b) not done)
+
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox() as sb:
+            _ = sb.root
+            # A concurrent external editor writes ~/.claude/CLAUDE.md mid-run:
+            claude_md.write_text("# user memory (edited by a concurrent claude-code session)\n")
+    # Clean exit (not inside pytest.raises): no SandboxLeak propagated — teardown completed.
+
+
+def test_downgrade_is_scoped_non_claude_root_still_hard_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G2 + G3 (SAFETY negative control + scope — the load-bearing safety test): the ~/.claude
+    downgrade must NOT weaken detection of a real, Canary-writable escape.
+
+    (a) NEGATIVE CONTROL: a real mutation of a fingerprinted guard root that is NOT ~/.claude
+        (via extra_guard_roots) STILL raises SandboxLeak — the oracle can fire post-fix.
+    (b) SCOPE: when a Canary-writable root AND ~/.claude BOTH change in the same run, the diff is
+        not [str(claude_root)] alone, so it STILL hard-raises — the downgrade applies ONLY to a
+        claude_root-ONLY diff and never masks a real-escape root moving alongside ~/.claude.
+    """
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+
+    # (a) negative control: a non-~/.claude guard root mutated -> still SandboxLeak.
+    guarded = tmp_path / "guarded-root"
+    guarded.mkdir()
+    with pytest.raises(SandboxLeak):
+        with sandbox(extra_guard_roots=[guarded]) as sb:
+            _ = sb.root
+            (guarded / "leaked.txt").write_text("a real escape")
+
+    # (b) scope: ~/.claude changes AND a Canary-writable root changes in one run -> still raises
+    #     (the downgrade never applies once a non-claude_root guard root has moved).
+    guarded2 = tmp_path / "guarded-root2"
+    guarded2.mkdir()
+    with pytest.raises(SandboxLeak):
+        with sandbox(extra_guard_roots=[guarded2]) as sb:
+            _ = sb.root
+            (fake_home / ".claude" / "CLAUDE.md").write_text("concurrent editor edit")
+            (guarded2 / "escaped.txt").write_text("a real Canary escape alongside the ~/.claude edit")
 
 
 def test_fingerprint_exclude_single_subtree_still_prunes(
