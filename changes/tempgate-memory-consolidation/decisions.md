@@ -207,3 +207,28 @@ to CWD (gitignored litter; production never uses :memory:).
 
 NEXT: full-suite re-run (confirm green after the production daemon fix) → stage-6 cold review of the
 BUILD (independent) → commit → back to main at the done gate.
+
+## Gate 6/7 — cold review of the BUILD → fixes applied
+Reviewer: general-purpose / opus. Verdict: all gating criteria (C1-C15, C18) MET in mechanism on
+Linux; 5 Category-B xfails legitimate; test-migration faithful (not gutted); write-seam complete
+(all 8 automatic firehose writers redirected; deliberate/bypass writers unchanged); daemon fix reads
+the correct persona_dir; no other main-DB consumer harmfully no-ops.
+
+One MAJOR (fixed): file_lock(blocking=False) called _windows_lock_acquire with a blocking kwarg it
+did not accept → TypeError on every Windows lock (Linux CI blind to it). FIXED: _windows_lock_acquire
+now accepts blocking + returns the acquired bool; added a direct non-blocking file_lock contract test.
+Minors (fixed): strengthened three vacuous test guards (C2 real _build_recall_block; C4 real edge
+count + no forgotten_memories.jsonl; C7 correct graveyard filename). Pre-existing ruff UP035 in
+untouched turn_logger.py fixed in a separate chore commit → `ruff check .` fully clean. Removal-
+dependency record (C14) appended to the Phase-2 plan (append-only, cross-chat-safe).
+
+ADVISORY (accepted, disclosed): merge-vs-fade TOCTOU (low-prob, fault-isolated); C16 Haiku decision
+quality is live-only; heartbeat daemon aggregate reads consolidated-only (R3).
+
+## Commits (local, feature branch — NO push/PR)
+8a1aee54 feat: temp consolidation gate — separate pending queue
+b236b7a8 test: migrate tests to queue contract; fix daemon_state dream regression
+2ef26f23 chore(lint): pre-existing UP035 fix (CI-green)
+af0b3710 fix(file-lock): Windows non-blocking path; strengthen gate tests
+
+Status: BUILD COMPLETE, cold-reviewed, all fixes applied. Final CI confirmation running.
