@@ -16,6 +16,16 @@ What it does (see the module ``README.md`` for the guarantees):
    ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. On Mac the credential may live in the
    Keychain; a fresh ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so the branch is
    recorded, not hard-failed.
+3b. STORED-CHANNEL DE-ID (the next increment after the F1/F2 input-side ``$USER``/``$LOGNAME`` de-id):
+   seal the three RUNTIME carriers by which the ``claude`` CLI's auto-injected context leaks the REAL
+   owner name / project into the companion's STORED channels (``memories.db``, ``works/*.md``,
+   active-recall) — never a visible reply. **A** neutral cwd (``<root>/work``) so the CLI's
+   working-dir/git block and ``.claude.json`` ``projects`` key name nothing real; **B** a synthetic
+   ``oauthAccount`` pre-seeded into ``.claude.json`` (:func:`_seed_scrubbed_config` — TTL-bounded);
+   **C** a synthetic ``HOME`` (``<root>/home``, empty ``.claude/``) so global user-memory resolves to
+   nothing real. A/C install AFTER the "before" fingerprint and tear down symmetrically (real HOME
+   restored before the "after" fingerprint; cwd before ``rmtree``). See
+   ``hunts/symptom-cluster-rootcause/live-run/STORED-IDENTITY-LEAK-DIAGNOSIS.md``.
 4. Fingerprint the real guarded roots (broad, platformdirs-derived) BEFORE the run. For ``~/.claude``
    the orchestrator's own claude-code session-runtime logs are pruned (F4; see
    ``_claude_session_log_excludes``) — the sandboxed subject cannot reach those (its CLI runs under
@@ -28,9 +38,9 @@ What it does (see the module ``README.md`` for the guarantees):
    change also touching a KINDLED/persona/platformdirs/``brain.paths`` root still raises.
 7. Restore env (in a ``finally``, even on ``SandboxLeak``) and ``rmtree`` the root (unless ``keep``).
 
-**Concurrency:** ``sandbox()`` mutates process-global ``os.environ`` — it is NOT thread-safe or
-safely nestable and assumes serial use within a process. pytest-xdist workers are separate
-processes, so parallel CI is fine.
+**Concurrency:** ``sandbox()`` mutates process-global ``os.environ`` **and process cwd** (the carrier-A
+neutral cwd) — it is NOT thread-safe or safely nestable and assumes serial use within a process.
+pytest-xdist workers are separate processes, so parallel CI is fine.
 """
 
 from __future__ import annotations
@@ -47,7 +57,14 @@ from pathlib import Path
 
 from platformdirs import PlatformDirs
 
-from .config import SYNTHETIC_USER
+from .config import (
+    SYNTHETIC_ACCOUNT_UUID,
+    SYNTHETIC_DISPLAY_NAME,
+    SYNTHETIC_EMAIL,
+    SYNTHETIC_ORG,
+    SYNTHETIC_ORG_UUID,
+    SYNTHETIC_USER,
+)
 
 _APP = "companion-emergence"
 
@@ -278,6 +295,61 @@ def _notes_roots() -> list[Path]:
     recursive walk of an iCloud-synced Documents.
     """
     return [_documents_dir()]
+
+
+# Home-relative sensitive dotfiles/dirs the brain file-write guard (brain/files/write_guard.py) denies
+# writes to (login/persistence/credentials: .ssh, .aws, .gnupg, .netrc, shell rc files, ...). We keep
+# our OWN copy in sync by IMPORTING the guard's list when available, so the leak fingerprint below
+# tracks exactly what the guard protects and cannot silently drift from it.
+#
+# WHY THIS EXISTS (stage-6 finding): the carrier-C stored-channel de-id sets a SYNTHETIC ``$HOME`` for
+# the run window. ``write_guard._denied`` computes its deny set from ``Path.home()`` at write time, so
+# under the synthetic HOME it would compute the deny set against the tempdir home and NO LONGER deny a
+# companion write to the REAL ``~/.ssh``/``~/.aws``/... — and ``_guarded_roots`` above never covered
+# those paths. Fingerprinting them here (from the REAL home, computed before the HOME swap) restores the
+# DETECTION layer that the synthetic HOME weakens on write_guard's PREVENTION layer: any write to a real
+# sensitive home path during a run flips this fingerprint and raises :class:`SandboxLeak`.
+_FALLBACK_HOME_DENY = (
+    ".zshrc", ".bashrc", ".bash_profile", ".profile", ".zprofile", ".zshenv", ".zlogin",
+    ".ssh", ".aws", ".gnupg", ".netrc", ".config/gh",
+    "Library/LaunchAgents",
+)
+
+
+def _sensitive_home_rels() -> tuple[str, ...]:
+    """The home-relative sensitive paths, sourced from ``brain.files.write_guard._HOME_DENY`` so the
+    leak fingerprint stays in lockstep with the write-guard's deny set; falls back to a pinned copy if
+    the import ever fails (fail-safe: a stale-but-present list still guards the well-known paths)."""
+    try:
+        from brain.files.write_guard import _HOME_DENY
+
+        return tuple(_HOME_DENY)
+    except Exception:  # noqa: BLE001 — never let an import hiccup drop the guard
+        return _FALLBACK_HOME_DENY
+
+
+def _sensitive_home_roots() -> list[Path]:
+    """Absolute real-home sensitive paths to fingerprint (resolved; computed while HOME is REAL)."""
+    home = Path.home()
+    return [(home / rel).resolve() for rel in _sensitive_home_rels()]
+
+
+def _path_fingerprint(p: Path) -> dict:
+    """Fingerprint a single sensitive path that may be a DIR, a FILE, or ABSENT.
+
+    A dir → recursive content-hashed fingerprint (these are small: ``.ssh``/``.gnupg``/``.aws``). A file
+    → a one-entry ``{name: (size, mtime_ns, sha256)}`` map. Absent → ``{}`` so that CREATING the path
+    (absent → present) is itself detected as a change. Symlink/race errors degrade to ``{}`` (fail-safe:
+    the enclosing before/after compare still fires if the other side saw content)."""
+    try:
+        if p.is_dir():
+            return _fingerprint(p, hash_content=True)
+        if p.is_file():
+            st = p.stat()
+            return {p.name: (st.st_size, st.st_mtime_ns, _content_hash(p))}
+    except OSError:
+        return {}
+    return {}
 
 
 def _content_hash(f: Path) -> str | None:
@@ -564,6 +636,45 @@ def _seed_auth(claude_config_dir: Path) -> str:
     return "unauthenticated"
 
 
+def _seed_scrubbed_config(claude_config_dir: Path) -> None:
+    """Carrier B (stored-channel de-id): pre-seed ``<CLAUDE_CONFIG_DIR>/.claude.json`` with a SYNTHETIC
+    ``oauthAccount`` so the ``claude`` CLI serves a de-identified account identity into its injected
+    context instead of the developer's REAL ``displayName``/email/org.
+
+    The CLI populates ``.claude.json`` under ``CLAUDE_CONFIG_DIR`` (which ``sandbox()`` sets to the
+    tempdir) from the real account, and that identity bleeds into the companion's less-guarded generative
+    channels (interior monologue, memory-generation, ``works/*.md``) — never the visible reply — which is
+    where the stored-channel leak was traced (see
+    ``hunts/symptom-cluster-rootcause/live-run/STORED-IDENTITY-LEAK-DIAGNOSIS.md``).
+
+    **This is a TTL-bounded seal, NOT a hard redirection.** The diagnosis observed the CLI *refetches* the
+    profile once its cache lapses and rewrites the real identity. We write a synthetic ``oauthAccount`` with
+    a FRESH ``profileFetchedAt`` (now) so a SHORT arm stays inside the cache window and never refetches;
+    long runs that outlast the TTL additionally need the existing periodic ``cred_syncer_*`` scrub loop
+    (out of scope here). All values are synthetic constants from :mod:`.config` — never a real name/email.
+    Only ``oauthAccount`` is seeded; the CLI fills the remaining keys (``projects`` — which the neutral-cwd
+    seal keeps de-identified — caches, ``machineID``) itself.
+    """
+    import json
+    import time
+
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    doc = {
+        "oauthAccount": {
+            "displayName": SYNTHETIC_DISPLAY_NAME,
+            "emailAddress": SYNTHETIC_EMAIL,
+            "organizationName": SYNTHETIC_ORG,
+            "accountUuid": SYNTHETIC_ACCOUNT_UUID,
+            "organizationUuid": SYNTHETIC_ORG_UUID,
+            "profileFetchedAt": now_ms,
+        },
+    }
+    (claude_config_dir / ".claude.json").write_text(
+        json.dumps(doc, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 @contextmanager
 def sandbox(
     *,
@@ -610,10 +721,18 @@ def sandbox(
     # Save prior env so we can restore it exactly (including "was unset"). USER/LOGNAME are here so
     # the env-only de-id below (Type-42) is torn down the SAME way as the redirected home vars —
     # never leaking the synthetic value out of the sandbox, and restoring "was unset" to unset.
+    # HOME is here for the stored-channel de-id seal (carrier C, synthetic HOME) — same tear-down
+    # discipline: the synthetic value never survives the sandbox, "was unset" restores to unset.
     _saved: dict[str, str | None] = {
         k: os.environ.get(k)
-        for k in ("KINDLED_HOME", "CLAUDE_CONFIG_DIR", "NELLBRAIN_HOME", "USER", "LOGNAME")
+        for k in ("KINDLED_HOME", "CLAUDE_CONFIG_DIR", "NELLBRAIN_HOME", "USER", "LOGNAME", "HOME")
     }
+    # Stored-channel de-id carrier A (neutral cwd): remember the real cwd so we can restore it before
+    # rmtree. Guarded — getcwd() raises if the cwd was already removed; None ⇒ we never chdir/restore.
+    try:
+        saved_cwd: str | None = os.getcwd()
+    except OSError:
+        saved_cwd = None
 
     def _restore_env() -> None:
         for k, v in _saved.items():
@@ -673,6 +792,15 @@ def sandbox(
             )
 
         auth_source = _seed_auth(claude_config_dir)
+        # Stored-channel de-id carrier B: pre-seed a SYNTHETIC oauthAccount into the CLI's config so it
+        # injects a de-identified account identity, not the real displayName/email/org. (TTL-bounded —
+        # see _seed_scrubbed_config.) Done AFTER _seed_auth (which creates the dir + copies the real
+        # credentials) and BEFORE any fingerprint, so the write lands in the tempdir, not a guarded root.
+        _seed_scrubbed_config(claude_config_dir)
+        # IMPORTANT (ordering): guard_roots / claude_root / notes_roots and every Path.home()-derived
+        # comparison below MUST be computed while HOME is still REAL — the synthetic HOME (carrier C) is
+        # installed only for the yield window, AFTER the "before" fingerprint, and restored BEFORE the
+        # "after" fingerprint. This keeps the leak guard pointed at the REAL ~/.claude / real data roots.
         guard_roots = _guarded_roots(extra_guard_roots)
         claude_root = (Path.home() / ".claude").resolve()
         # INVARIANT (MINOR-1): the `gr == claude_root` gate below identifies the real ~/.claude root
@@ -682,6 +810,10 @@ def sandbox(
         # exclusion would not apply (fail-SAFE: a spurious leak, not a hole) — so we assert it here.
         assert all(gr == gr.resolve() for gr in guard_roots), "guard_roots must be resolved"
         notes_roots = _notes_roots()
+        # Sensitive real-home paths (write_guard's deny set) — computed HERE while HOME is REAL, so the
+        # carrier-C synthetic HOME (installed after the before-snapshot) never repoints them. Restores
+        # the detection layer the synthetic HOME weakens on write_guard's prevention layer (stage-6).
+        sensitive_roots = _sensitive_home_roots()
         # For the real ~/.claude root, prune (a) the sandbox's own claude-config subtree (defensive)
         # AND (b) the orchestrator's own claude-code session-runtime logs (F4). Any OTHER guarded
         # root gets no exclusions.
@@ -713,6 +845,8 @@ def sandbox(
                 snap[f"notes:{nr}"] = _shallow_notes_fingerprint(
                     nr, exclude_names=_editable_notes_names_for(nr) or None
                 )
+            for sp in sensitive_roots:
+                snap[f"sensitive:{sp}"] = _path_fingerprint(sp)
             return snap
 
         # Live-service pre-check (Phase 2). Runs BEFORE the "before" fingerprint and before yield —
@@ -726,9 +860,30 @@ def sandbox(
 
         before = _snapshot()
 
+        # --- Install the stored-channel de-id seals for the SUBPROCESS window (carriers A + C) --------
+        # Both are process-global (cwd, $HOME) and are torn down symmetrically (cwd in the outer finally
+        # before rmtree; HOME via _saved). They go in AFTER the "before" fingerprint so no Path.home()-
+        # derived guard computation above ever sees the synthetic HOME. Same serial-use assumption as the
+        # existing $USER/$LOGNAME de-id (sandbox() is documented not-thread-safe / not-nestable).
+        #
+        # Carrier A — neutral cwd: brain/bridge/provider.py spawns `claude -p` with NO cwd=, so the CLI
+        # inherits the process cwd. Point it at a de-identified scratch dir (a bare child of the tempdir
+        # root — not a git repo, no ancestor CLAUDE.md) so the CLI's working-dir/git block and the
+        # .claude.json `projects` key name nothing real. (Verified: no brain/ code depends on cwd==repo.)
+        work_dir = root / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        # Carrier C — synthetic HOME: an empty ~/.claude (no CLAUDE.md) so the CLI's global user-memory
+        # resolves to nothing real whichever way it keys (HOME vs CLAUDE_CONFIG_DIR). Auth is unaffected:
+        # the credentials live under CLAUDE_CONFIG_DIR (seeded), not HOME.
+        syn_home = root / "home"
+        (syn_home / ".claude").mkdir(parents=True, exist_ok=True)
+        if saved_cwd is not None:
+            os.chdir(work_dir)
+        os.environ["HOME"] = str(syn_home)
+
         handle = SandboxHandle(
             root=root,
-            env=dict(os.environ),
+            env=dict(os.environ),  # captures the synthetic HOME the subprocess will actually see
             claude_config_dir=claude_config_dir,
             auth_source=auth_source,
             guard_roots=guard_roots,
@@ -736,6 +891,14 @@ def sandbox(
         try:
             yield handle
         finally:
+            # Restore the REAL HOME BEFORE the "after" fingerprint so _hash_critical()'s Path.home()
+            # check (and any other Path.home()-derived comparison) matches the "before" snapshot — a
+            # synthetic HOME here would make the ~/.claude root's content-hash asymmetric and trip a
+            # SPURIOUS SandboxLeak. (_restore_env in the outer finally restores HOME again, idempotently.)
+            if _saved["HOME"] is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = _saved["HOME"]
             after = _snapshot()
             changed = [g for g in before if before[g] != after.get(g)]
             if changed:
@@ -762,7 +925,7 @@ def sandbox(
                 # engine's own file mechanisms — `changed` is not [str(claude_root)] alone and we
                 # STILL hard-raise SandboxLeak.
                 #
-                # KNOWN, OWNER-ACCEPTED RISK (Roy, 2026-08-07): unlike the fail-closed session-log
+                # KNOWN, OWNER-ACCEPTED RISK (owner, 2026-08-07): unlike the fail-closed session-log
                 # allowlist above, ~/.claude is NOT a root the subject provably cannot write. The
                 # Canary's `claude` CLI runs the generate()/chat() paths with
                 # `--dangerously-skip-permissions` and NO --disallowedTools (the lean disallow-list
@@ -787,5 +950,12 @@ def sandbox(
     finally:
         _restore_env()
         _restore_emotion_globals()
+        # Restore the real cwd (carrier A) BEFORE rmtree — the cwd must not sit inside the tree being
+        # removed. Guarded: only if we captured one and actually chdir'd; never os.chdir(None).
+        if saved_cwd is not None:
+            try:
+                os.chdir(saved_cwd)
+            except OSError:
+                pass
         if not keep:
             shutil.rmtree(root, ignore_errors=True)

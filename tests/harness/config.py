@@ -41,6 +41,17 @@ class Timeouts:
 SYNTHETIC_USER = "Bob"
 PERSONA_NAME = "Canary"
 
+# Synthetic identity used to de-identify the `claude` CLI's auto-injected context so it cannot leak the
+# REAL account/project into the companion's STORED channels (memories.db, works/*.md, active-recall) at
+# runtime. Single source of truth for the stored-channel de-id seal in ``sandbox.py`` (the next increment
+# after the F1/F2 input-side $USER/$LOGNAME de-id). NEVER a real name/email/org/repo here.
+SYNTHETIC_DISPLAY_NAME = SYNTHETIC_USER          # the CLI account display name (== "Bob")
+SYNTHETIC_EMAIL = "bob@example.invalid"          # RFC-2606 reserved TLD → unmistakably synthetic
+SYNTHETIC_ORG = "Bob's Test Org"
+SYNTHETIC_PROJECT = "workspace"                  # neutral scratch-dir / project name (carrier A)
+SYNTHETIC_ACCOUNT_UUID = "00000000-0000-4000-8000-000000000001"
+SYNTHETIC_ORG_UUID = "00000000-0000-4000-8000-000000000002"
+
 # Exit-code contract shared by the engine driver + runner (ported from the hunt drivers).
 EXIT_DONE = 0
 EXIT_REVIEW = 10   # a detector trip — pause for adjudication
