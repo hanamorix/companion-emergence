@@ -15,9 +15,9 @@ import threading
 import pytest
 
 from brain.engines.consolidation import (
-    Decision,
     _ARCHIVE_FILENAME,
     _GATE_LOCK_FILENAME,
+    Decision,
     run_consolidation,
 )
 from brain.memory.hebbian import HebbianMatrix

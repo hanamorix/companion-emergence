@@ -18,6 +18,29 @@ from brain.chat.extractor import (
 )
 from brain.emotion import vocabulary  # noqa: I001
 
+
+def _promote_pending(persona_dir: Path) -> None:
+    """Promote the persona's pending-candidate queue into memories.db.
+
+    memory-consolidation migration: the extractor's monologue / monologue_emotion
+    / monologue_soul_candidate writes are GATED types — apply_side_effects enqueues
+    them as candidates rather than writing memories.db rows. Tests that assert the
+    end-state DB memory run the consolidation gate with a promote-all classifier
+    (candidate id preserved) so their store.list_active()/store.get() reads hold.
+    """
+    from brain.engines.consolidation import Decision, run_consolidation
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        run_consolidation(
+            store,
+            persona_dir=persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
+    finally:
+        store.close()
+
 # ---------------------------------------------------------------------------
 # Extension emotion fixture — register/unregister cleanly (registry is
 # process-global; tests MUST clean up per vocab_loaded_on_startup pattern).
@@ -59,6 +82,7 @@ def test_memory_writes_land_in_memorystore(persona_dir: Path):
         memory_writes=[MemoryWrite(episode="searched for Loopy, nothing surfaced", salience=0.4)]
     )
     apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -111,6 +135,7 @@ def test_emotion_delta_applies_memory_with_emotion(persona_dir: Path):
 
     out = ExtractorOutput(emotion_delta={"curiosity": 0.15})
     apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -155,6 +180,7 @@ def test_emotion_delta_excludes_zero_channels_from_both_content_and_vector(perso
     # Use registered vocab names: "curiosity" (baseline) and "fear" (baseline).
     out = ExtractorOutput(emotion_delta={"curiosity": 0.1, "fear": 0.0})
     apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -214,6 +240,7 @@ def test_emotion_delta_drops_unregistered_channels(
         emotion_delta={registered_test_emotion: 0.2, "zorblefright": 0.5}
     )
     apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
@@ -307,6 +334,8 @@ def test_crystallisation_queues_theme_and_evidence_combined(persona_dir: Path):
         ]
     )
     apply_side_effects(out, persona_dir=persona_dir)
+
+    _promote_pending(persona_dir)
 
     expected_text = "Ordinary trust — she let the goodnight be ordinary instead of performing it"
 
