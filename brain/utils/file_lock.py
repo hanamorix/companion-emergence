@@ -41,12 +41,23 @@ else:
 
 
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
+def file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     """Acquire an exclusive cross-process lock for ``path``.
 
     Lock lives on a sidecar ``<path>.lock`` next to the data file so
     the data file can be renamed/replaced while the lock is held.
-    Blocks until acquired. Released on context exit.
+    Released on context exit.
+
+    ``blocking`` (default True): block until acquired, then yield True —
+    the historical behaviour; existing callers ``with file_lock(p):``
+    ignore the yielded value and keep working unchanged.
+
+    ``blocking=False``: attempt the lock once. Yields True if acquired
+    (and holds it for the ``with`` body, releasing on exit), or False if
+    another holder has it (the body runs WITHOUT the lock — callers must
+    check the yielded bool and skip their critical section on False).
+    Used by the consolidation gate to skip a run when a concurrent gate
+    is already consolidating.
 
     The sidecar is created as needed and never deleted — it's empty
     metadata. Cleaning it up between operations would race the lock
@@ -57,17 +68,26 @@ def file_lock(path: Path) -> Iterator[None]:
     fh: IO[bytes] = open(lock_path, "ab")
     try:
         if _IS_WINDOWS:
-            _windows_lock_acquire(fh)
+            acquired = _windows_lock_acquire(fh, blocking=blocking)
             try:
-                yield
+                yield acquired
             finally:
-                _windows_lock_release(fh)
+                if acquired:
+                    _windows_lock_release(fh)
         else:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            acquired = True
+            if blocking:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            else:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    acquired = False
             try:
-                yield
+                yield acquired
             finally:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                if acquired:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     finally:
         fh.close()
 
