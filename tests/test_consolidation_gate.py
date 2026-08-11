@@ -73,13 +73,17 @@ def test_c1_automatic_gated_write_enqueues_not_in_db(persona):
 
 # --------------------------------------------------------------------------- C2
 def test_c2_candidate_never_in_recall_but_promoted_is(persona):
+    from brain.chat.prompt import _build_recall_block
+
     tmp, store, _heb, queue = persona
     queue.enqueue(_mem("Bob mentioned the harbor", "monologue"), source="x")
-    # Candidate is invisible to the recall read (it is not a memories.db row).
+    # Candidate is invisible to the real recall block (it is not a memories.db row).
     assert store.search_text("harbor") == []
-    # A genuine memory with matching content DOES surface.
+    assert "harbor" not in _build_recall_block(store, "harbor")
+    # A genuine memory with matching content DOES surface in recall.
     store.create(_mem("the harbor at dawn", "conversation"))
     assert any("harbor" in m.content for m in store.search_text("harbor"))
+    assert "harbor" in _build_recall_block(store, "harbor")
 
 
 # --------------------------------------------------------------------------- C3
@@ -113,7 +117,9 @@ def test_c4_reject_discards_no_side_effects(persona):
     )
     assert store.count(active_only=False) == before  # nothing created
     assert not (tmp / _ARCHIVE_FILENAME).exists()  # no archive
-    assert hebbian.activation_count("anything") == 0  # no edges
+    assert not (tmp / "forgotten_memories.jsonl").exists()  # no grief graveyard entry
+    edge_count = hebbian._conn.execute("SELECT COUNT(*) FROM hebbian_edges").fetchone()[0]
+    assert edge_count == 0  # no edges created at all
     assert queue.drain() == []  # candidate consumed, not re-queued
 
 
@@ -183,7 +189,7 @@ def test_c7_merge_archives_surgical_no_graveyard(persona):
     assert (tmp / _ARCHIVE_FILENAME).exists()
     archive = (tmp / _ARCHIVE_FILENAME).read_text()
     assert "Bob likes tea" in archive
-    assert not (tmp / "graveyard.jsonl").exists()
+    assert not (tmp / "forgotten_memories.jsonl").exists()  # grief graveyard untouched
     # (b) target edited to contain the new fact; (d) candidate not also promoted
     got = store.get(target_id)
     assert "honey" in got.content
@@ -279,6 +285,20 @@ def test_c10_no_candidate_lost_under_enqueue_drain_race(persona):
     remaining = queue.drain()
     total = len(drained) + len(remaining)
     assert total == n  # every enqueued candidate is accounted for — none lost
+
+
+def test_file_lock_non_blocking_contract(tmp_path):
+    """file_lock(blocking=False) yields True when acquired, False when contended,
+    and never holds the lock on a False (the gate's skip contract; the path the
+    Windows branch must also honour)."""
+    p = tmp_path / "x.dat"
+    with file_lock(p, blocking=False) as first:
+        assert first is True
+        with file_lock(p, blocking=False) as second:
+            assert second is False  # a second holder is refused, not blocked
+    # released on exit — acquirable again
+    with file_lock(p, blocking=False) as third:
+        assert third is True
 
 
 # -------------------------------------------------------------------------- C11

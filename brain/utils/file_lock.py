@@ -104,14 +104,22 @@ _WIN_LOCK_INITIAL_SLEEP = 0.005
 _WIN_LOCK_MAX_SLEEP = 0.2
 
 
-def _windows_lock_acquire(fh: IO[bytes]) -> None:
+def _windows_lock_acquire(fh: IO[bytes], *, blocking: bool = True) -> bool:
+    """Acquire the msvcrt lock. Returns True on acquire.
+
+    blocking=True: retry until acquired (returns True). blocking=False: a single
+    LK_NBLCK attempt — returns False immediately if another holder has it (the
+    non-blocking mode used by the consolidation gate's skip-if-contended lock).
+    """
     fh.seek(0)
     sleep_s = _WIN_LOCK_INITIAL_SLEEP
     while True:
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            return
+            return True
         except OSError:
+            if not blocking:
+                return False
             _time.sleep(sleep_s)
             if sleep_s < _WIN_LOCK_MAX_SLEEP:
                 sleep_s = min(sleep_s * 2, _WIN_LOCK_MAX_SLEEP)
