@@ -488,6 +488,23 @@ class HeartbeatEngine:
         else:
             persona_dir = self.state_path.parent
 
+        # Consolidation gate — runs FIRST (before reflex/dream/research) so each
+        # idle cycle consolidates the accumulated pending-candidate queue before
+        # the generative engines produce the next cycle's candidates. Fault-
+        # isolated: a gate failure must not abort the tick. TEMP (Root 2 stopgap).
+        if not dry_run:
+            try:
+                from brain.engines.consolidation import run_consolidation
+
+                run_consolidation(
+                    self.store,
+                    persona_dir=persona_dir,
+                    provider=self.provider,
+                    hebbian=self.hebbian,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("consolidation gate raised; continuing tick")
+
         # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
         reflex_fired, reflex_skipped_count, reflex_error = self._try_fire_reflex(
             trigger, dry_run, config
@@ -940,7 +957,9 @@ class HeartbeatEngine:
                 "provider": self.provider.name(),
             },
         )
-        self.store.create(mem)
+        from brain.memory.pending import route_write
+
+        route_write(self.store, mem, source="heartbeat")
         return mem.id
 
     # --- daemon_state write helpers (all fault-isolated) ---

@@ -66,7 +66,11 @@ def commit_item(
             emotions=dict(item.emotions) if item.emotions else {},
             metadata=metadata,
         )
-        new_id = store.create(memory)
+        from brain.memory.pending import route_write
+
+        # route_write self-classifies by item.label (variable memory_type):
+        # a gated label enqueues; a bypass label writes direct.
+        new_id = route_write(store, memory, source="ingest")
     except Exception as exc:  # noqa: BLE001
         logger.warning("commit_item: store.create failed: %s", exc)
         return None
@@ -75,6 +79,16 @@ def commit_item(
     # We use the longest meaningful word from the text as a keyword query so
     # that store.search_text (a LIKE substring match) has a realistic chance of
     # hitting overlapping memories without requiring the full phrase to match.
+    #
+    # SKIP for a GATED item: a gated label was enqueued as a candidate, not
+    # written to memories.db, so new_id is not a real row — linking to it would
+    # create a dangling hebbian edge (endpoints must resolve to a memories.db
+    # row). Auto-linking for gated content is deferred to the consolidation
+    # gate (which seeds weight-5 edges for corrections/continuations on promote).
+    from brain.memory.pending import GATE_BYPASS_TYPES
+
+    if item.label not in GATE_BYPASS_TYPES:
+        return new_id
     try:
         words = [w for w in item.text.split() if len(w) > 4]
         keyword = words[0] if words else item.text[:20]

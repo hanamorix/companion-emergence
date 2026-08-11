@@ -180,6 +180,36 @@ class HebbianMatrix:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def set_edge_weight(self, a: str, b: str, weight: float) -> None:
+        """Set edge (a, b) to at least `weight` (capped at MAX_WEIGHT).
+
+        UPSERT to MAX(existing, weight): a fresh pair is inserted at `weight`;
+        an existing weaker edge is raised to `weight`; an existing stronger
+        edge is left alone. Unlike ``ensure_edge`` (which no-ops on any
+        existing edge) and ``strengthen`` (which *adds* a delta), this lands
+        the edge at a specific floor regardless of prior state — used by the
+        consolidation gate to seed correction/continuation links at weight 5
+        even over a pre-existing ~0.5 co-activation edge. Self-edges are
+        ignored. `weight` must be positive.
+        """
+        if a == b:
+            return
+        if weight <= 0.0:
+            raise ValueError(f"weight must be positive, got {weight!r}")
+        capped = min(weight, MAX_WEIGHT)
+        lo, hi = _canonical(a, b)
+        self._conn.execute(
+            """
+            INSERT INTO hebbian_edges (memory_a, memory_b, weight)
+            VALUES (?, ?, ?)
+            ON CONFLICT(memory_a, memory_b)
+                DO UPDATE SET weight = MAX(weight, excluded.weight),
+                              last_strengthened_at = CURRENT_TIMESTAMP
+            """,
+            (lo, hi, capped),
+        )
+        self._conn.commit()
+
     def activation_count(self, memory_id: str) -> int:
         """Return the count of edges incident on this memory id."""
         row = self._conn.execute(

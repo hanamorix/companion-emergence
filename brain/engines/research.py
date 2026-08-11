@@ -324,7 +324,9 @@ class ResearchEngine:
                         provider_name=self.provider.name(),
                         searcher_name=self.searcher.name() if web_used else None,
                     )
-                    self.store.create(mem)
+                    from brain.memory.pending import route_write
+
+                    route_write(self.store, mem, source="research")
                     mem_id = mem.id
                 except Exception as exc:
                     logger.warning("research memory create failed for %r: %s", winner.id, exc)
