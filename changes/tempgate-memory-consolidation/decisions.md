@@ -175,3 +175,35 @@ before build. Recorded as ratification record R3 in 1-spec.md.
 Applied to artifacts: spec Pass-1 salience scoping + deferred note + R3 + sign-off resolutions;
 plan Step-4 salience scoping; criteria C18 added, C17b resolved→advisory. Next: cold spec pass, then
 build (instrument→build→cold-review→CI→local commits), back to main at post-build/done gate.
+
+## Stage 5 — BUILD (owner-approved; local only)
+Production implemented per plan: file_lock blocking=False; hebbian.set_edge_weight; store.db_path/
+persona_dir + search_text bump=False; NEW brain/memory/pending.py (PendingQueue + route_write +
+GATE_BYPASS_TYPES={journal_entry,initiate_outbound} + SALIENCE_ELIGIBLE_TYPES={monologue,
+monologue_emotion,monologue_soul_candidate}); NEW brain/engines/consolidation.py (drain + Pass1/2 +
+promote/merge/reject + non-blocking gate lock); heartbeat run_tick wiring (gate first); 8 automatic
+writers → route_write; interior-continuity (ambient.py, monologue/recall.py) read the queue.
+ingest auto-hebbian guarded to bypass-only (gated candidate has no DB row → would dangle).
+
+New gate tests: tests/test_consolidation_gate.py — 19 pass, covering C1-C14, C18.
+
+**Existing-test migration (44 fail on old direct-to-DB contract → new queue contract).** Delegated to
+a cold builder with strict anti-masking rules; result 4233 passed / 0 failed / 6 xfailed, ruff clean.
+Category-B xfails (behavior genuinely removed, deferred to Phase 4, assertions left intact):
+monologue_trace no longer fades/is-lost in DB (2), recall keep-sharp bump is a no-op (1), ambient
+faded-summary render N/A (1). These are legitimate (traces are ephemeral queue items now).
+
+**REAL REGRESSION found by the migration + FIXED (production).**
+`HeartbeatEngine._write_daemon_state_for_dream` re-fetched the just-fired dream via store.get(id) →
+None (dream now a gated candidate) → wrote nothing. Reflex/research daemon writers likewise degraded
+to synthetic fallbacks. FIX: all three now read the just-fired memory from the pending queue
+(store.persona_dir) with a store fallback. The migration's strict-xfail on that dream test is removed;
+all 77 heartbeat tests pass. Heartbeat daemon AGGREGATE (emotional state across memories) intentionally
+reads consolidated memories only — consistent with Roy's consolidated-only feeds ruling.
+
+Migration also surfaced (flagged, not my regression): an unrelated latent timezone flake in
+initiate/test_review (made deterministic); and :memory:-store tests leaking a pending_candidates.jsonl
+to CWD (gitignored litter; production never uses :memory:).
+
+NEXT: full-suite re-run (confirm green after the production daemon fix) → stage-6 cold review of the
+BUILD (independent) → commit → back to main at the done gate.

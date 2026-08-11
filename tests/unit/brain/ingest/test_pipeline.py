@@ -11,6 +11,7 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.ingest.buffer import (
     ingest_turn,
     read_backoff,
@@ -28,6 +29,13 @@ from brain.ingest.pipeline import (
 from brain.ingest.soul_queue import list_soul_candidates
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+
+# memory-consolidation migration: gated ingest labels (fact/observation/…) are
+# enqueued as candidates, not written to memories.db. Promote them through the
+# consolidation gate (inject a promote-all classifier) so the pre-existing
+# store.get() end-state assertions hold — the candidate id is preserved on
+# promote, so report.memory_ids still resolves.
+_PROMOTE_ALL = lambda _cand, _ctx: Decision("new")  # noqa: E731
 
 # ---------------------------------------------------------------------------
 # Fake providers for pipeline tests
@@ -103,8 +111,10 @@ def tracking_provider() -> _TrackingProvider:
 
 
 @pytest.fixture
-def store() -> MemoryStore:
-    return MemoryStore(":memory:")
+def store(tmp_path) -> MemoryStore:
+    # On-disk so store.persona_dir == the persona_dir passed to close_session:
+    # gated ingest labels enqueue to <persona_dir>/pending_candidates.jsonl.
+    return MemoryStore(tmp_path / "memories.db")
 
 
 @pytest.fixture
@@ -179,7 +189,8 @@ def test_close_session_full_path_correct_counts(
     assert report.deduped == 0
     assert report.errors == 0
     assert len(report.memory_ids) == 2
-    # Both memories should exist in the store.
+    # Gated candidates are enqueued; promote them, then both memories exist.
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     for mid in report.memory_ids:
         assert store.get(mid) is not None
 
@@ -286,6 +297,8 @@ def test_close_session_memory_and_soul_candidate_both_written(
     assert len(report.memory_ids) == 1
 
     mem_id = report.memory_ids[0]
+    # Gated candidate — promote it, then it is a real memories.db row (id kept).
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     memory = store.get(mem_id)
     assert memory is not None
     assert memory.content == "The most important truth"

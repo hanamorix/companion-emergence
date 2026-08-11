@@ -41,13 +41,15 @@ def test_parse_extraction_reads_emotions():
     assert item.emotions == {"longing": 7.0}
 
 
-def test_commit_item_passes_emotions_to_memory():
-    """commit_item forwards item.emotions into the committed Memory."""
+def test_commit_item_passes_emotions_to_memory(tmp_path):
+    """commit_item forwards item.emotions into the committed (enqueued) Memory."""
     from brain.ingest.commit import commit_item
     from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.pending import PendingQueue
     from brain.memory.store import MemoryStore
 
-    store = MemoryStore(":memory:")
+    # On-disk store so the gated "observation" label enqueues to a real queue.
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
     item = ExtractedItem(
         text="she seemed wistful today",
@@ -58,8 +60,7 @@ def test_commit_item_passes_emotions_to_memory():
     mem_id = commit_item(item, session_id="sess_w7", store=store, hebbian=hebbian)
 
     assert mem_id is not None
-    memory = store.get(mem_id)
-    assert memory is not None
+    memory = PendingQueue(store.persona_dir).read_recent("observation", limit=1)[0]
     assert memory.emotions == {"longing": 7.0, "nostalgia": 5.0}
 
 
@@ -71,13 +72,15 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
     from unittest.mock import patch
 
     from brain.emotion.aggregate import aggregate_state
+    from brain.engines.consolidation import Decision, run_consolidation
     from brain.ingest.buffer import ingest_turn
     from brain.ingest.extract import ExtractionOutcome
     from brain.ingest.pipeline import close_session
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
 
-    store = MemoryStore(":memory:")
+    # On-disk so store.persona_dir == tmp_path (where the gated candidate lands).
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
 
     # Write one conversation turn so the buffer exists.
@@ -112,6 +115,14 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
 
     assert report.committed >= 1
     assert len(report.memory_ids) >= 1
+
+    # The gated "feeling" candidate is enqueued; promote it into memories.db so
+    # the emotion aggregate (which reads store rows) sees it. Id is preserved.
+    run_consolidation(
+        store,
+        persona_dir=store.persona_dir,
+        classifier=lambda _c, _ctx: Decision("new"),
+    )
 
     # At least one committed memory carries non-empty emotions.
     mems = [store.get(mid) for mid in report.memory_ids]

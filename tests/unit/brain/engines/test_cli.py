@@ -60,7 +60,17 @@ def test_nell_dream_real_cycle_with_fake_provider(
     rc = main(["dream", "--persona", "nell", "--provider", "fake"])
     assert rc == 0
 
+    # The dream is written as a gated pending-candidate, not straight to
+    # memories.db. Promote the queue (id preserved) so the end-state DB
+    # assertion — a real dream memory exists — still holds.
+    from brain.engines.consolidation import Decision, run_consolidation
+
     store = MemoryStore(db_path=nell_persona / "memories.db")
+    run_consolidation(
+        store,
+        persona_dir=store.persona_dir,
+        classifier=lambda _c, _ctx: Decision("new"),
+    )
     dreams = store.list_by_type("dream")
     store.close()
     assert len(dreams) == 1

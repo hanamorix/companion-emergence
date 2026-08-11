@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from brain.bridge.provider import FakeProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.heartbeat import (
     HeartbeatConfig,
     HeartbeatEngine,
@@ -371,8 +372,14 @@ def test_heartbeat_state_save_rejects_naive_datetime(tmp_path: Path) -> None:
 
 @pytest.fixture
 def live_engine(tmp_path: Path) -> HeartbeatEngine:
-    """Engine with in-memory store/hebbian and tmp log/state paths."""
-    store = MemoryStore(":memory:")
+    """Engine with an on-disk store + in-memory hebbian and tmp log/state paths.
+
+    The store is on-disk (not ":memory:") so store.persona_dir == tmp_path,
+    matching the persona_dir the in-tick consolidation gate uses. Gated
+    candidates (dream/research/heartbeat) then land in tmp_path's pending queue
+    rather than leaking to the CWD.
+    """
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
     return HeartbeatEngine(
         store=store,
@@ -384,6 +391,19 @@ def live_engine(tmp_path: Path) -> HeartbeatEngine:
         heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
         persona_name="Nell",
         persona_system_prompt="You are Nell.",
+    )
+
+
+# memory-consolidation migration: dream/research/heartbeat are gated types. The
+# generative engines enqueue candidates; the in-tick consolidation gate runs
+# BEFORE they fire, so a candidate produced this tick is only promoted next tick.
+# Tests that inspect the end-state DB memory promote the queue explicitly with a
+# promote-all classifier (candidate id preserved).
+def _promote_queue(engine) -> None:
+    run_consolidation(
+        engine.store,
+        persona_dir=engine.store.persona_dir,
+        classifier=lambda _c, _ctx: Decision("new"),
     )
 
 
@@ -548,6 +568,7 @@ def test_heartbeat_memory_emitted_when_always_mode(live_engine: HeartbeatEngine)
     live_engine.run_tick(trigger="open")  # init, no memory
     live_engine.run_tick(trigger="close")
 
+    _promote_queue(live_engine)  # promote the heartbeat candidate into memories.db
     hb_memories = live_engine.store.list_by_type("heartbeat")
     assert len(hb_memories) == 1
     assert hb_memories[0].content.startswith("HEARTBEAT:")
@@ -600,6 +621,7 @@ def test_heartbeat_memory_metadata_links_to_dream_id(
     assert result.dream_id is not None
     assert result.heartbeat_memory_id is not None
 
+    _promote_queue(live_engine)  # promote dream + heartbeat candidates (ids kept)
     hb_mem = live_engine.store.get(result.heartbeat_memory_id)
     assert hb_mem is not None
     assert hb_mem.metadata.get("dream_id") == result.dream_id
@@ -1833,7 +1855,10 @@ def _make_engine_with_persona_dir(tmp_path: Path) -> tuple[HeartbeatEngine, Path
     """
     interests_path = tmp_path / "interests.json"
     interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
-    store = MemoryStore(":memory:")
+    # On-disk store so store.persona_dir == tmp_path (matches the persona_dir the
+    # in-tick consolidation gate + daemon_state writes use); gated candidates
+    # land in tmp_path's pending queue, not the CWD.
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     engine = HeartbeatEngine(
         store=store,
@@ -1880,7 +1905,11 @@ def test_daemon_state_heartbeat_entry_written_after_tick(tmp_path: Path) -> None
 
 
 def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> None:
-    """When a dream fires, daemon_state.json has last_dream populated."""
+    """When a dream fires, daemon_state.json has last_dream populated.
+
+    Regression fixed: _write_daemon_state_for_dream now reads the just-fired
+    dream from the pending queue (where gated candidates live), not memories.db.
+    """
     from brain.engines.daemon_state import load_daemon_state
 
     engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
@@ -2197,7 +2226,10 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         ]
     )
 
-    store = MemoryStore(":memory:")
+    # On-disk so store.persona_dir == tmp_path (== interests_path.parent, the
+    # heartbeat's persona_dir): the gated "research" candidate lands in that
+    # queue and can be promoted for the end-state DB assertion below.
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         old_mem = Memory.create_new(
@@ -2239,6 +2271,14 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         persona_dir = interests_path.parent
         assert "canary fact" in read_notes_tail(persona_dir, interest_id)
 
+        # The research memory is enqueued as a gated candidate; promote it so the
+        # canary's DB-visibility assertion (research really persisted, not a
+        # vignette) still holds. Candidate id is preserved.
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
         mems = store.list_by_type("research", active_only=True, limit=5)
         assert any("followed the thread" in m.content for m in mems)
 
