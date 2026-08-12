@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
@@ -58,7 +58,9 @@ def register_tools(
         ]
 
     @server.call_tool()
-    async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def _call_tool(
+        name: str, arguments: dict[str, Any]
+    ) -> list[TextContent | ImageContent]:
         try:
             result = dispatch(
                 name,
@@ -67,6 +69,28 @@ def register_tools(
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
+            # Viewable-image result: read_file (and any future image-returning
+            # tool) signals an image with a structured `image` key. Emit an MCP
+            # ImageContent block so the model actually SEES the pixels under the
+            # disallowed-builtins posture (P0 spike mechanism). The audit line
+            # summarizes the image compactly — NEVER the base64 (red-team G5 /
+            # C15).
+            if isinstance(result, dict) and isinstance(result.get("image"), dict):
+                img = result["image"]
+                media_type = str(img.get("media_type", ""))
+                data_b64 = str(img.get("data_b64", ""))
+                size_bytes = img.get("size_bytes")
+                summary = (
+                    f"{media_type} {size_bytes}B" if size_bytes is not None else media_type
+                )
+                log_invocation(
+                    persona_dir,
+                    name=name,
+                    arguments=arguments,
+                    result_summary=_summarize(summary),
+                    monologue_text=None,
+                )
+                return [ImageContent(type="image", data=data_b64, mimeType=media_type)]
             payload = json.dumps(result, default=str, ensure_ascii=False)
             monologue_text: str | None = (
                 result.get("monologue_text") if isinstance(result, dict) else None

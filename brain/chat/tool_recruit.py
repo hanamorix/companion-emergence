@@ -65,12 +65,19 @@ def select_tools(
     signal: SalienceSignal,
     *,
     base: tuple[str, ...] = NELL_TOOL_NAMES,
+    force_files: bool = False,
 ) -> list[str]:
     """Return the list of tool names allowed for this turn.
 
     Fails open: maximal signal → full suite (today's behaviour). Non-maximal
     turns get REFLEXIVE_CORE plus whichever heavier faculties the salience
     flags call for. Result is ordered by *base* so the LLM sees a stable list.
+
+    force_files: when a file was shared this turn, union the file tools (incl.
+    read_file) into the allowed set regardless of salience score, so the model
+    can always read the file it was just handed (P0 E5). A maximal signal
+    already recruits everything, so force_files only matters on non-maximal
+    turns where a low-text file-send would otherwise fail to recruit read_file.
     """
     if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
@@ -81,6 +88,9 @@ def select_tools(
         keep.update(_MEMORY_TOOLS)
 
     if signal.mentions_file_or_path:
+        keep.update(_FILE_TOOLS)
+
+    if force_files:
         keep.update(_FILE_TOOLS)
 
     # Preserve base ordering; drop anything not in base.

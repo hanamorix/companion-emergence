@@ -86,3 +86,24 @@ def test_deferred_d1_reach_valve_always_in_hand():
     project_companion_emergence_deferred.md."""
     assert "reach_for_capability" in REFLEXIVE_CORE
     assert "reach_for_capability" in select_tools(assess_salience("ok"))
+
+
+def test_force_files_recruits_read_file_on_low_salience_turn():
+    """C7b — when a file was shared this turn, read_file is force-included even
+    on a low-salience turn with no file/path mention."""
+    signal = assess_salience("what do you think?")  # low salience, no file mention
+    assert signal.score < 0.999
+    without = select_tools(signal)
+    assert "read_file" not in without, "premise: this turn does not recruit read_file on its own"
+    forced = select_tools(signal, force_files=True)
+    assert "read_file" in forced
+    assert "list_directory" in forced
+
+
+def test_force_files_default_off_does_not_over_recruit():
+    """C7 guard — force_files defaults off, so a no-file low-salience turn is NOT
+    given the file tools (guards against always-on over-recruitment)."""
+    signal = assess_salience("just chatting")
+    assert signal.score < 0.999
+    allowed = select_tools(signal)  # force_files defaults False
+    assert "read_file" not in allowed
