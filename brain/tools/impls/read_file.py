@@ -1,6 +1,7 @@
 """read_file tool — read-only, guarded, audited. Used only when the user asks."""
 from __future__ import annotations
 
+import base64
 import difflib
 import json
 import os
@@ -8,15 +9,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.images import sniff_media_type
 from brain.tools.impls import _read_cache
 
 _FILE_READ_MAX_BYTES = tunables.register("files.read_max_bytes", 256 * 1024)
+# Viewable-image support. The image branch runs BEFORE the 256KB text cap so
+# a real photo (>256KB text cap, <= image_max_bytes) is returned as a viewable
+# image rather than refused by the text cap (P0 red-team F-1 cap-ordering).
+# image_max_bytes defaults >= the 20MB /upload cap so there is no
+# upload-succeeds-but-read-refuses dead zone.
+_FILE_IMAGE_TYPES = tunables.register(
+    "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"]
+)
+_FILE_IMAGE_MAX_BYTES = tunables.register("files.image_max_bytes", 20 * 1024 * 1024)
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
 
 
 def _file_read_max_bytes() -> int:
     return tunables.get_tunable("files.read_max_bytes", _FILE_READ_MAX_BYTES)
+
+
+def _image_types() -> list:
+    return tunables.get_tunable("files.image_types", _FILE_IMAGE_TYPES)
+
+
+def _image_max_bytes() -> int:
+    return tunables.get_tunable("files.image_max_bytes", _FILE_IMAGE_MAX_BYTES)
 
 
 def _suggest(target: Path) -> list[str]:
@@ -98,6 +117,61 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             error="not a readable file",
         )
         return {"error": f"not a readable file: {p}", "did_you_mean": suggestions}
+
+    # Image branch — MUST run BEFORE the text size-cap check below so a real
+    # photo (larger than the 256KB text cap but within files.image_max_bytes)
+    # is returned as a viewable image, not refused by the text cap (P0 red-team
+    # F-1 cap-ordering). Sniff the media type from a small magic-byte prefix.
+    try:
+        with p.open("rb") as _fh:
+            _prefix = _fh.read(32)
+    except OSError:
+        _prefix = b""
+    sniffed = sniff_media_type(_prefix)
+    if sniffed is not None and sniffed in _image_types():
+        img_size = p.stat().st_size
+        img_cap = _image_max_bytes()
+        if img_size > img_cap:
+            _audit(
+                persona_dir,
+                tool="read_file",
+                path=raw,
+                resolved=str(p),
+                bytes_=img_size,
+                ok=False,
+                error="image too large",
+            )
+            return {"error": f"image too large ({img_size} bytes > {img_cap} cap) — not shown"}
+        _dedup_key = os.path.normcase(os.path.realpath(str(p)))
+        if _read_cache.seen_recently(_dedup_key):
+            _audit(
+                persona_dir, tool="read_file", path=raw, resolved=str(p),
+                bytes_=0, ok=True, error="deduped",
+            )
+            return {
+                "path": str(p),
+                "deduped": True,
+                "note": "you already read this file moments ago this turn — its content is above.",
+            }
+        _read_cache.mark(_dedup_key)
+        try:
+            data = p.read_bytes()
+        except OSError as exc:
+            _audit(
+                persona_dir, tool="read_file", path=raw, resolved=str(p),
+                bytes_=img_size, ok=False, error=str(exc),
+            )
+            return {"error": f"read failed: {exc}"}
+        # Audit records the size, never the base64 (red-team G5 / C15).
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=img_size, ok=True)
+        return {
+            "path": str(p),
+            "image": {
+                "media_type": sniffed,
+                "data_b64": base64.b64encode(data).decode("ascii"),
+                "size_bytes": img_size,
+            },
+        }
 
     cap = _file_read_max_bytes()
     size = p.stat().st_size
