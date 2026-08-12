@@ -42,6 +42,18 @@ Verbatim, on the open axes escalated at the gate-4 lap-2 stop:
   pre-release cost.
 
 ## Gate log
+- **Gate 7 (code) — 2026-08-12.** Build committed `ffa907c9` (base `cd29bc61`). Stage-6 cold code red-team
+  (opus, `a1d673607448c4ed8`, mechanical diff `git diff cd29bc61 ffa907c9`): worst severity **ADVISORY**,
+  routing **CLEAN → proceed**. Record: `6-redteam-code.md`. Independently verified: the one CI failure
+  (`test_review_tick_gate_blocks_send_records_hold`) reproduces on the base commit (date-dependent,
+  out-of-footprint) — genuinely pre-existing. **In-place fix (stage 7, traceable to plan step 4):** narrowed
+  `select_tools(force_files=...)` from the whole `_FILE_TOOLS` to just `{read_file}` so a bare file-send
+  never force-enables the write-capable `propose_write`; test updated; ruff + tool_recruit tests green.
+  Residual advisories noted, not blocking (dead `_SHA256_HEX_RE`, dormant `ImageBlock`, C5 pre-change repro
+  = stage-8). **STOP at the post-build gate per owner instruction** — do NOT proceed to stage 8 (live
+  harness C1/C13/C16-live are usage-gated). Escalating to owner at this gate: **PDF-text-readability**
+  (owner named PDF as readable; mechanism stores PDFs but returns "binary — not shown" — needs a PDF-text
+  extraction step; text is fully readable now).
 - **Gate 4 (plan), lap 3 = FINAL confirmation red-team + route-to-build — 2026-08-12.** Owner ruled scope A;
   artifacts revised for scope A (steps 9-11: `brain/files.py` store + `/upload` widening + engine file-ref
   resolution; C8b/C16 gating). Final cold red-team (opus, fresh subagent `a709f806a20d8cc8e`), with the owner

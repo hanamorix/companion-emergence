@@ -73,11 +73,14 @@ def select_tools(
     turns get REFLEXIVE_CORE plus whichever heavier faculties the salience
     flags call for. Result is ordered by *base* so the LLM sees a stable list.
 
-    force_files: when a file was shared this turn, union the file tools (incl.
-    read_file) into the allowed set regardless of salience score, so the model
-    can always read the file it was just handed (P0 E5). A maximal signal
-    already recruits everything, so force_files only matters on non-maximal
-    turns where a low-text file-send would otherwise fail to recruit read_file.
+    force_files: when a file was shared this turn, union {read_file} into the
+    allowed set regardless of salience score, so the model can always read the
+    file it was just handed (P0 E5, plan step 4). Only read_file is forced — the
+    heavier / write-capable file tools (list_directory, propose_write) stay
+    salience-gated, so a bare file-send does not force-enable a write tool. A
+    maximal signal already recruits everything, so force_files only matters on
+    non-maximal turns where a low-text file-send would otherwise fail to recruit
+    read_file.
     """
     if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
@@ -91,7 +94,7 @@ def select_tools(
         keep.update(_FILE_TOOLS)
 
     if force_files:
-        keep.update(_FILE_TOOLS)
+        keep.add("read_file")
 
     # Preserve base ordering; drop anything not in base.
     return [t for t in base if t in keep]

@@ -97,7 +97,11 @@ def test_force_files_recruits_read_file_on_low_salience_turn():
     assert "read_file" not in without, "premise: this turn does not recruit read_file on its own"
     forced = select_tools(signal, force_files=True)
     assert "read_file" in forced
-    assert "list_directory" in forced
+    # Only read_file is force-recruited (plan step 4). The heavier / write-capable
+    # file tools stay salience-gated, so a bare file-send never force-enables a
+    # write tool.
+    assert "list_directory" not in forced
+    assert "propose_write" not in forced
 
 
 def test_force_files_default_off_does_not_over_recruit():
