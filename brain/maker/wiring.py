@@ -66,6 +66,9 @@ def write_making_memory(store, making: Making, *, emotions: dict[str, float]) ->
         tags=["making", making.disposition], emotions=emotions or None,
     )
     try:
-        store.create(mem)
+        # Automatic generated write → route through the consolidation gate (gated by memory_type).
+        from brain.memory.pending import route_write
+
+        route_write(store, mem, source="maker")
     except Exception:
         logger.exception("maker: act-memory write failed")
