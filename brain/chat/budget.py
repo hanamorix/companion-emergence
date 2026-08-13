@@ -1,15 +1,23 @@
 """Prompt-size guard for engine.respond — the last-resort backstop.
 
-apply_budget estimates the assembled prompt size (len(content_text) // 4 per
-message) and, only when it exceeds ``max_tokens``:
-  1. Fires the PERSISTED compaction core (brain/chat/compaction.py) on the
-     conversation buffer — folding old, already-extracted turns into the head
-     summary block and archiving them. This mirrors the daily cadence and shrinks
-     the buffer so the NEXT turn is back under cap (so apply_budget does not fire
-     again until growth re-crosses the cap — not every turn).
+**Normal compaction is startup/idle-only (owner ruling 2026-08-13).** Routine
+compaction runs at startup + during idle ticks (supervisor), never mid-exchange.
+This module is the *emergency net* for the one case that gate cannot cover: a long
+ACTIVE session with no idle gap whose live prompt has ALREADY crossed the cap
+(properly Phase 7 / ROOT1's job). apply_budget estimates the assembled prompt size
+(len(content_text) // 4 per message) and, only when it exceeds ``max_tokens``:
+  1. LAST-RESORT persisted fold: fires the compaction core (emergency_fold_24h) on
+     the buffer — folding old, already-extracted turns into the head summary block
+     and archiving them, so the NEXT turn is back under cap. This is a rarely-hit
+     safety valve: with startup/idle compaction keeping normal sessions bounded, it
+     only fires when that has failed to keep up (a pathological active session). It
+     is NOT routine mid-exchange compaction; it triggers only when already over-cap.
   2. For the CURRENT over-cap prompt, applies a DETERMINISTIC truncation note as
-     the in-prompt floor — a non-LLM trim (the per-turn provider.generate summary
-     this module used to insert is removed; it busted prompt caching every turn).
+     the in-prompt floor — a non-LLM, no-buffer-write WINDOWING trim (the per-turn
+     provider.generate summary this module used to insert is removed; it busted
+     prompt caching every turn). **This step, not step 1, is what actually bounds
+     the within-session prompt** — so the size bound survives regardless of the
+     idle-gate, and idle-gating routine compaction cannot cause unbounded growth.
 
 The original system message is never compressed.
 """
