@@ -673,11 +673,14 @@ class CascadeResult:
 
 
 def _bucket_of_age(age: timedelta) -> str:
-    """Age-band a duration by the oldest-edge classifier: ``24h`` if ≤48h, ``48h``
-    if ≤72h, else terminal ``72h``. See plan §1.3 step 3."""
-    if age <= _AGE_48H:
+    """Age-band a duration by the oldest-edge classifier: ``24h`` if age < 48h,
+    ``48h`` if < 72h, else terminal ``72h`` (plan §1.3 step 3). The boundary is
+    strict ``<`` so a cohort sown at day 0 graduates tier1→tier2→tier3 on the daily
+    passes at exactly day 1 / day 2 / day 3 (age 24h → tier1, 48h → tier2, 72h →
+    tier3) — matching the criterion-C14 graduation cadence."""
+    if age < _AGE_48H:
         return "24h"
-    if age <= _AGE_72H:
+    if age < _AGE_72H:
         return "48h"
     return "72h"
 
