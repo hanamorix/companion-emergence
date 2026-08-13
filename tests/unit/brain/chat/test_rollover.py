@@ -426,3 +426,71 @@ def test_c18_without_carried_cursor_would_reextract_fail_demo(tmp_path: Path) ->
         store.close()
         hebbian.close()
         embeddings.close()
+
+
+def test_c1_mid_rollover_window_redirects_not_resurrect(tmp_path: Path) -> None:
+    """C-1 regression (stage-6 concurrency): during the mid-rollover window — the
+    ``rolled_to`` pointer is already written (the rollover writes it FIRST), but the
+    old sid is still cached in ``_SESSIONS`` (registry not yet evicted) AND its
+    buffer is not yet deleted — a request for the old sid MUST resolve to the
+    successor, never the stale-cached old session.
+
+    Pre-fix, ``get_or_hydrate_session`` short-circuited on the ``_SESSIONS`` cache
+    hit BEFORE consulting the pointer, so it returned the old session; the caller
+    then appended via ``ingest_turn`` (append-creates the file), resurrecting the
+    deleted old buffer and orphaning the turn. The assertion
+    ``resolved.session_id == new_sid`` fails against that pre-fix behavior — this is
+    the shown-able-to-fail regression guard. The whole C1–C22 suite missed this
+    race because none of them held a stale cache entry across the redirect.
+    """
+    from brain.chat.session import (
+        create_session,
+        get_or_hydrate_session,
+        get_session,
+        reset_registry,
+    )
+    from brain.ingest.buffer import read_session, write_rolled_to
+
+    persona = _persona(tmp_path)
+    reset_registry()
+    try:
+        # Old session: live, cached in _SESSIONS, with a real buffer.
+        old = create_session(_PERSONA_NAME)
+        old_sid = old.session_id
+        ingest_turn(persona, {"session_id": old_sid, "speaker": "user", "text": "hi"})
+        ingest_turn(
+            persona, {"session_id": old_sid, "speaker": "assistant", "text": "yo"}
+        )
+
+        # Successor session: seeded and present on disk.
+        new = create_session(_PERSONA_NAME)
+        new_sid = new.session_id
+        ingest_turn(
+            persona, {"session_id": new_sid, "speaker": "summary", "text": "[seed]"}
+        )
+
+        # --- Enter the mid-rollover window ---
+        # Pointer down (written first by the rollover); registry NOT yet evicted
+        # (old still cached) and the old buffer NOT yet deleted.
+        write_rolled_to(persona, old_sid, new_sid)
+        assert get_session(old_sid) is not None, "precondition: old still cached"
+        assert read_session(persona, old_sid), "precondition: old buffer still present"
+
+        # A request arriving now must resolve to the successor, not the stale cache.
+        resolved = get_or_hydrate_session(persona, _PERSONA_NAME, old_sid)
+        assert resolved is not None
+        assert resolved.session_id == new_sid, (
+            "mid-rollover request resolved to the stale-cached OLD session — "
+            "the C-1 race (resurrectable old buffer) is not closed"
+        )
+
+        # A turn on the resolved session lands in the successor buffer, and the old
+        # buffer is never re-grown beyond its two pre-window turns.
+        ingest_turn(
+            persona,
+            {"session_id": resolved.session_id, "speaker": "user", "text": "cont"},
+        )
+        assert any(t.get("text") == "cont" for t in read_session(persona, new_sid))
+        assert len(read_session(persona, old_sid)) == 2, "old buffer must not grow"
+    finally:
+        reset_registry()

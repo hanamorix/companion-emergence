@@ -164,20 +164,27 @@ def get_or_hydrate_session(
     from brain.ingest.buffer import read_session
 
     with _LOCK:  # RLock — the successor full-follow below recurses safely
+        # C-1 (stage-6 concurrency): the successor pointer is AUTHORITATIVE and is
+        # consulted FIRST — before the _SESSIONS cache and before the on-disk
+        # buffer. A rollover writes ``rolled_to`` before it evicts the registry or
+        # deletes the old buffer, so from that instant any request for the old sid
+        # must resolve to the successor. Checking it first closes the mid-rollover
+        # window in which a stale cache entry (registry not yet evicted) OR a
+        # not-yet-deleted old buffer would otherwise shadow the redirect — which
+        # let ``ingest_turn`` append-create (resurrect) the deleted buffer and
+        # orphan the turn. Full-follow to the live end (L-1); a cyclic pointer
+        # aborts to None via the visited-set guard, not a depth cap.
+        successor = _resolve_successor(persona_dir, session_id)
+        if successor is not None:
+            return get_or_hydrate_session(persona_dir, persona_name, successor)
+
         existing = _SESSIONS.get(session_id)
         if existing is not None:
             return existing
 
         turns = read_session(persona_dir, session_id)
         if not turns:
-            # Post-rollover state (evicted + buffer deleted): follow the successor
-            # pointer chain to the CURRENT live successor (full-follow, L-1), so a
-            # client dormant across many weekly rollovers still resolves. A corrupt
-            # cyclic pointer aborts to None (404-then-reattach) via a visited-set
-            # guard — NOT a depth cap (a legitimately long chain must resolve).
-            successor = _resolve_successor(persona_dir, session_id)
-            if successor is not None:
-                return get_or_hydrate_session(persona_dir, persona_name, successor)
+            # No successor pointer and no turns → the session is genuinely gone.
             return None
 
         # Count user+assistant pairs. The on-disk turn count is the

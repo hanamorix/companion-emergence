@@ -793,8 +793,6 @@ def _install_cascade_row(
     """Archive (removed raw + old summary) BEFORE rewrite, then install the new
     sectioned summary row + retained tail in ONE atomic rewrite. Returns the new
     gen, or ``None`` on an archive failure (buffer left untouched)."""
-    from pathlib import Path  # noqa: F401 — parity with module's lazy-import style
-
     new_gen = _summary_gen(existing_summary) + 1
     all_untils = [_parse_ts(s.get("covers_until_ts")) for s in new_sections.values()]
     covers_until = _iso_seconds(max([u for u in all_untils if u], default=now))
