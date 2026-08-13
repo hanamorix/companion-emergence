@@ -17,7 +17,6 @@ The original system message is never compressed.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage
@@ -72,14 +71,15 @@ def apply_budget(
         try:
             from brain.chat.compaction import (
                 build_compaction_provider,
-                compact_conversation,
+                emergency_fold_24h,
             )
 
-            compact_conversation(
+            # 24h-only emergency fold on the sectioned row (bounds the live head
+            # in-turn; does NOT run the full age-gated re-bucket, which stays on
+            # the daily tick). Tiers 2/3 are left untouched. See plan §1.3 / C22.
+            emergency_fold_24h(
                 persona_dir,
                 session_id,
-                older_than=timedelta(0),
-                fold_existing_summary=True,
                 # Compaction always folds with COMPACTION_MODEL, not the chat model.
                 provider=build_compaction_provider(persona_dir),
                 min_keep_tail=preserve_tail_msgs,
