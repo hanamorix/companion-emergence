@@ -35,11 +35,17 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import compact_conversation
-from brain.ingest.buffer import list_active_sessions, read_cursor, read_session
+from brain.ingest.buffer import (
+    list_active_sessions,
+    read_cursor,
+    read_session,
+    rewrite_session_atomic,
+)
 
 logger = logging.getLogger(__name__)
 
 _MARKER_NAME = ".compat_migrated"
+_SECTIONS_MARKER_NAME = ".sections_migrated"
 
 # Reasons (from CompactionResult.reason) that mean "nothing left to fold now" — a
 # genuine drained end-state. Everything else that returns compacted=False is a
@@ -231,3 +237,131 @@ def run_backlog_migration(
         # Belt-and-suspenders: the entry point must never break bridge startup.
         logger.exception("backlog migration: top-level failure; marker NOT written")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Sections migration (Phase 1 cascade) — legacy single-layer summary → tier 3
+# ---------------------------------------------------------------------------
+#
+# An existing persona carries ONE single-layer summary of accumulated (often
+# months-old) history. The oldest-edge cascade classifier keys on
+# ``covers_from_ts``, so a section-less legacy row would otherwise be mislabelled
+# "yesterday" and re-folded as recent — reproducing #82 for 100% of current
+# personas. This one-time, marker-gated migration rewrites that row into the
+# sectioned form seeded as TIER 3 ("a few days ago") with an explicit OLD-FLOOR
+# ``covers_from_ts`` (``migration_now − _LEGACY_AGE_FLOOR`` (96h)), set
+# UNCONDITIONALLY — never ``covers_until_ts`` — so the blob lands in and STAYS in
+# terminal tier 3. It is an in-place shape rewrite (no provider call). See plan §4.
+
+
+@dataclass
+class SectionsMigrationResult:
+    """Outcome of one run_sections_migration call (for logging + tests)."""
+
+    already_migrated: bool = False   # marker present at entry → no-op
+    marker_written: bool = False     # all sessions processed → marker written
+    sessions_seen: int = 0
+    sessions_migrated: int = 0       # rows rewritten legacy → sectioned this run
+
+
+def _sections_marker_path(persona_dir: Path) -> Path:
+    return Path(persona_dir) / "archived_conversations" / _SECTIONS_MARKER_NAME
+
+
+def _migrate_one_session_sections(persona_dir: Path, session_id: str, *, now: datetime) -> bool:
+    """Rewrite a session's legacy single-layer summary row into the sectioned form
+    (tier 3, old-floor covers_from_ts). Idempotent: an already-sectioned row (or no
+    summary / empty summary) is a no-op returning False."""
+    from brain.chat.compaction import _LEGACY_AGE_FLOOR, _render_sections
+
+    turns = read_session(persona_dir, session_id)
+    summary_idx: int | None = None
+    for i, t in enumerate(turns):
+        if t.get("speaker") == "summary":
+            summary_idx = i
+            break
+    if summary_idx is None:
+        return False
+    row = turns[summary_idx]
+    comp = dict(row.get("compaction") or {})
+    sections = comp.get("sections")
+    if isinstance(sections, dict) and sections:
+        return False  # already sectioned → idempotent no-op
+    text = (row.get("text") or "").strip()
+    if not text:
+        return False
+
+    covers_until = comp.get("covers_until_ts") or row.get("ts") or now.isoformat(timespec="seconds")
+    covers_from = (now - _LEGACY_AGE_FLOOR).isoformat(timespec="seconds")
+    new_sections = {
+        "72h": {"text": text, "covers_from_ts": covers_from, "covers_until_ts": covers_until},
+    }
+    comp["sections"] = new_sections
+    comp["covers_until_ts"] = covers_until
+    comp.setdefault("gen", 1)
+    comp.setdefault("folded", True)
+    new_row = dict(row)
+    new_row["compaction"] = comp
+    new_row["text"] = _render_sections(new_sections)
+
+    new_turns = list(turns)
+    new_turns[summary_idx] = new_row
+    rewrite_session_atomic(persona_dir, session_id, new_turns)
+    return True
+
+
+def run_sections_migration(
+    persona_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> SectionsMigrationResult:
+    """Rewrite every active session's legacy single-layer summary row into the
+    sectioned form (tier 3, old-floor), ONCE, gated by the ``.sections_migrated``
+    marker. Fault-isolated: never raises. A per-session failure withholds the
+    marker so a later restart retries (the tolerant reader + next cascade tick
+    self-heal in the meantime). See module docstring + plan §4."""
+    result = SectionsMigrationResult()
+    persona_dir = Path(persona_dir)
+    now = now or datetime.now(UTC)
+    try:
+        if _sections_marker_path(persona_dir).exists():
+            result.already_migrated = True
+            return result
+        (persona_dir / "archived_conversations").mkdir(parents=True, exist_ok=True)
+        all_ok = True
+        for sid in list_active_sessions(persona_dir):
+            result.sessions_seen += 1
+            try:
+                if _migrate_one_session_sections(persona_dir, sid, now=now):
+                    result.sessions_migrated += 1
+            except Exception:
+                logger.exception("sections migration: session=%s raised; withholding marker", sid)
+                all_ok = False
+        if all_ok:
+            _write_marker_at(
+                _sections_marker_path(persona_dir),
+                {
+                    "migrated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "n_sessions": result.sessions_seen,
+                    "n_migrated": result.sessions_migrated,
+                },
+            )
+            result.marker_written = True
+        logger.info(
+            "sections migration: sessions=%d migrated=%d marker=%s",
+            result.sessions_seen, result.sessions_migrated, result.marker_written,
+        )
+    except Exception:
+        logger.exception("sections migration: top-level failure; marker NOT written")
+    return result
+
+
+def _write_marker_at(path: Path, payload: dict) -> None:
+    """Atomically write a run-once marker (mkdir parent, tmp + fsync + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
