@@ -330,8 +330,12 @@ def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path, monkeypat
     # Compaction fired exactly once (one accepted cache write), NOT per turn.
     assert len(provider.calls) == 1
     # The buffer is now [summary, *2-tail] and byte-stable across turns 2 & 3.
+    # The backstop writes the SECTIONED row: the emergency fold lands in the 24h
+    # tier and the rendered head carries it (cascade-compaction change).
     after = read_session(tmp_path, sid)
-    assert _summary_rows(after)[0]["text"] == "SUM"
+    row = _summary_rows(after)[0]
+    assert row["compaction"]["sections"]["24h"]["text"] == "SUM"
+    assert "SUM" in row["text"]
     # The current-turn over-cap floor (turn 1) is the deterministic note, not an
     # LLM summary string.
     note = out1[1].content_text() if len(out1) > 1 else ""

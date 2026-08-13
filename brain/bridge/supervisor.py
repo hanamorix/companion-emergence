@@ -1628,18 +1628,14 @@ def _run_compaction_tick(persona_dir: Path, provider: LLMProvider) -> None:
     stays off the chat model. Called from the persisted_cadence block in
     run_folded (daily default, survives restart/sleep per #21).
     """
-    from datetime import timedelta
-
-    from brain.chat.compaction import compact_conversation
+    from brain.chat.compaction import cascade_conversation
     from brain.ingest.buffer import list_active_sessions
 
     for session_id in list_active_sessions(persona_dir):
         try:
-            compact_conversation(
+            cascade_conversation(
                 persona_dir,
                 session_id,
-                older_than=timedelta(hours=24),
-                fold_existing_summary=True,
                 provider=provider,
             )
         except Exception:
