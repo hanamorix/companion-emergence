@@ -725,7 +725,13 @@ def _fold_into_section(
     Returns ``(section_dict | None, fell_soft, validated)``. ``None`` when the tier
     has no inputs at all (empty band).
     """
-    prior_texts = [(s.get("text") or "").strip() for s in section_inputs if (s.get("text") or "").strip()]
+    # Join section inputs OLDEST-first (by covered edge) so the fade preferentially
+    # compresses the oldest material (plan §1.3 lossless-leaning join).
+    ordered_inputs = sorted(
+        section_inputs,
+        key=lambda s: (_parse_ts(s.get("covers_from_ts")) or datetime.max.replace(tzinfo=UTC)),
+    )
+    prior_texts = [(s.get("text") or "").strip() for s in ordered_inputs if (s.get("text") or "").strip()]
     prior_joined = "\n\n".join(prior_texts)
     raw_transcript = _render_transcript(raw_turns, persona_name)
     if not prior_joined and not raw_turns:
