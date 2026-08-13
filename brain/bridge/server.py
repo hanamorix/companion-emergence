@@ -947,6 +947,16 @@ def build_app(
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
+        def _is_session_busy(sid: str) -> bool:
+            """Best-effort cross-thread check: is a request in-flight for ``sid``?
+            The supervisor's idle-gate (compaction + weekly rollover) defers a busy
+            session so it never mutates/deletes a buffer mid-request (owner ruling
+            2026-08-13). Reads the async ``in_flight_locks`` from the supervisor
+            thread — ``asyncio.Lock.locked()`` is a plain bool read, safe enough for
+            a best-effort belt; the worst case is deferring one idle tick."""
+            lk = app.state.bridge.in_flight_locks.get(sid)
+            return lk is not None and lk.locked()
+
         stop_event = threading.Event()
         sup_thread = threading.Thread(
             target=run_folded,
@@ -957,6 +967,7 @@ def build_app(
                 "event_bus": bus,
                 "tick_interval_s": tick_interval_s,
                 "silence_minutes": silence_minutes,
+                "is_session_busy": _is_session_busy,
             },
             name="sp7-supervisor",
             daemon=False,

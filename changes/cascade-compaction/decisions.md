@@ -226,3 +226,33 @@ out-of-scope; new `rollover.py` factoring). One **Major C-1 (concurrency)** + mi
 - **Discretionary test-literalism (C10/C14 interleave/gap thinness, C21 regex-not-AST, the two pipeline.py
   extraction-ran checks) — ACCEPTED as-is:** the reviewer judged all non-vacuous / covered elsewhere; each
   gating criterion is verified by execution on its real path (stage-8 table). Not expanded (no gold-plating).
+
+### OWNER RULINGS — idle-gating (2026-08-13, attributed to the owner via the orchestrator)
+Stage-6 focused re-review found a NEW Major: the **resolve-persist race** — a request resolves the session,
+then during its multi-second tool-loop the weekly rollover deletes the session buffer; `_persist_turn` then
+appends to a deleted/archived buffer → orphaned turn / resurrected buffer (same symptom as C-1, different
+trigger). Owner rulings that DISSOLVE it (no split, no request-spanning lock, no shipping a known Major):
+
+**Ruling 1 (weekly rollover):** "The weekly rollover should only happen during idle periods, same as every
+other automatic tick." → `maybe_weekly_rollover` fires ONLY when idle: (1) last turn older than `quiet_gap`
+(user-quiet, already present) AND (2) NO in-flight request for the session (`is_session_busy` belt, checking
+`in_flight_locks`). A busy session defers to the next idle tick — so the rollover can never delete an active
+session's buffer mid-request. Closes the race by construction.
+
+**Ruling 2 (add-on — compaction):** "Make sure that this is also when the compaction fires, either at startup
+or during an idle period." → (a) a **startup catch-up cascade** (fires once at supervisor start — idle by
+nature — to catch turns that crossed 24/48/72h while the app was off); (b) the **periodic cascade is
+idle-gated** (defers a busy session, same `is_session_busy` belt), so routine compaction is startup/idle-only,
+never mid-exchange.
+
+**Backstop reconciliation (analyzed, RESOLVED — not escalated):** `apply_budget` does TWO things when
+over-cap: **step 1** a persisted `emergency_fold_24h` (buffer write — the mid-request compaction the rule
+targets) and **step 2** a deterministic in-prompt truncation note (`[truncated N earlier messages]` — pure
+prompt WINDOWING, no buffer write, no LLM). The **within-session prompt bound comes from step 2 (windowing),
+not step 1** (`budget.py:93-118`). Therefore idle-gating routine compaction canNOT cause unbounded prompt
+growth (option (b)'s regression does not materialize — the bound is windowing, always present). Per option
+(a): **step 1 stays as a documented LAST-RESORT emergency net** — it only fires when the prompt is already
+over-cap despite startup/idle compaction (the pathological long-active-no-idle session, which is **Phase 7's
+(ROOT1) dedicated job**, not Phase 1's); the normal compaction path is startup/idle. This does not violate the
+spirit of the rule (an emergency fold when already over-cap is a safety valve, not routine mid-exchange
+compaction). Clearly resolvable → implemented + documented, no owner escalation.

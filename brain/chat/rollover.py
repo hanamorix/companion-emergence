@@ -22,6 +22,7 @@ deletes buffers (see brain/ingest/pipeline.finalize_stale_sessions).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -186,11 +187,17 @@ def maybe_weekly_rollover(
     hebbian=None,
     embeddings=None,
     config: dict | None = None,
+    is_session_busy: Callable[[str], bool] | None = None,
 ) -> str | None:
-    """1c-B check, run on the daily tick AFTER the cascade fold. Fire the weekly
-    swap iff the session age (oldest turn → now) ≥ ``weekly_age`` AND its last turn
-    is older than ``quiet_gap`` (never mid-exchange). Returns the new sid on a swap,
-    else None (defer)."""
+    """1c-B check — the weekly swap fires ONLY when the session is IDLE, the same as
+    every other automatic tick (owner ruling 2026-08-13). Two idle conditions must
+    both hold: (1) the last completed turn is older than ``quiet_gap`` (user-quiet,
+    never mid-exchange) AND (2) there is NO in-flight request for the session
+    (``is_session_busy`` belt). Together these make the resolve-then-long-generate-
+    then-persist race unreachable: the rollover cannot delete an active session's
+    buffer out from under a request that is mid-tool-loop, because a busy session
+    defers to the next idle opportunity. Fires iff session age ≥ ``weekly_age`` AND
+    both idle conditions hold. Returns the new sid on a swap, else None (defer)."""
     now = now or datetime.now(UTC)
     turns = read_session(persona_dir, session_id)
     raw = [t for t in turns if t.get("speaker") != "summary"]
@@ -201,8 +208,18 @@ def maybe_weekly_rollover(
     if oldest is None or (now - oldest) < weekly_age:
         return None  # not old enough yet
 
-    # Quiet-gap: defer if the last turn is within the quiet window (mid-exchange).
+    # Idle condition 1 (user-quiet): defer if the last turn is within the quiet
+    # window (mid-exchange).
     if newest is None or (now - newest) < quiet_gap:
+        return None
+
+    # Idle condition 2 (belt — closes the resolve-persist race): defer if a request
+    # is in-flight for this session. A multi-second tool-loop can be active even
+    # when the last COMPLETED turn is old (a request that started after a long
+    # quiet gap), so the quiet-gap alone does not catch it — the in-flight check
+    # does. Best-effort cross-thread read of the async in_flight_locks; on a busy
+    # session we defer to the next idle tick rather than delete its live buffer.
+    if is_session_busy is not None and is_session_busy(session_id):
         return None
 
     return perform_rollover(

@@ -14,11 +14,13 @@ siblings) are the executed shown-able-to-fail evidence.
 
 ## CI (independently re-run by the orchestrator-runner, not accepted from the build agent)
 - `uv run ruff check .` → **All checks passed!**
-- `uv run pytest -m "not live and not requires_claude_cli and not integration"` (py3.12) → **[full-subset
-  result pasted at foot]**; the sole failure `tests/unit/brain/initiate/test_review.py::
-  test_review_tick_gate_blocks_send_records_hold` is **PRE-EXISTING**: reproduced identically at base
-  `cd29bc61` in the main worktree (1 failed / 25 passed), a time/date-dependent flake in `brain/initiate/`
-  **untouched by this branch's diff** (`git diff --stat cd29bc61..HEAD` shows no `initiate/` files).
+- `uv run pytest -m "not live and not requires_claude_cli and not integration"` (py3.12):
+  - **Pre-C-1-fix run:** `1 failed, 4250 passed, 19 skipped, 1 xfailed in 230s`.
+  - **Post-C-1-fix run (a485e72d):** `[foot — same shape; +1 new C-1 regression test]`.
+  The sole failure `tests/unit/brain/initiate/test_review.py::test_review_tick_gate_blocks_send_records_hold`
+  is **PRE-EXISTING**: reproduced identically at base `cd29bc61` in the main worktree (1 failed / 25 passed), a
+  time/date-dependent flake in `brain/initiate/` **untouched by this branch** (`git diff --stat
+  cd29bc61..HEAD` shows no `initiate/` files).
 - Cascade-specific suite (the C1–C22 fixtures): **43 passed in 2.75s.**
 
 ## Per-criterion verification table (H7)
@@ -47,6 +49,7 @@ siblings) are the executed shown-able-to-fail evidence.
 | C20 | gating | `test_c20_close_cleanup_uses_resolved_sid` — close on old sid reaps successor, /state correct | yes | PASS |
 | C21 | gating | `test_c21_no_raw_sid_downstream_of_resolution` (structural) + `test_c21_flags_all_five_sites_on_pre_fix_base_commit` (shown-able-to-fail on base) | yes (structural + fail-demo) | PASS |
 | C22 | gating | `test_c22_apply_budget_sectioned_row` — real backstop on a sectioned row | yes | PASS |
+| **C-1** | gating (stage-6 regression) | `test_c1_mid_rollover_window_redirects_not_resurrect` — the mid-rollover window (pointer written + old still cached + old buffer present) resolves to the successor, not a resurrectable old buffer | yes — **shown-able-to-fail proven**: stashing the session.py fix → the test FAILS (resolves to old_sid); with the fix → PASS | PASS |
 | A1 | advisory | regression metrics — no comparable workload (H8); surfaced, not gating | n/a | advisory |
 | A2 | advisory | CI green (ruff + pytest subset) — see above; the one failure is pre-existing/isolated | n/a | advisory (met) |
 

@@ -489,3 +489,86 @@ def test_c21_flags_all_five_sites_on_pre_fix_base_commit() -> None:
     assert set(failing) == set(_C21_HANDLER_NAMES), (
         f"expected the check to flag ALL 5 pre-fix sites, only flagged {failing}"
     )
+
+
+def test_owner_idle_gate_defers_busy_session(persona_dir: Path) -> None:
+    """Owner idle-gate (2026-08-13): the supervisor compaction tick fires ONLY at
+    startup or during idle — never mid-exchange. A session with an in-flight request
+    (``is_session_busy(sid)`` true) is SKIPPED entirely — neither its cascade nor its
+    weekly rollover runs — so the rollover can never delete an active session's buffer
+    out from under a mid-tool-loop request (the resolve-persist race). When idle (==
+    startup, which is idle by nature) the same tick fires normally.
+
+    Shown-able-to-fail: without the idle-gate, the BUSY tick would roll the session
+    (the pre-gate behaviour) — the ``read_rolled_to(...) is None`` assertion on the
+    busy tick is the discriminating guard.
+    """
+    from brain.bridge.supervisor import _run_compaction_tick
+    from brain.chat.session import reset_registry
+
+    now = datetime.now(UTC)
+    sid = str(uuid.uuid4())
+    provider = _ExtractStub()
+
+    idx = 0
+
+    def _put(ts: datetime) -> None:
+        nonlocal idx
+        speaker = "user" if idx % 2 == 0 else "assistant"
+        ingest_turn(
+            persona_dir,
+            {"session_id": sid, "speaker": speaker, "text": f"turn {idx}", "ts": _iso(ts)},
+        )
+        idx += 1
+
+    # Weekly-eligible: ≥7d old, all 3 age bands populated, last turn ~35min ago
+    # (past the 30-min quiet gap → user-quiet). Same shape as the C9 fixture.
+    for k in range(5):
+        _put(now - timedelta(days=8) + timedelta(minutes=k))
+    for k in range(5):
+        _put(now - timedelta(hours=60) + timedelta(minutes=k))
+    for k in range(5):
+        _put(now - timedelta(hours=30) + timedelta(minutes=k))
+    tail_start = now - timedelta(minutes=35 + 39)
+    for k in range(40):
+        _put(tail_start + timedelta(minutes=k))
+
+    reset_registry()
+    try:
+        # BUSY → the whole session is skipped: no rollover, still active, and NO
+        # sectioned summary was written (the cascade was skipped too).
+        _run_compaction_tick(persona_dir, provider, is_session_busy=lambda _s: True)
+        assert read_rolled_to(persona_dir, sid) is None
+        assert sid in list_active_sessions(persona_dir)
+        rows = read_session(persona_dir, sid)
+        assert not [r for r in rows if r.get("speaker") == "summary"], (
+            "busy session must not be compacted mid-request"
+        )
+
+        # IDLE (== the startup catch-up, which passes a busy-check that returns
+        # False) → the weekly rollover fires.
+        _run_compaction_tick(persona_dir, provider, is_session_busy=lambda _s: False)
+        assert read_rolled_to(persona_dir, sid) is not None
+        assert sid not in list_active_sessions(persona_dir)
+    finally:
+        reset_registry()
+
+
+def test_weekly_rollover_belt_defers_when_busy(persona_dir: Path) -> None:
+    """Unit belt for the idle-gate: maybe_weekly_rollover returns None (defer) when
+    ``is_session_busy`` reports an in-flight request, even for an otherwise-eligible
+    (aged + quiet) session — the direct guard on the buffer-deleting path."""
+    from brain.chat.rollover import maybe_weekly_rollover
+
+    now = datetime.now(UTC)
+    sid = str(uuid.uuid4())
+    # Aged ≥7d, last turn ~1d ago (well past the quiet gap).
+    _seed(persona_dir, sid, 6, base=now - timedelta(days=8), step=timedelta(hours=1))
+
+    got = maybe_weekly_rollover(
+        persona_dir, sid, "persona",
+        weekly_age=timedelta(days=7), quiet_gap=timedelta(minutes=30),
+        now=now, is_session_busy=lambda _s: True,
+    )
+    assert got is None, "must defer while a request is in-flight"
+    assert read_rolled_to(persona_dir, sid) is None
