@@ -296,3 +296,166 @@ def test_cm12_transient_noop_withholds_marker(tmp_path: Path, monkeypatch, trans
     monkeypatch.setattr(mig, "compact_conversation", real)
     res2 = run_backlog_migration(tmp_path, provider=_StubProvider())
     assert _marker_path(tmp_path).exists() and res2.marker_written is True
+
+
+# ---------------------------------------------------------------------------
+# C12 — sections migration: legacy single-layer summary → TIER 3 (old-floor),
+#        idempotent, #82-safe (round-6 MO-1 / round-7 MO-2 / round-8 MO-3)
+# ---------------------------------------------------------------------------
+
+from brain.chat.compaction import (  # noqa: E402
+    _LEGACY_AGE_FLOOR,
+    _read_sections,
+    cascade_conversation,
+)
+from brain.chat.compaction_migration import (  # noqa: E402
+    _sections_marker_path,
+    run_sections_migration,
+)
+from brain.ingest.buffer import ingest_turn  # noqa: E402
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+class _PreserveProvider:
+    """A marker-preserving fold stub: echoes every long UPPERCASE token found in the
+    prompt (so re-compaction keeps identifiable content) in a first-person string
+    (so the #77 validator accepts it)."""
+
+    def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:
+        import re
+        toks: list[str] = []
+        for m in re.findall(r"[A-Z]{6,}", prompt):
+            if m not in toks:
+                toks.append(m)
+        return "I recall " + " ".join(toks) + " and the recent turn."
+
+
+def _write_legacy_summary(persona_dir: Path, sid: str, text: str, *, covers_until: str, ts: str) -> None:
+    """Write a session buffer holding ONE legacy single-layer (section-less)
+    summary row — exactly the shape compact_conversation / run_backlog_migration
+    produce (no compaction.sections key)."""
+    ac = persona_dir / "active_conversations"
+    ac.mkdir(parents=True, exist_ok=True)
+    row = {
+        "session_id": sid,
+        "speaker": "summary",
+        "text": text,
+        "ts": ts,
+        "compaction": {"gen": 3, "folded": True, "covers_until_ts": covers_until},
+    }
+    with (ac / f"{sid}.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def _summary_row(persona_dir: Path, sid: str) -> dict:
+    return next(t for t in read_session(persona_dir, sid) if t.get("speaker") == "summary")
+
+
+def test_c12_legacy_migrates_to_tier3_and_stays_tier3(tmp_path: Path) -> None:
+    """(a) A months-old legacy single-layer summary migrates to TIER 3 with an
+    old-floor covers_from_ts, and a subsequent cascade pass keeps it TIER 3 — never
+    reclassified to tier 1 'yesterday' (#82). The covers_until_ts is deliberately
+    RECENT to prove the migration ignores it for classification."""
+    now = datetime.now(UTC)
+    sid = "sess_c12_legacy"
+    marker = "MONTHSOLDMARKER"
+    # covers_until deliberately recent — the #82 trap the mapping must NOT fall for.
+    _write_legacy_summary(
+        tmp_path, sid, f"I remember {marker}: a long accumulated history.",
+        covers_until=_iso(now - timedelta(minutes=5)), ts=_iso(now - timedelta(minutes=5)),
+    )
+
+    res = run_sections_migration(tmp_path, now=now)
+    assert res.marker_written is True
+    assert res.sessions_migrated == 1
+
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert set(sections) == {"72h"}, "legacy blob must seed ONLY tier 3, not tier 1"
+    assert marker in sections["72h"]["text"]
+    # covers_from_ts is the explicit old-floor (now - 96h), NOT covers_until_ts.
+    cf = datetime.fromisoformat(sections["72h"]["covers_from_ts"])
+    assert abs((now - cf) - _LEGACY_AGE_FLOOR) < timedelta(minutes=1)
+
+    # A cascade pass with a genuinely-recent raw turn must land the raw in tier 1
+    # and KEEP the legacy blob in tier 3 (its old edge classifies terminal).
+    write_cursor(tmp_path, sid, _iso(now - timedelta(hours=25)))
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "a fresh recent turn", "ts": _iso(now - timedelta(hours=25))})
+    cascade_conversation(tmp_path, sid, provider=_PreserveProvider(),
+                         now=now, min_keep_tail=0)
+    after = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert marker in after["72h"]["text"], "legacy history must STAY tier 3, not become tier 1"
+    assert marker not in after.get("24h", {}).get("text", ""), "legacy blob must NOT be relabelled 'yesterday' (#82)"
+
+
+def test_c12_migration_idempotent_rerun_is_noop(tmp_path: Path) -> None:
+    """Re-running the sections migration is a no-op (marker gate + already-sectioned
+    check)."""
+    now = datetime.now(UTC)
+    sid = "sess_c12_idem"
+    _write_legacy_summary(tmp_path, sid, "I recall a long history.",
+                          covers_until=_iso(now), ts=_iso(now))
+    first = run_sections_migration(tmp_path, now=now)
+    assert first.marker_written is True and first.sessions_migrated == 1
+    assert _sections_marker_path(tmp_path).exists()
+
+    row_before = _summary_row(tmp_path, sid)
+    second = run_sections_migration(tmp_path, now=now)
+    assert second.already_migrated is True
+    assert second.sessions_migrated == 0
+    assert _summary_row(tmp_path, sid) == row_before  # byte-identical row
+
+
+def test_c12_delayed_backlog_flatten_self_heals_to_tier3(tmp_path: Path) -> None:
+    """(c) round-8 MO-3: a persona already sections-migrated, then hit by a delayed
+    run_backlog_migration retry that flattens the row back to single-layer (no
+    sections key). The tolerant reader reads that flat row as TIER 3 (old-floor,
+    NOT tier 1), and the next cascade re-establishes the sectioned tier-3 form."""
+    now = datetime.now(UTC)
+    # A flattened (section-less) row is exactly what compact_conversation writes.
+    flat_row = {
+        "session_id": "s", "speaker": "summary",
+        "text": "I remember RESURFACED accumulated history.",
+        "ts": _iso(now - timedelta(minutes=1)),
+        "compaction": {"gen": 4, "folded": True,
+                       "covers_until_ts": _iso(now - timedelta(minutes=1))},  # recent!
+    }
+    # The tolerant reader classifies it TIER 3 with the old-floor, not tier 1.
+    sections = _read_sections(flat_row, now)
+    assert set(sections) == {"72h"}
+    cf = datetime.fromisoformat(sections["72h"]["covers_from_ts"])
+    assert abs((now - cf) - _LEGACY_AGE_FLOOR) < timedelta(minutes=1)
+    assert "RESURFACED" in sections["72h"]["text"]
+
+    # And the next cascade re-establishes the sectioned tier-3 form (still tier 3).
+    sid = "sess_c12_heal"
+    ac = tmp_path / "active_conversations"
+    ac.mkdir(parents=True, exist_ok=True)
+    with (ac / f"{sid}.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({**flat_row, "session_id": sid}) + "\n")
+    write_cursor(tmp_path, sid, _iso(now - timedelta(hours=25)))
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "fresh", "ts": _iso(now - timedelta(hours=25))})
+    cascade_conversation(tmp_path, sid, provider=_PreserveProvider(),
+                         now=now, min_keep_tail=0)
+    after = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert "RESURFACED" in after["72h"]["text"], "flattened legacy row must re-heal to tier 3, not tier 1"
+
+
+def test_c12_faildemo_covers_until_would_mislabel_tier1(tmp_path: Path) -> None:
+    """Shown-able-to-fail (MO-2): the BROKEN mapping (covers_from_ts = covers_until_ts,
+    a recent value) would make the classifier label months-old history 'yesterday'.
+    This asserts the real code does NOT do that — the classifier keys on the
+    old-floor, so a recent covers_until never pulls the blob into tier 1."""
+    now = datetime.now(UTC)
+    sid = "sess_c12_faildemo"
+    _write_legacy_summary(tmp_path, sid, "I recall old history.",
+                          covers_until=_iso(now), ts=_iso(now))
+    run_sections_migration(tmp_path, now=now)
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    cf = datetime.fromisoformat(sections["72h"]["covers_from_ts"])
+    # The broken mapping would put covers_from within minutes of now (age ~0 → tier1).
+    assert (now - cf) >= timedelta(hours=72), "covers_from must be the >72h old-floor, not a recent value"
