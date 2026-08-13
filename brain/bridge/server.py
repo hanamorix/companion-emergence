@@ -919,7 +919,17 @@ def build_app(
         def _run_backlog_migration() -> None:
             try:
                 from brain.chat.compaction import build_compaction_provider
-                from brain.chat.compaction_migration import run_backlog_migration
+                from brain.chat.compaction_migration import (
+                    run_backlog_migration,
+                    run_sections_migration,
+                )
+
+                # Sections-migration FIRST (round-9 N1): a cheap in-place shape
+                # rewrite of the existing legacy summary row into the sectioned
+                # form (tier 3, old-floor). Running it before the legacy backlog
+                # drain means any row that drain touches is already sectioned, and
+                # the tolerant reader + next cascade tick self-heal either way.
+                run_sections_migration(persona_dir)
 
                 # Migration folds with COMPACTION_MODEL (haiku), not the chat model.
                 run_backlog_migration(
