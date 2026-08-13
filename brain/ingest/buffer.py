@@ -210,6 +210,43 @@ def delete_cursor(persona_dir: Path, session_id: str) -> None:
     _unlink_with_retry(path)
 
 
+def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.rolled_to — the successor
+    pointer written by a session rollover. A ``.jsonl`` glob never picks it up, so it
+    is not seen as a live session; it survives the old buffer's deletion so a
+    continuous client still holding the old sid is redirected to the successor."""
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.rolled_to"
+
+
+def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> None:
+    """Atomically write the successor pointer (tmp + fsync + os.replace). Written
+    under the compaction lock BEFORE the old buffer is deleted, so the old sid never
+    resolves to nothing."""
+    _validate_session_id(session_id)
+    _validate_session_id(successor_id)
+    path = _rolled_to_path(persona_dir, session_id)
+    tmp = path.with_suffix(".rolled_to.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"successor": successor_id, "at": _now_iso()}, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_rolled_to(persona_dir: Path, session_id: str) -> str | None:
+    """Return the successor sid this session rolled over to, or None if absent/malformed."""
+    path = _rolled_to_path(persona_dir, session_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    succ = data.get("successor") if isinstance(data, dict) else None
+    return succ if isinstance(succ, str) and succ else None
+
+
 def _backoff_path(persona_dir: Path, session_id: str) -> Path:
     """Resolve <persona>/active_conversations/<session_id>.backoff.
 

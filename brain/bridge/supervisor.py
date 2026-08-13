@@ -1617,29 +1617,53 @@ def _run_narrative_memory_pass(
 
 
 def _run_compaction_tick(persona_dir: Path, provider: LLMProvider) -> None:
-    """Fold each active conversation's aged, extracted turns into its summary.
-
-    Iterates active_conversations buffers and calls the shared compaction core
-    with a 24h cutoff and fold_existing_summary=True (fade). Per-session
-    failures are logged and do not stop the sweep — autonomous-behaviour
-    recipe: defer cleanly, don't fail loudly.
+    """Run the age-gated cascade on each active conversation, then check the weekly
+    session-rollover (1c-B) — cascade-fold FIRST, then rollover, so a swap seeds from
+    the just-updated tiers (M2). Per-session failures are logged and do not stop the
+    sweep — autonomous-behaviour recipe: defer cleanly, don't fail loudly.
 
     Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
     stays off the chat model. Called from the persisted_cadence block in
     run_folded (daily default, survives restart/sleep per #21).
     """
-    from brain.chat.compaction import cascade_conversation
+    from brain.chat.compaction import (
+        _ROLLOVER_QUIET_GAP,
+        _WEEKLY_ROLLOVER_AGE,
+        cascade_conversation,
+    )
+    from brain.chat.rollover import maybe_weekly_rollover
     from brain.ingest.buffer import list_active_sessions
 
-    for session_id in list_active_sessions(persona_dir):
-        try:
-            cascade_conversation(
-                persona_dir,
-                session_id,
-                provider=provider,
-            )
-        except Exception:
-            logger.exception("compaction tick: session=%s raised", session_id)
+    persona_name = persona_dir.name
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+
+        for session_id in list_active_sessions(persona_dir):
+            now = datetime.now(UTC)
+            try:
+                cascade_conversation(persona_dir, session_id, provider=provider, now=now)
+            except Exception:
+                logger.exception("compaction tick: session=%s raised", session_id)
+            # 1c-B weekly rollover (quiet-moment boundary). Extraction inside the
+            # rollover uses the chat-model provider is unnecessary here — the fold
+            # already ran; extraction is best-effort with the haiku provider.
+            try:
+                maybe_weekly_rollover(
+                    persona_dir, session_id, persona_name,
+                    weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
+                    now=now, provider=provider,
+                    store=store, hebbian=hebbian, embeddings=embeddings,
+                )
+            except Exception:
+                logger.exception("weekly rollover: session=%s raised", session_id)
 
 
 def _run_finalize_tick(
