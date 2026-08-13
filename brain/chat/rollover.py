@@ -100,7 +100,12 @@ def perform_rollover(
         except Exception:
             logger.exception("rollover: extraction failed session=%s (continuing)", old_sid)
 
-    # 2. Fold the old conversation into its post-compaction form.
+    # 2. Fold the old conversation into its post-compaction form. NOTE: this runs
+    #    AFTER step-1 extraction advanced the cursor, so it is NOT redundant with
+    #    the daily tick's cascade — the tick cascades BEFORE any extraction (cursor
+    #    guard → folds nothing), so this post-extraction fold is what actually
+    #    populates the tiers the seed re-reads. (Stage-6 L2 proposed removing it as
+    #    "redundant"; the C9 real-tick test proves it load-bearing — reverted.)
     comp_provider = build_compaction_provider(persona_dir)
     if seed_mode == "summary_only":
         # Fold everything (a >24h-old "recent 40" is not recent).
@@ -110,7 +115,7 @@ def perform_rollover(
             provider=comp_provider, min_keep_tail=0, now=now,
         )
     elif seed_mode == "tiers_plus_tail":
-        # Bring the 3 tiers current, keeping the 40-msg raw tail live.
+        # Bring the 3 tiers current (post-extraction), keeping the 40-msg raw tail.
         cascade_conversation(
             persona_dir, old_sid, provider=comp_provider, now=now,
             min_keep_tail=_ROLLOVER_TAIL,
@@ -147,12 +152,18 @@ def perform_rollover(
         if old_cursor:
             write_cursor(persona_dir, new_sid, old_cursor)
 
-        # Successor pointer BEFORE the delete (old sid never resolves to nothing).
+        # Ordering closes the C-1 mid-rollover window (stage-6). The successor
+        # pointer goes down FIRST (old sid never resolves to nothing), then the
+        # registry is evicted BEFORE the buffer is deleted, so a concurrent
+        # resolve of the old sid cannot return a stale-cached session over a
+        # deleted buffer. get_or_hydrate_session consults the pointer first
+        # regardless, but keeping evict-before-delete removes the stale entry
+        # promptly as belt-and-braces.
         write_rolled_to(persona_dir, old_sid, new_sid)
+        remove_session(old_sid)  # registry evict (no file delete — handled next)
         delete_session_buffer(persona_dir, old_sid)
         delete_cursor(persona_dir, old_sid)
         delete_backoff(persona_dir, old_sid)
-        remove_session(old_sid)  # registry evict (no file delete — already handled)
         logger.info(
             "rollover: session=%s → %s mode=%s seeded=%d",
             old_sid, new_sid, seed_mode, len(reseeded),

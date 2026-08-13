@@ -194,3 +194,35 @@ Iteration count: **9 gate-4/stage-3 rounds** (converged).
 ### Stage 5 (build) — base for the stage-6 mechanical diff
 Build base commit: cd29bc611a2d00aabe12c56a2dc47a5eeeaa914e (== diagnose base cd29bc61, branch ThinkerOfThoughts/cascade-compaction).
 Stage-6 reviewed diff = `git diff <this base>`.
+
+### Gate 7 (code) — 2026-08-13 — worst finding: Major (C-1) → fix-in-place at stage 5, re-review
+Stage-6 cold code red-team (sonnet, record `6-redteam-code.md`): all FIVE flagged judgment calls ruled SOUND
+(age-boundary strict `<`; updated existing tests; resolved-sid echo; apply_budget `provider=` dead-param
+out-of-scope; new `rollover.py` factoring). One **Major C-1 (concurrency)** + minors. Dispositions:
+- **C-1 (Major) — FIXED:** `get_or_hydrate_session` now consults the `rolled_to` successor pointer FIRST
+  (before the `_SESSIONS` cache and the on-disk buffer), so the mid-rollover window (pointer written, registry
+  not yet evicted / old buffer not yet deleted) can no longer return a stale-cached old session that
+  `ingest_turn` would resurrect. `rollover.py` also reordered to evict the registry BEFORE deleting the buffer
+  (belt-and-braces). **New regression test** `test_c1_mid_rollover_window_redirects_not_resurrect`
+  (tests/unit/brain/chat/test_rollover.py) — shown-able-to-fail: it FAILS against the committed pre-fix
+  session.py (verified by stashing the fix; resolved to old_sid) and passes with it.
+- **L2 (minor) — REVERTED after test disproved the premise:** the reviewer proposed removing the in-rollover
+  `cascade_conversation` as "redundant with the daily tick's cascade." FALSE: `_run_compaction_tick` cascades
+  BEFORE any extraction (cursor guard → folds nothing), and `perform_rollover` extracts (step 1) THEN folds —
+  so the in-rollover cascade (post-extraction) is what actually populates the tiers the seed re-reads. The C9
+  real-tick test yielded 0 summary rows without it. Kept the call; documented why it's not redundant. (A case
+  where a stage-6 minor rested on an incorrect premise; the conformance test discriminated.)
+- **F1 (minor) — FIXED:** plan §1.3 age-boundary prose already reads strict-`<`-consistent with the shipped
+  `_bucket_of_age` (Judgment Call 1 ruled the code sound). Nitpick unused `from pathlib import Path`
+  (compaction.py) — removed. rollover.py unused import churn resolved.
+- **A1 (minor) — ACCEPTED LIMITATION (named):** the pre-existing single-fold double-reject fallback
+  (`compaction.py`, `[truncated N earlier messages]`) discards summary text (keeps a count) rather than the
+  lossless-leaning join the cascade fallback uses, and the new validator makes it reachable more often.
+  ACCEPTED, not changed: (a) it is pre-existing; (b) the raw turns are **archived before the rewrite**
+  (lossless-before-lossy), so it is a degraded *summary* on a rare double-reject, NOT data loss; (c) making
+  compact_conversation keep full raw text risks head bloat (the exact thing the caps prevent) + its own cap/test
+  surface — not cheap. Follow-up: unify the single-fold fallback with the cascade's lossless-leaning join when
+  the flat path is next touched.
+- **Discretionary test-literalism (C10/C14 interleave/gap thinness, C21 regex-not-AST, the two pipeline.py
+  extraction-ran checks) — ACCEPTED as-is:** the reviewer judged all non-vacuous / covered elsewhere; each
+  gating criterion is verified by execution on its real path (stage-8 table). Not expanded (no gold-plating).
