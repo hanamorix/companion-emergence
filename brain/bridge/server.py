@@ -1224,6 +1224,9 @@ def build_app(
 
         Response: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
         """
+        from contextlib import ExitStack
+
+        from brain.chat.rollover import perform_rollover
         from brain.ingest.buffer import list_active_sessions, read_session
 
         s: BridgeAppState = app.state.bridge
@@ -1234,6 +1237,11 @@ def build_app(
         _ATTACH_MAX_AGE_HOURS = 24.0  # noqa: N806 — local frozen constant
         best_sid: str | None = None
         best_ts: datetime | None = None
+        # Stale (idle > threshold) selection for the 1c-A rollover: roll over the
+        # MOST-RECENTLY-ACTIVE stale buffer (the one the user most plausibly
+        # continues); tie-break the lexicographically-largest sid (stage-3 A1-b).
+        stale_sid: str | None = None
+        stale_ts: datetime | None = None
         for sid in list_active_sessions(s.persona_dir):
             try:
                 turns = read_session(s.persona_dir, sid)
@@ -1256,11 +1264,41 @@ def build_app(
                 continue
             age_hours = (now - last).total_seconds() / 3600.0
             if age_hours >= _ATTACH_MAX_AGE_HOURS:
+                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
+                    stale_ts = last
+                    stale_sid = sid
                 continue
             if best_ts is None or last > best_ts:
                 best_ts = last
                 best_sid = sid
-        return {"session_id": best_sid}
+
+        if best_sid is not None:
+            return {"session_id": best_sid}
+
+        # No attach-eligible session — if a stale buffer exists, SYNC-roll it over
+        # (extract → fold everything → archive → delete old buffer → seed a
+        # summary-only head) and return the NEW session id (1c-A, owner-ratified).
+        if stale_sid is not None:
+            try:
+                with ExitStack() as stack:
+                    store = MemoryStore(s.persona_dir / "memories.db", integrity_check=False)
+                    stack.callback(store.close)
+                    hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
+                    stack.callback(hebbian.close)
+                    embeddings = EmbeddingCache(
+                        s.persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256)
+                    )
+                    stack.callback(embeddings.close)
+                    new_sid = perform_rollover(
+                        s.persona_dir, stale_sid, s.persona,
+                        seed_mode="summary_only", now=now, provider=s.provider,
+                        store=store, hebbian=hebbian, embeddings=embeddings,
+                    )
+                return {"session_id": new_sid}
+            except Exception:
+                logger.exception("sessions_active: stale rollover failed sid=%s", stale_sid)
+                return {"session_id": None}
+        return {"session_id": None}
 
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
@@ -1271,6 +1309,9 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
+        # Redirect: rebind to the RESOLVED sid so a post-rollover old sid reports
+        # the successor's in-flight state, not the gone old id (C20/C21).
+        session_id = sess.session_id
         in_flight = session_id in s.in_flight_locks and s.in_flight_locks[session_id].locked()
         return {
             "session_id": sess.session_id,
@@ -2375,12 +2416,16 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        # Redirect: use the RESOLVED sid for EVERY downstream op (lock key, backend
+        # call via sess, echoed id) so a post-rollover old sid transparently
+        # operates on the successor (C16/C19/C21). Never the raw req.session_id.
+        sid = sess.session_id
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         if lock.locked():
             raise HTTPException(status_code=429, detail="session has an in-flight turn")
         async with lock:
             t0 = datetime.now(UTC)
-            events.publish("chat_started", session_id=req.session_id, client=s.client_origin)
+            events.publish("chat_started", session_id=sid, client=s.client_origin)
             try:
                 result = await asyncio.to_thread(
                     _respond_blocking,
@@ -2391,7 +2436,7 @@ def build_app(
                     req.image_shas or None,
                 )
             except Exception as exc:
-                logger.exception("chat failed session=%s", req.session_id)
+                logger.exception("chat failed session=%s", sid)
                 # Audit 2026-05-07 P3-2: keep detailed exception text in
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
@@ -2400,12 +2445,12 @@ def build_app(
             s.last_chat_at = datetime.now(UTC)
             events.publish(
                 "chat_done",
-                session_id=req.session_id,
+                session_id=sid,
                 turn=result.turn,
                 duration_ms=duration_ms,
             )
             return {
-                "session_id": req.session_id,
+                "session_id": sid,
                 "reply": result.content,
                 "turn": result.turn,
                 "tool_invocations": result.tool_invocations,
@@ -2436,6 +2481,10 @@ def build_app(
             await ws.send_json({"type": "error", "code": "session_not_found", "done": True})
             await ws.close()
             return
+        # Redirect: rebind the path id to the RESOLVED sid so every downstream op
+        # (lock key, echoed frames, events) uses the successor after a rollover
+        # (C16/C19/C21). The engine writes to sess's buffer either way.
+        session_id = sess.session_id
         lock = s.in_flight_locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
             await ws.send_json({"type": "error", "code": "session_busy", "done": True})
@@ -2706,29 +2755,33 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        # Redirect: operate on the RESOLVED successor sid, not the deleted old
+        # buffer — else close/snapshot silently no-op and falsely report success
+        # (F1). Never the raw req.session_id (C16/C19/C21).
+        sid = sess.session_id
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             try:
                 report = await asyncio.to_thread(
                     _snapshot_session_blocking,
                     s.persona_dir,
-                    req.session_id,
+                    sid,
                     s.provider,
                 )
             except Exception as exc:
-                logger.exception("snapshot_session failed session=%s", req.session_id)
+                logger.exception("snapshot_session failed session=%s", sid)
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "code": "snapshot_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "errors": 1,
                     },
                 ) from exc
         events.publish(
             "session_snapshot",
-            session_id=req.session_id,
+            session_id=sid,
             committed=report.committed,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
@@ -2736,7 +2789,7 @@ def build_app(
             errors=report.errors,
         )
         return {
-            "session_id": req.session_id,
+            "session_id": sid,
             "closed": False,
             "committed": report.committed,
             "deduped": report.deduped,
@@ -2763,6 +2816,11 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
+        # Redirect: close/cleanup act on the RESOLVED successor sid, not the deleted
+        # old buffer — else the close no-ops on the old empty-guard and the
+        # successor's registry entry + lock leak forever (F1/G1). Never the raw
+        # req.session_id downstream (C16/C20/C21).
+        sid = sess.session_id
 
         # Audit 2026-05-07 P2-4: serialise close behind the same per-
         # session lock /chat and /stream use. Without this, a renderer
@@ -2772,7 +2830,7 @@ def build_app(
         # worker still thought the session was active. Acquiring the
         # lock here means close waits for any in-flight turn to
         # finish before running ingest.
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             # H-A: per-call stores inside the worker thread, not shared singletons.
             # Wrap the pipeline call so internal exceptions don't crash the handler.
@@ -2780,14 +2838,14 @@ def build_app(
                 report = await asyncio.to_thread(
                     _close_session_blocking,
                     s.persona_dir,
-                    req.session_id,
+                    sid,
                     s.provider,
                 )
             except Exception as exc:
-                logger.exception("close_session failed session=%s", req.session_id)
+                logger.exception("close_session failed session=%s", sid)
                 events.publish(
                     "session_close_failed",
-                    session_id=req.session_id,
+                    session_id=sid,
                     committed=0,
                     deduped=0,
                     soul_candidates=0,
@@ -2802,7 +2860,7 @@ def build_app(
                     status_code=502,
                     detail={
                         "code": "ingest_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "committed": 0,
                         "deduped": 0,
@@ -2815,7 +2873,7 @@ def build_app(
             if report.errors > 0:
                 events.publish(
                     "session_close_failed",
-                    session_id=req.session_id,
+                    session_id=sid,
                     committed=report.committed,
                     deduped=report.deduped,
                     soul_candidates=report.soul_candidates,
@@ -2831,7 +2889,7 @@ def build_app(
                     status_code=502,
                     detail={
                         "code": "ingest_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "committed": report.committed,
                         "deduped": report.deduped,
@@ -2842,12 +2900,12 @@ def build_app(
                 )
 
             # H2: clean up registry + lock so sessions_active stays accurate.
-            remove_session(req.session_id)
-        s.in_flight_locks.pop(req.session_id, None)
+            remove_session(sid)
+        s.in_flight_locks.pop(sid, None)
 
         events.publish(
             "session_closed",
-            session_id=req.session_id,
+            session_id=sid,
             committed=report.committed,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
@@ -2855,7 +2913,7 @@ def build_app(
             errors=report.errors,
         )
         return {
-            "session_id": req.session_id,
+            "session_id": sid,
             "closed": True,
             "committed": report.committed,
             "deduped": report.deduped,
