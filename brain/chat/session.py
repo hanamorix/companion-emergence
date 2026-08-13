@@ -163,13 +163,21 @@ def get_or_hydrate_session(
     # brain.ingest, which depends on brain.chat for some types.
     from brain.ingest.buffer import read_session
 
-    with _LOCK:
+    with _LOCK:  # RLock — the successor full-follow below recurses safely
         existing = _SESSIONS.get(session_id)
         if existing is not None:
             return existing
 
         turns = read_session(persona_dir, session_id)
         if not turns:
+            # Post-rollover state (evicted + buffer deleted): follow the successor
+            # pointer chain to the CURRENT live successor (full-follow, L-1), so a
+            # client dormant across many weekly rollovers still resolves. A corrupt
+            # cyclic pointer aborts to None (404-then-reattach) via a visited-set
+            # guard — NOT a depth cap (a legitimately long chain must resolve).
+            successor = _resolve_successor(persona_dir, session_id)
+            if successor is not None:
+                return get_or_hydrate_session(persona_dir, persona_name, successor)
             return None
 
         # Count user+assistant pairs. The on-disk turn count is the
@@ -203,6 +211,26 @@ def get_or_hydrate_session(
         )
         _SESSIONS[session_id] = state
         return state
+
+
+def _resolve_successor(persona_dir: Path, session_id: str) -> str | None:
+    """Full-follow the ``rolled_to`` successor chain from ``session_id`` to its live
+    end. Returns the terminal successor sid (the one with no further pointer), or
+    None when ``session_id`` has no pointer at all OR the chain is cyclic (corrupt).
+    A visited-set guards a cycle — not a depth cap, so a long legitimate chain still
+    resolves (round-6 L-1)."""
+    from brain.ingest.buffer import read_rolled_to
+
+    visited: set[str] = set()
+    cur = session_id
+    while True:
+        if cur in visited:
+            return None  # cyclic pointer → abort to 404-then-reattach
+        visited.add(cur)
+        nxt = read_rolled_to(persona_dir, cur)
+        if nxt is None:
+            return None if cur == session_id else cur
+        cur = nxt
 
 
 def all_sessions() -> list[SessionState]:
