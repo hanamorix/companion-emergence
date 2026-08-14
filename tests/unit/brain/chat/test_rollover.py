@@ -682,3 +682,44 @@ def test_persist_during_rollover_destructive_window_not_orphaned(
     assert "raced-user" in succ_texts and "raced-asst" in succ_texts, (
         "racing persist's turn was orphaned instead of threading into the successor"
     )
+
+
+def test_summary_only_carries_residual_raw_not_dropped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Round-4 regression (6-redteam-code-r4.md): a ``summary_only`` rollover must
+    carry raw turns still present after the fold into the successor. Pre-fix the seed
+    was ``[summary]`` only, so a fresh turn that raced into the old buffer after the
+    fold (or a turn the cursor-guarded fold left unfolded) was DROPPED — deleted with
+    the old buffer, never folded, never archived: permanent data loss.
+
+    The fold is stubbed to a no-op and the buffer is pre-seeded with a summary plus
+    two residual raw turns (the post-fold-with-race state). Without the fix the two
+    raw turns never reach the successor."""
+    from brain.chat import rollover as rollover_mod
+    from brain.chat.session import reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_sumonly"
+    # Fold no-op: the buffer already reflects a post-fold state with residual raw.
+    monkeypatch.setattr(rollover_mod, "compact_conversation", lambda *a, **k: None)
+    ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "summary", "text": "[folded]"})
+    ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "user", "text": "fresh-user"})
+    ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "assistant", "text": "fresh-asst"})
+    try:
+        new_sid = perform_rollover(
+            persona_dir, old_sid, _PERSONA_NAME, seed_mode="summary_only", provider=None,
+        )
+        assert new_sid is not None
+        texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
+        assert "[folded]" in texts, "the folded summary must be carried"
+        assert "fresh-user" in texts and "fresh-asst" in texts, (
+            "residual raw turns were dropped — summary_only rollover data loss (r4)"
+        )
+        # The summary still leads the seed (order preserved).
+        assert texts[0] == "[folded]"
+        assert old_sid not in list_active_sessions(persona_dir)
+    finally:
+        reset_registry()
