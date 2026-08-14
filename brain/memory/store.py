@@ -468,20 +468,26 @@ class MemoryStore:
         self._conn.commit()
         return memory.id
 
-    def get(self, memory_id: str) -> Memory | None:
+    def get(self, memory_id: str, *, bump: bool = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps
         last_accessed_at + recall_count on hit so salience scoring sees
         the access (Forgetting integration — spec v0.0.14-alpha.3).
+
+        bump: when True (default), a hit updates recall_count/last_accessed_at
+        — the correct behaviour for a genuine full-read. Internal
+        existence-checks (e.g. update()/deactivate()'s pre-write lookup) pass
+        ``bump=False`` so a maintenance write doesn't count as engagement.
         """
         row = self._conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if row is None:
             return None
-        now_iso = datetime.now(UTC).isoformat()
-        self._conn.execute(
-            "UPDATE memories SET recall_count = recall_count + 1, last_accessed_at = ? WHERE id = ?",
-            (now_iso, memory_id),
-        )
-        self._conn.commit()
+        if bump:
+            now_iso = datetime.now(UTC).isoformat()
+            self._conn.execute(
+                "UPDATE memories SET recall_count = recall_count + 1, last_accessed_at = ? WHERE id = ?",
+                (now_iso, memory_id),
+            )
+            self._conn.commit()
         return _row_to_memory(row)
 
     def list_by_domain(
@@ -528,7 +534,7 @@ class MemoryStore:
 
         Raises KeyError if memory_id does not exist.
         """
-        if self.get(memory_id) is None:
+        if self.get(memory_id, bump=False) is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
 
         column_map: dict[str, tuple[str, Any]] = {}
@@ -577,7 +583,7 @@ class MemoryStore:
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
-        if self.get(memory_id) is None:
+        if self.get(memory_id, bump=False) is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
         self._conn.commit()

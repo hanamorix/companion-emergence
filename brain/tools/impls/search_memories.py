@@ -76,11 +76,10 @@ def search_memories(
     key are boosted to the front of the result list. Cap at limit.
 
     Retrieval is **bump-free** — surfacing does not touch ``recall_count`` (only
-    a deliberate ``read_full_memory`` → ``store.get()`` bumps).
-    # NEEDS-DECISION (owner, morning) ND-1: whether to also pass bump=False to
-    # update()/deactivate()'s internal get() to fully decouple recall_count from
-    # the write path — provisional: leave it (out of P2's retrieval scope). See
-    # changes/p2-relevance/decisions.md.
+    a deliberate ``read_full_memory`` → ``store.get()`` bumps). ND-1 resolved
+    (owner, 2026-08-14): ``store.update()``/``store.deactivate()``'s internal
+    existence-check now also passes ``bump=False``, so only a genuine full-read
+    bumps ``recall_count``. See ``changes/p2-relevance/decisions.md``.
 
     Returns
     -------
