@@ -147,7 +147,23 @@ def perform_rollover(
             turns = read_session(persona_dir, old_sid)
             summary_row, raw = _split_summary_and_raw(turns)
             if seed_mode == "summary_only":
-                seed_rows: list[dict] = [summary_row] if summary_row else []
+                if summary_row is None:
+                    # No summary produced (the fold folded nothing / the content is
+                    # not foldable) → nothing to seed. Abort below and leave the old
+                    # buffer INTACT — a stale session that can't be summarised is not
+                    # attach-eligible, and any turn sitting in the buffer stays there
+                    # (not lost). Preserves the pre-existing "skip stale" behaviour.
+                    seed_rows: list[dict] = []
+                else:
+                    # A summary EXISTS, so the rollover WILL proceed and delete the old
+                    # buffer. Carry the summary PLUS any raw turns still present after
+                    # the fold: the fold (min_keep_tail=0, older_than=0) normally
+                    # empties raw, so this is usually just [summary]; but a live turn
+                    # that raced in after the fold (before this seed re-read under the
+                    # lock) — or a turn the cursor-guarded fold left unfolded — is a
+                    # genuinely FRESH turn. Dropping it while deleting the old buffer
+                    # would lose it permanently (never folded, never archived) (r4).
+                    seed_rows = [summary_row] + raw
             else:
                 tail = raw[-_ROLLOVER_TAIL:]
                 seed_rows = ([summary_row] if summary_row else []) + tail
