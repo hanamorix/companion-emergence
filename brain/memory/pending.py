@@ -1,6 +1,6 @@
 """Pending-candidate queue — a separate store OUTSIDE memories.db.
 
-TEMP (Root 2 stopgap — remove when Phase 2 relevance overhaul lands).
+TEMP (Root 2 stopgap — remove when the Phase 5 dream cycle lands to replace it).
 
 Automatically-generated ("firehose") memories are ENQUEUED here as *candidates*
 rather than written straight into ``memories.db``. A candidate is **not a stored

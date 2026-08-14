@@ -1,6 +1,6 @@
 """Consolidation gate — the idle-tick two-pass memory consolidator.
 
-TEMP (Root 2 stopgap — remove when Phase 2 relevance overhaul lands).
+TEMP (Root 2 stopgap — remove when the Phase 5 dream cycle lands to replace it).
 
 Runs FIRST on the idle heartbeat tick (before reflex/dream/research). Drains the
 pending-candidate queue and, per candidate, discards (reject), promotes
