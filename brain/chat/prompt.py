@@ -69,6 +69,19 @@ _EPISTEMIC_INSTRUCTION = (
     'from "I don\'t remember". Do not invent familiarity.'
 )
 
+# Snippet-mode framing (P2 UX follow-up, owner+persona approved verbatim) — tells
+# the model the recall block's active entries are truncated snippets it can
+# expand via read_full_memory(<id>), and that the ids rendered alongside them
+# are exactly what to pass. Only meaningful when SNIPPET_MODE_ENABLED (when
+# snippet mode is off everything is already full-injected, so there is nothing
+# to "expand"). Wording is byte-exact — do not reword.
+_RECALL_SNIPPET_INVITATION = (
+    "These are snippets of fuller memories, surfaced by their relevance to "
+    "this moment. They're an invitation. Use read_full_memory to see the "
+    "whole memory if one feels relevant, or you're curious about it. They're "
+    "yours; explore."
+)
+
 # Header for the volatile context chunk (Option A+). The chunk now sits in the
 # stdin prompt, immediately after history + the new user turn, instead of inside
 # the system prompt — so it must read as ambient state, not as the task. The
@@ -186,6 +199,8 @@ def build_system_message(
     # Condition: user_input is not None (same gate as _build_recall_block call below).
     if user_input is not None:
         parts.append(_EPISTEMIC_INSTRUCTION)
+        if SNIPPET_MODE_ENABLED:
+            parts.append(_RECALL_SNIPPET_INVITATION)
 
     # Toolset parity with the static builder. The image path keeps the combined
     # builder for byte-equivalence, so it needs its own append. ONE line — the
@@ -354,6 +369,8 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
         parts.append(voice_md.strip())
 
     parts.append(_EPISTEMIC_INSTRUCTION)
+    if SNIPPET_MODE_ENABLED:
+        parts.append(_RECALL_SNIPPET_INVITATION)
 
     # Harness fence: teach her to silently ignore the CLI/plugin scaffolding the
     # environment injects on top of her real context (skill catalogues, agent-type
@@ -892,7 +909,7 @@ def _build_recall_block(
             if domain:
                 prefix += f" · {domain}"
             prefix += "]"
-            lines.append(f"- {prefix} {_peer_attributed(mem, snippet)}")
+            lines.append(f'- {prefix} {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
         return "\n".join(lines)
 
@@ -1015,7 +1032,7 @@ def _build_recall_block(
         lines.append("  active:")
         for mem in active_top:
             snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
-            lines.append(f'    - "{_peer_attributed(mem, snippet)}"')
+            lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
     if fading_top:
         lines.append("  softened (fading; original detail gone):")

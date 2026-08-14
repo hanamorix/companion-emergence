@@ -70,7 +70,13 @@ def _la(store: MemoryStore, mid: str):
 
 
 def _active_lines(block: str) -> list[str]:
-    return [ln for ln in block.splitlines() if ln.startswith('    - "')]
+    # Active bullets now read '    - <id>: "…"' (memory id precedes the
+    # quoted snippet so read_full_memory(<id>) is callable) instead of the
+    # old bare '    - "…"'. Match the id-prefixed quote instead of the
+    # literal '    - "' — a stricter startswith would miss every active line.
+    import re
+
+    return [ln for ln in block.splitlines() if re.match(r'^    - \S+: "', ln)]
 
 
 def test_c6_surfacing_does_not_bump_recall_count(tmp_path: Path) -> None:

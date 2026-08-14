@@ -458,15 +458,24 @@ def test_recall_block_caps_at_limit(
         store=store,
         user_input="Tell me about Jordan.",
     )
-    # New forgetting-aware format renders bullets under "  active:" indented with "    - "
+    # New forgetting-aware format renders bullets under "  active:" indented with
+    # '    - <id>: "…"' (memory id now precedes the quoted snippet so
+    # read_full_memory(<id>) is callable — see the recall-snippet-ids follow-up).
     assert "recall" in msg
     assert "active:" in msg
-    # Each active result is a '    - "…"' bullet — cap is SNIPPET_COUNT (8) per bucket (P2).
-    # Count quoted bullets (active/fading entries use quoted content) excluding the
-    # unquoted "not recognised" token bullets which have no surrounding quotes.
+    # Cap is SNIPPET_COUNT (8) per bucket (P2). Count bullet lines under the
+    # "active:" section only — stop at the next section header (a line
+    # indented exactly two spaces, e.g. "  softened" / "  not recognised") so
+    # bullets from other buckets don't leak into the count.
     recall_section = msg.split("recall\n")[1]
-    quoted_bullet_count = recall_section.count('    - "')
-    assert quoted_bullet_count == 8, f"expected 8 recall bullets, got {quoted_bullet_count}"
+    active_section = recall_section.split("active:\n", 1)[1]
+    active_lines = []
+    for line in active_section.splitlines():
+        if line.startswith("  ") and not line.startswith("    "):
+            break  # next bucket's section header
+        active_lines.append(line)
+    bullet_count = sum(1 for line in active_lines if line.startswith("    - "))
+    assert bullet_count == 8, f"expected 8 recall bullets, got {bullet_count}"
 
 
 def test_recall_block_truncates_long_content(
@@ -1203,6 +1212,225 @@ def test_epistemic_instruction_is_proactive():
     assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
     # The reactive guidance stays.
     assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# Recall-snippet invitation framing (P2 UX follow-up) — the recall block's
+# active entries are truncated snippets; this framing tells the model they're
+# expandable via read_full_memory(<id>) and is gated on SNIPPET_MODE_ENABLED
+# so it doesn't appear when snippet mode is off (everything full-injected).
+# ---------------------------------------------------------------------------
+
+
+def test_build_system_message_includes_recall_snippet_invitation_when_snippet_mode_on(
+    tmp_path: Path,
+) -> None:
+    """Combined builder (build_system_message): invitation framing appears
+    alongside the epistemic instruction when SNIPPET_MODE_ENABLED is on and
+    user_input is provided (same gate as the recall block itself)."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_system_message
+    from brain.engines.daemon_state import DaemonState
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MagicMock(spec=MemoryStore)
+    store.search_text.return_value = []
+    soul_store = MagicMock(spec=SoulStore)
+    soul_store.list_active.return_value = []
+    daemon_state = MagicMock(spec=DaemonState)
+
+    with patch("brain.chat.prompt._build_recall_block", return_value=""), \
+         patch("brain.initiate.ambient.build_outbound_recall_block", return_value=None), \
+         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
+        msg = build_system_message(
+            tmp_path,
+            voice_md="",
+            daemon_state=daemon_state,
+            soul_store=soul_store,
+            store=store,
+            user_input="Tell me about Marcus",
+        )
+
+    assert _RECALL_SNIPPET_INVITATION in msg
+
+
+def test_build_system_message_omits_recall_snippet_invitation_when_snippet_mode_off(
+    tmp_path: Path,
+) -> None:
+    """When SNIPPET_MODE_ENABLED is False (everything full-injected), the
+    invitation framing must not appear — there is nothing to expand."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_system_message
+    from brain.engines.daemon_state import DaemonState
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MagicMock(spec=MemoryStore)
+    store.search_text.return_value = []
+    soul_store = MagicMock(spec=SoulStore)
+    soul_store.list_active.return_value = []
+    daemon_state = MagicMock(spec=DaemonState)
+
+    with patch("brain.chat.prompt._build_recall_block", return_value=""), \
+         patch("brain.initiate.ambient.build_outbound_recall_block", return_value=None), \
+         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
+        msg = build_system_message(
+            tmp_path,
+            voice_md="",
+            daemon_state=daemon_state,
+            soul_store=soul_store,
+            store=store,
+            user_input="Tell me about Marcus",
+        )
+
+    assert _RECALL_SNIPPET_INVITATION not in msg
+
+
+def test_build_static_system_message_includes_recall_snippet_invitation_when_snippet_mode_on(
+    tmp_path: Path,
+) -> None:
+    """Split/static builder (build_static_system_message) carries the same
+    invitation framing right after the epistemic instruction, gated the same
+    way — the chat path's frozen prefix must not lose this relative to the
+    combined/image-path builder."""
+    from unittest.mock import patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_static_system_message
+
+    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
+        msg = build_static_system_message(tmp_path, voice_md="")
+
+    assert _RECALL_SNIPPET_INVITATION in msg
+
+
+def test_build_static_system_message_omits_recall_snippet_invitation_when_snippet_mode_off(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_static_system_message
+
+    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
+        msg = build_static_system_message(tmp_path, voice_md="")
+
+    assert _RECALL_SNIPPET_INVITATION not in msg
+
+
+def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
+    """Owner+persona approved wording (no em-dash — 'invitation. Use', not
+    'invitation — use'). Locks the exact string so a future edit can't
+    silently reword it."""
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
+
+    assert _RECALL_SNIPPET_INVITATION == (
+        "These are snippets of fuller memories, surfaced by their relevance to "
+        "this moment. They're an invitation. Use read_full_memory to see the "
+        "whole memory if one feels relevant, or you're curious about it. They're "
+        "yours; explore."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recall block memory ids — active entries render "<id>: " so
+# read_full_memory(<id>) is callable; fading/lost entries (not expandable)
+# must not.
+# ---------------------------------------------------------------------------
+
+
+def test_recall_block_active_entry_includes_memory_id(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """An active recall bullet renders '<id>: "<snippet>"' so the model can
+    call read_full_memory(<id>) on it."""
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me what we said about Jordan last time.",
+    )
+    assert f'    - {mem.id}: "' in msg
+
+
+def test_recall_block_fading_entry_omits_memory_id(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A fading ('softened') recall bullet must NOT carry a memory id —
+    the original detail is gone, so there is nothing left to expand."""
+    m = Memory.create_new(
+        content="Jordan loved rainy afternoons.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"love": 6.0},
+    )
+    store.create(m)
+    store.fade(m.id, summary="Jordan — rainy afternoons")
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Do you remember Jordan?",
+    )
+    fading_idx = msg.index("softened")
+    fading_section = msg[fading_idx:]
+    # The bullet must not expose the memory id as an expandable reference.
+    assert f"{m.id}:" not in fading_section
+
+
+def test_recall_block_lost_entry_omits_memory_id(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A lost (graveyarded) recall bullet must NOT carry a memory id — the
+    memory is gone, not expandable."""
+    from brain.forgetting import graveyard
+    from brain.forgetting.salience import SalienceInputs
+
+    lost_m = Memory.create_new(
+        content="Jordan's old studio address.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={},
+    )
+    graveyard.append(
+        persona_dir,
+        memory=lost_m,
+        salience_at_drop=0.05,
+        inputs=SalienceInputs(emotion=0, hebbian=0, recall=0, soul=0, freshness=0),
+        lived_age_hours=200.0,
+        reason="salience<0.10 for 2 consecutive passes",
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Jordan's studio.",
+    )
+    lost_idx = msg.index("lost (no longer")
+    lost_section = msg[lost_idx:]
+    assert f"{lost_m.id}:" not in lost_section
 
 
 # ── Self-model gap block (Task 5, R-F1) ───────────────────────────────────────
