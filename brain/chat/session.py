@@ -240,6 +240,64 @@ def _resolve_successor(persona_dir: Path, session_id: str) -> str | None:
         cur = nxt
 
 
+def registry_lock() -> threading.RLock:
+    """Return the registry serialization lock (an ``RLock``) for use as a context
+    manager: ``with registry_lock(): ...``.
+
+    Concurrency contract (stage-6, round-4). The lock exists to serialize the two
+    operations that can race over a single session's buffer lifecycle across
+    threads:
+
+      * a **live turn persist** (``persist_turns_following_successor`` below, run
+        on the ``asyncio.to_thread`` worker thread that executes ``engine.respond``);
+      * a **rollover's destructive section** (``perform_rollover``'s seed re-read →
+        successor create → ``rolled_to`` pointer write → registry evict, run on the
+        supervisor thread).
+
+    BOTH run on ordinary OS threads (never the event loop), so an ``RLock`` — not an
+    ``asyncio.Lock`` — is the correct primitive; the async ``in_flight_locks`` only
+    serialize concurrent requests to the *same* session inside the event loop and
+    cannot be held across the thread boundary anyway. Holding this lock across the
+    rollover's seed-read↔pointer-write makes the resolve-persist race unreachable by
+    construction: a concurrent persist either lands before the seed re-read (and is
+    captured into the successor seed) or observes the already-written ``rolled_to``
+    pointer (and redirects to the live successor) — it can never resurrect the
+    deleted old buffer. ``RLock`` so nested ``create_session`` / ``remove_session``
+    (which re-acquire it) don't self-deadlock."""
+    return _LOCK
+
+
+def persist_turns_following_successor(persona_dir: Path, records: list[dict]) -> None:
+    """Append ``records`` to their session buffer, redirecting each to the rolled-over
+    successor when one exists — all under ``registry_lock()`` so the redirect+append
+    is atomic against a concurrent rollover's pointer-write-then-buffer-delete.
+
+    This is the live-turn persist path (``engine._persist_turn`` calls it for the
+    user+assistant pair). Resolving the successor and appending under the SAME lock
+    the rollover's destructive section holds is what closes the resolve-persist race:
+
+      * If this persist wins the lock first, it appends to the (still-live) old
+        buffer; the rollover then re-reads that buffer under the lock and carries the
+        just-appended turn into the successor seed — nothing is lost.
+      * If the rollover wins first, by the time this persist acquires the lock the
+        ``rolled_to`` pointer is already written, so ``_resolve_successor`` redirects
+        the append into the live successor buffer — the deleted old buffer is never
+        recreated (no resurrection / orphaned turn).
+
+    Errors propagate to the caller (``_persist_turn`` wraps them in its best-effort
+    try/except, preserving the "persist failure never breaks the reply" contract)."""
+    from brain.ingest.buffer import ingest_turn
+
+    with _LOCK:
+        for rec in records:
+            sid = rec.get("session_id")
+            if sid:
+                successor = _resolve_successor(persona_dir, sid)
+                if successor is not None:
+                    rec = {**rec, "session_id": successor}
+            ingest_turn(persona_dir, rec)
+
+
 def all_sessions() -> list[SessionState]:
     """Return all registered sessions.
 

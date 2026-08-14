@@ -1652,10 +1652,14 @@ def _run_compaction_tick(
     **Idle-gate (owner ruling 2026-08-13):** compaction and the weekly rollover fire
     only at startup or during idle — never mid-exchange. A session with an in-flight
     request (``is_session_busy(sid)`` true) is SKIPPED this tick (both its cascade
-    and its rollover) and retried on the next idle tick. This makes the
-    resolve-persist race unreachable (the rollover cannot delete an active session's
-    buffer out from under a mid-tool-loop request). At startup ``is_session_busy`` is
-    None / returns False (no requests yet), so the startup catch-up cascade fires.
+    and its rollover) and retried on the next idle tick. This is a best-effort
+    efficiency/UX belt (don't churn an actively-used session); it is NOT the
+    race-safety mechanism. The resolve-persist race is closed structurally inside
+    ``perform_rollover``, whose destructive section holds ``registry_lock()`` across
+    its seed re-read → successor-pointer write, serializing it against a concurrent
+    live-turn persist (see brain/chat/rollover.py + session.persist_turns_following_
+    successor). At startup ``is_session_busy`` is None / returns False (no requests
+    yet), so the startup catch-up cascade fires.
 
     Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
     stays off the chat model. Called from the persisted_cadence block in

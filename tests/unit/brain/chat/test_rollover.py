@@ -494,3 +494,191 @@ def test_c1_mid_rollover_window_redirects_not_resurrect(tmp_path: Path) -> None:
         assert len(read_session(persona, old_sid)) == 2, "old buffer must not grow"
     finally:
         reset_registry()
+
+
+# ------------------------------------------------------- resolve-persist race (r4)
+#
+# Stage-6 round-3 (6-redteam-code-r3.md) found a residual TOCTOU: the idle-gate
+# checks ``is_session_busy`` once before ``perform_rollover``, but the rollover then
+# spends multiple seconds in extract+cascade before deleting the old buffer. A live
+# request that resolves the OLD sid and persists inside that window used to orphan
+# its turn — ``ingest_turn`` append-creates (resurrects) the just-deleted buffer.
+#
+# The round-4 fix makes the destructive section (seed re-read → rolled_to pointer →
+# registry evict) hold ``session.registry_lock()``, the SAME lock the live persist
+# (``session.persist_turns_following_successor``) holds, and routes the engine's
+# persist through that redirect. These three tests pin the fix and demonstrate the
+# pre-fix failure.
+
+
+def test_persist_after_rollover_redirects_to_successor(tmp_path: Path) -> None:
+    """A live-turn persist for an already-rolled-over sid threads into the successor
+    (via the ``rolled_to`` redirect) instead of resurrecting the deleted old buffer.
+    This is the mechanism that closes the resolve-persist resurrection Major."""
+    from brain.chat.session import persist_turns_following_successor, reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_redir"
+    base = datetime.now(UTC) - timedelta(hours=3)
+    _seed(persona_dir, old_sid, 6, base=base, step=timedelta(minutes=1))
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
+    provider = _ExtractOnlyProvider()
+    try:
+        new_sid = perform_rollover(
+            persona_dir, old_sid, _PERSONA_NAME,
+            seed_mode="summary_only", provider=provider,
+            store=store, hebbian=hebbian, embeddings=embeddings,
+        )
+        assert new_sid is not None
+        assert old_sid not in list_active_sessions(persona_dir)
+
+        # A request that still holds the OLD sid persists its turn now.
+        persist_turns_following_successor(persona_dir, [
+            {"session_id": old_sid, "speaker": "user", "text": "late-user"},
+            {"session_id": old_sid, "speaker": "assistant", "text": "late-asst"},
+        ])
+
+        # It landed in the successor, NOT on a resurrected old buffer.
+        assert old_sid not in list_active_sessions(persona_dir), (
+            "old buffer was resurrected — the persist redirect did not fire"
+        )
+        succ_texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
+        assert "late-user" in succ_texts and "late-asst" in succ_texts
+    finally:
+        store.close()
+        hebbian.close()
+        embeddings.close()
+        reset_registry()
+
+
+def test_plain_ingest_after_rollover_resurrects_fail_demo(tmp_path: Path) -> None:
+    """Fail-demo: the PRE-FIX persist path (a plain ``ingest_turn`` on the old sid,
+    with no successor redirect — exactly what engine._persist_turn did before r4)
+    resurrects the deleted old buffer and orphans the turn OUTSIDE the successor
+    chain. Proves the redirect guard above is a real regression guard, not vacuous."""
+    from brain.chat.session import reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_resurrect"
+    base = datetime.now(UTC) - timedelta(hours=3)
+    _seed(persona_dir, old_sid, 6, base=base, step=timedelta(minutes=1))
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
+    provider = _ExtractOnlyProvider()
+    try:
+        new_sid = perform_rollover(
+            persona_dir, old_sid, _PERSONA_NAME,
+            seed_mode="summary_only", provider=provider,
+            store=store, hebbian=hebbian, embeddings=embeddings,
+        )
+        assert new_sid is not None
+        assert old_sid not in list_active_sessions(persona_dir)
+
+        # The OLD (unredirected) persist path — append straight to the old sid.
+        ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "user", "text": "orphan"})
+
+        # Bug reproduced: the old buffer is resurrected and the turn is orphaned —
+        # it is NOT in the successor. (The fixed path routes through
+        # persist_turns_following_successor, which redirects; see the test above.)
+        assert old_sid in list_active_sessions(persona_dir), (
+            "expected the unredirected ingest to resurrect the old buffer"
+        )
+        succ_texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
+        assert "orphan" not in succ_texts
+    finally:
+        store.close()
+        hebbian.close()
+        embeddings.close()
+        reset_registry()
+
+
+def test_persist_during_rollover_destructive_window_not_orphaned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exact r3 window, exercised concurrently: a live persist that registers
+    for the OLD sid WHILE ``perform_rollover`` is mid-destructive-section (pointer
+    written, buffer not yet deleted) must NOT orphan its turn — it threads into the
+    successor. The rollover runs on one thread, blocked at the buffer-delete step;
+    the racing persist runs on the main thread in that window.
+
+    Without the round-4 fix the racing persist (a) is not serialized against the
+    delete and (b) does not redirect, so its turn lands on the old buffer and is
+    deleted with it (or resurrects it). With the fix it redirects to the live
+    successor under registry_lock()."""
+    import threading
+
+    from brain.chat import rollover as rollover_mod
+    from brain.chat.session import persist_turns_following_successor, reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_window"
+    base = datetime.now(UTC) - timedelta(hours=3)
+    _seed(persona_dir, old_sid, 6, base=base, step=timedelta(minutes=1))
+
+    at_delete = threading.Event()
+    release_delete = threading.Event()
+    real_delete = rollover_mod.delete_session_buffer
+
+    def blocking_delete(pd, sid):
+        # perform_rollover has finished its destructive section (rolled_to pointer
+        # written, registry evicted) and is about to delete the old buffer. Pause
+        # here so the racing persist executes in exactly this window.
+        at_delete.set()
+        release_delete.wait(5)
+        real_delete(pd, sid)
+
+    monkeypatch.setattr(rollover_mod, "delete_session_buffer", blocking_delete)
+
+    # store/hebbian/embeddings are omitted: the best-effort memory extraction is
+    # irrelevant to the buffer-lifecycle race under test, and its SQLite handles
+    # can't cross the thread boundary. The fold + destructive section still run.
+    provider = _ExtractOnlyProvider()
+    result: dict = {}
+
+    def run_rollover() -> None:
+        # tiers_plus_tail is the real weekly-rollover (1c-B) mode r3's scenario
+        # targets; it seeds from the raw tail, so it reaches the destructive delete
+        # without depending on a memory-store-backed summary.
+        result["new_sid"] = perform_rollover(
+            persona_dir, old_sid, _PERSONA_NAME,
+            seed_mode="tiers_plus_tail", provider=provider,
+        )
+
+    t = threading.Thread(target=run_rollover, name="rollover-under-test")
+    try:
+        t.start()
+        assert at_delete.wait(5), "rollover never reached the buffer-delete step"
+
+        # Racing live persist for the OLD sid, exactly as engine._persist_turn does.
+        persist_turns_following_successor(persona_dir, [
+            {"session_id": old_sid, "speaker": "user", "text": "raced-user"},
+            {"session_id": old_sid, "speaker": "assistant", "text": "raced-asst"},
+        ])
+
+        release_delete.set()
+        t.join(5)
+        assert not t.is_alive(), "rollover thread did not finish"
+    finally:
+        release_delete.set()
+        t.join(5)
+        reset_registry()
+
+    new_sid = result.get("new_sid")
+    assert new_sid is not None
+    # No resurrection / no orphan: old buffer gone, raced turn in the successor.
+    assert old_sid not in list_active_sessions(persona_dir), (
+        "old buffer was resurrected by the racing persist"
+    )
+    succ_texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
+    assert "raced-user" in succ_texts and "raced-asst" in succ_texts, (
+        "racing persist's turn was orphaned instead of threading into the successor"
+    )
