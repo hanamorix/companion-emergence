@@ -723,3 +723,67 @@ def test_summary_only_carries_residual_raw_not_dropped(
         assert old_sid not in list_active_sessions(persona_dir)
     finally:
         reset_registry()
+
+
+def test_persist_during_summary_only_rollover_window_not_orphaned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Concurrent sibling of the tiers_plus_tail window test, for summary_only mode
+    (closes the r4 re-review's noted coverage gap). A live persist that registers in
+    the destructive window (pointer written, buffer not yet deleted) of a
+    summary_only rollover threads into the successor, not orphaned. The fold is a
+    no-op over a pre-seeded summary so the rollover proceeds without needing the
+    memory stores across the thread boundary."""
+    import threading
+
+    from brain.chat import rollover as rollover_mod
+    from brain.chat.session import persist_turns_following_successor, reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_sowin"
+    monkeypatch.setattr(rollover_mod, "compact_conversation", lambda *a, **k: None)
+    ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "summary", "text": "[folded]"})
+
+    at_delete = threading.Event()
+    release_delete = threading.Event()
+    real_delete = rollover_mod.delete_session_buffer
+
+    def blocking_delete(pd, sid):
+        at_delete.set()
+        release_delete.wait(5)
+        real_delete(pd, sid)
+
+    monkeypatch.setattr(rollover_mod, "delete_session_buffer", blocking_delete)
+
+    result: dict = {}
+
+    def run_rollover() -> None:
+        result["new_sid"] = perform_rollover(
+            persona_dir, old_sid, _PERSONA_NAME, seed_mode="summary_only", provider=None,
+        )
+
+    t = threading.Thread(target=run_rollover, name="summary-only-rollover")
+    try:
+        t.start()
+        assert at_delete.wait(5), "rollover never reached the buffer-delete step"
+        persist_turns_following_successor(persona_dir, [
+            {"session_id": old_sid, "speaker": "user", "text": "so-raced-user"},
+            {"session_id": old_sid, "speaker": "assistant", "text": "so-raced-asst"},
+        ])
+        release_delete.set()
+        t.join(5)
+        assert not t.is_alive(), "rollover thread did not finish"
+    finally:
+        release_delete.set()
+        t.join(5)
+        reset_registry()
+
+    new_sid = result.get("new_sid")
+    assert new_sid is not None
+    assert old_sid not in list_active_sessions(persona_dir), "old buffer resurrected"
+    texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
+    assert "so-raced-user" in texts and "so-raced-asst" in texts, (
+        "racing persist orphaned instead of threading into the successor"
+    )
