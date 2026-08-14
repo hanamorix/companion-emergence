@@ -32,7 +32,7 @@ from brain.chat.compaction import (
     cascade_conversation,
     compact_conversation,
 )
-from brain.chat.session import create_session, remove_session
+from brain.chat.session import create_session, registry_lock, remove_session
 from brain.ingest.buffer import (
     acquire_compaction_lock,
     delete_backoff,
@@ -124,44 +124,65 @@ def perform_rollover(
     else:  # pragma: no cover - guarded by callers
         raise ValueError(f"unknown seed_mode {seed_mode!r}")
 
-    # 3-6. Seed the new session + reap the old buffer, under the compaction lock.
-    #      Re-read the current committed row under the lock (interposition-safe;
-    #      apply_budget may have touched the 24h tier between fold and here).
+    # 3-6. Seed the new session + reap the old buffer. The compaction lock guards
+    #      against a concurrent cascade; the registry lock (below) guards the
+    #      seed-read↔pointer-write against a concurrent live-turn persist.
     if not acquire_compaction_lock(persona_dir, old_sid):
         return None  # busy → defer to the next cycle
     try:
-        turns = read_session(persona_dir, old_sid)
-        summary_row, raw = _split_summary_and_raw(turns)
-        if seed_mode == "summary_only":
-            seed_rows: list[dict] = [summary_row] if summary_row else []
-        else:
-            tail = raw[-_ROLLOVER_TAIL:]
-            seed_rows = ([summary_row] if summary_row else []) + tail
-        if not seed_rows:
-            return None  # nothing to seed → abort (nothing lost; old buffer stays)
+        # The destructive critical section runs under registry_lock() — the SAME
+        # lock brain.chat.session.persist_turns_following_successor holds for a live
+        # turn persist. This closes the resolve-persist race by construction (stage-6
+        # r4): a concurrent persist for old_sid either lands BEFORE the seed re-read
+        # below (and is carried into the successor seed) or, once the rolled_to
+        # pointer is written, is redirected into the live successor buffer — it can
+        # never resurrect the deleted old buffer. Both the persist worker thread and
+        # this supervisor thread are ordinary OS threads, so an RLock is the right
+        # cross-thread primitive (the async in_flight_locks cannot span the boundary).
+        #
+        # Re-read the committed row under the lock (interposition-safe; apply_budget
+        # may have touched the 24h tier between fold and here — and a persist that
+        # slipped in before us is now visible and captured).
+        with registry_lock():
+            turns = read_session(persona_dir, old_sid)
+            summary_row, raw = _split_summary_and_raw(turns)
+            if seed_mode == "summary_only":
+                seed_rows: list[dict] = [summary_row] if summary_row else []
+            else:
+                tail = raw[-_ROLLOVER_TAIL:]
+                seed_rows = ([summary_row] if summary_row else []) + tail
+            if not seed_rows:
+                # Nothing to seed → abort (nothing lost; old buffer stays).
+                return None
 
-        old_cursor = read_cursor(persona_dir, old_sid)
+            old_cursor = read_cursor(persona_dir, old_sid)
 
-        new_sess = create_session(persona_name)
-        new_sid = new_sess.session_id
-        # Re-stamp the seed rows' session_id to the new session so downstream
-        # readers see a consistent id.
-        reseeded = [{**r, "session_id": new_sid} for r in seed_rows]
-        rewrite_session_atomic(persona_dir, new_sid, reseeded)
-        # Carry the old session's extraction cursor so already-extracted carried
-        # tail messages are NOT re-extracted while unextracted ones still are (C18).
-        if old_cursor:
-            write_cursor(persona_dir, new_sid, old_cursor)
+            new_sess = create_session(persona_name)
+            new_sid = new_sess.session_id
+            # Re-stamp the seed rows' session_id to the new session so downstream
+            # readers see a consistent id.
+            reseeded = [{**r, "session_id": new_sid} for r in seed_rows]
+            rewrite_session_atomic(persona_dir, new_sid, reseeded)
+            # Carry the old session's extraction cursor so already-extracted carried
+            # tail messages are NOT re-extracted while unextracted ones still are (C18).
+            if old_cursor:
+                write_cursor(persona_dir, new_sid, old_cursor)
 
-        # Ordering closes the C-1 mid-rollover window (stage-6). The successor
-        # pointer goes down FIRST (old sid never resolves to nothing), then the
-        # registry is evicted BEFORE the buffer is deleted, so a concurrent
-        # resolve of the old sid cannot return a stale-cached session over a
-        # deleted buffer. get_or_hydrate_session consults the pointer first
-        # regardless, but keeping evict-before-delete removes the stale entry
-        # promptly as belt-and-braces.
-        write_rolled_to(persona_dir, old_sid, new_sid)
-        remove_session(old_sid)  # registry evict (no file delete — handled next)
+            # Successor pointer goes down FIRST — under the lock — so from this
+            # instant any resolve OR persist of old_sid redirects to the successor
+            # (C-1 resolve-side redirect + the persist-side redirect above). Then
+            # evict the stale registry entry. get_or_hydrate_session consults the
+            # pointer before the registry regardless; evict-before-delete just clears
+            # the stale entry promptly as belt-and-braces.
+            write_rolled_to(persona_dir, old_sid, new_sid)
+            remove_session(old_sid)  # registry evict (no file delete — handled next)
+
+        # Reap the old buffer/cursor/backoff OUTSIDE the registry lock: the pointer
+        # is durably in place, so every resolve/persist of old_sid already redirects
+        # to the successor and nothing can append to the old buffer anymore — the
+        # delete only reclaims the now-orphaned file. Keeping the (possibly
+        # retry-looping) unlink out of the lock avoids stalling registry ops on
+        # other sessions.
         delete_session_buffer(persona_dir, old_sid)
         delete_cursor(persona_dir, old_sid)
         delete_backoff(persona_dir, old_sid)
@@ -193,11 +214,17 @@ def maybe_weekly_rollover(
     every other automatic tick (owner ruling 2026-08-13). Two idle conditions must
     both hold: (1) the last completed turn is older than ``quiet_gap`` (user-quiet,
     never mid-exchange) AND (2) there is NO in-flight request for the session
-    (``is_session_busy`` belt). Together these make the resolve-then-long-generate-
-    then-persist race unreachable: the rollover cannot delete an active session's
-    buffer out from under a request that is mid-tool-loop, because a busy session
-    defers to the next idle opportunity. Fires iff session age ≥ ``weekly_age`` AND
-    both idle conditions hold. Returns the new sid on a swap, else None (defer)."""
+    (``is_session_busy`` belt). Fires iff session age ≥ ``weekly_age`` AND both idle
+    conditions hold. Returns the new sid on a swap, else None (defer).
+
+    These two checks are a best-effort EFFICIENCY/UX belt — they avoid swapping a
+    session out from under an active user. They are NOT what makes the swap safe: the
+    resolve-persist race is closed inside ``perform_rollover``, whose destructive
+    section holds ``registry_lock()`` across its seed re-read → ``rolled_to`` pointer
+    write, serializing it against a concurrent live-turn persist (which takes the same
+    lock). So even if a request registers in the check-then-act gap after (2) passed,
+    its turn is captured into the successor seed or redirected to the successor buffer
+    — never orphaned onto a deleted old buffer."""
     now = now or datetime.now(UTC)
     turns = read_session(persona_dir, session_id)
     raw = [t for t in turns if t.get("speaker") != "summary"]
@@ -213,12 +240,14 @@ def maybe_weekly_rollover(
     if newest is None or (now - newest) < quiet_gap:
         return None
 
-    # Idle condition 2 (belt — closes the resolve-persist race): defer if a request
-    # is in-flight for this session. A multi-second tool-loop can be active even
-    # when the last COMPLETED turn is old (a request that started after a long
-    # quiet gap), so the quiet-gap alone does not catch it — the in-flight check
-    # does. Best-effort cross-thread read of the async in_flight_locks; on a busy
-    # session we defer to the next idle tick rather than delete its live buffer.
+    # Idle condition 2 (best-effort belt): defer if a request is in-flight for this
+    # session. A multi-second tool-loop can be active even when the last COMPLETED
+    # turn is old (a request that started after a long quiet gap), so the quiet-gap
+    # alone does not catch it — the in-flight check does. This is an efficiency/UX
+    # guard (don't swap under an active user), NOT the race-safety mechanism: the
+    # check-then-act gap between here and the buffer delete is closed structurally by
+    # registry_lock() inside perform_rollover (see its destructive section).
+    # Best-effort cross-thread read of the async in_flight_locks.
     if is_session_busy is not None and is_session_busy(session_id):
         return None
 
