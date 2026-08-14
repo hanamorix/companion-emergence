@@ -210,6 +210,43 @@ def delete_cursor(persona_dir: Path, session_id: str) -> None:
     _unlink_with_retry(path)
 
 
+def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.rolled_to — the successor
+    pointer written by a session rollover. A ``.jsonl`` glob never picks it up, so it
+    is not seen as a live session; it survives the old buffer's deletion so a
+    continuous client still holding the old sid is redirected to the successor."""
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.rolled_to"
+
+
+def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> None:
+    """Atomically write the successor pointer (tmp + fsync + os.replace). Written
+    under the compaction lock BEFORE the old buffer is deleted, so the old sid never
+    resolves to nothing."""
+    _validate_session_id(session_id)
+    _validate_session_id(successor_id)
+    path = _rolled_to_path(persona_dir, session_id)
+    tmp = path.with_suffix(".rolled_to.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"successor": successor_id, "at": _now_iso()}, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_rolled_to(persona_dir: Path, session_id: str) -> str | None:
+    """Return the successor sid this session rolled over to, or None if absent/malformed."""
+    path = _rolled_to_path(persona_dir, session_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    succ = data.get("successor") if isinstance(data, dict) else None
+    return succ if isinstance(succ, str) and succ else None
+
+
 def _backoff_path(persona_dir: Path, session_id: str) -> Path:
     """Resolve <persona>/active_conversations/<session_id>.backoff.
 
@@ -281,35 +318,121 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     os.replace(tmp, path)
 
 
+# Archive rotation (1d). A single unbounded ``<sid>.jsonl`` grows without limit on
+# a long-lived session; segmenting bounds each file. A hard BYTE cap is chosen over
+# per-day so a bursty day cannot make one segment huge. The provenance chain (faded
+# summaries + superseded raw turns, in order) is preserved across segments by the
+# segment-aware reader.
+_ARCHIVE_SEGMENT_MAX_BYTES = 5 * 1024 * 1024
+
+
 def _archive_path(persona_dir: Path, session_id: str) -> Path:
-    """Resolve <persona>/archived_conversations/<session_id>.jsonl."""
+    """Resolve the LEGACY single-file archive path <persona>/archived_conversations/
+    <session_id>.jsonl. Retained for back-compat: a pre-segmentation archive still
+    reads. New writes roll into ``<session_id>.<NNN>.jsonl`` segments."""
     _validate_session_id(session_id)
     return _archived_conversations_dir(persona_dir) / f"{session_id}.jsonl"
+
+
+def _archive_segments(persona_dir: Path, session_id: str) -> list[tuple[int, Path]]:
+    """Return existing ``<sid>.<NNN>.jsonl`` segments as (num, path), numeric-sorted."""
+    _validate_session_id(session_id)
+    d = _archived_conversations_dir(persona_dir)
+    prefix = f"{session_id}."
+    suffix = ".jsonl"
+    out: list[tuple[int, Path]] = []
+    for p in d.glob(f"{session_id}.*.jsonl"):
+        mid = p.name[len(prefix) : -len(suffix)]
+        if mid.isdigit():
+            out.append((int(mid), p))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _archive_read_order(persona_dir: Path, session_id: str) -> list[Path]:
+    """All archive files for a sid in provenance order: the legacy single file (if
+    present, the oldest) then every rolling segment, numeric-ordered."""
+    paths: list[Path] = []
+    legacy = _archive_path(persona_dir, session_id)
+    if legacy.exists():
+        paths.append(legacy)
+    paths.extend(p for _, p in _archive_segments(persona_dir, session_id))
+    return paths
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory so a newly-created entry is durable (crash-mid-roll
+    protection, C11). POSIX-only — Windows has no O_DIRECTORY and raises; guarded
+    like brain/health/attempt_heal.py so Windows CI does not break."""
+    if os.name != "posix":
+        return
+    try:
+        dir_fd = os.open(str(path), os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> int:
     """Append ``records`` to the conversation archive, fsync, return byte count.
 
-    Append-only and NEVER size-rotated (a truncating rotation would destroy the
-    provenance chain and no multi-segment reader exists). The returned byte
-    count lets the caller verify the write landed before mutating the live
+    Append-only, rolled into size-capped segments ``<sid>.<NNN>.jsonl`` (never a
+    truncating rotation — that would destroy the provenance chain). When the active
+    segment would exceed ``_ARCHIVE_SEGMENT_MAX_BYTES`` a new segment is created and
+    its containing directory fsynced (crash-mid-roll durability, C11). The returned
+    byte count lets the caller verify the write landed before mutating the live
     buffer (the archive-before-rewrite atomicity contract).
     """
     if not records:
         return 0
-    path = _archive_path(persona_dir, session_id)
+    _validate_session_id(session_id)
+    d = _archived_conversations_dir(persona_dir)
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
     data = payload.encode("utf-8")
-    with open(path, "a", encoding="utf-8") as fh:
+
+    # Choose the active target: the highest existing segment, else a legacy single
+    # file if one exists, else a fresh segment 000.
+    segments = _archive_segments(persona_dir, session_id)
+    if segments:
+        active_path = segments[-1][1]
+    else:
+        legacy = d / f"{session_id}.jsonl"
+        active_path = legacy if legacy.exists() else d / f"{session_id}.000.jsonl"
+
+    is_new_segment = not active_path.exists()
+    if not is_new_segment:
+        try:
+            cur_size = active_path.stat().st_size
+        except OSError:
+            cur_size = 0
+        # Roll only a non-empty segment (a huge single record still lands somewhere).
+        if cur_size > 0 and cur_size + len(data) > _ARCHIVE_SEGMENT_MAX_BYTES:
+            next_num = (segments[-1][0] + 1) if segments else 0
+            active_path = d / f"{session_id}.{next_num:03d}.jsonl"
+            is_new_segment = True
+
+    with open(active_path, "a", encoding="utf-8") as fh:
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
+    if is_new_segment:
+        _fsync_dir(d)
     return len(data)
 
 
 def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
-    """Return archived records (raw turns + faded summaries), skipping corrupt lines."""
-    return read_jsonl_skipping_corrupt(_archive_path(persona_dir, session_id))
+    """Return archived records (raw turns + faded summaries) across ALL segments in
+    provenance order, skipping corrupt lines (tolerates a torn trailing line / a
+    zero-length trailing segment left by a crash mid-roll)."""
+    out: list[dict] = []
+    for p in _archive_read_order(persona_dir, session_id):
+        out.extend(read_jsonl_skipping_corrupt(p))
+    return out
 
 
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:

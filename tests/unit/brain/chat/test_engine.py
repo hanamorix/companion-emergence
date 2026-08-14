@@ -181,7 +181,10 @@ def test_respond_catches_and_logs_ingest_persistence_error(
     from unittest.mock import patch
 
     with (
-        patch("brain.chat.engine.ingest_turn", side_effect=OSError("disk full")),
+        patch(
+            "brain.chat.engine.persist_turns_following_successor",
+            side_effect=OSError("disk full"),
+        ),
         caplog.at_level(logging.WARNING, logger="brain.chat.engine"),
     ):
         result = respond(
