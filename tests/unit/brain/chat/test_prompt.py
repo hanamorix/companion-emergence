@@ -438,7 +438,7 @@ def test_recall_block_handles_no_match(
 def test_recall_block_caps_at_limit(
     persona_dir: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
-    """A query that matches many memories surfaces at most ``limit`` (default 5)."""
+    """A query that matches many memories surfaces at most ``limit`` (default SNIPPET_COUNT=8)."""
     for i in range(12):
         store.create(
             Memory.create_new(
@@ -461,12 +461,12 @@ def test_recall_block_caps_at_limit(
     # New forgetting-aware format renders bullets under "  active:" indented with "    - "
     assert "recall" in msg
     assert "active:" in msg
-    # Each active result is a '    - "…"' bullet — cap is still 5 per bucket.
+    # Each active result is a '    - "…"' bullet — cap is SNIPPET_COUNT (8) per bucket (P2).
     # Count quoted bullets (active/fading entries use quoted content) excluding the
     # unquoted "not recognised" token bullets which have no surrounding quotes.
     recall_section = msg.split("recall\n")[1]
     quoted_bullet_count = recall_section.count('    - "')
-    assert quoted_bullet_count == 5, f"expected 5 recall bullets, got {quoted_bullet_count}"
+    assert quoted_bullet_count == 8, f"expected 8 recall bullets, got {quoted_bullet_count}"
 
 
 def test_recall_block_truncates_long_content(
@@ -1034,6 +1034,7 @@ def _nr_empty_result():
     r.active = []
     r.fading = []
     r.lost = []
+    r.scores = {}
     return r
 
 
@@ -1050,6 +1051,7 @@ def _nr_hit_result(content: str):
     r.active = [mem]
     r.fading = []
     r.lost = []
+    r.scores = {}
     return r
 
 
@@ -1061,7 +1063,7 @@ def test_build_recall_block_not_recognised_section(tmp_path: Path):
 
     store = MagicMock()
 
-    def fake_search(persona_dir, store_, token, *, limit):
+    def fake_search(persona_dir, store_, token, *, limit, hebbian=None):
         if token == "Lisbon":
             return _nr_hit_result("we talked about a trip to Lisbon")
         return _nr_empty_result()

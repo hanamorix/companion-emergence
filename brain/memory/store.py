@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -203,10 +204,68 @@ CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+-- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
+-- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
+-- content with content_rowid='rowid' indexes only `content` (no duplication).
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content, content='memories', content_rowid='rowid'
+);
+
+-- Schema-level sync triggers: they live in the DB and fire on WHICHEVER
+-- connection performs the write, so every one of the ~15 MemoryStore
+-- connections maintains the index atomically within its own transaction.
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
 """
 
 
 _ALLOWED_FILTER_COLUMNS = frozenset({"domain", "memory_type"})
+
+# Minimum token length fed into the FTS5 MATCH sanitizer. Default 3 keeps short
+# proper-ish terms while still dropping the shortest stopword-shaped fragments;
+# every term is double-quoted anyway, so a token colliding with an FTS keyword
+# (AND/OR/NOT/NEAR) is treated as a literal string, not an operator. Sibling to
+# the recall/tool tokenizers' min_len=4.
+_FTS_TOKEN_MIN_LEN = 3
+
+
+def _to_fts_match(query: str) -> str:
+    """Build an FTS5 MATCH expression from a raw query string.
+
+    Tokenizes (split on ``[^A-Za-z0-9]+``, drop tokens shorter than
+    ``_FTS_TOKEN_MIN_LEN``, dedup case-insensitively) and **OR-joins each term
+    wrapped in double-quotes** — e.g. ``'"henryk" OR "preferences"'``.
+
+    The OR is mandatory, not cosmetic: FTS5's default bare-term MATCH is an
+    implicit AND, so a disjoint multi-term query would return ZERO rows. The
+    double-quoting makes each term a literal FTS string, immune to a token that
+    collides with an FTS keyword (AND/OR/NOT/NEAR) or a special char.
+
+    Returns ``""`` when the query yields no usable tokens (caller returns no
+    matches rather than issuing a MATCH).
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for piece in re.split(r"[^A-Za-z0-9]+", query):
+        if len(piece) < _FTS_TOKEN_MIN_LEN:
+            continue
+        low = piece.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        terms.append(f'"{piece}"')
+    return " OR ".join(terms)
 
 
 class MemoryStore:
@@ -298,6 +357,53 @@ class MemoryStore:
                     logger.warning("peak seeding skipped: %s", exc)
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
+        self._conn.commit()
+        self._boot_fts_backstop()
+
+    def _boot_fts_backstop(self) -> None:
+        """FTS5 boot integrity-check → rebuild backstop.
+
+        Runs on EVERY constructor, including ``integrity_check=False`` ones
+        (the hot/feed paths): this FTS check is separate from the ``memories.db``
+        ``PRAGMA integrity_check`` gated by that flag — it is a cheap
+        FTS-internal consistency probe, not a full-DB scan, and must run so a
+        feed-path writer never operates against a stale/absent FTS index.
+
+        Rebuilds when the shadow index is corrupt (integrity-check raises) OR
+        empty against a pre-populated ``memories`` table — which covers both a
+        persona whose ``memories.db`` predates FTS (the table was just created
+        against existing rows) and a cleared/corrupted index (C2 self-heal).
+        Fail-soft: a rebuild failure logs and leaves the LIKE fallback usable.
+        """
+        try:
+            self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+            healthy = True
+        except sqlite3.DatabaseError:
+            healthy = False
+        needs_rebuild = not healthy
+        if healthy:
+            try:
+                mem_rows = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+                # COUNT(*) on the FTS table itself reads the external CONTENT
+                # table, not the index — use the `_docsize` shadow table for the
+                # true count of INDEXED rows so an empty index against a
+                # populated `memories` (predates-FTS, or a cleared index) is
+                # detected.
+                fts_rows = self._conn.execute(
+                    "SELECT COUNT(*) FROM memories_fts_docsize"
+                ).fetchone()[0]
+                needs_rebuild = mem_rows > 0 and fts_rows == 0
+            except sqlite3.DatabaseError:
+                needs_rebuild = True
+        if needs_rebuild:
+            try:
+                self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            except sqlite3.DatabaseError as exc:
+                logger.warning("memories_fts rebuild failed; LIKE fallback in use: %s", exc)
+        # The 'integrity-check'/'rebuild' commands are INSERT statements, so
+        # sqlite3 opens an implicit write transaction. Commit it unconditionally
+        # (even the read-only integrity-check path) so no boot leaves a lock held
+        # against the other ~15 concurrent MemoryStore connections to this file.
         self._conn.commit()
 
     def close(self) -> None:
@@ -580,6 +686,60 @@ class MemoryStore:
             )
             self._conn.commit()
         return [_row_to_memory(row) for row in rows]
+
+    def search_fts_scored(
+        self,
+        query: str,
+        *,
+        active_only: bool = True,
+        include_fading: bool = True,
+        limit: int | None = None,
+        bump: bool = False,
+    ) -> list[tuple[Memory, float]]:
+        """FTS5/BM25 text-match search, best-match first.
+
+        Runs the sanitized query (``_to_fts_match``) as an FTS5 ``MATCH``,
+        joins back to ``memories``, and returns each Memory **with its raw
+        bm25 score** ordered by ``bm25(memories_fts)`` ascending (lower is a
+        better match). The ranker (:mod:`brain.memory.relevance`) inverts and
+        normalizes the score; it is surfaced here because the ranker needs it.
+
+        Applies the same ``active``/``state`` filters ``search_text`` does, so
+        an ``active_only`` caller gets no fading rows. ``bump`` defaults
+        **False** (surfacing must not inflate ``recall_count``); when True the
+        matched rows' ``recall_count``/``last_accessed_at`` are bumped.
+
+        An empty/all-tokens-dropped query returns ``[]`` (no MATCH is issued).
+        """
+        match = _to_fts_match(query)
+        if not match:
+            return []
+        sql = (
+            "SELECT m.*, bm25(memories_fts) AS _bm25 "
+            "FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
+            "WHERE memories_fts MATCH ?"
+        )
+        params: list[Any] = [match]
+        if active_only:
+            sql += " AND m.active = 1"
+        if not include_fading:
+            sql += " AND m.state != 'fading'"
+        sql += " ORDER BY _bm25 ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        if rows and bump:
+            now_iso = datetime.now(UTC).isoformat()
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"UPDATE memories SET recall_count = recall_count + 1, "
+                f"last_accessed_at = ? WHERE id IN ({placeholders})",
+                (now_iso, *ids),
+            )
+            self._conn.commit()
+        return [(_row_to_memory(row), float(row["_bm25"])) for row in rows]
 
     def list_active(self, limit: int | None = None) -> list[Memory]:
         """Return active memories ordered by created_at desc."""

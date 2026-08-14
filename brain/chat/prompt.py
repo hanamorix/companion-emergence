@@ -20,6 +20,13 @@ from brain.chat.monologue_prompts import build_monologue_frame, build_reply_fram
 from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.maker.ambient import build_maker_awareness_block
+from brain.memory.relevance import (
+    FULL_INJECT_IMPORTANCE,
+    FULL_INJECT_MAX,
+    SNIPPET_COUNT,
+    SNIPPET_MAX_CHARS,
+    SNIPPET_MODE_ENABLED,
+)
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
 
@@ -762,30 +769,79 @@ def _peer_attributed(mem, snippet: str) -> str:
     return snippet
 
 
+def _recall_sort_key(m):
+    """Recency-fallback sort key: importance desc, recency desc.
+
+    Used only when blended relevance scores are absent (RELEVANCE_RANKING_ENABLED
+    is False — the None-sentinel path). When scores are present the caller sorts
+    by the blended score instead.
+    """
+    importance = float(getattr(m, "importance", 0) or 0)
+    created_at = getattr(m, "created_at", None)
+    try:
+        ts = created_at.timestamp() if created_at is not None else 0.0
+    except Exception:  # noqa: BLE001
+        ts = 0.0
+    return (-importance, -ts)
+
+
+def _full_inject_ids(mems: list) -> set[str]:
+    """Ids of the candidates rendered in full (untruncated body).
+
+    A candidate with ``importance >= FULL_INJECT_IMPORTANCE`` is never gated
+    behind a read-call. At most ``FULL_INJECT_MAX`` are full-injected
+    (highest-importance first) so the volatile prompt tail stays bounded (C20);
+    any further imp≥9 candidates fall back to snippets.
+    """
+    if not SNIPPET_MODE_ENABLED:
+        return set()
+    hi = [m for m in mems if float(getattr(m, "importance", 0) or 0) >= FULL_INJECT_IMPORTANCE]
+    hi.sort(key=lambda m: -float(getattr(m, "importance", 0) or 0))
+    return {m.id for m in hi[:FULL_INJECT_MAX]}
+
+
+def _recall_snippet(mem, max_chars: int, *, full: bool) -> str:
+    """Render a memory body as a full body or a truncated snippet.
+
+    ``full`` (high-importance bypass, or SNIPPET_MODE_ENABLED=False) → untruncated;
+    otherwise truncate to ``max_chars`` with an ellipsis.
+    """
+    body = (getattr(mem, "content", "") or "").strip()
+    if full or not SNIPPET_MODE_ENABLED:
+        return body
+    if len(body) > max_chars:
+        return body[: max_chars - 1].rstrip() + "…"
+    return body
+
+
 def _build_recall_block(
     store: MemoryStore,
     user_input: str,
     *,
     persona_dir: Path | None = None,
-    limit: int = 5,
-    max_chars: int = 140,
+    limit: int = SNIPPET_COUNT,
+    max_chars: int = SNIPPET_MAX_CHARS,
 ) -> str:
     """Surface up to ``limit`` memories matching the current user input.
 
     Phase 2.A of the autonomous-memory work, rewired in Phase 8
     (forgetting design §5) to use search_with_loss so faded + lost
-    memories surface in their own labelled buckets.
+    memories surface in their own labelled buckets, and again in P2 to rank by
+    blended relevance (BM25 + importance + hebbian + recency), render snippets
+    with a high-importance full-inject bypass, and stop bumping recall_count on
+    mere surfacing.
 
     Strategy: extract content tokens from ``user_input`` (drop short
-    stopword-shaped fragments), call search_with_loss for each token,
-    dedupe across all buckets, render three sections:
-      - active memories (full body)
+    stopword-shaped fragments), call search_with_loss for each token (sharing a
+    single per-turn HebbianMatrix handle), dedupe across all buckets keeping the
+    best blended score per id, render four sections:
+      - active memories (snippet, or full body when importance ≥ FULL_INJECT_IMPORTANCE)
       - softened memories (fading; original detail gone)
       - lost memories (no longer in active memory; from graveyard)
+      - not recognised (searched; no memory found)
 
-    Falls back to raw search_text (active_only=True) when persona_dir
-    is None (e.g. called directly in tests without a dir) — same
-    semantics as the old implementation for that path.
+    Falls back to ranked retrieval with no graveyard/hebbian when persona_dir
+    is None (e.g. called directly in tests without a dir).
 
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
@@ -795,40 +851,41 @@ def _build_recall_block(
         return ""
 
     if persona_dir is None:
-        # Legacy path — used when called without a persona_dir.
+        # Legacy path — no persona_dir → cannot locate hebbian.db or the
+        # graveyard. Ranked retrieval per token (hebbian=None → w_heb=0), same
+        # snippet render as the main path, no surfacing bump.
+        from brain.memory.relevance import rank_memories
+
         seen: set = set()
         candidates: list = []
+        merged: dict[str, float] = {}
         for token in tokens:
             try:
-                hits = store.search_text(token, active_only=True, limit=limit * 2)
+                ranked = rank_memories(store, None, token, limit=limit)
             except Exception:  # noqa: BLE001
                 continue
-            for mem in hits:
-                if mem.id in seen:
-                    continue
-                seen.add(mem.id)
-                candidates.append(mem)
+            for mem, score in ranked:
+                if mem.id not in seen:
+                    seen.add(mem.id)
+                    candidates.append(mem)
+                    if score is not None:
+                        merged[mem.id] = score
+                elif score is not None:
+                    merged[mem.id] = max(merged.get(mem.id, score), score)
 
         if not candidates:
             return ""
 
-        def _sort_key(m):
-            importance = float(getattr(m, "importance", 0) or 0)
-            created_at = getattr(m, "created_at", None)
-            try:
-                ts = created_at.timestamp() if created_at is not None else 0.0
-            except Exception:  # noqa: BLE001
-                ts = 0.0
-            return (-importance, -ts)
-
-        candidates.sort(key=_sort_key)
+        if merged:
+            candidates.sort(key=lambda m: -merged.get(m.id, float("-inf")))
+        else:
+            candidates.sort(key=_recall_sort_key)
         top = candidates[:limit]
+        full_ids = _full_inject_ids(top)
 
         lines = ["── recall (memories matching this turn) ──"]
         for mem in top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
             importance = int(round(float(getattr(mem, "importance", 0) or 0)))
             domain = getattr(mem, "domain", "") or ""
             prefix = f"[importance {importance}/10"
@@ -841,6 +898,7 @@ def _build_recall_block(
 
     # Forgetting-aware path — partitions into active / fading / lost.
     from brain.forgetting.recall import search_with_loss
+    from brain.memory.hebbian import HebbianMatrix
 
     seen_active: set = set()
     seen_fading: set = set()
@@ -854,28 +912,58 @@ def _build_recall_block(
     fading_hits: list = []
     lost_hits: list = []
     unfamiliar: list[str] = []
+    # id → best blended score across tokens (None-sentinel: an unranked id is
+    # simply absent, so the merge falls back to (-importance, -ts) for it).
+    merged_score: dict[str, float] = {}
+    merged_fading: dict[str, float] = {}
 
-    for token in tokens:
+    # THE one hebbian open site in all of P2 (spec §2): open exactly one
+    # HebbianMatrix, thread it through every search_with_loss call in the token
+    # loop, close it once. integrity_check=False → no per-turn full-DB scan.
+    # Fail-soft: any open error → heb=None (w_heb=0) and the loop still runs.
+    heb = None
+    try:
         try:
-            result = search_with_loss(persona_dir, store, token, limit=limit * 2)
-        except Exception:  # noqa: BLE001
-            continue
-        found = bool(result.active or result.fading or result.lost)
-        if not found:
-            unfamiliar.append(token)
-        for mem in result.active:
-            if mem.id not in seen_active:
-                seen_active.add(mem.id)
-                active_hits.append(mem)
-        for mem in result.fading:
-            if mem.id not in seen_fading:
-                seen_fading.add(mem.id)
-                fading_hits.append(mem)
-        for entry in result.lost:
-            mid = entry.get("memory_id", "")
-            if mid not in seen_lost:
-                seen_lost.add(mid)
-                lost_hits.append(entry)
+            heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
+        except Exception:  # noqa: BLE001 — hebbian is a tie-breaker; degrade to None
+            heb = None
+        for token in tokens:
+            try:
+                result = search_with_loss(persona_dir, store, token, limit=limit * 2, hebbian=heb)
+            except Exception:  # noqa: BLE001
+                continue
+            found = bool(result.active or result.fading or result.lost)
+            if not found:
+                unfamiliar.append(token)
+            for mem in result.active:
+                s = result.scores.get(mem.id)
+                if mem.id not in seen_active:
+                    seen_active.add(mem.id)
+                    active_hits.append(mem)
+                    if s is not None:
+                        merged_score[mem.id] = s
+                elif s is not None:
+                    merged_score[mem.id] = max(merged_score.get(mem.id, s), s)
+            for mem in result.fading:
+                s = result.scores.get(mem.id)
+                if mem.id not in seen_fading:
+                    seen_fading.add(mem.id)
+                    fading_hits.append(mem)
+                    if s is not None:
+                        merged_fading[mem.id] = s
+                elif s is not None:
+                    merged_fading[mem.id] = max(merged_fading.get(mem.id, s), s)
+            for entry in result.lost:
+                mid = entry.get("memory_id", "")
+                if mid not in seen_lost:
+                    seen_lost.add(mid)
+                    lost_hits.append(entry)
+    finally:
+        if heb is not None:
+            try:
+                heb.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
     if len(unfamiliar) > 5:
@@ -905,18 +993,16 @@ def _build_recall_block(
         except Exception:  # noqa: BLE001
             log.exception("grief.handle_recall_touch failed inside _build_recall_block")
 
-    # Rank active + fading by importance desc, recency desc.
-    def _sort_key(m):
-        importance = float(getattr(m, "importance", 0) or 0)
-        created_at = getattr(m, "created_at", None)
-        try:
-            ts = created_at.timestamp() if created_at is not None else 0.0
-        except Exception:  # noqa: BLE001
-            ts = 0.0
-        return (-importance, -ts)
-
-    active_hits.sort(key=_sort_key)
-    fading_hits.sort(key=_sort_key)
+    # Cross-token merge: sort by the BLENDED score when ranking is on (the
+    # scores map is populated), else fall back to (-importance, -ts).
+    if merged_score:
+        active_hits.sort(key=lambda m: -merged_score.get(m.id, float("-inf")))
+    else:
+        active_hits.sort(key=_recall_sort_key)
+    if merged_fading:
+        fading_hits.sort(key=lambda m: -merged_fading.get(m.id, float("-inf")))
+    else:
+        fading_hits.sort(key=_recall_sort_key)
 
     active_top = active_hits[:limit]
     fading_top = fading_hits[:limit]
@@ -925,19 +1011,16 @@ def _build_recall_block(
     lines = ["recall"]
 
     if active_top:
+        full_ids = _full_inject_ids(active_top)
         lines.append("  active:")
         for mem in active_top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
             lines.append(f'    - "{_peer_attributed(mem, snippet)}"')
 
     if fading_top:
         lines.append("  softened (fading; original detail gone):")
         for mem in fading_top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            snippet = _recall_snippet(mem, max_chars, full=False)
             lines.append(f'    - "{_peer_attributed(mem, snippet)}"  [state: fading]')
 
     if lost_top:

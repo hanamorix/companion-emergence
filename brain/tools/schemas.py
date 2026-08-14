@@ -273,8 +273,36 @@ SCHEMAS: dict[str, dict] = {
                     "description": "Max results to return. Default 5.",
                     "default": 5,
                 },
+                "exclude_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Memory ids to omit from results (already-surfaced or "
+                        "explicitly-rejected) — pass these to fetch the next tranche."
+                    ),
+                },
             },
             "required": ["query"],
+        },
+    },
+    "read_full_memory": {
+        "name": "read_full_memory",
+        "description": (
+            "Read the full, untruncated body of one memory by its id. "
+            "search_memories and the ambient recall block surface short snippets "
+            "with ids — call this to pull the full text of a specific memory you "
+            "want to engage with. This is the deliberate 'I looked at this' read "
+            "(it strengthens the memory); merely seeing a snippet does not."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "The id of the memory to read in full (from a snippet result).",
+                },
+            },
+            "required": ["memory_id"],
         },
     },
     "save_work": {
