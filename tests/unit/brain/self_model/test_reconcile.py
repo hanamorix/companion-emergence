@@ -51,8 +51,16 @@ def test_revise_writes_clamped_registered_emotion_memory(tmp_path: Path) -> None
     assert result.get("ok") is True
     assert result.get("delta_written") is True
 
+    # self_model_reconcile is a GATED type (Root-2 stopgap): the emotion-carrying memory
+    # enqueues to the pending queue and reaches memories.db only after a consolidation drain.
+    from brain.engines.consolidation import Decision, run_consolidation
+
     store = MemoryStore(tmp_path / "memories.db")
     try:
+        assert not [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]
+        run_consolidation(
+            store, persona_dir=tmp_path, classifier=lambda _c, _ctx: Decision("new")
+        )
         mems = [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]
     finally:
         store.close()

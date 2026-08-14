@@ -26,7 +26,13 @@ def recall_monologue(
     """Return monologue_trace memories whose content matches `query` (case-
     insensitive token substring). Bumps recall_count on each returned trace."""
     tokens = [t for t in query.lower().split() if t]
-    candidates = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True, limit=None)
+    # monologue_trace is now GATED — recent traces live in the pending-candidate
+    # queue (not memories.db). Read a generous recent window from the queue and
+    # token-match. TEMP (Root 2 stopgap). Promoted traces (rare) are not searched
+    # here — accepted; the common case is recent un-promoted traces.
+    from brain.memory.pending import PendingQueue
+
+    candidates = PendingQueue(persona_dir).read_recent(MONOLOGUE_TRACE_TYPE, limit=200)
     matched = []
     seen: set[str] = set()
     for mem in candidates:
@@ -39,7 +45,8 @@ def recall_monologue(
 
     results = []
     for mem in matched:
-        store.get(mem.id)  # bump recall_count + last_accessed (keep-sharp)
+        store.get(mem.id)  # keep-sharp bump — now a NO-OP for a queue trace (id
+        #                    not a memories.db row); harmless. Accepted (round-4).
         results.append(
             {
                 "content": mem.content,

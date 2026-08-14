@@ -28,4 +28,6 @@ def write_trace_memory(store: MemoryStore, monologue: str) -> str:
         emotions=emotions,
         importance=_TRACE_IMPORTANCE,
     )
-    return store.create(mem)
+    from brain.memory.pending import route_write
+
+    return route_write(store, mem, source="monologue_trace")

@@ -217,6 +217,7 @@ class MemoryStore:
     """
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
+        self._db_path = Path(db_path)
         self._conn = sqlite3.connect(str(db_path))
         # Run integrity check BEFORE setting row_factory so result rows are
         # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
@@ -302,6 +303,22 @@ class MemoryStore:
     def close(self) -> None:
         """Close the underlying connection. Safe to call multiple times."""
         self._conn.close()
+
+    @property
+    def db_path(self) -> Path:
+        """Filesystem path of the backing SQLite database (or ':memory:')."""
+        return self._db_path
+
+    @property
+    def persona_dir(self) -> Path:
+        """Persona directory containing this store — the parent of db_path.
+
+        Function-style writers use this to locate the sibling pending-candidate
+        queue (``pending_candidates.jsonl``) without threading persona_dir
+        through every call. Meaningless for an in-memory store (parent of
+        ':memory:'); such stores are test-only and never enqueue.
+        """
+        return self._db_path.parent
 
     def create(self, memory: Memory) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id."""
@@ -519,6 +536,8 @@ class MemoryStore:
         active_only: bool = True,
         limit: int | None = None,
         include_fading: bool = True,
+        *,
+        bump: bool = True,
     ) -> list[Memory]:
         """Case-insensitive substring search on content.
 
@@ -530,6 +549,12 @@ class MemoryStore:
         results with their summary as content and state='fading'.
         When False, only active memories are returned. Set False on
         callers that need pre-Forgetting search semantics.
+
+        bump: when True (default), matched rows have recall_count and
+        last_accessed_at updated — the correct behaviour for a genuine
+        recall. The consolidation gate's internal dedup/context scans pass
+        ``bump=False`` so an evaluation read does not inflate committed-row
+        salience (which would perturb the forgetting pass).
         """
         if query == "":
             raise ValueError("empty query passed to search_text; use list_active() instead")
@@ -545,7 +570,7 @@ class MemoryStore:
             sql += " LIMIT ?"
             params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
-        if rows:
+        if rows and bump:
             now_iso = datetime.now(UTC).isoformat()
             ids = [row["id"] for row in rows]
             placeholders = ",".join("?" * len(ids))

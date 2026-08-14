@@ -147,3 +147,7 @@ app/src-tauri/python-runtime/
 hooks/leak-rules.local
 docs/guarded-change/
 CLAUDE.local.md
+
+# temp consolidation-gate queue (Root 2 stopgap) — never committed
+pending_candidates.jsonl
+pending_candidates.jsonl.lock

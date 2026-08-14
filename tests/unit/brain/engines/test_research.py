@@ -10,9 +10,18 @@ import pytest
 
 from brain.bridge.provider import FakeProvider
 from brain.engines._interests import InterestSet
-from brain.engines.research import ResearchEngine
+from brain.engines.consolidation import Decision, run_consolidation
+from brain.engines.research import RESEARCH_SCHEMA_VERSION, ResearchEngine
+from brain.engines.research_notes import read_notes_tail
+from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
+
+# memory-consolidation migration: the "research" memory_type is GATED, so the
+# engine's route_write enqueues a candidate instead of writing to memories.db.
+# Tests that assert the end-state DB memory promote the queue with a promote-all
+# classifier (candidate id preserved), keeping their store.get() assertions.
+_PROMOTE_ALL = lambda _c, _ctx: Decision("new")  # noqa: E731
 
 DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_interests.json"
 
@@ -68,6 +77,24 @@ def _interest_dict(**overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+class ScriptedProvider(FakeProvider):
+    """Returns replies from a fixed script, in call order.
+
+    Task 6's firing block makes two provider.generate() calls per fire (select,
+    then the research session) — tests script both. Calls past the end of the
+    script repeat the last reply.
+    """
+
+    def __init__(self, replies: list[str]) -> None:
+        self._replies = list(replies)
+        self.calls: list[tuple[str, str | None]] = []
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        self.calls.append((prompt, system))
+        idx = min(len(self.calls) - 1, len(self._replies) - 1)
+        return self._replies[idx]
 
 
 def test_run_tick_no_interests_defined(tmp_path: Path):
@@ -200,16 +227,55 @@ def test_run_tick_dry_run_reports_would_fire(tmp_path: Path):
 
 def test_run_tick_fire_writes_research_memory(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select call chooses i1, session call returns a real MEMORY
+        # section so a memory actually gets created (the old flow persisted
+        # the raw reply unconditionally; the new one only persists on MEMORY).
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(days_since_human_override=5.0)
         assert result.fired is not None
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
         mem = store.get(result.fired.output_memory_id)
         assert mem is not None
         assert mem.memory_type == "research"
         assert mem.metadata["interest_topic"] == "marine bioluminescence"
         assert mem.metadata["web_used"] is False  # Noop searcher returns []
+    finally:
+        store.close()
+
+
+def test_run_tick_fire_stamps_research_schema_version(tmp_path: Path):
+    """Research memories carry schema_version so the dedup pass can tell a
+    redesigned-engine memory from a pre-redesign vignette (absent => v1).
+
+    Requested by ThinkerOfThoughts for the issue #66 memory-system work.
+    """
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        result = engine.run_tick(days_since_human_override=5.0)
+        assert result.fired is not None
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
+        mem = store.get(result.fired.output_memory_id)
+        assert mem is not None
+        assert mem.metadata["schema_version"] == RESEARCH_SCHEMA_VERSION
+        assert RESEARCH_SCHEMA_VERSION >= 2  # 1 == the pre-redesign vignette engine
     finally:
         store.close()
 
@@ -345,6 +411,172 @@ def test_run_tick_renders_prompt_with_context(tmp_path: Path, monkeypatch):
     assert "Nell" in (captured["system"] or "")
 
 
+# ---- Task 6: select call, notes-cumulative sessions, verdict lifecycle ----
+
+
+def test_select_declines_ends_tick_without_cooldown(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.reason == "declined" and res.fired is None
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert all(i.last_researched_at is None for i in saved.interests)
+    finally:
+        store.close()
+
+
+def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None
+        assert "found X" in read_notes_tail(engine.interests_path.parent, res.fired.interest_id)
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
+        mem = store.get(res.fired.output_memory_id)
+        assert mem.content == "I liked it."
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].last_researched_at is not None
+    finally:
+        store.close()
+
+
+def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
+    tmp_path: Path, caplog
+) -> None:
+    """§5.3 fail-soft: store.create raising (SQLite lock, disk full, ...) must not
+    abort the tick. Cooldown still burns (last_researched_at updates) so the same
+    interest doesn't re-fire + duplicate on the next cadence tick, and the fire
+    correctly records no memory was persisted.
+
+    Migration note: "research" is a gated type, so the write goes through
+    route_write → PendingQueue.enqueue, not store.create. The failure is injected
+    at enqueue (the real write point); the rest of the tick is unchanged."""
+    import logging
+    from unittest.mock import patch
+
+    def _raise_enqueue(self, mem, *, source):
+        raise RuntimeError("simulated disk full")
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        caplog.set_level(logging.WARNING)
+
+        with patch.object(PendingQueue, "enqueue", _raise_enqueue):
+            res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+
+        # (a) exception did not propagate out of run_tick
+        assert res.fired is not None
+        # (c) no research memory exists
+        assert res.fired.output_memory_id is None
+        assert store.count() == 0
+        # (b) cooldown burned — won't re-fire + duplicate next tick
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].last_researched_at is not None
+        assert any(
+            "research memory create failed" in r.getMessage() for r in caplog.records
+        ), "expected a logged warning naming the failed step"
+    finally:
+        store.close()
+
+
+def test_close_verdict_marks_dormant(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "NOTES:\nwrapped up\n\nMEMORY:\nFelt done with this.\n\nVERDICT:\nclose",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        assert saved.interests[0].status == "dormant"
+    finally:
+        store.close()
+
+
+def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
+    # Existing interest topic is mixed-case; the spawn verdict names it back in
+    # lowercase — proves the dedup match is casefolded, not exact-string.
+    _write_interests(
+        tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")]
+    )
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "NOTES:\nfound stuff\n\nMEMORY:\nGood session.\n\n"
+                "VERDICT:\nspawn: brand new topic; marine bioluminescence",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+        spawned = [i for i in saved.interests if i.origin == "side_quest"]
+        assert len(spawned) == 1 and spawned[0].pull_score == engine.pull_threshold - 1.0
+        assert spawned[0].topic == "brand new topic"
+    finally:
+        store.close()
+
+
+def test_select_parse_failure_falls_back_to_mechanical_winner(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                "not json at all, just rambling prose",
+                "NOTES:\nfound stuff\n\nMEMORY:\nSession happened.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None  # highest-pull fallback fired
+        assert res.fired.topic == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_degraded_reply_appends_notes_but_no_memory(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "curious"}',
+                "just some rambling prose with no markers at all",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None and res.fired.output_memory_id is None
+        assert store.count() == 0
+    finally:
+        store.close()
+
+
 # ---- ResearchLog unit tests ----
 
 
@@ -431,7 +663,16 @@ def test_research_fire_emits_initiate_candidate_when_maturity_passes(
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
     store = MemoryStore(":memory:")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select chooses i1, session returns a real MEMORY section —
+        # candidate emission is gated on a memory existing (mem_id is not None).
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(
             trigger="days_since_human", dry_run=False, days_since_human_override=5.0
         )
@@ -477,7 +718,16 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
     store = MemoryStore(":memory:")
     try:
-        engine = _build_engine(tmp_path, store)
+        # Scripted: select chooses i1, session returns a real MEMORY section —
+        # a memory must exist for the gate path (and its rejection write) to run.
+        provider = ScriptedProvider(
+            [
+                '{"choice": "i1", "why": "it connects"}',
+                "NOTES:\nfound things\n\nMEMORY:\nI explored bioluminescence today.\n\n"
+                "VERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(
             trigger="days_since_human", dry_run=False, days_since_human_override=5.0
         )

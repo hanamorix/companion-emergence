@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from brain.bridge.provider import FakeProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.reflex import (
     ArcFire,
     ArcSkipped,
@@ -411,7 +412,10 @@ def test_run_tick_fires_arc_when_trigger_met(tmp_path: Path):
     arcs_path = tmp_path / "arcs.json"
     _write_single_arc(arcs_path, trigger={"love": 5})
 
-    store = MemoryStore(":memory:")
+    # On-disk so store.persona_dir == tmp_path: the reflex arc output type
+    # "reflex_journal" is gated (only journal_entry bypasses), so it is enqueued
+    # as a candidate; promote it to satisfy the store.get() end-state assertion.
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         _seed_emotion_memory(store, {"love": 8.0})
         engine = _build_engine(tmp_path, store)
@@ -419,7 +423,12 @@ def test_run_tick_fires_arc_when_trigger_met(tmp_path: Path):
         result = engine.run_tick(dry_run=False)
         assert len(result.arcs_fired) == 1
         assert result.arcs_fired[0].arc_name == "test_arc"
-        # Memory was written
+        # Memory was written (as a gated candidate → promote it into memories.db).
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
         mem = store.get(result.arcs_fired[0].output_memory_id)
         assert mem is not None
         assert mem.memory_type == "reflex_journal"

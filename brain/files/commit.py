@@ -20,14 +20,16 @@ def _wire_memory(store, *, path: str, outcome: str) -> None:
     else:
         content = f"you declined my write to {path}"  # no file content stored
     try:
-        store.create(
-            Memory.create_new(
-                content=content,
-                memory_type="file_write",
-                domain="interior",
-                tags=["file_write", outcome],
-            )
+        mem = Memory.create_new(
+            content=content,
+            memory_type="file_write",
+            domain="interior",
+            tags=["file_write", outcome],
         )
+        # Automatic generated write → route through the consolidation gate (gated by memory_type).
+        from brain.memory.pending import route_write
+
+        route_write(store, mem, source="file_write")
     except Exception:
         logger.exception("file_write wire-back memory failed")
 

@@ -50,6 +50,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
+from brain.diag import turn_logger
 
 logger = logging.getLogger(__name__)
 
@@ -225,9 +226,25 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation even though
-# Nell can't call them (she's restricted to mcp__brain-tools__*). Disallowing
-# them removes the dead-weight definition tokens from cache-creation cost.
+# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
+# the ones she has no business calling removes their definition tokens from
+# cache-creation cost AND keeps them out of her hands.
+#
+# This list is POLICY, not dead weight. --allowedTools is a permission list, not
+# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
+# --dangerously-skip-permissions rides every call — so anything left off this
+# list is genuinely callable. 87bfc692's original comment claimed the opposite
+# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
+# swept out on that false premise, silently removing chat-time web access (#71).
+#
+# Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
+# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
+# unspiked comment is what caused #71 in the first place; don't trust this one
+# either if the CLI has moved. Re-spike and date a new row.
+#
+# Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
+# Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
+# guards that.
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -236,8 +253,6 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Glob",
     "Grep",
     "Task",
-    "WebFetch",
-    "WebSearch",
     "TodoWrite",
     "NotebookEdit",
     "BashOutput",
@@ -246,8 +261,9 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 def _apply_lean_flags(cmd: list[str]) -> None:
-    """Strip the CLI's built-in tool defs (dead weight — Nell only uses MCP tools)
-    and pin to the configured MCP server. Saves ~14K cache-creation tokens/call."""
+    """Disallow the built-in tools she has no business calling and pin to the
+    configured MCP server. Trims their definition tokens from cache-creation
+    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
 
@@ -663,6 +679,7 @@ class ClaudeCliProvider(LLMProvider):
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
 
+            _tl_sent_ts = turn_logger.now_iso()
             try:
                 result = subprocess.run(
                     cmd,
@@ -701,6 +718,12 @@ class ClaudeCliProvider(LLMProvider):
                 text = (
                     f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                 )
+                turn_logger.log_turn(
+                    (options or {}).get("persona_dir"), path="text-budget",
+                    system=system_prompt, messages=conversation_messages,
+                    volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                    received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                )
                 return ChatResponse(content=text, tool_calls=(), raw=payload)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -715,6 +738,12 @@ class ClaudeCliProvider(LLMProvider):
             call_type="chat",
             model=self._model,
             frame=payload,
+        )
+        turn_logger.log_turn(
+            persona_dir_opt, path="text",
+            system=system_prompt, messages=conversation_messages,
+            volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+            received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
         )
 
         return ChatResponse(
@@ -896,6 +925,7 @@ class ClaudeCliProvider(LLMProvider):
             # Send prompt via stdin then close so the subprocess can start.
             try:
                 assert proc.stdin is not None
+                _tl_sent_ts = turn_logger.now_iso()
                 proc.stdin.write(flat_prompt)
                 proc.stdin.close()
             except OSError:
@@ -1006,8 +1036,20 @@ class ClaudeCliProvider(LLMProvider):
                                 if partial
                                 else _BUDGET_EXCEEDED_MSG
                             )
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=cutoff,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=cutoff, metadata=metadata)
                         else:
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=result_text,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
@@ -1029,6 +1071,12 @@ class ClaudeCliProvider(LLMProvider):
                         )
                     else:
                         content = "".join(delta_chunks) or (assistant_snapshot or "")
+                        turn_logger.log_turn(
+                            persona_dir, path="stream", system=system_prompt,
+                            messages=None, volatile=None, sent_blob=flat_prompt,
+                            sent_ts=_tl_sent_ts, received_raw=content,
+                            received_ts=turn_logger.now_iso(), usage_frame=None,
+                        )
                         yield StreamDone(content=content, metadata={})
 
             except GeneratorExit:
@@ -1175,6 +1223,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(full_system) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
+                _tl_sent_ts = turn_logger.now_iso()
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1210,6 +1259,12 @@ class ClaudeCliProvider(LLMProvider):
                         if partial
                         else _BUDGET_EXCEEDED_MSG
                     )
+                    turn_logger.log_turn(
+                        persona_dir, path="image-budget",
+                        system=full_system, messages=conversation_messages,
+                        volatile=None, sent_blob=stdin_payload, sent_ts=_tl_sent_ts,
+                        received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=None,
+                    )
                     return ChatResponse(content=text, tool_calls=(), raw=None)
                 raise
             dispatched: tuple[dict[str, Any], ...] = ()
@@ -1219,6 +1274,12 @@ class ClaudeCliProvider(LLMProvider):
                         audit_log_path, audit_offset_before, request_id=request_id
                     )
                 )
+            turn_logger.log_turn(
+                persona_dir, path="image",
+                system=full_system, messages=conversation_messages,
+                volatile=None, sent_blob=stdin_payload, sent_ts=_tl_sent_ts,
+                received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=None,
+            )
             return ChatResponse(
                 content=_truncate_at_role_leak(content),
                 tool_calls=(),
@@ -1333,6 +1394,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
+                _tl_sent_ts = turn_logger.now_iso()
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1371,6 +1433,12 @@ class ClaudeCliProvider(LLMProvider):
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
+                    turn_logger.log_turn(
+                        persona_dir, path="mcp-budget",
+                        system=system_prompt, messages=None,
+                        volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                        received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                    )
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -1387,6 +1455,12 @@ class ClaudeCliProvider(LLMProvider):
                 call_type="chat",
                 model=self._model,
                 frame=payload,
+            )
+            turn_logger.log_turn(
+                persona_dir, path="mcp",
+                system=system_prompt, messages=None,
+                volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
             )
 
             dispatched = _read_audit_lines_since(
