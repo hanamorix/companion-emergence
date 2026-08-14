@@ -326,3 +326,245 @@ weekly path this commit targeted.
    delete), and either close the gap or, if deferred, correct the "unreachable by construction" language to
    scope it explicitly to `tiers_plus_tail` and name the `summary_only` gap as a known, accepted residual risk
    in `decisions.md`.
+
+## Round-4 re-review (after fix commits 33cd5ba2 + 2e1bcf6f)
+
+**Reviewer stance:** cold, independent, no shared context with the author or with any prior review round
+beyond what is verifiable from source. Scope: the complete delta from `5348cae8` (the commit round-3
+examined) through `2e1bcf6f` (HEAD), i.e. both `33cd5ba2` (registry-lock + successor-redirected persist) and
+`2e1bcf6f` (carry residual raw turns in `summary_only`). This round verifies that `2e1bcf6f` actually closes
+the `summary_only` data-loss Major this file's own round-4 review (above) found in `33cd5ba2` alone.
+
+### Provenance
+
+```
+cd /home/zero/Desktop/companion-emergence/.claude/worktrees/cascade-compaction
+git diff 5348cae8 2e1bcf6f -- brain/ tests/
+git show 33cd5ba2 ; git show 2e1bcf6f
+uv run pytest tests/unit/brain/chat/test_rollover.py tests/bridge/test_cascade_rollover_endpoints.py -q   # 20 passed
+uv run pytest tests/unit/brain/bridge/test_compaction_cadence.py tests/unit/brain/chat/test_engine.py \
+    tests/bridge/test_endpoints.py tests/unit/brain/chat/ -q   # 416 passed, 1 xfailed
+```
+
+### Charge 1 — is the r3 resurrection race now closed with no residual TOCTOU (both orderings, both seed
+modes)?
+
+Yes, for the resurrection mechanism specifically. Traced both orderings against the actual code:
+
+- `perform_rollover` (`brain/chat/rollover.py:146-206`) holds `registry_lock()` — the module `_LOCK` `RLock`
+  defined at `brain/chat/session.py:104` — across the ENTIRE destructive section: seed re-read
+  (`read_session`, `rollover.py:147`) → seed-row construction (mode-dependent, `rollover.py:149-163`) →
+  `create_session` (`rollover.py:170-171`) → `rewrite_session_atomic` (`rollover.py:174`) →
+  `write_cursor` (`rollover.py:177-178`) → `write_rolled_to` (`rollover.py:190`) → `remove_session`
+  (`rollover.py:191`). The pointer write (`write_rolled_to`) happens strictly before `remove_session` and
+  both are still inside the `with registry_lock():` block — confirmed by direct read of the block, not by
+  trusting the comment.
+- `persist_turns_following_successor` (`brain/chat/session.py:269-298`) — the ONLY other production writer to
+  a session buffer (verified: `grep -rn "ingest_turn(" brain/` outside tests shows exactly two production
+  call sites — the function definition itself in `brain/ingest/buffer.py:74` and this one call site at
+  `session.py:298`; `brain/chat/engine.py`'s old direct `ingest_turn` calls are gone, replaced by a single
+  call to this function at `engine.py:449`, confirmed via `git diff 5348cae8 2e1bcf6f -- brain/chat/engine.py`)
+  — takes the SAME `_LOCK` for its entire resolve+append body.
+- Because both critical sections use the same non-reentrant-across-threads `RLock`, the two can never
+  interleave partially: a persist for `old_sid` either (a) fully completes BEFORE the rollover's seed re-read
+  acquires the lock — in which case its turn is already on disk when `read_session` runs and is captured into
+  `raw`/`seed_rows` for BOTH modes — or (b) fully executes AFTER the rollover releases the lock, at which
+  point `write_rolled_to` has already run, so `_resolve_successor` (`session.py:220-236`) returns the new sid
+  and the persist redirects there via `ingest_turn(persona_dir, {**rec, "session_id": successor})`
+  (`session.py:296-298`). There is no ordering in which a persist can land on `old_sid` AFTER
+  `remove_session`/`write_rolled_to` but write straight to the old buffer — every append path routes through
+  `_resolve_successor` under the same lock.
+- This reasoning is mode-agnostic: the lock scope and pointer-write timing are identical for `summary_only`
+  and `tiers_plus_tail` — only the seed-row CONTENT differs (`rollover.py:149-163`). So the resurrection
+  closure applies to both, not just `tiers_plus_tail` as round-3/round-4-original found.
+- Confirmed concretely by `test_persist_during_rollover_destructive_window_not_orphaned`
+  (`tests/unit/brain/chat/test_rollover.py:603-684`) — a genuine two-thread test that pauses
+  `delete_session_buffer` (monkeypatched) mid-rollover and races a real `persist_turns_following_successor`
+  call against it; it passes. And by `test_persist_after_rollover_redirects_to_successor`
+  (`test_rollover.py:514-555`), which exercises ordering (b) directly. Both ran green in this session.
+
+### Charge 2 — is the r4 `summary_only` data-loss now closed?
+
+Yes, verified by trace and by re-deriving the exact scenario the original round-4 review reproduced.
+
+- `rollover.py:149-163`: when `seed_mode == "summary_only"` and a `summary_row` was found at the T0 read,
+  `seed_rows = [summary_row] + raw` (`rollover.py:163`) — `raw` here is whatever is STILL in the buffer at the
+  T0 read, i.e. any turn present after the fold (step 2) and not yet folded/archived.
+- Traced the exact race the original r4 review reproduced ("a live turn racing in between the fold step and
+  the registry-lock seed-read"): the fold (`compact_conversation`, called at `rollover.py:117-121` with
+  `min_keep_tail=0, older_than=timedelta(0)`) is NOT naive-overwrite — its own install step re-reads the live
+  buffer immediately before its `rewrite_session_atomic` call and reconciles by turn identity
+  (`brain/chat/compaction.py:612-628`, comment at 610-621: "Re-read the live buffer just before the rewrite
+  and rebuild the retained set from CURRENT turns minus the archived ones"). A turn that lands on `old_sid`
+  DURING the fold's multi-second summarize call is therefore never silently overwritten by the fold — it
+  survives the fold's own rewrite as a retained raw turn, exactly the "residual raw" state
+  `test_summary_only_carries_residual_raw_not_dropped` (`test_rollover.py:687-725`) sets up directly. When
+  `perform_rollover` then does its own T0 `read_session` (`rollover.py:147`), it sees that same residual raw
+  turn and — with the fix — carries it via `[summary_row] + raw` instead of dropping it.
+- A turn that lands AFTER the fold's rewrite but BEFORE `perform_rollover`'s T0 read is even easier to
+  handle: at that point neither lock is held yet (the fold runs entirely before `acquire_compaction_lock` at
+  `rollover.py:130`), so the persist either completes and is visible at T0, or (per charge 1) is serialized
+  against the T0 read by `_LOCK` and lands in one of the two safe orderings.
+- `summary_row is None` branch (`rollover.py:150-158`): `seed_rows = []` → falls through to
+  `if not seed_rows: return None` at `rollover.py:165-167`, which executes INSIDE the `with registry_lock():`
+  block, before any of `create_session`/`rewrite_session_atomic`/`write_rolled_to`/`remove_session` run, and
+  Python's `with` statement releases the lock cleanly on the early `return`. The old buffer is never touched
+  — confirmed by re-running `test_sessions_active_skips_stale_over_24h`
+  (`tests/bridge/test_endpoints.py:654-659`), which exercises exactly this abort path through the real
+  `/sessions/active` endpoint and passed.
+- `test_summary_only_carries_residual_raw_not_dropped` is a genuine fail-demo in the sense that matters here:
+  it is structurally identical to the failing repro the original round-4 review wrote independently (residual
+  raw present after a stubbed no-op fold), and it exercises the actual `rollover.py:149-163` code path, not a
+  mock of it.
+
+### Charge 3 — any new race/loss from carrying `+ raw` (e.g. duplication)?
+
+None found. Because `raw` is a single point-in-time snapshot taken from the SAME `read_session` call
+(`rollover.py:147`) used to determine `summary_row`, and because that read happens once, under the lock, the
+carried raw turns are exactly "whatever `old_sid`'s buffer contained at the T0 read" — there is no second,
+independent read that could duplicate or diverge from it.
+
+Traced the specific duplication concern from the charge: could a turn be captured into the seed AND ALSO
+redirected to the successor? For that to happen, the SAME `persist_turns_following_successor` call would have
+to write to `old_sid` (to be captured into the T0 read) and separately write to the successor (to be
+"redirected") for the SAME logical turn — but a single call processes each record exactly once
+(`session.py:294-298`, one `ingest_turn` call per record, decided once by a single `_resolve_successor`
+check). Two DIFFERENT calls (e.g. the user-record and the assistant-record from the same `_persist_turn`
+pair) could in principle straddle the rollover boundary, landing one on each side — but `2e1bcf6f`'s parent
+commit `33cd5ba2` already closed that: `engine.py:449` now makes ONE call to
+`persist_turns_following_successor(persona_dir, [user_record, assistant_record])` for the pair, so both
+records are resolved and appended under the SAME `_LOCK` acquisition (`session.py:294` loop runs inside one
+`with _LOCK:` block) — they cannot straddle a rollover. (Pre-`33cd5ba2`, `engine.py` made two SEPARATE
+`ingest_turn` calls for the pair with no shared lock at all; that path is gone.)
+
+No loss scenario introduced either: `raw` is additive to the pre-existing `[summary_row]`-only seed, and the
+common case (no race) is `raw == []`, a pure no-op — confirmed by the assertion in
+`test_summary_only_carries_residual_raw_not_dropped` that the summary is still `texts[0]` (order preserved,
+nothing reordered/dropped).
+
+### Charge 4 — deadlock / lock ordering / event-loop hazard
+
+No reverse-order acquisition found. `grep -rn "acquire_compaction_lock\|registry_lock(" brain/ --include=*.py`
+(excluding tests) shows `registry_lock()`/`_LOCK` is acquired ONLY in `session.py` (`persist_turns_following_
+successor`, plus the pre-existing `create_session`/`remove_session`/`get_or_hydrate_session`/etc., all
+reentrant via the same `RLock`) and in `rollover.py:146` inside `perform_rollover`. `acquire_compaction_lock`
+(`brain/ingest/buffer.py:464`) is a non-blocking, file-based, O_EXCL advisory lock — it never blocks the
+calling thread (`FileExistsError` → return `False` immediately, `brain/ingest/buffer.py:474-497`) — so even
+though `perform_rollover` acquires it BEFORE `registry_lock()` (`rollover.py:130` then `146`), and no other
+path acquires `registry_lock()` first and then blocks on `acquire_compaction_lock`, there is no possible
+deadlock: the only primitive that can actually block a thread is `_LOCK`, and nothing acquires `_LOCK` and
+then waits on anything else that could itself be waiting on `_LOCK`.
+
+Confirmed the slow fold (`compact_conversation`/`cascade_conversation`, `rollover.py:117-124`) runs BEFORE
+`acquire_compaction_lock` is even called (`rollover.py:130`) — i.e. entirely outside both locks — and
+`delete_session_buffer`/`delete_cursor`/`delete_backoff` (`rollover.py:209-211`, with `_unlink_with_retry`'s
+bounded retry loop at `brain/ingest/buffer.py:141-150`) run AFTER the `with registry_lock():` block exits
+(`rollover.py:203` closes it) but still inside the outer `try` (released via `finally: release_compaction_
+lock` at `rollover.py:213-214`) — so the retry-looping unlink is outside `_LOCK`, matching the docstring
+claim.
+
+Event-loop hazard (noted per the charge, not blocked on, consistent with the original round-4 review's
+"Minor"): `get_or_hydrate_session` (`session.py:129-137`) still acquires `_LOCK` synchronously and is still
+called directly (not via `asyncio.to_thread`) from `async def` FastAPI route handlers — confirmed at
+`brain/bridge/server.py:1317` (inside `async def chat`) and `server.py:2427`/`2766`/`2827` (other async
+routes) — so a long hold of `_LOCK` by a rollover on the supervisor thread can stall the event loop for every
+concurrent `/chat`/`/state`/etc. request. This is unchanged by `2e1bcf6f` (the only addition to the locked
+section is a `+ raw` list-concatenation, negligible) and was already flagged as pre-existing/Minor by the
+original round-4 review in this same file; not a new issue introduced by either commit under review here.
+`persist_turns_following_successor` itself is only ever reached via `_persist_turn` → `engine.respond`, which
+is invoked exclusively through `asyncio.to_thread(_respond_blocking, ...)` — confirmed at `server.py:2442`
+and `server.py:2609`, with `_respond_blocking`'s own docstring stating as much (`server.py:249`) — so the
+live-turn persist path itself never runs on the event-loop thread, matching the design claim; only the
+(pre-existing) hydrate-on-lookup path does.
+
+### Charge 5 — are comments/docstrings now accurate?
+
+Yes, and demonstrably corrected from the r3-era overstatement the original round-4 review flagged.
+`brain/bridge/supervisor.py`'s `_run_compaction_tick` docstring previously read "This makes the resolve-
+persist race unreachable (the rollover cannot delete an active session's buffer out from under a mid-tool-
+loop request)" — `git diff 5348cae8 2e1bcf6f -- brain/bridge/supervisor.py` shows this replaced with language
+correctly demoting `is_session_busy` to "a best-effort efficiency/UX belt... NOT the race-safety mechanism"
+and naming `registry_lock()` as the actual mechanism. `maybe_weekly_rollover`'s docstring
+(`rollover.py:216-243`) states the same thing correctly. The one place an unqualified "closes ... by
+construction" phrase remains (`rollover.py:135`, `session.py:261-266`) is now accurate as written per charge
+1's trace: with `2e1bcf6f` in place, the closure genuinely applies to both seed modes, not just
+`tiers_plus_tail` — so this is no longer the overstatement the original round-4 review caught (at that time
+`33cd5ba2` alone had NOT closed it for `summary_only`, and the review correctly flagged the phrase as
+inaccurate). No new overstated claim was introduced by either commit.
+
+### Charge 6 — do the tests genuinely discriminate?
+
+`uv run pytest tests/unit/brain/chat/test_rollover.py tests/bridge/test_cascade_rollover_endpoints.py -q` →
+**20 passed.** Broader sweep (`test_compaction_cadence.py`, `test_engine.py`, `test_endpoints.py`, all of
+`tests/unit/brain/chat/`) → **416 passed, 1 xfailed**, no regressions.
+
+- `test_persist_during_rollover_destructive_window_not_orphaned` (`test_rollover.py:603-684`): REAL. Two
+  actual `threading.Thread`s, a monkeypatched `delete_session_buffer` that blocks on an `Event` so the racing
+  persist is guaranteed to land in the exact post-pointer-write/pre-delete window, asserting both no
+  resurrection and the raced turn present in the successor. This is a true concurrency test, not a sequential
+  simulation.
+- `test_plain_ingest_after_rollover_resurrects_fail_demo` (`test_rollover.py:558-600`): REAL fail-demo. Calls
+  the OLD unredirected `ingest_turn` path directly (bypassing the fix) and asserts the bug DOES reproduce
+  (old buffer resurrected, turn NOT in successor) — proves the regression guard in the adjacent test is not
+  vacuous, since the harness can demonstrably fail.
+- `test_persist_after_rollover_redirects_to_successor` (`test_rollover.py:514-555`): REAL, sequential (not
+  concurrent) but exercises the actual production call path (`persist_turns_following_successor`) after a
+  real `perform_rollover` call, asserting the redirect fires and lands in the successor. Sound mechanism
+  check, not a concurrency test — same characterization the original round-4 review gave the analogous test
+  in `33cd5ba2`.
+- `test_summary_only_carries_residual_raw_not_dropped` (`test_rollover.py:687-725`): REAL but sequential —
+  the fold is monkeypatched to a no-op and the buffer is pre-seeded to look like a post-fold-with-race state,
+  rather than driving an actual concurrent race. It does exercise the real `rollover.py:149-163` seed-
+  selection code and would fail against the pre-`2e1bcf6f` `[summary_row]`-only logic (I confirmed this by
+  reading the diff: `git diff 5348cae8 2e1bcf6f -- brain/chat/rollover.py` shows the old code path had no
+  `+ raw` term at all in the `summary_only` branch, so this test is shown-able-to-fail on the parent commit).
+  **Minor gap:** there is no true two-thread concurrent test for `summary_only` analogous to
+  `test_persist_during_rollover_destructive_window_not_orphaned` (i.e. one that races a real persist against a
+  real in-progress `summary_only` rollover, rather than pre-seeding the post-race state). Given the shared
+  underlying mechanism (`registry_lock()` scope) is already proven correct under true concurrency for
+  `tiers_plus_tail`, and the `summary_only`-specific piece being tested is pure seed-row selection logic (no
+  additional concurrency-sensitive code), this is a coverage gap worth closing opportunistically, not a
+  reason to doubt the fix.
+
+### Charge 7 — regression check
+
+`a485e72d`'s C-1 redirect-first resolution: `git diff 5348cae8 2e1bcf6f -- brain/chat/session.py` shows
+`_resolve_successor` (`session.py:220-236`) and the successor-first ordering in `get_or_hydrate_session`
+(`session.py:174-179`, consults `_resolve_successor` before the `_SESSIONS` cache and before the on-disk
+buffer) are byte-identical to the base — the diff only ADDS `registry_lock()` and `persist_turns_following_
+successor` after the existing code, touching nothing in the C-1 path. Idle-gate wiring
+(`is_session_busy`, `5348cae8`): `_run_compaction_tick` (`supervisor.py:1640-1701`) and `maybe_weekly_rollover`
+(`rollover.py:216-282`) still gate on the same two conditions (quiet-gap + `is_session_busy`) in the same
+places; only the docstrings changed (see charge 5) plus one keyword-argument-position fix in
+`test_compaction_cadence.py` (confirmed by re-running that file green). No regression found in either.
+
+### Verdict
+
+1. **Worst severity: none (no residual Blocker/Major/Minor defect found in the fix itself).** The one
+   observation worth recording is a **Minor test-coverage gap** (charge 6): `summary_only`'s residual-raw
+   carry is verified by a sound sequential test, not a true concurrent race test, unlike its `tiers_plus_tail`
+   sibling. The event-loop `_LOCK` contention noted under charge 4 is a pre-existing characteristic
+   (unaffected in magnitude by this delta) already logged as Minor by the original round-4 review in this
+   file, not a new finding.
+2. **Findings, one line each:**
+   - The r3 resurrection race (`tiers_plus_tail`) remains closed by construction, and the closure is now
+     shown to be mode-agnostic (applies to `summary_only` too) by direct trace of the shared `registry_lock()`
+     section.
+   - The r4 `summary_only` data-loss Major this file's own round-4 review reproduced is closed by
+     `2e1bcf6f`'s `[summary_row] + raw` carry (`rollover.py:163`), verified by trace through the fold's own
+     race-safe re-read (`compaction.py:612-628`) and by a real (if sequential) regression test.
+   - No duplication or new loss from carrying `+ raw`: the seed is one point-in-time snapshot, and
+     `33cd5ba2` already collapsed the user+assistant persist pair into one lock-protected call, closing the
+     one plausible split-pair duplication path before it could interact with the r4 carry.
+   - No deadlock: `_LOCK` is the only blocking primitive in play; `acquire_compaction_lock` never blocks; no
+     reverse-order acquisition exists anywhere in the touched code.
+   - Docstrings no longer overstate what's closed; the previously-flagged inaccurate "unreachable by
+     construction" language is now accurate given `2e1bcf6f` closes the mode-agnostic gap it was flagged for.
+   - `a485e72d` C-1 and the idle-gate wiring are both unregressed (diff-confirmed + green tests).
+3. **Explicit answer:** **YES — both the r3 resurrection race and the r4 `summary_only` data loss are now
+   closed, with no residual TOCTOU and no new issue found.** The only open item is a test-coverage
+   nice-to-have (a true concurrent race test for `summary_only`, mirroring the existing `tiers_plus_tail` one)
+   which does not indicate a live defect given the shared, already-concurrently-tested locking mechanism.
+4. **Routing recommendation: advance to build-gate.** Optionally fold in a concurrent `summary_only` test
+   (mirroring `test_persist_during_rollover_destructive_window_not_orphaned`) as a low-cost follow-up, but it
+   is not a blocking condition for this change.
