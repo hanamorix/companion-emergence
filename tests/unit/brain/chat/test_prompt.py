@@ -1222,100 +1222,71 @@ def test_epistemic_instruction_is_proactive():
 # ---------------------------------------------------------------------------
 
 
-def test_build_system_message_includes_recall_snippet_invitation_when_snippet_mode_on(
-    tmp_path: Path,
+def test_recall_snippet_invitation_heads_the_block_when_snippet_mode_on(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
-    """Combined builder (build_system_message): invitation framing appears
-    alongside the epistemic instruction when SNIPPET_MODE_ENABLED is on and
-    user_input is provided (same gate as the recall block itself)."""
-    from unittest.mock import MagicMock, patch
+    """The invitation now lives ON the recall block (as its header), not in the
+    system prefix: with snippet mode on and an active recall match, it appears."""
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
 
-    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_system_message
-    from brain.engines.daemon_state import DaemonState
-    from brain.memory.store import MemoryStore
-    from brain.soul.store import SoulStore
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
 
-    store = MagicMock(spec=MemoryStore)
-    store.search_text.return_value = []
-    soul_store = MagicMock(spec=SoulStore)
-    soul_store.list_active.return_value = []
-    daemon_state = MagicMock(spec=DaemonState)
-
-    with patch("brain.chat.prompt._build_recall_block", return_value=""), \
-         patch("brain.initiate.ambient.build_outbound_recall_block", return_value=None), \
-         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
-        msg = build_system_message(
-            tmp_path,
-            voice_md="",
-            daemon_state=daemon_state,
-            soul_store=soul_store,
-            store=store,
-            user_input="Tell me about Marcus",
-        )
-
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me what we said about Jordan last time.",
+    )
     assert _RECALL_SNIPPET_INVITATION in msg
 
 
-def test_build_system_message_omits_recall_snippet_invitation_when_snippet_mode_off(
-    tmp_path: Path,
+def test_recall_snippet_invitation_absent_when_snippet_mode_off(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
-    """When SNIPPET_MODE_ENABLED is False (everything full-injected), the
-    invitation framing must not appear — there is nothing to expand."""
-    from unittest.mock import MagicMock, patch
+    """Snippet mode off (everything full-injected): no invitation, nothing to expand."""
+    from unittest.mock import patch
 
-    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_system_message
-    from brain.engines.daemon_state import DaemonState
-    from brain.memory.store import MemoryStore
-    from brain.soul.store import SoulStore
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
 
-    store = MagicMock(spec=MemoryStore)
-    store.search_text.return_value = []
-    soul_store = MagicMock(spec=SoulStore)
-    soul_store.list_active.return_value = []
-    daemon_state = MagicMock(spec=DaemonState)
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
 
-    with patch("brain.chat.prompt._build_recall_block", return_value=""), \
-         patch("brain.initiate.ambient.build_outbound_recall_block", return_value=None), \
-         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
+    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
         msg = build_system_message(
-            tmp_path,
+            persona_dir,
             voice_md="",
-            daemon_state=daemon_state,
+            daemon_state=_empty_daemon_state(),
             soul_store=soul_store,
             store=store,
-            user_input="Tell me about Marcus",
+            user_input="Tell me what we said about Jordan last time.",
         )
-
     assert _RECALL_SNIPPET_INVITATION not in msg
 
 
-def test_build_static_system_message_includes_recall_snippet_invitation_when_snippet_mode_on(
-    tmp_path: Path,
-) -> None:
-    """Split/static builder (build_static_system_message) carries the same
-    invitation framing right after the epistemic instruction, gated the same
-    way — the chat path's frozen prefix must not lose this relative to the
-    combined/image-path builder."""
+def test_recall_snippet_invitation_not_in_static_prefix(tmp_path: Path) -> None:
+    """The invitation moved OFF the frozen system prefix onto the volatile recall
+    block; the static builder must not carry it (even with snippet mode on)."""
     from unittest.mock import patch
 
     from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_static_system_message
 
     with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
         msg = build_static_system_message(tmp_path, voice_md="")
-
-    assert _RECALL_SNIPPET_INVITATION in msg
-
-
-def test_build_static_system_message_omits_recall_snippet_invitation_when_snippet_mode_off(
-    tmp_path: Path,
-) -> None:
-    from unittest.mock import patch
-
-    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_static_system_message
-
-    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
-        msg = build_static_system_message(tmp_path, voice_md="")
-
     assert _RECALL_SNIPPET_INVITATION not in msg
 
 

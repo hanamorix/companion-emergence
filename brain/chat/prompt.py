@@ -199,8 +199,6 @@ def build_system_message(
     # Condition: user_input is not None (same gate as _build_recall_block call below).
     if user_input is not None:
         parts.append(_EPISTEMIC_INSTRUCTION)
-        if SNIPPET_MODE_ENABLED:
-            parts.append(_RECALL_SNIPPET_INVITATION)
 
     # Toolset parity with the static builder. The image path keeps the combined
     # builder for byte-equivalence, so it needs its own append. ONE line — the
@@ -369,8 +367,6 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
         parts.append(voice_md.strip())
 
     parts.append(_EPISTEMIC_INSTRUCTION)
-    if SNIPPET_MODE_ENABLED:
-        parts.append(_RECALL_SNIPPET_INVITATION)
 
     # Harness fence: teach her to silently ignore the CLI/plugin scaffolding the
     # environment injects on top of her real context (skill catalogues, agent-type
@@ -901,6 +897,8 @@ def _build_recall_block(
         full_ids = _full_inject_ids(top)
 
         lines = ["── recall (memories matching this turn) ──"]
+        if SNIPPET_MODE_ENABLED:
+            lines.insert(0, _RECALL_SNIPPET_INVITATION)
         for mem in top:
             snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
             importance = int(round(float(getattr(mem, "importance", 0) or 0)))
@@ -1026,6 +1024,8 @@ def _build_recall_block(
     lost_top = lost_hits[:limit]
 
     lines = ["recall"]
+    if SNIPPET_MODE_ENABLED and active_top:
+        lines.insert(0, _RECALL_SNIPPET_INVITATION)
 
     if active_top:
         full_ids = _full_inject_ids(active_top)
