@@ -392,7 +392,10 @@ class MemoryStore:
                 fts_rows = self._conn.execute(
                     "SELECT COUNT(*) FROM memories_fts_docsize"
                 ).fetchone()[0]
-                needs_rebuild = mem_rows > 0 and fts_rows == 0
+                # mem_rows != fts_rows catches BOTH the empty-index case
+                # (predates-FTS / cleared → fts_rows==0) AND partial staleness
+                # (0 < fts_rows < mem_rows) at no extra cost (stage-6 minor).
+                needs_rebuild = mem_rows != fts_rows
             except sqlite3.DatabaseError:
                 needs_rebuild = True
         if needs_rebuild:

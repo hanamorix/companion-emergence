@@ -91,3 +91,24 @@ def test_disabled_ranking_returns_none_sentinel(monkeypatch) -> None:
     monkeypatch.setattr(rel, "RELEVANCE_RANKING_ENABLED", False)
     ranked = rank_memories(store, None, "henryk", limit=5)
     assert ranked and all(score is None for _, score in ranked)
+
+
+def test_disabled_ranking_excludes_before_limit_backfills(monkeypatch) -> None:
+    """Flag-off fallback applies exclude_ids BEFORE the limit slice, so an
+    excluded id inside the top-`limit` backfills from the next match instead of
+    shrinking the result (stage-6 minor). Known-bad: excluding then slicing
+    would return `limit - 1` items.
+    """
+    store = MemoryStore(":memory:")
+    # 3 matches; search_text orders by created_at DESC → newest first.
+    m_new = _mk(store, "henryk newest", importance=5.0, age_days=0)
+    m_mid = _mk(store, "henryk middle", importance=5.0, age_days=1)
+    m_old = _mk(store, "henryk oldest", importance=5.0, age_days=2)
+    monkeypatch.setattr(rel, "RELEVANCE_RANKING_ENABLED", False)
+
+    # limit=2, exclude the newest (which would occupy slot 1 of the top-2).
+    ranked = rank_memories(store, None, "henryk", limit=2, exclude_ids={m_new.id})
+    ids = [m.id for m, _ in ranked]
+    assert m_new.id not in ids
+    # Backfill: still 2 results (m_mid, m_old), not 1.
+    assert ids == [m_mid.id, m_old.id]

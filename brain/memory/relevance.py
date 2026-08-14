@@ -100,15 +100,20 @@ def rank_memories(
     exclude = frozenset(exclude_ids)
 
     if not RELEVANCE_RANKING_ENABLED:
-        # Recency-only fallback. None signals "unranked".
+        # Recency-only fallback. None signals "unranked". Exclusion is applied
+        # BEFORE the final limit (mirroring the ranked path): fetch a wider pool,
+        # drop excluded ids, THEN slice — so an excluded id inside the top-`limit`
+        # matches backfills from the next candidate instead of shrinking the
+        # result (stage-6 minor).
         fallback = store.search_text(
             query,
             active_only=active_only,
             include_fading=include_fading,
             bump=False,
-            limit=limit,
+            limit=(limit + len(exclude)) if limit is not None else None,
         )
-        return [(m, None) for m in fallback if m.id not in exclude]
+        kept = [(m, None) for m in fallback if m.id not in exclude]
+        return kept[:limit] if limit is not None else kept
 
     scored = store.search_fts_scored(
         query,
