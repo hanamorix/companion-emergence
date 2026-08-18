@@ -1614,6 +1614,9 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "cache": get_cache_dir(),
         "logs": get_log_dir(),
         "personas_root": home / "personas",
+        # The only ops-override surface, and it lives under the platformdirs
+        # home — undiscoverable unless `paths` says where it is (#63).
+        "tunables": home / "tunables.json",
         # Per-persona
         "persona_dir": pd,
         "bridge_json": pd / "bridge.json",

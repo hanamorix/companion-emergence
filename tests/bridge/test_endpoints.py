@@ -386,11 +386,12 @@ _TINY_PNG = bytes.fromhex(
 )
 
 
-def test_chat_accepts_image_shas_and_records_in_buffer(persona_dir: Path, monkeypatch):
-    """POST /chat with image_shas: ingest buffer JSONL has the shas on the user turn."""
+def test_chat_accepts_shared_files_and_surfaces_path(persona_dir: Path, monkeypatch):
+    """POST /chat with shared_files: the buffer user turn carries the surfaced
+    path (plain text), and NO image_shas transport metadata is written."""
     _patch_fake_provider(monkeypatch, reply="I see you.")
     with _make_client(persona_dir) as c:
-        # Upload a real image first so media_type lookup succeeds.
+        # Upload a real image first so the sha resolves.
         up = c.post(
             "/upload",
             files={"file": ("p.png", _TINY_PNG, "image/png")},
@@ -400,18 +401,24 @@ def test_chat_accepts_image_shas_and_records_in_buffer(persona_dir: Path, monkey
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         r = c.post(
             "/chat",
-            json={"session_id": sid, "message": "look at this", "image_shas": [sha]},
+            json={
+                "session_id": sid,
+                "message": "look at this",
+                "shared_files": [{"kind": "image", "sha": sha, "media_type": "image/png"}],
+            },
         )
         assert r.status_code == 200, r.text
-        # Buffer JSONL should have the user record with image_shas.
         from brain.ingest.buffer import read_session
 
         turns = read_session(persona_dir, sid)
         user_turn = next(t for t in turns if t["speaker"] == "user")
-        assert user_turn["image_shas"] == [sha]
+        # New behaviour: the path rides the user text as plain text; no image_shas.
+        assert "the user shared a file" in user_turn["text"]
+        assert sha in user_turn["text"]
+        assert "image_shas" not in user_turn
 
 
-def test_chat_rejects_too_many_image_shas(persona_dir: Path, monkeypatch):
+def test_chat_rejects_too_many_shared_files(persona_dir: Path, monkeypatch):
     _patch_fake_provider(monkeypatch, reply="ok")
     with _make_client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
@@ -420,7 +427,10 @@ def test_chat_rejects_too_many_image_shas(persona_dir: Path, monkeypatch):
             json={
                 "session_id": sid,
                 "message": "lots",
-                "image_shas": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(9)],
+                "shared_files": [
+                    {"kind": "image", "sha": hashlib.sha256(str(i).encode()).hexdigest()}
+                    for i in range(9)
+                ],
             },
         )
         assert r.status_code == 422
@@ -440,23 +450,31 @@ def test_chat_image_shas_default_empty_works(persona_dir: Path, monkeypatch):
         assert "image_shas" not in user_turn
 
 
-def test_chat_with_missing_image_sha_still_completes(persona_dir: Path, monkeypatch):
-    """Sha references a file that doesn't exist — chat still completes; image is dropped."""
+def test_chat_with_missing_shared_file_still_completes(persona_dir: Path, monkeypatch):
+    """A shared image whose bytes aren't on disk — chat still completes.
+
+    The engine resolves the path (image_path doesn't require existence), and
+    the model would simply get a read error if it tried to read it; the chat
+    turn itself must not break.
+    """
     _patch_fake_provider(monkeypatch, reply="ok")
     with _make_client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         ghost = "f" * 64
         r = c.post(
             "/chat",
-            json={"session_id": sid, "message": "ghost image", "image_shas": [ghost]},
+            json={
+                "session_id": sid,
+                "message": "ghost image",
+                "shared_files": [{"kind": "image", "sha": ghost, "media_type": "image/png"}],
+            },
         )
-        # Chat must succeed — the engine logs and skips the missing image,
-        # passing the user's text portion through unchanged.
         assert r.status_code == 200
 
 
-def test_stream_accepts_image_shas_in_request_frame(persona_dir: Path, monkeypatch):
-    """WS /stream/{sid} accepts image_shas alongside message; buffer carries them."""
+def test_stream_accepts_shared_files_in_request_frame(persona_dir: Path, monkeypatch):
+    """WS /stream/{sid} accepts shared_files alongside message; the buffer user
+    turn carries the surfaced path (plain text), not image_shas."""
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
     _patch_fake_provider(monkeypatch, reply="seen")
     with _make_client(persona_dir) as c:
@@ -467,7 +485,12 @@ def test_stream_accepts_image_shas_in_request_frame(persona_dir: Path, monkeypat
         sha = up.json()["sha"]
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         with c.websocket_connect(f"/stream/{sid}") as ws:
-            ws.send_json({"message": "look", "image_shas": [sha]})
+            ws.send_json(
+                {
+                    "message": "look",
+                    "shared_files": [{"kind": "image", "sha": sha, "media_type": "image/png"}],
+                }
+            )
             while True:
                 f = ws.receive_json()
                 if f.get("type") == "done":
@@ -476,21 +499,24 @@ def test_stream_accepts_image_shas_in_request_frame(persona_dir: Path, monkeypat
 
         turns = read_session(persona_dir, sid)
         user_turn = next(t for t in turns if t["speaker"] == "user")
-        assert user_turn["image_shas"] == [sha]
+        assert "the user shared a file" in user_turn["text"]
+        assert sha in user_turn["text"]
+        assert "image_shas" not in user_turn
 
 
-def test_stream_rejects_invalid_image_shas_field(persona_dir: Path, monkeypatch):
-    """WS frame with non-list image_shas closes with an error frame."""
+def test_stream_rejects_invalid_shared_files_field(persona_dir: Path, monkeypatch):
+    """WS frame with too many shared_files closes with an error frame."""
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
     _patch_fake_provider(monkeypatch, reply="ok")
     with _make_client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         with c.websocket_connect(f"/stream/{sid}") as ws:
-            # Too many shas
-            ws.send_json({"message": "x", "image_shas": ["a" * 64] * 9})
+            ws.send_json(
+                {"message": "x", "shared_files": [{"kind": "image", "sha": "a" * 64}] * 9}
+            )
             f = ws.receive_json()
             assert f.get("type") == "error"
-            assert f.get("code") == "invalid_image_shas"
+            assert f.get("code") == "invalid_shared_files"
 
 
 def test_stream_with_reply_to_audit_id_transitions_audit_to_replied_explicit(

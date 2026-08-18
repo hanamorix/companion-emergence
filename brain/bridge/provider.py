@@ -42,14 +42,13 @@ from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
     ChatStreamEvent,
-    ImageBlock,
     StreamDone,
     StreamError,
-    TextBlock,
     TextDelta,
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
+from brain.diag import turn_logger
 
 logger = logging.getLogger(__name__)
 
@@ -225,9 +224,25 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation even though
-# Nell can't call them (she's restricted to mcp__brain-tools__*). Disallowing
-# them removes the dead-weight definition tokens from cache-creation cost.
+# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
+# the ones she has no business calling removes their definition tokens from
+# cache-creation cost AND keeps them out of her hands.
+#
+# This list is POLICY, not dead weight. --allowedTools is a permission list, not
+# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
+# --dangerously-skip-permissions rides every call — so anything left off this
+# list is genuinely callable. 87bfc692's original comment claimed the opposite
+# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
+# swept out on that false premise, silently removing chat-time web access (#71).
+#
+# Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
+# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
+# unspiked comment is what caused #71 in the first place; don't trust this one
+# either if the CLI has moved. Re-spike and date a new row.
+#
+# Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
+# Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
+# guards that.
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -236,8 +251,6 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Glob",
     "Grep",
     "Task",
-    "WebFetch",
-    "WebSearch",
     "TodoWrite",
     "NotebookEdit",
     "BashOutput",
@@ -246,8 +259,9 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 def _apply_lean_flags(cmd: list[str]) -> None:
-    """Strip the CLI's built-in tool defs (dead weight — Nell only uses MCP tools)
-    and pin to the configured MCP server. Saves ~14K cache-creation tokens/call."""
+    """Disallow the built-in tools she has no business calling and pin to the
+    configured MCP server. Trims their definition tokens from cache-creation
+    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
 
@@ -600,26 +614,10 @@ class ClaudeCliProvider(LLMProvider):
             else:
                 conversation_messages.append(msg)
 
-        # If any conversation message carries an ImageBlock, route through
-        # the stream-json input path so claude actually sees the pixels.
-        # The legacy text path stays the default for text-only turns —
-        # cheaper, no JSON-stream framing overhead.
-        has_images = any(_message_has_image(m) for m in conversation_messages)
-        if has_images:
-            persona_dir_str = (options or {}).get("persona_dir")
-            if not persona_dir_str:
-                raise ProviderError(
-                    "image_passthrough_unavailable",
-                    "image-bearing turns require options['persona_dir'] "
-                    "to resolve <persona_dir>/images/<sha>.<ext>",
-                )
-            return self._chat_with_images(
-                conversation_messages=conversation_messages,
-                system_prompt=system_prompt,
-                persona_dir=Path(persona_dir_str),
-                tools_enabled=bool(tools),
-            )
-
+        # Single assembly path: the image transport is gone. Shared images are
+        # surfaced to the model as a file path in the user text (engine step 5)
+        # and read back via the read_file MCP tool, so no message carries image
+        # pixels here — every turn flows through the text/MCP path below.
         volatile_suffix = (options or {}).get("volatile_suffix")
         include_block_clock = (options or {}).get("include_block_clock", True)
         flat_prompt = _format_claude_print_prompt(
@@ -663,6 +661,7 @@ class ClaudeCliProvider(LLMProvider):
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
 
+            _tl_sent_ts = turn_logger.now_iso()
             try:
                 result = subprocess.run(
                     cmd,
@@ -701,6 +700,12 @@ class ClaudeCliProvider(LLMProvider):
                 text = (
                     f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                 )
+                turn_logger.log_turn(
+                    (options or {}).get("persona_dir"), path="text-budget",
+                    system=system_prompt, messages=conversation_messages,
+                    volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                    received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                )
                 return ChatResponse(content=text, tool_calls=(), raw=payload)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -715,6 +720,12 @@ class ClaudeCliProvider(LLMProvider):
             call_type="chat",
             model=self._model,
             frame=payload,
+        )
+        turn_logger.log_turn(
+            persona_dir_opt, path="text",
+            system=system_prompt, messages=conversation_messages,
+            volatile=volatile_suffix, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+            received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
         )
 
         return ChatResponse(
@@ -743,8 +754,9 @@ class ClaudeCliProvider(LLMProvider):
           StreamDone   — when the result frame arrives (or EOF)
           StreamError  — on timeout, non-zero exit, or spawn failure
 
-        Note: images are not supported; pass image-bearing turns through
-        chat() which routes to _chat_with_images.
+        Note: there is no image transport — shared images are surfaced as a
+        file path in the user text and read back via the read_file MCP tool,
+        so every turn is a text/MCP turn on this path.
         """
         system_prompt: str | None = None
         conversation_messages: list[ChatMessage] = []
@@ -896,6 +908,7 @@ class ClaudeCliProvider(LLMProvider):
             # Send prompt via stdin then close so the subprocess can start.
             try:
                 assert proc.stdin is not None
+                _tl_sent_ts = turn_logger.now_iso()
                 proc.stdin.write(flat_prompt)
                 proc.stdin.close()
             except OSError:
@@ -1006,8 +1019,20 @@ class ClaudeCliProvider(LLMProvider):
                                 if partial
                                 else _BUDGET_EXCEEDED_MSG
                             )
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=cutoff,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=cutoff, metadata=metadata)
                         else:
+                            turn_logger.log_turn(
+                                persona_dir, path="stream", system=system_prompt,
+                                messages=None, volatile=None, sent_blob=flat_prompt,
+                                sent_ts=_tl_sent_ts, received_raw=result_text,
+                                received_ts=turn_logger.now_iso(), usage_frame=obj,
+                            )
                             yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
@@ -1029,6 +1054,12 @@ class ClaudeCliProvider(LLMProvider):
                         )
                     else:
                         content = "".join(delta_chunks) or (assistant_snapshot or "")
+                        turn_logger.log_turn(
+                            persona_dir, path="stream", system=system_prompt,
+                            messages=None, volatile=None, sent_blob=flat_prompt,
+                            sent_ts=_tl_sent_ts, received_raw=content,
+                            received_ts=turn_logger.now_iso(), usage_frame=None,
+                        )
                         yield StreamDone(content=content, metadata={})
 
             except GeneratorExit:
@@ -1036,201 +1067,6 @@ class ClaudeCliProvider(LLMProvider):
                 raise
             finally:
                 reader.join(timeout=5)
-
-    def _chat_with_images(
-        self,
-        conversation_messages: list[ChatMessage],
-        system_prompt: str | None,
-        persona_dir: Path,
-        tools_enabled: bool,
-    ) -> ChatResponse:
-        """Multimodal chat path — pipes Anthropic-shaped messages via stream-json.
-
-        Why: claude CLI has no native ``--image`` flag. ``--input-format
-        stream-json`` does accept SDK-shape messages with content blocks
-        including ``{type: image, source: {type: base64, ...}}`` (verified
-        2026-05-07). This path is reserved for turns that actually carry
-        ImageBlocks; pure text turns continue through the legacy ``-p``
-        path which avoids the JSON-stream framing overhead.
-
-        Tool-calling: when ``tools_enabled`` is True we still write a
-        temp mcp.json + ``--mcp-config`` + ``--allowedTools`` so MCP tool
-        calls inside the claude subprocess work the same as in the
-        text-only path. Stream-json input is orthogonal to MCP.
-
-        Persisted history: only the LAST user turn is sent as a
-        multimodal block list — earlier turns are flattened into the
-        system prompt because stream-json sends one user message at a
-        time. This matches how the legacy text path collapses prior
-        turns into the prompt body.
-        """
-        # Split: history (everything but the last user turn) goes into
-        # system prompt as a flat transcript; the final user turn goes
-        # through stream-json as Anthropic content blocks.
-        if not conversation_messages:
-            raise ProviderError(
-                "image_passthrough_unavailable",
-                "no conversation messages to send",
-            )
-        last_user = conversation_messages[-1]
-        if last_user.role != "user":
-            raise ProviderError(
-                "image_passthrough_unavailable",
-                f"last message must be role=user; got {last_user.role!r}",
-            )
-        history = conversation_messages[:-1]
-
-        # Compose the final system prompt: original system + JSONL context
-        # data for prior turns. Multi-turn image conversations work; what
-        # changes is that earlier images render as [image: <sha[:8]>]
-        # text markers in the history, not as visible blocks. We deliberately
-        # avoid ``User:`` / ``Assistant:`` transcript labels here too; those
-        # labels prime Claude to continue the script in its own reply.
-        history_text = ""
-        if history:
-            history_text = _format_claude_context_block(history, includes_latest_user=False)
-        full_system: str | None = system_prompt
-        if history_text:
-            full_system = f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-
-        # Build the SDK-shape user message frame.
-        user_frame = _build_stream_json_user_message(last_user, persona_dir)
-        stdin_payload = json.dumps(user_frame, ensure_ascii=False) + "\n"
-
-        cmd = [
-            "claude",
-            "--print",
-            "--dangerously-skip-permissions",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--model",
-            self._model,
-        ]
-        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
-        # System prompt (which on this path includes flattened history) goes
-        # to a tempfile + --system-prompt-file. Stdin is reserved for the
-        # stream-json user frame so we can't pipe it the way the text path
-        # does. Off-argv keeps long histories under Windows' 32,767-char
-        # CreateProcess limit.
-
-        # Set up MCP if tools are enabled — same shape as the
-        # legacy-text tool path so the brain's tools remain available
-        # for image-bearing turns.
-        tmp_mcp_path: str | None = None
-        request_id = uuid.uuid4().hex
-        env_overrides = {**_subprocess_env(), "NELL_MCP_AUDIT_REQUEST_ID": request_id}
-        audit_offset_before = 0
-        audit_log_path = persona_dir / "tool_invocations.log.jsonl"
-        if tools_enabled:
-            try:
-                import mcp  # noqa: F401
-            except ImportError as exc:
-                raise ProviderError(
-                    "mcp_unavailable",
-                    "the 'mcp' SDK is required for image-passthrough + tools",
-                ) from exc
-            mcp_config = {
-                "mcpServers": {
-                    "brain-tools": {
-                        "command": sys.executable,
-                        "args": [
-                            "-m",
-                            "brain.mcp_server",
-                            "--persona-dir",
-                            str(persona_dir),
-                        ],
-                        "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
-                    }
-                }
-            }
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    suffix=".json",
-                    delete=False,
-                    encoding="utf-8",
-                ) as tmp:
-                    json.dump(mcp_config, tmp)
-                    tmp_mcp_path = tmp.name
-            except OSError as exc:
-                raise ProviderError(
-                    "claude_cli_setup",
-                    f"failed to write temp mcp.json: {exc}",
-                ) from exc
-            from brain.tools import NELL_TOOL_NAMES
-
-            allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
-            cmd.extend(["--mcp-config", tmp_mcp_path])
-            cmd.extend(["--allowedTools", *allowed_mcp])
-            _apply_lean_flags(cmd)
-            try:
-                audit_offset_before = audit_log_path.stat().st_size
-            except FileNotFoundError:
-                audit_offset_before = 0
-
-        try:
-            with _system_prompt_tempfile(full_system) as sp_path:
-                if sp_path is not None:
-                    cmd.extend(["--system-prompt-file", sp_path])
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        input=stdin_payload,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=self._timeout,
-                        env=env_overrides,
-                        check=False,
-                        creationflags=_NO_WINDOW,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    raise ProviderError(
-                        "claude_cli_timeout",
-                        f"image-passthrough subprocess timed out after {self._timeout}s",
-                    ) from exc
-
-            if result.returncode != 0:
-                raise ProviderError(
-                    "claude_cli_exit",
-                    f"exit {result.returncode}: {_claude_failure_detail(result)}",
-                )
-
-            try:
-                content = _parse_stream_json_result(result.stdout)
-            except ProviderError as exc:
-                if exc.stage == "error_max_budget_usd":
-                    partial = exc.detail.strip()
-                    text = (
-                        f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
-                        if partial
-                        else _BUDGET_EXCEEDED_MSG
-                    )
-                    return ChatResponse(content=text, tool_calls=(), raw=None)
-                raise
-            dispatched: tuple[dict[str, Any], ...] = ()
-            if tools_enabled:
-                dispatched = tuple(
-                    _read_audit_lines_since(
-                        audit_log_path, audit_offset_before, request_id=request_id
-                    )
-                )
-            return ChatResponse(
-                content=_truncate_at_role_leak(content),
-                tool_calls=(),
-                dispatched_invocations=dispatched,
-                raw=None,
-            )
-        finally:
-            if tmp_mcp_path:
-                try:
-                    os.unlink(tmp_mcp_path)
-                except OSError:
-                    pass
 
     def _chat_with_mcp_tools(
         self,
@@ -1333,6 +1169,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
+                _tl_sent_ts = turn_logger.now_iso()
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1371,6 +1208,12 @@ class ClaudeCliProvider(LLMProvider):
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
+                    turn_logger.log_turn(
+                        persona_dir, path="mcp-budget",
+                        system=system_prompt, messages=None,
+                        volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                        received_raw=partial, received_ts=turn_logger.now_iso(), usage_frame=payload,
+                    )
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -1387,6 +1230,12 @@ class ClaudeCliProvider(LLMProvider):
                 call_type="chat",
                 model=self._model,
                 frame=payload,
+            )
+            turn_logger.log_turn(
+                persona_dir, path="mcp",
+                system=system_prompt, messages=None,
+                volatile=None, sent_blob=flat_prompt, sent_ts=_tl_sent_ts,
+                received_raw=content, received_ts=turn_logger.now_iso(), usage_frame=payload,
             )
 
             dispatched = _read_audit_lines_since(
@@ -1485,6 +1334,10 @@ def _read_audit_lines_since(
             record["error"] = entry["error"]
         if entry.get("monologue_text"):
             record["monologue_text"] = entry["monologue_text"]
+        # Content-addressed image path (a hash, never base64) — surfaced so the
+        # engine can persist it into the durable buffer for memory binding.
+        if entry.get("stored_image_path"):
+            record["stored_image_path"] = entry["stored_image_path"]
         records.append(record)
     if malformed:
         logger.warning(
@@ -1696,69 +1549,6 @@ def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
         if msg.tool_calls:
             record["tool_calls"] = [tc.to_dict() for tc in msg.tool_calls]
         yield json.dumps(record, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# ClaudeCliProvider — image passthrough helpers
-# ---------------------------------------------------------------------------
-
-
-def _message_has_image(msg: ChatMessage) -> bool:
-    """True if ``msg.content`` carries any ImageBlock."""
-    if isinstance(msg.content, str):
-        return False
-    return any(isinstance(b, ImageBlock) for b in msg.content)
-
-
-def _build_stream_json_user_message(
-    msg: ChatMessage,
-    persona_dir: Path,
-) -> dict[str, Any]:
-    """Convert a ChatMessage with image blocks into Anthropic-shaped JSON.
-
-    Reads image bytes from disk, base64-encodes inline, and emits the
-    SDK-shape envelope claude --input-format stream-json expects:
-
-        {"type": "user", "message": {"role": "user", "content": [...]}}
-
-    where each content block is either ``{type: text, text}`` or
-    ``{type: image, source: {type: base64, media_type, data}}``.
-
-    Image-block bytes are read via ``brain.images.read_image_bytes``;
-    missing files surface as ProviderError("image_missing", ...) so the
-    caller can decide whether to skip or fail.
-    """
-    import base64
-
-    from brain.images import read_image_bytes
-
-    blocks_out: list[dict[str, Any]] = []
-    for block in msg.content_blocks():
-        if isinstance(block, TextBlock):
-            if block.text:
-                blocks_out.append({"type": "text", "text": block.text})
-        elif isinstance(block, ImageBlock):
-            try:
-                raw = read_image_bytes(persona_dir, block.image_sha, block.media_type)
-            except FileNotFoundError as exc:
-                raise ProviderError(
-                    "image_missing",
-                    f"image_sha={block.image_sha[:8]} not on disk: {exc}",
-                ) from exc
-            blocks_out.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": block.media_type,
-                        "data": base64.b64encode(raw).decode("ascii"),
-                    },
-                }
-            )
-    return {
-        "type": "user",
-        "message": {"role": msg.role, "content": blocks_out},
-    }
 
 
 def _parse_stream_json_result(stdout: str) -> str:

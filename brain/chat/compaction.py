@@ -161,6 +161,13 @@ def _render_transcript(turns: list[dict], kindled_name: str) -> str:
     lines = []
     for r in turns:
         sp = r.get("speaker", "?")
+        if sp == "image":
+            # Image-annotation rows (a content-addressed images/<sha>.<ext>
+            # handle persisted for memory binding) are kept out of the summary
+            # the model sees on later turns — the distinct "image" speaker keeps
+            # them for extraction/archive only. They are still archived by
+            # _split_buffer (never lost), just not fed to the summariser.
+            continue
         if sp == "assistant":
             sp = kindled_name
         lines.append(f"{sp}: {r.get('text', '')}")
@@ -310,7 +317,13 @@ def compact_conversation(
         from pathlib import Path
         persona_name = Path(persona_dir).name
         transcript = _render_transcript(removable, persona_name)
-        removable_words = sum(_word_count(r.get("text", "")) for r in removable)
+        # Image-annotation rows are excluded from the rendered transcript (see
+        # _render_transcript), so exclude them from the length-target estimate
+        # too — otherwise their few words inflate target_words for content the
+        # summariser never sees.
+        removable_words = sum(
+            _word_count(r.get("text", "")) for r in removable if r.get("speaker") != "image"
+        )
         prior_text = _summary_text(existing_summary)
         folding = fold_existing_summary and existing_summary is not None
 
