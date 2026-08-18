@@ -291,11 +291,22 @@ def respond(
     # user text (with any shared-file path line) is persisted as PLAIN TEXT —
     # the buffer needs no image_shas now that the transport is gone, and replay
     # simply re-sends the path line as ordinary text.
+    #
+    # If read_file opened any viewable image this turn, each carries a
+    # content-addressed rel_path on its invocation record (stored_image_path).
+    # Persist those into the buffer as distinct "image" records so a normal
+    # memory can bind to the image by content hash. Deduped, first-seen order.
+    image_rel_paths: list[str] = []
+    for inv in invocations:
+        rel = inv.get("stored_image_path") if isinstance(inv, dict) else None
+        if rel and rel not in image_rel_paths:
+            image_rel_paths.append(rel)
     persistence_ok, persistence_error = _persist_turn(
         persona_dir=persona_dir,
         session_id=session.session_id,
         user_text=outgoing_user_text,
         assistant_text=content,
+        image_rel_paths=image_rel_paths,
     )
     session.append_turn(outgoing_user_text, content)
 
@@ -413,6 +424,7 @@ def _persist_turn(
     session_id: str,
     user_text: str,
     assistant_text: str,
+    image_rel_paths: list[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
@@ -423,6 +435,16 @@ def _persist_turn(
     A file-send turn's surfaced path line is already part of ``user_text``
     (plain text) — no image_shas metadata is written now that the transport
     is gone.
+
+    ``image_rel_paths``: content-addressed rel_paths (``images/<sha>.<ext>``)
+    for any image read via read_file this turn. Each is written as a distinct
+    ``speaker="image"`` record, in chronological order between the user and
+    assistant records. A distinct speaker keeps the annotation OUT of the
+    model-replayed prompt (_buffer_turns_to_messages skips unknown speakers)
+    and out of the compaction summary (compaction._render_transcript skips
+    "image"), while memory formation (extract.py) still reads it — so a normal
+    memory can bind to the image by content hash. The line text carries no
+    em-dash / LLM-tell (persona-surface string rule).
     """
     try:
         user_record: dict = {
@@ -431,6 +453,15 @@ def _persist_turn(
             "text": user_text,
         }
         ingest_turn(persona_dir, user_record)
+        for rel_path in image_rel_paths or []:
+            ingest_turn(
+                persona_dir,
+                {
+                    "session_id": session_id,
+                    "speaker": "image",
+                    "text": f"[image opened, stored at {rel_path}]",
+                },
+            )
         ingest_turn(
             persona_dir,
             {"session_id": session_id, "speaker": "assistant", "text": assistant_text},

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
-from brain.images import sniff_media_type
+from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
 from brain.tools.impls import _read_cache
 
 _FILE_READ_MAX_BYTES = tunables.register("files.read_max_bytes", 256 * 1024)
@@ -162,9 +162,32 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
                 bytes_=img_size, ok=False, error=str(exc),
             )
             return {"error": f"read failed: {exc}"}
-        # Audit records the size, never the base64 (red-team G5 / C15).
+        # Content-address the opened image into the persona's image store so a
+        # durable, hash-bearing handle (images/<sha>.<ext>) exists for it. This
+        # is what lets a normal memory later bind to the image by content hash:
+        # the engine surfaces this rel_path into the durable buffer (see
+        # engine._persist_turn + the stored_image_path invocation field). The
+        # write is content-addressed, idempotent, dedup'd, and confined to
+        # <persona_dir>/images/ (brain.images validates the sha — no traversal).
+        # NEVER put base64 in the stored_image block (red-team G5 / C15).
+        stored_image: dict | None = None
+        try:
+            rec = save_image_bytes(persona_dir, data, sniffed)
+            ext = media_type_to_ext(rec.media_type)
+            stored_image = {
+                "sha": rec.sha,
+                "media_type": rec.media_type,
+                "rel_path": f"images/{rec.sha}.{ext}",
+            }
+        except (ValueError, OSError):
+            # Content-addressing is best-effort: a store failure must never
+            # break the viewable-image return (she must still SEE the pixels).
+            stored_image = None
+        # Audit records the size + the content-addressed rel_path, never the
+        # base64 (red-team G5 / C15). The rel_path is a content hash (metadata),
+        # not image bytes.
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=img_size, ok=True)
-        return {
+        result: dict = {
             "path": str(p),
             "image": {
                 "media_type": sniffed,
@@ -172,6 +195,9 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
                 "size_bytes": img_size,
             },
         }
+        if stored_image is not None:
+            result["stored_image"] = stored_image
+        return result
 
     cap = _file_read_max_bytes()
     size = p.stat().st_size

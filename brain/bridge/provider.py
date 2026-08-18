@@ -1334,6 +1334,10 @@ def _read_audit_lines_since(
             record["error"] = entry["error"]
         if entry.get("monologue_text"):
             record["monologue_text"] = entry["monologue_text"]
+        # Content-addressed image path (a hash, never base64) — surfaced so the
+        # engine can persist it into the durable buffer for memory binding.
+        if entry.get("stored_image_path"):
+            record["stored_image_path"] = entry["stored_image_path"]
         records.append(record)
     if malformed:
         logger.warning(

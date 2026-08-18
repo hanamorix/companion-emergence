@@ -83,12 +83,21 @@ def register_tools(
                 summary = (
                     f"{media_type} {size_bytes}B" if size_bytes is not None else media_type
                 )
+                # Surface the content-addressed rel_path (a hash, never base64)
+                # so it rides the audit -> dispatched_invocations channel back to
+                # the engine, which persists it into the durable buffer. This is
+                # the only structured tool->engine back-channel on the cli path.
+                stored = result.get("stored_image")
+                stored_image_path = (
+                    stored.get("rel_path") if isinstance(stored, dict) else None
+                )
                 log_invocation(
                     persona_dir,
                     name=name,
                     arguments=arguments,
                     result_summary=_summarize(summary),
                     monologue_text=None,
+                    stored_image_path=stored_image_path,
                 )
                 return [ImageContent(type="image", data=data_b64, mimeType=media_type)]
             payload = json.dumps(result, default=str, ensure_ascii=False)

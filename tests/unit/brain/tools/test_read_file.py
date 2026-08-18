@@ -85,6 +85,45 @@ def test_read_file_returns_image_result_for_png(tmp_path):
     assert out["image"]["size_bytes"] == 64
 
 
+def test_read_file_image_returns_content_addressed_handle(tmp_path):
+    """image-path-persist C1(tool)/C6 — an opened image is content-addressed into
+    the persona's image store and the handle (sha + images/<sha>.<ext> rel_path)
+    is returned alongside the pixels; the store file exists and is confined to
+    <persona_dir>/images/."""
+    from brain.images import compute_sha
+
+    raw = _png_of_size(64)
+    f = tmp_path / "pic.png"
+    f.write_bytes(raw)
+    out = read_file(path=str(f), persona_dir=tmp_path)
+
+    assert "image" in out and out["image"]["data_b64"]  # C4 — still SEES pixels
+    stored = out["stored_image"]
+    sha = compute_sha(raw)
+    assert stored["sha"] == sha
+    assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)
+    assert stored["media_type"] == "image/png"
+    assert stored["rel_path"] == f"images/{sha}.png"
+    # C6 — the store file exists and is confined under <persona_dir>/images/.
+    store_file = tmp_path / "images" / f"{sha}.png"
+    assert store_file.is_file()
+    assert store_file.resolve().parent == (tmp_path / "images").resolve()
+
+
+def test_read_file_image_audit_line_has_no_base64(tmp_path):
+    """image-path-persist C3 — the read_file file_access.jsonl audit records
+    size/ok, never the base64 image bytes (red-team G5 / C15)."""
+    raw = _png_of_size(64)
+    f = tmp_path / "pic.png"
+    f.write_bytes(raw)
+    out = read_file(path=str(f), persona_dir=tmp_path)
+    b64 = out["image"]["data_b64"]
+    audit_text = (tmp_path / "file_access.jsonl").read_text()
+    assert b64 not in audit_text
+    # sanity: the audit line was written for this read
+    assert '"tool": "read_file"' in audit_text and '"ok": true' in audit_text
+
+
 def test_read_file_large_image_not_refused_by_text_cap(tmp_path):
     """C12 — an image between the 256KB text cap and image_max_bytes returns an
     image result, NOT 'file too large'. This is the cap-ordering guard: the
