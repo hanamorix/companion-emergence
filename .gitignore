@@ -147,3 +147,7 @@ app/src-tauri/python-runtime/
 hooks/leak-rules.local
 docs/guarded-change/
 CLAUDE.local.md
+
+# Guarded-change process artefacts (spec/plan/red-team drafts) — local
+# working state only, never pushed.
+changes/
