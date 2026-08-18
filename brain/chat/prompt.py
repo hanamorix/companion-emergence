@@ -61,6 +61,11 @@ _HARNESS_FENCE = (
 )
 
 _EPISTEMIC_INSTRUCTION = (
+    "When a memory is already surfaced in front of you, in the recall block or "
+    "in an earlier search result, and it carries an id, open it with "
+    "read_full_memory before you answer from it. That is the deliberate read: "
+    "seeing the snippet alone does not count. Reach for search_memories only "
+    "when what you need is not already surfaced. "
     "If asked about something you might have stored — a name, a fact, a shared "
     "moment — and it isn't in the context you can see, call search_memories "
     'before answering. Never say "I don\'t remember" without searching first. '
