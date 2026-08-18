@@ -77,7 +77,7 @@ _EPISTEMIC_INSTRUCTION = (
 # to "expand"). Wording is byte-exact — do not reword.
 _RECALL_SNIPPET_INVITATION = (
     "These are yours. Reach into any that might touch this turn. "
-    "Skip only if you can name why it doesn't."
+    "Open one with read_full_memory. Skip only if you can name why it doesn't."
 )
 
 # Header for the volatile context chunk (Option A+). The chunk now sits in the

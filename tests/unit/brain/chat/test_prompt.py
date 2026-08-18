@@ -1298,7 +1298,7 @@ def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
 
     assert _RECALL_SNIPPET_INVITATION == (
         "These are yours. Reach into any that might touch this turn. "
-        "Skip only if you can name why it doesn't."
+        "Open one with read_full_memory. Skip only if you can name why it doesn't."
     )
 
 
