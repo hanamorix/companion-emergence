@@ -102,6 +102,7 @@ def log_invocation(
     result_summary: str,
     error: str | None = None,
     monologue_text: str | None = None,
+    stored_image_path: str | None = None,
 ) -> None:
     """Append one invocation record to <persona_dir>/tool_invocations.log.jsonl.
 
@@ -120,6 +121,15 @@ def log_invocation(
         Compact preview of the result. Truncated to 140 chars + "…" if longer.
     error:
         ``None`` on success; ``str(exc)`` on dispatch failure.
+    stored_image_path:
+        For a viewable-image read, the content-addressed rel_path
+        (``images/<sha>.<ext>``). Recorded as a first-class field so it can be
+        surfaced back to the engine and persisted into the durable buffer. It is
+        a content HASH (deliberately non-identifying) and metadata, so — like
+        ``monologue_text`` — it is written unconditionally, outside the
+        privacy-mode branch, and NOT redacted. It is emitted in ``full`` /
+        ``redacted`` / ``metadata`` modes; only ``off`` (which skips all logging)
+        drops it. NEVER contains base64 / image bytes.
     """
     mode = _audit_mode(persona_dir)
     if mode == "off":
@@ -150,6 +160,11 @@ def log_invocation(
     }
     if monologue_text:
         record["monologue_text"] = monologue_text
+    # A content-addressed image path is a hash (metadata), never content — write
+    # it like monologue_text, outside the redaction branch, so memory formation
+    # can bind to the image by its content hash. Never base64.
+    if stored_image_path:
+        record["stored_image_path"] = stored_image_path
     request_id = os.environ.get("NELL_MCP_AUDIT_REQUEST_ID")
     if request_id:
         record["request_id"] = request_id
