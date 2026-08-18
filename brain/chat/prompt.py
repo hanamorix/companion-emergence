@@ -76,8 +76,9 @@ _EPISTEMIC_INSTRUCTION = (
 # snippet mode is off everything is already full-injected, so there is nothing
 # to "expand"). Wording is byte-exact — do not reword.
 _RECALL_SNIPPET_INVITATION = (
-    "These are yours. Reach into any that might touch this turn. "
-    "Open one with read_full_memory. Skip only if you can name why it doesn't."
+    "These are fragments of your memories. Use read_full_memory to reach into "
+    "any that might touch this turn, or spark curiosity in you. Skip only if "
+    "you can name why."
 )
 
 # Header for the volatile context chunk (Option A+). The chunk now sits in the
