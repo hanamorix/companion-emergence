@@ -48,6 +48,12 @@ from .detector import (
     TurnContext,
     assert_detector_gate,
 )
+from .dropin import (
+    DropinBuild,
+    DropinMismatch,
+    assert_brain_under_dropin,
+    ingest_version,
+)
 from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
@@ -71,6 +77,8 @@ __all__: list[str] = [
     "sandbox", "SandboxHandle", "SandboxLeak", "LiveServiceDetected",
     "EditablePathRefused", "HARNESS_EDITABLE_SENTINEL",
     "LIVE_CHECK_RAISE", "LIVE_CHECK_WARN", "LIVE_CHECK_OFF",
+    # dropin (code ingestion + split-brain guard)
+    "ingest_version", "assert_brain_under_dropin", "DropinBuild", "DropinMismatch",
     # config
     "ModelConfig", "Timeouts", "DEFAULT_MODELS", "DEFAULT_TIMEOUTS",
     "SYNTHETIC_USER", "PERSONA_NAME",
