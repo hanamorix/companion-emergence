@@ -1297,10 +1297,8 @@ def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
     from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
 
     assert _RECALL_SNIPPET_INVITATION == (
-        "These are snippets of fuller memories, surfaced by their relevance to "
-        "this moment. They're an invitation. Use read_full_memory to see the "
-        "whole memory if one feels relevant, or you're curious about it. They're "
-        "yours; explore."
+        "These are yours. Reach into any that might touch this turn. "
+        "Skip only if you can name why it doesn't."
     )
 
 
