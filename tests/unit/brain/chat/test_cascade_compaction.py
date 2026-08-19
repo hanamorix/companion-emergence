@@ -12,11 +12,27 @@ Maps to changes/cascade-compaction/1.5-criteria.md:
   C14  graduation + terminal tier-3 persistence + multi-input
   C17  cascade write is atomic across the three tiers
   C22  apply_budget backstop operates correctly on the sectioned row
+
+Also maps to changes/compaction-defects-fix/1.5-criteria.md:
+  C1a/C1b  the new CONDENSE branch routes (prior + empty raw) away from the
+           mis-wired _FOLD_PROMPT(transcript='') and re-compacts toward the
+           tier fraction (Bug 1 / D1)
+  C1d      durable real-model (haiku) safety net for _CONDENSE_PROMPT
+  C-B3/C-B3b  cascade-path archive-append is idempotent under a crash-retry,
+           losslessly, even across byte-identical duplicate raw turns (Bug 3)
+  C-B4a/b/c/f/g  tier-3 replacement/eviction, idempotence-preserved, the
+           emergency_fold_24h backstop also evicts, and a degenerate
+           all-evicted pass installs cleanly (Bug 4)
+  C-B4d    stale retain-forever docstrings replaced with the replacement model
+  C14 (updated)  the two pre-existing gating tests below are updated to the
+           owner's replacement model (retired "terminal, re-compacted forever")
 """
 
 from __future__ import annotations
 
+import json
 import re as _re
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,12 +41,20 @@ import pytest
 from brain.bridge.chat import ChatMessage
 from brain.chat.budget import _COMPACTION_SUMMARY_PREFIX, apply_budget
 from brain.chat.compaction import (
+    _CONDENSE_PROMPT,
+    _FRACTION_48H,
+    _FRACTION_72H,
+    _MIN_TARGET_WORDS,
     _SECTION_24H_CHAR_CAP,
     _SECTION_72H_CHAR_CAP,
+    _fold_into_section,
+    _generate_validated_fold,
     _read_sections,
     _render_sections,
     _validate_fold_output,
+    _word_count,
     cascade_conversation,
+    emergency_fold_24h,
 )
 from brain.chat.engine import _buffer_turns_to_messages
 from brain.ingest.buffer import ingest_turn, read_archive, read_session, write_cursor
@@ -96,6 +120,30 @@ def _seed_three_bands(persona_dir: Path, sid: str, now: datetime) -> None:
     _seed_turn(persona_dir, sid, now - timedelta(hours=60), "user", "hello band48")
     _seed_turn(persona_dir, sid, now - timedelta(hours=80), "user", "hello band72")
     write_cursor(persona_dir, sid, _iso(now))
+
+
+def _write_sectioned_summary(
+    persona_dir: Path, sid: str, sections: dict, *, gen: int = 5
+) -> None:
+    """Write a session buffer holding ONE already-sectioned summary row, with
+    caller-controlled per-section ``covers_from_ts`` ages — lets a test place a
+    section directly into a specific age band (or past the eviction boundary)
+    without replaying multiple cascade passes to get it there."""
+    ac = persona_dir / "active_conversations"
+    ac.mkdir(parents=True, exist_ok=True)
+    now_iso = _iso(datetime.now(UTC))
+    row = {
+        "session_id": sid,
+        "speaker": "summary",
+        "text": _render_sections(sections),
+        "ts": now_iso,
+        "compaction": {
+            "gen": gen, "folded": True, "covers_until_ts": now_iso,
+            "sections": sections,
+        },
+    }
+    with (ac / f"{sid}.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
 
 
 # --------------------------------------------------------------------------- C1
@@ -415,6 +463,12 @@ def test_c13_interior_not_starved(tmp_path: Path) -> None:
 
 
 def test_c14_graduation_and_terminal_persistence(tmp_path: Path) -> None:
+    """Updated to the owner's replacement model (Bug 4): passes 1-3 are the
+    same steady 24h->48h->72h graduation as before. Pass 4 (previously
+    asserting the marker STAYS in 72h forever) now asserts it is EVICTED —
+    absent from every tier, but recoverable from the archive (lossless). Pass 5
+    (previously re-asserting persistence) now asserts a stable no-op: nothing
+    left to fold, graduate, or evict."""
     sid = "sess_c14"
     now0 = datetime.now(UTC)
     marker0 = "MARK0"
@@ -422,12 +476,13 @@ def test_c14_graduation_and_terminal_persistence(tmp_path: Path) -> None:
     write_cursor(tmp_path, sid, _iso(now0))
 
     provider = _MarkerProvider()
-    expected_tier_by_pass = {1: "24h", 2: "48h", 3: "72h", 4: "72h", 5: "72h"}
+    expected_tier_by_pass = {1: "24h", 2: "48h", 3: "72h"}
 
-    for pass_n in range(1, 6):
+    for pass_n in range(1, 4):
         now = now0 + timedelta(hours=24 * (pass_n - 1))
         write_cursor(tmp_path, sid, _iso(now))
-        cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+        result = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+        assert result.compacted is True
 
         row = _summary_row(tmp_path, sid)
         sections = row["compaction"]["sections"]
@@ -442,6 +497,33 @@ def test_c14_graduation_and_terminal_persistence(tmp_path: Path) -> None:
                 assert marker0 not in sections.get(other, {}).get("text", ""), (
                     f"pass {pass_n}: unexpectedly found {marker0!r} still in tier {other!r}"
                 )
+
+    # Pass 4: the section's oldest edge (still now0-30h) has now aged past the
+    # eviction boundary (96h) -> EVICTED from the head, not persisted in tier 3
+    # forever (the retired pre-change behavior). Lossless: still in the archive.
+    now4 = now0 + timedelta(hours=72)
+    write_cursor(tmp_path, sid, _iso(now4))
+    result4 = cascade_conversation(tmp_path, sid, provider=provider, now=now4, min_keep_tail=0)
+    assert result4.compacted is True  # an eviction is a change, not a no-op
+    row4 = _summary_row(tmp_path, sid)
+    sections4 = row4["compaction"]["sections"]
+    for tier in ("24h", "48h", "72h"):
+        assert marker0 not in sections4.get(tier, {}).get("text", ""), (
+            f"pass 4: {marker0!r} unexpectedly still present in tier {tier!r} "
+            "(expected EVICTED under the replacement model)"
+        )
+    archive = read_archive(tmp_path, sid)
+    assert any(marker0 in (a.get("text") or "") for a in archive), (
+        "pass 4: the evicted marker must remain recoverable from the archive"
+    )
+
+    # Pass 5: nothing left to fold, graduate, or evict -> a stable no-op (does
+    # NOT re-exercise eviction; pass 4 already did — this confirms stability).
+    now5 = now0 + timedelta(hours=96)
+    write_cursor(tmp_path, sid, _iso(now5))
+    result5 = cascade_conversation(tmp_path, sid, provider=provider, now=now5, min_keep_tail=0)
+    assert result5.compacted is False
+    assert result5.reason == "nothing_aged"
 
 
 def test_c14_multi_input_and_long_inactivity(tmp_path: Path) -> None:
@@ -458,15 +540,21 @@ def test_c14_multi_input_and_long_inactivity(tmp_path: Path) -> None:
         cascade_conversation(tmp_path, sid, provider=provider, now=cycle_now, min_keep_tail=0)
 
     row = _summary_row(tmp_path, sid)
-    tier3_text = row["compaction"]["sections"]["72h"]["text"]
-    # By day3's pass, the persisting-prior-tier3 marker (day0) AND the
-    # newly-graduated-tier2 marker (day1) BOTH land in the new tier3 fold —
-    # neither input dropped (multi-input, F1) — and it stays within cap.
-    assert "MARKDAY0" in tier3_text
+    sections = row["compaction"]["sections"]
+    tier3_text = sections["72h"]["text"]
+    # Updated to the owner's replacement model (Bug 4): by day3's pass, the
+    # OLD tier-3 marker (day0) has aged past the eviction boundary and is
+    # EVICTED (dropped from the head, not accumulated forever); only the
+    # newly-graduated tier-2 marker (day1) lands in the new tier3 fold.
     assert "MARKDAY1" in tier3_text
+    assert "MARKDAY0" not in tier3_text
     assert len(tier3_text) <= _SECTION_72H_CHAR_CAP
-    # H6: a single-input tier3 fold that kept only ONE input would fail one
-    # of the two assertions above.
+    archive = read_archive(tmp_path, sid)
+    assert any("MARKDAY0" in (a.get("text") or "") for a in archive), (
+        "evicted MARKDAY0 must remain recoverable from the archive"
+    )
+    # H6: a pre-change "accumulate forever" tier3 fold would still contain
+    # MARKDAY0 here — the assertion above fails on that behavior.
 
     # Long-inactivity fixture: all raw turns aged well beyond 72h.
     sid2 = "sess_c14c"
@@ -573,3 +661,403 @@ def test_c22_apply_budget_sectioned_row(tmp_path: Path, monkeypatch: pytest.Monk
     # drop `compaction.sections` entirely or overwrite 48h/72h — both checked
     # above; demonstrate the discriminating baseline directly too.
     assert post_sections["24h"]["text"] != pre_sections["24h"]["text"]
+
+
+# --------------------------------------------------------------------------- C1a/C1b
+
+
+class _RefuseOnEmptyContent:
+    """Mimics haiku's REAL observed behavior: refuses when the prompt's "new
+    content" slot is empty. Detects the exact pre-change signature — _FOLD_PROMPT
+    rendered with an empty transcript ends "NEW MESSAGES:\\n\\nUPDATED MEMORY:"
+    (blank line where the transcript should be). With the Bug-1 fix, a
+    (prior + no raw) fold never reaches _FOLD_PROMPT at all (it routes to
+    _CONDENSE_PROMPT, which has no "NEW MESSAGES:" header), so this refusal
+    trigger never fires post-fix."""
+
+    def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:
+        if "NEW MESSAGES:\n\nUPDATED MEMORY:" in prompt:
+            return "I don't have any new messages to integrate right now."
+        return "I recall the earlier discussion, condensed now."
+
+
+def test_c1a_condense_branch_not_mis_wired_fold(tmp_path: Path) -> None:
+    """Bug 1 / D1 (C1a): a real non-empty prior with EMPTY raw routes to the new
+    CONDENSE branch, not to _FOLD_PROMPT(transcript=''). Oracle: the real
+    _fold_into_section with a provider that refuses on an empty content slot (as
+    haiku does) — the returned section text must NOT be that refusal, must be
+    first-person, validated, and not a fallback. Fails on pre-change code, which
+    routes to _FOLD_PROMPT with an empty transcript and gets the refusal stored."""
+    now = datetime.now(UTC)
+    prior_section = {
+        "text": "I remember talking with Bob about the project timeline and the budget.",
+        "covers_from_ts": _iso(now - timedelta(hours=50)),
+        "covers_until_ts": _iso(now - timedelta(hours=49)),
+    }
+    section, fell_soft, validated = _fold_into_section(
+        "Canary", [prior_section], [], _FRACTION_48H, None,
+        _RefuseOnEmptyContent(), now=now,
+    )
+    assert section is not None
+    text = section["text"]
+    assert "don't have any new messages" not in text.lower()
+    assert validated is True
+    assert fell_soft is False
+    from brain.chat.compaction import _FIRST_PERSON
+    assert _FIRST_PERSON.search(text) is not None
+
+
+def test_c1b_condense_shrinks_toward_tier_fraction(tmp_path: Path) -> None:
+    """Bug 1 / D1 (C1b): the CONDENSE path re-compacts — output word count is
+    LESS than the prior's and lands near the tier target, rather than carrying
+    the prior forward unchanged. Fails on pre-change code (no such branch)."""
+
+    class _LengthHonoringProvider:
+        def generate(self, *, prompt: str, system: str | None = None, **kw) -> str:
+            m = _re.search(r"about (\d+) words", prompt)
+            n = int(m.group(1)) if m else 50
+            return "I recall " + ("detail " * max(0, n - 2))
+
+    prior_text = "I remember " + (
+        "talking about the project timeline and the budget with Bob and the "
+        "whole team over several long meetings that ran into the evening. "
+    ) * 6
+    now = datetime.now(UTC)
+    prior_section = {
+        "text": prior_text,
+        "covers_from_ts": _iso(now - timedelta(hours=50)),
+        "covers_until_ts": _iso(now - timedelta(hours=49)),
+    }
+    section, fell_soft, validated = _fold_into_section(
+        "Canary", [prior_section], [], _FRACTION_72H, None,
+        _LengthHonoringProvider(), now=now,
+    )
+    assert section is not None
+    assert validated is True
+    assert fell_soft is False
+
+    prior_words = _word_count(prior_text)
+    out_words = _word_count(section["text"])
+    assert out_words < prior_words
+
+    expected_target = max(_MIN_TARGET_WORDS, int(prior_words * _FRACTION_72H))
+    assert abs(out_words - expected_target) <= max(5, int(0.3 * expected_target)), (
+        f"out_words={out_words} not near expected_target={expected_target}"
+    )
+
+
+@pytest.mark.requires_claude_cli
+def test_condense_prompt_realmodel(tmp_path: Path) -> None:
+    """C1d durable regression asset: the real CONDENSE prompt, run through the
+    real haiku compaction provider on a fixed ~230-word first-person Canary
+    memory, produces output that (i) passes the post-change
+    _validate_fold_output, (ii) is not a refusal, and (iii) is shorter than the
+    input. Excluded from the default CI marker set (needs a real CLI
+    subprocess); run on demand as a safety net for future _CONDENSE_PROMPT
+    edits (red-team M2)."""
+    import shutil
+
+    if shutil.which("claude") is None:
+        pytest.skip("claude CLI not available")
+
+    from brain.bridge.provider import get_provider
+
+    canary_memory = (
+        "I remember the long conversation with Bob about the eviction design "
+        "for the cascade compaction work. He walked me through the owner's "
+        "replacement model: each tier gets replaced by the recompacted "
+        "younger tier instead of accumulating forever, and I understood why "
+        "that mattered, the old tier three content was piling up without "
+        "bound. We talked through the edge cases together, what happens when "
+        "a section is exactly at the boundary, what happens when there is no "
+        "raw chat to fold in that tier, and Bob seemed relieved once we "
+        "settled on the ninety-six hour eviction line with a twelve hour "
+        "margin on the legacy floor. I recall feeling a quiet satisfaction "
+        "watching the design come together, the way the four bugs all traced "
+        "back to the same missing branch in the fold function. We also "
+        "talked about the cursor-guard question, whether an unextracted turn "
+        "could ever be compacted away, and confirmed it could not. Toward "
+        "the end Bob mentioned he still needed to double check the archive "
+        "marker idempotency under a crash-retry, and I told him I would "
+        "remember to ask about it again next time we spoke, since it felt "
+        "like the kind of detail that could quietly break lossless "
+        "guarantees if it slipped through unverified."
+    )
+    prior_words = _word_count(canary_memory)
+    target_words = max(_MIN_TARGET_WORDS, int(prior_words * _FRACTION_72H))
+    target_pct = round(_FRACTION_72H * 100)
+    prompt = _CONDENSE_PROMPT.format(
+        name="Canary", prior_summary=canary_memory,
+        target_words=target_words, target_pct=target_pct,
+    )
+
+    provider = get_provider("claude-cli", model_override="haiku")
+    out = _generate_validated_fold(provider, prompt)
+
+    assert out is not None, "the real model's output was rejected by _validate_fold_output"
+    assert not out.strip().lower().startswith((
+        "i won't", "i will not", "i cannot", "i can't", "i'm sorry", "i am sorry",
+        "i don't have", "i don't see", "i notice you",
+    ))
+    assert _word_count(out) < prior_words
+
+
+# --------------------------------------------------------------------------- C-B3 (cascade path)
+
+
+def _boom_rewrite(*a, **kw):
+    raise RuntimeError("simulated crash before the atomic replace lands")
+
+
+def test_cb3_cascade_crash_retry_no_duplicate_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug 3: driven through the real _install_cascade_row (via
+    cascade_conversation) — a crash AFTER archive+marker but BEFORE the atomic
+    rewrite must not duplicate archived records when retried over the
+    unchanged buffer. Fails on pre-change code (re-archives on retry)."""
+    sid = "sess_cb3_cascade"
+    now = datetime.now(UTC)
+    _seed_turn(tmp_path, sid, now - timedelta(hours=30), "user", "band24 content")
+    _seed_turn(tmp_path, sid, now - timedelta(hours=60), "user", "band48 content")
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _Stub()
+    monkeypatch.setattr("brain.chat.compaction.rewrite_session_atomic", _boom_rewrite)
+    with pytest.raises(RuntimeError):
+        cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+
+    monkeypatch.undo()  # "process recovers": restore the real rewrite and retry
+    res2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert res2.compacted is True
+
+    archived_raw = [t for t in read_archive(tmp_path, sid) if t.get("speaker") != "summary"]
+    counts = Counter((t.get("ts"), t.get("speaker"), t.get("text")) for t in archived_raw)
+    assert all(c == 1 for c in counts.values()), f"duplicate archived records: {counts}"
+
+
+def test_cb3b_cascade_multiset_no_loss_or_dup_across_crash_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug 3 / L2: a fixture with two BYTE-IDENTICAL (ts, speaker, text) raw
+    turns survives a cascade crash + retry with neither turn lost NOR
+    duplicated. The commit-marker design never dedups by identity, so this
+    passes; a rejected identity-dedup design would drop one of the two."""
+    sid = "sess_cb3b_cascade"
+    now = datetime.now(UTC)
+    dup_ts = now - timedelta(hours=30)
+    _seed_turn(tmp_path, sid, dup_ts, "user", "identical content")
+    _seed_turn(tmp_path, sid, dup_ts, "user", "identical content")
+    _seed_turn(tmp_path, sid, now - timedelta(hours=60), "user", "band48 content")
+    write_cursor(tmp_path, sid, _iso(now))
+
+    original_raw = [t for t in read_session(tmp_path, sid) if t.get("speaker") != "summary"]
+    original_counts = Counter(
+        (t.get("ts"), t.get("speaker"), t.get("text")) for t in original_raw
+    )
+
+    provider = _Stub()
+    monkeypatch.setattr("brain.chat.compaction.rewrite_session_atomic", _boom_rewrite)
+    with pytest.raises(RuntimeError):
+        cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    monkeypatch.undo()
+    res2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert res2.compacted is True
+
+    archived_raw = [t for t in read_archive(tmp_path, sid) if t.get("speaker") != "summary"]
+    live_raw = [t for t in read_session(tmp_path, sid) if t.get("speaker") != "summary"]
+    combined = Counter(
+        (t.get("ts"), t.get("speaker"), t.get("text")) for t in archived_raw
+    ) + Counter((t.get("ts"), t.get("speaker"), t.get("text")) for t in live_raw)
+    assert combined == original_counts, (
+        f"lossy or duplicated across crash+retry: got {combined!r}, want {original_counts!r}"
+    )
+
+
+# --------------------------------------------------------------------------- C-B4 (tier-3 eviction)
+
+
+def test_cb4a_tier3_replaced_not_accumulated(tmp_path: Path) -> None:
+    """Bug 4 (C-B4a): after a steady cascade pass, tier 3's new content derives
+    from the recompacted graduated OLD-48h section and does NOT contain the
+    old-72h content (replacement, not accumulation). Fails on pre-change code
+    (old-72h marker persists in tier 3 forever)."""
+    sid = "sess_cb4a"
+    now = datetime.now(UTC)
+    sections = {
+        "24h": {
+            "text": "I recall MARK24 from yesterday.",
+            "covers_from_ts": _iso(now - timedelta(hours=30)),
+            "covers_until_ts": _iso(now - timedelta(hours=29)),
+        },
+        "48h": {
+            "text": "I recall MARK48 from a couple days back.",
+            "covers_from_ts": _iso(now - timedelta(hours=80)),  # -> graduates to 72h
+            "covers_until_ts": _iso(now - timedelta(hours=79)),
+        },
+        "72h": {
+            "text": "I recall MARK72 from long, long ago.",
+            "covers_from_ts": _iso(now - timedelta(hours=100)),  # >=96h -> evicted
+            "covers_until_ts": _iso(now - timedelta(hours=99)),
+        },
+    }
+    _write_sectioned_summary(tmp_path, sid, sections)
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _MarkerProvider()
+    result = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert result.compacted is True
+
+    row = _summary_row(tmp_path, sid)
+    new_sections = row["compaction"]["sections"]
+    tier3_text = new_sections.get("72h", {}).get("text", "")
+    assert "MARK48" in tier3_text
+    assert "MARK72" not in tier3_text
+    assert "72h" in result.evicted_keys
+
+
+def test_cb4b_evicted_content_excluded_from_head_present_in_archive(tmp_path: Path) -> None:
+    """Bug 4 (C-B4b, behavior-preservation/position lens + eviction): content
+    whose oldest edge is aged >= the eviction boundary (96h) is EXCLUDED from
+    the installed head but PRESENT in the archive (lossless). repro_bug4-style:
+    a fixture with a 9-day-old tier-3 section. Fails on pre-change code
+    (9-day content retained in the head forever)."""
+    sid = "sess_cb4b"
+    now = datetime.now(UTC)
+    marker = "MARKSTALE9DAY"
+    sections = {
+        "72h": {
+            "text": f"I recall {marker} from long, long ago.",
+            "covers_from_ts": _iso(now - timedelta(days=9)),
+            "covers_until_ts": _iso(now - timedelta(days=8, hours=23)),
+        },
+    }
+    _write_sectioned_summary(tmp_path, sid, sections)
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _MarkerProvider()
+    result = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert result.compacted is True
+
+    row = _summary_row(tmp_path, sid)
+    installed_sections = row["compaction"]["sections"]
+    for sec in installed_sections.values():
+        assert marker not in sec.get("text", "")
+
+    archive = read_archive(tmp_path, sid)
+    archived_summaries = [a for a in archive if a.get("speaker") == "summary"]
+    assert any(marker in (a.get("text") or "") for a in archived_summaries), (
+        "the evicted section must remain recoverable from the archive"
+    )
+
+
+def test_cb4c_idempotent_rerun_same_now_is_noop(tmp_path: Path) -> None:
+    """Bug 4 (C-B4c, idempotence preserved): a cascade pass immediately re-run
+    with no new raw and no boundary crossed is a no-op (compacted=False,
+    reason='nothing_aged') — the replacement/eviction change did not turn
+    every call into a re-graduation/re-eviction."""
+    sid = "sess_cb4c"
+    now = datetime.now(UTC)
+    _seed_turn(tmp_path, sid, now - timedelta(hours=30), "user", "note recent")
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _Stub()
+    r1 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert r1.compacted is True
+
+    r2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert r2.compacted is False
+    assert r2.reason == "nothing_aged"
+
+
+def test_cb4d_docstrings_reflect_replacement_model() -> None:
+    """Bug 4 (C-B4d, docs match code): the retain-forever docstrings/comments no
+    longer say "terminal / re-compacted forever" or "leaving tiers 2/3
+    untouched", and the replacement model wording is present instead. Fails on
+    pre-change code (which contains the stale phrases)."""
+    import inspect
+
+    import brain.chat.compaction as comp
+
+    source = inspect.getsource(comp)
+    stale_phrases = [
+        "STAYS in tier 3 (terminal, re-compacted forever",
+        "a terminal, multi-input tier 3",
+        "then stays in tier 3 (terminal, re-compacted forever)",
+        "Tier 3 is a terminal, multi-input",
+        "leaving tiers 2/3 untouched",
+    ]
+    for phrase in stale_phrases:
+        assert phrase not in source, f"stale retain-forever wording still present: {phrase!r}"
+    assert "evicted" in source.lower()
+    assert "replaced" in source.lower() or "replacement" in source.lower()
+
+
+def test_cb4f_emergency_fold_evicts_stale_section(tmp_path: Path) -> None:
+    """Bug 4 / red-team CH8 (C-B4f): emergency_fold_24h (the apply_budget
+    backstop) on a row carrying an evictable (>=96h) section drops that
+    section from the installed head (present in archive). Fails on pre-change
+    code AND on a fix that only evicts in cascade_conversation."""
+    sid = "sess_cb4f"
+    now = datetime.now(UTC)
+    marker = "MARKSTALEEMFOLD"
+    sections = {
+        "72h": {
+            "text": f"I recall {marker} from long, long ago.",
+            "covers_from_ts": _iso(now - timedelta(days=9)),
+            "covers_until_ts": _iso(now - timedelta(days=8, hours=23)),
+        },
+    }
+    _write_sectioned_summary(tmp_path, sid, sections)
+    # Give the backstop some fresh raw so it has something to fold (its own
+    # early "nothing to fold" no-op guard is unrelated to eviction).
+    _seed_turn(tmp_path, sid, now - timedelta(minutes=5), "user", "fresh recent chatter")
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _Stub()
+    result = emergency_fold_24h(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert result.compacted is True
+    assert "72h" in result.evicted_keys
+
+    row = _summary_row(tmp_path, sid)
+    installed = row["compaction"]["sections"]
+    for sec in installed.values():
+        assert marker not in sec.get("text", "")
+
+    archive = read_archive(tmp_path, sid)
+    assert any(
+        marker in (a.get("text") or "") for a in archive if a.get("speaker") == "summary"
+    ), "the evicted section must remain recoverable from the archive"
+
+
+def test_cb4g_all_evicted_pass_installs_empty_row_cleanly(tmp_path: Path) -> None:
+    """Bug 4 (C-B4g, newly-reachable degenerate row): a pass that evicts the
+    only section(s) with no raw to fold installs text=""/sections={} without
+    raising; _read_sections re-reads it as {}; a subsequent pass is a clean
+    no-op."""
+    sid = "sess_cb4g"
+    now = datetime.now(UTC)
+    sections = {
+        "72h": {
+            "text": "I recall stale content from long, long ago.",
+            "covers_from_ts": _iso(now - timedelta(days=9)),
+            "covers_until_ts": _iso(now - timedelta(days=8, hours=23)),
+        },
+    }
+    _write_sectioned_summary(tmp_path, sid, sections)
+    write_cursor(tmp_path, sid, _iso(now))
+
+    provider = _MarkerProvider()
+    result = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert result.compacted is True  # eviction is a change, not a no-op
+
+    row = _summary_row(tmp_path, sid)
+    assert row["text"] == ""
+    assert row["compaction"]["sections"] == {}
+
+    reread = _read_sections(row, now)
+    assert reread == {}
+
+    result2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
+    assert result2.compacted is False
+    assert result2.reason == "nothing_aged"

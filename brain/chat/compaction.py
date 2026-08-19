@@ -25,6 +25,7 @@ Design invariants this module upholds:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -34,10 +35,12 @@ from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     acquire_compaction_lock,
     append_archive,
+    read_archive_marker,
     read_cursor,
     read_session,
     release_compaction_lock,
     rewrite_session_atomic,
+    write_archive_marker,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,35 @@ NEW MESSAGES:
 
 UPDATED MEMORY:"""
 
+# Pure re-compaction: an existing memory with no new raw this pass (a section
+# graduating into an older tier with nothing new in its band). Purpose-built
+# rather than reusing _FOLD_PROMPT with an empty transcript (that mis-wiring is
+# Bug 1: haiku correctly refuses to integrate nothing, and the refusal then gets
+# stored as the memory) or _SUMMARY_PROMPT (framed for a raw dialogue transcript,
+# not memory prose already in the persona's own voice).
+_CONDENSE_PROMPT = """Shorten {name}'s own existing first-person memory below to about
+{target_words} words, roughly {target_pct}% of its current length. "I" is {name}: keep
+the same first-person voice, tone, and phrasing already present in the memory.
+
+ACCURACY FIRST: shorten only. Do not invent, infer beyond the text, or reverse who did
+what to whom.
+
+How to shorten:
+- Preserve names of people and places, decisions, emotional beats, unresolved threads,
+  and ongoing projects.
+- Drop repetition and formatting noise, not substance.
+- Keep concrete specifics: names, numbers, what was decided and why.
+- Length: aim for about {target_words} words. That is the target, do not over-compress
+  below it, and do not pad to reach it.
+- Output plain first-person prose ONLY: begin directly with the recollection. No title,
+  no name/description/metadata fields, no frontmatter, no headers, no lists, no
+  preamble, no closing sign-off.
+
+EXISTING MEMORY:
+{prior_summary}
+
+SHORTENED MEMORY:"""
+
 # The summary's target length as a fraction of the source being summarised. This is
 # the HONEST target the prompt states (number + percent both derived from it), so it
 # is model-agnostic: a model that follows instructions faithfully lands near this
@@ -154,11 +186,18 @@ _MIN_TARGET_WORDS = 40
 # ---------------------------------------------------------------------------
 #
 # Age-band boundaries measured from ``now``. Material graduates raw→tier1→tier2→
-# tier3 by TRUE content age (oldest covered edge), then STAYS in tier 3 (terminal,
-# re-compacted forever so the oldest fades). See plan §1.3.
+# tier3 by TRUE content age (oldest covered edge); each tier is REPLACED by the
+# recompacted section from the younger tier (tier3 = recompact(old tier2)), and a
+# section whose oldest edge passes ``_AGE_EVICT`` leaves the head entirely — the
+# archive retains it, it is never re-summarised back in. See plan §1.3.
 _AGE_24H = timedelta(hours=24)
 _AGE_48H = timedelta(hours=48)
 _AGE_72H = timedelta(hours=72)
+# Eviction boundary: a section whose oldest covered edge is ≥96h leaves the head
+# (archive-only from then on). Clean 24-hour bands: 24h tier holds age [24h,48h),
+# 48h holds [48h,72h), 72h holds [72h,96h), and ≥96h evicts. See spec §Owner
+# design constraint for Bug 4.
+_AGE_EVICT = _AGE_72H + _AGE_24H
 
 # Per-tier soft compaction targets (fraction of that tier's source material).
 _FRACTION_24H = 0.60
@@ -179,7 +218,9 @@ _SECTION_72H_CHAR_CAP = int(0.20 * _SECTION_24H_CHAR_CAP)  # 2_400 at the defaul
 # read/migrated as TIER 3 with an explicit OLD-FLOOR covers_from_ts so the
 # oldest-edge classifier keeps it terminal — never reclassified "yesterday" (#82).
 # Set UNCONDITIONALLY, never falling back to covers_until_ts. See plan §1.1/§4.
-_LEGACY_AGE_FLOOR = timedelta(hours=96)  # >72h with margin
+_LEGACY_AGE_FLOOR = _AGE_72H + timedelta(hours=12)  # 84h: inside the 72h band with
+# margin, so a legacy summary lands in the head for one pass, then evicts on the
+# next daily pass (graceful one-pass fade) rather than being dropped on first sight.
 
 # Weekly session-rollover (1c-B) tuning — consulted by the supervisor daily tick.
 _WEEKLY_ROLLOVER_AGE = timedelta(days=7)
@@ -214,6 +255,30 @@ _FIRST_PERSON = re.compile(
     r"\b(i|i'?m|i'?ve|i'?ll|i'?d|me|my|mine|myself|we|our|ours|us)\b",
     re.IGNORECASE,
 )
+# D2 safe-direction backstop (Bug 1): catches the observed content-absence refusal
+# family that _REFUSAL_LEAD/_META_FRAME miss (the refusal is itself first-person,
+# e.g. "I don't have any new messages...") when a residual mis-wired/degenerate
+# prompt still reaches the model. NOT a perfect classifier — the primary guarantee
+# is the CONDENSE branch (D1) never emitting the degenerate empty-transcript
+# prompt in the first place. No unbounded ``.*`` between the "don't have/see"
+# opener and the absence-object noun: an unbounded gap would over-reject a hedged
+# real memory ("I don't have the full picture, but I remember..."). The
+# ``(?!\s+of\b)`` negative-lookahead excludes the hedge shape "I don't have any
+# memory OF the date, but I remember..." while still rejecting "I don't see any
+# existing memory content".
+_CONTENT_ABSENCE = re.compile(
+    r"^\s*(?:"
+    # "I don't have/see [any/the/no] [new/existing/actual] messages" (messages: broad),
+    # but NOT a hedge "...messages OF x, but..." (symmetric with the content/memory branch).
+    r"i\s+(?:don'?t|do\s+not)\s+(?:have|see)\s+(?:any\s+|the\s+|no\s+)?(?:new\s+|existing\s+|actual\s+)*messages?\b(?!\s+of\b)"
+    # "...content / memory [content]" -> refusal, but NOT a hedge "...memory/content OF x, but..."
+    r"|i\s+(?:don'?t|do\s+not)\s+(?:have|see)\s+(?:any\s+|the\s+|no\s+)?(?:new\s+|existing\s+|actual\s+)*(?:content|memory(?:\s+content)?)\b(?!\s+of\b)"
+    r"|i\s+notice\s+(?:that\s+)?you'?(?:ve|\s+have)\s+provided\b"
+    r"|there\s+(?:are|is)\s+no\s+(?:new\s+|existing\s+)?(?:messages?|memory|content)\b"
+    r"|(?:the\s+)?(?:input|prompt|transcript)\s+(?:is\s+empty|contains?\s+no\b)"
+    r")",
+    re.IGNORECASE,
+)
 # Below this word count a bare non-first-person output (e.g. a test stub token) is
 # too short to be a refusal essay; only longer non-first-person prose is rejected.
 _NONTRIVIAL_WORDS = 8
@@ -234,6 +299,8 @@ def _validate_fold_output(text: object) -> str | None:
     if _META_FRAME.match(s):
         return None
     if _REFUSAL_LEAD.match(s):
+        return None
+    if _CONTENT_ABSENCE.match(s):
         return None
     if len(s.split()) >= _NONTRIVIAL_WORDS and not _FIRST_PERSON.search(s):
         return None
@@ -293,10 +360,11 @@ def _coarse_span(covers_from_ts: object, covers_until_ts: object) -> str:
 
 
 def _render_sections(sections: dict) -> str:
-    """Deterministic render of the 3 sections — fixed tier1→tier2→tier3 order,
-    owner human labels, coarse ts span; NO nonce/``now()`` (byte-stable, C6)."""
+    """Deterministic render of the 3 sections — fixed OLDEST→NEWEST order
+    (tier3→tier2→tier1, the reverse of ``_SECTION_ORDER``), owner human labels,
+    coarse ts span; NO nonce/``now()`` (byte-stable, C6)."""
     parts: list[str] = []
-    for key in _SECTION_ORDER:
+    for key in reversed(_SECTION_ORDER):
         sec = sections.get(key)
         if not sec:
             continue
@@ -424,6 +492,38 @@ def _turn_identity(t: dict) -> tuple:
     a collision means two byte-identical turns in the same second, where keeping
     or dropping one is harmless."""
     return (t.get("ts"), t.get("speaker"), t.get("text"))
+
+
+def _archive_batch_key(records: list[dict], new_gen: int) -> str:
+    """A stable identity for one archive-append batch: sha256 over ``new_gen`` and
+    the ORDERED ``(ts, speaker, text)`` identity of every record — never any
+    generated fold text. Two invocations that recompute the identical batch (a
+    crash-retry over an unchanged buffer) hash to the SAME key; a later,
+    genuinely-different batch (different ``new_gen`` or different records) never
+    collides (Bug 3)."""
+    h = hashlib.sha256()
+    h.update(str(new_gen).encode("utf-8"))
+    for r in records:
+        h.update(repr(_turn_identity(r)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _archive_once(persona_dir, session_id: str, records: list[dict], *, new_gen: int) -> int:
+    """Archive ``records`` exactly once for this batch, proven by a durable commit
+    marker (Bug 3). Skips the append ONLY when the marker key matches — i.e. the
+    marker PROVES a completed prior append of this exact batch — never by
+    inferring from turn identity, so two byte-identical raw turns are always both
+    archived (or both re-archived on a true partial-write retry), never silently
+    collapsed (L2). Returns the byte count written, or ``1`` as a skip sentinel
+    (a proven-already-archived batch; still ``> 0`` for the caller's write-verify)."""
+    if not records:
+        return 0
+    key = _archive_batch_key(records, new_gen)
+    if read_archive_marker(persona_dir, session_id) == key:
+        return 1  # proven already archived this pass -> skip append (no dup, no loss)
+    n = append_archive(persona_dir, session_id, records)
+    write_archive_marker(persona_dir, session_id, key)
+    return n
 
 
 def _summary_text(row: dict | None) -> str:
@@ -598,7 +698,7 @@ def compact_conversation(
         if fold_existing_summary and existing_summary is not None:
             archive_records.append(existing_summary)
         try:
-            written = append_archive(persona_dir, session_id, archive_records)
+            written = _archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
             if written <= 0 and archive_records:
                 raise OSError("archive append wrote zero bytes")
         except Exception:
@@ -645,7 +745,10 @@ def compact_conversation(
 
 
 # ---------------------------------------------------------------------------
-# Cascade pass — true age-gated graduation with a terminal, multi-input tier 3
+# Cascade pass — true age-gated graduation with tier-by-tier REPLACEMENT
+# (raw→24h→48h→72h→evicted; each tier is replaced by the recompacted section
+# from the younger tier, and a section past the eviction boundary leaves the
+# head for good — the archive retains it)
 # ---------------------------------------------------------------------------
 
 
@@ -670,6 +773,7 @@ class CascadeResult:
     new_gen: int
     reason: str = ""
     tiers: dict[str, TierRecord] = field(default_factory=dict)
+    evicted_keys: list[str] = field(default_factory=list)
 
 
 def _bucket_of_age(age: timedelta) -> str:
@@ -725,6 +829,13 @@ def _fold_into_section(
     (or provider error) the fallback is the SAME lossless-leaning join truncated to
     the cap — never dropping either input (plan §1.3/§1.4 cascade fallback).
 
+    Three prompt branches (Bug 1): a non-empty prior WITH new raw folds them
+    together (``_FOLD_PROMPT``); a non-empty prior with NO new raw (the pure
+    graduation/re-compaction case) is condensed on its own (``_CONDENSE_PROMPT``)
+    rather than mis-wired into ``_FOLD_PROMPT`` with an empty transcript (which
+    the compaction model correctly refuses, storing the refusal as the memory);
+    no prior falls back to a plain summarise (``_SUMMARY_PROMPT``).
+
     Returns ``(section_dict | None, fell_soft, validated)``. ``None`` when the tier
     has no inputs at all (empty band).
     """
@@ -740,12 +851,20 @@ def _fold_into_section(
     if not prior_joined and not raw_turns:
         return None, False, True
 
+    # source_words: when raw_turns is empty (the CONDENSE case) this is exactly
+    # _word_count(prior_joined), so target_words below is the same computation
+    # the CONDENSE prompt is specified against (max(floor, prior_words*fraction)).
     source_words = _word_count(prior_joined) + sum(_word_count(r.get("text", "")) for r in raw_turns)
     target_words = max(_MIN_TARGET_WORDS, int(source_words * fraction))
     target_pct = round(fraction * 100)
-    if prior_joined:
+    if prior_joined and raw_turns:
         prompt = _FOLD_PROMPT.format(
             name=persona_name, prior_summary=prior_joined, transcript=raw_transcript,
+            target_words=target_words, target_pct=target_pct,
+        )
+    elif prior_joined:
+        prompt = _CONDENSE_PROMPT.format(
+            name=persona_name, prior_summary=prior_joined,
             target_words=target_words, target_pct=target_pct,
         )
     else:
@@ -816,7 +935,7 @@ def _install_cascade_row(
         archive_records.append(existing_summary)
     if archive_records:
         try:
-            written = append_archive(persona_dir, session_id, archive_records)
+            written = _archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
             if written <= 0:
                 raise OSError("archive append wrote zero bytes")
         except Exception:
@@ -852,10 +971,13 @@ def cascade_conversation(
 ) -> CascadeResult:
     """One age-gated GRADUATION pass over the sectioned summary row (plan §1.3).
 
-    Material graduates raw→tier1→tier2→tier3 by TRUE content age (oldest covered
-    edge) and then stays in tier 3 (terminal, re-compacted forever). Never
-    co-folds the prior tier1 section with fresh raw. All three tiers are computed
-    from the pre-pass snapshot and installed in ONE atomic rewrite (C17).
+    Material graduates raw→24h→48h→72h→evicted by TRUE content age (oldest
+    covered edge). Each tier is REPLACED by the recompacted section from the
+    younger tier (tier3 = recompact(old tier2)); a section whose oldest edge has
+    passed ``_AGE_EVICT`` leaves the head entirely (the archive retains it, it is
+    never re-summarised back in). Never co-folds the prior tier1 section with
+    fresh raw. All three tiers are computed from the pre-pass snapshot and
+    installed in ONE atomic rewrite (C17).
     """
     from pathlib import Path
 
@@ -890,28 +1012,44 @@ def cascade_conversation(
             ts = _parse_ts(t.get("ts"))
             raw_groups[_bucket_of_age(now - ts)].append(t)
 
-        # Age-classify each existing section by its OLDEST covered edge.
+        # Age-classify each existing section by its OLDEST covered edge. A section
+        # whose oldest edge has passed the eviction boundary is EVICTED (dropped
+        # from the head entirely, never classified into a tier) rather than
+        # bucketed — the replacement model (Bug 4): each tier is replaced by the
+        # recompacted younger tier, and content past the boundary leaves the head
+        # for good (the archive-of-superseded-summary step below still retains it).
         existing_sections = _read_sections(existing_summary, now)
         classified: dict[str, list[dict]] = {"24h": [], "48h": [], "72h": []}
         classified_keys: dict[str, list[str]] = {"24h": [], "48h": [], "72h": []}
         needs_graduate = False
+        evicted_keys: list[str] = []
         for key, sec in existing_sections.items():
             cf = _parse_ts(sec.get("covers_from_ts"))
-            bucket = _bucket_of_age(now - cf) if cf else "72h"
+            if cf is not None:
+                age = now - cf
+                if age >= _AGE_EVICT:
+                    evicted_keys.append(key)
+                    needs_graduate = True  # an eviction is a change, not a no-op
+                    continue
+                bucket = _bucket_of_age(age)
+            else:
+                bucket = "72h"
             classified[bucket].append(sec)
             classified_keys[bucket].append(key)
             if bucket != key:
                 needs_graduate = True
 
-        # Idempotence: nothing newly crossed AND no section needs to graduate → no-op.
+        # Idempotence: nothing newly crossed AND no section needs to graduate/evict
+        # → no-op.
         if not removable and not needs_graduate:
             return CascadeResult(
                 False, 0, _summary_gen(existing_summary), reason="nothing_aged"
             )
 
-        # Assemble oldest-first (72 → 48 → 24). Tier 3 is a terminal, multi-input
-        # fold: the persisting tier-3 section + the newly-graduated tier-2 section
-        # (both classify into the 72h band) + any raw crossing 72h.
+        # Assemble oldest-first (72 → 48 → 24). Tier 3 is REPLACED each pass: the
+        # newly-graduated tier-2 section (now classifying into the 72h band) + any
+        # raw crossing 72h; the old tier-3 section evicts once its oldest edge has
+        # passed ``_AGE_EVICT`` (dropped from the head, retained in the archive).
         persona_name = Path(persona_dir).name
         tiers_spec = [
             ("72h", _FRACTION_72H, _SECTION_72H_CHAR_CAP),
@@ -947,10 +1085,13 @@ def cascade_conversation(
                 False, 0, _summary_gen(existing_summary), reason="archive_failed"
             )
         logger.info(
-            "cascade: session=%s gen=%d compacted_n=%d tiers=%s",
-            session_id, new_gen, len(removable), sorted(new_sections),
+            "cascade: session=%s gen=%d compacted_n=%d tiers=%s evicted=%d",
+            session_id, new_gen, len(removable), sorted(new_sections), len(evicted_keys),
         )
-        return CascadeResult(True, len(removable), new_gen, reason="ok", tiers=records)
+        return CascadeResult(
+            True, len(removable), new_gen, reason="ok", tiers=records,
+            evicted_keys=evicted_keys,
+        )
     finally:
         release_compaction_lock(persona_dir, session_id)
 
@@ -967,9 +1108,12 @@ def emergency_fold_24h(
     """The apply_budget backstop: a 24h-ONLY emergency fold on the sectioned row.
 
     Folds any extracted raw beyond the protected tail (``older_than=0``) into the
-    24h tier (0.60, capped), leaving tiers 2/3 untouched — it bounds the live head
-    in-turn without running the full age-gated re-bucket (that stays on the daily
-    tick). Writes the sectioned row, holds the lock, archives-before-rewrite (C22).
+    24h tier (0.60, capped), re-folding tier 1 and evicting any tier-2/3 section
+    whose oldest edge has passed the eviction boundary (``_AGE_EVICT``) — the
+    superseded section is still archived, so eviction is lossless — otherwise
+    leaving tiers 2/3 unchanged. It bounds the live head in-turn without running
+    the full age-gated re-bucket (that stays on the daily tick). Writes the
+    sectioned row, holds the lock, archives-before-rewrite (C22).
     """
     from pathlib import Path
 
@@ -1006,7 +1150,19 @@ def emergency_fold_24h(
             persona_name, sec24_inputs, removable, _FRACTION_24H, _SECTION_24H_CHAR_CAP,
             provider, now=now,
         )
-        new_sections: dict[str, dict] = dict(existing_sections)
+        # Evict any section (tier 2/3 or otherwise) whose oldest edge has passed
+        # the boundary — the backstop never runs the full re-bucket, so without
+        # this an evictable ≥96h section would sit in the head forever under a
+        # backstop-dominated session (Bug 4 / red-team CH8). No extra fold: the
+        # superseded section is still archived by _install_cascade_row below.
+        evicted_keys: list[str] = []
+        new_sections: dict[str, dict] = {}
+        for key, sec in existing_sections.items():
+            cf = _parse_ts(sec.get("covers_from_ts"))
+            if cf is not None and (now - cf) >= _AGE_EVICT:
+                evicted_keys.append(key)
+                continue
+            new_sections[key] = sec
         if new24 is not None:
             new_sections["24h"] = new24
 
@@ -1019,6 +1175,12 @@ def emergency_fold_24h(
             return CascadeResult(
                 False, 0, _summary_gen(existing_summary), reason="archive_failed"
             )
-        return CascadeResult(True, len(removable), new_gen, reason="ok")
+        logger.info(
+            "cascade: emergency_fold session=%s gen=%d compacted_n=%d evicted=%d",
+            session_id, new_gen, len(removable), len(evicted_keys),
+        )
+        return CascadeResult(
+            True, len(removable), new_gen, reason="ok", evicted_keys=evicted_keys
+        )
     finally:
         release_compaction_lock(persona_dir, session_id)

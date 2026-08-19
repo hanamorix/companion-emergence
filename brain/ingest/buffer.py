@@ -435,6 +435,52 @@ def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
     return out
 
 
+# --- Archive commit marker (Bug 3: idempotent archive-under-crash-retry) -----
+# A durable sidecar proving a specific archive-append batch completed, so a
+# crash-retry compaction pass can skip a redundant re-append ONLY when the
+# marker PROVES the identical batch already landed — never by inferring from
+# turn identity (that risks silently dropping a byte-identical duplicate turn).
+# ``append_archive`` itself is left untouched: its append-only/never-dedup
+# contract (that ``read_archive`` relies on) stays intact. A non-``.jsonl`` name
+# so the session/segment globs never pick it up.
+
+
+def _archive_marker_path(persona_dir: Path, session_id: str) -> Path:
+    _validate_session_id(session_id)
+    return _archived_conversations_dir(persona_dir) / f"{session_id}.archived"
+
+
+def read_archive_marker(persona_dir: Path, session_id: str) -> str | None:
+    """Return the last completed archive-batch key for this session, or None
+    when the sidecar is missing, empty, or unreadable."""
+    path = _archive_marker_path(persona_dir, session_id)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
+    """Atomically write the archive commit-marker (temp + os.replace + fsync),
+    mirroring ``write_cursor`` but WITH an fsync — this marker must be durable
+    across a crash landing immediately after the archive append's own fsync."""
+    path = _archive_marker_path(persona_dir, session_id)
+    is_new = not path.exists()
+    tmp = path.with_suffix(".archived.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(key)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    if is_new:
+        # fsync the containing dir so the new sidecar's directory entry is durable
+        # (crash-mid-create), matching append_archive's new-segment durability.
+        _fsync_dir(path.parent)
+
+
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
     """Resolve <persona>/active_conversations/<session_id>.compacting.
 

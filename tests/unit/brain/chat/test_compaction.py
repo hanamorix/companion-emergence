@@ -10,18 +10,33 @@ Maps to changes/timed-conversation-compaction/1.5-criteria.md:
   C7   cross-readers never re-ingest / mis-count a summary row
   C8   cursor guard: ts<=cursor removable; None cursor -> no-op
   C12  stale lock reaped; fresh lock skips
+
+Also maps to changes/compaction-defects-fix/1.5-criteria.md:
+  C1c   fold-output validator rejects the content-absence refusal family,
+        accepts hedged-negation real memories (Bug 1 / D2)
+  C-B2  _render_sections emits oldest->newest; _SECTION_ORDER unchanged (Bug 2)
+  C-B3  compact_conversation archive-append is idempotent under a crash-retry
+        (Bug 3, commit-marker design)
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.bridge.chat import ChatMessage
 from brain.chat.budget import apply_budget
-from brain.chat.compaction import compact_conversation
+from brain.chat.compaction import (
+    _SECTION_ORDER,
+    _render_sections,
+    _validate_fold_output,
+    compact_conversation,
+)
 from brain.chat.engine import _buffer_turns_to_messages
 from brain.ingest.buffer import (
     _compacting_lock_path,
@@ -430,3 +445,187 @@ def test_c7_session_hours_skips_summary(tmp_path: Path) -> None:
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
     stamps = _entry_timestamps(buf)
     assert len(stamps) == 3  # only the 3 real turns counted
+
+
+# --------------------------------------------------------------------------- C1c
+def test_c1c_validator_rejects_content_absence_family_accepts_hedges() -> None:
+    """Bug 1 / D2: _validate_fold_output rejects the OBSERVED content-absence
+    refusal family (a mis-wired-prompt refusal that is itself first-person, so
+    the pre-existing _REFUSAL_LEAD/_META_FRAME/first-person checks miss it) while
+    ACCEPTING an expanded control set of genuine first-person memories, including
+    four hedged-negation recollections a naive "don't have/see...*" regex would
+    over-reject."""
+    reject_family = [
+        "I don't have any new messages to integrate right now.",
+        "I don't see any new messages in this conversation.",
+        "I don't see any existing memory content to work with.",
+        "I don't have any content to update at this time.",
+        "I notice you've provided the existing memory but there are no new "
+        "messages to fold in.",
+    ]
+    accept_controls = [
+        # Four hedged-negation real memories (F2 + re-review #1 guard):
+        "I don't have the full picture, but I remember the messages we "
+        "exchanged about the project timeline.",
+        "I don't have any memory of the exact date, but I remember we "
+        "discussed the budget.",
+        "I don't remember the exact number, but Bob and I settled the "
+        "cursor-guard question.",
+        "I recall that we didn't have time to finish the eviction design.",
+        # Plain genuine first-person memories (no absence phrasing at all):
+        "I remember we talked about the weekend plans and decided to meet on "
+        "Saturday.",
+        "I recall Bob mentioning a new project idea and feeling excited "
+        "about it.",
+        "I remember the conversation about the budget going long, and we "
+        "agreed to revisit it next week.",
+    ]
+    assert len(accept_controls) >= 7
+
+    for s in reject_family:
+        assert _validate_fold_output(s) is None, f"expected reject, got accept: {s!r}"
+    for s in accept_controls:
+        assert _validate_fold_output(s) == s, f"expected accept, got reject: {s!r}"
+
+    # H6 (two-sided fail-shown): two of the reject-family strings are
+    # first-person and match neither _META_FRAME nor _REFUSAL_LEAD, so WITHOUT
+    # _CONTENT_ABSENCE every other check in _validate_fold_output would have
+    # accepted them (i.e. this criterion fails on pre-change code, which lacked
+    # _CONTENT_ABSENCE).
+    from brain.chat.compaction import _FIRST_PERSON, _META_FRAME, _REFUSAL_LEAD
+
+    for s in (
+        "I don't see any new messages in this conversation.",
+        "I notice you've provided the existing memory but there are no new "
+        "messages to fold in.",
+    ):
+        assert _META_FRAME.match(s) is None
+        assert _REFUSAL_LEAD.match(s) is None
+        assert _FIRST_PERSON.search(s) is not None
+
+
+# --------------------------------------------------------------------------- C-B2
+def test_cb2_render_sections_oldest_to_newest() -> None:
+    """Bug 2: _render_sections emits oldest->newest (72h, 48h, 24h), the reverse
+    of pre-change code (which iterated _SECTION_ORDER = ("24h","48h","72h")
+    directly, emitting newest-first). _SECTION_ORDER itself is unchanged (tier
+    identity in _read_sections / cascade classification is untouched)."""
+    now = datetime.now(UTC)
+    sections = {
+        "24h": {
+            "text": "MARKNEWEST recent chatter.",
+            "covers_from_ts": _iso(now - timedelta(hours=30)),
+            "covers_until_ts": _iso(now - timedelta(hours=29)),
+        },
+        "48h": {
+            "text": "MARKMIDDLE day-before chatter.",
+            "covers_from_ts": _iso(now - timedelta(hours=60)),
+            "covers_until_ts": _iso(now - timedelta(hours=59)),
+        },
+        "72h": {
+            "text": "MARKOLDEST a-few-days-ago chatter.",
+            "covers_from_ts": _iso(now - timedelta(hours=90)),
+            "covers_until_ts": _iso(now - timedelta(hours=89)),
+        },
+    }
+    rendered = _render_sections(sections)
+    i_oldest = rendered.index("MARKOLDEST")
+    i_middle = rendered.index("MARKMIDDLE")
+    i_newest = rendered.index("MARKNEWEST")
+    assert i_oldest < i_middle < i_newest, (
+        f"expected oldest->newest order, got: {rendered!r}"
+    )
+    # H6: the pre-change order (_SECTION_ORDER as-is) would put MARKNEWEST
+    # first — the direct opposite of the assertion above.
+    assert not (i_newest < i_middle < i_oldest)
+
+    assert _SECTION_ORDER == ("24h", "48h", "72h")
+
+
+def _boom_rewrite(*a, **kw):
+    raise RuntimeError("simulated crash before the atomic replace lands")
+
+
+# --------------------------------------------------------------------------- C-B3
+def test_cb3_compact_conversation_crash_retry_no_duplicate_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug 3: a crash AFTER the archive append + commit-marker write but BEFORE
+    the atomic buffer rewrite (the diagnosed window) must not duplicate archived
+    records when the same compaction is retried over the unchanged buffer."""
+    sid = "sess_cb3"
+    base = datetime.now(UTC) - timedelta(hours=10)
+    _seed(tmp_path, sid, 60, base=base)
+    write_cursor(tmp_path, sid, _iso(datetime.now(UTC)))
+    now = datetime.now(UTC)
+
+    monkeypatch.setattr("brain.chat.compaction.rewrite_session_atomic", _boom_rewrite)
+    with pytest.raises(RuntimeError):
+        compact_conversation(
+            tmp_path, sid, older_than=timedelta(hours=1),
+            fold_existing_summary=True, provider=_StubProvider("S1"),
+            min_keep_tail=40, now=now,
+        )
+
+    # "Process recovers": restore the real rewrite and retry over the SAME
+    # unchanged buffer (nothing rewrote, so the same batch recomputes).
+    monkeypatch.undo()
+    res2 = compact_conversation(
+        tmp_path, sid, older_than=timedelta(hours=1),
+        fold_existing_summary=True, provider=_StubProvider("S1"),
+        min_keep_tail=40, now=now,
+    )
+    assert res2.compacted is True
+
+    archived_raw = [t for t in read_archive(tmp_path, sid) if t.get("speaker") != "summary"]
+    counts = Counter((t.get("ts"), t.get("speaker"), t.get("text")) for t in archived_raw)
+    assert all(c == 1 for c in counts.values()), f"duplicate archived records: {counts}"
+
+
+def test_cb3b_multiset_no_loss_or_dup_across_crash_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug 3 / L2: a fixture with two BYTE-IDENTICAL (ts, speaker, text) raw
+    turns must survive a crash + retry with neither turn lost NOR duplicated —
+    archived + retained (as a multiset) must equal the original exactly. Guards
+    against the rejected identity-dedup design, which could silently collapse
+    one of the two identical turns."""
+    sid = "sess_cb3b"
+    base = datetime.now(UTC) - timedelta(hours=10)
+    dup_ts = _iso(base)
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "identical content", "ts": dup_ts})
+    ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                           "text": "identical content", "ts": dup_ts})
+    tss = _seed(tmp_path, sid, 40, base=base + timedelta(minutes=1))
+    write_cursor(tmp_path, sid, tss[-1])
+    now = datetime.now(UTC)
+
+    original_raw = [t for t in read_session(tmp_path, sid) if t.get("speaker") != "summary"]
+    original_counts = Counter(
+        (t.get("ts"), t.get("speaker"), t.get("text")) for t in original_raw
+    )
+
+    monkeypatch.setattr("brain.chat.compaction.rewrite_session_atomic", _boom_rewrite)
+    with pytest.raises(RuntimeError):
+        compact_conversation(
+            tmp_path, sid, older_than=timedelta(hours=1),
+            fold_existing_summary=True, provider=_StubProvider("S1"),
+            min_keep_tail=5, now=now,
+        )
+    monkeypatch.undo()
+    res2 = compact_conversation(
+        tmp_path, sid, older_than=timedelta(hours=1),
+        fold_existing_summary=True, provider=_StubProvider("S1"),
+        min_keep_tail=5, now=now,
+    )
+    assert res2.compacted is True
+
+    archived_raw = [t for t in read_archive(tmp_path, sid) if t.get("speaker") != "summary"]
+    retained_raw = [t for t in read_session(tmp_path, sid) if t.get("speaker") != "summary"]
+    combined = Counter(
+        (t.get("ts"), t.get("speaker"), t.get("text")) for t in archived_raw
+    ) + Counter((t.get("ts"), t.get("speaker"), t.get("text")) for t in retained_raw)
+    assert combined == original_counts, (
+        f"lossy or duplicated across crash+retry: got {combined!r}, want {original_counts!r}"
+    )
