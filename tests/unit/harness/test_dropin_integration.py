@@ -87,7 +87,6 @@ def test_c7_real_brain_negative_shadowed_source_exits_loud(tmp_path: Path) -> No
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(src)
-    env.pop("CE_DROPIN_EXPECT_ROOT", None)
     proc = subprocess.run(
         [str(build.python), "-c", "import brain"],
         cwd=str(tmp_path),

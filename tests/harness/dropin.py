@@ -23,8 +23,10 @@ This module makes "drop in and run" literal:
      prompt process is itself running under the sandbox venv (the check the original incident
      lacked), raising :class:`DropinMismatch` loudly at startup before any child is spawned.
    - A venv startup hook (``.pth`` + guard module) installed by :func:`ingest_version` into the
-     sandbox venv's ``site-packages``. ``site.py`` runs it at every non-``-S`` interpreter start,
-     so it fires for the MCP child and the prompt process alike, hard-exiting a mis-wired process.
+     sandbox venv's ``site-packages``. ``site.py`` runs it at every non-``-S`` interpreter start; it
+     registers a ``sys.meta_path`` finder that validates ``brain`` when ``brain`` is imported (after
+     all ``.pth`` path setup, so it is independent of ``.pth`` ordering), hard-exiting a mis-wired
+     process. It fires for the MCP child and the prompt process alike.
 
 This module composes with :mod:`tests.harness.sandbox` (which isolates STATE dirs); the two are
 orthogonal — sandbox isolates state, drop-in ingestion isolates code. It imports only the standard
@@ -56,7 +58,6 @@ _DEPS = ("auto", "none")
 _VENV_DIRNAME = ".dropin-venv"
 _HOOK_MODULE = "_ce_dropin_guard.py"
 _HOOK_PTH = "_ce_dropin_guard.pth"
-_EXPECT_ROOT_ENV = "CE_DROPIN_EXPECT_ROOT"
 
 # Files/dirs never copied into the sandbox copy: VCS metadata, caches, any pre-existing venv, the
 # drop-in venv itself, and the guarded-change stage folder.
@@ -102,8 +103,11 @@ class DropinBuild:
 
 
 # --- guard: shared, side-effect-free containment logic -------------------------------------------
-# These three helpers are also emitted VERBATIM (via inspect.getsource) into the generated venv hook,
-# so the containment logic has a single source of truth. They import only the standard library.
+# ``_is_under`` and the ``_DropinImportGuard`` finder below are emitted VERBATIM (via
+# inspect.getsource) into the generated venv hook, so the containment logic has a single source of
+# truth. They import only the standard library. ``_resolve_module_origin`` is used only by the
+# explicit prompt-side call (which runs after interpreter startup, when import resolution is final);
+# the venv hook does NOT resolve at startup (see ``_DropinImportGuard`` for why).
 
 
 def _resolve_module_origin(module: str = "brain") -> Path | None:
@@ -132,25 +136,64 @@ def _is_under(path: Path, root: Path) -> bool:
     return rp == rr or rp.startswith(rr + os.sep)
 
 
-def _guard_or_die(expect_root: str, module: str = "brain") -> None:
-    """Containment guard body for the generated venv startup hook.
+class _DropinImportGuard:
+    """A ``sys.meta_path`` finder that validates ``brain`` resolves under the sandbox copy AT IMPORT.
 
-    Resolves ``module``'s origin; if it is unresolvable or resolves OUTSIDE ``expect_root``, writes a
-    loud operator-facing diagnostic to ``sys.stderr`` and hard-exits with ``os._exit(70)``. A hard
-    exit is required because a raise inside a ``.pth`` import is swallowed by ``site.py``, so a mere
-    raise would not actually stop a mis-wired process. Honors the ``CE_DROPIN_EXPECT_ROOT`` environment
-    override when set, letting a test repoint the expected root without regenerating the hook.
+    The generated venv hook installs one of these at interpreter startup. Crucially it does NOT resolve
+    ``brain`` during ``.pth`` processing: ``site.py`` runs ``.pth`` files in filename-sorted order, and
+    an editable install (``uv pip install -e``) adds the copy to ``sys.path`` via its OWN ``.pth`` (e.g.
+    ``_editable_impl_*.pth``). Our hook's ``.pth`` can sort BEFORE that one, so a startup-time
+    ``find_spec("brain")`` would see an incomplete ``sys.path``, resolve nothing, and hard-exit on a
+    correctly-wired run. Instead this finder validates when ``brain`` is actually imported — after
+    ``site.py`` has finished all path setup — making the check independent of ``.pth`` ordering.
+
+    Registered at the FRONT of ``sys.meta_path``. On an ``import brain`` it consults every OTHER finder
+    to obtain the real spec, then checks the resolved origin is under ``expect_root``. If the origin is
+    outside the copy, unresolvable, or a ``None``-origin namespace package, it writes a loud diagnostic
+    and hard-exits with ``os._exit(70)`` (a raise here would surface only as an ``ImportError`` a caller
+    could swallow); otherwise it returns the genuine spec so the import proceeds normally. Only the
+    top-level ``brain`` is intercepted: ``brain.mcp_server`` lives inside the same package dir, so once
+    ``brain`` is validated its submodules are covered.
     """
-    expect = os.environ.get("CE_DROPIN_EXPECT_ROOT") or expect_root
-    origin = _resolve_module_origin(module)
-    if origin is None or not _is_under(origin, Path(expect)):
-        sys.stderr.write(
-            "ce-dropin guard: this process resolved the package "
-            f"{module!r} to {origin!s}, which is NOT under the expected sandbox copy "
-            f"{expect!s}. This is a split-brain drop-in; refusing to start. Exiting 70.\n"
-        )
-        sys.stderr.flush()
-        os._exit(70)
+
+    def __init__(self, expect_root: str, module: str = "brain") -> None:
+        self._expect = expect_root
+        self._module = module
+
+    def find_spec(self, fullname, path=None, target=None):  # noqa: ANN001,ANN201 — import-protocol sig
+        if fullname != self._module:
+            return None
+        for finder in list(sys.meta_path):
+            if finder is self:
+                continue
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            try:
+                spec = find(fullname, path, target)
+            except Exception:  # noqa: BLE001 — a broken finder must not mask the guard; try the next
+                spec = None
+            if spec is not None:
+                origin = getattr(spec, "origin", None)
+                if origin is None or not _is_under(Path(origin), Path(self._expect)):
+                    sys.stderr.write(
+                        "ce-dropin guard: this process resolved the package "
+                        f"{fullname!r} to {origin!s}, which is NOT under the expected sandbox copy "
+                        f"{self._expect!s}. This is a split-brain drop-in; refusing to start. "
+                        "Exiting 70.\n"
+                    )
+                    sys.stderr.flush()
+                    os._exit(70)
+                return spec
+        return None
+
+
+def _install_import_guard(expect_root: str, module: str = "brain") -> None:
+    """Register a :class:`_DropinImportGuard` at the front of ``sys.meta_path`` (idempotent)."""
+    for existing in sys.meta_path:
+        if type(existing).__name__ == "_DropinImportGuard":
+            return
+    sys.meta_path.insert(0, _DropinImportGuard(expect_root, module))
 
 
 def assert_brain_under_dropin(build: DropinBuild, *, module: str = "brain") -> None:
@@ -365,9 +408,11 @@ def _hook_source(expect_root: Path) -> str:
     """Generate the standalone ``_ce_dropin_guard.py`` text for a venv with baked ``expect_root``.
 
     The hook is a self-contained, stdlib-only module (the sandbox venv has no harness code installed).
-    It embeds the containment helpers VERBATIM (via ``inspect.getsource``) so the guard logic has one
-    source of truth, and ends with a top-level ``_guard_or_die(<abs expect_root>)`` call that runs at
-    interpreter startup when ``site.py`` processes the companion ``.pth``.
+    It embeds ``_is_under`` and the ``_DropinImportGuard`` finder VERBATIM (via ``inspect.getsource``)
+    so the guard logic has one source of truth, and ends with a top-level ``_install_import_guard(<abs
+    expect_root>)`` call. That runs at interpreter startup when ``site.py`` processes the companion
+    ``.pth``, but only REGISTERS the finder; the containment check itself fires later, when ``brain`` is
+    imported (after all ``.pth`` path setup), so it is independent of ``.pth`` processing order.
     """
     root_literal = repr(os.fspath(expect_root))
     body = "\n".join(
@@ -375,16 +420,15 @@ def _hook_source(expect_root: Path) -> str:
             '"""Generated harness startup hook. Do not edit — installed by tests.harness.dropin."""',
             "from __future__ import annotations",
             "",
-            "import importlib.util",
             "import os",
             "import sys",
             "from pathlib import Path",
             "",
-            inspect.getsource(_resolve_module_origin),
             inspect.getsource(_is_under),
-            inspect.getsource(_guard_or_die),
+            inspect.getsource(_DropinImportGuard),
+            inspect.getsource(_install_import_guard),
             "",
-            f"_guard_or_die({root_literal}, 'brain')",
+            f"_install_import_guard({root_literal}, 'brain')",
             "",
         ]
     )

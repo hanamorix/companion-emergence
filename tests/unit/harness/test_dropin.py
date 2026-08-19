@@ -95,9 +95,7 @@ def _run(argv: list[str], *, cwd: Path, pythonpath: Path) -> subprocess.Complete
 def _clean_env() -> dict[str, str]:
     import os
 
-    env = dict(os.environ)
-    env.pop("CE_DROPIN_EXPECT_ROOT", None)  # never let an outer override leak into a subprocess test
-    return env
+    return dict(os.environ)
 
 
 # --- C1: copy independence -----------------------------------------------------------------------
@@ -274,8 +272,19 @@ def _build_with_hook(tmp_path: Path, name: str = "dest") -> DropinBuild:
 
 def test_c4b_hook_fires_and_passes_when_brain_under_copy(tmp_path: Path) -> None:
     build = _build_with_hook(tmp_path)
+    # Non-vacuous positive (F4): assert the hook module actually loaded at startup AND registered its
+    # meta-path finder, THEN import brain (which resolves under the copy, so the finder passes). A bare
+    # `print('ok')` would exit 0 even with NO hook installed, proving nothing.
+    code = (
+        "import sys;"
+        "assert '_ce_dropin_guard' in sys.modules, 'hook module not loaded at startup';"
+        "assert any(type(f).__name__ == '_DropinImportGuard' for f in sys.meta_path),"
+        " 'guard finder not registered';"
+        "import brain;"
+        "print('ok')"
+    )
     proc = _run(
-        [str(build.python), "-c", "print('ok')"],
+        [str(build.python), "-c", code],
         cwd=_neutral_cwd(tmp_path),
         pythonpath=build.repo,  # brain resolves under the expected root
     )
@@ -286,14 +295,39 @@ def test_c4b_hook_fires_and_passes_when_brain_under_copy(tmp_path: Path) -> None
 def test_c5b_hook_exits_70_when_brain_outside_copy(tmp_path: Path) -> None:
     build = _build_with_hook(tmp_path)
     outside = _make_fakebrain(tmp_path / "outside")  # brain shadowed from OUTSIDE the expected root
+    # The guard validates at IMPORT time, so the child must actually import brain to trip it.
     proc = _run(
-        [str(build.python), "-c", "print('should-not-print')"],
+        [str(build.python), "-c", "import brain; print('should-not-print')"],
         cwd=_neutral_cwd(tmp_path),
         pythonpath=outside,
     )
     assert proc.returncode == 70, (proc.returncode, proc.stdout, proc.stderr)
     assert "ce-dropin guard" in proc.stderr
-    assert "should-not-print" not in proc.stdout  # user code never ran
+    assert "should-not-print" not in proc.stdout  # exited before the import completed
+
+
+def test_hook_validates_after_late_sorting_path_pth(tmp_path: Path) -> None:
+    """Regression for the ``.pth`` ordering bug (stage-6 red-team F2, hit live by C7).
+
+    An editable install (``uv pip install -e``) makes ``brain`` reachable via its OWN path ``.pth``
+    (e.g. ``_editable_impl_*.pth``), which can sort AFTER ``_ce_dropin_guard.pth``. A guard that
+    resolved ``brain`` at ``.pth``-processing time would see an incomplete ``sys.path`` and hard-exit a
+    correctly-wired run. The finder validates at IMPORT time (after all ``.pth`` setup), so ``brain``
+    reachable ONLY through a late-sorting path ``.pth`` — pointing UNDER the copy — still passes.
+    """
+    build = _build_with_hook(tmp_path)
+    purelib = dropin_mod._venv_purelib(build.python)
+    # A path .pth that sorts AFTER the guard's .pth ('z' > '_') and puts the copy (which contains
+    # brain/) on sys.path. brain is reachable ONLY through this late .pth (no PYTHONPATH, neutral cwd).
+    (purelib / "zzz_latepath.pth").write_text(f"{build.repo}\n", encoding="utf-8")
+    proc = _run(
+        [str(build.python), "-c", "import brain; print(brain.__file__); print('ok')"],
+        cwd=_neutral_cwd(tmp_path),
+        pythonpath=_neutral_cwd(tmp_path),  # empty dir: brain NOT reachable via PYTHONPATH
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "ok" in proc.stdout
+    assert str(build.repo.resolve()) in proc.stdout  # brain resolved from under the copy
 
 
 # --- C4c: no tool name in the shipped guard or the generated hook --------------------------------
