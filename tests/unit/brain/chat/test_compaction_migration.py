@@ -304,6 +304,8 @@ def test_cm12_transient_noop_withholds_marker(tmp_path: Path, monkeypatch, trans
 # ---------------------------------------------------------------------------
 
 from brain.chat.compaction import (  # noqa: E402
+    _AGE_72H,
+    _AGE_EVICT,
     _LEGACY_AGE_FLOOR,
     _read_sections,
     cascade_conversation,
@@ -459,3 +461,33 @@ def test_c12_faildemo_covers_until_would_mislabel_tier1(tmp_path: Path) -> None:
     cf = datetime.fromisoformat(sections["72h"]["covers_from_ts"])
     # The broken mapping would put covers_from within minutes of now (age ~0 → tier1).
     assert (now - cf) >= timedelta(hours=72), "covers_from must be the >72h old-floor, not a recent value"
+
+
+# --------------------------------------------------------------------- C-B4e
+def test_cb4e_migration_legacy_floor_lands_inside_72h_band(tmp_path: Path) -> None:
+    """Bug 4 / red-team F3 (C-B4e): after the legacy-floor change (96h -> 84h),
+    the real _migrate_one_session_sections maps a legacy flat summary to a 72h
+    section whose covers_from age is in [_AGE_72H, _AGE_EVICT) — retained for
+    one pass, not instantly evicted at migration time. Fails if the floor lands
+    legacy content in the evict band (>=96h) or back in a younger band."""
+    now = datetime.now(UTC)
+    sid = "sess_cb4e"
+    _write_legacy_summary(
+        tmp_path, sid, "I recall an old accumulated history.",
+        covers_until=_iso(now), ts=_iso(now),
+    )
+
+    res = run_sections_migration(tmp_path, now=now)
+    assert res.marker_written is True
+    assert res.sessions_migrated == 1
+
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert set(sections) == {"72h"}
+    cf = datetime.fromisoformat(sections["72h"]["covers_from_ts"])
+    age = now - cf
+    assert _AGE_72H <= age < _AGE_EVICT, (
+        f"legacy covers_from age {age} not inside the retained 72h band "
+        f"[{_AGE_72H}, {_AGE_EVICT})"
+    )
+    # And it matches the specific 84h floor value (not just "somewhere in band").
+    assert abs(age - _LEGACY_AGE_FLOOR) < timedelta(minutes=1)

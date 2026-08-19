@@ -249,9 +249,12 @@ def run_backlog_migration(
 # "yesterday" and re-folded as recent — reproducing #82 for 100% of current
 # personas. This one-time, marker-gated migration rewrites that row into the
 # sectioned form seeded as TIER 3 ("a few days ago") with an explicit OLD-FLOOR
-# ``covers_from_ts`` (``migration_now − _LEGACY_AGE_FLOOR`` (96h)), set
-# UNCONDITIONALLY — never ``covers_until_ts`` — so the blob lands in and STAYS in
-# terminal tier 3. It is an in-place shape rewrite (no provider call). See plan §4.
+# ``covers_from_ts`` (``migration_now − _LEGACY_AGE_FLOOR``, 84h — inside the 72h
+# band with margin), set UNCONDITIONALLY — never ``covers_until_ts`` — so the
+# blob lands in tier 3, appears in the head for one pass, then evicts on the
+# next daily pass like any other tier-3 content once past the eviction boundary
+# (a graceful one-pass fade, not an instant drop). It is an in-place shape
+# rewrite (no provider call). See plan §4 / spec §Open decision.
 
 
 @dataclass
