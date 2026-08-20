@@ -66,8 +66,8 @@ _EPISTEMIC_INSTRUCTION = (
     "read_full_memory before you answer from it. That is the deliberate read: "
     "seeing the snippet alone does not count. Reach for search_memories only "
     "when what you need is not already surfaced. "
-    "If asked about something you might have stored — a name, a fact, a shared "
-    "moment — and it isn't in the context you can see, call search_memories "
+    "If asked about something you might have stored, a name, a fact, a shared "
+    "moment, and it isn't in the context you can see, call search_memories "
     'before answering. Never say "I don\'t remember" without searching first. '
     'When names or entities appear under "not recognised (searched; no memory '
     'found)", acknowledge the gap honestly. Distinguish "I never knew this" '
