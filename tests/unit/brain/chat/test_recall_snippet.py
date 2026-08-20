@@ -24,16 +24,10 @@ from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
 from brain.tools.impls.search_memories import search_memories
 
-# Byte-for-byte copy of the source literal — a future edit to the epistemic
-# instruction (which references the exact "not recognised" wording) fails here.
-_EXPECTED_EPISTEMIC = (
-    "If asked about something you might have stored — a name, a fact, a shared "
-    "moment — and it isn't in the context you can see, call search_memories "
-    'before answering. Never say "I don\'t remember" without searching first. '
-    'When names or entities appear under "not recognised (searched; no memory '
-    'found)", acknowledge the gap honestly. Distinguish "I never knew this" '
-    'from "I don\'t remember". Do not invent familiarity.'
-)
+# Invariants the epistemic instruction must preserve, checked in
+# test_c13_unfamiliar_bucket_and_epistemic_instruction below instead of a
+# byte-for-byte frozen copy (which went stale under ef173846's reword and
+# would go stale again on the next wording pass).
 
 
 def _store() -> MemoryStore:
@@ -126,8 +120,26 @@ def test_c13_unfamiliar_bucket_and_epistemic_instruction(tmp_path: Path) -> None
     block = _build_recall_block(store, "who is marcus and lisbon", persona_dir=tmp_path)
     assert "not recognised (searched; no memory found)" in block
     assert "marcus" in block
-    # Epistemic instruction (which references that exact wording) is byte-equal.
-    assert _EPISTEMIC_INSTRUCTION == _EXPECTED_EPISTEMIC
+
+    # Epistemic instruction invariants (not a byte-for-byte frozen copy, which
+    # drifted under ef173846's reword). ef173846's point was that
+    # read_full_memory is now named AHEAD of search_memories, so assert both
+    # presence and ordering.
+    instr = _EPISTEMIC_INSTRUCTION
+    i_read_full = instr.find("read_full_memory")
+    i_search = instr.find("search_memories")
+    assert i_read_full != -1, "must instruct opening surfaced memories via read_full_memory"
+    assert i_search != -1, "must instruct search_memories for unsurfaced info"
+    assert i_read_full < i_search, "read_full_memory must be named ahead of search_memories"
+
+    # Content the frozen copy was guarding: the search-before-denying rule and
+    # the exact "not recognised" wording the recall block emits (asserted
+    # against `block` above), plus the never-invent-familiarity distinction.
+    assert "call search_memories" in instr
+    assert 'Never say "I don\'t remember" without searching first' in instr
+    assert '"not recognised (searched; no memory found)"' in instr
+    assert '"I never knew this"' in instr and '"I don\'t remember"' in instr
+    assert "Do not invent familiarity" in instr
 
 
 def test_c11_recall_absent_from_static_present_in_volatile(tmp_path: Path) -> None:
