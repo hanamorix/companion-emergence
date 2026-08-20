@@ -1035,51 +1035,31 @@ def test_build_recent_journal_block_uses_user_name_not_hana(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 
-def _nr_empty_result():
-    """search_with_loss result with nothing in any bucket."""
-    from unittest.mock import MagicMock
-
-    r = MagicMock()
-    r.active = []
-    r.fading = []
-    r.lost = []
-    r.scores = {}
-    return r
-
-
-def _nr_hit_result(content: str):
-    """search_with_loss result with one active hit."""
-    from unittest.mock import MagicMock
-
-    mem = MagicMock()
-    mem.id = "m1"
-    mem.content = content
-    mem.importance = 5
-    mem.created_at = None
-    r = MagicMock()
-    r.active = [mem]
-    r.fading = []
-    r.lost = []
-    r.scores = {}
-    return r
+# Tier-1 recall-query fix (guarded-change, changes/recall-query-tier1): the
+# "not recognised" display now derives from ONE combined-query
+# store.term_stats(tokens) read (memories_vocab document frequency), not a
+# per-token search_with_loss-empty convention — a predicate the single
+# combined query cannot reproduce per token. These four tests are re-expressed
+# against a REAL seeded ":memory:" MemoryStore (not a MagicMock) so intended
+# tokens are genuinely present (df>0 → recognised) or absent (df=0 → not
+# recognised); `_extract_recall_tokens` stays patched so the exact token text
+# (incl. capitalisation, for the B→A fallback test) is still controlled by
+# the test, matching the SAME display behaviour as before — not weakened.
 
 
 def test_build_recall_block_not_recognised_section(tmp_path: Path):
     """Unfamiliar token appears in 'not recognised' section."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import Memory, MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")
+    store.create(Memory.create_new("we talked about a trip to lisbon", "event", "d"))
 
-    def fake_search(persona_dir, store_, token, *, limit, hebbian=None):
-        if token == "Lisbon":
-            return _nr_hit_result("we talked about a trip to Lisbon")
-        return _nr_empty_result()
-
-    with patch("brain.forgetting.recall.search_with_loss", side_effect=fake_search):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus", "Lisbon"]):
-            block = _build_recall_block(store, "Tell me about Marcus and Lisbon", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus", "Lisbon"]):
+        block = _build_recall_block(store, "Tell me about Marcus and Lisbon", persona_dir=tmp_path)
+    store.close()
 
     assert "not recognised" in block
     assert "Marcus" in block
@@ -1090,15 +1070,16 @@ def test_build_recall_block_not_recognised_section(tmp_path: Path):
 
 def test_build_recall_block_not_recognised_only_emits_block(tmp_path: Path):
     """Block is still emitted when only unfamiliar tokens exist (no active/fading/lost hits)."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")  # empty store: every token is "not recognised"
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
-            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+        block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    store.close()
 
     assert block.strip() != ""
     assert "not recognised" in block
@@ -1107,16 +1088,17 @@ def test_build_recall_block_not_recognised_only_emits_block(tmp_path: Path):
 
 def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
     """When >5 unfamiliar tokens, only capitalised ones survive."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")  # empty store: every selected token is unfamiliar
     tokens = ["antique", "yesterday", "slowly", "Marcus", "Kellerman", "Lisbon", "quiet"]
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
-            block = _build_recall_block(store, "query", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
+        block = _build_recall_block(store, "query", persona_dir=tmp_path)
+    store.close()
 
     # 7 tokens, all unfamiliar → B→A: keep only initial-caps
     assert "Marcus" in block
@@ -1130,15 +1112,17 @@ def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
 
 def test_build_recall_block_no_not_recognised_when_all_found(tmp_path: Path):
     """No 'not recognised' section when all tokens return memory hits."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import Memory, MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")
+    store.create(Memory.create_new("some memory about marcus", "event", "d"))
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_hit_result("some memory")):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
-            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+        block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    store.close()
 
     assert "not recognised" not in block
 

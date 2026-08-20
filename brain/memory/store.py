@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import uuid
@@ -211,6 +212,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, content='memories', content_rowid='rowid'
 );
+
+-- Tier-1 passive-recall salience: zero-dependency corpus IDF straight from
+-- SQLite's own fts5vocab shadow of memories_fts ('row' mode → one row per
+-- term with its document frequency in column `doc`). Virtual/read-only (no
+-- storage, no write path); must be created AFTER memories_fts since it
+-- indexes that table's content.
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_vocab USING fts5vocab('memories_fts', 'row');
 
 -- Schema-level sync triggers: they live in the DB and fire on WHICHEVER
 -- connection performs the write, so every one of the ~15 MemoryStore
@@ -644,6 +652,46 @@ class MemoryStore:
         if active_only:
             sql += " WHERE active = 1"
         return int(self._conn.execute(sql).fetchone()[0])
+
+    def term_stats(self, terms: list[str]) -> dict[str, tuple[int, float]]:
+        """Return per-term document frequency + corpus IDF (Tier-1 recall salience).
+
+        Looks up ``doc`` (document frequency) for each (lowercased) term from
+        ``memories_vocab`` — the ``fts5vocab('memories_fts', 'row')`` shadow
+        table — and computes ``idf = log(N / (1 + df))`` where ``N`` is the
+        **all-indexed-docs** count (``SELECT count(*) FROM memories``). This
+        deliberately does NOT reuse :meth:`count`, whose ``active_only=True``
+        default would risk ``N < df`` and a negative IDF.
+
+        Returns ``{lowered_term: (df, idf)}`` for every requested term — a
+        term absent from the vocabulary gets ``df=0`` (present in the store's
+        vocabulary is exactly what "absent" means here; the caller treats
+        ``df=0`` as both lowest-recall-value and, in ``_build_recall_block``,
+        "not recognised"). Fail-soft: returns ``{}`` when the store is empty
+        (``N == 0``, so any IDF would be undefined) or on any sqlite error —
+        callers fall back to non-IDF, non-``in_store`` salience. Read-only:
+        no write, no recall_count bump.
+        """
+        if not terms:
+            return {}
+        lowered = [t.lower() for t in terms]
+        try:
+            n = int(self._conn.execute("SELECT count(*) FROM memories").fetchone()[0])
+            if n == 0:
+                return {}
+            placeholders = ",".join("?" * len(lowered))
+            rows = self._conn.execute(
+                f"SELECT term, doc FROM memories_vocab WHERE term IN ({placeholders})",
+                lowered,
+            ).fetchall()
+            df_by_term = {row["term"]: int(row["doc"]) for row in rows}
+        except sqlite3.Error:
+            return {}
+        stats: dict[str, tuple[int, float]] = {}
+        for term in lowered:
+            df = df_by_term.get(term, 0)
+            stats[term] = (df, math.log(n / (1 + df)))
+        return stats
 
     def search_text(
         self,

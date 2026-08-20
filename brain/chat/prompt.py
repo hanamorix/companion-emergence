@@ -848,10 +848,11 @@ def _build_recall_block(
     with a high-importance full-inject bypass, and stop bumping recall_count on
     mere surfacing.
 
-    Strategy: extract content tokens from ``user_input`` (drop short
-    stopword-shaped fragments), call search_with_loss for each token (sharing a
-    single per-turn HebbianMatrix handle), dedupe across all buckets keeping the
-    best blended score per id, render four sections:
+    Strategy: extract salient content tokens from ``user_input`` (drop
+    stopwords/short fragments; select by corpus IDF + proper-noun bonus —
+    Tier-1 recall-query fix), issue ONE combined OR query via a single
+    search_with_loss call (sharing a single per-turn HebbianMatrix handle),
+    render four sections:
       - active memories (snippet, or full body when importance ≥ FULL_INJECT_IMPORTANCE)
       - softened memories (fading; original detail gone)
       - lost memories (no longer in active memory; from graveyard)
@@ -863,32 +864,32 @@ def _build_recall_block(
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
     """
-    tokens = _extract_recall_tokens(user_input)
+    tokens = _extract_recall_tokens(user_input, store)
     if not tokens:
         return ""
 
     if persona_dir is None:
         # Legacy path — no persona_dir → cannot locate hebbian.db or the
-        # graveyard. Ranked retrieval per token (hebbian=None → w_heb=0), same
-        # snippet render as the main path, no surfacing bump.
+        # graveyard. Ranked retrieval over ONE combined OR query (Tier-1: was
+        # a per-token loop; hebbian=None → w_heb=0), same snippet render as
+        # the main path, no surfacing bump.
         from brain.memory.relevance import rank_memories
 
         seen: set = set()
         candidates: list = []
         merged: dict[str, float] = {}
-        for token in tokens:
-            try:
-                ranked = rank_memories(store, None, token, limit=limit)
-            except Exception:  # noqa: BLE001
-                continue
-            for mem, score in ranked:
-                if mem.id not in seen:
-                    seen.add(mem.id)
-                    candidates.append(mem)
-                    if score is not None:
-                        merged[mem.id] = score
-                elif score is not None:
-                    merged[mem.id] = max(merged.get(mem.id, score), score)
+        try:
+            ranked = rank_memories(store, None, " ".join(tokens), limit=limit)
+        except Exception:  # noqa: BLE001
+            ranked = []
+        for mem, score in ranked:
+            if mem.id not in seen:
+                seen.add(mem.id)
+                candidates.append(mem)
+                if score is not None:
+                    merged[mem.id] = score
+            elif score is not None:
+                merged[mem.id] = max(merged.get(mem.id, score), score)
 
         if not candidates:
             return ""
@@ -922,7 +923,7 @@ def _build_recall_block(
     seen_active: set = set()
     seen_fading: set = set()
     # seen_lost accumulates graveyard hit IDs for two purposes:
-    #   1. Dedup across per-token loop iterations (render path below).
+    #   1. Dedup within the (now single) search result (render path below).
     #   2. Passed to handle_recall_touch as the grief accumulator (see the
     #      fault-isolated block after this loop). Both paths read the same
     #      set — no separate copy needed.
@@ -930,30 +931,28 @@ def _build_recall_block(
     active_hits: list = []
     fading_hits: list = []
     lost_hits: list = []
-    unfamiliar: list[str] = []
-    # id → best blended score across tokens (None-sentinel: an unranked id is
-    # simply absent, so the merge falls back to (-importance, -ts) for it).
+    # id → best blended score (None-sentinel: an unranked id is simply
+    # absent, so the merge falls back to (-importance, -ts) for it).
     merged_score: dict[str, float] = {}
     merged_fading: dict[str, float] = {}
 
     # THE one hebbian open site in all of P2 (spec §2): open exactly one
-    # HebbianMatrix, thread it through every search_with_loss call in the token
-    # loop, close it once. integrity_check=False → no per-turn full-DB scan.
-    # Fail-soft: any open error → heb=None (w_heb=0) and the loop still runs.
+    # HebbianMatrix for the turn's single combined search_with_loss call,
+    # close it once. integrity_check=False → no per-turn full-DB scan.
+    # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
     heb = None
     try:
         try:
             heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
         except Exception:  # noqa: BLE001 — hebbian is a tie-breaker; degrade to None
             heb = None
-        for token in tokens:
-            try:
-                result = search_with_loss(persona_dir, store, token, limit=limit * 2, hebbian=heb)
-            except Exception:  # noqa: BLE001
-                continue
-            found = bool(result.active or result.fading or result.lost)
-            if not found:
-                unfamiliar.append(token)
+        try:
+            result = search_with_loss(
+                persona_dir, store, " ".join(tokens), limit=limit * 2, hebbian=heb
+            )
+        except Exception:  # noqa: BLE001
+            result = None
+        if result is not None:
             for mem in result.active:
                 s = result.scores.get(mem.id)
                 if mem.id not in seen_active:
@@ -983,6 +982,16 @@ def _build_recall_block(
                 heb.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    # "Not recognised": iff the store holds no memory containing the whole-word
+    # token (memories_vocab document frequency 0) — reconstructed under one
+    # combined query from a dedicated store.term_stats(tokens) read (Tier-1;
+    # the old per-token "this token's own search returned nothing" predicate
+    # cannot survive a single combined query). Matches the render string's
+    # literal claim ("no memory found"). Fail-soft: term_stats() itself
+    # returns {} on an empty store or any sqlite error.
+    stats = store.term_stats(tokens)
+    unfamiliar: list[str] = [t for t in tokens if stats.get(t.lower(), (0, 0.0))[0] == 0]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
     if len(unfamiliar) > 5:
@@ -1106,37 +1115,107 @@ def _build_reply_to_outbound_block(
 # stopwords and pronouns ("the", "is", "I", "we") without an explicit
 # stopword list — keeps the helper lightweight and locale-flexible.
 _RECALL_TOKEN_MIN_LEN = 4
-_RECALL_TOKEN_LIMIT = 6  # cap unique tokens passed to search_text
+# Tier-1 (passive-recall-ranking hunt): the combined-OR-query fix (below)
+# dissolves the old "bound per-turn query count" rationale for this cap — it
+# now only bounds OR-clause width, since every turn issues exactly one FTS
+# query regardless of token count. Raised 6 → 10 so the flagship incident
+# message's 8 salient content tokens ("logger, live, first, quick, memory,
+# trigger, garbage, treasure") all survive selection regardless of IDF.
+_RECALL_TOKEN_LIMIT = 10
+
+# Conservative closed-class English function words + common discourse
+# interjections/fillers — deliberately EXCLUDES content words ("issue",
+# "first", "quick", "seems", "memory", "trigger", "signal", "logger" etc.),
+# which are demoted by salience ordering, not filtered outright. English-
+# specific (documented limitation). Static frozenset: no NLTK/sklearn
+# dependency for a word list.
+_RECALL_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # articles
+        "a", "an", "the",
+        # pronouns / determiners
+        "i", "me", "my", "mine", "myself",
+        "you", "your", "yours", "yourself", "yourselves",
+        "he", "him", "his", "himself",
+        "she", "her", "hers", "herself",
+        "it", "its", "itself",
+        "we", "us", "our", "ours", "ourselves",
+        "they", "them", "their", "theirs", "themselves",
+        "this", "that", "these", "those",
+        "who", "whom", "whose", "which", "what",
+        "whoever", "whatever", "whichever",
+        "any", "some", "all", "both", "each", "either", "neither",
+        "every", "other", "another", "such", "own", "same", "only", "none",
+        # auxiliaries / modals
+        "am", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "having",
+        "do", "does", "did", "doing",
+        "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+        # prepositions
+        "about", "above", "across", "after", "against", "along", "among",
+        "around", "at", "before", "behind", "below", "beside", "between",
+        "by", "down", "during", "except", "for", "from", "in", "into",
+        "near", "of", "off", "on", "out", "over", "since", "through", "to",
+        "towards", "under", "until", "up", "upon", "with", "within", "without",
+        # conjunctions
+        "and", "but", "or", "nor", "so", "yet", "because", "although",
+        "though", "while", "if", "unless", "whether", "than", "as",
+        # common discourse interjections / fillers
+        "alrighty", "okay", "ok", "yeah", "yep", "nope", "hmm", "anyway",
+        "gonna", "wanna", "oh", "hey", "yes", "no", "alright", "hi", "hello",
+    }
+)
 
 
-def _extract_recall_tokens(user_input: str) -> list[str]:
-    """Pull search tokens from a user message.
+def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) -> list[str]:
+    """Pull search tokens from a user message, ranked by salience.
 
-    - Lowercases.
-    - Splits on non-alphanumerics.
-    - Drops tokens shorter than _RECALL_TOKEN_MIN_LEN (catches most
-      stopwords / pronouns / interjections without a stopword list).
-    - Dedupes preserving first-seen order.
-    - Caps at _RECALL_TOKEN_LIMIT unique tokens so a long message
-      doesn't fan out to dozens of LIKE queries.
+    - Splits on non-alphanumerics over the ORIGINAL (case-preserved) string
+      so proper-noun capitalization can be captured before lowercasing.
+    - Drops tokens shorter than _RECALL_TOKEN_MIN_LEN and any token in
+      _RECALL_STOPWORDS (closed-class function words / interjections).
+    - Dedupes on the lowercased form, preserving first-seen index.
+    - Ranks survivors by corpus salience — descending
+      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)`` —
+      and keeps the top _RECALL_TOKEN_LIMIT. ``in_store`` (whether the store
+      has any memory containing the term at all) is the PRIMARY key: a
+      zero-hit token can retrieve nothing, so it loses to any real token
+      when the cap binds, regardless of its (necessarily high) IDF.
+    - ``store=None`` (degraded path, no vocab available) → every token gets
+      ``in_store=False, idf=0.0``, so selection falls back to
+      ``(is_capitalized, len(token), -first_seen_index)``.
+
+    Returns the selected tokens lowercased (the FTS match tokens).
     """
     if not user_input:
         return []
     import re
 
-    pieces = re.split(r"[^A-Za-z0-9]+", user_input.lower())
+    pieces = re.split(r"[^A-Za-z0-9]+", user_input)
     seen: set[str] = set()
-    out: list[str] = []
-    for piece in pieces:
-        if len(piece) < _RECALL_TOKEN_MIN_LEN:
+    survivors: list[tuple[str, bool, int]] = []  # (low, is_capitalized, first_seen_index)
+    for idx, piece in enumerate(pieces):
+        if not piece:
             continue
-        if piece in seen:
+        low = piece.lower()
+        if len(low) < _RECALL_TOKEN_MIN_LEN:
             continue
-        seen.add(piece)
-        out.append(piece)
-        if len(out) >= _RECALL_TOKEN_LIMIT:
-            break
-    return out
+        if low in _RECALL_STOPWORDS:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        survivors.append((low, piece[:1].isupper(), idx))
+
+    stats = store.term_stats([low for low, _, _ in survivors]) if store is not None else {}
+
+    def _salience_key(item: tuple[str, bool, int]) -> tuple[bool, float, bool, int, int]:
+        low, is_capitalized, first_seen_index = item
+        df, idf = stats.get(low, (0, 0.0))
+        return (df > 0, idf, is_capitalized, len(low), -first_seen_index)
+
+    survivors.sort(key=_salience_key, reverse=True)
+    return [low for low, _, _ in survivors[:_RECALL_TOKEN_LIMIT]]
 
 
 def _count_soul_candidates(persona_dir: Path) -> int:
