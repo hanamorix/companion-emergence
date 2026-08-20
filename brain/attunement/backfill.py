@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC
 from datetime import datetime as _datetime
@@ -179,6 +180,12 @@ def _cursor_index(windows: list[Window], cursor: str) -> int:
 
 _MIN_TURNS_FOR_BACKFILL = 10
 
+# Inter-call pacing between windows, so a backfill never bursts its whole daily
+# budget of `claude -p` spawns in one sitting. Mirrors _INTER_CALL_DELAY_S in
+# brain/ingest/emotion_backfill.py, the sibling backfill this loop is modelled
+# on. Tests pass delay_s=0 to skip the wait.
+_INTER_CALL_DELAY_S = 1.5
+
 # Categories added in schema v0.0.29 that need a supplementary bootstrap
 # when an existing persona's backfill completed at an older schema version.
 # tone + cadence are already learned and must NOT be double-counted.
@@ -224,6 +231,7 @@ def run_backfill(
     cap: int | None = None,
     only_categories: frozenset[str] | None = None,
     supplementary: bool = False,
+    delay_s: float = _INTER_CALL_DELAY_S,
 ):
     """Run (or resume) the one-time backfill migration.
 
@@ -247,6 +255,13 @@ def run_backfill(
         BackfillState,
     )
     from brain.attunement.store import merge_into_learned
+    from brain.body.session_hours import compute_active_session_hours
+    from brain.bridge import cli_throttle
+
+    # cli_throttle is imported locally: brain.bridge pulls in the supervisor, so
+    # a module-level import would be circular. compute_active_session_hours is
+    # the layer-neutral primitive (brain/body/session_hours.py) — the same
+    # signal emotion_backfill's _user_recently_active wraps.
 
     if cap is None:
         cap = DAILY_BUDGET_DEFAULT
@@ -330,34 +345,69 @@ def run_backfill(
 
     for i in range(start_idx, len(sampled)):
         window = sampled[i]
-        if not _attunement_consume_call(persona_dir, now=now_dt, cap=cap):
-            state = replace(state, status="deferred_to_next_day")
-            _save_state(persona_dir, state)
+
+        # Yield gate (disk-based, restart-robust): stand down while the user is
+        # actively chatting so the CLI is free for the interactive turn. The
+        # cursor is already persisted, so the next pass resumes right here.
+        if compute_active_session_hours(persona_dir, now=now_dt) > 0.0:
+            _log.info(
+                "attunement backfill: yielding — user actively chatting; "
+                "will resume when idle (cursor=%s)",
+                state.last_cursor,
+            )
             return state
 
-        try:
-            output = detector_fn(buffer_slice=list(window.turns), reply_text="")
-        except Exception as exc:  # noqa: BLE001
-            _log.warning(
-                "attunement backfill: detector error on %s: %s", window.id, exc
-            )
-            continue
+        # Global concurrency cap: one background CLI consumer at a time. Each
+        # detector_fn call is a fresh `claude -p` spawn, and without this the
+        # loop could issue up to `cap` of them while another engine held the
+        # single slot — invisibly, since _inflight_background never saw them.
+        # The slot wraps budget-check + detector + write-back so it covers the
+        # whole per-window unit of work, and is released before the pacing sleep.
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                # Return rather than break: falling through would run the
+                # completion tail below and mark a partially-processed backfill
+                # 'complete', which should_run_backfill treats as done forever.
+                _log.info(
+                    "attunement backfill: throttle slot unavailable — deferring; "
+                    "cursor preserved (cursor=%s)",
+                    state.last_cursor,
+                )
+                return state
 
-        merge_into_learned(
-            persona_dir,
-            output.pattern_candidates,
-            list(window.turns),
-            now_iso=now_iso,
-        )
-        patterns_emitted_so_far += len(output.pattern_candidates)
-        processed_so_far += 1
-        state = replace(
-            state,
-            processed_windows=processed_so_far,
-            patterns_emitted=patterns_emitted_so_far,
-            last_cursor=window.id,
-        )
-        _save_state(persona_dir, state)
+            if not _attunement_consume_call(persona_dir, now=now_dt, cap=cap):
+                state = replace(state, status="deferred_to_next_day")
+                _save_state(persona_dir, state)
+                return state
+
+            try:
+                output = detector_fn(buffer_slice=list(window.turns), reply_text="")
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "attunement backfill: detector error on %s: %s", window.id, exc
+                )
+                continue
+
+            merge_into_learned(
+                persona_dir,
+                output.pattern_candidates,
+                list(window.turns),
+                now_iso=now_iso,
+            )
+            patterns_emitted_so_far += len(output.pattern_candidates)
+            processed_so_far += 1
+            state = replace(
+                state,
+                processed_windows=processed_so_far,
+                patterns_emitted=patterns_emitted_so_far,
+                last_cursor=window.id,
+            )
+            _save_state(persona_dir, state)
+
+        # Outside the slot: another background consumer can acquire while we pace.
+        # Tests pass delay_s=0 to skip the wait (matches emotion_backfill).
+        if delay_s > 0:
+            time.sleep(delay_s)
 
     check_crystallisations(persona_dir, now_iso=now_iso)
     state = replace(state, status="complete")
@@ -371,6 +421,7 @@ def run_supplementary_backfill(
     detector_fn=None,
     now_dt: _datetime | None = None,
     cap: int | None = None,
+    delay_s: float = _INTER_CALL_DELAY_S,
 ):
     """One-time supplementary pass after a schema upgrade.
 
@@ -386,6 +437,7 @@ def run_supplementary_backfill(
         cap=cap,
         only_categories=_NEW_CATEGORIES,
         supplementary=True,
+        delay_s=delay_s,
     )
 
 
