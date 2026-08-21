@@ -98,6 +98,7 @@ def test_run_supplementary_backfill_completes_at_current_schema_version(tmp_path
         tmp_path,
         detector_fn=stub_detector,
         now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
 
     assert state.schema_version == SCHEMA_VERSION
@@ -137,6 +138,7 @@ def test_supplementary_resets_cursor_not_inheriting_stale_completed_cursor(tmp_p
         detector_fn=lambda *, buffer_slice, reply_text: None,  # never called (cap=0)
         now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
         cap=0,
+        delay_s=0,
     )
 
     assert state.status == "deferred_to_next_day"
@@ -191,6 +193,7 @@ def test_supplementary_preserves_prior_completion_record(tmp_path):
     state = run_supplementary_backfill(
         tmp_path, detector_fn=stub_detector,
         now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
 
     # Original journey-start preserved (not reset to now); new patterns accumulate.
