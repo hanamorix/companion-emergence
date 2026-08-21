@@ -314,7 +314,12 @@ from brain.chat.compaction_migration import (  # noqa: E402
     _sections_marker_path,
     run_sections_migration,
 )
-from brain.ingest.buffer import ingest_turn  # noqa: E402
+from brain.ingest.buffer import (  # noqa: E402
+    acquire_compaction_lock,
+    ingest_turn,
+    release_compaction_lock,
+    rewrite_session_atomic,
+)
 
 
 def _iso(dt: datetime) -> str:
@@ -491,3 +496,309 @@ def test_cb4e_migration_legacy_floor_lands_inside_72h_band(tmp_path: Path) -> No
     )
     # And it matches the specific 84h floor value (not just "somewhere in band").
     assert abs(age - _LEGACY_AGE_FLOOR) < timedelta(minutes=1)
+
+
+# ---------------------------------------------------------------------------
+# Migration-lock race (item2 "A2" buffer-writer race). Criteria in
+# changes/migration-lock-race/1.5-criteria.md (C1..C7). These exercise the REAL
+# run_sections_migration / _migrate_one_session_sections with the REAL
+# acquire_compaction_lock / read_session / rewrite_session_atomic / ingest_turn
+# on throwaway tmp_path persona dirs. C2a/C2b/C7 are the load-bearing race
+# oracles: each is demonstrated RED on the pre-fix source in ST1.5f
+# (changes/migration-lock-race/5-selftest-output.txt).
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_with_raw(persona_dir: Path, sid: str, *, now: datetime, marker: str) -> None:
+    """Seed a legacy session buffer: one section-less summary row followed by two
+    raw turns — the [summary(no "sections"), raw1, raw2] shape the criteria seed."""
+    ac = persona_dir / "active_conversations"
+    ac.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "session_id": sid, "speaker": "summary",
+        "text": f"I recall {marker}: a long accumulated history.",
+        "ts": _iso(now - timedelta(minutes=5)),
+        "compaction": {"gen": 3, "folded": True, "covers_until_ts": _iso(now - timedelta(minutes=5))},
+    }
+    rows = [summary]
+    for i in range(2):
+        rows.append({"session_id": sid, "speaker": "user" if i % 2 == 0 else "assistant",
+                     "text": f"raw turn {i}", "ts": _iso(now - timedelta(minutes=4 - i))})
+    with (ac / f"{sid}.jsonl").open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
+def _buffer_bytes(persona_dir: Path, sid: str) -> bytes:
+    return (persona_dir / "active_conversations" / f"{sid}.jsonl").read_bytes()
+
+
+# --------------------------------------------------------------------- C4
+def test_lockrace_c4_uncontended_migrates(tmp_path: Path) -> None:
+    """C4: with NO contention, a seeded legacy session migrates to the sectioned
+    tier-3 form and the run-once marker is written (happy-path preservation)."""
+    now = datetime.now(UTC)
+    sid = "sess_lr_c4"
+    marker = "UNCONTENDEDHIST"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker=marker)
+
+    res = run_sections_migration(tmp_path, now=now)
+
+    assert res.sessions_migrated == 1
+    assert res.marker_written is True
+    assert _sections_marker_path(tmp_path).exists()
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert set(sections) == {"72h"} and sections["72h"]["text"]
+    assert marker in sections["72h"]["text"]           # 72h band == legacy text
+    # Raw turns preserved alongside the now-sectioned summary.
+    raws = _raw(read_session(tmp_path, sid))
+    assert len(raws) == 2
+
+
+# --------------------------------------------------------------------- C2a
+def test_lockrace_c2a_lock_respected(tmp_path: Path) -> None:
+    """C2a: a concurrent writer holds the per-session lock → migration must NOT
+    modify the buffer and must WITHHOLD the marker (retry next boot). RED on
+    pre-fix (migration ignores the lock, rewrites, writes the marker)."""
+    now = datetime.now(UTC)
+    sid = "sess_lr_c2a"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker="LOCKEDHIST")
+    before = _buffer_bytes(tmp_path, sid)
+
+    assert acquire_compaction_lock(tmp_path, sid) is True
+    try:
+        res = run_sections_migration(tmp_path, now=now)
+    finally:
+        release_compaction_lock(tmp_path, sid)
+
+    # Buffer byte-identical: still legacy, no sections key.
+    assert _buffer_bytes(tmp_path, sid) == before
+    comp = _summary_row(tmp_path, sid).get("compaction") or {}
+    assert "sections" not in comp
+    # Marker withheld → next boot retries.
+    assert not _sections_marker_path(tmp_path).exists()
+    assert res.marker_written is False
+    assert res.sessions_migrated == 0
+
+
+# --------------------------------------------------------------------- C2b
+def test_lockrace_c2b_no_clobber_of_committed_fold(tmp_path: Path) -> None:
+    """C2b: a lock-holding writer has committed a real-shaped cascade fold (raw
+    dropped, summary row folded=True + non-empty sections) and still holds the
+    lock. Migration must leave the fold intact and withhold the marker. RED on
+    pre-fix (migration no-ops on the already-sectioned row but still writes the
+    marker for a session another writer owns)."""
+    now = datetime.now(UTC)
+    sid = "sess_lr_c2b"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker="PREFOLD")
+
+    assert acquire_compaction_lock(tmp_path, sid) is True
+    try:
+        # Real-shaped committed cascade fold (matches _install_cascade_row): raw
+        # turns dropped, summary row carries folded=True + a non-empty sections
+        # dict. There is NO "cascade_folded" key in the codebase (F1).
+        cascade_sections = {
+            "72h": {"text": "I recall CASCADEFOLD content.",
+                    "covers_from_ts": _iso(now - timedelta(hours=80)),
+                    "covers_until_ts": _iso(now - timedelta(hours=1))},
+        }
+        fold_row = {
+            "session_id": sid, "speaker": "summary",
+            "text": "I recall CASCADEFOLD content.",
+            "ts": _iso(now),
+            "compaction": {"gen": 5, "folded": True,
+                           "covers_until_ts": _iso(now - timedelta(hours=1)),
+                           "sections": cascade_sections},
+        }
+        rewrite_session_atomic(tmp_path, sid, [fold_row])
+
+        res = run_sections_migration(tmp_path, now=now)
+    finally:
+        release_compaction_lock(tmp_path, sid)
+
+    comp = _summary_row(tmp_path, sid)["compaction"]
+    assert comp["folded"] is True                       # fold survives
+    assert comp["sections"] == cascade_sections         # cascade dict intact
+    assert _raw(read_session(tmp_path, sid)) == []      # no raw reintroduced
+    # Marker withheld — the session belongs to a live writer, not done.
+    assert not _sections_marker_path(tmp_path).exists()
+    assert res.marker_written is False
+    assert res.sessions_migrated == 0
+
+
+# --------------------------------------------------------------------- C3
+def test_lockrace_c3_contended_then_converges(tmp_path: Path) -> None:
+    """C3: after a contended boot (lock held → skipped, marker withheld), a later
+    boot with the lock free migrates the session and writes the marker. Proves
+    skip-on-contention does not lose the migration."""
+    now = datetime.now(UTC)
+    sid = "sess_lr_c3"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker="CONVERGEHIST")
+
+    # Boot 1: contended.
+    assert acquire_compaction_lock(tmp_path, sid) is True
+    try:
+        res1 = run_sections_migration(tmp_path, now=now)
+    finally:
+        release_compaction_lock(tmp_path, sid)
+    assert res1.marker_written is False
+    assert not _sections_marker_path(tmp_path).exists()
+
+    # Boot 2: lock free → migrates + marker written.
+    res2 = run_sections_migration(tmp_path, now=now)
+    assert res2.sessions_migrated == 1
+    assert res2.marker_written is True
+    assert _sections_marker_path(tmp_path).exists()
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert set(sections) == {"72h"}
+    assert _raw(read_session(tmp_path, sid))               # raw turns retained, none lost
+
+
+# --------------------------------------------------------------------- C7
+def test_lockrace_c7_live_append_in_window_survives(tmp_path: Path) -> None:
+    """C7: a live ingest_turn append landing in migration's read→rewrite window
+    survives (the CC1 re-read mitigation). Monkeypatch the module's read_session
+    so migration's FIRST read captures the seeded turns and, as a one-shot side
+    effect AFTER the snapshot, appends a raw turn via the real ingest_turn. RED on
+    pre-fix (single read → rewrite of the stale snapshot drops the append) and on a
+    lock-only fix that does not re-read."""
+    now = datetime.now(UTC)
+    sid = "sess_lr_c7"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker="APPENDHIST")
+
+    real_read = mig.read_session
+    state = {"fired": False}
+    appended_ts = _iso(now - timedelta(hours=1))
+
+    def read_then_append(persona_dir, session_id, *a, **kw):
+        snapshot = real_read(persona_dir, session_id, *a, **kw)
+        # After capturing migration's first snapshot, land a live append ONCE.
+        if not state["fired"] and session_id == sid:
+            state["fired"] = True
+            ingest_turn(tmp_path, {"session_id": sid, "speaker": "user",
+                                   "text": "LIVEAPPEND in the window", "ts": appended_ts})
+        return snapshot
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(mig, "read_session", read_then_append)
+    try:
+        res = run_sections_migration(tmp_path, now=now)
+    finally:
+        monkeypatch.undo()
+
+    assert res.sessions_migrated == 1
+    assert res.marker_written is True
+    session = read_session(tmp_path, sid)
+    assert any(t.get("text") == "LIVEAPPEND in the window" for t in _raw(session)), \
+        "the live append in migration's window must survive the rewrite"
+    sections = _summary_row(tmp_path, sid)["compaction"]["sections"]
+    assert set(sections) == {"72h"} and "APPENDHIST" in sections["72h"]["text"]
+
+
+# --------------------------------------------------------- C7-mixed (hardening)
+def test_lockrace_c7mixed_one_migrates_one_contended(tmp_path: Path) -> None:
+    """A boot with session A uncontended + session B contended (lock held on B):
+    A migrates, but the GLOBAL marker is still withheld (B not done). Hardens the
+    all_ok AND-accumulator beyond the single-session path."""
+    now = datetime.now(UTC)
+    sid_a, sid_b = "sess_lr_a", "sess_lr_b"
+    _seed_legacy_with_raw(tmp_path, sid_a, now=now, marker="AHIST")
+    _seed_legacy_with_raw(tmp_path, sid_b, now=now, marker="BHIST")
+
+    assert acquire_compaction_lock(tmp_path, sid_b) is True
+    try:
+        res = run_sections_migration(tmp_path, now=now)
+    finally:
+        release_compaction_lock(tmp_path, sid_b)
+
+    # A migrated; B skipped; global marker withheld.
+    assert res.sessions_migrated == 1
+    assert res.marker_written is False
+    assert not _sections_marker_path(tmp_path).exists()
+    a_comp = _summary_row(tmp_path, sid_a)["compaction"]
+    assert isinstance(a_comp.get("sections"), dict) and a_comp["sections"]
+    b_comp = _summary_row(tmp_path, sid_b).get("compaction") or {}
+    assert "sections" not in b_comp                       # B untouched (still legacy)
+
+
+# ------------------------------------------------ C2 barrier-interleave oracle
+def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypatch) -> None:
+    """Reproduce the ACTUAL diagnosed lost-update interleave (dragonfly CONTROL arm,
+    derived), deterministically with threading.Event barriers:
+
+        migration reads a STALE pre-fold snapshot (no sections)
+          → a concurrent writer commits a real-shaped cascade fold (raw dropped,
+            summary sectioned + folded)  [lands IN migration's read→write window]
+          → migration proceeds to its write.
+
+    On PRE-FIX code migration's single read → late whole-file write clobbers the
+    committed fold: raw turns reintroduced, the fold's sections replaced by
+    migration's own legacy sectioning → the fold-survives assertions go RED.
+
+    On the FIXED code migration holds the per-session lock across its whole window
+    (a lock-taking writer would be mutually excluded by construction — the deadlock
+    would BE the fix working), so the fold is injected as the same on-disk event
+    migration saw pre-fix, and the RE-READ before the rewrite detects the now-
+    sectioned row and no-ops → the fold survives → GREEN.
+
+    Deterministic (Event barriers + bounded 5s timeouts); cannot hang CI (the
+    writer thread is joined and asserted finished).
+    """
+    import threading
+
+    now = datetime.now(UTC)
+    sid = "sess_lr_barrier"
+    _seed_legacy_with_raw(tmp_path, sid, now=now, marker="STALELEGACY")
+
+    cascade_sections = {
+        "72h": {"text": "I recall CASCADEFOLD content.",
+                "covers_from_ts": _iso(now - timedelta(hours=80)),
+                "covers_until_ts": _iso(now - timedelta(hours=1))},
+    }
+    fold_row = {
+        "session_id": sid, "speaker": "summary",
+        "text": "I recall CASCADEFOLD content.",
+        "ts": _iso(now),
+        "compaction": {"gen": 5, "folded": True,
+                       "covers_until_ts": _iso(now - timedelta(hours=1)),
+                       "sections": cascade_sections},
+    }
+
+    migration_has_read = threading.Event()
+    fold_committed = threading.Event()
+    real_read = mig.read_session
+    state = {"fired": False}
+
+    def writer() -> None:
+        # Commit the fold ONLY after migration has captured its stale snapshot, so
+        # the fold lands strictly inside migration's read→write window.
+        if not migration_has_read.wait(timeout=5.0):
+            return
+        rewrite_session_atomic(tmp_path, sid, [fold_row])
+        fold_committed.set()
+
+    def read_barrier(persona_dir, session_id, *a, **kw):
+        snapshot = real_read(persona_dir, session_id, *a, **kw)
+        if not state["fired"] and session_id == sid:
+            state["fired"] = True          # only the FIRST (stale) read barriers
+            migration_has_read.set()        # release the writer to commit the fold
+            fold_committed.wait(timeout=5.0)  # hold migration until the fold lands
+        return snapshot
+
+    monkeypatch.setattr(mig, "read_session", read_barrier)
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        run_sections_migration(tmp_path, now=now)
+    finally:
+        t.join(timeout=5.0)
+        monkeypatch.undo()
+    assert not t.is_alive(), "writer thread did not finish (barrier deadlock)"
+
+    # The committed fold must survive — no last-writer-wins clobber.
+    comp = _summary_row(tmp_path, sid)["compaction"]
+    assert comp.get("sections") == cascade_sections, \
+        "committed cascade fold was clobbered by migration's stale-snapshot write"
+    assert comp.get("folded") is True
+    assert _raw(read_session(tmp_path, sid)) == [], \
+        "migration reintroduced raw turns the committed fold had dropped"
