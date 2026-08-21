@@ -1111,10 +1111,15 @@ def _build_reply_to_outbound_block(
     )
 
 
-# Words shorter than this are dropped before search. Captures most
-# stopwords and pronouns ("the", "is", "I", "we") without an explicit
-# stopword list — keeps the helper lightweight and locale-flexible.
-_RECALL_TOKEN_MIN_LEN = 4
+# Ordinary-word floor: a lowercase, non-acronym, non-capitalized token needs
+# at least this many characters to be kept on shape alone. Below the floor a
+# token is dropped unless the store has already seen it (df > 0). This floor
+# is not the stopword filter: closed-class function words and interjections
+# ("the", "is", "and") are removed separately by _RECALL_STOPWORDS, whatever
+# their length. Acronyms (2-5 letters, all uppercase) and short capitalized
+# words (length 2, e.g. an initial-style proper name) are kept by shape and
+# are not held to this floor.
+_RECALL_TOKEN_MIN_LEN = 3
 # Tier-1 (passive-recall-ranking hunt): the combined-OR-query fix (below)
 # dissolves the old "bound per-turn query count" rationale for this cap — it
 # now only bounds OR-clause width, since every turn issues exactly one FTS
@@ -1170,44 +1175,103 @@ _RECALL_STOPWORDS: frozenset[str] = frozenset(
 def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) -> list[str]:
     """Pull search tokens from a user message, ranked by salience.
 
-    - Splits on non-alphanumerics over the ORIGINAL (case-preserved) string
-      so proper-noun capitalization can be captured before lowercasing.
-    - Drops tokens shorter than _RECALL_TOKEN_MIN_LEN and any token in
-      _RECALL_STOPWORDS (closed-class function words / interjections).
+    - Matches runs of letters/digits over the ORIGINAL (case-preserved)
+      string so proper-noun capitalization and sentence position can be read
+      before lowercasing.
+    - Keep rule, shape-aware (replaces a flat length cut): a token is kept
+      if it is long enough on its own (>= _RECALL_TOKEN_MIN_LEN), OR shaped
+      like an acronym (2-5 letters, all uppercase), OR a short capitalized
+      word (length 2, e.g. an initial-style proper name), OR the store has
+      already seen it (df > 0). This is what keeps short content like "FBI",
+      "AI", "Roy", "cat" that a flat length cut would drop.
+    - Stoplist exemption, shape-before-lowercase: a token whose lowercased
+      form is in _RECALL_STOPWORDS is dropped UNLESS its shape marks it as a
+      proper noun. Titlecase (capitalized, not ALL-CAPS) mid-sentence is
+      exempt outright, so "Will" in "I think Will can help" survives even
+      though "will" is a modal in the stoplist. Titlecase at the start of a
+      sentence is exempt only when corroborated, either the store has seen
+      it or it also appears capitalized elsewhere in the same message,
+      because a sentence-initial capital alone could just be ordinary
+      capitalization rather than a name. ALL-CAPS tokens get NO stoplist
+      exemption: they still face the stoplist as their lowercased form, so
+      an acronym like "FBI" or "AI" survives (its lowercased form is not a
+      stopword) while a shouted function word like "THE" or "AND" is still
+      dropped.
     - Dedupes on the lowercased form, preserving first-seen index.
-    - Ranks survivors by corpus salience — descending
-      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)`` —
+    - Ranks survivors by corpus salience, descending
+      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)``,
       and keeps the top _RECALL_TOKEN_LIMIT. ``in_store`` (whether the store
       has any memory containing the term at all) is the PRIMARY key: a
       zero-hit token can retrieve nothing, so it loses to any real token
       when the cap binds, regardless of its (necessarily high) IDF.
-    - ``store=None`` (degraded path, no vocab available) → every token gets
-      ``in_store=False, idf=0.0``, so selection falls back to
-      ``(is_capitalized, len(token), -first_seen_index)``.
+    - ``store=None`` (degraded path, no vocab available): every token gets
+      ``in_store=False, idf=0.0`` and the df-dependent keep/exemption
+      clauses are inert, so selection falls back to shape and length alone.
+      Acronyms, short capitalized words, mid-sentence Titlecase, and words
+      at or above the ordinary floor still survive; only the store-backed
+      corroboration for a sentence-initial capital is unavailable.
 
     Returns the selected tokens lowercased (the FTS match tokens).
     """
     if not user_input:
         return []
     import re
+    from collections import Counter
 
-    pieces = re.split(r"[^A-Za-z0-9]+", user_input)
+    matches = list(re.finditer(r"[A-Za-z0-9]+", user_input))
+
+    prev_end = 0
+    sent_initial: list[bool] = []
+    for idx, m in enumerate(matches):
+        delim = user_input[prev_end:m.start()]
+        sent_initial.append(idx == 0 or any(ch in delim for ch in ".?!"))
+        prev_end = m.end()
+
+    cap_forms: Counter[str] = Counter(
+        m.group().lower() for m in matches if m.group()[:1].isupper()
+    )
+
     seen: set[str] = set()
-    survivors: list[tuple[str, bool, int]] = []  # (low, is_capitalized, first_seen_index)
-    for idx, piece in enumerate(pieces):
-        if not piece:
-            continue
+    candidates: list[tuple[str, str, bool, bool, bool, int]] = []
+    # (piece, low, is_cap, is_acro, is_sent_initial, first_seen_index)
+    for idx, m in enumerate(matches):
+        piece = m.group()
         low = piece.lower()
-        if len(low) < _RECALL_TOKEN_MIN_LEN:
-            continue
-        if low in _RECALL_STOPWORDS:
-            continue
-        if low in seen:
+        if not low or low in seen:
             continue
         seen.add(low)
-        survivors.append((low, piece[:1].isupper(), idx))
+        is_cap = piece[:1].isupper()
+        is_acro = piece.isalpha() and piece.isupper() and 2 <= len(piece) <= 5
+        candidates.append((piece, low, is_cap, is_acro, sent_initial[idx], idx))
 
-    stats = store.term_stats([low for low, _, _ in survivors]) if store is not None else {}
+    stats = (
+        store.term_stats([low for _, low, _, _, _, _ in candidates])
+        if store is not None
+        else {}
+    )
+
+    def _df(low: str) -> int:
+        return stats.get(low, (0, 0.0))[0]
+
+    survivors: list[tuple[str, bool, int]] = []  # (low, is_capitalized, first_seen_index)
+    for piece, low, is_cap, is_acro, is_sent_initial, first_idx in candidates:
+        keep = (
+            len(low) >= _RECALL_TOKEN_MIN_LEN
+            or is_acro
+            or (len(low) == 2 and is_cap)
+            or _df(low) > 0
+        )
+        if not keep:
+            continue
+        proper_noun_shape = is_cap and len(low) >= 2 and not piece.isupper()
+        exempt = (proper_noun_shape and not is_sent_initial) or (
+            proper_noun_shape
+            and is_sent_initial
+            and (_df(low) > 0 or cap_forms[low] >= 2)
+        )
+        if not exempt and low in _RECALL_STOPWORDS:
+            continue
+        survivors.append((low, is_cap, first_idx))
 
     def _salience_key(item: tuple[str, bool, int]) -> tuple[bool, float, bool, int, int]:
         low, is_capitalized, first_seen_index = item

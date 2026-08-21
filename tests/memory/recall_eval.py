@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from brain.chat.prompt import _build_recall_block
+from brain.chat.prompt import _build_recall_block, _extract_recall_tokens
 from brain.memory.relevance import SNIPPET_COUNT
 from brain.memory.store import Memory, MemoryStore
 
@@ -245,6 +246,208 @@ def fts_call_count(
     return counter["n"]
 
 
+# ---------------------------------------------------------------------------
+# Token-selection eval (recall-token-selector): hand-labeled GOLD set,
+# precision/recall/F1, latency, and end-to-end recall on newly-admitted
+# token classes.
+# ---------------------------------------------------------------------------
+
+# LABELING RUBRIC for GOLD (word-class based, not fitted to the algorithm):
+#
+#   POSITIVE (expected in the selected set): an open-class content word
+#   (noun, proper noun, verb, adjective, adverb carrying topical meaning),
+#   a genuine acronym, a number with len >= 3, or a domain-specific term.
+#
+#   NEGATIVE (expected absent from the selected set): a closed-class
+#   function word (article, pronoun, preposition, conjunction, auxiliary or
+#   modal verb, quantifier/determiner), an interjection, a discourse filler,
+#   OR a number with len < 3. This includes a function word written in
+#   ALL-CAPS (e.g. "THE", "AND", "WHO") which is still a function word, not
+#   an acronym, and stays negative regardless of case.
+#
+# The rubric is applied by word class, not by what the current selector
+# happens to do. Some short, non-stoplisted closed-class words ("not",
+# "how", "why", "now", "too") and intensifiers ("really") ARE selected by
+# the algorithm (documented as advisory A4: the stoplist is fixed and these
+# are not in it) but are labeled NEGATIVE here per their class, accepting
+# the resulting precision hit rather than fitting the label to the
+# algorithm's actual output.
+GOLD: list[tuple[str, set[str]]] = [
+    ("The FBI opened a case file", {"fbi", "opened", "case", "file"}),
+    ("AI is transforming research", {"ai", "transforming", "research"}),
+    ("Roy set up a logger", {"roy", "logger", "set"}),
+    ("My cat knocked over the vase", {"cat", "knocked", "vase"}),
+    ("CIA agents met with Ada yesterday", {"cia", "ada", "yesterday", "agents", "met"}),
+    ("I think Will can help", {"will", "think", "help"}),
+    ("Ask May about it", {"ask", "may"}),
+    ("I love Simply Orange juice", {"simply", "orange", "juice", "love"}),
+    ("training a random forest", {"training", "random", "forest"}),
+    ("my research question is", {"research", "question"}),
+    ("I saw the cat and the dog", {"saw", "cat", "dog"}),
+    ("Okay, so what next", {"next"}),
+    ("I said Okay to him", {"said"}),
+    ("THE AND FOR shouted", {"shouted"}),
+    ("WHO IT US shouted", {"shouted"}),
+    ("call 911 now", {"call", "911"}),
+    ("a 42 count and a 7 count", {"count"}),
+    ("ML models need data", {"ml", "models", "need", "data"}),
+    ("not now, but how and why", set()),
+    ("too many things really happening", {"things", "happening"}),
+    ("Bob met Canary at the cafe", {"bob", "canary", "cafe", "met"}),
+    ("a hat and a bat on the mat", {"hat", "bat", "mat"}),
+    ("quick, popped the question", {"question", "quick", "popped"}),
+    ("Ada trained a new model with Bob", {"ada", "trained", "model", "bob", "new"}),
+    ("The CIA and FBI shared a file", {"cia", "fbi", "shared", "file"}),
+    ("Canary asked about the AI project", {"canary", "asked", "ai", "project"}),
+    ("Simply Orange sponsored the event", {"simply", "orange", "sponsored", "event"}),
+    ("Roy adopted a cat named Ada", {"roy", "adopted", "cat", "ada", "named"}),
+    ("May I ask about the schedule", {"ask", "schedule"}),
+    ("Will the meeting start soon", {"meeting", "start", "soon"}),
+    ("hello there, how are you", set()),
+    ("yeah okay sure thing", {"thing"}),
+    ("The FBI and CIA rarely agree", {"fbi", "cia", "rarely", "agree"}),
+    ("Bob bought a hat for Canary", {"bob", "bought", "hat", "canary"}),
+]
+
+
+def select_tokens_prf(
+    gold: list[tuple[str, set[str]]], store: MemoryStore | None = None
+) -> dict[str, float]:
+    """Micro-averaged precision / recall / F1 of `_extract_recall_tokens`
+    selections against `gold` (message, expected-token-set pairs).
+
+    Micro-averaged: true positives, false positives, and false negatives
+    are summed across the whole gold set before dividing, so messages with
+    more expected tokens weigh proportionally more than short ones.
+    """
+    tp = fp = fn = 0
+    for msg, expected in gold:
+        selected = set(_extract_recall_tokens(msg, store))
+        tp += len(selected & expected)
+        fp += len(selected - expected)
+        fn += len(expected - selected)
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def selection_latency_ms(
+    messages: list[str], iters: int, store: MemoryStore | None
+) -> float:
+    """Mean milliseconds per `_extract_recall_tokens` call, warmed up first.
+
+    Cycles through `messages` for `iters` calls (>= 1000 recommended) and
+    times the total, returning the mean per-call latency in milliseconds.
+    Pass a seeded, non-empty store so the timed `term_stats` path performs a
+    real vocabulary lookup rather than the empty-store early return.
+    """
+    if not messages:
+        return 0.0
+    # Warm-up call: pays for any one-time import/setup cost outside the loop.
+    _extract_recall_tokens(messages[0], store)
+
+    n = len(messages)
+    start = time.perf_counter()
+    for i in range(iters):
+        _extract_recall_tokens(messages[i % n], store)
+    elapsed = time.perf_counter() - start
+    return (elapsed / iters) * 1000.0
+
+
+# Representative message mix for latency benchmarking: short, long, plain,
+# and shape-heavy (acronym/capitalized/number) messages, reusing GOLD's
+# content so the benchmark reflects the same kind of traffic as the F1 eval.
+LATENCY_MESSAGE_MIX: list[str] = [msg for msg, _ in GOLD]
+
+
+def seed_token_target_store() -> tuple[MemoryStore, dict[str, str]]:
+    """Build a dedicated seeded store for the G7 newly-admitted-token recall
+    pairs: a short name (Roy), a genuine acronym (FBI), and a short noun
+    (cat). Each target memory's distinguishing term is unique in the store
+    (absent from every background memory), so recall@k == 1.0 is a
+    well-defined pass/fail for each pair. Never Phoebe data; synthetic
+    content only.
+
+    Returns (store, target_ids) where target_ids maps "roy" / "acronym" /
+    "noun" to the id of that pair's target memory.
+    """
+    store = MemoryStore(":memory:")
+    target_ids: dict[str, str] = {}
+
+    roy_mem = Memory.create_new(
+        content="Roy set up a logger integrated into Claude Code to observe the memory system.",
+        memory_type="conversation",
+        domain="work",
+        importance=5.0,
+    )
+    store.create(roy_mem)
+    target_ids["roy"] = roy_mem.id
+
+    acronym_mem = Memory.create_new(
+        content="The FBI opened a case file requesting additional documents.",
+        memory_type="conversation",
+        domain="work",
+        importance=5.0,
+    )
+    store.create(acronym_mem)
+    target_ids["acronym"] = acronym_mem.id
+
+    noun_mem = Memory.create_new(
+        content="My cat knocked over the vase again this morning.",
+        memory_type="conversation",
+        domain="us",
+        importance=5.0,
+    )
+    store.create(noun_mem)
+    target_ids["noun"] = noun_mem.id
+
+    for i, topic in enumerate(_BACKGROUND_TOPICS):
+        store.create(
+            Memory.create_new(
+                content=f"{topic} (note {i})",
+                memory_type="conversation",
+                domain="us",
+                importance=3.0,
+            )
+        )
+
+    return store, target_ids
+
+
+# One query per G7 pair, phrased so the newly-admitted token class (short
+# name / acronym / short noun) is the only content word carrying the query.
+TOKEN_TARGET_QUERIES: dict[str, str] = {
+    "roy": "What did Roy set up?",
+    "acronym": "Tell me about the FBI case",
+    "noun": "tell me about the cat",
+}
+
+
+def token_target_recall_at_k(k: int = K) -> dict[str, float]:
+    """recall@k for each G7 pair (roy / acronym / noun), via the real
+    `surfaced_ids` / `_build_recall_block` path on a dedicated seeded store.
+
+    Returns {"roy": recall@k, "acronym": recall@k, "noun": recall@k}, each
+    1.0 if that pair's target memory id is among the top-k surfaced ids,
+    else 0.0.
+    """
+    import tempfile
+
+    store, target_ids = seed_token_target_store()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            pdir = Path(td)
+            results: dict[str, float] = {}
+            for key, msg in TOKEN_TARGET_QUERIES.items():
+                surfaced = surfaced_ids(store, msg, pdir, limit=k)
+                results[key] = 1.0 if target_ids[key] in surfaced[:k] else 0.0
+            return results
+    finally:
+        store.close()
+
+
 def _report_store(label: str, target_fraction: float, tmp_persona_dir: Path) -> None:
     store, target_ids = seed_store(target_fraction)
     try:
@@ -285,6 +488,28 @@ def main() -> None:
             print(f"  Path B (persona_dir set):  {path_b_calls} call(s)")
         finally:
             store.close()
+
+        # Token-selection eval: P/R/F1 on the hand-labeled GOLD set, latency,
+        # and end-to-end recall on the newly-admitted token classes (G5/G6/G7).
+        latency_store, _ = seed_store(COMMON_STORE_FRACTION)
+        try:
+            prf = select_tokens_prf(GOLD, latency_store)
+            print(f"=== token selection P/R/F1 (GOLD, n={len(GOLD)}) ===")
+            print(
+                f"  precision={prf['precision']:.3f} recall={prf['recall']:.3f} "
+                f"f1={prf['f1']:.3f}"
+            )
+
+            latency_ms = selection_latency_ms(LATENCY_MESSAGE_MIX, 1000, latency_store)
+            print("=== token selection latency ===")
+            print(f"  mean {latency_ms:.4f} ms/call (1000 calls, seeded store)")
+        finally:
+            latency_store.close()
+
+        recall_at_k = token_target_recall_at_k()
+        print("=== token selection end-to-end recall@k (G7 pairs) ===")
+        for key, value in recall_at_k.items():
+            print(f"  {key}: recall@k={value:.3f}")
 
 
 if __name__ == "__main__":
