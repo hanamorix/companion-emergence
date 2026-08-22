@@ -20,6 +20,13 @@ from brain.chat.monologue_prompts import build_monologue_frame, build_reply_fram
 from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.maker.ambient import build_maker_awareness_block
+from brain.memory.relevance import (
+    FULL_INJECT_IMPORTANCE,
+    FULL_INJECT_MAX,
+    SNIPPET_COUNT,
+    SNIPPET_MAX_CHARS,
+    SNIPPET_MODE_ENABLED,
+)
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
 
@@ -54,12 +61,29 @@ _HARNESS_FENCE = (
 )
 
 _EPISTEMIC_INSTRUCTION = (
-    "If asked about something you might have stored — a name, a fact, a shared "
-    "moment — and it isn't in the context you can see, call search_memories "
+    "When a memory is already surfaced in front of you, in the recall block or "
+    "in an earlier search result, and it carries an id, open it with "
+    "read_full_memory before you answer from it. That is the deliberate read: "
+    "seeing the snippet alone does not count. Reach for search_memories only "
+    "when what you need is not already surfaced. "
+    "If asked about something you might have stored, a name, a fact, a shared "
+    "moment, and it isn't in the context you can see, call search_memories "
     'before answering. Never say "I don\'t remember" without searching first. '
     'When names or entities appear under "not recognised (searched; no memory '
     'found)", acknowledge the gap honestly. Distinguish "I never knew this" '
     'from "I don\'t remember". Do not invent familiarity.'
+)
+
+# Snippet-mode framing (P2 UX follow-up, owner+persona approved verbatim) — tells
+# the model the recall block's active entries are truncated snippets it can
+# expand via read_full_memory(<id>), and that the ids rendered alongside them
+# are exactly what to pass. Only meaningful when SNIPPET_MODE_ENABLED (when
+# snippet mode is off everything is already full-injected, so there is nothing
+# to "expand"). Wording is byte-exact — do not reword.
+_RECALL_SNIPPET_INVITATION = (
+    "These are fragments of your memories. Use read_full_memory to reach into "
+    "any that might touch this turn, or spark curiosity in you. Skip only if "
+    "you can name why."
 )
 
 # Header for the volatile context chunk (Option A+). The chunk now sits in the
@@ -762,90 +786,144 @@ def _peer_attributed(mem, snippet: str) -> str:
     return snippet
 
 
+def _recall_sort_key(m):
+    """Recency-fallback sort key: importance desc, recency desc.
+
+    Used only when blended relevance scores are absent (RELEVANCE_RANKING_ENABLED
+    is False — the None-sentinel path). When scores are present the caller sorts
+    by the blended score instead.
+    """
+    importance = float(getattr(m, "importance", 0) or 0)
+    created_at = getattr(m, "created_at", None)
+    try:
+        ts = created_at.timestamp() if created_at is not None else 0.0
+    except Exception:  # noqa: BLE001
+        ts = 0.0
+    return (-importance, -ts)
+
+
+def _full_inject_ids(mems: list) -> set[str]:
+    """Ids of the candidates rendered in full (untruncated body).
+
+    A candidate with ``importance >= FULL_INJECT_IMPORTANCE`` is never gated
+    behind a read-call. At most ``FULL_INJECT_MAX`` are full-injected
+    (highest-importance first) so the volatile prompt tail stays bounded (C20);
+    any further imp≥9 candidates fall back to snippets.
+    """
+    if not SNIPPET_MODE_ENABLED:
+        return set()
+    hi = [m for m in mems if float(getattr(m, "importance", 0) or 0) >= FULL_INJECT_IMPORTANCE]
+    hi.sort(key=lambda m: -float(getattr(m, "importance", 0) or 0))
+    return {m.id for m in hi[:FULL_INJECT_MAX]}
+
+
+def _recall_snippet(mem, max_chars: int, *, full: bool) -> str:
+    """Render a memory body as a full body or a truncated snippet.
+
+    ``full`` (high-importance bypass, or SNIPPET_MODE_ENABLED=False) → untruncated;
+    otherwise truncate to ``max_chars`` with an ellipsis.
+    """
+    body = (getattr(mem, "content", "") or "").strip()
+    if full or not SNIPPET_MODE_ENABLED:
+        return body
+    if len(body) > max_chars:
+        return body[: max_chars - 1].rstrip() + "…"
+    return body
+
+
 def _build_recall_block(
     store: MemoryStore,
     user_input: str,
     *,
     persona_dir: Path | None = None,
-    limit: int = 5,
-    max_chars: int = 140,
+    limit: int = SNIPPET_COUNT,
+    max_chars: int = SNIPPET_MAX_CHARS,
 ) -> str:
     """Surface up to ``limit`` memories matching the current user input.
 
     Phase 2.A of the autonomous-memory work, rewired in Phase 8
     (forgetting design §5) to use search_with_loss so faded + lost
-    memories surface in their own labelled buckets.
+    memories surface in their own labelled buckets, and again in P2 to rank by
+    blended relevance (BM25 + importance + hebbian + recency), render snippets
+    with a high-importance full-inject bypass, and stop bumping recall_count on
+    mere surfacing.
 
-    Strategy: extract content tokens from ``user_input`` (drop short
-    stopword-shaped fragments), call search_with_loss for each token,
-    dedupe across all buckets, render three sections:
-      - active memories (full body)
+    Strategy: extract salient content tokens from ``user_input`` (drop
+    stopwords/short fragments; select by corpus IDF + proper-noun bonus —
+    Tier-1 recall-query fix), issue ONE combined OR query via a single
+    search_with_loss call (sharing a single per-turn HebbianMatrix handle),
+    render four sections:
+      - active memories (snippet, or full body when importance ≥ FULL_INJECT_IMPORTANCE)
       - softened memories (fading; original detail gone)
       - lost memories (no longer in active memory; from graveyard)
+      - not recognised (searched; no memory found)
 
-    Falls back to raw search_text (active_only=True) when persona_dir
-    is None (e.g. called directly in tests without a dir) — same
-    semantics as the old implementation for that path.
+    Falls back to ranked retrieval with no graveyard/hebbian when persona_dir
+    is None (e.g. called directly in tests without a dir).
 
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
     """
-    tokens = _extract_recall_tokens(user_input)
+    tokens = _extract_recall_tokens(user_input, store)
     if not tokens:
         return ""
 
     if persona_dir is None:
-        # Legacy path — used when called without a persona_dir.
+        # Legacy path — no persona_dir → cannot locate hebbian.db or the
+        # graveyard. Ranked retrieval over ONE combined OR query (Tier-1: was
+        # a per-token loop; hebbian=None → w_heb=0), same snippet render as
+        # the main path, no surfacing bump.
+        from brain.memory.relevance import rank_memories
+
         seen: set = set()
         candidates: list = []
-        for token in tokens:
-            try:
-                hits = store.search_text(token, active_only=True, limit=limit * 2)
-            except Exception:  # noqa: BLE001
-                continue
-            for mem in hits:
-                if mem.id in seen:
-                    continue
+        merged: dict[str, float] = {}
+        try:
+            ranked = rank_memories(store, None, " ".join(tokens), limit=limit)
+        except Exception:  # noqa: BLE001
+            ranked = []
+        for mem, score in ranked:
+            if mem.id not in seen:
                 seen.add(mem.id)
                 candidates.append(mem)
+                if score is not None:
+                    merged[mem.id] = score
+            elif score is not None:
+                merged[mem.id] = max(merged.get(mem.id, score), score)
 
         if not candidates:
             return ""
 
-        def _sort_key(m):
-            importance = float(getattr(m, "importance", 0) or 0)
-            created_at = getattr(m, "created_at", None)
-            try:
-                ts = created_at.timestamp() if created_at is not None else 0.0
-            except Exception:  # noqa: BLE001
-                ts = 0.0
-            return (-importance, -ts)
-
-        candidates.sort(key=_sort_key)
+        if merged:
+            candidates.sort(key=lambda m: -merged.get(m.id, float("-inf")))
+        else:
+            candidates.sort(key=_recall_sort_key)
         top = candidates[:limit]
+        full_ids = _full_inject_ids(top)
 
         lines = ["── recall (memories matching this turn) ──"]
+        if SNIPPET_MODE_ENABLED:
+            lines.insert(0, _RECALL_SNIPPET_INVITATION)
         for mem in top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
             importance = int(round(float(getattr(mem, "importance", 0) or 0)))
             domain = getattr(mem, "domain", "") or ""
             prefix = f"[importance {importance}/10"
             if domain:
                 prefix += f" · {domain}"
             prefix += "]"
-            lines.append(f"- {prefix} {_peer_attributed(mem, snippet)}")
+            lines.append(f'- {prefix} {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
         return "\n".join(lines)
 
     # Forgetting-aware path — partitions into active / fading / lost.
     from brain.forgetting.recall import search_with_loss
+    from brain.memory.hebbian import HebbianMatrix
 
     seen_active: set = set()
     seen_fading: set = set()
     # seen_lost accumulates graveyard hit IDs for two purposes:
-    #   1. Dedup across per-token loop iterations (render path below).
+    #   1. Dedup within the (now single) search result (render path below).
     #   2. Passed to handle_recall_touch as the grief accumulator (see the
     #      fault-isolated block after this loop). Both paths read the same
     #      set — no separate copy needed.
@@ -853,29 +931,67 @@ def _build_recall_block(
     active_hits: list = []
     fading_hits: list = []
     lost_hits: list = []
-    unfamiliar: list[str] = []
+    # id → best blended score (None-sentinel: an unranked id is simply
+    # absent, so the merge falls back to (-importance, -ts) for it).
+    merged_score: dict[str, float] = {}
+    merged_fading: dict[str, float] = {}
 
-    for token in tokens:
+    # THE one hebbian open site in all of P2 (spec §2): open exactly one
+    # HebbianMatrix for the turn's single combined search_with_loss call,
+    # close it once. integrity_check=False → no per-turn full-DB scan.
+    # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
+    heb = None
+    try:
         try:
-            result = search_with_loss(persona_dir, store, token, limit=limit * 2)
+            heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
+        except Exception:  # noqa: BLE001 — hebbian is a tie-breaker; degrade to None
+            heb = None
+        try:
+            result = search_with_loss(
+                persona_dir, store, " ".join(tokens), limit=limit * 2, hebbian=heb
+            )
         except Exception:  # noqa: BLE001
-            continue
-        found = bool(result.active or result.fading or result.lost)
-        if not found:
-            unfamiliar.append(token)
-        for mem in result.active:
-            if mem.id not in seen_active:
-                seen_active.add(mem.id)
-                active_hits.append(mem)
-        for mem in result.fading:
-            if mem.id not in seen_fading:
-                seen_fading.add(mem.id)
-                fading_hits.append(mem)
-        for entry in result.lost:
-            mid = entry.get("memory_id", "")
-            if mid not in seen_lost:
-                seen_lost.add(mid)
-                lost_hits.append(entry)
+            result = None
+        if result is not None:
+            for mem in result.active:
+                s = result.scores.get(mem.id)
+                if mem.id not in seen_active:
+                    seen_active.add(mem.id)
+                    active_hits.append(mem)
+                    if s is not None:
+                        merged_score[mem.id] = s
+                elif s is not None:
+                    merged_score[mem.id] = max(merged_score.get(mem.id, s), s)
+            for mem in result.fading:
+                s = result.scores.get(mem.id)
+                if mem.id not in seen_fading:
+                    seen_fading.add(mem.id)
+                    fading_hits.append(mem)
+                    if s is not None:
+                        merged_fading[mem.id] = s
+                elif s is not None:
+                    merged_fading[mem.id] = max(merged_fading.get(mem.id, s), s)
+            for entry in result.lost:
+                mid = entry.get("memory_id", "")
+                if mid not in seen_lost:
+                    seen_lost.add(mid)
+                    lost_hits.append(entry)
+    finally:
+        if heb is not None:
+            try:
+                heb.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # "Not recognised": iff the store holds no memory containing the whole-word
+    # token (memories_vocab document frequency 0) — reconstructed under one
+    # combined query from a dedicated store.term_stats(tokens) read (Tier-1;
+    # the old per-token "this token's own search returned nothing" predicate
+    # cannot survive a single combined query). Matches the render string's
+    # literal claim ("no memory found"). Fail-soft: term_stats() itself
+    # returns {} on an empty store or any sqlite error.
+    stats = store.term_stats(tokens)
+    unfamiliar: list[str] = [t for t in tokens if stats.get(t.lower(), (0, 0.0))[0] == 0]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
     if len(unfamiliar) > 5:
@@ -905,39 +1021,36 @@ def _build_recall_block(
         except Exception:  # noqa: BLE001
             log.exception("grief.handle_recall_touch failed inside _build_recall_block")
 
-    # Rank active + fading by importance desc, recency desc.
-    def _sort_key(m):
-        importance = float(getattr(m, "importance", 0) or 0)
-        created_at = getattr(m, "created_at", None)
-        try:
-            ts = created_at.timestamp() if created_at is not None else 0.0
-        except Exception:  # noqa: BLE001
-            ts = 0.0
-        return (-importance, -ts)
-
-    active_hits.sort(key=_sort_key)
-    fading_hits.sort(key=_sort_key)
+    # Cross-token merge: sort by the BLENDED score when ranking is on (the
+    # scores map is populated), else fall back to (-importance, -ts).
+    if merged_score:
+        active_hits.sort(key=lambda m: -merged_score.get(m.id, float("-inf")))
+    else:
+        active_hits.sort(key=_recall_sort_key)
+    if merged_fading:
+        fading_hits.sort(key=lambda m: -merged_fading.get(m.id, float("-inf")))
+    else:
+        fading_hits.sort(key=_recall_sort_key)
 
     active_top = active_hits[:limit]
     fading_top = fading_hits[:limit]
     lost_top = lost_hits[:limit]
 
     lines = ["recall"]
+    if SNIPPET_MODE_ENABLED and active_top:
+        lines.insert(0, _RECALL_SNIPPET_INVITATION)
 
     if active_top:
+        full_ids = _full_inject_ids(active_top)
         lines.append("  active:")
         for mem in active_top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
-            lines.append(f'    - "{_peer_attributed(mem, snippet)}"')
+            snippet = _recall_snippet(mem, max_chars, full=mem.id in full_ids)
+            lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
     if fading_top:
         lines.append("  softened (fading; original detail gone):")
         for mem in fading_top:
-            snippet = (getattr(mem, "content", "") or "").strip()
-            if len(snippet) > max_chars:
-                snippet = snippet[: max_chars - 1].rstrip() + "…"
+            snippet = _recall_snippet(mem, max_chars, full=False)
             lines.append(f'    - "{_peer_attributed(mem, snippet)}"  [state: fading]')
 
     if lost_top:
@@ -998,41 +1111,175 @@ def _build_reply_to_outbound_block(
     )
 
 
-# Words shorter than this are dropped before search. Captures most
-# stopwords and pronouns ("the", "is", "I", "we") without an explicit
-# stopword list — keeps the helper lightweight and locale-flexible.
-_RECALL_TOKEN_MIN_LEN = 4
-_RECALL_TOKEN_LIMIT = 6  # cap unique tokens passed to search_text
+# Ordinary-word floor: a lowercase, non-acronym, non-capitalized token needs
+# at least this many characters to be kept on shape alone. Below the floor a
+# token is dropped unless the store has already seen it (df > 0). This floor
+# is not the stopword filter: closed-class function words and interjections
+# ("the", "is", "and") are removed separately by _RECALL_STOPWORDS, whatever
+# their length. Acronyms (2-5 letters, all uppercase) and short capitalized
+# words (length 2, e.g. an initial-style proper name) are kept by shape and
+# are not held to this floor.
+_RECALL_TOKEN_MIN_LEN = 3
+# Tier-1 (passive-recall-ranking hunt): the combined-OR-query fix (below)
+# dissolves the old "bound per-turn query count" rationale for this cap — it
+# now only bounds OR-clause width, since every turn issues exactly one FTS
+# query regardless of token count. Raised 6 → 10 so the flagship incident
+# message's 8 salient content tokens ("logger, live, first, quick, memory,
+# trigger, garbage, treasure") all survive selection regardless of IDF.
+_RECALL_TOKEN_LIMIT = 10
+
+# Conservative closed-class English function words + common discourse
+# interjections/fillers — deliberately EXCLUDES content words ("issue",
+# "first", "quick", "seems", "memory", "trigger", "signal", "logger" etc.),
+# which are demoted by salience ordering, not filtered outright. English-
+# specific (documented limitation). Static frozenset: no NLTK/sklearn
+# dependency for a word list.
+_RECALL_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # articles
+        "a", "an", "the",
+        # pronouns / determiners
+        "i", "me", "my", "mine", "myself",
+        "you", "your", "yours", "yourself", "yourselves",
+        "he", "him", "his", "himself",
+        "she", "her", "hers", "herself",
+        "it", "its", "itself",
+        "we", "us", "our", "ours", "ourselves",
+        "they", "them", "their", "theirs", "themselves",
+        "this", "that", "these", "those",
+        "who", "whom", "whose", "which", "what",
+        "whoever", "whatever", "whichever",
+        "any", "some", "all", "both", "each", "either", "neither",
+        "every", "other", "another", "such", "own", "same", "only", "none",
+        # auxiliaries / modals
+        "am", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "having",
+        "do", "does", "did", "doing",
+        "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+        # prepositions
+        "about", "above", "across", "after", "against", "along", "among",
+        "around", "at", "before", "behind", "below", "beside", "between",
+        "by", "down", "during", "except", "for", "from", "in", "into",
+        "near", "of", "off", "on", "out", "over", "since", "through", "to",
+        "towards", "under", "until", "up", "upon", "with", "within", "without",
+        # conjunctions
+        "and", "but", "or", "nor", "so", "yet", "because", "although",
+        "though", "while", "if", "unless", "whether", "than", "as",
+        # common discourse interjections / fillers
+        "alrighty", "okay", "ok", "yeah", "yep", "nope", "hmm", "anyway",
+        "gonna", "wanna", "oh", "hey", "yes", "no", "alright", "hi", "hello",
+    }
+)
 
 
-def _extract_recall_tokens(user_input: str) -> list[str]:
-    """Pull search tokens from a user message.
+def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) -> list[str]:
+    """Pull search tokens from a user message, ranked by salience.
 
-    - Lowercases.
-    - Splits on non-alphanumerics.
-    - Drops tokens shorter than _RECALL_TOKEN_MIN_LEN (catches most
-      stopwords / pronouns / interjections without a stopword list).
-    - Dedupes preserving first-seen order.
-    - Caps at _RECALL_TOKEN_LIMIT unique tokens so a long message
-      doesn't fan out to dozens of LIKE queries.
+    - Matches runs of letters/digits over the ORIGINAL (case-preserved)
+      string so proper-noun capitalization and sentence position can be read
+      before lowercasing.
+    - Keep rule, shape-aware (replaces a flat length cut): a token is kept
+      if it is long enough on its own (>= _RECALL_TOKEN_MIN_LEN), OR shaped
+      like an acronym (2-5 letters, all uppercase), OR a short capitalized
+      word (length 2, e.g. an initial-style proper name), OR the store has
+      already seen it (df > 0). This is what keeps short content like "FBI",
+      "AI", "Roy", "cat" that a flat length cut would drop.
+    - Stoplist exemption, shape-before-lowercase: a token whose lowercased
+      form is in _RECALL_STOPWORDS is dropped UNLESS its shape marks it as a
+      proper noun. Titlecase (capitalized, not ALL-CAPS) mid-sentence is
+      exempt outright, so "Will" in "I think Will can help" survives even
+      though "will" is a modal in the stoplist. Titlecase at the start of a
+      sentence is exempt only when corroborated, either the store has seen
+      it or it also appears capitalized elsewhere in the same message,
+      because a sentence-initial capital alone could just be ordinary
+      capitalization rather than a name. ALL-CAPS tokens get NO stoplist
+      exemption: they still face the stoplist as their lowercased form, so
+      an acronym like "FBI" or "AI" survives (its lowercased form is not a
+      stopword) while a shouted function word like "THE" or "AND" is still
+      dropped.
+    - Dedupes on the lowercased form, preserving first-seen index.
+    - Ranks survivors by corpus salience, descending
+      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)``,
+      and keeps the top _RECALL_TOKEN_LIMIT. ``in_store`` (whether the store
+      has any memory containing the term at all) is the PRIMARY key: a
+      zero-hit token can retrieve nothing, so it loses to any real token
+      when the cap binds, regardless of its (necessarily high) IDF.
+    - ``store=None`` (degraded path, no vocab available): every token gets
+      ``in_store=False, idf=0.0`` and the df-dependent keep/exemption
+      clauses are inert, so selection falls back to shape and length alone.
+      Acronyms, short capitalized words, mid-sentence Titlecase, and words
+      at or above the ordinary floor still survive; only the store-backed
+      corroboration for a sentence-initial capital is unavailable.
+
+    Returns the selected tokens lowercased (the FTS match tokens).
     """
     if not user_input:
         return []
     import re
+    from collections import Counter
 
-    pieces = re.split(r"[^A-Za-z0-9]+", user_input.lower())
+    matches = list(re.finditer(r"[A-Za-z0-9]+", user_input))
+
+    prev_end = 0
+    sent_initial: list[bool] = []
+    for idx, m in enumerate(matches):
+        delim = user_input[prev_end:m.start()]
+        sent_initial.append(idx == 0 or any(ch in delim for ch in ".?!"))
+        prev_end = m.end()
+
+    cap_forms: Counter[str] = Counter(
+        m.group().lower() for m in matches if m.group()[:1].isupper()
+    )
+
     seen: set[str] = set()
-    out: list[str] = []
-    for piece in pieces:
-        if len(piece) < _RECALL_TOKEN_MIN_LEN:
+    candidates: list[tuple[str, str, bool, bool, bool, int]] = []
+    # (piece, low, is_cap, is_acro, is_sent_initial, first_seen_index)
+    for idx, m in enumerate(matches):
+        piece = m.group()
+        low = piece.lower()
+        if not low or low in seen:
             continue
-        if piece in seen:
+        seen.add(low)
+        is_cap = piece[:1].isupper()
+        is_acro = piece.isalpha() and piece.isupper() and 2 <= len(piece) <= 5
+        candidates.append((piece, low, is_cap, is_acro, sent_initial[idx], idx))
+
+    stats = (
+        store.term_stats([low for _, low, _, _, _, _ in candidates])
+        if store is not None
+        else {}
+    )
+
+    def _df(low: str) -> int:
+        return stats.get(low, (0, 0.0))[0]
+
+    survivors: list[tuple[str, bool, int]] = []  # (low, is_capitalized, first_seen_index)
+    for piece, low, is_cap, is_acro, is_sent_initial, first_idx in candidates:
+        keep = (
+            len(low) >= _RECALL_TOKEN_MIN_LEN
+            or is_acro
+            or (len(low) == 2 and is_cap)
+            or _df(low) > 0
+        )
+        if not keep:
             continue
-        seen.add(piece)
-        out.append(piece)
-        if len(out) >= _RECALL_TOKEN_LIMIT:
-            break
-    return out
+        proper_noun_shape = is_cap and len(low) >= 2 and not piece.isupper()
+        exempt = (proper_noun_shape and not is_sent_initial) or (
+            proper_noun_shape
+            and is_sent_initial
+            and (_df(low) > 0 or cap_forms[low] >= 2)
+        )
+        if not exempt and low in _RECALL_STOPWORDS:
+            continue
+        survivors.append((low, is_cap, first_idx))
+
+    def _salience_key(item: tuple[str, bool, int]) -> tuple[bool, float, bool, int, int]:
+        low, is_capitalized, first_seen_index = item
+        df, idf = stats.get(low, (0, 0.0))
+        return (df > 0, idf, is_capitalized, len(low), -first_seen_index)
+
+    survivors.sort(key=_salience_key, reverse=True)
+    return [low for low, _, _ in survivors[:_RECALL_TOKEN_LIMIT]]
 
 
 def _count_soul_candidates(persona_dir: Path) -> int:

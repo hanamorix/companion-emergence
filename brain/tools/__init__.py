@@ -23,6 +23,7 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "get_body_state",
     "boot",
     "search_memories",
+    "read_full_memory",
     "add_journal",
     "add_memory",
     "crystallize_soul",

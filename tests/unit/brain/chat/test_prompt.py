@@ -438,7 +438,7 @@ def test_recall_block_handles_no_match(
 def test_recall_block_caps_at_limit(
     persona_dir: Path, store: MemoryStore, soul_store: SoulStore
 ) -> None:
-    """A query that matches many memories surfaces at most ``limit`` (default 5)."""
+    """A query that matches many memories surfaces at most ``limit`` (default SNIPPET_COUNT=8)."""
     for i in range(12):
         store.create(
             Memory.create_new(
@@ -458,15 +458,24 @@ def test_recall_block_caps_at_limit(
         store=store,
         user_input="Tell me about Jordan.",
     )
-    # New forgetting-aware format renders bullets under "  active:" indented with "    - "
+    # New forgetting-aware format renders bullets under "  active:" indented with
+    # '    - <id>: "…"' (memory id now precedes the quoted snippet so
+    # read_full_memory(<id>) is callable — see the recall-snippet-ids follow-up).
     assert "recall" in msg
     assert "active:" in msg
-    # Each active result is a '    - "…"' bullet — cap is still 5 per bucket.
-    # Count quoted bullets (active/fading entries use quoted content) excluding the
-    # unquoted "not recognised" token bullets which have no surrounding quotes.
+    # Cap is SNIPPET_COUNT (8) per bucket (P2). Count bullet lines under the
+    # "active:" section only — stop at the next section header (a line
+    # indented exactly two spaces, e.g. "  softened" / "  not recognised") so
+    # bullets from other buckets don't leak into the count.
     recall_section = msg.split("recall\n")[1]
-    quoted_bullet_count = recall_section.count('    - "')
-    assert quoted_bullet_count == 5, f"expected 5 recall bullets, got {quoted_bullet_count}"
+    active_section = recall_section.split("active:\n", 1)[1]
+    active_lines = []
+    for line in active_section.splitlines():
+        if line.startswith("  ") and not line.startswith("    "):
+            break  # next bucket's section header
+        active_lines.append(line)
+    bullet_count = sum(1 for line in active_lines if line.startswith("    - "))
+    assert bullet_count == 8, f"expected 8 recall bullets, got {bullet_count}"
 
 
 def test_recall_block_truncates_long_content(
@@ -1026,49 +1035,31 @@ def test_build_recent_journal_block_uses_user_name_not_hana(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 
-def _nr_empty_result():
-    """search_with_loss result with nothing in any bucket."""
-    from unittest.mock import MagicMock
-
-    r = MagicMock()
-    r.active = []
-    r.fading = []
-    r.lost = []
-    return r
-
-
-def _nr_hit_result(content: str):
-    """search_with_loss result with one active hit."""
-    from unittest.mock import MagicMock
-
-    mem = MagicMock()
-    mem.id = "m1"
-    mem.content = content
-    mem.importance = 5
-    mem.created_at = None
-    r = MagicMock()
-    r.active = [mem]
-    r.fading = []
-    r.lost = []
-    return r
+# Tier-1 recall-query fix (guarded-change, changes/recall-query-tier1): the
+# "not recognised" display now derives from ONE combined-query
+# store.term_stats(tokens) read (memories_vocab document frequency), not a
+# per-token search_with_loss-empty convention — a predicate the single
+# combined query cannot reproduce per token. These four tests are re-expressed
+# against a REAL seeded ":memory:" MemoryStore (not a MagicMock) so intended
+# tokens are genuinely present (df>0 → recognised) or absent (df=0 → not
+# recognised); `_extract_recall_tokens` stays patched so the exact token text
+# (incl. capitalisation, for the B→A fallback test) is still controlled by
+# the test, matching the SAME display behaviour as before — not weakened.
 
 
 def test_build_recall_block_not_recognised_section(tmp_path: Path):
     """Unfamiliar token appears in 'not recognised' section."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import Memory, MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")
+    store.create(Memory.create_new("we talked about a trip to lisbon", "event", "d"))
 
-    def fake_search(persona_dir, store_, token, *, limit):
-        if token == "Lisbon":
-            return _nr_hit_result("we talked about a trip to Lisbon")
-        return _nr_empty_result()
-
-    with patch("brain.forgetting.recall.search_with_loss", side_effect=fake_search):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus", "Lisbon"]):
-            block = _build_recall_block(store, "Tell me about Marcus and Lisbon", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus", "Lisbon"]):
+        block = _build_recall_block(store, "Tell me about Marcus and Lisbon", persona_dir=tmp_path)
+    store.close()
 
     assert "not recognised" in block
     assert "Marcus" in block
@@ -1079,15 +1070,16 @@ def test_build_recall_block_not_recognised_section(tmp_path: Path):
 
 def test_build_recall_block_not_recognised_only_emits_block(tmp_path: Path):
     """Block is still emitted when only unfamiliar tokens exist (no active/fading/lost hits)."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")  # empty store: every token is "not recognised"
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
-            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+        block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    store.close()
 
     assert block.strip() != ""
     assert "not recognised" in block
@@ -1096,16 +1088,17 @@ def test_build_recall_block_not_recognised_only_emits_block(tmp_path: Path):
 
 def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
     """When >5 unfamiliar tokens, only capitalised ones survive."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")  # empty store: every selected token is unfamiliar
     tokens = ["antique", "yesterday", "slowly", "Marcus", "Kellerman", "Lisbon", "quiet"]
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_empty_result()):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
-            block = _build_recall_block(store, "query", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
+        block = _build_recall_block(store, "query", persona_dir=tmp_path)
+    store.close()
 
     # 7 tokens, all unfamiliar → B→A: keep only initial-caps
     assert "Marcus" in block
@@ -1119,15 +1112,17 @@ def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
 
 def test_build_recall_block_no_not_recognised_when_all_found(tmp_path: Path):
     """No 'not recognised' section when all tokens return memory hits."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import Memory, MemoryStore
 
-    store = MagicMock()
+    store = MemoryStore(":memory:")
+    store.create(Memory.create_new("some memory about marcus", "event", "d"))
 
-    with patch("brain.forgetting.recall.search_with_loss", return_value=_nr_hit_result("some memory")):
-        with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
-            block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    with patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]):
+        block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    store.close()
 
     assert "not recognised" not in block
 
@@ -1201,6 +1196,195 @@ def test_epistemic_instruction_is_proactive():
     assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
     # The reactive guidance stays.
     assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# Recall-snippet invitation framing (P2 UX follow-up) — the recall block's
+# active entries are truncated snippets; this framing tells the model they're
+# expandable via read_full_memory(<id>) and is gated on SNIPPET_MODE_ENABLED
+# so it doesn't appear when snippet mode is off (everything full-injected).
+# ---------------------------------------------------------------------------
+
+
+def test_recall_snippet_invitation_heads_the_block_when_snippet_mode_on(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """The invitation now lives ON the recall block (as its header), not in the
+    system prefix: with snippet mode on and an active recall match, it appears."""
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
+
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me what we said about Jordan last time.",
+    )
+    assert _RECALL_SNIPPET_INVITATION in msg
+
+
+def test_recall_snippet_invitation_absent_when_snippet_mode_off(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """Snippet mode off (everything full-injected): no invitation, nothing to expand."""
+    from unittest.mock import patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
+
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False):
+        msg = build_system_message(
+            persona_dir,
+            voice_md="",
+            daemon_state=_empty_daemon_state(),
+            soul_store=soul_store,
+            store=store,
+            user_input="Tell me what we said about Jordan last time.",
+        )
+    assert _RECALL_SNIPPET_INVITATION not in msg
+
+
+def test_recall_snippet_invitation_not_in_static_prefix(tmp_path: Path) -> None:
+    """The invitation moved OFF the frozen system prefix onto the volatile recall
+    block; the static builder must not carry it (even with snippet mode on)."""
+    from unittest.mock import patch
+
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION, build_static_system_message
+
+    with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
+        msg = build_static_system_message(tmp_path, voice_md="")
+    assert _RECALL_SNIPPET_INVITATION not in msg
+
+
+def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
+    """Owner+persona approved wording (no em-dash — 'invitation. Use', not
+    'invitation — use'). Locks the exact string so a future edit can't
+    silently reword it."""
+    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
+
+    assert _RECALL_SNIPPET_INVITATION == (
+        "These are fragments of your memories. Use read_full_memory to reach into "
+        "any that might touch this turn, or spark curiosity in you. Skip only if "
+        "you can name why."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recall block memory ids — active entries render "<id>: " so
+# read_full_memory(<id>) is callable; fading/lost entries (not expandable)
+# must not.
+# ---------------------------------------------------------------------------
+
+
+def test_recall_block_active_entry_includes_memory_id(
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+) -> None:
+    """An active recall bullet renders '<id>: "<snippet>"' so the model can
+    call read_full_memory(<id>) on it."""
+    mem = Memory.create_new(
+        content="Hana mentioned Jordan once over coffee.",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 6.0},
+        tags=[],
+    )
+    store.create(mem)
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me what we said about Jordan last time.",
+    )
+    assert f'    - {mem.id}: "' in msg
+
+
+def test_recall_block_fading_entry_omits_memory_id(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A fading ('softened') recall bullet must NOT carry a memory id —
+    the original detail is gone, so there is nothing left to expand."""
+    m = Memory.create_new(
+        content="Jordan loved rainy afternoons.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={"love": 6.0},
+    )
+    store.create(m)
+    store.fade(m.id, summary="Jordan — rainy afternoons")
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Do you remember Jordan?",
+    )
+    fading_idx = msg.index("softened")
+    fading_section = msg[fading_idx:]
+    # The bullet must not expose the memory id as an expandable reference.
+    assert f"{m.id}:" not in fading_section
+
+
+def test_recall_block_lost_entry_omits_memory_id(
+    persona_dir: Path,
+    store: MemoryStore,
+    soul_store: SoulStore,
+) -> None:
+    """A lost (graveyarded) recall bullet must NOT carry a memory id — the
+    memory is gone, not expandable."""
+    from brain.forgetting import graveyard
+    from brain.forgetting.salience import SalienceInputs
+
+    lost_m = Memory.create_new(
+        content="Jordan's old studio address.",
+        memory_type="episodic",
+        domain="chat",
+        emotions={},
+    )
+    graveyard.append(
+        persona_dir,
+        memory=lost_m,
+        salience_at_drop=0.05,
+        inputs=SalienceInputs(emotion=0, hebbian=0, recall=0, soul=0, freshness=0),
+        lived_age_hours=200.0,
+        reason="salience<0.10 for 2 consecutive passes",
+    )
+
+    msg = build_system_message(
+        persona_dir,
+        voice_md="",
+        daemon_state=_empty_daemon_state(),
+        soul_store=soul_store,
+        store=store,
+        user_input="Tell me about Jordan's studio.",
+    )
+    lost_idx = msg.index("lost (no longer")
+    lost_section = msg[lost_idx:]
+    assert f"{lost_m.id}:" not in lost_section
 
 
 # ── Self-model gap block (Task 5, R-F1) ───────────────────────────────────────

@@ -881,6 +881,57 @@ def test_hard_delete_does_not_bump_recall_count_on_other_rows():
     store.close()
 
 
+# ---------------------------------------------------------------------------
+# ND-1 follow-up: update()/deactivate()'s internal existence-check must not
+# bump recall_count either (closes the last leak — only a genuine full-read
+# via get(bump=True, the default) counts as engagement).
+# ---------------------------------------------------------------------------
+
+
+def test_update_does_not_bump_recall_count():
+    """update()'s internal existence-check must not inflate recall_count."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0
+    store.update(m.id, content="modified")
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # a maintenance write is NOT a recall
+    store.close()
+
+
+def test_deactivate_does_not_bump_recall_count():
+    """deactivate()'s internal existence-check must not inflate recall_count."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0
+    store.deactivate(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # deactivating is NOT a recall
+    store.close()
+
+
+def test_genuine_full_read_still_bumps_recall_count_after_nd1():
+    """Regression: get()'s default path (bump=True) is untouched by the ND-1 fix
+    — a deliberate full-read still bumps recall_count, even after update()/
+    deactivate() calls that themselves must not bump it."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.update(m.id, content="modified")
+    store.deactivate(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # confirm the maintenance writes above didn't bump it
+    restored = store.get(m.id)  # genuine full-read, default bump=True
+    assert restored is not None
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 1  # only the full-read counted
+    store.close()
+
+
 def test_double_fade_preserves_original_content_snapshot(caplog):
     """fade called twice must NOT overwrite the original snapshot."""
     import logging
