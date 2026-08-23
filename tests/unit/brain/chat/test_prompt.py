@@ -1254,7 +1254,8 @@ def test_build_system_message_includes_self_model_block_when_gap_open(
         soul_store=soul_store,
         store=store,
     )
-    assert "A note on your own read" in msg
+    # Block header (weather-language framing); tracks the owner-approved wording.
+    assert "How some things have been running lately" in msg
     assert "reconcile_self_read" in msg
 
 
@@ -1269,7 +1270,7 @@ def test_build_system_message_omits_self_model_block_when_no_gap(
         soul_store=soul_store,
         store=store,
     )
-    assert "A note on your own read" not in msg
+    assert "How some things have been running lately" not in msg
 
 
 # ── Tool inventory (frozen prefix, text path) ─────────────────────────────────

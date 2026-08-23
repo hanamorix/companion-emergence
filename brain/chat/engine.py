@@ -46,6 +46,24 @@ from brain.soul.store import SoulStore
 
 logger = logging.getLogger(__name__)
 
+
+def _self_model_gap_open(persona_dir: Path) -> bool:
+    """True iff a self-model gap is currently open (the ambient block is
+    surfacing it and inviting reconcile). Used to grant ``reconcile_self_read``
+    on a gap-open turn without a maximal-salience signal. Fail-open to False:
+    a missing/corrupt state file must never crash recruitment or force the tool.
+    """
+    try:
+        from brain.self_model.ambient import _LIVE_STATUSES
+        from brain.self_model.state import load_or_recover
+
+        state, _recovered = load_or_recover(persona_dir)
+        gap = state.current_gap
+        return gap is not None and gap.status in _LIVE_STATUSES
+    except Exception:  # noqa: BLE001 — recruitment never crashes on a bad read
+        return False
+
+
 # Replayed conversation history is NO LONGER per-turn windowed. The old
 # sliding window (_window_history, last 80 msgs) re-shaped the FRONT of the
 # replayed history every turn, which busted prompt caching (a prefix match) on
@@ -251,7 +269,7 @@ def respond(
     )
     try:
         signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
-        allowed = select_tools(signal)
+        allowed = select_tools(signal, gap_open=_self_model_gap_open(persona_dir))
     except Exception:  # noqa: BLE001 — never let recruitment crash a turn; fall back to full suite
         logger.warning("salience/recruitment failed; using full tool suite", exc_info=True)
         signal = None

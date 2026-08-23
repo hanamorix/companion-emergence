@@ -100,7 +100,7 @@ from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
-from brain.self_model.derived import compute_derived
+from brain.self_model.derived import compute_baseline, compute_derived
 from brain.self_model.gap import compute_gap
 from brain.self_model.resolve import (
     check_and_emit_resolution,
@@ -1225,9 +1225,9 @@ def _run_self_model_tick(
          (the cadence survives restart/sleep, mirroring soul review's
          decoupling from the monotonic timers).
       1. Read the recent active emotion-bearing memories.
-      2. declared = aggregate_state(memories)          (existing max-pool peak)
-      3. derived  = compute_derived(memories, body)    (new orthogonal trend)
-      4. gap      = compute_gap(declared, derived)
+      2. short = compute_derived(memories, body)       (recent normalized mean, short half-life)
+      3. long  = compute_baseline(memories)            (baseline normalized mean, long half-life)
+      4. gap   = compute_gap(short, long)              (bidirectional short − long, noise-floored)
       5. Track sustained_ticks vs the prior current_gap; bump the
          gaps_surfaced audit counter while a gap is active.
       6. If gap.magnitude >= threshold → articulate a note via Haiku.
@@ -1286,9 +1286,10 @@ def _self_model_reflect(
     from brain.memory.store import MemoryStore, _row_to_memory
     from brain.utils.memory import days_since_human
 
-    # ── 1-3: read memories, declared + body + derived ───────────────────────
+    # ── 1-3: read memories, body + short/long reads ─────────────────────────
     # Same query as _build_intensity_drivers: the 200 most recent active
-    # emotion-bearing memories. declared = max-pool peak; derived = trend+body.
+    # emotion-bearing memories. aggregate_state (max-pool peak) still feeds the
+    # body-state computation; the gap uses short/long normalized-mean reads.
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -1315,10 +1316,11 @@ def _self_model_reflect(
             now=now,
         )
 
-    derived = compute_derived(
-        memories, body_energy=body.energy, body_exhaustion=body.exhaustion
+    short = compute_derived(
+        memories, body_energy=body.energy, body_exhaustion=body.exhaustion, now=now
     )
-    new_gap = compute_gap(declared, derived)
+    long = compute_baseline(memories, now=now)
+    new_gap = compute_gap(short, long)
 
     # ── 4: load prior state, track sustained ticks ──────────────────────────
     state, _recovered = self_model_state.load_or_recover(persona_dir)

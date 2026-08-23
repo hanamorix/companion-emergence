@@ -145,13 +145,18 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
                 f"{ch}: {delta:+.2f}" for ch, delta in sorted(gap.per_channel.items())
             )
             system = (
-                "You are a companion noticing a gap between what you think you feel "
-                "and what the signs suggest. Write one honest sentence in first person."
+                "You are noticing how some of your feelings have been running lately "
+                "compared to where they usually sit. Write one plain first-person "
+                "sentence about how they've been running: present tense, directional, no "
+                "judgment about whether a feeling is real or performed. Think "
+                "'curiosity's been running quieter than usual this week,' or "
+                "'warmth's been stronger than my baseline lately.'"
             )
             prompt = (
-                f"Channel deltas (derived − declared): {deltas_text}. "
+                f"Recent vs baseline, per channel (positive is running above your "
+                f"baseline lately, negative is below): {deltas_text}. "
                 f"Unnamed pressure: {gap.unnamed_pressure:.2f}. "
-                "What do you notice?"
+                "What's the weather?"
             )
             raw = provider.generate(prompt, system=system)
 
