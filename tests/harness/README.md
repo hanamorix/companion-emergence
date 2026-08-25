@@ -197,6 +197,10 @@ programmatically** from the on-disk transcript.
 (the "one arm = one turn, everything foreground" rule, the two parkable surfaces, and the
 `foreground.py` helpers) that governs how the sequence below must actually be driven.
 
+**Testing an alternate `brain` version?** Read `tests/harness/DROP-IN-RUNBOOK.md` first — the
+end-to-end operator sequence for `ingest_version` + the split-brain startup guards
+(`dropin.py`, `roster_preflight.py`), which this sequence assumes is already wired up.
+
 ```python
 from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, ModelConfig
 from tests.harness.engine import BridgeServer
