@@ -156,7 +156,7 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
                 f"Recent vs baseline, per channel (positive is running above your "
                 f"baseline lately, negative is below): {deltas_text}. "
                 f"Unnamed pressure: {gap.unnamed_pressure:.2f}. "
-                "What's the weather?"
+                "What's the (metaphorical) weather?"
             )
             raw = provider.generate(prompt, system=system)
 
