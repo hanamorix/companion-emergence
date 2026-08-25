@@ -57,6 +57,7 @@ from .dropin import (
 from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
+from .roster_preflight import assert_brain_tools_roster
 from .runner import ArmSpec, Runner, RunnerState
 from .sandbox import (
     HARNESS_EDITABLE_SENTINEL,
@@ -79,6 +80,7 @@ __all__: list[str] = [
     "LIVE_CHECK_RAISE", "LIVE_CHECK_WARN", "LIVE_CHECK_OFF",
     # dropin (code ingestion + split-brain guard)
     "ingest_version", "assert_brain_under_dropin", "DropinBuild", "DropinMismatch",
+    "assert_brain_tools_roster",
     # config
     "ModelConfig", "Timeouts", "DEFAULT_MODELS", "DEFAULT_TIMEOUTS",
     "SYNTHETIC_USER", "PERSONA_NAME",
