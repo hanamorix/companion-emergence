@@ -42,6 +42,46 @@ _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
 
 _BUDGET_FILE = "daily_articulate_budget.json"
 
+# The self-model tick's articulate note is cheap housekeeping — one short
+# sentence, not a chat reply — so it must not inherit the (larger, costlier)
+# persona chat model. Mirrors brain/chat/compaction.py's COMPACTION_MODEL /
+# build_compaction_provider: change this one string to swap the model; the
+# future model-agnostic refactor replaces the whole seam.
+SELF_MODEL_MODEL: str = "haiku"
+
+
+def build_self_model_provider(persona_dir: Path) -> Any:
+    """The provider self-model articulation should use — the persona's
+    provider *kind* but forced to SELF_MODEL_MODEL. For a ``fake`` persona
+    (tests) this resolves to a FakeProvider, so no real CLI is shelled.
+    Call site: brain/bridge/supervisor.py's self-model cadence block, which
+    passes the result into ``_run_self_model_tick`` in place of the persona
+    chat provider — verified the only provider.generate() call anywhere in
+    that tick is this module's ``articulate()``, so scoping the whole tick to
+    this provider is safe."""
+    from brain.bridge.provider import get_provider
+    from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
+
+    name = DEFAULT_PROVIDER
+    cfg = Path(persona_dir) / "persona_config.json"
+    if cfg.exists():
+        name = PersonaConfig.load(cfg).provider
+    return get_provider(name, persona_dir=Path(persona_dir), model_override=SELF_MODEL_MODEL)
+
+
+def _provider_model_label(provider: Any) -> str:
+    """Best-effort ACTUAL model label for the usage log.
+
+    Prefers the provider's own recorded model (``ClaudeCliProvider`` and
+    ``OllamaProvider`` both set ``._model`` from the ``model_override`` passed
+    to ``get_provider``), so the label reflects what really ran. Falls back to
+    SELF_MODEL_MODEL — the constant ``build_self_model_provider`` forces every
+    real call site to use — for providers with no such attribute (e.g.
+    ``FakeProvider`` in tests). Either way this can no longer drift from the
+    model that was actually invoked."""
+    return getattr(provider, "_model", None) or SELF_MODEL_MODEL
+
+
 # ---------------------------------------------------------------------------
 # Budget helpers  (mirror brain/attunement/budget.py)
 # ---------------------------------------------------------------------------
@@ -164,7 +204,12 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
         frame: dict = {}
         if hasattr(raw, "__dict__"):
             frame = raw.__dict__
-        log_usage(persona_dir, call_type="self_model_articulate", model="haiku", frame=frame)
+        log_usage(
+            persona_dir,
+            call_type="self_model_articulate",
+            model=_provider_model_label(provider),
+            frame=frame,
+        )
 
         if not isinstance(raw, str) or not raw.strip():
             return None

@@ -582,10 +582,16 @@ def run_folded(
         # this enable flag only switches the block on/off — the pacing lives
         # in the tick. Fault-isolated so a reflection crash can't take the
         # supervisor down (Organ DoD — the producer fires on the live path).
+        # Cost: pinned to SELF_MODEL_MODEL (haiku) via build_self_model_provider
+        # — the tick's only model call is the articulate note (a one-sentence
+        # housekeeping call), so it must not inherit the persona chat provider.
         if self_model_interval_s is not None:
             try:
+                from brain.self_model.articulate import build_self_model_provider
                 _run_self_model_tick(
-                    persona_dir, provider=provider, event_bus=event_bus
+                    persona_dir,
+                    provider=build_self_model_provider(persona_dir),
+                    event_bus=event_bus,
                 )
             except Exception:
                 logger.exception("supervisor self-model tick raised")
