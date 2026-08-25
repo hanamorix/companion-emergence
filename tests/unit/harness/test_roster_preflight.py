@@ -143,14 +143,16 @@ def test_preflight_raises_on_roster_mismatch(tmp_path: Path, monkeypatch) -> Non
 # --- C9: a tools/call under -P dispatches (production-hardening claim, not just tools/list) --------
 
 
-def _call_tool(argv: list[str], name: str, arguments: dict):
+def _call_tool(argv: list[str], name: str, arguments: dict, *, cwd: str | None = None):
     import os
 
     async def _go():
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
-        params = StdioServerParameters(command=argv[0], args=list(argv[1:]), env=dict(os.environ))
+        params = StdioServerParameters(
+            command=argv[0], args=list(argv[1:]), env=dict(os.environ), cwd=cwd
+        )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -167,3 +169,25 @@ def test_tools_call_under_safe_path_dispatches(tmp_path: Path) -> None:
     # A working dispatch: not an MCP error frame ("no such tool" / import failure would set this).
     assert result.isError is not True, getattr(result, "content", result)
     assert result.content, "expected a tool result payload"
+
+
+def test_tools_call_under_broken_shadow_fails(tmp_path: Path) -> None:
+    """C9 discrimination (ST1.5f): a tools/call whose child resolves a BROKEN shadowed `brain`
+    fails (no result), so the positive assertion above distinguishes a working dispatch from a
+    broken one — not just an always-passing call.
+
+    Construction mirrors the real bug: from a cwd holding a fake top-level `brain/` that raises on
+    import, launch the child WITHOUT `-P` (the pre-#138 argv), so `-m brain.mcp_server` imports the
+    broken shadow, the child dies at startup, and the MCP handshake / tools/call gets no result.
+    The `-P` in the positive test's argv is exactly what prevents this — the pair is the oracle
+    shown able to fail.
+    """
+    persona = _seed_persona(tmp_path)
+    shadow = tmp_path / "shadow"
+    (shadow / "brain").mkdir(parents=True)
+    (shadow / "brain" / "__init__.py").write_text(
+        "raise ImportError('shadowed broken brain')\n", encoding="utf-8"
+    )
+    bad_argv = [sys.executable, "-m", "brain.mcp_server", "--persona-dir", str(persona)]  # no -P
+    with pytest.raises(Exception):  # noqa: B017,PT011 — child dies at import; any failure == no dispatch
+        _call_tool(bad_argv, "list_works", {}, cwd=str(shadow))
