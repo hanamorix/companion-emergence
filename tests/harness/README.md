@@ -193,6 +193,10 @@ programmatically** from the on-disk transcript.
 
 ### The orchestration protocol (what the session executes)
 
+**Read `tests/harness/RUN-ORCHESTRATION.md` first** — the canonical anti-stall contract
+(the "one arm = one turn, everything foreground" rule, the two parkable surfaces, and the
+`foreground.py` helpers) that governs how the sequence below must actually be driven.
+
 ```python
 from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, ModelConfig
 from tests.harness.engine import BridgeServer

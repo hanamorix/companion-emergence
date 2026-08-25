@@ -56,6 +56,19 @@ from .dropin import (
 )
 from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
 from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
+from .foreground import (
+    DRIVE_NOW_BANNER_HEADLINE,
+    ArmBootSpec,
+    ArmSession,
+    ForegroundBootError,
+    PreservationIncomplete,
+    PreserveResult,
+    ToolSideBroken,
+    assert_tool_callable,
+    boot_and_verify,
+    drive_now_banner,
+    preserve_artifacts,
+)
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
 from .roster_preflight import assert_brain_tools_roster
 from .runner import ArmSpec, Runner, RunnerState
@@ -100,4 +113,9 @@ __all__: list[str] = [
     "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply", "drive_ws",
     # runner / watchdog
     "ArmSpec", "Runner", "RunnerState", "Watchdog", "real_ping_fn", "watchdog_ping_argv",
+    # foreground (run-orchestration hardening: the anti-stall helper)
+    "ArmBootSpec", "ArmSession", "PreserveResult",
+    "ForegroundBootError", "ToolSideBroken", "PreservationIncomplete",
+    "boot_and_verify", "assert_tool_callable", "preserve_artifacts", "drive_now_banner",
+    "DRIVE_NOW_BANNER_HEADLINE",
 ]
