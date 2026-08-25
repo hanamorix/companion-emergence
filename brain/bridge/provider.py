@@ -587,6 +587,14 @@ class ClaudeCliProvider(LLMProvider):
         try:
             payload = json.loads(result.stdout)
             log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
+            # #119: the CLI can exit 0 and report the failure inside the frame,
+            # so the returncode guard above never sees it. Without this the error
+            # string was returned as the generation itself — and this is the
+            # Haiku path, so the attunement detector then parsed "Not logged in
+            # · Please run /login" as if it were its classification JSON.
+            cli_err = _cli_error_detail(payload)
+            if cli_err is not None:
+                raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
             return str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(
@@ -1861,6 +1869,14 @@ def _parse_stream_json_result(stdout: str) -> str:
         )
     ):
         raise ProviderError("error_max_budget_usd", result_text or "")
+    # #119: any OTHER is_error frame is a failure, not a reply. Checked after
+    # the over-budget branch above so that frame keeps its dedicated graceful
+    # path — it carries real partial work. Without this the error text was
+    # returned as the assistant reply and persisted as a companion turn.
+    if result_frame is not None:
+        cli_err = _cli_error_detail(result_frame)
+        if cli_err is not None:
+            raise ProviderError("claude_cli_error", cli_err)
     if result_text is not None:
         return result_text
     if assistant_chunks:
