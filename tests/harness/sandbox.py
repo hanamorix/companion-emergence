@@ -269,6 +269,47 @@ def _claude_session_log_excludes() -> list[Path]:
     return [base / name for name in (*_CLAUDE_SESSION_LOG_DIRS, *_CLAUDE_SESSION_LOG_FILES)]
 
 
+# --- claude-code ORCHESTRATOR server-pushed housekeeping files (#158) -----------------------------
+# NOT session-runtime logs: these are Anthropic-server-pushed CLI CONFIG that the `claude` CLI
+# rewrites under the real ~/.claude on essentially every invocation — including the orchestrator's
+# own session and its subprocess calls — bumping mtime even when the bytes are UNCHANGED. (Measured
+# 2026-08-27: one `claude -p` bumped both files' mtime with identical size/content; ~/.claude is
+# content-hashed, but mtime_ns is part of the fingerprint tuple, so the bump alone trips the guard
+# on EVERY orchestrator-driven run.) They are the ORCHESTRATOR's real CLI config, never companion
+# state: the sandboxed subject's own policy-limits/remote-settings live under the tempdir
+# CLAUDE_CONFIG_DIR.
+#
+# We make ONLY these two top-level files MTIME-INSENSITIVE (drop mtime_ns from the fingerprint entry)
+# while KEEPING their content sha256 — so a benign mtime-only bump is silent, but a genuine CONTENT
+# change still flips the fingerprint and surfaces at the SAME option-(c) "warn" floor every other
+# ~/.claude path gets. We deliberately do NOT name-EXCLUDE them (unlike the F4 session logs above):
+# the sandboxed Canary CAN write an absolute ~/.claude path (the generate/chat provider paths run
+# `--dangerously-skip-permissions` with no tool disallow-list — see the OWNER-ACCEPTED RISK note in
+# the post-run block), so a FULL prune would drop these two files below the owner-ratified "warn"
+# floor to fully silent on a real write. Content-aware narrowing fixes the false positive (which is
+# purely the mtime bump on unchanged bytes) WITHOUT that detection loss, and touches none of the
+# raise-vs-warn logic. TARGETED to two exact top-level paths (a same-basename file in a ~/.claude
+# subdir is matched by resolved path, not basename, so it stays fully mtime-guarded).
+_CLAUDE_CLI_HOUSEKEEPING_FILES = (
+    "policy-limits.json",
+    "remote-settings.json",
+)
+
+
+def _claude_cli_housekeeping_files() -> list[Path]:
+    """Absolute ~/.claude paths whose fingerprint entry is mtime-insensitive but content-sensitive.
+
+    Server-pushed CLI config the `claude` CLI rewrites (mtime-bump) every run; we ignore the mtime
+    axis for exactly these top-level paths while keeping the content sha256, so the benign churn is
+    silent but a genuine content change still surfaces (#158). Derived by NAME under the REAL
+    ``Path.home()/".claude"`` — an absent file is a harmless no-op (nothing to match). These ride the
+    ``_fingerprint(..., mtime_insensitive=...)`` path, NOT the exclude allowlist — every other
+    ~/.claude path (and a same-basename file in any subdir) stays fully mtime-guarded.
+    """
+    base = Path.home() / ".claude"
+    return [base / name for name in _CLAUDE_CLI_HOUSEKEEPING_FILES]
+
+
 def _documents_dir() -> Path:
     """The user's Documents dir, resolved via the SAME resolver the engine uses for the real notes
     folder (``platformdirs.user_documents_dir`` — see ``brain/notes/config.py:resolve_notes_folder``).
@@ -369,7 +410,11 @@ def _hash_critical(root: Path) -> bool:
 
 
 def _fingerprint(
-    root: Path, exclude: Iterable[Path] | None = None, *, hash_content: bool = False
+    root: Path,
+    exclude: Iterable[Path] | None = None,
+    *,
+    hash_content: bool = False,
+    mtime_insensitive: Iterable[Path] | None = None,
 ) -> dict:
     """Recursive {relpath -> (size, mtime_ns[, sha256])} for a root. Missing root -> empty map.
 
@@ -382,11 +427,26 @@ def _fingerprint(
     unresolved equality; the equivalence at the one pre-existing (canonical, non-symlinked) call
     site is unchanged. ``hash_content`` adds a content sha256 for small files so a
     same-size+same-mtime in-place overwrite is still detected (M1).
+
+    ``mtime_insensitive`` (#158) is a set of individual FILE paths whose entry drops ``mtime_ns``
+    (recorded as ``(size, None, sha256)``) so a benign mtime-only bump with identical bytes does not
+    flip the fingerprint, while a genuine size/content change still does. Honored ONLY when
+    ``hash_content`` is True — without the content hash, dropping mtime would leave a size-only
+    entry, too weak to be a fingerprint. Matched by **resolved path** (name-prefiltered like
+    ``exclude``): only the exact named files are affected; a same-basename file elsewhere keeps its
+    normal mtime-sensitive entry. Used for the server-pushed CLI housekeeping files under
+    ``~/.claude`` (:func:`_claude_cli_housekeeping_files`).
     """
     fp: dict = {}
     if not root.exists():
         return fp
     excludes = {e.resolve() for e in exclude} if exclude else set()
+    # #158: files under this root whose entry ignores mtime (content-sensitive only). Name-prefilter
+    # mirrors ``exclude`` — resolve() only to confirm a name candidate, no per-file syscall otherwise.
+    mtime_ins = (
+        {m.resolve() for m in mtime_insensitive} if (mtime_insensitive and hash_content) else set()
+    )
+    mtime_ins_names = {m.name for m in mtime_ins}
     # Cheap pre-filter for the per-FILE exclusion: only the basenames of excluded paths can match a
     # file, so we skip the expensive f.resolve() syscall for every file whose name isn't even a
     # candidate. A name collision (a kept file sharing a basename with an excluded path elsewhere) is
@@ -413,7 +473,14 @@ def _fingerprint(
                 continue
             entry: tuple = (st.st_size, st.st_mtime_ns)
             if hash_content:
-                entry = (st.st_size, st.st_mtime_ns, _content_hash(f))
+                # #158: for a mtime-insensitive file, null the mtime slot (keep size + sha256) so a
+                # benign mtime-only bump is invisible but a content/size change still shows. Exact
+                # resolved-path match (name candidate first) — a same-basename file elsewhere is
+                # unaffected and keeps its mtime.
+                if mtime_ins_names and name in mtime_ins_names and f.resolve() in mtime_ins:
+                    entry = (st.st_size, None, _content_hash(f))
+                else:
+                    entry = (st.st_size, st.st_mtime_ns, _content_hash(f))
             # as_posix(), not str(): str(Path) gives OS-native separators, so the same tree
             # keyed 'keep/present.txt' here and 'keep\present.txt' on Windows. The map is only
             # ever compared against another map from the same run, so the logic never cared —
@@ -840,6 +907,11 @@ def sandbox(
                     gr,
                     exclude=ex or None,
                     hash_content=_hash_critical(gr),
+                    # #158: only the real ~/.claude root gets the server-pushed CLI housekeeping
+                    # files made mtime-insensitive (content still guarded). Every other root: None.
+                    mtime_insensitive=(
+                        _claude_cli_housekeeping_files() if gr == claude_root else None
+                    ),
                 )
             for nr in notes_roots:
                 snap[f"notes:{nr}"] = _shallow_notes_fingerprint(

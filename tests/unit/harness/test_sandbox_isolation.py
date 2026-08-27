@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from pathlib import Path
 
 import pytest
@@ -27,8 +28,10 @@ from tests.harness import (
 )
 from tests.harness.config import SYNTHETIC_USER
 from tests.harness.sandbox import (
+    _CLAUDE_CLI_HOUSEKEEPING_FILES,
     _CLAUDE_SESSION_LOG_DIRS,
     _CLAUDE_SESSION_LOG_FILES,
+    _claude_cli_housekeeping_files,
     _claude_session_log_excludes,
     _fingerprint,
     _guarded_roots,
@@ -617,3 +620,186 @@ def test_synthetic_user_sourced_from_config_not_hardcoded(
     with sandbox():
         assert os.environ["USER"] == "Zzz"
         assert os.environ["LOGNAME"] == "Zzz"
+
+
+# --- #158: server-pushed CLI housekeeping files are MTIME-insensitive but CONTENT-sensitive --------
+# The orchestrator `claude` CLI rewrites ~/.claude/policy-limits.json + remote-settings.json on every
+# run, bumping mtime with identical bytes → a guaranteed-spurious ~/.claude fingerprint flip. We make
+# ONLY these two top-level files mtime-insensitive while keeping their content hash: the benign mtime
+# bump is silent, but a genuine content change still surfaces at the option-(c) "warn" floor.
+
+
+def _seed_housekeeping_files(fake_home: Path) -> dict[str, os.stat_result]:
+    """Pre-create both server-pushed CLI housekeeping files with initial bytes; return their stats."""
+    claude = fake_home / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    stats: dict[str, os.stat_result] = {}
+    for name in _CLAUDE_CLI_HOUSEKEEPING_FILES:
+        p = claude / name
+        p.write_text("{}")
+        stats[name] = p.stat()
+    return stats
+
+
+def test_cli_housekeeping_mtime_bump_is_silent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G1 (core FP fix): an mtime-ONLY bump (identical bytes) of the two housekeeping files under
+    ~/.claude produces a CLEAN exit — no SandboxLeak, no RuntimeWarning. This is the bug being killed.
+
+    Oracle-can-fail preface: an mtime-SENSITIVE `_fingerprint(hash_content=True)` (no
+    `mtime_insensitive=`) DOES change on the same bump — proving the churn would trip pre-fix and the
+    silence below is the new mtime-insensitive path, not a no-op.
+    """
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+    claude = fake_home / ".claude"
+    stats = _seed_housekeeping_files(fake_home)
+
+    # Oracle-can-fail: mtime-sensitive fingerprint flips on an mtime-only bump.
+    before_sensitive = _fingerprint(claude, hash_content=True)
+    for name, st in stats.items():
+        os.utime(claude / name, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    after_sensitive = _fingerprint(claude, hash_content=True)
+    assert after_sensitive != before_sensitive, "mtime bump must flip the mtime-SENSITIVE fingerprint"
+
+    # The real run: bump both files' mtime (identical bytes) inside sandbox() → silent.
+    fresh = {name: (claude / name).stat() for name in _CLAUDE_CLI_HOUSEKEEPING_FILES}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with sandbox() as sb:
+            _ = sb.root
+            for name, st in fresh.items():
+                os.utime(claude / name, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    guard_warnings = [
+        w for w in caught
+        if issubclass(w.category, RuntimeWarning)
+        and ("DOWNGRADED" in str(w.message) or "guarded real-home root" in str(w.message))
+    ]
+    assert not guard_warnings, f"mtime-only churn must be silent, got: {[str(w.message) for w in guard_warnings]}"
+
+
+def test_cli_housekeeping_content_change_still_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G1b (content-aware floor preserved): a genuine CONTENT change to a housekeeping file still
+    surfaces as the option-(c) RuntimeWarning — only the mtime axis is silenced, not the content axis.
+    This is the property a full name-prune could NOT provide; content-aware makes it testable.
+
+    Direct-`_fingerprint` half (oracle-can-fail for the content axis): with
+    `mtime_insensitive=_claude_cli_housekeeping_files()`, a CONTENT rewrite still changes the entry.
+    """
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+    claude = fake_home / ".claude"
+    _seed_housekeeping_files(fake_home)
+
+    # Oracle-can-fail (content axis): even with mtime-insensitivity, a content change flips the entry.
+    ins = _claude_cli_housekeeping_files()
+    before = _fingerprint(claude, hash_content=True, mtime_insensitive=ins)
+    (claude / "policy-limits.json").write_text('{"restrictions": {"tampered": true}}')
+    after = _fingerprint(claude, hash_content=True, mtime_insensitive=ins)
+    assert after != before, "a CONTENT change must flip the entry even when mtime is ignored"
+
+    # In a real run: a content rewrite of a housekeeping file still warns (detection floor intact).
+    _seed_housekeeping_files(fake_home)  # reset to known bytes
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox() as sb:
+            _ = sb.root
+            (claude / "policy-limits.json").write_text('{"restrictions": {"tampered": true}}')
+
+
+def test_non_housekeeping_claude_file_still_surfaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G2 + G4 (targeted, fail-closed): the mtime-insensitivity is scoped to the two named files.
+    A non-housekeeping file (settings.json) and a THIRD non-named top-level json (some-other.json)
+    are both still fingerprinted mtime-sensitively → surface as the option-(c) warning."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox() as sb:
+            _ = sb.root
+            (fake_home / ".claude" / "settings.json").write_text("leaked config")
+
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox() as sb:
+            _ = sb.root
+            (fake_home / ".claude" / "some-other.json").write_text("not on the mtime-insensitive set")
+
+
+def test_same_basename_in_subdir_stays_mtime_guarded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G4b (top-level only): a same-BASENAME file in a ~/.claude SUBDIR
+    (~/.claude/plugins/policy-limits.json) is matched by RESOLVED PATH, not basename — so it keeps its
+    normal mtime-SENSITIVE entry. An mtime-only bump of that nested file is still detected (warns),
+    while the exact top-level path is mtime-insensitive."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+    claude = fake_home / ".claude"
+    nested = claude / "plugins" / "policy-limits.json"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text("{}")
+    nst = nested.stat()
+
+    # Direct-_fingerprint scope pin: top-level policy-limits.json is mtime-insensitive; the nested
+    # same-basename file is NOT (its entry changes on an mtime-only bump).
+    _seed_housekeeping_files(fake_home)
+    ins = _claude_cli_housekeeping_files()
+    top = claude / "policy-limits.json"
+    tst = top.stat()
+    before = _fingerprint(claude, hash_content=True, mtime_insensitive=ins)
+    os.utime(top, ns=(tst.st_atime_ns, tst.st_mtime_ns + 1_000_000_000))  # top-level: should be ignored
+    os.utime(nested, ns=(nst.st_atime_ns, nst.st_mtime_ns + 1_000_000_000))  # nested: should be seen
+    after = _fingerprint(claude, hash_content=True, mtime_insensitive=ins)
+    assert after["policy-limits.json"] == before["policy-limits.json"], "top-level entry must ignore mtime"
+    assert (
+        after["plugins/policy-limits.json"] != before["plugins/policy-limits.json"]
+    ), "nested same-basename file must stay mtime-sensitive"
+
+    # And in a real run, the nested-file mtime bump surfaces as the option-(c) warning.
+    nst2 = nested.stat()
+    with pytest.warns(RuntimeWarning, match="DOWNGRADED to a warning"):
+        with sandbox() as sb:
+            _ = sb.root
+            os.utime(nested, ns=(nst2.st_atime_ns, nst2.st_mtime_ns + 5_000_000_000))
+
+
+def test_housekeeping_churn_alongside_real_escape_still_hard_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G3 (safety): the mtime-insensitivity never masks a real non-~/.claude escape moving in the same
+    run — the two housekeeping files churn (mtime bump) AND a fingerprinted extra guard root is
+    mutated → the diff is not [claude_root] alone → still hard-raises SandboxLeak."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    fake_home = tmp_path / "fake-home"
+    claude = fake_home / ".claude"
+    stats = _seed_housekeeping_files(fake_home)
+    guarded = tmp_path / "guarded-root"
+    guarded.mkdir()
+
+    with pytest.raises(SandboxLeak):
+        with sandbox(extra_guard_roots=[guarded]) as sb:
+            _ = sb.root
+            for name, st in stats.items():
+                os.utime(claude / name, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+            (guarded / "escaped.txt").write_text("a real Canary escape alongside the benign CLI churn")
+
+
+def test_cli_housekeeping_constant_and_helper_pinned() -> None:
+    """G5 + G6: the housekeeping constant is exactly the two files; the helper derives exactly those
+    two under ~/.claude; and they ride the mtime-insensitive path, NOT the exclude allowlist nor the
+    F4 session-log set (preserves the semantic split + keeps test_af2_exclusion_set_unchanged valid).
+    """
+    assert _CLAUDE_CLI_HOUSEKEEPING_FILES == ("policy-limits.json", "remote-settings.json")
+    base = Path.home() / ".claude"
+    assert set(_claude_cli_housekeeping_files()) == {base / n for n in _CLAUDE_CLI_HOUSEKEEPING_FILES}
+    # NOT in the session-log set nor the exclude list — they are content-guarded, not pruned.
+    for name in _CLAUDE_CLI_HOUSEKEEPING_FILES:
+        assert name not in _CLAUDE_SESSION_LOG_FILES
+        assert name not in _CLAUDE_SESSION_LOG_DIRS
+    excluded_names = {e.name for e in _claude_session_log_excludes()}
+    for name in _CLAUDE_CLI_HOUSEKEEPING_FILES:
+        assert name not in excluded_names, f"{name} must NOT be name-excluded (it is content-guarded)"
