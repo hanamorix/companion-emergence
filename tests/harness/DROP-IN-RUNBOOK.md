@@ -40,6 +40,40 @@ there is only one `brain` to resolve, by construction.
 - Only one harness server against a given `dest` at a time (see the serial-use precondition in
   section 3a) — this matches the standing "one harness server at a time" operating rule.
 
+## 2a. Authentication (the `claude` CLI OAuth token)
+
+The booted server spends tokens through the `claude` CLI, which needs `CLAUDE_CODE_OAUTH_TOKEN` in
+its environment. The bridge spawns the CLI via `brain/bridge/provider.py:_subprocess_env`, which
+copies the server process's `os.environ` (scrubbing only `CAVEMAN_*`), so **whatever auth env the
+server process holds reaches the CLI**. The job is therefore to get the token into the launching
+process's env.
+
+**Durable, portable setup (do this once).** Put the token in a `settings.json` `env` entry, ideally
+sourced from a long-lived `claude setup-token` (a plain interactive OAuth token expires in hours; a
+setup-token is long-lived — the right choice for unattended/overnight arms):
+
+```jsonc
+// e.g. .claude/settings.json used by the launch
+{ "env": { "CLAUDE_CODE_OAUTH_TOKEN": "<token from `claude setup-token`>" } }
+```
+
+Once set, every non-interactive launch inherits it, with **no per-run `env`-forwarding trick in the
+launcher**. This is the portable setup any operator (including on another machine) applies once —
+prefer it over recovering the token from a shell profile inside the launcher, which is
+machine-specific and must not be baked into the tracked harness.
+
+**Which path forwards the token:**
+- **Normal external / poll-mode boot** (`build.python live_server.py`, or an external launcher such
+  as `run_arm.sh`, driven via `boot_and_verify(boot_cmd=None)`) — **the dominant path.** Here
+  `boot_and_verify` only polls for READY; it does **not** launch the server, so it cannot forward
+  anything. The token must already be present in the launcher's env — use the `settings.json env`
+  setup above.
+- **Harness `boot_cmd`-mode launch** (a Python caller passing `boot_cmd=` to `boot_and_verify`).
+  Only here does `boot_and_verify` forward `CLAUDE_CODE_OAUTH_TOKEN` from the launching env into the
+  `boot_cmd` subprocess's curated env (via `tests.harness.forward_cli_auth_token`), so a curated
+  `env=` that omitted the token does not silently deauth the launch. This reaches the eventual
+  server only if `boot_cmd` does not itself scrub/replace its env.
+
 ## 3. The sequence
 
 All of steps (a)-(c) happen once, before any token is spent. Step (d) is the arm itself

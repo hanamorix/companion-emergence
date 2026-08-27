@@ -12,6 +12,7 @@ network -- runs under the default (non-live) marker set.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -406,7 +407,140 @@ def test_all_new_symbols_importable_and_in_all() -> None:
         "preserve_artifacts",
         "drive_now_banner",
         "DRIVE_NOW_BANNER_HEADLINE",
+        "forward_cli_auth_token",
     ]
     for name in names:
         assert hasattr(harness, name), f"tests.harness has no attribute {name!r}"
         assert name in harness.__all__, f"{name!r} missing from tests.harness.__all__"
+
+
+# --- #159: forward the CLI auth-token env KEY into a curated server-launch env ---------------------
+#
+# Mechanical facts only. The token VALUE is never a real token: a SENTINEL is used and the tests
+# assert the KEY is forwarded (value-equality against the sentinel), never a real credential.
+
+_AUTH_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
+_SENTINEL = "sentinel-not-a-real-token"  # noqa: S105 -- a fixed non-secret test marker, not a credential
+
+
+def test_forward_cli_auth_token_forwards_when_present() -> None:
+    """C1: key present in source -> returned dict carries it (value == the sentinel)."""
+    src = {_AUTH_KEY: _SENTINEL, "OTHER": "1"}
+    out = fg.forward_cli_auth_token({"CE_DROPIN_REPO": "x"}, source=src)
+
+    assert out[_AUTH_KEY] == src[_AUTH_KEY]
+    assert out["CE_DROPIN_REPO"] == "x"
+
+
+def test_forward_cli_auth_token_unchanged_when_absent() -> None:
+    """C2: key absent from source -> returned dict lacks it, everything else unchanged.
+
+    Oracle can-fail: an 'always-inject' impl would add the key here and fail this assertion.
+    """
+    env = {"CE_DROPIN_REPO": "x", "PATH": "/bin"}
+    out = fg.forward_cli_auth_token(env, source={"OTHER": "1"})
+
+    assert _AUTH_KEY not in out
+    assert out == env
+
+
+def test_forward_cli_auth_token_does_not_mutate_inputs() -> None:
+    """C3: neither the env arg nor the source dict is mutated; result is a distinct object."""
+    env = {"CE_DROPIN_REPO": "x"}
+    src = {_AUTH_KEY: _SENTINEL}
+    env_before = dict(env)
+    src_before = dict(src)
+
+    out = fg.forward_cli_auth_token(env, source=src)
+
+    assert env == env_before
+    assert src == src_before
+    assert out is not env
+
+
+def test_forward_cli_auth_token_default_source_is_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C4: with source omitted, the token is read from os.environ (present and absent cases)."""
+    monkeypatch.setenv(_AUTH_KEY, _SENTINEL)
+    out_present = fg.forward_cli_auth_token({"CE_DROPIN_REPO": "x"})
+    assert out_present[_AUTH_KEY] == _SENTINEL
+
+    monkeypatch.delenv(_AUTH_KEY, raising=False)
+    out_absent = fg.forward_cli_auth_token({"CE_DROPIN_REPO": "x"})
+    assert _AUTH_KEY not in out_absent
+
+
+def _patch_run_capturing_env(
+    monkeypatch: pytest.MonkeyPatch, run_dir: Path, captured: dict
+) -> None:
+    """Patch fg.subprocess.run to CAPTURE the env kwarg (not execute) and satisfy the post-run
+    READY freshness + payload checks by writing a fresh READY at capture time."""
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003 -- test stub mirrors subprocess.run
+        captured["env"] = kwargs.get("env")
+        _write_ready(run_dir, {"brain_repo": "x"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(fg.subprocess, "run", _fake_run)
+
+
+def test_boot_and_verify_forwards_token_into_curated_launch_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C5: with the token in os.environ and a curated env= LACKING it, the env handed to
+    subprocess.run carries the token KEY (== sentinel) while the caller's other keys survive.
+
+    Exercises the REAL boot_and_verify governed path (subprocess.run(env=...)), captured not run.
+    """
+    monkeypatch.setenv(_AUTH_KEY, _SENTINEL)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    captured: dict = {}
+    _patch_run_capturing_env(monkeypatch, run_dir, captured)
+
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    fg.boot_and_verify(spec, boot_cmd=["true"], env={"CE_DROPIN_REPO": "x"})
+
+    assert captured["env"][_AUTH_KEY] == _SENTINEL
+    assert captured["env"]["CE_DROPIN_REPO"] == "x"  # forwarding adds the token, does not replace env
+
+
+def test_boot_and_verify_launch_env_unchanged_when_parent_lacks_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C6: with NO token in os.environ, the curated env handed to subprocess.run lacks the key and
+    equals the caller-supplied env (behavior-unchanged half)."""
+    monkeypatch.delenv(_AUTH_KEY, raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    captured: dict = {}
+    _patch_run_capturing_env(monkeypatch, run_dir, captured)
+
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    fg.boot_and_verify(spec, boot_cmd=["true"], env={"CE_DROPIN_REPO": "x"})
+
+    assert _AUTH_KEY not in captured["env"]
+    assert captured["env"] == {"CE_DROPIN_REPO": "x"}
+
+
+def test_boot_and_verify_error_does_not_leak_forwarded_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C7 (automated slice): the forwarded token VALUE never appears in the ForegroundBootError
+    raised on a non-zero boot. The error path carries boot_cmd + the subprocess stderr tail, not
+    the env, so a token forwarded into the launch env does not leak through the exception."""
+    monkeypatch.setenv(_AUTH_KEY, _SENTINEL)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def _fail_run(cmd, **kwargs):  # noqa: ANN001, ANN003 -- test stub mirrors subprocess.run
+        # Precondition: the token WAS forwarded into the curated launch env (else the test would
+        # pass vacuously). The process then fails with unrelated stderr.
+        assert kwargs["env"][_AUTH_KEY] == _SENTINEL
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom: unrelated failure")
+
+    monkeypatch.setattr(fg.subprocess, "run", _fail_run)
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    with pytest.raises(fg.ForegroundBootError) as excinfo:
+        fg.boot_and_verify(spec, boot_cmd=["false"], env={"CE_DROPIN_REPO": "x"})
+
+    assert _SENTINEL not in str(excinfo.value)

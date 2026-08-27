@@ -39,9 +39,10 @@ This module hardcodes no gitignored path: ``boot_cmd``, ``source``/turn_diag loc
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +50,35 @@ DRIVE_NOW_BANNER_HEADLINE = "▶ DRIVE NOW, IN THIS SAME TURN — do not end you
 
 _POLL_INTERVAL = 0.1
 _READY_NAME = "READY"
+_CLI_AUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def forward_cli_auth_token(
+    env: Mapping[str, str], *, source: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Return a copy of ``env`` with the ``claude`` CLI auth token forwarded from ``source``.
+
+    ``source`` defaults to ``os.environ``. If ``CLAUDE_CODE_OAUTH_TOKEN`` is present in ``source``
+    it is set on the returned dict, so a server subprocess launched with this curated env inherits
+    the harness's auth without a run script re-injecting it; if absent, the copy is returned
+    unchanged (behavior is unchanged and the key is not invented). This is the reusable forwarding
+    primitive a Python launch path can build its curated launch env through; it only helps the
+    harness's own ``boot_cmd``-mode launch (a bash launcher cannot call it, and the recommended
+    poll-mode/external server boot makes the token present via the settings.json env setup instead
+    -- see DROP-IN-RUNBOOK.md).
+
+    SECURITY: this only copies the token VALUE between dicts; it is never logged, printed, or
+    otherwise emitted. Blast-radius note: forwarding a real token into a ``boot_cmd`` subprocess's
+    env widens where the value can travel to *anything that subprocess itself prints*. On a boot
+    failure :class:`ForegroundBootError` includes the subprocess ``stderr`` tail (not its env), so a
+    ``boot_cmd`` that dumps its own environment to stderr (e.g. ``set -x``, a crash/env dump) could
+    surface the token there. Do not hand this helper's output to a ``boot_cmd`` that echoes its env.
+    """
+    src = os.environ if source is None else source
+    out = dict(env)
+    if _CLI_AUTH_TOKEN_ENV in src:
+        out[_CLI_AUTH_TOKEN_ENV] = src[_CLI_AUTH_TOKEN_ENV]
+    return out
 
 
 @dataclass(frozen=True)
@@ -132,7 +162,13 @@ def boot_and_verify(
 
     1. If ``boot_cmd`` is given: a start timestamp is captured BEFORE ``subprocess.run``, then it
        is run via ``subprocess.run(boot_cmd, timeout=ready_timeout)`` -- FOREGROUND, blocking,
-       bounded. A non-zero exit or a timeout raises :class:`ForegroundBootError` in-turn; it
+       bounded. When a caller supplies a curated ``env`` (``env is not None``), the
+       ``CLAUDE_CODE_OAUTH_TOKEN`` key is forwarded from the launching env into it (via
+       :func:`forward_cli_auth_token`) so the launched process is not silently deauthed by a
+       curated env that omitted it; this only reaches the eventual server if ``boot_cmd`` does not
+       scrub its own env. ``env=None`` is passed through untouched (the subprocess inherits
+       ``os.environ``, which already carries the token if set). A non-zero exit or a timeout raises
+       :class:`ForegroundBootError` in-turn; it
        never hangs. After a successful (exit-0) boot, the same stale-READY guard as the poll
        branch applies: ``<run_dir>/READY`` must exist AND its mtime must be ``>=`` the captured
        start, else :class:`ForegroundBootError` is raised -- a leftover ``READY`` from a reused
@@ -168,11 +204,17 @@ def boot_and_verify(
     boot_start: float | None = None
     if boot_cmd is not None:
         boot_start = time.time()
+        # Forward the CLI auth token into a CURATED launch env only: a caller-supplied ``env``
+        # replaces os.environ wholesale for the subprocess, so it can silently drop the token.
+        # When ``env is None`` the subprocess inherits os.environ (token already present if set),
+        # so it is passed through untouched -- no snapshot is taken. The token only reaches the
+        # eventual server if ``boot_cmd`` does not itself scrub/replace its env (e.g. ``env -i``).
+        launch_env = forward_cli_auth_token(env) if env is not None else None
         try:
             proc = subprocess.run(
                 list(boot_cmd),
                 cwd=cwd,
-                env=env,
+                env=launch_env,
                 timeout=spec.ready_timeout,
                 capture_output=True,
                 text=True,

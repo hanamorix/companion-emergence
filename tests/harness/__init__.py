@@ -67,6 +67,7 @@ from .foreground import (
     assert_tool_callable,
     boot_and_verify,
     drive_now_banner,
+    forward_cli_auth_token,
     preserve_artifacts,
 )
 from .incident import IncidentResult, IncidentSpec, build_compacted_state
@@ -117,5 +118,5 @@ __all__: list[str] = [
     "ArmBootSpec", "ArmSession", "PreserveResult",
     "ForegroundBootError", "ToolSideBroken", "PreservationIncomplete",
     "boot_and_verify", "assert_tool_callable", "preserve_artifacts", "drive_now_banner",
-    "DRIVE_NOW_BANNER_HEADLINE",
+    "DRIVE_NOW_BANNER_HEADLINE", "forward_cli_auth_token",
 ]
