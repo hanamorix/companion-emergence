@@ -345,7 +345,9 @@ def _apply_memory_writes(writes: list[MemoryWrite], persona_dir: Path) -> None:
                 domain="monologue",
                 importance=w.salience * 10.0,  # 0..1 → 0..10 scale
             )
-            store.create(mem)
+            from brain.memory.pending import route_write
+
+            route_write(store, mem, source="extractor")
     finally:
         store.close()
 
@@ -421,7 +423,9 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
             emotions=emotions,
             importance=max(emotions.values()),
         )
-        store.create(mem)
+        from brain.memory.pending import route_write
+
+        route_write(store, mem, source="extractor")
     finally:
         store.close()
 
@@ -559,7 +563,9 @@ def _apply_crystallisation(candidates: list[CrystallisationCandidate], persona_d
                 domain="monologue",
                 importance=c.importance * 1.0,  # extractor-scored 1-10; 0..10 MemoryStore scale
             )
-            store.create(mem)
+            from brain.memory.pending import route_write
+
+            route_write(store, mem, source="extractor")
             item = ExtractedItem(
                 text=combined,
                 label="observation",

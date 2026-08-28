@@ -151,3 +151,7 @@ hooks/leak-rules.local
 docs/guarded-change/
 CLAUDE.local.md
 CLAUDE.local.history.md
+
+# temp consolidation-gate queue (Root 2 stopgap) — never committed
+pending_candidates.jsonl
+pending_candidates.jsonl.lock

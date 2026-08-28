@@ -274,7 +274,9 @@ class DreamEngine:
                 "provider": self.provider.name(),
             },
         )
-        self.store.create(dream)
+        from brain.memory.pending import route_write
+
+        route_write(self.store, dream, source="dream")
         return dream
 
     def _strengthen_edges(

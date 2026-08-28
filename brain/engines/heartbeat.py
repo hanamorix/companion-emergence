@@ -488,6 +488,23 @@ class HeartbeatEngine:
         else:
             persona_dir = self.state_path.parent
 
+        # Consolidation gate — runs FIRST (before reflex/dream/research) so each
+        # idle cycle consolidates the accumulated pending-candidate queue before
+        # the generative engines produce the next cycle's candidates. Fault-
+        # isolated: a gate failure must not abort the tick. TEMP (Root 2 stopgap).
+        if not dry_run:
+            try:
+                from brain.engines.consolidation import run_consolidation
+
+                run_consolidation(
+                    self.store,
+                    persona_dir=persona_dir,
+                    provider=self.provider,
+                    hebbian=self.hebbian,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("consolidation gate raised; continuing tick")
+
         # Reflex evaluation (runs before dream gate so reflex outputs can seed dreams)
         reflex_fired, reflex_skipped_count, reflex_error = self._try_fire_reflex(
             trigger, dry_run, config
@@ -940,7 +957,9 @@ class HeartbeatEngine:
                 "provider": self.provider.name(),
             },
         )
-        self.store.create(mem)
+        from brain.memory.pending import route_write
+
+        route_write(self.store, mem, source="heartbeat")
         return mem.id
 
     # --- daemon_state write helpers (all fault-isolated) ---
@@ -952,7 +971,21 @@ class HeartbeatEngine:
         Falls back to 'curiosity'/'5' when the dict is missing or empty.
         """
         try:
-            mem = self.store.get(dream_id)
+            # The just-fired dream is a GATED candidate in the pending queue,
+            # not a memories.db row yet — read it there (fall back to the store
+            # in case it was promoted/bypassed). TEMP (Root 2 stopgap).
+            from brain.memory.pending import PendingQueue
+
+            mem = next(
+                (
+                    c
+                    for c in PendingQueue(self.store.persona_dir).read_recent("dream", limit=10)
+                    if c.id == dream_id
+                ),
+                None,
+            )
+            if mem is None:
+                mem = self.store.get(dream_id)
             if mem is None:
                 return
             dominant_emotion, intensity = self._peak_emotion(mem.emotions)
@@ -979,7 +1012,16 @@ class HeartbeatEngine:
         """
         try:
             arc_name = fired_arcs[0] if fired_arcs else "reflex"
-            reflex_mems = self.store.list_by_type("reflex_journal", active_only=True, limit=1)
+            # reflex_journal is a GATED type — the just-fired reflex memory is in
+            # the pending queue, not memories.db. Read it there (fall back to the
+            # store). TEMP (Root 2 stopgap).
+            from brain.memory.pending import PendingQueue
+
+            reflex_mems = PendingQueue(self.store.persona_dir).read_recent("reflex_journal", limit=1)
+            if not reflex_mems:
+                reflex_mems = self.store.list_by_type(
+                    "reflex_journal", active_only=True, limit=1
+                )
             if reflex_mems:
                 mem = reflex_mems[0]
                 dominant_emotion, intensity = self._peak_emotion(mem.emotions)
@@ -1011,7 +1053,14 @@ class HeartbeatEngine:
         to a synthetic entry keyed on the topic string if none is found.
         """
         try:
-            research_mems = self.store.list_by_type("research", active_only=True, limit=1)
+            # research is a GATED type — the just-fired research memory is in the
+            # pending queue, not memories.db. Read it there (fall back to store).
+            # TEMP (Root 2 stopgap).
+            from brain.memory.pending import PendingQueue
+
+            research_mems = PendingQueue(self.store.persona_dir).read_recent("research", limit=1)
+            if not research_mems:
+                research_mems = self.store.list_by_type("research", active_only=True, limit=1)
             if research_mems:
                 mem = research_mems[0]
                 dominant_emotion, intensity = self._peak_emotion(mem.emotions)

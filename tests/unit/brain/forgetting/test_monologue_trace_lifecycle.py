@@ -1,11 +1,27 @@
 """monologue_trace is picked up by the forgetting engine like any memory:
-FADE blurs verbatim→summary, LOSE forgets it (graveyard + grief)."""
+FADE blurs verbatim→summary, LOSE forgets it (graveyard + grief).
+
+CATEGORY-B (memory-consolidation migration): monologue_trace is now a GATED type,
+so write_trace_memory ENQUEUES an ephemeral pending-candidate instead of writing a
+memories.db row. A candidate is never a store row, so the forgetting engine never
+sees it: it does not FADE, is not LOST/graveyarded, and the recall keep-sharp bump
+is a no-op. The DB-fade/recall lifecycle these two tests encode is deferred to
+Phase 4 (Root 2 stopgap). Marked xfail(strict) rather than deleted so the deferred
+behavior stays visible; revisit when the trace lifecycle is reinstated."""
 import json
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from brain.forgetting import run_pass
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import write_trace_memory
+
+_TRACE_LIFECYCLE_DEFERRED = (
+    "trace lifecycle moved to pending queue; DB-fade/recall-bump deferred to "
+    "Phase 4 (Root 2 stopgap) — a monologue_trace is now an ephemeral queue "
+    "candidate, not a memories.db row, so the forgetting engine never processes it"
+)
 
 
 class _Bus:
@@ -26,6 +42,7 @@ def _age_memory(store, mem_id, days):
     store._conn.commit()
 
 
+@pytest.mark.xfail(reason=_TRACE_LIFECYCLE_DEFERRED, strict=True)
 def test_unrevisited_trace_fades_then_is_lost(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     mem_id = write_trace_memory(store, "an idle unremarkable drift")
@@ -48,6 +65,7 @@ def test_unrevisited_trace_fades_then_is_lost(tmp_path):
     assert "an idle unremarkable drift" in graveyard.read_text()  # stored under "summary"
 
 
+@pytest.mark.xfail(reason=_TRACE_LIFECYCLE_DEFERRED, strict=True)
 def test_recalled_trace_stays(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     mem_id = write_trace_memory(store, "a thought she keeps returning to")

@@ -92,6 +92,17 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path):
         cli_throttle.reset()
         pass2_queue.drain_pending()
 
+        # memory-consolidation migration: the pass-2 "monologue" write is a gated
+        # type → enqueued as a pending candidate, not a memories.db row. Promote
+        # the queue (id preserved) so the end-state list_by_type assertion holds.
+        from brain.engines.consolidation import Decision, run_consolidation
+
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
+
         recent = list(store.list_by_type("monologue", active_only=True, limit=10))
         assert any("Loopy" in m.content for m in recent), (
             f"no Loopy memory found in {[m.content for m in recent]}"
