@@ -100,6 +100,7 @@ from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
+from brain.self_model.articulate import articulate_min_idle_seconds, log_self_model_deferred
 from brain.self_model.derived import compute_baseline, compute_derived
 from brain.self_model.gap import compute_gap
 from brain.self_model.resolve import (
@@ -1230,19 +1231,34 @@ def _run_self_model_tick(
       0. load the PERSISTED wall-clock cadence; if not due → return
          (the cadence survives restart/sleep, mirroring soul review's
          decoupling from the monotonic timers).
+      0a. PRE-FLIGHT THROTTLE PEEK — a defer must cost NOTHING. Checked here,
+         before any of the tick's own work, mirroring brain/maker/__init__.py's
+         "Pre-flight throttle gate" comment exactly. cli_throttle.slot_available()
+         is a read-only peek (never touches the shared semaphore); on denial we
+         log + advance the cadence to a short "deferred" retry and return
+         WITHOUT calling _self_model_reflect at all — steps 1-9 below never run,
+         so a denied attempt has zero side effects (no gap computation, no
+         budget consumption, no sustained_ticks/gaps_surfaced change, no
+         self_model_state.json write).
       1. Read the recent active emotion-bearing memories.
       2. short = compute_derived(memories, body)       (recent normalized mean, short half-life)
       3. long  = compute_baseline(memories)            (baseline normalized mean, long half-life)
       4. gap   = compute_gap(short, long)              (bidirectional short − long, noise-floored)
       5. Track sustained_ticks vs the prior current_gap; bump the
          gaps_surfaced audit counter while a gap is active.
-      6. If gap.magnitude >= threshold → articulate a note via Haiku.
+      6. If gap.magnitude >= threshold → articulate a note via Haiku. The real
+         (authoritative) throttle acquire happens inside articulate() itself,
+         only reachable once step 0a's peek has already granted — it is the
+         guard for the rare race where chat resumes (or another accessor wins
+         the shared slot) between the peek and this call, not the common-case
+         check.
       7. check_and_emit_resolution(prior, new) → soul candidate + feed event
          when a sustained gap just resolved (either path).
       8. push_gap (displaced-gap helper preserves an unresolved displaced
          gap in history), save state.
-      9. advance + save the cadence by outcome (clean / failure) so a
-         crash backs off and a clean pass schedules the normal interval.
+      9. advance + save the cadence by outcome (clean / deferred / failure) so
+         a crash backs off, a throttle deferral retries promptly at no cost,
+         and a clean pass schedules the normal interval.
 
     Fail-isolated by the caller (run_folded's try/except), AND every I/O
     step here is locally fail-soft so a single bad read degrades to
@@ -1260,9 +1276,22 @@ def _run_self_model_tick(
     if not self_model_cadence.is_due(cadence_state, now=now):
         return
 
+    # ── 0a: pre-flight throttle peek (a defer must cost NOTHING) ────────────
+    if not cli_throttle.slot_available(min_idle=articulate_min_idle_seconds()):
+        log_self_model_deferred(persona_dir)
+        cadence_state = self_model_cadence.compute_next_state(
+            cadence_state, outcome="deferred", now=now
+        )
+        self_model_cadence.save(persona_dir, cadence_state)
+        return
+
     outcome = "clean"
     try:
-        _self_model_reflect(persona_dir, provider=provider, event_bus=event_bus, now=now)
+        deferred = _self_model_reflect(
+            persona_dir, provider=provider, event_bus=event_bus, now=now
+        )
+        if deferred:
+            outcome = "deferred"
     except Exception:
         logger.exception("supervisor self-model reflect raised")
         outcome = "failure"
@@ -1279,12 +1308,19 @@ def _self_model_reflect(
     provider: LLMProvider,
     event_bus: EventBus | object,
     now: datetime,
-) -> None:
+) -> bool:
     """The reflection body — separated so cadence advance always runs.
 
     See _run_self_model_tick for the step-by-step contract. This function
-    does steps 1-8; the caller owns the cadence gate (step 0) and advance
-    (step 9) so a crash here still backs the cadence off.
+    does steps 1-8; the caller owns the cadence gates (steps 0/0a) and
+    advance (step 9) so a crash here still backs the cadence off.
+
+    Returns True if this tick's articulation was deferred by the throttle
+    (the rare peek-then-lost race — see step 6/articulate()'s docstring),
+    False otherwise (gap below threshold, a note was produced, budget
+    exhausted, or a provider exception — all pre-existing "no note" cases
+    unrelated to the throttle). The caller uses this to pick the cadence
+    outcome ("deferred" vs "clean").
     """
     from brain.body.state import compute_body_state
     from brain.body.words import count_words_in_session
@@ -1356,6 +1392,7 @@ def _self_model_reflect(
             logger.exception("self_model: channel-cooldown filtering failed; ignoring")
             carried_cooldowns = {}
 
+    deferred_by_throttle = False
     gap_active = new_gap.magnitude > 0.0 or new_gap.unnamed_pressure > 0.0
     if gap_active:
         # Carry sustained_ticks forward when this gap continues the prior one
@@ -1386,9 +1423,22 @@ def _self_model_reflect(
 
         # ── 5: articulate above threshold (fail-soft inside) ─────────────────
         if new_gap.magnitude >= _SELF_MODEL_ARTICULATE_THRESHOLD:
-            note = sm_articulate(new_gap, provider=provider, persona_dir=persona_dir)
+            try:
+                note = sm_articulate(new_gap, provider=provider, persona_dir=persona_dir)
+            except cli_throttle.ThrottleDeferred:
+                # Rare peek-then-lost race (the common case never reaches here —
+                # it's short-circuited by _run_self_model_tick's own pre-flight
+                # peek before this function is even called). Gap computation has
+                # already run for this tick; only the note stays unset.
+                note = None
+                deferred_by_throttle = True
             if note:
                 new_gap.note = note
+            elif same_channels and prior_gap is not None and prior_gap.note:
+                # same_channels also requires prior_gap.status == "open" (a
+                # reconciled/dismissed prior gap's note must not carry forward
+                # even on a channel-set match — see supervisor.py:~1400).
+                new_gap.note = prior_gap.note
 
     # ── 6: resolution downstream (two paths) ────────────────────────────────
     # session_id is informational on the resolved soul candidate; the
@@ -1425,6 +1475,8 @@ def _self_model_reflect(
                 "at": _now_iso(),
             }
         )
+
+    return deferred_by_throttle
 
 
 def _run_narrative_memory_pass(
@@ -1880,6 +1932,7 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("file_access.jsonl", 5),
     ("attunement_errors.jsonl", 5),
     ("gate_rejections.jsonl", 3),
+    ("self_model_articulate_errors.jsonl", 5),
 )
 # This table is deliberately hand-maintained, NOT derived from the jsonl files
 # present on disk. Several persona jsonl files are stores or queues, not logs —
