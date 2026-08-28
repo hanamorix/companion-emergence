@@ -483,6 +483,14 @@ def run_tool_loop(
                 # success so _find_monologue_text can locate it and spawn pass 2.
                 if isinstance(result, dict) and result.get("monologue_text"):
                     record["monologue_text"] = result["monologue_text"]
+                # In-process-path parity with the cli path's audit surfacing: a
+                # viewable-image read returns a stored_image block; carry its
+                # content-addressed rel_path on the invocation record (never
+                # base64) so the engine persists it into the durable buffer.
+                if isinstance(result, dict) and isinstance(result.get("stored_image"), dict):
+                    rel_path = result["stored_image"].get("rel_path")
+                    if rel_path:
+                        record["stored_image_path"] = rel_path
                 tool_content = json.dumps(result, default=str, ensure_ascii=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("tool dispatch error: %s — %s", tc.name, exc)
