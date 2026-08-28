@@ -85,12 +85,15 @@ def registered_channel():
 
 # ── G1-G4: each newly-routed automatic writer enqueues, none reach memories.db ──
 def test_g1_reconcile_routes_to_queue(tmp_path, registered_channel):
+    """self_model_reconcile BYPASSES the gate (owner decision, GATE_BYPASS_TYPES in
+    brain/memory/pending.py): it commits straight to memories.db so a self-authored
+    emotional nudge affects felt state immediately."""
     from brain.self_model.reconcile import _write_self_authored_delta
 
     wrote = _write_self_authored_delta(tmp_path, registered_channel, 0.5)
     assert wrote is True
-    assert _queue_types(tmp_path).count("self_model_reconcile") == 1
-    assert _db_count(tmp_path, "self_model_reconcile") == 0  # gated, not in recall
+    assert _db_count(tmp_path, "self_model_reconcile") == 1
+    assert _queue_types(tmp_path).count("self_model_reconcile") == 0  # bypasses the gate
 
 
 def test_g2_resolve_routes_and_still_queues_soul(tmp_path):
@@ -177,8 +180,13 @@ def test_g5_live_path_gate_fires_end_to_end(tmp_path, registered_channel):
     assert "monologue_trace" in qtypes  # from capture_monologue
     assert "monologue" in qtypes  # from apply_side_effects memory_writes
     # ... and NO gated type leaked straight into the recall channel.
-    for gated in ("monologue", "monologue_trace", "monologue_emotion"):
+    for gated in ("monologue", "monologue_trace"):
         assert _db_count(tmp_path, gated) == 0, f"{gated} leaked into memories.db"
+    # monologue_emotion BYPASSES the gate (owner decision, GATE_BYPASS_TYPES in
+    # brain/memory/pending.py): it commits straight to memories.db so per-turn
+    # emotional nudges affect felt state immediately, not queued for consolidation.
+    assert _db_count(tmp_path, "monologue_emotion") == 1, "monologue_emotion bypass didn't fire"
+    assert "monologue_emotion" not in qtypes, "monologue_emotion should bypass the queue"
 
     # Shown-able-to-fail: the oracle distinguishes a gated write that DOES reach the DB
     # (an ungated direct store.create — the pre-gate behavior). If this assertion could not

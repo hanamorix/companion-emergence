@@ -45,7 +45,17 @@ _QUEUE_FILENAME = "pending_candidates.jsonl"
 # an unknown automatic type (delayed/vetted, recoverable) rather than leak it into
 # recall. Owner-confirmed BROAD scope (Roy, 2026-08-11): only journal_entry and
 # initiate_outbound bypass.
-GATE_BYPASS_TYPES: frozenset[str] = frozenset({"journal_entry", "initiate_outbound"})
+#
+# monologue_emotion / self_model_reconcile bypass the consolidation gate so
+# per-turn emotional nudges affect felt state immediately (aggregate_state pools
+# their emotion vectors) rather than waiting for consolidation promotion.
+# Trade-off: these are recallable auto-generated memories, so they enter recall
+# without gate review. If the memory-flood / low-value-recall problem (ROOT2)
+# resurfaces, THIS bypass is the first place to look. Revisit when the dream
+# cycle replaces this interim gate.
+GATE_BYPASS_TYPES: frozenset[str] = frozenset(
+    {"journal_entry", "initiate_outbound", "monologue_emotion", "self_model_reconcile"}
+)
 
 # Only these monologue-EPISODE types are eligible for the Pass-1 salience drop —
 # they carry a real 0..10 importance signal (extractor sets importance=salience*10).
