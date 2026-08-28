@@ -1,0 +1,951 @@
+diff --git a/tests/harness/README.md b/tests/harness/README.md
+index 03dd895d..29dd0017 100644
+--- a/tests/harness/README.md
++++ b/tests/harness/README.md
+@@ -193,6 +193,10 @@ programmatically** from the on-disk transcript.
+ 
+ ### The orchestration protocol (what the session executes)
+ 
++**Read `tests/harness/RUN-ORCHESTRATION.md` first** — the canonical anti-stall contract
++(the "one arm = one turn, everything foreground" rule, the two parkable surfaces, and the
++`foreground.py` helpers) that governs how the sequence below must actually be driven.
++
+ ```python
+ from tests.harness import sandbox, PersonaSpec, MemorySeed, build_persona, AgentBob, ModelConfig
+ from tests.harness.engine import BridgeServer
+diff --git a/tests/harness/__init__.py b/tests/harness/__init__.py
+index 56d0f8b1..a54db012 100644
+--- a/tests/harness/__init__.py
++++ b/tests/harness/__init__.py
+@@ -56,6 +56,19 @@ from .dropin import (
+ )
+ from .engine import BridgeServer, atomic_write, collect_reply, drive_ws, parse_ws_frame
+ from .fixture import LiveEnv, MemorySeed, PersonaSpec, build_persona
++from .foreground import (
++    DRIVE_NOW_BANNER_HEADLINE,
++    ArmBootSpec,
++    ArmSession,
++    ForegroundBootError,
++    PreservationIncomplete,
++    PreserveResult,
++    ToolSideBroken,
++    assert_tool_callable,
++    boot_and_verify,
++    drive_now_banner,
++    preserve_artifacts,
++)
+ from .incident import IncidentResult, IncidentSpec, build_compacted_state
+ from .roster_preflight import assert_brain_tools_roster
+ from .runner import ArmSpec, Runner, RunnerState
+@@ -100,4 +113,9 @@ __all__: list[str] = [
+     "BridgeServer", "atomic_write", "parse_ws_frame", "collect_reply", "drive_ws",
+     # runner / watchdog
+     "ArmSpec", "Runner", "RunnerState", "Watchdog", "real_ping_fn", "watchdog_ping_argv",
++    # foreground (run-orchestration hardening: the anti-stall helper)
++    "ArmBootSpec", "ArmSession", "PreserveResult",
++    "ForegroundBootError", "ToolSideBroken", "PreservationIncomplete",
++    "boot_and_verify", "assert_tool_callable", "preserve_artifacts", "drive_now_banner",
++    "DRIVE_NOW_BANNER_HEADLINE",
+ ]
+diff --git a/tests/harness/foreground.py b/tests/harness/foreground.py
+new file mode 100644
+index 00000000..80782516
+--- /dev/null
++++ b/tests/harness/foreground.py
+@@ -0,0 +1,478 @@
++"""Run-orchestration hardening: the anti-stall foreground helper (item B of #139).
++
++Live-arm runs repeatedly dead-stalled for ~30 minutes. Root cause (issue #139, live-verified
++by Testing): an orchestrator agent **backgrounds a step and ends its turn to wait for it**. A
++backgrounded child -- either a ``run_in_background: true`` Bash task OR a background sub-agent
++(e.g. AgentBob) -- routes its completion notification to **main**, never back to the waiting
++parent. This is structurally guaranteed by the agent messaging topology, not a flaky bug: a
++completed child cannot wake the specific parent that parked on it.
++
++The fix pattern (Testing, owner-endorsed): **one arm = one agent = one turn, everything
++FOREGROUND.** Boot, verify, drive all turns, pause, preserve, and report within a single turn,
++every step foreground. A foreground call blocks and returns in-turn, so the orchestrator can
++never park. This module encapsulates the setup/teardown steps that CAN be encapsulated as
++blocking, bounded, in-turn calls with no await surface to park on:
++
++- :func:`boot_and_verify` -- boot the arm (bounded) and confirm a clean READY.
++- :func:`assert_tool_callable` -- the orchestrator-side tool-side check (a broken MCP child
++  fails SILENTLY; the served roster in the transcript is the only real signal).
++- :func:`preserve_artifacts` -- copy the raw run artifacts before any teardown.
++- :func:`drive_now_banner` -- the loud structural nudge at the READY decision point.
++
++The **drive turns cannot be encapsulated in code** -- that is the orchestrator's own
++turn-by-turn reasoning (improvising Bob), or a synchronous AgentBob call. See
++``tests/harness/RUN-ORCHESTRATION.md`` for the full one-turn contract this module supports.
++
++**Design note -- why `boot_and_verify` does NOT call the item-A process-self asserts**
++(``assert_brain_under_dropin`` / ``assert_brain_tools_roster``). Those check the *calling*
++process's own venv/``brain`` resolution and are only meaningful inside ``live_server.py``
++(where item A already wires them). ``boot_and_verify`` runs in the **orchestrator** process,
++which runs under a different venv -- calling those asserts there would raise on a *healthy*
++run. The correct orchestrator-side verification is READY-confirmation (their effect, written
++by the in-process guard) plus the transcript-based tool-side check, not re-running the asserts
++in the wrong process.
++
++This module hardcodes no gitignored path: ``boot_cmd``, ``source``/turn_diag locations, and
++``subproc_dirs`` are all caller-supplied. It imports only the standard library.
++"""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import time
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from pathlib import Path
++
++DRIVE_NOW_BANNER_HEADLINE = "▶ DRIVE NOW, IN THIS SAME TURN — do not end your turn to wait"
++
++_POLL_INTERVAL = 0.1
++_READY_NAME = "READY"
++
++
++@dataclass(frozen=True)
++class ArmBootSpec:
++    """What to boot and how to bound the wait for a clean READY.
++
++    ``ready_timeout`` bounds the whole boot: a dead boot RAISES within it, never hangs.
++    ``expect_brain_repo_under``, if set, is an optional orchestrator-side cross-check that the
++    READY payload's ``brain_repo`` resolves under a given drop-in repo root.
++    """
++
++    arm: str
++    port: int
++    run_dir: Path
++    ready_timeout: float = 60.0
++    expect_brain_repo_under: Path | None = None
++
++
++@dataclass(frozen=True)
++class ArmSession:
++    """A confirmed, booted arm: the parsed READY payload plus the spec fields it answers."""
++
++    arm: str
++    port: int
++    run_dir: Path
++    ready_payload: dict
++    brain_repo: str | None
++
++
++@dataclass(frozen=True)
++class PreserveResult:
++    """What :func:`preserve_artifacts` copied, and what non-required source was missing."""
++
++    dest: Path
++    copied: list[Path] = field(default_factory=list)
++    missing: list[Path] = field(default_factory=list)
++
++
++class ForegroundBootError(RuntimeError):
++    """Raised by :func:`boot_and_verify` on a non-zero boot / error marker / timeout / bad READY.
++
++    Always raised in-turn, within ``spec.ready_timeout`` -- ``boot_and_verify`` never hangs.
++    """
++
++
++class ToolSideBroken(RuntimeError):  # noqa: N818 — exact public API name (spec/criteria)
++    """Raised by :func:`assert_tool_callable` when a version-unique tool is absent from the
++    served MCP roster -- the orchestrator-side catch for a silently tool-less run."""
++
++
++class PreservationIncomplete(RuntimeError):  # noqa: N818 — exact public API name (spec/criteria)
++    """Raised by :func:`preserve_artifacts` when a source named in ``require=`` is missing.
++
++    The raw run artifacts are load-bearing (the VM has crashed mid-run before); a required
++    source going missing must never report as a silently-green preserve.
++    """
++
++
++def boot_and_verify(
++    spec: ArmBootSpec,
++    *,
++    boot_cmd: Sequence[str] | None = None,
++    cwd: str | Path | None = None,
++    env: dict[str, str] | None = None,
++    error_markers: Sequence[str] = ("ERROR",),
++) -> ArmSession:
++    """FOREGROUND, blocking, bounded. Boot -> confirm clean READY -> (optional) cross-check -> return.
++
++    MUST be called in the foreground, in the same turn you will drive the arm in. NEVER wrap
++    this in a ``run_in_background`` task or a background sub-agent call: a backgrounded
++    child's completion routes to **main**, not back to you, and you will dead-stall. This call
++    blocks and returns in-turn; a dead boot RAISES within ``spec.ready_timeout``, it does not
++    hang.
++
++    Orchestrator-side verification is CONFIRMATION, not re-execution of the in-process
++    drop-in guard: ``live_server.py`` writes ``READY`` only after its in-process guard passes,
++    and writes an error marker on hard-fail -- so READY-present-without-error IS the legitimate
++    orchestrator-side confirmation that the guard/roster passed.
++
++    Behavior:
++
++    1. If ``boot_cmd`` is given: a start timestamp is captured BEFORE ``subprocess.run``, then it
++       is run via ``subprocess.run(boot_cmd, timeout=ready_timeout)`` -- FOREGROUND, blocking,
++       bounded. A non-zero exit or a timeout raises :class:`ForegroundBootError` in-turn; it
++       never hangs. After a successful (exit-0) boot, the same stale-READY guard as the poll
++       branch applies: ``<run_dir>/READY`` must exist AND its mtime must be ``>=`` the captured
++       start, else :class:`ForegroundBootError` is raised -- a leftover ``READY`` from a reused
++       run dir must not be read as a false confirmation just because ``boot_cmd`` happened to
++       exit 0. If ``boot_cmd`` is ``None``: a bounded poll loop waits (up to ``ready_timeout``)
++       for ``<run_dir>/READY`` or an error marker to appear, for an already-foregrounded external
++       boot (e.g. Testing's ``run_arm.sh``, which itself blocks until READY). A start timestamp
++       is captured before polling begins and a ``READY`` whose mtime predates it is ignored (a
++       stale READY left over in a reused run dir must not be read as a false confirmation).
++
++       **Pitfall:** a ``boot_cmd`` that leaves a surviving process holding the captured
++       stdout/stderr pipe (e.g. an un-detached background server launched by the command) will
++       make ``subprocess.run(capture_output=True)`` block until ``ready_timeout`` even on an
++       otherwise-successful boot, since the pipe never reaches EOF while a child still holds it
++       open. This is bounded (it still raises ``ForegroundBootError`` at ``ready_timeout``
++       rather than hanging forever), but it is a usage pitfall, not a correctness bug in this
++       function. For booting a long-lived server, prefer poll mode (``boot_cmd=None``) after
++       foregrounding the boot separately (see ``tests/harness/RUN-ORCHESTRATION.md``'s
++       one-turn sequence), or ensure ``boot_cmd`` fully detaches its children's stdio.
++    2. If any ``<run_dir>/<error_marker>`` exists, raise :class:`ForegroundBootError` with its
++       contents. Otherwise read and JSON-parse ``<run_dir>/READY``; absent or unparseable
++       raises :class:`ForegroundBootError`.
++    3. If ``spec.expect_brain_repo_under`` is set, assert the READY payload's ``brain_repo``
++       resolves under it, else raise :class:`ForegroundBootError` -- an orchestrator-side file
++       read, not a process-self check. This confirms the booted server loaded the drop-in copy.
++    4. Return a populated :class:`ArmSession`.
++
++    ``error_markers`` defaults to ``("ERROR",)`` only -- ``PAUSED_ON_LEAK.json`` is a teardown
++    pause-for-adjudication state, not a boot failure, and is never written in the boot window.
++    """
++    run_dir = Path(spec.run_dir)
++
++    boot_start: float | None = None
++    if boot_cmd is not None:
++        boot_start = time.time()
++        try:
++            proc = subprocess.run(
++                list(boot_cmd),
++                cwd=cwd,
++                env=env,
++                timeout=spec.ready_timeout,
++                capture_output=True,
++                text=True,
++            )
++        except subprocess.TimeoutExpired as exc:
++            raise ForegroundBootError(
++                f"boot_cmd {list(boot_cmd)!r} did not complete within "
++                f"{spec.ready_timeout}s (timed out, not hung -- this raised in-turn)."
++            ) from exc
++        if proc.returncode != 0:
++            stderr_tail = (proc.stderr or "")[-2000:]
++            raise ForegroundBootError(
++                f"boot_cmd {list(boot_cmd)!r} exited {proc.returncode}.\nstderr (tail):\n"
++                f"{stderr_tail}"
++            )
++    else:
++        _poll_for_ready_or_error(run_dir, spec.ready_timeout, error_markers)
++
++    _raise_on_error_marker(run_dir, error_markers)
++
++    if boot_start is not None:
++        _require_fresh_ready(run_dir, boot_start)
++
++    ready_payload = _read_ready_payload(run_dir)
++
++    brain_repo = ready_payload.get("brain_repo") if isinstance(ready_payload, dict) else None
++    if spec.expect_brain_repo_under is not None:
++        expected_root = Path(spec.expect_brain_repo_under).resolve()
++        if not brain_repo:
++            raise ForegroundBootError(
++                "expect_brain_repo_under was set but the READY payload carries no 'brain_repo' "
++                f"field: {ready_payload!r}"
++            )
++        resolved_brain_repo = Path(brain_repo).resolve()
++        if resolved_brain_repo != expected_root and expected_root not in resolved_brain_repo.parents:
++            raise ForegroundBootError(
++                f"READY payload brain_repo {resolved_brain_repo} is NOT under the expected "
++                f"drop-in root {expected_root} -- the booted server did not load the drop-in "
++                "copy."
++            )
++
++    return ArmSession(
++        arm=spec.arm,
++        port=spec.port,
++        run_dir=run_dir,
++        ready_payload=ready_payload,
++        brain_repo=brain_repo,
++    )
++
++
++def _poll_for_ready_or_error(
++    run_dir: Path, ready_timeout: float, error_markers: Sequence[str]
++) -> None:
++    """Bounded poll waiting for ``<run_dir>/READY`` (fresh) or an error marker. Never hangs."""
++    start = time.time()
++    deadline = start + ready_timeout
++    ready_path = run_dir / _READY_NAME
++    while time.time() < deadline:
++        for marker in error_markers:
++            if (run_dir / marker).exists():
++                return
++        if ready_path.exists() and ready_path.stat().st_mtime >= start:
++            return
++        time.sleep(_POLL_INTERVAL)
++    raise ForegroundBootError(
++        f"no READY (or error marker) appeared under {run_dir} within {ready_timeout}s "
++        "(bounded poll timed out, did not hang)."
++    )
++
++
++def _require_fresh_ready(run_dir: Path, start: float) -> None:
++    """boot_cmd-branch counterpart to the poll branch's stale-READY guard.
++
++    A successful (exit-0) ``boot_cmd`` is not itself proof the run booted -- a leftover
++    ``READY`` file from a reused ``run_dir`` would otherwise be misread as this boot's own
++    confirmation. Require ``<run_dir>/READY`` to exist AND have an mtime ``>= start``.
++    """
++    ready_path = run_dir / _READY_NAME
++    if not ready_path.exists() or ready_path.stat().st_mtime < start:
++        raise ForegroundBootError(
++            f"boot_cmd exited 0 but {ready_path} is missing or stale (its mtime predates the "
++            "boot's own start) -- refusing to treat a leftover READY in a reused run_dir as a "
++            "false confirmation."
++        )
++
++
++def _raise_on_error_marker(run_dir: Path, error_markers: Sequence[str]) -> None:
++    for marker in error_markers:
++        marker_path = run_dir / marker
++        if marker_path.exists():
++            contents = marker_path.read_text(encoding="utf-8", errors="replace")
++            raise ForegroundBootError(f"boot wrote error marker {marker!r}:\n{contents}")
++
++
++def _read_ready_payload(run_dir: Path) -> dict:
++    ready_path = run_dir / _READY_NAME
++    if not ready_path.exists():
++        raise ForegroundBootError(f"no READY file at {ready_path} after boot.")
++    raw = ready_path.read_text(encoding="utf-8")
++    try:
++        payload = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise ForegroundBootError(f"READY at {ready_path} is not valid JSON: {raw!r}") from exc
++    if not isinstance(payload, dict):
++        raise ForegroundBootError(f"READY at {ready_path} did not parse to an object: {payload!r}")
++    return payload
++
++
++def assert_tool_callable(
++    source: Path,
++    tool_name: str,
++    *,
++    roster_field: str = "sent.system",
++) -> None:
++    """FOREGROUND. Confirm ``tool_name`` is actually in the served MCP roster (RUN-INSTRUCTIONS
++    step 4, after turn 1).
++
++    A broken MCP child fails SILENTLY -- the ``claude`` CLI proceeds tool-less, no abort -- so
++    this is the real, load-bearing tool-side verify: it can only be caught from the actual
++    served roster in the transcript, orchestrator-side. Raises :class:`ToolSideBroken` if
++    ``tool_name`` is absent from the served roster found in ``source``.
++
++    ``source`` may be a ``turn_diag.jsonl`` / ``transcript.jsonl`` file path directly, or a run
++    dir containing one of those files (``turn_diag.jsonl`` is preferred if both exist).
++
++    N1: the served roster appears under ``sent.system`` per RUN-INSTRUCTIONS step 4, but the
++    exact turn_diag serialization lives in the gitignored live-run lane and is UNVERIFIABLE
++    from tracked code. Extraction is therefore tolerant: this scans the ``roster_field`` /
++    general system text of every JSON row in ``source`` for ``tool_name`` as a substring, rather
++    than assuming a rigid schema. ``roster_field`` documents the expected field but is not
++    strictly required to be present -- rows without it are still scanned as a whole. No live
++    bridge; this only reads a file.
++    """
++    path = _resolve_diag_source(source)
++    text = path.read_text(encoding="utf-8", errors="replace")
++
++    if _tool_name_in_served_text(text, tool_name, roster_field):
++        return
++
++    raise ToolSideBroken(
++        f"tool {tool_name!r} was NOT found in the served roster (field {roster_field!r}) of "
++        f"{path} -- the MCP tool child is silently broken (the run proceeded tool-less)."
++    )
++
++
++def _resolve_diag_source(source: Path) -> Path:
++    source = Path(source)
++    if source.is_file():
++        return source
++    if source.is_dir():
++        for name in ("turn_diag.jsonl", "transcript.jsonl"):
++            candidate = source / name
++            if candidate.exists():
++                return candidate
++        raise ToolSideBroken(
++            f"{source} is a directory but contains neither turn_diag.jsonl nor "
++            "transcript.jsonl to scan for the served roster."
++        )
++    raise ToolSideBroken(f"{source} does not exist (no turn_diag/transcript to scan).")
++
++
++def _tool_name_in_served_text(text: str, tool_name: str, roster_field: str) -> bool:
++    """Tolerant scan (N1): look for ``tool_name`` inside any row's roster/system text.
++
++    Tries, per non-empty line: parse as JSON and walk for a value at (or containing)
++    ``roster_field``'s dotted path, falling back to scanning the WHOLE row's raw text if the
++    field is absent or unparseable -- so this survives an unknown/differently-shaped
++    serialization rather than hard-assuming a rigid schema.
++    """
++    field_parts = roster_field.split(".")
++    for line in text.splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            row = json.loads(line)
++        except json.JSONDecodeError:
++            if tool_name in line:
++                return True
++            continue
++        value = _dig(row, field_parts)
++        haystack = json.dumps(value) if value is not None else json.dumps(row)
++        if tool_name in haystack:
++            return True
++    return False
++
++
++def _dig(obj: object, parts: list[str]) -> object | None:
++    current = obj
++    for part in parts:
++        if isinstance(current, dict) and part in current:
++            current = current[part]
++        else:
++            return None
++    return current
++
++
++def preserve_artifacts(
++    run_dir: Path,
++    *,
++    dest: Path | None = None,
++    names: Sequence[str] = ("turn_diag.jsonl", "transcript.jsonl"),
++    subproc_dirs: Sequence[str] = (),
++    require: Sequence[str] = (),
++) -> PreserveResult:
++    """FOREGROUND, blocking. Copy raw run artifacts into ``dest`` BEFORE any teardown.
++
++    Copies each of ``names`` (files) and ``subproc_dirs`` (directories) found directly under
++    ``run_dir`` into ``dest`` (default ``<run_dir>/valid-run``). Preserves as much as exists --
++    the VM has crashed mid-run before, so a missing non-required source is reported in
++    ``PreserveResult.missing`` rather than aborting the rest.
++
++    The guarantee: if a name is listed in ``require=``, then after a clean (non-raising) return
++    that source WAS copied into ``dest``. This is enforced globally, not just inside the
++    ``names``/``subproc_dirs`` copy loops -- a ``require=`` entry that isn't ALSO listed in
++    ``names=`` or ``subproc_dirs=`` (so it was never even attempted) raises
++    :class:`PreservationIncomplete` just the same as one that was attempted and found missing on
++    disk. A required entry never silently no-ops just because it was left out of the copy lists.
++    Idempotent (re-running overwrites the same dest cleanly); no network.
++    """
++    import shutil
++
++    run_dir = Path(run_dir)
++    dest_dir = Path(dest) if dest is not None else run_dir / "valid-run"
++    dest_dir.mkdir(parents=True, exist_ok=True)
++
++    copied: list[Path] = []
++    missing: list[Path] = []
++    required = set(require)
++    confirmed: set[str] = set()
++
++    for name in names:
++        src = run_dir / name
++        dst = dest_dir / name
++        if src.exists():
++            shutil.copy2(src, dst)
++            copied.append(dst)
++            if name in required:
++                confirmed.add(name)
++        else:
++            missing.append(src)
++
++    for dirname in subproc_dirs:
++        src_dir = run_dir / dirname
++        dst_dir = dest_dir / dirname
++        if src_dir.exists():
++            if dst_dir.exists():
++                shutil.rmtree(dst_dir)
++            shutil.copytree(src_dir, dst_dir)
++            copied.append(dst_dir)
++            if dirname in required:
++                confirmed.add(dirname)
++        else:
++            missing.append(src_dir)
++
++    unconfirmed = sorted(required - confirmed)
++    if unconfirmed:
++        raise PreservationIncomplete(
++            f"required source(s) {unconfirmed!r} were not confirmed copied into {dest_dir} -- "
++            "either missing on disk, or never listed in names=/subproc_dirs= at all -- "
++            "refusing a silently-green preserve."
++        )
++
++    return PreserveResult(dest=dest_dir, copied=copied, missing=missing)
++
++
++def drive_now_banner(
++    *,
++    arm: str,
++    port: int,
++    run_dir: Path | str,
++    roster_ok: bool | None = None,
++    extra_lines: Sequence[str] | None = None,
++) -> str:
++    """Return the operator-facing READY banner. Pure function; no I/O.
++
++    First line is exactly :data:`DRIVE_NOW_BANNER_HEADLINE`. The body states the run context
++    (arm/port/run_dir, and roster status if given), names BOTH parkable surfaces (a
++    ``run_in_background: true`` Bash task AND a background sub-agent -- both route their
++    completion to main, not back to you), and restates the one rule: one arm = one turn,
++    everything foreground -- drive inline or via a synchronous AgentBob in THIS turn.
++
++    Operator-facing text (printed to the human/agent running the harness); it is never
++    injected into any companion/persona context, so the em-dash in the headline is intentional
++    and correct here (see the spec's note on the no-claudisms rule).
++    """
++    lines = [DRIVE_NOW_BANNER_HEADLINE, ""]
++    lines.append(f"arm={arm} port={port} run_dir={run_dir}")
++    if roster_ok is not None:
++        lines.append(f"roster_ok={roster_ok}")
++    lines.append("")
++    lines.append(
++        "Both a `run_in_background: true` Bash task AND a background sub-agent are PARKABLE "
++        "surfaces: each one's completion routes to main, not back to you, so ending your turn "
++        "to wait on either one dead-stalls you."
++    )
++    lines.append(
++        "THE ONE RULE: one arm = one turn, everything foreground -- drive inline or via a "
++        "synchronous AgentBob, in THIS SAME turn."
++    )
++    if extra_lines:
++        lines.extend(extra_lines)
++    return "\n".join(lines)
+diff --git a/tests/unit/harness/test_foreground.py b/tests/unit/harness/test_foreground.py
+new file mode 100644
+index 00000000..07b04b08
+--- /dev/null
++++ b/tests/unit/harness/test_foreground.py
+@@ -0,0 +1,412 @@
++"""Offline unit tests for the run-orchestration anti-stall helper (tests.harness.foreground).
++
++Covers G1 (real boot+confirm path returns a populated ArmSession in-turn), G2 (a dead/failed
++boot raises ForegroundBootError in-turn, never hangs), G3 (the real verification paths reject a
++bad build / a broken tool roster in-turn), G4 (preserve_artifacts copies + raises on a missing
++REQUIRED source), G5 (the banner's exact headline + required content), G6 (the shipped contract
++doc names both surfaces + the one rule), and G7 (every new public symbol is exported from
++tests.harness and listed in __all__). Mechanical facts only: no live bridge, no tokens, no
++network -- runs under the default (non-live) marker set.
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from tests.harness import foreground as fg
++
++RUN_ORCHESTRATION_MD = Path(__file__).resolve().parents[3] / "tests" / "harness" / "RUN-ORCHESTRATION.md"
++
++
++def _write_ready(run_dir: Path, payload: dict) -> None:
++    (run_dir / "READY").write_text(json.dumps(payload), encoding="utf-8")
++
++
++# --- G1: real boot+confirm path returns a populated ArmSession in-turn ----------------------------
++
++
++def test_boot_and_verify_real_boot_cmd_returns_populated_session(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    ready_path = run_dir / "READY"
++    boot_cmd = [
++        sys.executable,
++        "-c",
++        f"import json; open({str(ready_path)!r}, 'w').write(json.dumps({{'brain_repo': 'x'}}))",
++    ]
++    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
++
++    session = fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++
++    assert isinstance(session, fg.ArmSession)
++    assert session.arm == "A"
++    assert session.port == 8931
++    assert session.run_dir == run_dir
++    assert session.ready_payload == {"brain_repo": "x"}
++    assert session.brain_repo == "x"
++
++
++def test_boot_and_verify_poll_mode_picks_up_fresh_ready(tmp_path: Path) -> None:
++    """boot_cmd=None: bounded poll for a READY written by an already-foregrounded external boot.
++
++    The READY is written from a background thread AFTER the poll's own start timestamp is
++    captured (a short delay), mirroring an external ``run_arm.sh``-style boot that writes READY
++    while the orchestrator is already polling -- the case the stale-READY guard must NOT reject.
++    """
++    import threading
++
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++
++    def _delayed_write() -> None:
++        time.sleep(0.3)
++        _write_ready(run_dir, {"brain_repo": "y"})
++
++    threading.Thread(target=_delayed_write, daemon=True).start()
++    spec = fg.ArmBootSpec(arm="B", port=8932, run_dir=run_dir, ready_timeout=5.0)
++
++    session = fg.boot_and_verify(spec, boot_cmd=None)
++
++    assert session.ready_payload == {"brain_repo": "y"}
++
++
++def test_boot_and_verify_poll_mode_ignores_stale_ready(tmp_path: Path) -> None:
++    """N3: a READY predating the poll start must be ignored, not read as a false confirmation."""
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    _write_ready(run_dir, {"brain_repo": "stale"})
++    # Backdate the READY file's mtime so it predates the poll's captured start timestamp.
++    stale_mtime = time.time() - 3600
++    import os
++
++    os.utime(run_dir / "READY", (stale_mtime, stale_mtime))
++
++    spec = fg.ArmBootSpec(arm="C", port=8933, run_dir=run_dir, ready_timeout=0.5)
++    with pytest.raises(fg.ForegroundBootError, match="no READY"):
++        fg.boot_and_verify(spec, boot_cmd=None)
++
++
++# --- G2: a dead/failed boot raises in-turn, does not hang -----------------------------------------
++
++
++def test_boot_and_verify_nonzero_exit_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    boot_cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
++    spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=10.0)
++
++    with pytest.raises(fg.ForegroundBootError, match="exited 1"):
++        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++
++
++def test_boot_and_verify_error_marker_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    error_path = run_dir / "ERROR"
++    boot_cmd = [
++        sys.executable,
++        "-c",
++        f"open({str(error_path)!r}, 'w').write('boom')",
++    ]
++    spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=10.0)
++
++    with pytest.raises(fg.ForegroundBootError, match="error marker"):
++        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++
++
++def test_boot_and_verify_no_ready_times_out_quickly(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=0.5)
++
++    start = time.monotonic()
++    with pytest.raises(fg.ForegroundBootError, match="no READY"):
++        fg.boot_and_verify(spec, boot_cmd=None)
++    elapsed = time.monotonic() - start
++
++    assert elapsed < 5.0, f"boot_and_verify hung: took {elapsed}s for a 0.5s ready_timeout"
++
++
++def test_boot_and_verify_timeout_expired_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    boot_cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
++    spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=0.5)
++
++    start = time.monotonic()
++    with pytest.raises(fg.ForegroundBootError, match="did not complete"):
++        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++    elapsed = time.monotonic() - start
++
++    assert elapsed < 10.0, f"boot_and_verify hung past its own bound: {elapsed}s"
++
++
++# --- G3(a): expect_brain_repo_under cross-check rejects a bad build -------------------------------
++
++
++def _boot_cmd_writing_ready(ready_path: Path, payload: dict) -> list[str]:
++    """A real, foreground boot_cmd that writes a READY payload -- the G1 real path, reused here
++    so the brain_repo cross-check is exercised via the actual boot_cmd branch (no poll-mode
++    staleness concerns, since boot_cmd mode does not apply the poll freshness guard)."""
++    return [
++        sys.executable,
++        "-c",
++        f"import json; open({str(ready_path)!r}, 'w').write(json.dumps({payload!r}))",
++    ]
++
++
++def test_boot_and_verify_brain_repo_outside_expected_root_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    other_repo = tmp_path / "other-repo"
++    other_repo.mkdir()
++
++    expected_root = tmp_path / "expected-repo"
++    expected_root.mkdir()
++    spec = fg.ArmBootSpec(
++        arm="A", port=1, run_dir=run_dir, ready_timeout=5.0, expect_brain_repo_under=expected_root
++    )
++    boot_cmd = _boot_cmd_writing_ready(run_dir / "READY", {"brain_repo": str(other_repo)})
++
++    with pytest.raises(fg.ForegroundBootError, match="NOT under"):
++        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++
++
++def test_boot_and_verify_brain_repo_under_expected_root_passes(tmp_path: Path) -> None:
++    expected_root = tmp_path / "expected-repo"
++    expected_root.mkdir()
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    nested = expected_root / "checkout"
++    nested.mkdir()
++
++    spec = fg.ArmBootSpec(
++        arm="A", port=1, run_dir=run_dir, ready_timeout=5.0, expect_brain_repo_under=expected_root
++    )
++    boot_cmd = _boot_cmd_writing_ready(run_dir / "READY", {"brain_repo": str(nested)})
++
++    session = fg.boot_and_verify(spec, boot_cmd=boot_cmd)
++    assert session.brain_repo == str(nested)
++
++
++# --- G3(b): assert_tool_callable rejects an absent tool, passes a present one ---------------------
++
++
++def _turn_diag_row(system_text: str) -> str:
++    return json.dumps({"sent": {"system": system_text}})
++
++
++def test_assert_tool_callable_raises_when_tool_absent(tmp_path: Path) -> None:
++    diag = tmp_path / "turn_diag.jsonl"
++    diag.write_text(_turn_diag_row("Available tools: search_memories, list_works") + "\n")
++
++    with pytest.raises(fg.ToolSideBroken, match="read_full_memory"):
++        fg.assert_tool_callable(diag, "read_full_memory")
++
++
++def test_assert_tool_callable_passes_when_tool_present(tmp_path: Path) -> None:
++    diag = tmp_path / "turn_diag.jsonl"
++    diag.write_text(
++        _turn_diag_row("Available tools: search_memories, read_full_memory, list_works") + "\n"
++    )
++
++    fg.assert_tool_callable(diag, "read_full_memory")  # must not raise
++
++
++def test_assert_tool_callable_accepts_a_run_dir(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text(
++        _turn_diag_row("Available tools: read_full_memory") + "\n"
++    )
++
++    fg.assert_tool_callable(run_dir, "read_full_memory")  # must not raise
++
++
++def test_assert_tool_callable_missing_source_raises(tmp_path: Path) -> None:
++    with pytest.raises(fg.ToolSideBroken):
++        fg.assert_tool_callable(tmp_path / "does-not-exist.jsonl", "read_full_memory")
++
++
++# --- G4: preserve_artifacts copies, reports missing, raises on a missing REQUIRED source ----------
++
++
++def test_preserve_artifacts_copies_files_and_subproc_dir(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    (run_dir / "transcript.jsonl").write_text("{}\n")
++    subproc = run_dir / "mcp-child"
++    subproc.mkdir()
++    (subproc / "log.txt").write_text("hello\n")
++
++    result = fg.preserve_artifacts(run_dir, subproc_dirs=("mcp-child",))
++
++    assert isinstance(result, fg.PreserveResult)
++    assert result.dest == run_dir / "valid-run"
++    assert (result.dest / "turn_diag.jsonl").exists()
++    assert (result.dest / "transcript.jsonl").exists()
++    assert (result.dest / "mcp-child" / "log.txt").read_text() == "hello\n"
++    assert result.missing == []
++    assert len(result.copied) == 3
++
++
++def test_preserve_artifacts_reports_nonrequired_missing_without_raising(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    # transcript.jsonl deliberately absent, and NOT required.
++
++    result = fg.preserve_artifacts(run_dir)
++
++    assert (result.dest / "turn_diag.jsonl").exists()
++    assert run_dir / "transcript.jsonl" in result.missing
++    assert (result.dest / "transcript.jsonl") not in result.copied
++
++
++def test_preserve_artifacts_missing_required_source_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    # transcript.jsonl absent AND required this time.
++
++    with pytest.raises(fg.PreservationIncomplete, match="transcript.jsonl"):
++        fg.preserve_artifacts(run_dir, require=("transcript.jsonl",))
++
++
++def test_preserve_artifacts_missing_required_subproc_dir_raises(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    (run_dir / "transcript.jsonl").write_text("{}\n")
++
++    with pytest.raises(fg.PreservationIncomplete, match="mcp-child"):
++        fg.preserve_artifacts(run_dir, subproc_dirs=("mcp-child",), require=("mcp-child",))
++
++
++def test_preserve_artifacts_require_entry_absent_from_names_still_raises(tmp_path: Path) -> None:
++    """A `require=` entry that is NOT also listed in `names=`/`subproc_dirs=` must still be
++    enforced -- it must never be silently skipped just because it was never attempted. This
++    guards against the enforcement gap where `require` was only checked INSIDE the copy loops:
++    `transcript.jsonl` exists on disk but is deliberately left out of `names=`, so the pre-fix
++    code would return green with `missing=[]` instead of raising."""
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    (run_dir / "transcript.jsonl").write_text("{}\n")  # present on disk, NOT in names=
++
++    with pytest.raises(fg.PreservationIncomplete, match="transcript.jsonl"):
++        fg.preserve_artifacts(
++            run_dir,
++            names=("turn_diag.jsonl",),
++            require=("transcript.jsonl",),
++        )
++
++
++def test_preserve_artifacts_require_entry_in_names_and_present_copies_cleanly(
++    tmp_path: Path,
++) -> None:
++    """Complementary case: a `require=` entry that IS listed in `names=` and present on disk
++    copies cleanly (no raise) -- the enforcement fix must not break the normal path."""
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++
++    result = fg.preserve_artifacts(
++        run_dir,
++        names=("turn_diag.jsonl",),
++        require=("turn_diag.jsonl",),
++    )
++
++    assert (result.dest / "turn_diag.jsonl").exists()
++    assert result.dest / "turn_diag.jsonl" in result.copied
++    assert result.missing == []
++
++
++def test_preserve_artifacts_custom_dest(tmp_path: Path) -> None:
++    run_dir = tmp_path / "run"
++    run_dir.mkdir()
++    (run_dir / "turn_diag.jsonl").write_text("{}\n")
++    dest = tmp_path / "elsewhere"
++
++    result = fg.preserve_artifacts(run_dir, dest=dest, names=("turn_diag.jsonl",))
++
++    assert result.dest == dest
++    assert (dest / "turn_diag.jsonl").exists()
++
++
++# --- G5: the banner's exact headline + required content -------------------------------------------
++
++
++def test_drive_now_banner_first_line_is_exact_headline(tmp_path: Path) -> None:
++    banner = fg.drive_now_banner(arm="A", port=8931, run_dir=tmp_path / "run")
++    first_line = banner.splitlines()[0]
++    assert first_line == fg.DRIVE_NOW_BANNER_HEADLINE
++    assert first_line == "▶ DRIVE NOW, IN THIS SAME TURN — do not end your turn to wait"
++
++
++def test_drive_now_banner_names_both_surfaces_and_the_rule() -> None:
++    banner = fg.drive_now_banner(arm="A", port=8931, run_dir="/tmp/run")
++    assert "run_in_background" in banner
++    assert "background sub-agent" in banner
++    assert "one arm = one turn" in banner
++    assert "foreground" in banner.lower()
++
++
++def test_drive_now_banner_includes_run_context_and_roster_ok() -> None:
++    banner = fg.drive_now_banner(arm="my-arm", port=9999, run_dir="/tmp/xyz", roster_ok=True)
++    assert "my-arm" in banner
++    assert "9999" in banner
++    assert "/tmp/xyz" in banner
++    assert "roster_ok=True" in banner
++
++
++def test_drive_now_banner_extra_lines_appended() -> None:
++    banner = fg.drive_now_banner(
++        arm="A", port=1, run_dir="/tmp/run", extra_lines=["custom note here"]
++    )
++    assert "custom note here" in banner
++
++
++# --- G6: the shipped contract doc names both surfaces + the one rule ------------------------------
++
++
++def test_run_orchestration_doc_exists() -> None:
++    assert RUN_ORCHESTRATION_MD.exists(), f"expected {RUN_ORCHESTRATION_MD} to exist"
++
++
++def test_run_orchestration_doc_names_both_surfaces_and_the_rule() -> None:
++    text = RUN_ORCHESTRATION_MD.read_text(encoding="utf-8")
++    assert "run_in_background" in text
++    assert "background sub-agent" in text
++    assert "one arm = one" in text.lower() or "one arm = one agent = one turn" in text
++    assert "FOREGROUND" in text
++
++
++# --- G7: every new public symbol is exported from tests.harness and listed in __all__ -------------
++
++
++def test_all_new_symbols_importable_and_in_all() -> None:
++    import tests.harness as harness
++
++    names = [
++        "ArmBootSpec",
++        "ArmSession",
++        "PreserveResult",
++        "ForegroundBootError",
++        "ToolSideBroken",
++        "PreservationIncomplete",
++        "boot_and_verify",
++        "assert_tool_callable",
++        "preserve_artifacts",
++        "drive_now_banner",
++        "DRIVE_NOW_BANNER_HEADLINE",
++    ]
++    for name in names:
++        assert hasattr(harness, name), f"tests.harness has no attribute {name!r}"
++        assert name in harness.__all__, f"{name!r} missing from tests.harness.__all__"

@@ -267,6 +267,32 @@ def _apply_lean_flags(cmd: list[str]) -> None:
     cmd.append("--strict-mcp-config")
 
 
+def brain_tools_mcp_entry(persona_dir: Path, *, request_id: str | None = None) -> dict:
+    """The ``mcpServers["brain-tools"]`` entry the claude CLI uses to spawn the MCP child.
+
+    Single source of truth for the child spawn (issue #138). ``-P`` (PYTHONSAFEPATH) drops the
+    implicit launch-cwd entry from the child's ``sys.path``, so a foreign top-level ``brain/`` in
+    the launch directory cannot shadow the installed/venv ``brain`` (right interpreter, wrong
+    code). ``-P`` must precede ``-m``; it removes only the unsafe ``sys.path[0]`` (cwd / script
+    dir), never ``site-packages``, so the venv/editable ``brain`` still resolves. requires-python
+    >= 3.12 guarantees ``-P`` (added 3.11).
+
+    A safe explicit ``cwd=`` is not used because there is no fixed cwd guaranteed free of a foreign
+    top-level ``brain/`` (the drop-in copy root itself contains one); ``-P`` drops the cwd entry
+    unconditionally, matching the cwd-independence the fix wants.
+
+    Keeping this the ONE definition lets the harness roster preflight
+    (``tests.harness.roster_preflight``) reproduce the child argv/config by construction.
+    """
+    entry: dict = {
+        "command": sys.executable,
+        "args": ["-P", "-m", "brain.mcp_server", "--persona-dir", str(persona_dir)],
+    }
+    if request_id is not None:
+        entry["env"] = {"NELL_MCP_AUDIT_REQUEST_ID": request_id}
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -851,15 +877,7 @@ class ClaudeCliProvider(LLMProvider):
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
             config = {
                 "mcpServers": {
-                    "brain-tools": {
-                        "command": sys.executable,
-                        "args": [
-                            "-m",
-                            "brain.mcp_server",
-                            "--persona-dir",
-                            str(persona_dir_path),
-                        ],
-                    }
+                    "brain-tools": brain_tools_mcp_entry(persona_dir_path),
                 }
             }
             try:
@@ -1190,16 +1208,7 @@ class ClaudeCliProvider(LLMProvider):
                 ) from exc
             mcp_config = {
                 "mcpServers": {
-                    "brain-tools": {
-                        "command": sys.executable,
-                        "args": [
-                            "-m",
-                            "brain.mcp_server",
-                            "--persona-dir",
-                            str(persona_dir),
-                        ],
-                        "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
-                    }
+                    "brain-tools": brain_tools_mcp_entry(persona_dir, request_id=request_id),
                 }
             }
             try:
@@ -1319,16 +1328,7 @@ class ClaudeCliProvider(LLMProvider):
         request_id = uuid.uuid4().hex
         config = {
             "mcpServers": {
-                "brain-tools": {
-                    "command": sys.executable,
-                    "args": [
-                        "-m",
-                        "brain.mcp_server",
-                        "--persona-dir",
-                        str(persona_dir),
-                    ],
-                    "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
-                }
+                "brain-tools": brain_tools_mcp_entry(persona_dir, request_id=request_id),
             }
         }
 

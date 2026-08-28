@@ -891,8 +891,10 @@ def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
     assert "brain-tools" in cfg["mcpServers"]
     server_cfg = cfg["mcpServers"]["brain-tools"]
     assert server_cfg["command"] == sys.executable
-    assert server_cfg["args"][0] == "-m"
-    assert server_cfg["args"][1] == "brain.mcp_server"
+    # #138: -P (PYTHONSAFEPATH) must precede -m so the launch cwd can't shadow the child's `brain`.
+    assert server_cfg["args"][0] == "-P"
+    assert server_cfg["args"][1] == "-m"
+    assert server_cfg["args"][2] == "brain.mcp_server"
     assert "--persona-dir" in server_cfg["args"]
     assert str(persona_dir) in server_cfg["args"]
     assert server_cfg["env"]["NELL_MCP_AUDIT_REQUEST_ID"]
