@@ -3,9 +3,10 @@
 TEMP — companion to tests/test_consolidation_gate.py. These tests close the coverage the
 isolation tests missed (change: changes/gate-leak-coverage/):
 
-- G1-G4: the four automatic writers the owner ordered GATED
-  (self_model_reconcile / self_model_resolved / making / file_write) now route through
-  ``route_write`` — a candidate lands in the pending queue and ZERO rows reach memories.db.
+- G1-G4: four automatic writers routed through ``route_write``. G2-G4
+  (self_model_resolved / making / file_write) are GATED — a candidate lands in the pending
+  queue and ZERO rows reach memories.db. G1 (self_model_reconcile) is a later owner-decision
+  BYPASS (GATE_BYPASS_TYPES in brain/memory/pending.py) — it commits straight to memories.db.
 - G5: a LIVE-PATH integration test proving the gate FIRES end-to-end when the real per-turn
   write path runs (monologue capture + the public pass-2 ``apply_side_effects`` wrapper) — the
   coverage that would have caught the Run-#1 apparatus regression at unit level.
@@ -83,8 +84,9 @@ def registered_channel():
     vocabulary._unregister(_TEST_CHANNEL)
 
 
-# ── G1-G4: each newly-routed automatic writer enqueues, none reach memories.db ──
-def test_g1_reconcile_routes_to_queue(tmp_path, registered_channel):
+# ── G1: self_model_reconcile BYPASSES the gate (owner decision); G2-G4: each
+# remaining newly-routed automatic writer enqueues, none reach memories.db ──
+def test_g1_reconcile_bypasses_gate(tmp_path, registered_channel):
     """self_model_reconcile BYPASSES the gate (owner decision, GATE_BYPASS_TYPES in
     brain/memory/pending.py): it commits straight to memories.db so a self-authored
     emotional nudge affects felt state immediately."""
