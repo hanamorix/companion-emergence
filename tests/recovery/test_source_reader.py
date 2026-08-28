@@ -111,3 +111,18 @@ def test_peak_emotion_intensity_defaults_zero_for_old_schema(tmp_path):
     src = _mk_old_schema_source(tmp_path)
     mems = read_source_memories(src)
     assert mems["m1"].peak_emotion_intensity == 0.0
+
+
+def test_recall_count_round_trips_as_float(tmp_path):
+    """G6 (recall-reinforcement): a source row with a fractional recall_count
+    (as a REAL-typed post-fractional-bump DB would carry) round-trips as
+    1.6 — not truncated to 1 by an int() cast."""
+    src = _mk_v033_schema_source(tmp_path, subdir="src_frac")
+    conn = sqlite3.connect(src / "memories.db")
+    conn.execute("UPDATE memories SET recall_count = 1.6 WHERE id = 'm2'")
+    conn.commit()
+    conn.close()
+
+    mems = read_source_memories(src)
+    assert mems["m2"].recall_count == 1.6
+    assert isinstance(mems["m2"].recall_count, float)

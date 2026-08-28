@@ -881,6 +881,151 @@ def test_hard_delete_does_not_bump_recall_count_on_other_rows():
     store.close()
 
 
+# ---------------------------------------------------------------------------
+# ND-1 follow-up: update()/deactivate()'s internal existence-check must not
+# bump recall_count either (closes the last leak — only a genuine full-read
+# via get(bump=True, the default) counts as engagement).
+# ---------------------------------------------------------------------------
+
+
+def test_update_does_not_bump_recall_count():
+    """update()'s internal existence-check must not inflate recall_count."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0
+    store.update(m.id, content="modified")
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # a maintenance write is NOT a recall
+    store.close()
+
+
+def test_deactivate_does_not_bump_recall_count():
+    """deactivate()'s internal existence-check must not inflate recall_count."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0
+    store.deactivate(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # deactivating is NOT a recall
+    store.close()
+
+
+def test_genuine_full_read_still_bumps_recall_count_after_nd1():
+    """Regression: get()'s default path (bump=True) is untouched by the ND-1 fix
+    — a deliberate full-read still bumps recall_count, even after update()/
+    deactivate() calls that themselves must not bump it."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.update(m.id, content="modified")
+    store.deactivate(m.id)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 0  # confirm the maintenance writes above didn't bump it
+    restored = store.get(m.id)  # genuine full-read, default bump=True
+    assert restored is not None
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == 1  # only the full-read counted
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# recall-reinforcement: fractional recall_count bump (CHANGE 1, G4/G5/G14)
+# ---------------------------------------------------------------------------
+
+
+def test_bump_recall_accumulates_fractional_values():
+    """G4: bump_recall stores and accumulates fractional amounts — two 0.8
+    bumps read back as ~1.6 (float), not 1 or 2."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+
+    store.bump_recall(m.id, 0.8)
+    store.bump_recall(m.id, 0.8)
+
+    restored = store.get(m.id, bump=False)
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == pytest.approx(1.6)
+    assert restored.recall_count == pytest.approx(1.6)  # round-trips through _row_to_memory too
+    store.close()
+
+
+# Pre-REAL personas (e.g. the v0.0.33 schema in tests/recovery/test_source_reader.py)
+# declared recall_count with INTEGER column affinity. When such a DB is opened by
+# MemoryStore, `CREATE TABLE IF NOT EXISTS` leaves the existing table alone and the
+# column-migration only adds recall_count when absent, so the INTEGER affinity is
+# preserved on the live table. This helper reproduces that exact starting state so
+# G5 tests the real back-compat path, not a fresh REAL-affinity column.
+def _mk_integer_affinity_store(db_path, *, seed_recall_count=3):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT NOT NULL,"
+        " memory_type TEXT NOT NULL, domain TEXT NOT NULL, emotions_json TEXT NOT NULL,"
+        " tags_json TEXT NOT NULL, importance REAL NOT NULL DEFAULT 0.0,"
+        " score REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL, last_accessed_at TEXT,"
+        " active INTEGER NOT NULL DEFAULT 1, protected INTEGER NOT NULL DEFAULT 0,"
+        " metadata_json TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'active',"
+        " content_snapshot TEXT, recall_count INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "INSERT INTO memories (id, content, memory_type, domain, emotions_json, tags_json,"
+        " created_at, recall_count) VALUES ('m1','x','episodic','chat','{}','[]',"
+        " '2026-01-01T00:00:00+00:00', ?)",
+        (seed_recall_count,),
+    )
+    conn.commit()
+    conn.close()
+    return MemoryStore(str(db_path))
+
+
+def test_bump_recall_on_integer_affinity_column_accumulates_to_float(tmp_path):
+    """G5 (back-compat): a persona whose recall_count column genuinely has
+    INTEGER affinity (holding integer 3) accepts a subsequent fractional bump
+    through the store's real UPDATE path and reads back as 3.8 (float) — no
+    crash, no truncation to 3 or 4. Fails if SQLite were to truncate a
+    fractional bump on an integer-affinity column."""
+    store = _mk_integer_affinity_store(tmp_path / "memories.db")
+    # Confirm we are actually testing INTEGER affinity, not a REAL column.
+    affinity = {
+        row["name"]: row["type"]
+        for row in store._conn.execute("PRAGMA table_info(memories)")
+    }["recall_count"]
+    assert affinity == "INTEGER"
+
+    store.bump_recall("m1", 0.8)
+
+    row = store._conn.execute(
+        "SELECT recall_count, typeof(recall_count) AS t FROM memories WHERE id = 'm1'"
+    ).fetchone()
+    assert row["recall_count"] == pytest.approx(3.8)
+    assert row["t"] == "real"  # stored as a real, not truncated to an integer
+    store.close()
+
+
+def test_recall_count_bumps_from_different_sites_accumulate_additively():
+    """G14 (no-lost-update): a full-read bump (+1.0, via get()) and a passive-
+    recall fractional bump (+0.8, via bump_recall()) both land as a SUM — the
+    second write does not clobber the first. Each bump site issues a single
+    atomic `recall_count = recall_count + ?` UPDATE, so this must FAIL against
+    a non-additive/overwrite implementation (e.g. one that read-then-wrote a
+    computed total in Python)."""
+    store = MemoryStore(":memory:")
+    m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+
+    store.get(m.id)  # +1.0
+    store.bump_recall(m.id, 0.8)  # +0.8
+    store.get(m.id)  # +1.0
+
+    row = store._conn.execute("SELECT recall_count FROM memories WHERE id = ?", (m.id,)).fetchone()
+    assert row["recall_count"] == pytest.approx(2.8)
+    store.close()
+
+
 def test_double_fade_preserves_original_content_snapshot(caplog):
     """fade called twice must NOT overwrite the original snapshot."""
     import logging

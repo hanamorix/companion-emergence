@@ -265,6 +265,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
         "get_personality": {},
         "get_body_state": {},
         "search_memories": {"query": "test"},
+        "read_full_memory": {"memory_id": "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"},
         "add_journal": {"content": "journal entry"},
         "add_memory": {
             "content": "significant moment",

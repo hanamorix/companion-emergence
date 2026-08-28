@@ -29,6 +29,7 @@ REFLEXIVE_CORE: tuple[str, ...] = (
     "felt_time_now",
     "pressure_since",
     "search_memories",
+    "read_full_memory",
 )
 
 _MEMORY_TOOLS = (

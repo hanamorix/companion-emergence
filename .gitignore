@@ -155,3 +155,7 @@ CLAUDE.local.history.md
 # temp consolidation-gate queue (Root 2 stopgap) — never committed
 pending_candidates.jsonl
 pending_candidates.jsonl.lock
+
+# Guarded-change process artefacts (spec/plan/red-team drafts) — local
+# working state only, never pushed.
+changes/
