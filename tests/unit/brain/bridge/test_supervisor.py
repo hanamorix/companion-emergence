@@ -9,6 +9,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from brain.bridge import persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
@@ -19,6 +22,52 @@ from brain.bridge.supervisor import (
     _run_voice_reflection_tick,  # noqa: F401 — imported to assert symbol exists
     run_folded,
 )
+from brain.engines import interest_sweep
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_supervisor_threads():
+    """Fail the test that leaks a live thread, not the innocent one downstream.
+
+    17 tests in this file start a supervisor thread and none used try/finally.
+    An assertion between `t.start()` and `stop.set()` therefore leaves a daemon
+    thread running for the whole session; the heartbeat-failure test's thread
+    logs ERROR every tick, which is how it broke an unrelated maker test on
+    Windows CI (#110). This turns that silent cross-test poisoning into a local
+    failure at the point of the leak.
+    """
+    before = {t.ident for t in threading.enumerate()}
+    yield
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        leaked = [t for t in threading.enumerate()
+                  if t.ident not in before and t.is_alive()]
+        if not leaked:
+            return
+        time.sleep(0.05)
+    assert not leaked, (
+        f"test leaked {len(leaked)} live thread(s): {[t.name for t in leaked]} — "
+        "stop the supervisor thread in a finally so a failed assertion cannot "
+        "leave it running and logging into later tests"
+    )
+
+
+def _wait_until(pred, *, timeout: float = 30.0, interval: float = 0.02) -> bool:
+    """Poll until `pred()` holds or the deadline passes; return the final value.
+
+    Replaces fixed `time.sleep(N)` windows before an assertion (#110). A
+    constant sleep encodes an assumption about how fast the runner is: the
+    Windows CI box is routinely ~25% slower than a local machine, and these
+    supervisor loops then had not finished a pass when the assertion ran.
+    Polling is also FASTER on a quick runner — it stops as soon as the
+    condition holds instead of always burning the full window.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
 
 
 def test_audit_logs_registered_for_rotation() -> None:
@@ -168,9 +217,18 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    assert second_attempt.wait(timeout=5.0), "loop did not survive first heartbeat exception"
-    stop.set()
-    t.join(timeout=5.0)
+    try:
+        # #110: this assertion sits between start and stop. Without the finally,
+        # a failure here skips stop.set() and the daemon thread runs for the rest
+        # of the session — raising every tick and logging ERROR into whatever
+        # test is running later. That is what failed an unrelated maker test
+        # eight minutes downstream on Windows CI.
+        assert second_attempt.wait(timeout=30.0), (
+            "loop did not survive first heartbeat exception"
+        )
+    finally:
+        stop.set()
+        t.join(timeout=30.0)
     assert not t.is_alive()
 
 
@@ -242,9 +300,9 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
+    _wait_until(lambda: "session_snapshot" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=2.0)
+    t.join(timeout=30.0)
 
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     assert buf.exists(), "snapshot sweep must NOT delete the buffer"
@@ -289,11 +347,11 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
-    stop.set()
-    t.join(timeout=2.0)
-
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
+    _wait_until(lambda: not buf.exists())
+    stop.set()
+    t.join(timeout=30.0)
+
     assert not buf.exists(), "finalize must delete the buffer"
     assert get_session(sid) is None, "finalize must remove from _SESSIONS"
     types = [e.get("type") for e in bus.events]
@@ -539,9 +597,9 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    time.sleep(0.3)
+    time.sleep(0.3)  # a window in which it COULD misbehave — not pollable
     stop.set()
-    t.join(timeout=5.0)
+    t.join(timeout=30.0)
     assert not t.is_alive()
     assert fired == [], "self-model tick fired even though disabled"
 
@@ -868,4 +926,147 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     assert captured.get("is_rest_state") is False, (
         f"fail-open violated: expected is_rest_state=False on body error, got: {captured}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interest sweep (Task 10) — weekly persisted wall-clock cadence. Mirrors the
+# maintenance block's load-at-startup / is_due-gate / fully-wrapped-body /
+# end-of-block-advance+save discipline (defer #21 pattern).
+# ---------------------------------------------------------------------------
+
+
+def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
+    """A fresh persona has no interest_sweep_cadence.json yet, so it's due-now
+    on the very first tick: run_folded must call run_sweep_tick and advance
+    the persisted cadence past now, even though the tick was a no-op."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    fired = threading.Event()
+    calls: list[dict] = []
+
+    def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        fired.set()
+        return {"spawned": 0, "retired": 0, "error": None}
+
+    def runner():
+        with patch("brain.engines.interest_sweep.run_sweep_tick", side_effect=fake_sweep):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    assert fired.wait(timeout=5.0), "interest sweep never fired"
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert len(calls) == 1
+
+    state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
+    assert state.next_at is not None
+    assert state.next_at > datetime.now(UTC), "cadence must advance past now even on a no-op result"
+
+
+def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_path: Path) -> None:
+    """run_sweep_tick never raises by its own contract, but the supervisor's
+    wrap around it must hold anyway: a raised exception must not stop the
+    end-of-block advance+save, and must not kill the supervisor loop."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+
+    def fake_sweep(**kwargs):
+        raise RuntimeError("boom")
+
+    def runner():
+        with patch("brain.engines.interest_sweep.run_sweep_tick", side_effect=fake_sweep):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                soul_review_interval_s=None,
+                finalize_interval_s=None,
+                log_rotation_interval_s=None,
+                initiate_review_interval_s=None,
+                voice_reflection_interval_s=None,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "supervisor loop must not die from a tick exception"
+
+    state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
+    assert state.next_at is not None
+    assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
+
+
+def test_run_folded_interest_sweep_interval_none_disables_it(tmp_path: Path) -> None:
+    """interest_sweep_interval_s=None disables the sweep entirely — no tick, no
+    cadence file. Parity with the other six cadences' None-gate.
+
+    Load-bearing for anything driving a real supervisor in a sandbox (e.g. the
+    tests/harness live rig): the sweep calls a real provider and writes
+    interests.json, so a run that hasn't opted in must be able to switch it off.
+    """
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    calls: list[dict] = []
+    errors: list[BaseException] = []
+
+    def runner():
+        try:
+            with patch(
+                "brain.engines.interest_sweep.run_sweep_tick",
+                side_effect=lambda **kw: calls.append(kw),
+            ):
+                run_folded(
+                    stop,
+                    persona_dir=persona_dir,
+                    provider=FakeProvider(),
+                    event_bus=bus,
+                    tick_interval_s=0.05,
+                    heartbeat_interval_s=None,
+                    soul_review_interval_s=None,
+                    finalize_interval_s=None,
+                    log_rotation_interval_s=None,
+                    initiate_review_interval_s=None,
+                    voice_reflection_interval_s=None,
+                    interest_sweep_interval_s=None,
+                )
+        except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below
+            errors.append(exc)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    # Guard against a vacuous pass: if run_folded rejected the kwarg the thread
+    # would die and the assertions below would hold for the wrong reason.
+    assert errors == [], f"run_folded raised: {errors}"
+
+    assert calls == [], "sweep must not fire when disabled"
+    assert not (persona_dir / interest_sweep.SWEEP_CADENCE_FILE).exists(), (
+        "disabled sweep must not write its cadence file"
     )

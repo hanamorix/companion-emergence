@@ -96,17 +96,23 @@ def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) ->
 
     Mirrors brain/chat/extractor.py::_apply_emotion_delta: the delta is routed
     through ``_filter_to_registered`` (off-vocab channel → dropped) and clamped
-    to [-1, 1]; importance is abs(delta) * 10 on the 0..10 MemoryStore scale.
+    to [-1, 1]; importance is abs(delta) * 10 on the 0..10 MemoryStore scale,
+    then capped at ``extractor._MAX_DELTA_INTENSITY`` — one reconcile can't peg
+    a channel to the full clamp any more than one chat-turn extraction can.
 
     Returns True if a memory was written, False if the channel was off-vocab or
     the delta was effectively zero (nothing to write).
     """
-    from brain.chat.extractor import _filter_to_registered
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY, _filter_to_registered
     from brain.memory.store import Memory, MemoryStore
 
     clamped = _clamp_delta(delta)
     registered = _filter_to_registered({channel: clamped})
-    emotions = {ch: abs(v) * 10.0 for ch, v in registered.items() if abs(v) > 1e-9}
+    emotions = {
+        ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
+        for ch, v in registered.items()
+        if abs(v) > 1e-9
+    }
     if not emotions:
         return False
 

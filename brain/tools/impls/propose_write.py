@@ -32,6 +32,21 @@ def _authorised_notes_folder(persona_dir: Path) -> Path | None:
     return None
 
 
+def _block_present(existing: str, content: str) -> bool:
+    """True if `content` appears as a contiguous run of complete lines in `existing`.
+
+    Line-anchored rather than a plain substring test on purpose: a short append
+    ("done") must not be swallowed because it happens to sit inside unrelated
+    text ("well done, truly"). That would silently drop a legitimate note —
+    the same class of harm as the doubling this guards against (#105).
+    """
+    hay = existing.splitlines()
+    needle = content.splitlines()
+    if not needle:
+        return True
+    return any(hay[i:i + len(needle)] == needle for i in range(len(hay) - len(needle) + 1))
+
+
 def propose_write(path: str, content: str | None = None, *, op: str,
                   making_id: str | None = None, persona_dir: Path, **_) -> dict:
     # making_id source (Maker combined-build integration; Task 16b of the maker plan)
@@ -61,6 +76,8 @@ def propose_write(path: str, content: str | None = None, *, op: str,
         audit(persona_dir, event="propose_refused", id="", op=op, path=str(g.resolved), error=s.error)
         return {"error": s.error}
 
+    content_sha = hashlib.sha256(content.encode()).hexdigest()
+
     # Auto-commit into the user-authorised notes folder (no confirmation card):
     # the user enabled "let her leave me notes" for this exact folder, so a tool
     # write whose target resolves inside it is committed directly. It still passes
@@ -70,6 +87,25 @@ def propose_write(path: str, content: str | None = None, *, op: str,
     if auto is not None and is_within_authorized(g.resolved, auto):
         from brain.files.commit import commit_write
         from brain.memory.store import MemoryStore
+
+        # #105: this branch commits inside the same call, so the pending-record
+        # dedupe (#93) never sees it — an identical block landed on disk twice,
+        # and with no consent card to catch it. Ask the file instead of tracking
+        # recency. `create` cannot double (the guard refuses an existing path),
+        # so only append needs this.
+        # Fail-soft: an unreadable target must never block a legitimate note.
+        if op == "append":
+            try:
+                existing = g.resolved.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                existing = None
+            if existing is not None and _block_present(existing, content):
+                audit(persona_dir, event="write_skipped_present", id="", op=op,
+                      path=str(g.resolved), content_sha=content_sha)
+                return {
+                    "status": "already_present", "path": str(g.resolved), "deduped": True,
+                    "note": f"that block is already in {g.resolved} — nothing written",
+                }
 
         rid = pending.create(persona_dir, op=op, resolved_path=str(g.resolved),
                              content=content, now=datetime.now(UTC), making_id=making_id)
@@ -85,12 +121,26 @@ def propose_write(path: str, content: str | None = None, *, op: str,
         return {"error": res.get("error", "write failed")}
 
     now = datetime.now(UTC)
+
+    # #93/#101: the same write proposed twice in one turn must not stage two
+    # cards. The record id can't carry this — _new_id mixes in `now` — so match
+    # on (op, resolved_path, content_sha) against the fresh pending set.
+    existing = pending.find_duplicate(persona_dir, op=op,
+                                      resolved_path=str(g.resolved),
+                                      content_sha=content_sha, now=now)
+    if existing is not None:
+        audit(persona_dir, event="propose_deduped", id=existing, op=op,
+              path=str(g.resolved), content_sha=content_sha)
+        return {"status": "already_proposed", "id": existing, "deduped": True,
+                "note": f"this exact {op} of {g.resolved} is already staged and "
+                        "awaiting your confirmation — no second card was created"}
+
     if pending.count_pending(persona_dir, now=now) >= pending._MAX_PENDING:
         return {"error": "too many writes awaiting your review — resolve some first"}
 
     rid = pending.create(persona_dir, op=op, resolved_path=str(g.resolved), content=content,
                          now=now, making_id=making_id)
     audit(persona_dir, event="propose", id=rid, op=op, path=str(g.resolved),
-          content_sha=hashlib.sha256(content.encode()).hexdigest())
+          content_sha=content_sha)
     return {"status": "proposed", "id": rid,
             "note": f"proposed {op} of {g.resolved} — awaiting your confirmation in NellFace"}

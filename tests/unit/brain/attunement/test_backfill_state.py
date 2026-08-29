@@ -59,6 +59,7 @@ def test_run_backfill_completes_status_when_all_windows_processed(tmp_path: Path
         tmp_path,
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
     assert state.status == "complete"
     assert state.processed_windows == state.sampled_windows
@@ -73,7 +74,8 @@ def test_run_backfill_respects_daily_cap_splits_across_days(tmp_path: Path):
         tmp_path,
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
-        cap=2,  # tiny cap forces split
+        cap=2,  # tiny cap forces split,
+        delay_s=0,
     )
     assert state.status == "deferred_to_next_day"
     assert state.last_cursor != ""
@@ -89,6 +91,7 @@ def test_run_backfill_resumes_from_last_cursor(tmp_path: Path):
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
         cap=2,
+        delay_s=0,
     )
     assert first.status == "deferred_to_next_day"
     first_processed = first.processed_windows
@@ -99,6 +102,7 @@ def test_run_backfill_resumes_from_last_cursor(tmp_path: Path):
         detector_fn=fake_detector,
         now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
         cap=100,
+        delay_s=0,
     )
     assert second.status == "complete"
     assert second.processed_windows > first_processed
@@ -111,6 +115,7 @@ def test_run_backfill_returns_existing_when_complete(tmp_path: Path):
         tmp_path,
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
     assert first.status == "complete"
     # Second call: short-circuit before window_buffer is reached
@@ -119,6 +124,7 @@ def test_run_backfill_returns_existing_when_complete(tmp_path: Path):
             tmp_path,
             detector_fn=fake_detector,
             now_dt=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            delay_s=0,
         )
     assert second.status == "complete"
     mock_window.assert_not_called()
@@ -130,6 +136,7 @@ def test_run_backfill_skips_when_no_active_conversations(tmp_path: Path):
         tmp_path,
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
     assert state.status == "complete"
     assert state.processed_windows == 0
@@ -143,6 +150,7 @@ def test_run_backfill_persists_state_after_each_window(tmp_path: Path):
         tmp_path,
         detector_fn=fake_detector,
         now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
+        delay_s=0,
     )
     state_path = tmp_path / "attunement" / "backfill_state.json"
     assert state_path.exists()
@@ -164,7 +172,7 @@ def test_run_backfill_default_detector_threads_identity(tmp_path: Path):
         return _fake_detector_output()
 
     with patch("brain.attunement.detector.run_detector", side_effect=_capture):
-        run_backfill(tmp_path, now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC))
+        run_backfill(tmp_path, now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC), delay_s=0)
 
     assert captured, "expected the default detector closure to be invoked"
     assert captured[0]["companion_name"] == tmp_path.name

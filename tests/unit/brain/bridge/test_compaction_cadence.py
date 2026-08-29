@@ -19,9 +19,15 @@ def test_run_compaction_tick_importable_and_callable():
 
     sig = inspect.signature(_run_compaction_tick)
     params = list(sig.parameters)
-    assert params == ["persona_dir", "provider"], (
-        f"expected (persona_dir, provider), got {params}"
+    # Positional contract: (persona_dir, provider). The idle-gate added an optional
+    # keyword-only ``is_session_busy`` (defaulted, so the tick stays importable and
+    # callable without it — startup catch-up passes None).
+    assert params == ["persona_dir", "provider", "is_session_busy"], (
+        f"expected (persona_dir, provider, *, is_session_busy), got {params}"
     )
+    busy = sig.parameters["is_session_busy"]
+    assert busy.kind is inspect.Parameter.KEYWORD_ONLY
+    assert busy.default is None
 
 
 def test_compaction_cadence_due_now_when_missing():

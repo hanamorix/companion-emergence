@@ -71,11 +71,19 @@ def register_tools(
             monologue_text: str | None = (
                 result.get("monologue_text") if isinstance(result, dict) else None
             )
+            # #96/#102: a tool that RETURNS {"error": ...} is a refusal, not a
+            # success — write_guard denials come back this way rather than
+            # raising, so a refused propose_write was indistinguishable from a
+            # committed one in the invocation record. Mirrors tool_loop.py's
+            # in-process outcome semantics exactly.
+            refusal_error = result.get("error") if isinstance(result, dict) else None
             log_invocation(
                 persona_dir,
                 name=name,
                 arguments=arguments,
                 result_summary=_summarize(payload),
+                error=refusal_error,
+                outcome="refused" if refusal_error else "ok",
                 monologue_text=monologue_text,
             )
             return [TextContent(type="text", text=payload)]
@@ -87,6 +95,7 @@ def register_tools(
                 arguments=arguments,
                 result_summary=f"error: {exc}",
                 error=str(exc),
+                outcome="error",
             )
             return [TextContent(type="text", text=err_payload)]
 

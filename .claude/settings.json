@@ -11,5 +11,12 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "ui-ux-pro-max@ui-ux-pro-max-skill": false,
+    "hookify@claude-plugins-official": true,
+    "code-review@claude-plugins-official": false,
+    "claude-code-setup@claude-plugins-official": true,
+    "headroom@headroom-marketplace": true
   }
 }

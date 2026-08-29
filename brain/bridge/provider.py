@@ -225,9 +225,25 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation even though
-# Nell can't call them (she's restricted to mcp__brain-tools__*). Disallowing
-# them removes the dead-weight definition tokens from cache-creation cost.
+# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
+# the ones she has no business calling removes their definition tokens from
+# cache-creation cost AND keeps them out of her hands.
+#
+# This list is POLICY, not dead weight. --allowedTools is a permission list, not
+# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
+# --dangerously-skip-permissions rides every call — so anything left off this
+# list is genuinely callable. 87bfc692's original comment claimed the opposite
+# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
+# swept out on that false premise, silently removing chat-time web access (#71).
+#
+# Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
+# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
+# unspiked comment is what caused #71 in the first place; don't trust this one
+# either if the CLI has moved. Re-spike and date a new row.
+#
+# Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
+# Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
+# guards that.
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -236,8 +252,6 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Glob",
     "Grep",
     "Task",
-    "WebFetch",
-    "WebSearch",
     "TodoWrite",
     "NotebookEdit",
     "BashOutput",
@@ -246,10 +260,37 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 def _apply_lean_flags(cmd: list[str]) -> None:
-    """Strip the CLI's built-in tool defs (dead weight — Nell only uses MCP tools)
-    and pin to the configured MCP server. Saves ~14K cache-creation tokens/call."""
+    """Disallow the built-in tools she has no business calling and pin to the
+    configured MCP server. Trims their definition tokens from cache-creation
+    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
+
+
+def brain_tools_mcp_entry(persona_dir: Path, *, request_id: str | None = None) -> dict:
+    """The ``mcpServers["brain-tools"]`` entry the claude CLI uses to spawn the MCP child.
+
+    Single source of truth for the child spawn (issue #138). ``-P`` (PYTHONSAFEPATH) drops the
+    implicit launch-cwd entry from the child's ``sys.path``, so a foreign top-level ``brain/`` in
+    the launch directory cannot shadow the installed/venv ``brain`` (right interpreter, wrong
+    code). ``-P`` must precede ``-m``; it removes only the unsafe ``sys.path[0]`` (cwd / script
+    dir), never ``site-packages``, so the venv/editable ``brain`` still resolves. requires-python
+    >= 3.12 guarantees ``-P`` (added 3.11).
+
+    A safe explicit ``cwd=`` is not used because there is no fixed cwd guaranteed free of a foreign
+    top-level ``brain/`` (the drop-in copy root itself contains one); ``-P`` drops the cwd entry
+    unconditionally, matching the cwd-independence the fix wants.
+
+    Keeping this the ONE definition lets the harness roster preflight
+    (``tests.harness.roster_preflight``) reproduce the child argv/config by construction.
+    """
+    entry: dict = {
+        "command": sys.executable,
+        "args": ["-P", "-m", "brain.mcp_server", "--persona-dir", str(persona_dir)],
+    }
+    if request_id is not None:
+        entry["env"] = {"NELL_MCP_AUDIT_REQUEST_ID": request_id}
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +461,29 @@ def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
             pass
 
 
+def _cli_error_detail(payload: dict) -> str | None:
+    """Detail for a result frame that reports failure, or None if it is fine.
+
+    The CLI can exit 0 and report the failure *inside* the frame (#92) — e.g.
+    ``{"is_error": true, "result": "Not logged in · Please run /login"}``. The
+    non-zero-exit guard never sees those, so without this check the error
+    string was assigned straight to ChatResponse.content and the user read a
+    system error as something their companion said.
+
+    The over-budget frame is excluded deliberately: it also carries
+    ``is_error`` but holds partial work worth keeping, and has its own
+    graceful path at each call site.
+    """
+    if not payload.get("is_error"):
+        return None
+    if payload.get("subtype") == "error_max_budget_usd" or any(
+        "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
+    ):
+        return None
+    detail = str(payload.get("result") or "").strip()
+    return detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+
+
 def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     """Return a useful error detail for failed Claude CLI subprocesses.
 
@@ -549,6 +613,14 @@ class ClaudeCliProvider(LLMProvider):
         try:
             payload = json.loads(result.stdout)
             log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
+            # #119: the CLI can exit 0 and report the failure inside the frame,
+            # so the returncode guard above never sees it. Without this the error
+            # string was returned as the generation itself — and this is the
+            # Haiku path, so the attunement detector then parsed "Not logged in
+            # · Please run /login" as if it were its classification JSON.
+            cli_err = _cli_error_detail(payload)
+            if cli_err is not None:
+                raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
             return str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(
@@ -702,6 +774,9 @@ class ClaudeCliProvider(LLMProvider):
                     f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                 )
                 return ChatResponse(content=text, tool_calls=(), raw=payload)
+            cli_err = _cli_error_detail(payload)
+            if cli_err is not None:
+                raise ProviderError("claude_cli_error", cli_err)
             content = str(payload["result"])
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ProviderError(
@@ -802,15 +877,7 @@ class ClaudeCliProvider(LLMProvider):
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
             config = {
                 "mcpServers": {
-                    "brain-tools": {
-                        "command": sys.executable,
-                        "args": [
-                            "-m",
-                            "brain.mcp_server",
-                            "--persona-dir",
-                            str(persona_dir_path),
-                        ],
-                    }
+                    "brain-tools": brain_tools_mcp_entry(persona_dir_path),
                 }
             }
             try:
@@ -1008,7 +1075,14 @@ class ClaudeCliProvider(LLMProvider):
                             )
                             yield StreamDone(content=cutoff, metadata=metadata)
                         else:
-                            yield StreamDone(content=result_text, metadata=metadata)
+                            # #92: an exit-0 frame can still report a failure —
+                            # surface it as an error rather than streaming the
+                            # CLI's error text as her reply.
+                            cli_err = _cli_error_detail(obj)
+                            if cli_err is not None:
+                                yield StreamError(stage="claude_cli_error", detail=cli_err)
+                            else:
+                                yield StreamDone(content=result_text, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
                         # to q.get would re-arm the idle-timeout watchdog and, if
@@ -1134,16 +1208,7 @@ class ClaudeCliProvider(LLMProvider):
                 ) from exc
             mcp_config = {
                 "mcpServers": {
-                    "brain-tools": {
-                        "command": sys.executable,
-                        "args": [
-                            "-m",
-                            "brain.mcp_server",
-                            "--persona-dir",
-                            str(persona_dir),
-                        ],
-                        "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
-                    }
+                    "brain-tools": brain_tools_mcp_entry(persona_dir, request_id=request_id),
                 }
             }
             try:
@@ -1263,16 +1328,7 @@ class ClaudeCliProvider(LLMProvider):
         request_id = uuid.uuid4().hex
         config = {
             "mcpServers": {
-                "brain-tools": {
-                    "command": sys.executable,
-                    "args": [
-                        "-m",
-                        "brain.mcp_server",
-                        "--persona-dir",
-                        str(persona_dir),
-                    ],
-                    "env": {"NELL_MCP_AUDIT_REQUEST_ID": request_id},
-                }
+                "brain-tools": brain_tools_mcp_entry(persona_dir, request_id=request_id),
             }
         }
 
@@ -1372,6 +1428,9 @@ class ClaudeCliProvider(LLMProvider):
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
+                cli_err = _cli_error_detail(payload)
+                if cli_err is not None:
+                    raise ProviderError("claude_cli_error", cli_err)
                 content = str(payload["result"])
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 raise ProviderError(
@@ -1417,8 +1476,8 @@ def _read_audit_lines_since(
     """Read audit log lines newly appended after `offset` bytes.
 
     Returns a list of invocation records in the engine's tool_invocations
-    shape: ``{name, arguments, result_summary, error?}``. Malformed lines
-    are skipped silently — telemetry should never break a chat response.
+    shape: ``{name, arguments, result_summary, error?, outcome?}``. Malformed
+    lines are skipped silently — telemetry should never break a chat response.
     """
     try:
         # Rotation guard (bug #5): audit._rotate_if_needed renames the log to
@@ -1483,6 +1542,8 @@ def _read_audit_lines_since(
         }
         if entry.get("error"):
             record["error"] = entry["error"]
+        if entry.get("outcome"):
+            record["outcome"] = entry["outcome"]
         if entry.get("monologue_text"):
             record["monologue_text"] = entry["monologue_text"]
         records.append(record)
@@ -1808,6 +1869,14 @@ def _parse_stream_json_result(stdout: str) -> str:
         )
     ):
         raise ProviderError("error_max_budget_usd", result_text or "")
+    # #119: any OTHER is_error frame is a failure, not a reply. Checked after
+    # the over-budget branch above so that frame keeps its dedicated graceful
+    # path — it carries real partial work. Without this the error text was
+    # returned as the assistant reply and persisted as a companion turn.
+    if result_frame is not None:
+        cli_err = _cli_error_detail(result_frame)
+        if cli_err is not None:
+            raise ProviderError("claude_cli_error", cli_err)
     if result_text is not None:
         return result_text
     if assistant_chunks:

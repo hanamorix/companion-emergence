@@ -891,8 +891,10 @@ def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
     assert "brain-tools" in cfg["mcpServers"]
     server_cfg = cfg["mcpServers"]["brain-tools"]
     assert server_cfg["command"] == sys.executable
-    assert server_cfg["args"][0] == "-m"
-    assert server_cfg["args"][1] == "brain.mcp_server"
+    # #138: -P (PYTHONSAFEPATH) must precede -m so the launch cwd can't shadow the child's `brain`.
+    assert server_cfg["args"][0] == "-P"
+    assert server_cfg["args"][1] == "-m"
+    assert server_cfg["args"][2] == "brain.mcp_server"
     assert "--persona-dir" in server_cfg["args"]
     assert str(persona_dir) in server_cfg["args"]
     assert server_cfg["env"]["NELL_MCP_AUDIT_REQUEST_ID"]
@@ -944,6 +946,37 @@ def test_read_audit_lines_since_logs_malformed_lines(tmp_path: Path, caplog) -> 
 
     assert [record["name"] for record in records] == ["ok"]
     assert "malformed" in caplog.text
+
+
+def test_read_audit_lines_since_surfaces_outcome_and_omits_when_absent(tmp_path: Path) -> None:
+    """#96/#102: outcome must ride along when the MCP audit log carries it, and
+    a legacy line written before the field existed must not gain a fabricated
+    key (the caller distinguishes "no outcome recorded" from "outcome=None")."""
+    from brain.bridge.provider import _read_audit_lines_since
+
+    audit_path = tmp_path / "tool_invocations.log.jsonl"
+    audit_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "name": "propose_write",
+                        "arguments": {},
+                        "result_summary": "error: denied",
+                        "outcome": "refused",
+                    }
+                ),
+                json.dumps({"name": "legacy_tool", "arguments": {}, "result_summary": "ok"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = _read_audit_lines_since(audit_path, 0)
+
+    assert records[0]["outcome"] == "refused"
+    assert "outcome" not in records[1]
 
 
 def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:

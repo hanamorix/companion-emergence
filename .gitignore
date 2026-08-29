@@ -141,9 +141,13 @@ AGENTS.md
 app/pnpm-workspace.yaml
 # dragonfly diagnosis hunts — local working/scratch (ledgers + token harnesses)
 hunts/
+
+# guarded-change working/scratch — per-change stage docs (spec/criteria/plan/red-team)
+changes/
 app/src-tauri/python-runtime/
 
 # ── Leak-guard local tier + private local docs (never tracked) ──
 hooks/leak-rules.local
 docs/guarded-change/
 CLAUDE.local.md
+CLAUDE.local.history.md

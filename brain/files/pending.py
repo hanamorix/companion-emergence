@@ -75,15 +75,44 @@ def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
     return sorted(fresh, key=lambda r: r["proposed_at"], reverse=True)
 
 
-def mark(persona_dir: Path, rid: str, *, status: str) -> None:
+def find_duplicate(persona_dir: Path, *, op: str, resolved_path: str,
+                   content_sha: str, now: datetime) -> str | None:
+    """Id of a fresh pending record proposing this exact write, or None.
+
+    The record id is not a dedupe key — _new_id mixes in `now`, so two
+    identical proposals moments apart mint different ids and both persist
+    (#93/#101). The dedupe key is (op, resolved_path, content_sha).
+
+    Matches against list_pending, which already filters to status="pending"
+    AND within _TTL_HOURS: a record still marked pending but past the TTL has
+    merely not been swept yet, and must not suppress a legitimate proposal.
+    """
+    for r in list_pending(persona_dir, now=now):
+        if (r.get("op") == op
+                and r.get("resolved_path") == resolved_path
+                and r.get("content_sha") == content_sha):
+            return r["id"]
+    return None
+
+
+def mark(persona_dir: Path, rid: str, *, status: str) -> bool:
+    """Set the record's status. Returns True if it took, False if it did not.
+
+    Returning a bool rather than failing mutely is load-bearing (#101): get()
+    swallows OSError/ValueError, so a transient read failure made this a silent
+    no-op. commit_write then wrote the file while the record stayed 'pending',
+    and its status guard — the thing making the commit idempotent — stopped
+    guarding, so a retry appended the block a second time.
+    """
     rec = get(persona_dir, rid)
     if rec is None:
-        return
+        return False
     rec["status"] = status
     p = _dir(persona_dir) / f"{rid}.json"
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec), encoding="utf-8")
     tmp.replace(p)
+    return True
 
 
 def sweep_expired(persona_dir: Path, *, now: datetime) -> int:

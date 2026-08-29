@@ -103,10 +103,13 @@ def test_recruit_on_reach_expands_and_reruns(tmp_path: Path) -> None:
     # not the full suite — T5 (E) scopes reach re-invoke to the faculty.
     from brain.chat.tool_recruit import tools_for_capability
     second_tool_names = {t["function"]["name"] for t in (provider.chat_calls[1]["tools"] or [])}
-    expected_tools = set(tools_for_capability("memory"))
+    # reach_for_capability fired on pass 1 and is deliberately not re-offered (#93) —
+    # the rerun prompt already tells her not to reach again.
+    expected_tools = set(tools_for_capability("memory")) - {"reach_for_capability"}
     assert expected_tools.issubset(second_tool_names), (
         f"2nd call tools missing: {expected_tools - second_tool_names}"
     )
+    assert "reach_for_capability" not in second_tool_names
     # Heavy tools NOT in the memory faculty must be absent (scoped, not full suite)
     assert "crystallize_soul" not in second_tool_names
 
@@ -342,3 +345,94 @@ def test_full_toolset_turn_does_not_suppress_streaming(tmp_path: Path) -> None:
     )
     assert not provider.options_seen[0].get("suppress_stream")
     assert provider.emit_text_calls == []
+
+
+def test_rerun_excludes_tools_that_already_fired(tmp_path: Path) -> None:
+    """#93: the re-invoke must not re-offer a tool that already ran this turn.
+
+    record_monologue is in REFLEXIVE_CORE, so it lands in every expanded set —
+    which let one turn record two monologues and let a file-capability reach
+    issue a second propose_write against identical context.
+    """
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim_allowed = ["record_monologue", "reach_for_capability"]
+
+    response_1 = ChatResponse(
+        content="I need more tools",
+        tool_calls=(),
+        dispatched_invocations=(
+            {"name": "record_monologue", "arguments": {"monologue": "a thought"}},
+            {"name": "reach_for_capability", "arguments": {"capability": "files"}},
+        ),
+        raw=None,
+    )
+    response_2 = ChatResponse(content="done", tool_calls=(), dispatched_invocations=(), raw=None)
+
+    provider = ScriptedProvider([response_1, response_2])
+    run_tool_loop(
+        [ChatMessage(role="user", content="help")],
+        provider=provider,
+        tools=build_tools_list("Nell", allowed=slim_allowed),
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+        companion_name="Nell",
+        recruited_allowed=slim_allowed,
+    )
+
+    assert len(provider.chat_calls) == 2
+    second = {t["function"]["name"] for t in (provider.chat_calls[1]["tools"] or [])}
+    assert "record_monologue" not in second, (
+        "record_monologue already fired on pass 1 and must not be re-offered"
+    )
+    assert "reach_for_capability" not in second, (
+        "the rerun prompt tells her not to reach again — the toolset must agree"
+    )
+    # The faculty she actually reached for is still available.
+    assert "propose_write" in second
+
+
+def test_rerun_still_offers_read_only_tool_that_already_fired(tmp_path: Path) -> None:
+    """#93 (narrowed): only _NEVER_REOFFER tools are excluded from the rerun.
+
+    search_memories is in REFLEXIVE_CORE and in tools_for_capability("memory"),
+    and the rerun prompt itself names it as an example tool to call — excluding
+    it after it already fired once would collide with both. Read-only tools are
+    safe to call again with different arguments and must stay available.
+    """
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    slim_allowed = ["search_memories", "reach_for_capability"]
+
+    response_1 = ChatResponse(
+        content="let me check",
+        tool_calls=(),
+        dispatched_invocations=(
+            {"name": "search_memories", "arguments": {"query": "something"}},
+            {"name": "reach_for_capability", "arguments": {"capability": "memory"}},
+        ),
+        raw=None,
+    )
+    response_2 = ChatResponse(content="done", tool_calls=(), dispatched_invocations=(), raw=None)
+
+    provider = ScriptedProvider([response_1, response_2])
+    run_tool_loop(
+        [ChatMessage(role="user", content="help")],
+        provider=provider,
+        tools=build_tools_list("Nell", allowed=slim_allowed),
+        store=store,
+        hebbian=hebbian,
+        persona_dir=tmp_path,
+        companion_name="Nell",
+        recruited_allowed=slim_allowed,
+    )
+
+    assert len(provider.chat_calls) == 2
+    second = {t["function"]["name"] for t in (provider.chat_calls[1]["tools"] or [])}
+    assert "search_memories" in second, (
+        "a read-only tool that already fired must still be offered on the rerun"
+    )
+    assert "reach_for_capability" not in second, (
+        "reach_for_capability must never be re-offered — the rerun prompt says not to reach again"
+    )

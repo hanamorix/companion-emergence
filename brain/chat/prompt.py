@@ -17,7 +17,9 @@ import logging
 from pathlib import Path
 
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
+from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
+from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -179,6 +181,11 @@ def build_system_message(
     if user_input is not None:
         parts.append(_EPISTEMIC_INSTRUCTION)
 
+    # Toolset parity with the static builder. The image path keeps the combined
+    # builder for byte-equivalence, so it needs its own append. ONE line — the
+    # monologue/reply framing divergence between the two paths is #72, not this.
+    parts.append(build_tool_inventory(persona_name))
+
     # 4b. Recall block — memories matching the current user input.
     # Passes persona_dir so the forgetting-aware path can partition into
     # active / fading / lost via search_with_loss (spec §5).
@@ -267,6 +274,16 @@ def build_system_message(
     except Exception:  # noqa: BLE001
         pass
 
+    # 7c. Interior research-awareness — recent research she ran on her own, so it
+    # is present in context (she was previously unaware research had run at all;
+    # it only reached her if she actively searched). Fail-soft.
+    try:
+        research_block = build_research_awareness_block(store, limit=3)
+        if research_block:
+            parts.append(research_block)
+    except Exception:  # noqa: BLE001
+        pass
+
     # 8. Inner monologue framing — names the record_monologue tool, articulates
     # situational trigger criteria. Per spec 2026-05-30 §2.
     soul_hints = _collect_soul_hints(soul_store, limit=3)
@@ -347,6 +364,12 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
     # lists, "superpowers", copied CLAUDE.md, mode banners). Static text → stays in
     # the frozen prefix, byte-stable for caching. See the caveman/skill-leak work.
     parts.append(_HARNESS_FENCE)
+
+    # The toolset, derived from the registry rather than hand-written into
+    # voice.md. Static text → frozen prefix, byte-stable for caching, same as
+    # the fence above. This is what reaches EXISTING personas: their voice.md is
+    # a frozen copy taken at creation and the framework never edits it (#69).
+    parts.append(build_tool_inventory(persona_name))
 
     # Inner-monologue framing ("record_monologue FIRST, then reply") lives in the
     # FROZEN prefix, not the volatile tail: a "do this before composing" directive
@@ -492,6 +515,14 @@ def build_volatile_context(
     except Exception:  # noqa: BLE001
         pass
 
+    # 7c. Interior research-awareness — fail-soft (mirrors maker block above).
+    try:
+        research_block = build_research_awareness_block(store, limit=3)
+        if research_block:
+            parts.append(research_block)
+    except Exception:  # noqa: BLE001
+        pass
+
     # 8. Inner-monologue framing moved to build_static_system_message (the frozen
     # prefix): its "record_monologue FIRST, then reply" directive must be read
     # before the model composes, so the volatile tail (read after the
@@ -629,8 +660,28 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         from brain.memory.store import _row_to_memory
         from brain.utils.memory import days_since_human
 
+        # #90: filter to memories that actually carry an emotion vector. This is
+        # the SAME fix already applied to _build_emotion_summary below and to
+        # _build_emotions / _build_body in brain/bridge/persona_state.py — this
+        # site and get_body_state were missed when it went in.
+        #
+        # Measured on the real persona 2026-08-08: 48 of the 50 most recent
+        # memories were `heartbeat` rows with empty emotions_json, so this
+        # aggregated to {} — the injected body block carried no emotion at all —
+        # while love:10.0 and belonging:10.0 sat just outside the window.
+        # heartbeat writes ~50-75 emotionless memories a day and is 49% of the
+        # store, so the unfiltered window fills within a day of quiet.
+        #
+        # Filtering cannot change the aggregation: an emotionless memory is a
+        # no-op in aggregate_state's max-pool. It only stops the window being
+        # spent on rows that cannot contribute. LIMIT matches the sibling's 200
+        # so the two emotion surfaces in one prompt cannot disagree.
         rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT 200"
         ).fetchall()
         memories = [_row_to_memory(row) for row in rows]
         state = aggregate_state(memories)

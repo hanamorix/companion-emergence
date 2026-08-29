@@ -41,10 +41,12 @@ def test_accept_marks_gap_acknowledged_and_sets_cooldown(tmp_path: Path) -> None
 
 
 def test_revise_writes_clamped_registered_emotion_memory(tmp_path: Path) -> None:
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
     from brain.memory.store import MemoryStore
 
     _seed_open_gap(tmp_path)
-    # delta over the [-1, 1] bound — must be clamped to 1.0 → importance 10.
+    # delta over the [-1, 1] bound — must be clamped to 1.0 → abs(1.0)*10 = 10.0,
+    # then capped at _MAX_DELTA_INTENSITY (F1/#94 twin of the extractor ceiling).
     result = reconcile_self_read(
         persona_dir=tmp_path, action="revise", channel="grief", delta=5.0
     )
@@ -57,8 +59,34 @@ def test_revise_writes_clamped_registered_emotion_memory(tmp_path: Path) -> None
     finally:
         store.close()
     assert len(mems) == 1
-    # clamped to 1.0 → abs(1.0)*10 = 10.0 intensity on the grief channel
-    assert mems[0].emotions.get("grief") == 10.0
+    assert mems[0].emotions.get("grief") == _MAX_DELTA_INTENSITY
+
+
+def test_revise_delta_is_capped_at_max_delta_intensity(tmp_path: Path) -> None:
+    """F1/#94 twin: brain/chat/extractor.py::_apply_emotion_delta caps a minted
+    vector at _MAX_DELTA_INTENSITY so one extraction can't peg a channel to the
+    full 10.0 clamp. This self-authored path must be capped the same way — a
+    delta well inside the [-1, 1] bound (not touched by _clamp_delta) whose x10
+    mapping would exceed the ceiling must still be capped."""
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+    from brain.memory.store import MemoryStore
+
+    _seed_open_gap(tmp_path)
+    # 0.5 is within the [-1, 1] delta bound — abs(0.5) * 10 = 5.0, which must
+    # be capped down to _MAX_DELTA_INTENSITY (3.0).
+    result = reconcile_self_read(
+        persona_dir=tmp_path, action="revise", channel="grief", delta=0.5
+    )
+    assert result.get("ok") is True
+    assert result.get("delta_written") is True
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        mems = [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]
+    finally:
+        store.close()
+    assert len(mems) == 1
+    assert mems[0].emotions.get("grief") == _MAX_DELTA_INTENSITY
 
 
 def test_revise_off_vocab_channel_is_dropped(tmp_path: Path) -> None:

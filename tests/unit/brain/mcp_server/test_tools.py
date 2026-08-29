@@ -77,6 +77,8 @@ def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stor
     # Audit 2026-05-07 P3-3: 'query' is now redacted in default mode.
     assert rec["arguments"] == {"query": "[REDACTED]"}
     assert rec["error"] is None
+    # #96/#102: a normal return is outcome="ok".
+    assert rec["outcome"] == "ok"
 
 
 def test_register_tools_dispatches_and_logs_error(persona_dir: Path, fake_stores) -> None:
@@ -100,6 +102,8 @@ def test_register_tools_dispatches_and_logs_error(persona_dir: Path, fake_stores
     rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert rec["name"] == "search_memories"
     assert rec["error"] == "boom"
+    # #96/#102: a raised exception is outcome="error".
+    assert rec["outcome"] == "error"
 
 
 def test_register_tools_unknown_tool_returns_error(persona_dir: Path, fake_stores) -> None:
@@ -141,6 +145,42 @@ def test_register_tools_summary_truncated(persona_dir: Path, fake_stores) -> Non
 
     rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert len(rec["result_summary"]) <= 141  # 140 + "…"
+
+
+def test_register_tools_logs_refused_outcome_for_guard_denial(
+    persona_dir: Path, fake_stores
+) -> None:
+    """#96/#102: write_guard denials RETURN {"error": ...} rather than raising,
+    so a refused propose_write was indistinguishable from a committed one in
+    the invocation record. Goes through the real dispatch/propose_write/
+    write_guard chain (not mocked) — a guard-denied path is a realistic case.
+    """
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+    register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+    call_handler = _get_call_handler(server)
+
+    result = asyncio.run(
+        call_handler(
+            _call_request(
+                "propose_write",
+                {"path": "/etc/passwd", "op": "create", "content": "x"},
+            )
+        )
+    )
+
+    text = result.root.content[0].text
+    payload = json.loads(text)
+    assert "error" in payload  # write_guard denial, returned not raised
+
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["name"] == "propose_write"
+    assert rec["outcome"] == "refused"
+    assert rec["error"]  # non-null/non-empty — the record must not drop it
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
