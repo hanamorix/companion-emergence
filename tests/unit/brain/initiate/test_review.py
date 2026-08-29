@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.review import run_initiate_review_tick
@@ -144,7 +145,15 @@ def test_review_tick_gate_blocks_send_records_hold(tmp_path: Path, monkeypatch) 
         semantic_context=_ctx(),
     )
     provider = _fake_provider("send_notify")
-    blackout_time = datetime(2026, 5, 11, 1, 30, tzinfo=UTC)
+    # A fixed non-UTC offset (not the host's OS timezone) so the gate takes
+    # its "already user-local" branch deterministically — see
+    # `check_send_allowed`'s tzinfo/utcoffset() branch in brain/initiate/gates.py
+    # and the same pattern in test_gates.py::test_check_send_allowed_blocks_notify_in_blackout.
+    # A tzinfo=UTC value here would be re-converted via `.astimezone()` to
+    # whatever local timezone the test happens to run in, making the
+    # blackout check (and thus this test) pass or fail depending on the
+    # host machine's configured timezone/DST offset for this date.
+    blackout_time = datetime(2026, 5, 11, 1, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
     with patch("brain.initiate.review.datetime") as mock_dt:
         mock_dt.now = MagicMock(return_value=blackout_time)
         mock_dt.fromisoformat = datetime.fromisoformat
