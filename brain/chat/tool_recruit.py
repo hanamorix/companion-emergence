@@ -65,12 +65,20 @@ def select_tools(
     signal: SalienceSignal,
     *,
     base: tuple[str, ...] = NELL_TOOL_NAMES,
+    gap_open: bool = False,
 ) -> list[str]:
     """Return the list of tool names allowed for this turn.
 
     Fails open: maximal signal → full suite (today's behaviour). Non-maximal
     turns get REFLEXIVE_CORE plus whichever heavier faculties the salience
     flags call for. Result is ordered by *base* so the LLM sees a stable list.
+
+    ``gap_open``: when a self-model gap is currently open (the ambient block is
+    surfacing it and inviting her to reconcile), grant ``reconcile_self_read`` so
+    the invitation is actionable. Gated on gap-open, not on maximal salience, and
+    NOT always-on: the tool only appears when a gap is actually being surfaced, so
+    it cannot drive the reconcile→self-authored-memory feedback loop on ordinary
+    turns (and the recency-baseline gap makes open gaps occasional, not constant).
     """
     if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
@@ -82,6 +90,9 @@ def select_tools(
 
     if signal.mentions_file_or_path:
         keep.update(_FILE_TOOLS)
+
+    if gap_open:
+        keep.add("reconcile_self_read")
 
     # Preserve base ordering; drop anything not in base.
     return [t for t in base if t in keep]
