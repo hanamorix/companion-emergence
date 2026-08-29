@@ -45,21 +45,25 @@ class HebbianMatrix:
     CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._conn = sqlite3.connect(str(db_path))
-        try:
-            result = self._conn.execute("PRAGMA integrity_check").fetchall()
-        except sqlite3.DatabaseError as exc:
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
+        # Mirrors MemoryStore: hot per-turn openers (the recall-path single
+        # open in _build_recall_block) pass integrity_check=False to skip the
+        # full-DB PRAGMA integrity_check and take a lightweight WAL open.
+        if integrity_check:
+            try:
+                result = self._conn.execute("PRAGMA integrity_check").fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._conn.close()
+                from brain.health.anomaly import BrainIntegrityError
 
-            raise BrainIntegrityError(str(db_path), str(exc)) from exc
-        if result != [("ok",)]:
-            detail = "; ".join(str(row[0]) for row in result)
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
+                raise BrainIntegrityError(str(db_path), str(exc)) from exc
+            if result != [("ok",)]:
+                detail = "; ".join(str(row[0]) for row in result)
+                self._conn.close()
+                from brain.health.anomaly import BrainIntegrityError
 
-            raise BrainIntegrityError(str(db_path), detail)
+                raise BrainIntegrityError(str(db_path), detail)
         # WAL + 5s busy_timeout — set AFTER the integrity check so a
         # corrupt-file probe surfaces BrainIntegrityError, not a pragma
         # crash. In-memory dbs reject WAL; fallback keeps `:memory:` ok.

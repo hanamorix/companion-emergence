@@ -8,14 +8,19 @@ would be pinning memories permanently — a real design failure against spec §3
 (decay-subordinate by construction).
 
 Why abandonment has TWO arms here: reaching for a cluster via search_memories
-strengthens the hebbian co-recall edges (the W5 signal — `salience.hebbian`),
-but the bare `store.search_text` underneath the tool ALSO bumps each hit's
-monotone `recall_count` and `last_accessed_at` (the pre-existing recall/freshness
-salience inputs). The W5 invariant is specifically that the *edges* don't ratchet
-the memory permanently vivid — so a faithful abandonment must (a) decay+GC the
-edges AND (b) let the reach-recency lapse (lived time passing since the last
-reach), exactly as it would in lived use. With both, the cluster drops out of
-'active' and fades, proving the edges were not the thing keeping it alive.
+strengthens the hebbian co-recall edges (the W5 signal — `salience.hebbian`).
+Retrieval itself is bump-free: search_memories ranks via `rank_memories`,
+which always calls `store.search_fts_scored`/`search_text` with `bump=False`,
+so this reach never touches `recall_count` or `last_accessed_at` here (only a
+deliberate `read_full_memory` full-read, or the passive recall-block's
+fractional snippet bump, do that — neither fires in this test). The W5
+invariant is specifically that the *edges* don't ratchet the memory
+permanently vivid — so a faithful abandonment must (a) decay+GC the edges AND
+(b) pin the freshness signal explicitly into the deep past (it was already
+stale via the `last_accessed_at`-is-None -> `created_at` fallback; this
+removes any ambiguity), exactly as it would look after lived time passing.
+With both, the cluster drops out of 'active' and fades, proving the edges
+were not the thing keeping it alive.
 """
 
 from datetime import UTC, datetime, timedelta
