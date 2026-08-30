@@ -145,13 +145,14 @@ def test_review_tick_gate_blocks_send_records_hold(tmp_path: Path, monkeypatch) 
         semantic_context=_ctx(),
     )
     provider = _fake_provider("send_notify")
-    # Inject a tz-aware, non-UTC wall-clock inside the 23:00-07:00 blackout
-    # window. check_send_allowed treats a non-UTC-offset datetime's wall-clock
-    # as user-local (see brain/initiate/gates.py + test_gates.py's LA-zoned
-    # cases), so the blackout fires deterministically regardless of the runner's
-    # OS timezone. The prior UTC 01:30 only landed in blackout on a UTC host
-    # (e.g. CI) and spuriously "delivered" on a machine west of UTC — unrelated
-    # to the memory-consolidation migration.
+    # A fixed non-UTC offset (not the host's OS timezone) so the gate takes
+    # its "already user-local" branch deterministically — see
+    # `check_send_allowed`'s tzinfo/utcoffset() branch in brain/initiate/gates.py
+    # and the same pattern in test_gates.py::test_check_send_allowed_blocks_notify_in_blackout.
+    # A tzinfo=UTC value here would be re-converted via `.astimezone()` to
+    # whatever local timezone the test happens to run in, making the
+    # blackout check (and thus this test) pass or fail depending on the
+    # host machine's configured timezone/DST offset for this date.
     blackout_time = datetime(2026, 5, 11, 1, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
     with patch("brain.initiate.review.datetime") as mock_dt:
         mock_dt.now = MagicMock(return_value=blackout_time)

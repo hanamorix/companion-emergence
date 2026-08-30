@@ -34,6 +34,12 @@ _CATCHUP_INTERVAL_S = 30 * 60.0
 # Backoff base: 30 min, then doubles (1h, 2h, …) capped at normal interval.
 _BACKOFF_BASE_S = 30 * 60.0
 
+# Throttle-deferral retry: matches run_folded's own tick_interval_s default
+# (brain/bridge/supervisor.py) - any value at or below that granularity is
+# equivalent, since the next real retry opportunity is gated by the
+# supervisor's own loop cadence regardless of a finer-grained number here.
+_DEFERRED_RETRY_INTERVAL_S = 60.0
+
 
 @dataclass(frozen=True)
 class SelfModelCadenceState:
@@ -113,12 +119,25 @@ def compute_next_state(
     """Advance cadence state based on tick outcome.
 
     outcome values:
-      "clean"   → normal interval, reset consecutive_failures.
-      "backlog" → short catch-up interval, reset consecutive_failures.
-      "failure" → escalating backoff, increment consecutive_failures.
+      "clean"    → normal interval, reset consecutive_failures.
+      "backlog"  → short catch-up interval, reset consecutive_failures.
+      "deferred" → throttle denied the slot (not a provider failure) - short
+                   retry interval, consecutive_failures left UNCHANGED (no
+                   backoff, no reset - mirrors brain/maker/__init__.py's own
+                   "no cooldown, no error" framing for the identical
+                   ThrottleDeferred situation).
+      "failure"  → escalating backoff, increment consecutive_failures.
 
-    Any unrecognised outcome is treated as "clean".
+    Any unrecognised outcome is treated as "clean". "deferred" is checked
+    before "failure" so a future outcome-string typo can't silently fall
+    through to the "clean"/unknown default and use the full normal interval
+    instead of retrying promptly.
     """
+    if outcome == "deferred":
+        return SelfModelCadenceState(
+            next_reflection_at=now + timedelta(seconds=_DEFERRED_RETRY_INTERVAL_S),
+            consecutive_failures=state.consecutive_failures,
+        )
     if outcome == "failure":
         cf = state.consecutive_failures + 1
         backoff = _BACKOFF_BASE_S * (2 ** (cf - 1))

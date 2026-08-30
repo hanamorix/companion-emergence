@@ -80,6 +80,35 @@ def test_backlog_uses_catchup_interval():
     assert delta < 1.0
 
 
+def test_deferred_uses_short_retry_interval_and_leaves_failures_unchanged():
+    """C8: a throttle-denial ("deferred") outcome sets a short retry interval
+    (not the ~6h normal interval, and not the escalating failure backoff),
+    and leaves consecutive_failures UNCHANGED — a deferral is not a provider
+    failure, so it must neither reset nor increment the backoff counter
+    (mirrors brain/maker/__init__.py's "no cooldown, no error" framing for
+    the identical ThrottleDeferred situation)."""
+    from brain.self_model.cadence import _DEFERRED_RETRY_INTERVAL_S
+
+    now = datetime.now(UTC)
+    state = SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0)
+    next_state = compute_next_state(state, outcome="deferred", now=now)
+    assert next_state.consecutive_failures == 0
+    expected_at = now + timedelta(seconds=_DEFERRED_RETRY_INTERVAL_S)
+    delta = abs((next_state.next_reflection_at - expected_at).total_seconds())
+    assert delta < 1.0
+
+
+def test_deferred_does_not_reset_existing_failure_count():
+    """The "leaves consecutive_failures unchanged" guarantee must hold on
+    both sides — including when there's an existing nonzero count (a
+    deferral must neither reset it back to 0, matching a clean tick's
+    behavior, nor increment it, matching a failure's)."""
+    now = datetime.now(UTC)
+    state = SelfModelCadenceState(next_reflection_at=None, consecutive_failures=3)
+    next_state = compute_next_state(state, outcome="deferred", now=now)
+    assert next_state.consecutive_failures == 3
+
+
 def test_round_trip_persist(tmp_path):
     """Cadence state survives save → load."""
     now = datetime.now(UTC)
