@@ -91,4 +91,6 @@ def test_safe_path_prevents_cwd_shadow(tmp_path: Path) -> None:
     )
     # The fix: -P drops the cwd entry, so brain resolves from the installed/venv location.
     assert str(shadow) not in with_p, f"-P failed to prevent the cwd shadow (got {with_p})"
-    assert with_p.endswith("brain/__init__.py"), with_p
+    # str(Path) is OS-native — on Windows this string uses backslashes, so a
+    # POSIX literal can never match. as_posix() normalises; it is a no-op off Windows.
+    assert Path(with_p).as_posix().endswith("brain/__init__.py"), with_p
