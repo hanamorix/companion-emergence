@@ -2,13 +2,14 @@
 
 Task 7 (Organ DoD): the producer (self-model reflection) fires through the
 supervisor's own persisted-cadence block — NOT a monotonic timer. The tick
-composes the whole organ end-to-end: declared (aggregate_state) vs derived
-(compute_derived) → gap → state persistence → cadence advance, fail-isolated.
+composes the whole organ end-to-end: short (compute_derived) vs long
+(compute_baseline) → gap → state persistence → cadence advance, fail-isolated.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.bridge.provider import FakeProvider
@@ -33,41 +34,45 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
-def _seed_divergent_memories(persona_dir: Path) -> None:
-    """OLD high-intensity joy + love peaks, beyond the recent window, plus many
-    RECENT grief memories.
+def _seed_divergent_memories(persona_dir: Path, now: datetime | None = None) -> None:
+    """A genuine, sustained short-vs-long (recent-vs-baseline) cross on two channels.
 
-    declared (max-pool over the whole history) surfaces joy + love at their old
-    peaks; derived (peak over the most-recent _RECENT_WINDOW_COUNT=30 memories)
-    sees only the recent grief — so joy and love show a real negative gap
-    ("I claim these but haven't felt them lately"), while grief ~matches. Two
-    divergent channels so a reconcile on one leaves the gap non-empty.
+    Placed RELATIVE to ``now`` (the tick's reference instant) so "recent" is recent
+    for that tick:
+      - joy:   OLD low events (2.0) + RECENT high events (9.0) → the SHORT read runs
+               above the LONG baseline → a GOLDEN cross (delta > +0.5).
+      - grief: OLD high events (9.0) + RECENT low events (2.0) → the SHORT read runs
+               below baseline → a DEATH cross (delta < -0.5).
+    Each channel is MULTI-event (a single event would give short == long under the
+    normalized mean, hence no gap). The deltas are ~±1.8, robustly above the 0.5
+    noise floor, so {joy, grief} is a stable per_channel key set across ticks — as
+    ``now`` advances over a fixed memory set every event ages by the same amount, a
+    uniform time-shift the normalized mean is invariant to, so the cross persists and
+    sustained_ticks accumulates. Two divergent channels so a reconcile on joy leaves
+    the gap non-empty (grief remains).
     """
     from brain.memory.store import Memory, MemoryStore
 
+    now = now or datetime.now(UTC)
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        for name, intensity in (("joy", 9.0), ("love", 8.0)):
-            old = Memory.create_new(
-                content=f"an old bright day of {name}",
-                memory_type="episodic",
-                domain="self",
-                emotions={name: intensity},
-                importance=8.0,
-            )
-            object.__setattr__(old, "created_at", datetime(2026, 1, 1, tzinfo=UTC))
-            store.create(old)
-        # > _RECENT_WINDOW_COUNT recent grief memories so the old peaks fall
-        # outside the derived window.
-        for i in range(31):
-            m = Memory.create_new(
-                content=f"a recent ache #{i}",
-                memory_type="episodic",
-                domain="self",
-                emotions={"grief": 4.0},
-                importance=7.0,
-            )
-            store.create(m)
+        for name, old_val, new_val in (("joy", 2.0, 9.0), ("grief", 9.0, 2.0)):
+            for days in (40, 45, 50):  # OLD events
+                m = Memory.create_new(
+                    content=f"an old {name} memory",
+                    memory_type="episodic", domain="self",
+                    emotions={name: old_val}, importance=7.0,
+                )
+                object.__setattr__(m, "created_at", now - timedelta(days=days))
+                store.create(m)
+            for hours in (1, 3, 6):  # RECENT events
+                m = Memory.create_new(
+                    content=f"a recent {name} memory",
+                    memory_type="episodic", domain="self",
+                    emotions={name: new_val}, importance=7.0,
+                )
+                object.__setattr__(m, "created_at", now - timedelta(hours=hours))
+                store.create(m)
     finally:
         store.close()
 
@@ -88,7 +93,7 @@ def test_self_model_tick_runs_end_to_end_and_persists_state(tmp_path: Path) -> N
 
     _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus)
 
-    # State file persisted, with an active current_gap that derived/declared
+    # State file persisted, with an active current_gap that short/long
     # genuinely diverge on.
     state_file = persona_dir / "self_model_state.json"
     assert state_file.exists(), "tick must persist self_model_state.json"
@@ -188,6 +193,281 @@ def test_self_model_tick_fail_isolated_on_articulate_error(tmp_path: Path) -> No
     assert advanced.consecutive_failures >= 1
 
 
+# ── Throttle-denial fix (self-model-note-null-fix, C1/C4/C8/C9) ───────────────
+#
+# The note went silently null on every tick since PR #151 because the shared
+# throttle's 300s idle bar was essentially never met on a chatty persona.
+# Revision 4's fix: a pre-flight cli_throttle.slot_available() peek in
+# _run_self_model_tick, checked BEFORE _self_model_reflect is called at all,
+# so a denied attempt costs nothing (C9) - and articulate()'s own real
+# acquire_background() stays as the authoritative fallback for the rare race
+# where the peek granted but a different accessor (or resumed chat) won the
+# slot first (C8 route 2).
+
+
+def test_preflight_peek_denial_is_zero_side_effect(tmp_path: Path) -> None:
+    """C9: when the pre-flight throttle peek denies (the common case during a
+    sustained-chat spell), NOTHING except the cadence advance and the C1
+    error-sink log happens - no gap computation, no self_model_state.json
+    write, no daily-budget consumption, no gaps_surfaced change, no feed
+    event. Seeds a gap that WOULD be computed/consumed if a granted attempt
+    ran, so this test can actually detect a regression rather than merely
+    observing an absence because nothing would have happened anyway.
+
+    Oracle (H6): this assertion set fails against the pre-Revision-4 design
+    (throttle check inside articulate(), downstream of gap computation and
+    budget consumption) - that design calls _self_model_reflect on every
+    denied attempt, so all of these assertions would fail against it.
+    """
+    from brain.bridge import cli_throttle
+    from brain.self_model import cadence as sm_cadence
+    from brain.self_model.resolve import load_audit
+
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir)
+    bus = _CapturingBus()
+
+    cli_throttle.mark_interactive_active()  # chat "just happened" — denies the peek
+
+    _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus)
+
+    assert not (persona_dir / "self_model_state.json").exists(), (
+        "a denied attempt must not compute or persist a gap"
+    )
+    assert not (persona_dir / "self_model" / "daily_articulate_budget.json").exists(), (
+        "a denied attempt must not consume the daily articulate budget"
+    )
+    audit = load_audit(persona_dir)
+    assert audit.get("gaps_surfaced", 0) == 0, (
+        "a denied attempt must not bump the gaps_surfaced counter"
+    )
+    assert bus.events == [], "a denied attempt must not publish a self_model_tick event"
+
+    error_path = persona_dir / "self_model_articulate_errors.jsonl"
+    assert error_path.exists()
+    rows = [json.loads(line) for line in error_path.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "self_model_articulate_deferred"
+
+    advanced = sm_cadence.load(persona_dir)
+    assert advanced.next_reflection_at is not None
+    delta = (advanced.next_reflection_at - datetime.now(UTC)).total_seconds()
+    assert 0 < delta <= 65, "cadence must advance to the short ~60s deferred retry, not ~6h"
+    assert advanced.consecutive_failures == 0, "a deferral must not trigger the failure backoff"
+
+
+def test_rare_race_throttle_deferred_still_persists_state_but_defers_cadence(
+    tmp_path: Path,
+) -> None:
+    """C8 route 2: if articulate() raises ThrottleDeferred (the rare
+    peek-then-lost race — pre-flight peek granted, but the real acquire then
+    lost the slot), the cadence still advances to the short "deferred" retry
+    (not the 6h normal interval, not the escalating failure backoff) — but
+    UNLIKE route 1 (C9's zero-side-effects guarantee), self_model_state.json
+    WAS written this tick, because gap computation already ran before the
+    race was discovered. This is the accepted, maker-precedented tradeoff for
+    the rare race, distinct from route 1's pure no-op."""
+    from unittest.mock import patch
+
+    from brain.bridge import cli_throttle
+    from brain.self_model import cadence as sm_cadence
+
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir)
+    bus = _CapturingBus()
+
+    with patch(
+        "brain.bridge.supervisor.sm_articulate",
+        side_effect=cli_throttle.ThrottleDeferred("lost the race"),
+    ):
+        _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus)
+
+    assert (persona_dir / "self_model_state.json").exists(), (
+        "the rare-race path already ran gap computation before the race was "
+        "discovered — state IS written, unlike route 1's pre-flight denial"
+    )
+    advanced = sm_cadence.load(persona_dir)
+    assert advanced.next_reflection_at is not None
+    delta = (advanced.next_reflection_at - datetime.now(UTC)).total_seconds()
+    assert 0 < delta <= 65, "cadence must use the short deferred retry, not 6h or a backoff"
+    assert advanced.consecutive_failures == 0, "a deferral must not trigger the failure backoff"
+
+
+def test_carry_forward_same_channels_open_status_note_present(tmp_path: Path) -> None:
+    """C4 case (i): same channels + prior status == "open" + prior note
+    present → the note IS carried forward onto the new gap."""
+    from unittest.mock import patch
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir, now=base)
+
+    prior_gap = Gap(
+        per_channel={"joy": 1.8, "grief": -1.8},
+        magnitude=3.6,
+        unnamed_pressure=0.0,
+        note="a note that should carry forward",
+        status="open",
+        first_seen_ts=base.isoformat(),
+        last_seen_ts=base.isoformat(),
+        sustained_ticks=1,
+    )
+    sm_state.save(
+        persona_dir,
+        sm_state.SelfModelState(current_gap=prior_gap, gap_history=[]),
+    )
+
+    with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
+        _self_model_reflect(
+            persona_dir,
+            provider=provider,
+            event_bus=_CapturingBus(),
+            now=base + timedelta(hours=6),
+        )
+
+    new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert new_gap is not None
+    assert set(new_gap.per_channel) == {"joy", "grief"}, (
+        "test setup check: the new tick's channel set must match the prior's"
+    )
+    assert new_gap.note == "a note that should carry forward"
+
+
+def test_carry_forward_blocked_on_different_channels(tmp_path: Path) -> None:
+    """C4 case (ii), MANDATORY: the adversarial cross-channel case that was
+    the original gate-3 bounce-1 MAJOR finding, demonstrated live on the
+    real persona's own gap_history (see decisions.md). A prior gap with a
+    note, still open, but on a DIFFERENT channel set than the new tick's
+    gap, must NOT have its stale, off-channel note carried forward."""
+    from unittest.mock import patch
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir, now=base)  # new tick will be {joy, grief}
+
+    prior_gap = Gap(
+        per_channel={"focus": 1.2},  # disjoint from {joy, grief}
+        magnitude=1.2,
+        unnamed_pressure=0.0,
+        note="a stale note about an unrelated channel",
+        status="open",
+        first_seen_ts=base.isoformat(),
+        last_seen_ts=base.isoformat(),
+        sustained_ticks=1,
+    )
+    sm_state.save(
+        persona_dir,
+        sm_state.SelfModelState(current_gap=prior_gap, gap_history=[]),
+    )
+
+    with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
+        _self_model_reflect(
+            persona_dir,
+            provider=provider,
+            event_bus=_CapturingBus(),
+            now=base + timedelta(hours=6),
+        )
+
+    new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert new_gap is not None
+    assert set(new_gap.per_channel) == {"joy", "grief"}
+    assert new_gap.note is None, (
+        "a stale, off-channel note must never be attached — different "
+        "channel sets must block carry-forward"
+    )
+
+
+def test_carry_forward_blocked_when_no_prior_note(tmp_path: Path) -> None:
+    """C4 case (iii): no prior gap at all (fresh persona) → new_gap.note
+    stays None (nothing to carry forward)."""
+    from unittest.mock import patch
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.self_model import state as sm_state
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir, now=base)
+    # No prior state file written — this is a fresh persona's first tick.
+
+    with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
+        _self_model_reflect(
+            persona_dir, provider=provider, event_bus=_CapturingBus(), now=base
+        )
+
+    new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert new_gap is not None
+    assert new_gap.note is None
+
+
+def test_carry_forward_requires_prior_status_open_not_just_same_channels(
+    tmp_path: Path,
+) -> None:
+    """C4 case (iv): a prior gap on the SAME channel set with a note, but
+    whose status is NOT "open" (e.g. already reconciled/dismissed), must NOT
+    have its note carried forward — same_channels requires
+    prior_gap.status == "open" too, not just a channel-set match. Regression
+    test for the gate-3 pass-5 MINOR fidelity finding (the criterion's prior
+    wording named only the channel-set half of the predicate it reuses)."""
+    from unittest.mock import patch
+
+    from brain.bridge.supervisor import _self_model_reflect
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    provider = FakeProvider()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    persona_dir = _persona_dir(tmp_path)
+    _seed_divergent_memories(persona_dir, now=base)
+
+    # Hand-construct a prior state: an "acknowledged" (NOT open) gap on the
+    # exact channel set the seeded memories will produce ({joy, grief}), with
+    # a note present.
+    prior_gap = Gap(
+        per_channel={"joy": 1.8, "grief": -1.8},
+        magnitude=3.6,
+        unnamed_pressure=0.0,
+        note="an old note that must not resurface",
+        status="acknowledged",
+        first_seen_ts=base.isoformat(),
+        last_seen_ts=base.isoformat(),
+        sustained_ticks=1,
+    )
+    sm_state.save(
+        persona_dir,
+        sm_state.SelfModelState(current_gap=prior_gap, gap_history=[]),
+    )
+
+    with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
+        _self_model_reflect(
+            persona_dir,
+            provider=provider,
+            event_bus=_CapturingBus(),
+            now=base + timedelta(hours=6),
+        )
+
+    new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert new_gap is not None
+    assert set(new_gap.per_channel) == {"joy", "grief"}, (
+        "test setup check: the new tick's channel set must match the prior's"
+    )
+    assert new_gap.note is None, (
+        "prior_gap.status != 'open' must block carry-forward even though the "
+        "channel sets match"
+    )
+
+
 # ── Organ-DoD live-path resolution test (Fix C1) ──────────────────────────────
 
 
@@ -243,7 +523,7 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
 
     # ── PATH A — reconcile ───────────────────────────────────────────────────
     pa = _persona_dir(tmp_path)
-    _seed_divergent_memories(pa)
+    _seed_divergent_memories(pa, now=base)
 
     # Sustain the gap over enough real ticks to cross _SUSTAINED_TICKS.
     for i in range(_SUSTAINED_TICKS + 1):
@@ -275,7 +555,7 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     pb_root = tmp_path / "b"
     pb_root.mkdir()
     pb = _persona_dir(pb_root)
-    _seed_divergent_memories(pb)
+    _seed_divergent_memories(pb, now=base)
 
     for i in range(_SUSTAINED_TICKS + 1):
         _tick(pb, base + timedelta(hours=6 * i))
@@ -317,7 +597,7 @@ def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path)
     base = datetime(2026, 6, 1, tzinfo=UTC)
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
+    _seed_divergent_memories(persona_dir, now=base)
 
     # Tick once → a gap surfaces on joy (and grief).
     _self_model_reflect(
