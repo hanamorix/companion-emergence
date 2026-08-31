@@ -60,15 +60,30 @@ def test_upload_dedupes_same_content(persona_dir: Path) -> None:
     assert len(files) == 1
 
 
-def test_upload_rejects_unsupported_media_type(persona_dir: Path) -> None:
+def test_upload_stores_non_image_file(persona_dir: Path) -> None:
+    """#43 widening: a non-image file is stored (kind=file), no longer 415'd.
+
+    The pre-change endpoint hard-refused every non-image at 415; the widened
+    endpoint routes it to the general content-addressable store.
+    """
+    payload = b"%PDF-1.7 hello"
+    sha = hashlib.sha256(payload).hexdigest()
     client = _client(persona_dir)
     with client:
         r = client.post(
             "/upload",
-            files={"file": ("x.pdf", b"%PDF-1.7", "application/pdf")},
+            files={"file": ("x.pdf", payload, "application/pdf")},
         )
-    assert r.status_code == 415
-    assert "media_type" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "file"
+    assert body["sha"] == sha
+    assert body["filename"] == "x.pdf"
+    # On-disk name is the sha ONLY (no client filename/extension in the path).
+    saved = persona_dir / "files" / sha
+    assert saved.exists()
+    assert saved.read_bytes() == payload
+    assert not (persona_dir / "files" / "x.pdf").exists()
 
 
 def test_upload_rejects_oversized_file(persona_dir: Path) -> None:
@@ -128,13 +143,22 @@ def test_upload_rejects_mismatched_magic_bytes(persona_dir: Path) -> None:
     assert "look like" in r.json()["detail"]
 
 
-def test_upload_rejects_unrecognised_bytes(persona_dir: Path) -> None:
-    """Bytes don't match any supported format → 422."""
+def test_upload_stores_unrecognised_bytes_as_file(persona_dir: Path) -> None:
+    """Bytes that sniff as no image type are stored in the general file store.
+
+    Pre-change these were 422'd; the #43 widening treats any non-image bytes
+    as a general file (the on-disk name is still the content sha only).
+    """
+    payload = b"this is not any image"
+    sha = hashlib.sha256(payload).hexdigest()
     client = _client(persona_dir)
     with client:
         r = client.post(
             "/upload",
-            files={"file": ("mystery.png", b"this is not any image", "image/png")},
+            files={"file": ("mystery.txt", payload, "text/plain")},
         )
-    assert r.status_code == 422
-    assert "supported format" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "file"
+    assert body["sha"] == sha
+    assert (persona_dir / "files" / sha).exists()

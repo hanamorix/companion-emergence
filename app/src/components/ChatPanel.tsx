@@ -4,7 +4,7 @@ import { acceptVoiceEdit, fetchActiveSession, fetchChatHistory, getBridgeCredent
 import { subscribeToBridgeEvents, type EventStream } from "../bridgeEvents";
 import { InitiateBanner, type InitiateMessage } from "./InitiateBanner";
 import { VoiceEditPanel, type VoiceEditProposal } from "./VoiceEditPanel";
-import { streamChat } from "../streamChat";
+import { streamChat, type SharedFileRef } from "../streamChat";
 import { errString } from "../lib/errString";
 import { friendlyChatError } from "../lib/friendlyChatError";
 import { resolveFrameUrl } from "../expressions";
@@ -51,13 +51,21 @@ interface StagedImage {
   fileName: string;
   /** Bridge-returned sha after upload. Empty until upload completes. */
   sha: string;
+  /** Which on-disk store the upload landed in (image vs general file). */
+  kind: "image" | "file";
+  /** Sniffed MIME type for images (undefined for non-image files). */
+  mediaType?: string;
   /** Upload state — driven by the async POST /upload call. */
   status: "uploading" | "ready" | "error";
   /** Error text on failure. */
   error?: string;
 }
 
-const ACCEPTED_IMAGE_TYPES = "image/png,image/jpeg,image/webp,image/gif";
+// /upload is widened (#43) to accept non-image files too, so the picker
+// offers images plus at least one non-image type. Kept as a superset of the
+// old image-only set so existing image sends are unaffected.
+const ACCEPTED_FILE_TYPES =
+  "image/png,image/jpeg,image/webp,image/gif,text/plain,application/pdf,.md,.txt";
 const MAX_BYTES = 20 * 1024 * 1024;
 
 // Curated emoji palette — small enough to inline, broad enough for chat.
@@ -419,13 +427,20 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       previewUrl,
       fileName: file.name,
       sha: "",
+      kind: file.type.startsWith("image/") ? "image" : "file",
       status: "uploading",
     });
     try {
       const result = await uploadImage(persona, file);
       setStagedImage((prev) =>
         prev && prev.previewUrl === previewUrl
-          ? { ...prev, sha: result.sha, status: "ready" }
+          ? {
+              ...prev,
+              sha: result.sha,
+              kind: result.kind,
+              mediaType: result.media_type,
+              status: "ready",
+            }
           : prev,
       );
     } catch (e) {
@@ -466,17 +481,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   //   (used by onCardSendReply to prepend the reach-out body bubble).
   // opts.replyToAuditId: threaded to streamChat so the server records
   //   replied_explicit atomically with the chat turn (Bundle A #4).
-  // opts.imageShas: forwarded to streamChat for image turns.
+  // opts.sharedFiles: forwarded to streamChat for file/image sends.
   // opts.text: the outbound message text.
   // opts.imageThumb: thumbnail URL for the user bubble (image sends).
   async function streamTurn(opts: {
     text: string;
     replyToAuditId?: string;
-    imageShas?: string[];
+    sharedFiles?: SharedFileRef[];
     imageThumb?: string;
     prepend?: Message[];
   }): Promise<void> {
-    const { text: outboundText, replyToAuditId, imageShas, imageThumb, prepend = [] } = opts;
+    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [] } = opts;
 
     // Session resolve: reattach or create.
     let sessionId = sessionRef.current;
@@ -616,8 +631,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           },
         },
         (() => {
-          const streamOpts: { imageShas?: string[]; replyToAuditId?: string } = {};
-          if (imageShas?.length) streamOpts.imageShas = imageShas;
+          const streamOpts: { sharedFiles?: SharedFileRef[]; replyToAuditId?: string } = {};
+          if (sharedFiles?.length) streamOpts.sharedFiles = sharedFiles;
           if (replyToAuditId) streamOpts.replyToAuditId = replyToAuditId;
           return Object.keys(streamOpts).length > 0 ? streamOpts : undefined;
         })(),
@@ -648,12 +663,27 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Main composer submit — validates input, clears UI state, calls streamTurn.
   async function send() {
     const text = input.trim();
-    const readySha =
-      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage.sha : null;
-    if ((!text && !readySha) || streaming) return;
+    const ready =
+      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage : null;
+    if ((!text && !ready) || streaming) return;
     if (stagedImage && stagedImage.status === "uploading") return;
-    const outboundText = text || "Please look at this image.";
-    const imageThumb = readySha ? stagedImage?.previewUrl : undefined;
+    const isImage = ready?.kind === "image";
+    const outboundText =
+      text || (isImage ? "Please look at this image." : "Please look at this file.");
+    const imageThumb = ready && isImage ? ready.previewUrl : undefined;
+    // Send the staged upload as a shared_files reference on the normal turn
+    // (the bridge resolves it to a path the model reads) — NOT the old
+    // image_shas transport payload.
+    const sharedFiles: SharedFileRef[] | undefined = ready
+      ? [
+          {
+            kind: ready.kind,
+            sha: ready.sha,
+            media_type: ready.mediaType,
+            filename: ready.fileName,
+          },
+        ]
+      : undefined;
 
     setStagedImage(null);
     setEmojiOpen(false);
@@ -664,7 +694,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
     await streamTurn({
       text: outboundText,
-      imageShas: readySha ? [readySha] : undefined,
+      sharedFiles,
       imageThumb,
     });
   }
@@ -867,7 +897,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         <input
           ref={fileInputRef}
           type="file"
-          accept={ACCEPTED_IMAGE_TYPES}
+          accept={ACCEPTED_FILE_TYPES}
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) handleFile(f);
@@ -876,8 +906,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           style={{ display: "none" }}
         />
         <IconButton
-          aria-label="attach image"
-          title="attach image"
+          aria-label="send file"
+          title="send file"
           onClick={() => fileInputRef.current?.click()}
           disabled={streaming || !!stagedImage}
         >

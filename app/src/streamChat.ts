@@ -2,7 +2,7 @@
  * WS streaming chat client, talks to /stream/{session_id}.
  *
  * Wire protocol (from brain/bridge/server.py):
- *   client -> server: {message: string, image_shas?: string[],
+ *   client -> server: {message: string, shared_files?: SharedFileRef[],
  *                      reply_to_audit_id?: string} after WS open
  *   server -> client:
  *     {type: "started", session_id, at}
@@ -34,9 +34,19 @@ export interface StreamChatHandlers {
   onError?: (msg: string) => void;
 }
 
+/** A file (image or non-image) the user attached this turn, as returned by
+ *  POST /upload. The bridge resolves it to an on-disk path and surfaces it to
+ *  the model, which reads it back via the read_file MCP tool. */
+export interface SharedFileRef {
+  kind: "image" | "file";
+  sha: string;
+  media_type?: string;
+  filename?: string;
+}
+
 export interface StreamChatOptions {
-  /** Sha-strings for any /upload-staged images attached to this turn. */
-  imageShas?: string[];
+  /** References for any /upload-staged files attached to this turn. */
+  sharedFiles?: SharedFileRef[];
   /** If this turn is an explicit reply to an outbound initiate, the
    *  audit row id (e.g. ``"ia_001"``). The bridge ingests it, records
    *  the ``replied_explicit`` state transition + memory re-render
@@ -134,10 +144,11 @@ export async function streamChat(
       );
       const frame: {
         message: string;
-        image_shas?: string[];
+        shared_files?: SharedFileRef[];
         reply_to_audit_id?: string;
       } = { message };
-      if (options.imageShas && options.imageShas.length > 0) frame.image_shas = options.imageShas;
+      if (options.sharedFiles && options.sharedFiles.length > 0)
+        frame.shared_files = options.sharedFiles;
       if (options.replyToAuditId) frame.reply_to_audit_id = options.replyToAuditId;
       ws.send(JSON.stringify(frame));
     });
