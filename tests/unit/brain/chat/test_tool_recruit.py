@@ -48,6 +48,43 @@ def test_maximal_signal_recruits_everything():
     assert allowed == set(NELL_TOOL_NAMES)
 
 
+def test_gap_open_grants_reconcile_on_ordinary_turn():
+    """#149: when a self-model gap is open, reconcile_self_read is offered even on
+    a trivial, non-maximal turn — so the ambient block's invitation is actionable."""
+    signal = assess_salience("ok")
+    assert signal.score < 0.999  # guards the premise: a non-maximal turn
+    assert "reconcile_self_read" not in select_tools(signal, gap_open=False)
+    assert "reconcile_self_read" in select_tools(signal, gap_open=True)
+
+
+def test_gap_open_does_not_pull_in_other_heavy_tools():
+    """gap_open grants ONLY reconcile_self_read, not the memory/file tiers."""
+    allowed = select_tools(assess_salience("ok"), gap_open=True)
+    assert "reconcile_self_read" in allowed
+    assert "recall_forgotten" not in allowed and "read_file" not in allowed
+
+
+def test_self_model_gap_open_helper_reads_persisted_status(tmp_path):
+    """#149: the engine helper reports gap-open from the ALREADY-PERSISTED
+    current_gap.status (live statuses = open/acknowledged), fail-open to False."""
+    from brain.chat.engine import _self_model_gap_open
+    from brain.self_model.gap import Gap
+    from brain.self_model.state import SelfModelState, save
+
+    p = tmp_path / "persona"
+    p.mkdir()
+    assert _self_model_gap_open(p) is False  # no state file → False (fail-open)
+
+    def _gap(status):
+        return Gap(per_channel={"grief": 1.0}, magnitude=1.0, unnamed_pressure=0.0, status=status)
+
+    save(p, SelfModelState(current_gap=_gap("open")))
+    assert _self_model_gap_open(p) is True
+
+    save(p, SelfModelState(current_gap=_gap("dismissed")))
+    assert _self_model_gap_open(p) is False  # not a live status
+
+
 def test_select_tools_returns_base_order():
     """Result must be a subsequence of NELL_TOOL_NAMES in the same relative order.
 

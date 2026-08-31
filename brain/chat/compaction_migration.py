@@ -26,6 +26,7 @@ break bridge startup.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -35,11 +36,19 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import compact_conversation
-from brain.ingest.buffer import list_active_sessions, read_cursor, read_session
+from brain.ingest.buffer import (
+    acquire_compaction_lock,
+    list_active_sessions,
+    read_cursor,
+    read_session,
+    release_compaction_lock,
+    rewrite_session_atomic,
+)
 
 logger = logging.getLogger(__name__)
 
 _MARKER_NAME = ".compat_migrated"
+_SECTIONS_MARKER_NAME = ".sections_migrated"
 
 # Reasons (from CompactionResult.reason) that mean "nothing left to fold now" — a
 # genuine drained end-state. Everything else that returns compacted=False is a
@@ -231,3 +240,205 @@ def run_backlog_migration(
         # Belt-and-suspenders: the entry point must never break bridge startup.
         logger.exception("backlog migration: top-level failure; marker NOT written")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Sections migration (Phase 1 cascade) — legacy single-layer summary → tier 3
+# ---------------------------------------------------------------------------
+#
+# An existing persona carries ONE single-layer summary of accumulated (often
+# months-old) history. The oldest-edge cascade classifier keys on
+# ``covers_from_ts``, so a section-less legacy row would otherwise be mislabelled
+# "yesterday" and re-folded as recent — reproducing #82 for 100% of current
+# personas. This one-time, marker-gated migration rewrites that row into the
+# sectioned form seeded as TIER 3 ("a few days ago") with an explicit OLD-FLOOR
+# ``covers_from_ts`` (``migration_now − _LEGACY_AGE_FLOOR``, 84h — inside the 72h
+# band with margin), set UNCONDITIONALLY — never ``covers_until_ts`` — so the
+# blob lands in tier 3, appears in the head for one pass, then evicts on the
+# next daily pass like any other tier-3 content once past the eviction boundary
+# (a graceful one-pass fade, not an instant drop). It is an in-place shape
+# rewrite (no provider call). See plan §4 / spec §Open decision.
+
+
+@dataclass
+class SectionsMigrationResult:
+    """Outcome of one run_sections_migration call (for logging + tests)."""
+
+    already_migrated: bool = False   # marker present at entry → no-op
+    marker_written: bool = False     # all sessions processed → marker written
+    sessions_seen: int = 0
+    sessions_migrated: int = 0       # rows rewritten legacy → sectioned this run
+
+
+def _sections_marker_path(persona_dir: Path) -> Path:
+    return Path(persona_dir) / "archived_conversations" / _SECTIONS_MARKER_NAME
+
+
+class _SectionsOutcome(enum.Enum):
+    """Tri-state result of one _migrate_one_session_sections call.
+
+    MIGRATED  — the legacy row was rewritten into the sectioned form.
+    NOOP      — nothing to do (no summary row / already sectioned / empty text).
+    CONTENDED — the per-session compaction lock was held by a concurrent writer;
+                the session was SKIPPED unguarded and MUST withhold the run-once
+                marker so a later boot retries. Distinct from NOOP so the caller
+                never treats contention as a benign done-state.
+    """
+
+    MIGRATED = "migrated"
+    NOOP = "noop"
+    CONTENDED = "contended"
+
+
+def _migrate_one_session_sections(
+    persona_dir: Path, session_id: str, *, now: datetime
+) -> _SectionsOutcome:
+    """Rewrite a session's legacy single-layer summary row into the sectioned form
+    (tier 3, old-floor covers_from_ts), UNDER the per-session compaction lock.
+
+    Joins the same advisory-lock protocol every other buffer writer uses
+    (cascade_conversation / perform_rollover): acquire the lock BEFORE the read,
+    do read → patch → rewrite inside the critical section, release in a finally.
+    The acquire is NON-BLOCKING: on contention it returns CONTENDED (skip, do not
+    proceed unguarded) BEFORE the try, so the finally never releases a lock we did
+    not take (release is idempotent regardless).
+
+    Idempotent: an already-sectioned row (or no summary / empty summary) returns
+    NOOP. Immediately before the rewrite it RE-READS the buffer fresh and re-locates
+    the summary row in the fresh turns, swapping only that row — mirroring
+    _install_cascade_row (compaction.py:947-959) so a concurrent lock-free
+    ingest_turn append landing in the read→rewrite window survives.
+    """
+    from brain.chat.compaction import _LEGACY_AGE_FLOOR, _render_sections
+
+    # Non-blocking acquire, BEFORE any read. On contention: skip, do not proceed.
+    if not acquire_compaction_lock(persona_dir, session_id):
+        return _SectionsOutcome.CONTENDED
+    try:
+        turns = read_session(persona_dir, session_id)
+        summary_idx: int | None = None
+        for i, t in enumerate(turns):
+            if t.get("speaker") == "summary":
+                summary_idx = i
+                break
+        if summary_idx is None:
+            return _SectionsOutcome.NOOP
+        row = turns[summary_idx]
+        comp = dict(row.get("compaction") or {})
+        sections = comp.get("sections")
+        if isinstance(sections, dict) and sections:
+            return _SectionsOutcome.NOOP  # already sectioned → idempotent no-op
+        text = (row.get("text") or "").strip()
+        if not text:
+            return _SectionsOutcome.NOOP
+
+        covers_until = comp.get("covers_until_ts") or row.get("ts") or now.isoformat(timespec="seconds")
+        covers_from = (now - _LEGACY_AGE_FLOOR).isoformat(timespec="seconds")
+        new_sections = {
+            "72h": {"text": text, "covers_from_ts": covers_from, "covers_until_ts": covers_until},
+        }
+        comp["sections"] = new_sections
+        comp["covers_until_ts"] = covers_until
+        comp.setdefault("gen", 1)
+        comp.setdefault("folded", True)
+        new_row = dict(row)
+        new_row["compaction"] = comp
+        new_row["text"] = _render_sections(new_sections)
+
+        # Re-read fresh immediately before the rewrite (CC1 fix): the compaction
+        # lock excludes every other lock-holding writer, but the lock-free
+        # ingest_turn appender never takes it, so a live raw turn can have landed
+        # since the read above. Re-locate the summary row in the FRESH turns and
+        # swap only that row, keeping every fresh raw turn — so the append survives
+        # migration's whole-file rewrite. (ingest_turn is append-only and never
+        # touches the summary row, so the stale-computed new_row is still valid.)
+        fresh_turns = read_session(persona_dir, session_id)
+        fresh_idx: int | None = None
+        for i, t in enumerate(fresh_turns):
+            if t.get("speaker") == "summary":
+                fresh_idx = i
+                break
+        if fresh_idx is None:
+            return _SectionsOutcome.NOOP  # summary row vanished under us → nothing to patch
+        fresh_comp = fresh_turns[fresh_idx].get("compaction") or {}
+        fresh_sections = fresh_comp.get("sections")
+        if isinstance(fresh_sections, dict) and fresh_sections:
+            # Another pass sectioned it while we worked → idempotent no-op, do not
+            # overwrite.
+            return _SectionsOutcome.NOOP
+        new_turns = list(fresh_turns)
+        new_turns[fresh_idx] = new_row
+        rewrite_session_atomic(persona_dir, session_id, new_turns)
+        return _SectionsOutcome.MIGRATED
+    finally:
+        release_compaction_lock(persona_dir, session_id)
+
+
+def run_sections_migration(
+    persona_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> SectionsMigrationResult:
+    """Rewrite every active session's legacy single-layer summary row into the
+    sectioned form (tier 3, old-floor), ONCE, gated by the ``.sections_migrated``
+    marker. Fault-isolated: never raises. A per-session failure withholds the
+    marker so a later restart retries (the tolerant reader + next cascade tick
+    self-heal in the meantime). See module docstring + plan §4."""
+    result = SectionsMigrationResult()
+    persona_dir = Path(persona_dir)
+    now = now or datetime.now(UTC)
+    try:
+        if _sections_marker_path(persona_dir).exists():
+            result.already_migrated = True
+            return result
+        (persona_dir / "archived_conversations").mkdir(parents=True, exist_ok=True)
+        all_ok = True
+        for sid in list_active_sessions(persona_dir):
+            result.sessions_seen += 1
+            try:
+                outcome = _migrate_one_session_sections(persona_dir, sid, now=now)
+            except Exception:
+                logger.exception("sections migration: session=%s raised; withholding marker", sid)
+                all_ok = False
+                continue
+            if outcome is _SectionsOutcome.MIGRATED:
+                result.sessions_migrated += 1
+            elif outcome is _SectionsOutcome.CONTENDED:
+                # Lock held by a concurrent writer → session skipped this boot.
+                # Withhold the run-once marker so the next start retries. This is
+                # EXPECTED contention, not a fault: log at INFO, never as an
+                # exception.
+                all_ok = False
+                logger.info(
+                    "sections migration: session=%s locked by a concurrent writer; "
+                    "skipped this boot, marker withheld (retries next start)", sid,
+                )
+            # _SectionsOutcome.NOOP → nothing to count.
+        if all_ok:
+            _write_marker_at(
+                _sections_marker_path(persona_dir),
+                {
+                    "migrated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "n_sessions": result.sessions_seen,
+                    "n_migrated": result.sessions_migrated,
+                },
+            )
+            result.marker_written = True
+        logger.info(
+            "sections migration: sessions=%d migrated=%d marker=%s",
+            result.sessions_seen, result.sessions_migrated, result.marker_written,
+        )
+    except Exception:
+        logger.exception("sections migration: top-level failure; marker NOT written")
+    return result
+
+
+def _write_marker_at(path: Path, payload: dict) -> None:
+    """Atomically write a run-once marker (mkdir parent, tmp + fsync + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)

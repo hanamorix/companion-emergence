@@ -745,12 +745,15 @@ def test_finalize_under_threshold_skips(
     assert buf.exists()
 
 
-def test_finalize_at_threshold_deletes_buffer_and_cursor(
+def test_finalize_at_threshold_extracts_but_keeps_buffer(
     tmp_path: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
+    # Cascade-compaction 1c (stage-3 L2): finalize is now EXTRACTION-ONLY — it runs
+    # the final extraction but no longer deletes the buffer/cursor. The rollover path
+    # owns buffer deletion (a still-live session's buffer stays until it rolls over).
     sid = "sess_abc"
     old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x", "ts": old})
@@ -767,9 +770,7 @@ def test_finalize_at_threshold_deletes_buffer_and_cursor(
     assert len(reports) == 1
     assert reports[0].session_id == sid
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
-    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
-    assert not buf.exists(), "finalize must delete the buffer"
-    assert not cursor_file.exists(), "finalize must delete the cursor"
+    assert buf.exists(), "finalize is extraction-only — it must NOT delete the buffer"
 
 
 def test_finalize_per_session_error_isolation(
@@ -812,10 +813,11 @@ def test_finalize_per_session_error_isolation(
 
     # Both stale sessions reach finalize regardless of the first one exploding.
     assert len(reports) == 2
-    # Both buffers cleaned up after their finalize attempt.
+    # Extraction-only finalize keeps both buffers (rollover owns deletion); the
+    # point here is error isolation — one session raising doesn't abort the sweep.
     for sid in (sid_a, sid_b):
         buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
-        assert not buf.exists()
+        assert buf.exists()
 
 
 # ---------------------------------------------------------------------------

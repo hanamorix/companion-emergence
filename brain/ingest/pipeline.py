@@ -539,24 +539,26 @@ def finalize_stale_sessions(
     """Iterate active sessions; finalize any whose last turn is past
     ``finalize_after_hours``.
 
-    "Finalize" = run one last snapshot extraction, then delete the buffer
-    and the cursor sidecar. Caller (supervisor) follows up with
-    remove_session() for each returned report.session_id.
+    "Finalize" = run one last snapshot extraction. It is now **extraction-only**
+    (cascade-compaction 1c, stage-3 L2): it NO LONGER deletes conversation buffers —
+    the rollover path (brain/chat/rollover.perform_rollover) owns buffer deletion, so
+    a rolled-over buffer is reaped exactly once and a still-live session's buffer is
+    left intact (bounded by the daily cascade + 1d segmentation, and becomes
+    rollover-eligible at the 24h-idle or weekly boundary). The empty-buffer branch's
+    delete is removed too. Only the poison-move path (corrupt input) still quarantines
+    a buffer out of the active set. Caller (supervisor) follows up with
+    remove_session() for each returned report.session_id (registry-cache eviction; a
+    still-live session re-hydrates from disk on next access).
 
-    Per-session try/except so one bad session can't abort the loop. The
-    buffer + cursor are deleted whether the final snapshot succeeded or
-    not — sessions silent past the finalize threshold are dropped
-    unconditionally; memories already in MemoryStore from earlier
-    snapshots stay.
+    Per-session try/except so one bad session can't abort the loop.
     """
     threshold_minutes = finalize_after_hours * 60.0
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
         turns = read_session(persona_dir, sid)
         if not turns:
-            delete_session_buffer(persona_dir, sid)
-            delete_cursor(persona_dir, sid)
-            delete_backoff(persona_dir, sid)
+            # Extraction-only: an empty live buffer is bounded and rollover-eligible;
+            # do NOT delete it here (the rollover / ghost-cleanup sweep reaps it).
             continue
         age = session_silence_minutes(turns)
         if age < threshold_minutes:
@@ -584,17 +586,11 @@ def finalize_stale_sessions(
         at_threshold = (
             backoff is not None and backoff["failures"] >= _BACKOFF_FAILURE_THRESHOLD
         )
-        if report.commit_failures == 0 and not at_threshold:
-            delete_session_buffer(persona_dir, sid)
-            delete_cursor(persona_dir, sid)
-            delete_backoff(persona_dir, sid)
-        elif at_threshold:
+        if at_threshold:
             # Buffer has failed >= threshold times — move to poison queue so it
-            # doesn't block the finalize loop indefinitely.
-            # Accepted narrow window: an extraction-wedged buffer hit by the 24h
-            # finalize tick while still inside its 10-min backoff window may be
-            # dead-lettered before a post-window recovery attempt. Recoverable
-            # (moved to poison/, not deleted); window is narrow in practice.
+            # doesn't block the finalize loop indefinitely. This is the ONLY
+            # buffer-lifecycle action finalize still performs (quarantine of
+            # corrupt input); the successful path no longer deletes.
             src = persona_dir / "active_conversations" / f"{sid}.jsonl"
             poison_dir = persona_dir / "active_conversations" / "poison"
             poison_dir.mkdir(parents=True, exist_ok=True)
@@ -606,12 +602,6 @@ def finalize_stale_sessions(
                 "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
                 sid,
                 backoff["failures"],  # type: ignore[index]
-            )
-        else:
-            logger.warning(
-                "conversation_finalize_held session=%s commit_failures=%d — buffer retained for retry",
-                sid,
-                report.commit_failures,
             )
         reports.append(report)
         logger.info(

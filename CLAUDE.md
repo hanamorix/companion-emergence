@@ -51,6 +51,7 @@ Do not create `WIP.md`, `CLAIMS.md`, `TODO.md`, or similar files intended to tra
 - Commit messages: imperative mood, present tense ("fix provider path resolution," not "fixed" or "fixes").
 - If a commit or PR resolves an issue, include `Fixes #N` in the PR description so it auto-closes.
 - Don't squash unrelated changes into one commit. If the user is fixing two different things, suggest two branches.
+- **Out-of-scope follow-ups → a new issue, not a PR-body note.** When you spot follow-up work during a PR that's outside that PR's scope, file it as its own issue rather than leaving a "follow-up" note in the PR description — PR-body notes get lost on merge; issues stay tracked. (Human-facing version in `CONTRIBUTING.md`.)
 
 ## When in doubt
 

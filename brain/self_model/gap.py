@@ -1,31 +1,37 @@
-"""Gap — derived-minus-declared emotional divergence.
+"""Gap — short-minus-long (recent-vs-baseline) emotional divergence.
 
-`compute_gap(declared, derived) -> Gap`
+`compute_gap(short, long) -> Gap`
 
 Pure compute, no I/O, no LLM.
 
-The gap is the vector difference between the derived (trend/body) and the
-declared (max-pool peak) emotional reads, restricted to REGISTERED channels.
-Unregistered channel names — whether from stale vocabulary or synthetic tests —
-are silently dropped (vocab-flood guard, R-A adjacent).
+The gap is the vector difference between the short (recent, felt-lately) and the
+long (baseline) normalized recency-weighted mean reads, restricted to REGISTERED
+channels. Unregistered channel names — whether from stale vocabulary or synthetic
+tests — are silently dropped (vocab-flood guard, R-A adjacent).
 
-per_channel[c] = derived.channels.get(c, 0) − declared.emotions.get(c, 0)
+per_channel[c] = short.channels.get(c, 0) − long.channels.get(c, 0)
 
 for every channel c that:
-  1. appears in EITHER derived.channels or declared.emotions, AND
-  2. is registered in the emotion vocabulary (vocabulary.get(c) is not None).
+  1. appears in EITHER short.channels or long.channels, AND
+  2. is registered in the emotion vocabulary (vocabulary.get(c) is not None), AND
+  3. has |delta| >= _GAP_NOISE_FLOOR.
 
-Exact-zero deltas (declared == derived for that channel) are dropped from
-per_channel to keep the dict sparse. This is a deliberate design choice:
-a zero delta carries no information and would inflate magnitude calculations.
+The delta is BIDIRECTIONAL: >0 running above baseline lately (golden cross), <0
+below baseline lately (death cross).
 
-magnitude = sum(abs(v) for v in per_channel.values())
+Below-floor deltas are dropped: a channel whose recent read is within
+_GAP_NOISE_FLOOR of its baseline is at-baseline, and near-zero noise summed over
+~20 channels would otherwise inflate magnitude to a few points on a persona that
+is not actually diverging, so the gap would surface every reflection tick. The
+floor makes magnitude reflect only genuine crosses; magnitude == 0 on a steady
+persona (nothing surfaces), and a genuine cross survives at its full delta. The
+floor equals ambient._CHANNEL_FLOOR (0.5) by design — a channel is surfaced only
+when it diverges enough for the ambient block to name it (kept a local constant
+here, not imported, to avoid a self_model→self_model import cycle).
 
-Orthogonality assertion (R-C1):
-  - Divergent declared/derived   → magnitude > 0  (per_channel is non-empty)
-  - Identical declared/derived   → magnitude == 0.0
+magnitude = sum(abs(v) for v in per_channel.values())  # over survivors
 
-unnamed_pressure is carried through from the derived read unchanged.
+unnamed_pressure is carried through from the short (felt) read unchanged.
 
 Gap dataclass fields per spec §4:
   per_channel        — {channel: delta}  registered-only, zero-deltas dropped
@@ -43,9 +49,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from brain.emotion.state import EmotionalState
 from brain.emotion.vocabulary import get as _get_emotion
 from brain.self_model.derived import DerivedRead
+
+# A channel is surfaced only when its recent read diverges from baseline by at
+# least this much (on the 0–10 intensity scale). Below-floor deltas are treated
+# as at-baseline and dropped, so magnitude reflects only genuine crosses. Set
+# equal to ambient._CHANNEL_FLOOR (0.5) by design — the same bar at which the
+# ambient block would name the channel. Kept local (not imported) to avoid a
+# self_model→self_model import cycle; the equality is intentional.
+_GAP_NOISE_FLOOR: float = 0.5
 
 
 @dataclass
@@ -55,12 +68,12 @@ class Gap:
     See module docstring for invariants.
 
     Attributes:
-        per_channel: {channel_name: delta} where delta = derived − declared.
-            Registered channels only. Zero-delta channels are omitted.
+        per_channel: {channel_name: delta} where delta = short − long.
+            Registered channels only. Below-noise-floor channels are omitted.
         magnitude: sum(abs(delta) for delta in per_channel.values()).
-            0.0 when declared and derived are identical on all registered channels.
-        unnamed_pressure: residual body signal from DerivedRead that maps to no
-            known channel. Carried through unchanged from the derived read.
+            0.0 when short and long are within the noise floor on every channel.
+        unnamed_pressure: residual body signal from the short read that maps to no
+            known channel. Carried through unchanged from the short (felt) read.
         note: optional human-readable articulation from the Haiku articulate layer
             (Task 4). None until articulated.
         status: lifecycle marker — "open" | "acknowledged" | "dismissed" | "resolved".
@@ -83,31 +96,31 @@ class Gap:
     channel_cooldowns: dict[str, str] = field(default_factory=dict)
 
 
-def compute_gap(declared: EmotionalState, derived: DerivedRead) -> Gap:
-    """Compute the gap between declared and derived emotional reads.
+def compute_gap(short: DerivedRead, long: DerivedRead) -> Gap:
+    """Compute the gap between the short (recent) and long (baseline) reads.
 
     Args:
-        declared: The existing aggregate_state (max-pool peak over memories).
-        derived:  The new orthogonal read (recency-weighted mean + body).
+        short: The felt-lately read (short-half-life normalized mean + body).
+        long:  The baseline read (long-half-life normalized mean).
 
     Returns:
-        Gap with registered-only per_channel deltas and passed-through
-        unnamed_pressure. All persistence fields (ts, ticks, cooldowns) are
-        at their zero/None defaults — the cadence layer sets them.
+        Gap with registered-only per_channel deltas above the noise floor and
+        passed-through unnamed_pressure. All persistence fields (ts, ticks,
+        cooldowns) are at their zero/None defaults — the cadence layer sets them.
     """
     # Collect candidate channels: union of both reads, registered-only.
     candidate_channels: set[str] = set()
-    for c in derived.channels:
+    for c in short.channels:
         if _get_emotion(c) is not None:
             candidate_channels.add(c)
-    for c in declared.emotions:
+    for c in long.channels:
         if _get_emotion(c) is not None:
             candidate_channels.add(c)
 
     per_channel: dict[str, float] = {}
     for c in candidate_channels:
-        delta = derived.channels.get(c, 0.0) - declared.emotions.get(c, 0.0)
-        if delta != 0.0:
+        delta = short.channels.get(c, 0.0) - long.channels.get(c, 0.0)
+        if abs(delta) >= _GAP_NOISE_FLOOR:
             per_channel[c] = delta
 
     magnitude = sum(abs(v) for v in per_channel.values())
@@ -115,5 +128,5 @@ def compute_gap(declared: EmotionalState, derived: DerivedRead) -> Gap:
     return Gap(
         per_channel=per_channel,
         magnitude=magnitude,
-        unnamed_pressure=derived.unnamed_pressure,
+        unnamed_pressure=short.unnamed_pressure,
     )

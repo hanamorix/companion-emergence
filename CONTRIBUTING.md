@@ -23,6 +23,7 @@ Every bug, feature, or chunk of work gets an issue in the Issues tab.
 - **If an issue is assigned to the other person, don't start work on it** without talking first. They might be mid-thought on it even if there's no PR yet.
 - **Labels are optional** but `bug`, `enhancement`, and `question` are worth using so we can filter.
 - **Closing:** if your PR fixes an issue, put `Fixes #12` in the PR description. GitHub auto-closes the issue when the PR merges.
+- **Out-of-scope follow-ups get their own issue, not a PR note.** If you notice separate follow-up work while doing a PR (a related bug, a deferred cleanup, a "should also do X later"), open an issue for it. A note buried in a PR description disappears once the PR merges; an issue stays on the board.
 
 ## Branches: never commit to main
 

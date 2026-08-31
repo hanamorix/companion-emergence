@@ -66,6 +66,7 @@ def select_tools(
     *,
     base: tuple[str, ...] = NELL_TOOL_NAMES,
     force_files: bool = False,
+    gap_open: bool = False,
 ) -> list[str]:
     """Return the list of tool names allowed for this turn.
 
@@ -81,6 +82,13 @@ def select_tools(
     maximal signal already recruits everything, so force_files only matters on
     non-maximal turns where a low-text file-send would otherwise fail to recruit
     read_file.
+
+    ``gap_open``: when a self-model gap is currently open (the ambient block is
+    surfacing it and inviting her to reconcile), grant ``reconcile_self_read`` so
+    the invitation is actionable. Gated on gap-open, not on maximal salience, and
+    NOT always-on: the tool only appears when a gap is actually being surfaced, so
+    it cannot drive the reconcile→self-authored-memory feedback loop on ordinary
+    turns (and the recency-baseline gap makes open gaps occasional, not constant).
     """
     if signal.score >= _MAXIMAL_SCORE:  # maximal / fail-open → full suite
         return list(base)
@@ -95,6 +103,9 @@ def select_tools(
 
     if force_files:
         keep.add("read_file")
+
+    if gap_open:
+        keep.add("reconcile_self_read")
 
     # Preserve base ordering; drop anything not in base.
     return [t for t in base if t in keep]
