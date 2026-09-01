@@ -66,6 +66,7 @@ def select_tools(
     signal: SalienceSignal,
     *,
     base: tuple[str, ...] = NELL_TOOL_NAMES,
+    force_files: bool = False,
     gap_open: bool = False,
 ) -> list[str]:
     """Return the list of tool names allowed for this turn.
@@ -73,6 +74,15 @@ def select_tools(
     Fails open: maximal signal → full suite (today's behaviour). Non-maximal
     turns get REFLEXIVE_CORE plus whichever heavier faculties the salience
     flags call for. Result is ordered by *base* so the LLM sees a stable list.
+
+    force_files: when a file was shared this turn, union {read_file} into the
+    allowed set regardless of salience score, so the model can always read the
+    file it was just handed (P0 E5, plan step 4). Only read_file is forced — the
+    heavier / write-capable file tools (list_directory, propose_write) stay
+    salience-gated, so a bare file-send does not force-enable a write tool. A
+    maximal signal already recruits everything, so force_files only matters on
+    non-maximal turns where a low-text file-send would otherwise fail to recruit
+    read_file.
 
     ``gap_open``: when a self-model gap is currently open (the ambient block is
     surfacing it and inviting her to reconcile), grant ``reconcile_self_read`` so
@@ -91,6 +101,9 @@ def select_tools(
 
     if signal.mentions_file_or_path:
         keep.update(_FILE_TOOLS)
+
+    if force_files:
+        keep.add("read_file")
 
     if gap_open:
         keep.add("reconcile_self_read")

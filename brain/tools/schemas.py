@@ -597,9 +597,13 @@ SCHEMAS: dict[str, dict] = {
     "read_file": {
         "name": "read_file",
         "description": (
-            "Read a text file from the user's computer. Use ONLY when the user explicitly asks you "
-            "to read, open, or look at a specific file or path — never proactively. If something you "
-            "read matters, you can choose to remember or reflect on it. "
+            "Read a file from the user's computer. Text files return their contents; an image file "
+            "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see. When the user "
+            "shares a file with you this turn, its path appears in their message as "
+            "'[the user shared a file: <path>]' — you can read that path to see or read what they "
+            "handed you. Otherwise, use this ONLY when the user explicitly asks you to read, open, or "
+            "look at a specific file or path — never proactively. If something you read matters, you "
+            "can choose to remember or reflect on it. "
             "Given a folder and an approximate filename, list that folder once and read the matching "
             "file. Do not walk up to parent directories or search unrelated locations."
         ),

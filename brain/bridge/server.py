@@ -44,7 +44,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictBool, field_validator
+from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import tunables
@@ -243,7 +243,7 @@ def _respond_blocking(
     sess: Any,
     message: str,
     provider: LLMProvider,
-    image_shas: list[str] | None = None,
+    shared_files: list[dict] | None = None,
     reply_to_audit_id: str | None = None,
 ) -> Any:
     """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
@@ -268,7 +268,7 @@ def _respond_blocking(
             hebbian=hebbian,
             provider=provider,
             session=sess,
-            image_shas=image_shas,
+            shared_files=shared_files,
             reply_to_audit_id=reply_to_audit_id,
         )
 
@@ -316,16 +316,10 @@ class _StreamingProxy:
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
-        # Image-bearing turns: chat_stream() flattens ImageBlocks to the text
-        # marker "[image: <sha>]" (it has no multimodal input path), so the
-        # model would see the tag but never the pixels. Route them through the
-        # real provider's non-streaming chat(), which base64-inlines the image
-        # via _chat_with_images and still returns dispatched_invocations (so
-        # pass-2 monologue fires). Forward the reply as word chunks, like the
-        # no-chat_stream fallback. Image turns lose token-level streaming but
-        # the model actually sees the picture — correct over fast.
-        # Regression: the v0.0.34 "got the tag but no image data" live bug.
-        from brain.bridge.provider import _message_has_image
+        # The image transport is gone — no message carries image pixels now, so
+        # every turn streams through the normal chat_stream() path below. Shared
+        # images are surfaced as a file path in the user text and read back via
+        # the read_file MCP tool.
 
         # suppress_stream (bug #4): run_tool_loop sets this on a recruitable
         # first pass so its text is NOT pushed to the WS (only the recruit rerun
@@ -335,13 +329,6 @@ class _StreamingProxy:
         if options is not None and "suppress_stream" in options:
             options = {k: v for k, v in options.items() if k != "suppress_stream"}
             suppress = True
-
-        if any(_message_has_image(m) for m in messages):
-            resp = self._real.chat(messages, tools=tools, options=options)
-            if not suppress:
-                for word in _word_chunks(resp.content):
-                    self._loop.call_soon_threadsafe(self._q.put_nowait, word)
-            return resp
 
         # Capture the MCP audit-log offset BEFORE the stream so we can read
         # dispatched_invocations after — without this the streaming path
@@ -725,26 +712,33 @@ class NewSessionResp(BaseModel):
     created_at: str
 
 
+class SharedFileRef(BaseModel):
+    """A file the user attached this turn, as returned by /upload.
+
+    ``kind`` discriminates the on-disk store: an ``image`` resolves under
+    ``<persona_dir>/images/<sha>.<ext>`` (media_type gives the ext), a
+    ``file`` under ``<persona_dir>/files/<sha>``. The sha is the sole path
+    component; ``filename`` is display-only metadata (never a path part) so a
+    crafted filename cannot traverse (C17).
+    """
+
+    kind: Literal["image", "file"]
+    sha: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    media_type: str | None = Field(default=None, max_length=128)
+    filename: str | None = Field(default=None, max_length=255)
+
+
 class ChatReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     message: str = Field(..., min_length=1, max_length=20_000)
-    # Optional image attachments — sha-strings as returned by /upload.
-    # Audit 2026-05-07 P4-1: comment used to promise 64-char-hex
-    # validation but the model only enforced the list length cap.
-    # Now Pydantic enforces it at the API boundary too. Deeper image
-    # handling stays as defense in depth.
-    image_shas: list[str] = Field(
+    # Optional file attachments (images + non-image files) — references as
+    # returned by /upload. Replaces the pre-P0 image-only image_shas transport
+    # payload; each ref is resolved to an on-disk path the engine surfaces to
+    # the model, which reads it back via the read_file MCP tool.
+    shared_files: list[SharedFileRef] = Field(
         default_factory=list,
         max_length=8,
     )
-
-    @field_validator("image_shas")
-    @classmethod
-    def _validate_image_shas(cls, v: list[str]) -> list[str]:
-        for sha in v:
-            if not _SHA256_HEX_RE.fullmatch(sha):
-                raise ValueError(f"image_sha must be 64 lowercase hex chars, got {sha!r}")
-        return v
 
 
 class CloseReq(BaseModel):
@@ -2201,7 +2195,7 @@ def build_app(
                 )
         return {"ok": True}
 
-    # ── POST /upload — multimodal image upload ────────────────────────────
+    # ── POST /upload — file upload (images + non-image files) ──────────────
     # Image upload limit (matches the spec D2 default; per-persona override
     # via PersonaConfig.image_max_bytes can come later if needed).
     _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
@@ -2211,55 +2205,73 @@ def build_app(
 
     @app.post("/upload", dependencies=[Depends(require_http_auth)])
     async def upload(file: UploadFile) -> dict[str, Any]:
-        """Accept a multipart-uploaded image, persist content-addressably.
+        """Accept a multipart-uploaded file, persist content-addressably.
 
-        Returns ``{sha, media_type, size_bytes}`` on success. Image lands at
-        ``<persona_dir>/images/<sha>.<ext>``. Identical content (same sha)
-        is deduped — second upload of the same bytes returns the same sha
-        without writing a duplicate file.
+        Widened for #43: both images and non-image files are accepted.
+
+        * An **image** (bytes sniff as PNG/JPEG/WebP/GIF) lands at
+          ``<persona_dir>/images/<sha>.<ext>`` via ``save_image_bytes`` and
+          returns ``{kind: "image", sha, media_type, size_bytes}``.
+        * Any **other** file lands at ``<persona_dir>/files/<sha>`` via
+          ``save_file_bytes`` (the on-disk name is the validated sha ONLY —
+          the client filename is never a path component, C17) and returns
+          ``{kind: "file", sha, filename, size_bytes}``.
+
+        Identical content (same sha) is deduped in either store. The engine
+        resolves the returned ref to an on-disk path and surfaces it to the
+        model, which reads it back via the read_file MCP tool.
 
         Errors:
-          * 415 — unsupported media_type (only PNG / JPEG / WebP / GIF)
-          * 413 — file exceeds the 20 MB cap
+          * 413 — file exceeds the size cap
+          * 422 — bytes sniff as one image type but the client declared a
+            *different* image type (integrity check on image uploads)
         """
+        from brain import file_store
         from brain.images import save_image_bytes, sniff_media_type
 
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
-        if declared_media_type not in _ALLOWED_UPLOAD_MEDIA_TYPES:
-            raise HTTPException(
-                status_code=415,
-                detail=f"unsupported media_type {declared_media_type!r}; "
-                f"must be one of {sorted(_ALLOWED_UPLOAD_MEDIA_TYPES)}",
-            )
-        # Read up to limit + 1 so we can detect overrun without buffering
-        # arbitrarily large payloads in memory.
-        raw = await file.read(_IMAGE_MAX_BYTES + 1)
-        if len(raw) > _IMAGE_MAX_BYTES:
+        # Read up to the larger of the two caps + 1 so overrun is detectable
+        # without buffering arbitrarily large payloads in memory.
+        max_bytes = max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes())
+        raw = await file.read(max_bytes + 1)
+        if len(raw) > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"file too large; max {_IMAGE_MAX_BYTES} bytes",
+                detail=f"file too large; max {max_bytes} bytes",
             )
         # Sniff the actual bytes — the multipart Content-Type header is
         # client-controlled and a renderer compromise could ship arbitrary
-        # bytes under an image MIME label. The disk's ground truth is
-        # what gets passed to the provider later, so this is the gate.
+        # bytes under a chosen MIME label. The disk's ground truth is what
+        # gets surfaced to the model later.
         sniffed = sniff_media_type(raw)
-        if sniffed is None:
-            raise HTTPException(
-                status_code=422,
-                detail="image bytes don't match any supported format",
-            )
-        if sniffed != declared_media_type:
-            raise HTTPException(
-                status_code=422,
-                detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
-            )
-        record = save_image_bytes(s.persona_dir, raw, sniffed)
+        if sniffed is not None:
+            # Image path (unchanged storage). Keep the sniff-vs-declared
+            # integrity check when the client declared an image type: a
+            # png-claimed-but-jpeg mismatch is still rejected.
+            if (
+                declared_media_type in _ALLOWED_UPLOAD_MEDIA_TYPES
+                and sniffed != declared_media_type
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
+                )
+            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            return {
+                "kind": "image",
+                "sha": record.sha,
+                "media_type": record.media_type,
+                "size_bytes": record.size_bytes,
+            }
+        # Non-image path (#43). The on-disk name is the content sha only; the
+        # client filename is returned as display metadata, never a path part.
+        frecord = file_store.save_file_bytes(s.persona_dir, raw)
         return {
-            "sha": record.sha,
-            "media_type": record.media_type,
-            "size_bytes": record.size_bytes,
+            "kind": "file",
+            "sha": frecord.sha,
+            "filename": file.filename,
+            "size_bytes": frecord.size_bytes,
         }
 
     # ── GET /images — past-image gallery listing ─────────────────────────
@@ -2444,7 +2456,7 @@ def build_app(
                     sess,
                     req.message,
                     s.provider,
-                    req.image_shas or None,
+                    [r.model_dump() for r in req.shared_files] or None,
                 )
             except Exception as exc:
                 logger.exception("chat failed session=%s", sid)
@@ -2539,23 +2551,22 @@ def build_app(
             await ws.close()
             return
 
-        # Optional image attachments — sha-strings as returned by /upload.
-        # Audit 2026-05-07 P4-1: same item-level constraints as the
-        # HTTP /chat ChatReq path — list of strings only, ≤ 8 entries,
-        # each entry must be 64 lowercase hex chars.
-        raw_shas = req.get("image_shas") or []
-        image_shas: list[str] | None = None
-        if isinstance(raw_shas, list) and raw_shas:
-            valid = (
-                len(raw_shas) <= 8
-                and all(isinstance(x, str) for x in raw_shas)
-                and all(_SHA256_HEX_RE.fullmatch(x) for x in raw_shas)
-            )
-            if not valid:
-                await ws.send_json({"type": "error", "code": "invalid_image_shas", "done": True})
+        # Optional file attachments (images + non-image files) — references as
+        # returned by /upload. Same item-level constraints as the HTTP /chat
+        # ChatReq path: ≤ 8 entries, each a {kind: "image"|"file", sha: 64hex,
+        # media_type?, filename?} dict. Parse into plain dicts for the engine.
+        raw_files = req.get("shared_files") or []
+        shared_files: list[dict] | None = None
+        if isinstance(raw_files, list) and raw_files:
+            try:
+                parsed = [SharedFileRef.model_validate(r).model_dump() for r in raw_files]
+            except Exception:  # noqa: BLE001 — any validation failure → reject
+                parsed = None
+            if parsed is None or len(parsed) > 8:
+                await ws.send_json({"type": "error", "code": "invalid_shared_files", "done": True})
                 await ws.close()
                 return
-            image_shas = list(raw_shas)
+            shared_files = parsed
 
         # Bundle A #4: optional ``reply_to_audit_id`` threads the link from a
         # banner-driven "↩ reply" through to the chat engine. If present, the
@@ -2611,7 +2622,7 @@ def build_app(
                         sess,
                         message,
                         streaming_provider,
-                        image_shas,
+                        shared_files,
                         reply_to_audit_id,
                     )
                 finally:

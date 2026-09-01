@@ -287,18 +287,26 @@ export async function sendChat(persona: string, sessionId: string, message: stri
   return await r.json();
 }
 
-export interface ImageUploadResponse {
+export interface FileUploadResponse {
+  /** Discriminates the on-disk store the file landed in. */
+  kind: "image" | "file";
   sha: string;
-  media_type: string;
+  /** Present for kind === "image" — the sniffed MIME type. */
+  media_type?: string;
+  /** Present for kind === "file" — display-only original filename. */
+  filename?: string;
   size_bytes: number;
 }
 
+/** @deprecated use {@link FileUploadResponse} — /upload now accepts any file. */
+export type ImageUploadResponse = FileUploadResponse;
+
 /**
- * Upload an image File to the bridge. Returns the sha-addressable
- * record on success. Throws on non-200 (415 unsupported, 413 too
- * large, 401 unauthorised).
+ * Upload a File (image or non-image) to the bridge's widened /upload.
+ * Returns the discriminated sha-addressable record on success. Throws on
+ * non-200 (413 too large, 422 image integrity mismatch, 401 unauthorised).
  */
-export async function uploadImage(persona: string, file: File): Promise<ImageUploadResponse> {
+export async function uploadImage(persona: string, file: File): Promise<FileUploadResponse> {
   const fd = new FormData();
   fd.append("file", file);
   // Note: don't set Content-Type — fetch will pick the multipart boundary.
@@ -315,7 +323,7 @@ export async function uploadImage(persona: string, file: File): Promise<ImageUpl
     }
     throw new Error(`/upload ${r.status}: ${detail.slice(0, 200)}`);
   }
-  return (await r.json()) as ImageUploadResponse;
+  return (await r.json()) as FileUploadResponse;
 }
 
 /**

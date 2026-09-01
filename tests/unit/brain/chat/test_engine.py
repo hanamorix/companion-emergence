@@ -405,25 +405,182 @@ def test_respond_outbound_recall_block_rides_volatile_tail(
     assert options.get("include_block_clock") is False
 
 
-def test_respond_replays_image_turn_from_buffer(
+# ---------------------------------------------------------------------------
+# P0 image-tool-route — shared-file surfacing + volatile-drop fix
+# ---------------------------------------------------------------------------
+
+
+def test_respond_file_send_surfaces_path_in_user_text(
     persona_dir: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     recording_provider: _RecordingProvider,
 ) -> None:
-    """A prior user turn with image_shas is reconstructed as a content tuple."""
-    from brain.bridge.chat import ImageBlock, TextBlock
-    from brain.images import save_image_bytes
-    from brain.ingest.buffer import ingest_turn
-
-    # Store a real 1x1 PNG so media_type_for_sha can resolve it.
-    png_bytes = (
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00"
-        b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    """C7a — a shared file's resolved path (+ filename) appears in the assembled
+    user turn text, alongside the raw typed text."""
+    sha = "a" * 64
+    respond(
+        persona_dir,
+        "look at this",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        shared_files=[{"kind": "file", "sha": sha, "filename": "notes.txt"}],
+        voice_md_override="# Nell",
     )
-    record = save_image_bytes(persona_dir, png_bytes, "image/png")
-    sha = record.sha
+    sent = recording_provider.last_messages
+    user_msgs = [m for m in sent if m.role == "user"]
+    assert user_msgs, "expected a user message"
+    last_user = user_msgs[-1].content_text()
+    assert "the user shared a file" in last_user
+    assert sha in last_user
+    assert "notes.txt" in last_user
+    assert "look at this" in last_user
+    # Shown-able-to-fail: with no shared file, the path line is absent.
+    respond(
+        persona_dir,
+        "plain text",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        voice_md_override="# Nell",
+    )
+    plain = [m for m in recording_provider.last_messages if m.role == "user"][-1].content_text()
+    assert "the user shared a file" not in plain
+
+
+def test_respond_file_send_turn_then_text_turn_carries_volatile(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """C5 (post-change) — after a file-send turn, a following text-only turn still
+    carries its volatile_suffix.
+
+    The volatile-drop bug: pre-change a turn carrying an image took the image
+    fork (``build_system_message`` inline, ``volatile_suffix=None``) and the
+    provider picked its transport from *replayed history*, so a later text turn
+    silently dropped its volatile context. That fork is gone — every turn takes
+    the static-system + volatile-suffix split. The pre-change reproduce ran the
+    image transport, which no longer exists in-tree (removed by this change), so
+    per the plan we assert the post-change invariant here; the pre-change repro
+    is the deleted transport itself.
+    """
+    from brain.chat.session import create_session
+
+    sess = create_session(persona_dir.name)
+    # turn k — file-send
+    respond(
+        persona_dir,
+        "here is a file",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        session=sess,
+        shared_files=[{"kind": "file", "sha": "b" * 64, "filename": "n.txt"}],
+        voice_md_override="# Nell",
+    )
+    # turn k+1 — text only
+    respond(
+        persona_dir,
+        "what did you think?",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        session=sess,
+        voice_md_override="# Nell",
+    )
+    options = recording_provider.last_options
+    assert options is not None, "text turn after a file turn must carry per-call options"
+    assert options.get("volatile_suffix") is not None, "volatile_suffix dropped after a file turn"
+    assert options.get("include_block_clock") is False
+
+
+def test_respond_text_only_static_system_is_byte_preserving(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """C9 — a text-only turn's system message is byte-identical to
+    ``build_static_system_message`` and volatile rides the stdin suffix."""
+    from brain.chat.prompt import build_static_system_message
+
+    respond(
+        persona_dir,
+        "hello there",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        voice_md_override="# Nell",
+    )
+    sent = recording_provider.last_messages
+    system_msgs = [m.content for m in sent if m.role == "system"]
+    assert system_msgs, "expected a system message"
+    sent_system = system_msgs[0]
+    expected_static = build_static_system_message(persona_dir, voice_md="# Nell")
+    assert sent_system == expected_static, "text-only static system message drifted from pre-change"
+    options = recording_provider.last_options
+    assert options is not None
+    assert isinstance(options.get("volatile_suffix"), str)
+    assert options.get("include_block_clock") is False
+
+
+def test_respond_path_line_not_fed_to_salience_or_volatile(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+    monkeypatch,
+) -> None:
+    """C14 — the surfaced ``[the user shared a file: ...]`` line does NOT reach
+    ``assess_salience`` / ``build_volatile_context``; both see only the raw
+    typed text (so a file-send turn's volatile content equals the same text
+    without a file)."""
+    import brain.chat.engine as engine_mod
+
+    seen: dict[str, str] = {}
+    real_salience = engine_mod.assess_salience
+    real_volatile = engine_mod.build_volatile_context
+
+    def spy_salience(user_input, **kw):
+        seen["salience"] = user_input
+        return real_salience(user_input, **kw)
+
+    def spy_volatile(persona_dir_, *, user_input, **kw):
+        seen["volatile"] = user_input
+        return real_volatile(persona_dir_, user_input=user_input, **kw)
+
+    monkeypatch.setattr(engine_mod, "assess_salience", spy_salience)
+    monkeypatch.setattr(engine_mod, "build_volatile_context", spy_volatile)
+
+    raw = "please look at it"
+    respond(
+        persona_dir,
+        raw,
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        shared_files=[{"kind": "file", "sha": "c" * 64, "filename": "x.txt"}],
+        voice_md_override="# Nell",
+    )
+    assert seen["salience"] == raw
+    assert "the user shared a file" not in seen["salience"]
+    assert seen["volatile"] == raw
+    assert "the user shared a file" not in seen["volatile"]
+
+
+def test_respond_replays_file_send_turn_from_buffer_as_text(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """A prior file-send turn (persisted as plain text with its path line)
+    replays as a plain-string user message — no ImageBlock reconstruction."""
+    from brain.chat.session import create_session
+    from brain.ingest.buffer import ingest_turn
 
     sess = create_session(persona_dir.name)
     ingest_turn(
@@ -431,145 +588,22 @@ def test_respond_replays_image_turn_from_buffer(
         {
             "session_id": sess.session_id,
             "speaker": "user",
-            "text": "look at this",
-            "image_shas": [sha],
+            "text": "look at this\n[the user shared a file: /p/files/abc]",
         },
     )
-
     respond(
         persona_dir,
-        "what do you think?",
+        "and?",
         store=store,
         hebbian=hebbian,
         provider=recording_provider,
         session=sess,
         voice_md_override="# Nell",
     )
-
     sent = recording_provider.last_messages
-    image_msgs = [m for m in sent if m.role == "user" and not isinstance(m.content, str)]
-    assert image_msgs, "expected at least one user msg with tuple content"
-    # The replayed prior turn should be among them. The live turn ("what do you
-    # think?") is text-only so it stays a string-content message.
-    found = False
-    for msg in image_msgs:
-        blocks = list(msg.content)
-        text_blocks = [b for b in blocks if isinstance(b, TextBlock)]
-        image_blocks = [b for b in blocks if isinstance(b, ImageBlock)]
-        if any(b.text == "look at this" for b in text_blocks) and any(
-            b.image_sha == sha for b in image_blocks
-        ):
-            found = True
-            break
-    assert found, "image-bearing user turn was not replayed from buffer"
-
-
-def test_respond_image_turn_system_message_is_unsplit_full(
-    persona_dir: Path,
-    store: MemoryStore,
-    hebbian: HebbianMatrix,
-    recording_provider: _RecordingProvider,
-) -> None:
-    """C5 — the IMAGE path stays byte-identical to the pre-change shape.
-
-    An image turn must NOT take the Option A/A+ split: it builds the FULL system
-    message via the unchanged ``build_system_message`` (volatile blocks inline)
-    and carries NO ``volatile_suffix`` (the image fold has no stdin tail). The
-    proof: the system message the engine sent on an image turn carries the
-    volatile markers inline (so it is the unsplit full build, NOT the static-only
-    head), is byte-identical to ``build_system_message`` re-run over the SAME
-    frozen inputs, and the options carry no volatile suffix / clock flag.
-
-    Determinism: ``build_system_message`` reads body/temperature state the engine
-    mutates per turn, so we freeze the body block on BOTH builds via a stub,
-    leaving the rest byte-comparable. (The system message itself carries no wall
-    clock — that line lives only in the provider's JSONL block — so no other clock
-    pin is needed.)
-    """
-    import brain.chat.prompt as prompt_mod
-    from brain.chat.prompt import (
-        _AMBIENT_FRAMING,
-        build_static_system_message,
-        build_system_message,
-    )
-    from brain.engines.daemon_state import load_daemon_state
-    from brain.images import save_image_bytes
-    from brain.memory.store import Memory
-    from brain.soul.store import SoulStore
-
-    # Seed deterministic emotion state so a split-vs-unsplit difference is
-    # observable in the system message (emotions surface in the brain block).
-    store.create(
-        Memory.create_new(
-            content="A tender afternoon with Jordan.",
-            memory_type="event",
-            domain="relationship",
-            emotions={"love": 7.0, "tenderness": 5.0},
-            tags=[],
-        )
-    )
-
-    # Freeze the body block (the only per-call mutating volatile block) so the
-    # engine's build and our reference build compare byte-for-byte.
-    frozen_body = "── body ──\nenergy: 7/10, temperature: 3/9, exhaustion: 0/10"
-    original_body_builder = prompt_mod._build_body_block
-    prompt_mod._build_body_block = lambda *a, **k: frozen_body  # type: ignore[attr-defined]
-    try:
-        png_bytes = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00"
-            b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        record = save_image_bytes(persona_dir, png_bytes, "image/png")
-        sha = record.sha
-
-        user_input = "what do you think of this?"
-        respond(
-            persona_dir,
-            user_input,
-            store=store,
-            hebbian=hebbian,
-            provider=recording_provider,
-            image_shas=[sha],
-            voice_md_override="# Nell",
-        )
-
-        sent = recording_provider.last_messages
-        system_msgs = [m.content for m in sent if m.role == "system"]
-        assert system_msgs, "expected a system message on the image turn"
-        sent_system = system_msgs[0]
-        assert isinstance(sent_system, str)
-
-        # The image-turn system message must be the UNSPLIT full build: volatile
-        # blocks inline, NOT the static-only head, NOT the volatile-tail shape.
-        static_head = build_static_system_message(persona_dir, voice_md="# Nell")
-        assert sent_system != static_head, "image turn must NOT use the static-only head"
-        assert "── brain context ──" in sent_system
-        assert "current emotions:" in sent_system
-        assert frozen_body in sent_system
-        assert _AMBIENT_FRAMING not in sent_system
-
-        # Byte-identity against a fresh unsplit build over the same frozen inputs.
-        daemon_state, _ = load_daemon_state(persona_dir)
-        soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
-        try:
-            expected_system = build_system_message(
-                persona_dir,
-                voice_md="# Nell",
-                daemon_state=daemon_state,
-                soul_store=soul_store,
-                store=store,
-                user_input=user_input,
-                reply_to_audit_id=None,
-            )
-        finally:
-            soul_store.close()
-        assert sent_system == expected_system
-    finally:
-        prompt_mod._build_body_block = original_body_builder  # type: ignore[attr-defined]
-
-    # And NO volatile suffix / clock-relocation flag rides on an image turn.
-    options = recording_provider.last_options
-    if options is not None:
-        assert options.get("volatile_suffix") is None
-        assert "include_block_clock" not in options
+    for m in sent:
+        if m.role in ("user", "assistant"):
+            assert isinstance(m.content, str), "every replayed turn must be plain string content"
+    replayed = [m.content for m in sent if m.role == "user" and "look at this" in m.content]
+    assert replayed, "the prior file-send turn was not replayed"
+    assert "the user shared a file" in replayed[0]
