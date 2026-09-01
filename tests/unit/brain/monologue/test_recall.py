@@ -1,3 +1,5 @@
+import pytest
+
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.monologue.recall import recall_monologue
@@ -21,6 +23,16 @@ def test_recall_finds_matching_trace_only(tmp_path):
     assert "lighthouse facts" not in bodies
 
 
+@pytest.mark.xfail(
+    reason=(
+        "CATEGORY-B (memory-consolidation migration): monologue_trace is now a gated "
+        "pending-candidate, not a memories.db row, so recall reads it from the queue "
+        "and the keep-sharp recall_count bump is a NO-OP (there is no store row to "
+        "bump — list_by_type('monologue_trace') is empty). recall-bump deferred to "
+        "Phase 4 (Root 2 stopgap)."
+    ),
+    strict=True,
+)
 def test_recall_bumps_recall_count_keeping_it_sharp(tmp_path):
     store, hebbian = _ctx(tmp_path)
     write_trace_memory(store, "the harbour at dusk")

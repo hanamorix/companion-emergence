@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -138,6 +139,7 @@ def run_folded(
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+    is_session_busy: Callable[[str], bool] | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -240,6 +242,23 @@ def run_folded(
             _attunement_run_supplementary_backfill(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("attunement backfill failed during startup: %s", exc)
+
+    # One-shot startup: catch-up compaction (owner ruling 2026-08-13 — compaction
+    # fires at startup OR during idle). Runs the age-gated cascade once now to fold
+    # any turns that crossed the 24/48/72h thresholds while the app was off. Startup
+    # is idle by nature (no in-flight requests), so it fires cleanly; the periodic
+    # cascade is idle-gated thereafter. Fault-isolated (recipe item 3). Skipped when
+    # the compaction cadence is disabled (tests/dev), mirroring the periodic gate.
+    try:
+        if compaction_interval_s is not None:
+            from brain.chat.compaction import build_compaction_provider
+
+            _run_compaction_tick(
+                persona_dir, build_compaction_provider(persona_dir),
+                is_session_busy=is_session_busy,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup catch-up compaction failed: %s", exc)
 
     # One-shot startup: re-tag emotion-less memories so existing personas
     # benefit from the A2 forward-only emotion seeding.  Independent of the
@@ -657,7 +676,10 @@ def run_folded(
         ):
             try:
                 from brain.chat.compaction import build_compaction_provider
-                _run_compaction_tick(persona_dir, build_compaction_provider(persona_dir))
+                _run_compaction_tick(
+                    persona_dir, build_compaction_provider(persona_dir),
+                    is_session_busy=is_session_busy,
+                )
             except Exception:
                 logger.exception("supervisor compaction tick raised")
             finally:
@@ -1676,34 +1698,77 @@ def _run_narrative_memory_pass(
         )
 
 
-def _run_compaction_tick(persona_dir: Path, provider: LLMProvider) -> None:
-    """Fold each active conversation's aged, extracted turns into its summary.
+def _run_compaction_tick(
+    persona_dir: Path,
+    provider: LLMProvider,
+    *,
+    is_session_busy: Callable[[str], bool] | None = None,
+) -> None:
+    """Run the age-gated cascade on each active conversation, then check the weekly
+    session-rollover (1c-B) — cascade-fold FIRST, then rollover, so a swap seeds from
+    the just-updated tiers (M2). Per-session failures are logged and do not stop the
+    sweep — autonomous-behaviour recipe: defer cleanly, don't fail loudly.
 
-    Iterates active_conversations buffers and calls the shared compaction core
-    with a 24h cutoff and fold_existing_summary=True (fade). Per-session
-    failures are logged and do not stop the sweep — autonomous-behaviour
-    recipe: defer cleanly, don't fail loudly.
+    **Idle-gate (owner ruling 2026-08-13):** compaction and the weekly rollover fire
+    only at startup or during idle — never mid-exchange. A session with an in-flight
+    request (``is_session_busy(sid)`` true) is SKIPPED this tick (both its cascade
+    and its rollover) and retried on the next idle tick. This is a best-effort
+    efficiency/UX belt (don't churn an actively-used session); it is NOT the
+    race-safety mechanism. The resolve-persist race is closed structurally inside
+    ``perform_rollover``, whose destructive section holds ``registry_lock()`` across
+    its seed re-read → successor-pointer write, serializing it against a concurrent
+    live-turn persist (see brain/chat/rollover.py + session.persist_turns_following_
+    successor). At startup ``is_session_busy`` is None / returns False (no requests
+    yet), so the startup catch-up cascade fires.
 
     Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
     stays off the chat model. Called from the persisted_cadence block in
-    run_folded (daily default, survives restart/sleep per #21).
+    run_folded (daily default, survives restart/sleep per #21) and once at startup.
     """
-    from datetime import timedelta
-
-    from brain.chat.compaction import compact_conversation
+    from brain.chat.compaction import (
+        _ROLLOVER_QUIET_GAP,
+        _WEEKLY_ROLLOVER_AGE,
+        cascade_conversation,
+    )
+    from brain.chat.rollover import maybe_weekly_rollover
     from brain.ingest.buffer import list_active_sessions
 
-    for session_id in list_active_sessions(persona_dir):
-        try:
-            compact_conversation(
-                persona_dir,
-                session_id,
-                older_than=timedelta(hours=24),
-                fold_existing_summary=True,
-                provider=provider,
-            )
-        except Exception:
-            logger.exception("compaction tick: session=%s raised", session_id)
+    persona_name = persona_dir.name
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        embeddings = EmbeddingCache(
+            persona_dir / "embeddings.db",
+            FakeEmbeddingProvider(dim=256),
+        )
+        stack.callback(embeddings.close)
+
+        for session_id in list_active_sessions(persona_dir):
+            now = datetime.now(UTC)
+            # Idle-gate: skip a session with an in-flight request (owner ruling) —
+            # its cascade AND its rollover defer to the next idle tick. Compaction
+            # is thus startup/idle-only, never mid-exchange.
+            if is_session_busy is not None and is_session_busy(session_id):
+                continue
+            try:
+                cascade_conversation(persona_dir, session_id, provider=provider, now=now)
+            except Exception:
+                logger.exception("compaction tick: session=%s raised", session_id)
+            # 1c-B weekly rollover (quiet-moment boundary). The is_session_busy belt
+            # is passed through as a second guard (defer if a request slipped in
+            # between the skip-check above and here).
+            try:
+                maybe_weekly_rollover(
+                    persona_dir, session_id, persona_name,
+                    weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
+                    now=now, provider=provider,
+                    store=store, hebbian=hebbian, embeddings=embeddings,
+                    is_session_busy=is_session_busy,
+                )
+            except Exception:
+                logger.exception("weekly rollover: session=%s raised", session_id)
 
 
 def _run_finalize_tick(

@@ -78,8 +78,15 @@ def capture_monologue(
     #
     # Fail-soft: if the lookup raises, capture anyway — never lose her thought
     # to a dedupe check.
+    # monologue_trace is a GATED type — write_trace_memory routes the trace into
+    # the pending-candidate queue, not memories.db. The other monologue_trace
+    # reads (recall.py, ambient.py) read PendingQueue, so this same-turn dedup
+    # guard must too, or it goes blind to the just-enqueued trace and writes a
+    # duplicate digest line (the #93 bug this guard exists to prevent).
     try:
-        recent = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True, limit=1)
+        from brain.memory.pending import PendingQueue
+
+        recent = PendingQueue(store.persona_dir).read_recent(MONOLOGUE_TRACE_TYPE, limit=1)
         if recent and recent[0].content == monologue:
             return monologue
     except Exception:  # noqa: BLE001

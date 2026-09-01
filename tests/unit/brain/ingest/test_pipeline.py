@@ -11,6 +11,7 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.ingest.buffer import (
     ingest_turn,
     read_backoff,
@@ -28,6 +29,13 @@ from brain.ingest.pipeline import (
 from brain.ingest.soul_queue import list_soul_candidates
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+
+# memory-consolidation migration: gated ingest labels (fact/observation/…) are
+# enqueued as candidates, not written to memories.db. Promote them through the
+# consolidation gate (inject a promote-all classifier) so the pre-existing
+# store.get() end-state assertions hold — the candidate id is preserved on
+# promote, so report.memory_ids still resolves.
+_PROMOTE_ALL = lambda _cand, _ctx: Decision("new")  # noqa: E731
 
 # ---------------------------------------------------------------------------
 # Fake providers for pipeline tests
@@ -103,8 +111,10 @@ def tracking_provider() -> _TrackingProvider:
 
 
 @pytest.fixture
-def store() -> MemoryStore:
-    return MemoryStore(":memory:")
+def store(tmp_path) -> MemoryStore:
+    # On-disk so store.persona_dir == the persona_dir passed to close_session:
+    # gated ingest labels enqueue to <persona_dir>/pending_candidates.jsonl.
+    return MemoryStore(tmp_path / "memories.db")
 
 
 @pytest.fixture
@@ -179,7 +189,8 @@ def test_close_session_full_path_correct_counts(
     assert report.deduped == 0
     assert report.errors == 0
     assert len(report.memory_ids) == 2
-    # Both memories should exist in the store.
+    # Gated candidates are enqueued; promote them, then both memories exist.
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     for mid in report.memory_ids:
         assert store.get(mid) is not None
 
@@ -286,6 +297,8 @@ def test_close_session_memory_and_soul_candidate_both_written(
     assert len(report.memory_ids) == 1
 
     mem_id = report.memory_ids[0]
+    # Gated candidate — promote it, then it is a real memories.db row (id kept).
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     memory = store.get(mem_id)
     assert memory is not None
     assert memory.content == "The most important truth"
@@ -745,12 +758,15 @@ def test_finalize_under_threshold_skips(
     assert buf.exists()
 
 
-def test_finalize_at_threshold_deletes_buffer_and_cursor(
+def test_finalize_at_threshold_extracts_but_keeps_buffer(
     tmp_path: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     tracking_provider: _TrackingProvider,
 ) -> None:
+    # Cascade-compaction 1c (stage-3 L2): finalize is now EXTRACTION-ONLY — it runs
+    # the final extraction but no longer deletes the buffer/cursor. The rollover path
+    # owns buffer deletion (a still-live session's buffer stays until it rolls over).
     sid = "sess_abc"
     old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
     ingest_turn(tmp_path, {"session_id": sid, "speaker": "user", "text": "x", "ts": old})
@@ -767,9 +783,7 @@ def test_finalize_at_threshold_deletes_buffer_and_cursor(
     assert len(reports) == 1
     assert reports[0].session_id == sid
     buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
-    cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
-    assert not buf.exists(), "finalize must delete the buffer"
-    assert not cursor_file.exists(), "finalize must delete the cursor"
+    assert buf.exists(), "finalize is extraction-only — it must NOT delete the buffer"
 
 
 def test_finalize_per_session_error_isolation(
@@ -812,10 +826,11 @@ def test_finalize_per_session_error_isolation(
 
     # Both stale sessions reach finalize regardless of the first one exploding.
     assert len(reports) == 2
-    # Both buffers cleaned up after their finalize attempt.
+    # Extraction-only finalize keeps both buffers (rollover owns deletion); the
+    # point here is error isolation — one session raising doesn't abort the sweep.
     for sid in (sid_a, sid_b):
         buf = tmp_path / "active_conversations" / f"{sid}.jsonl"
-        assert not buf.exists()
+        assert buf.exists()
 
 
 # ---------------------------------------------------------------------------

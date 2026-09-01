@@ -10,6 +10,7 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import FakeProvider, LLMProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -46,8 +47,11 @@ class _UnprefixedFakeProvider(LLMProvider):
 
 
 @pytest.fixture
-def store() -> MemoryStore:
-    return MemoryStore(db_path=":memory:")
+def store(tmp_path) -> MemoryStore:
+    # On-disk so store.persona_dir == tmp_path: gated "dream" candidates land in
+    # tmp_path's pending queue (not the CWD) and can be promoted when a test
+    # needs the end-state DB row.
+    return MemoryStore(db_path=tmp_path / "memories.db")
 
 
 @pytest.fixture
@@ -135,6 +139,13 @@ def test_run_cycle_writes_dream_memory_to_store(engine: DreamEngine, store: Memo
     assert result.memory is not None
     assert result.memory.memory_type == "dream"
 
+    # The dream is enqueued as a gated candidate; promote it (id preserved) so
+    # the store.get() end-state assertion holds.
+    run_consolidation(
+        store,
+        persona_dir=store.persona_dir,
+        classifier=lambda _c, _ctx: Decision("new"),
+    )
     restored = store.get(result.memory.id)
     assert restored is not None
     assert restored.memory_type == "dream"

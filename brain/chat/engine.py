@@ -33,13 +33,17 @@ from brain.chat.prompt import (
     build_volatile_context,
 )
 from brain.chat.salience import assess_salience
-from brain.chat.session import SessionState, create_session
+from brain.chat.session import (
+    SessionState,
+    create_session,
+    persist_turns_following_successor,
+)
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
 from brain.images import media_type_for_sha
-from brain.ingest.buffer import ingest_turn, read_session
+from brain.ingest.buffer import read_session
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -460,11 +464,19 @@ def _persist_turn(
         }
         if image_shas:
             user_record["image_shas"] = list(image_shas)
-        ingest_turn(persona_dir, user_record)
-        ingest_turn(
-            persona_dir,
-            {"session_id": session_id, "speaker": "assistant", "text": assistant_text},
-        )
+        assistant_record: dict = {
+            "session_id": session_id,
+            "speaker": "assistant",
+            "text": assistant_text,
+        }
+        # Persist the pair under the registry lock, redirecting to the rolled-over
+        # successor if this session was rolled over while the turn was in flight.
+        # This closes the resolve-persist race (stage-6 r4): the rollover's
+        # destructive section holds the same lock across its seed re-read → pointer
+        # write, so this append can never resurrect a just-deleted old buffer — it
+        # is either captured into the successor seed or redirected to the live
+        # successor. See brain.chat.session.persist_turns_following_successor.
+        persist_turns_following_successor(persona_dir, [user_record, assistant_record])
         return True, None
     except Exception as exc:  # noqa: BLE001
         # The contract here is explicit (per OG nell_bridge.py:200-230):

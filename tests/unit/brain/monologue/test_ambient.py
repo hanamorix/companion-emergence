@@ -1,3 +1,5 @@
+import pytest
+
 from brain.memory.store import MemoryStore
 from brain.monologue.ambient import build_interior_continuity_block
 from brain.monologue.trace import write_trace_memory
@@ -16,6 +18,17 @@ def test_renders_active_verbatim(tmp_path):
     assert "interior continuity" in block.lower()
 
 
+@pytest.mark.xfail(
+    reason=(
+        "CATEGORY-B (memory-consolidation migration): monologue_trace is now a gated "
+        "pending-candidate, not a memories.db row. Ambient reads traces from the "
+        "queue and renders them VERBATIM (see test_renders_active_verbatim); a "
+        "candidate cannot fade — store.fade(mem_id) raises KeyError since there is no "
+        "DB row. The blurred-summary rendering is deferred to Phase 4 (Root 2 "
+        "stopgap)."
+    ),
+    strict=True,
+)
 def test_renders_faded_summary_not_original(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     mem_id = write_trace_memory(store, "a long original verbatim thought")

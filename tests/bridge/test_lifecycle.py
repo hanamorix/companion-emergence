@@ -257,6 +257,17 @@ def test_dirty_recovery_real_snapshot_preserves_buffer_and_commits(persona_dir: 
     assert buffer_path.exists(), "recovery must not delete the replay buffer"
     store = MemoryStore(persona_dir / "memories.db")
     try:
+        # memory-consolidation migration: the recovered "fact" is a gated ingest
+        # label, so it is enqueued as a pending candidate rather than written to
+        # memories.db. Promote the queue (promote-all classifier) so the recovered
+        # turn lands as a real row and the count assertion holds.
+        from brain.engines.consolidation import Decision, run_consolidation
+
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
         rows = store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()
         assert rows[0] >= 1
     finally:

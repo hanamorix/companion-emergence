@@ -53,6 +53,9 @@ def test_revise_writes_clamped_registered_emotion_memory(tmp_path: Path) -> None
     assert result.get("ok") is True
     assert result.get("delta_written") is True
 
+    # self_model_reconcile BYPASSES the consolidation gate (owner decision, see
+    # GATE_BYPASS_TYPES in brain/memory/pending.py): the emotion-carrying memory
+    # commits straight to memories.db, immediately visible via list_active.
     store = MemoryStore(tmp_path / "memories.db")
     try:
         mems = [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]

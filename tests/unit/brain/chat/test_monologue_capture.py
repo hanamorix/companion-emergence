@@ -9,6 +9,28 @@ import pytest
 from brain.memory.store import MemoryStore
 
 
+def _promote_pending(persona_dir: Path) -> None:
+    """Promote the persona's pending-candidate queue into memories.db.
+
+    memory-consolidation migration: monologue-trace writes are GATED types —
+    capture_monologue enqueues them as candidates rather than writing
+    memories.db rows directly. Tests that assert the end-state DB memory run
+    the consolidation gate with a promote-all classifier (candidate id
+    preserved) so their store reads hold.
+    """
+    from brain.engines.consolidation import Decision, run_consolidation
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        run_consolidation(
+            store,
+            persona_dir=persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
+    finally:
+        store.close()
+
+
 def _store(tmp_path: Path) -> MemoryStore:
     return MemoryStore(tmp_path / "memories.db")
 
@@ -126,6 +148,8 @@ def test_identical_monologue_in_one_turn_is_captured_once(tmp_path: Path):
             feed_digest=digest,
         )
 
+    _promote_pending(tmp_path)
+
     traces = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True)
     assert len(traces) == 1, f"one thought, one trace — got {len(traces)}"
 
@@ -143,5 +167,7 @@ def test_a_different_monologue_still_captures(tmp_path: Path):
                       monologue="First thought.", feed_digest="d1")
     capture_monologue(persona_dir=tmp_path, store=store,
                       monologue="Second, different thought.", feed_digest="d2")
+
+    _promote_pending(tmp_path)
 
     assert len(store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True)) == 2

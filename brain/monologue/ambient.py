@@ -31,7 +31,15 @@ def build_interior_continuity_block(
     privacy footer is appended after capping so it can never be truncated
     (v0.0.33 Track 2a). Returns "" when there are none or on any error."""
     try:
-        traces = store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True, limit=limit)
+        # monologue_trace is now GATED — traces live in the pending-candidate
+        # queue (not memories.db), so interior-continuity reads them there. The
+        # limit (_AMBIENT_LIMIT=5) and rendering semantics are unchanged; only
+        # the read source moves. TEMP (Root 2 stopgap; ≤2-thought rework → Phase 4).
+        from brain.memory.pending import PendingQueue
+
+        traces = PendingQueue(store.persona_dir).read_recent(
+            MONOLOGUE_TRACE_TYPE, limit=limit
+        )
     except Exception:  # noqa: BLE001
         return ""
     if not traces:
