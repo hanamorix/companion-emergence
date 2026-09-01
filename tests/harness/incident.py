@@ -93,6 +93,7 @@ def build_compacted_state(persona_dir: Path, spec: IncidentSpec, provider: objec
     """Build the incident-regime state in ``persona_dir`` using the REAL fold + injected provider."""
     from brain.chat.compaction import compact_conversation
     from brain.ingest.buffer import ingest_turn, read_session, write_cursor
+    from brain.memory.pending import PendingQueue
     from brain.memory.store import Memory, MemoryStore
     from brain.monologue.ambient import build_interior_continuity_block
     from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
@@ -145,6 +146,12 @@ def build_compacted_state(persona_dir: Path, spec: IncidentSpec, provider: objec
     if spec.seed_interior and spec.interior_traces:
         store = MemoryStore(db_path=persona_dir / "memories.db")
         try:
+            # memory-consolidation migration: monologue_trace is a gated type and
+            # build_interior_continuity_block now reads recent traces from the
+            # PENDING QUEUE (not memories.db). Seed the traces by ENQUEUEing them
+            # (oldest→newest, matching read_recent's newest-first ordering) rather
+            # than store.create — a DB row would be invisible to the consumer.
+            queue = PendingQueue(store.persona_dir)
             tbase = datetime.now(UTC)
             seeds = list(spec.interior_traces)
             for i, tx in enumerate(seeds):
@@ -154,7 +161,7 @@ def build_compacted_state(persona_dir: Path, spec: IncidentSpec, provider: objec
                     importance=5.0,
                 )
                 m.created_at = tbase - timedelta(minutes=len(seeds) - i)
-                store.create(m)
+                queue.enqueue(m, source="interior-seed")
             interior_block = build_interior_continuity_block(store, user_name=user_name)
         finally:
             store.close()

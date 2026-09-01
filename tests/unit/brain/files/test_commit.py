@@ -22,6 +22,24 @@ def _store(persona_dir):
     return MemoryStore(persona_dir / "memories.db")
 
 
+def _promote_pending(persona_dir):
+    """Drain the consolidation gate with a promote-all classifier.
+
+    file_write is a GATED type (Root-2 stopgap): its wire-back memory enqueues to the
+    pending queue and only reaches memories.db after a consolidation drain. Tests that
+    assert the end-state DB row run this to promote the candidate.
+    """
+    from brain.engines.consolidation import Decision, run_consolidation
+
+    s = MemoryStore(persona_dir / "memories.db")
+    try:
+        run_consolidation(
+            s, persona_dir=persona_dir, classifier=lambda _c, _ctx: Decision("new")
+        )
+    finally:
+        s.close()
+
+
 def test_commit_create_writes_file_and_memory(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     persona = _persona(tmp_path)
@@ -38,8 +56,13 @@ def test_commit_create_writes_file_and_memory(tmp_path, monkeypatch):
     assert res["ok"]
     assert target.read_text() == "body"
     assert pending.get(persona, rid)["status"] == "committed"
-    assert store.list_by_type("file_write", active_only=True, limit=5)  # wire-back memory
+    # file_write is GATED: the wire-back memory enqueues, not written straight to db.
+    assert not store.list_by_type("file_write", active_only=True, limit=5)
     store.close()
+    _promote_pending(persona)  # drain → promote the candidate
+    store2 = _store(persona)
+    assert store2.list_by_type("file_write", active_only=True, limit=5)  # wire-back memory
+    store2.close()
 
 
 def test_commit_append_preserves_existing(tmp_path, monkeypatch):
@@ -94,9 +117,14 @@ def test_decline_writes_nothing_records_memory(tmp_path):
     store = MemoryStore(persona / "memories.db")
     decline_write(persona, rid, store=store)
     assert pending.get(persona, rid)["status"] == "declined"
-    mems = store.list_by_type("file_write", active_only=True, limit=5)
-    assert mems and "secret" not in mems[0].content  # declined content NOT stored
+    # file_write is GATED: enqueues, promoted on drain.
+    assert not store.list_by_type("file_write", active_only=True, limit=5)
     store.close()
+    _promote_pending(persona)
+    store2 = MemoryStore(persona / "memories.db")
+    mems = store2.list_by_type("file_write", active_only=True, limit=5)
+    assert mems and "secret" not in mems[0].content  # declined content NOT stored
+    store2.close()
 
 
 def test_committed_write_surfaces_in_feed(tmp_path, monkeypatch):
@@ -115,6 +143,11 @@ def test_committed_write_surfaces_in_feed(tmp_path, monkeypatch):
     store = _store(persona)
     commit_write(persona, rid, store=store)
     store.close()
+    # BLAST RADIUS (accepted, see changes/gate-leak-coverage/decisions.md): the Feed source
+    # build_file_write_entries reads memories.db, so a committed file-write is NOT visible in
+    # the Feed until the consolidation gate promotes the (now gated) file_write candidate —
+    # a user-facing latency that mirrors the self-model latency (criteria A3). Drain to promote.
+    _promote_pending(persona)
 
     from brain.bridge.feed import build_file_write_entries
 

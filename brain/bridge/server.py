@@ -44,7 +44,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictBool, field_validator
+from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import tunables
@@ -243,7 +243,7 @@ def _respond_blocking(
     sess: Any,
     message: str,
     provider: LLMProvider,
-    image_shas: list[str] | None = None,
+    shared_files: list[dict] | None = None,
     reply_to_audit_id: str | None = None,
 ) -> Any:
     """Wrap brain.chat.engine.respond — blocks; called via asyncio.to_thread.
@@ -268,7 +268,7 @@ def _respond_blocking(
             hebbian=hebbian,
             provider=provider,
             session=sess,
-            image_shas=image_shas,
+            shared_files=shared_files,
             reply_to_audit_id=reply_to_audit_id,
         )
 
@@ -316,16 +316,10 @@ class _StreamingProxy:
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> ChatResponse:
-        # Image-bearing turns: chat_stream() flattens ImageBlocks to the text
-        # marker "[image: <sha>]" (it has no multimodal input path), so the
-        # model would see the tag but never the pixels. Route them through the
-        # real provider's non-streaming chat(), which base64-inlines the image
-        # via _chat_with_images and still returns dispatched_invocations (so
-        # pass-2 monologue fires). Forward the reply as word chunks, like the
-        # no-chat_stream fallback. Image turns lose token-level streaming but
-        # the model actually sees the picture — correct over fast.
-        # Regression: the v0.0.34 "got the tag but no image data" live bug.
-        from brain.bridge.provider import _message_has_image
+        # The image transport is gone — no message carries image pixels now, so
+        # every turn streams through the normal chat_stream() path below. Shared
+        # images are surfaced as a file path in the user text and read back via
+        # the read_file MCP tool.
 
         # suppress_stream (bug #4): run_tool_loop sets this on a recruitable
         # first pass so its text is NOT pushed to the WS (only the recruit rerun
@@ -335,13 +329,6 @@ class _StreamingProxy:
         if options is not None and "suppress_stream" in options:
             options = {k: v for k, v in options.items() if k != "suppress_stream"}
             suppress = True
-
-        if any(_message_has_image(m) for m in messages):
-            resp = self._real.chat(messages, tools=tools, options=options)
-            if not suppress:
-                for word in _word_chunks(resp.content):
-                    self._loop.call_soon_threadsafe(self._q.put_nowait, word)
-            return resp
 
         # Capture the MCP audit-log offset BEFORE the stream so we can read
         # dispatched_invocations after — without this the streaming path
@@ -725,26 +712,33 @@ class NewSessionResp(BaseModel):
     created_at: str
 
 
+class SharedFileRef(BaseModel):
+    """A file the user attached this turn, as returned by /upload.
+
+    ``kind`` discriminates the on-disk store: an ``image`` resolves under
+    ``<persona_dir>/images/<sha>.<ext>`` (media_type gives the ext), a
+    ``file`` under ``<persona_dir>/files/<sha>``. The sha is the sole path
+    component; ``filename`` is display-only metadata (never a path part) so a
+    crafted filename cannot traverse (C17).
+    """
+
+    kind: Literal["image", "file"]
+    sha: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    media_type: str | None = Field(default=None, max_length=128)
+    filename: str | None = Field(default=None, max_length=255)
+
+
 class ChatReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     message: str = Field(..., min_length=1, max_length=20_000)
-    # Optional image attachments — sha-strings as returned by /upload.
-    # Audit 2026-05-07 P4-1: comment used to promise 64-char-hex
-    # validation but the model only enforced the list length cap.
-    # Now Pydantic enforces it at the API boundary too. Deeper image
-    # handling stays as defense in depth.
-    image_shas: list[str] = Field(
+    # Optional file attachments (images + non-image files) — references as
+    # returned by /upload. Replaces the pre-P0 image-only image_shas transport
+    # payload; each ref is resolved to an on-disk path the engine surfaces to
+    # the model, which reads it back via the read_file MCP tool.
+    shared_files: list[SharedFileRef] = Field(
         default_factory=list,
         max_length=8,
     )
-
-    @field_validator("image_shas")
-    @classmethod
-    def _validate_image_shas(cls, v: list[str]) -> list[str]:
-        for sha in v:
-            if not _SHA256_HEX_RE.fullmatch(sha):
-                raise ValueError(f"image_sha must be 64 lowercase hex chars, got {sha!r}")
-        return v
 
 
 class CloseReq(BaseModel):
@@ -919,7 +913,17 @@ def build_app(
         def _run_backlog_migration() -> None:
             try:
                 from brain.chat.compaction import build_compaction_provider
-                from brain.chat.compaction_migration import run_backlog_migration
+                from brain.chat.compaction_migration import (
+                    run_backlog_migration,
+                    run_sections_migration,
+                )
+
+                # Sections-migration FIRST (round-9 N1): a cheap in-place shape
+                # rewrite of the existing legacy summary row into the sectioned
+                # form (tier 3, old-floor). Running it before the legacy backlog
+                # drain means any row that drain touches is already sectioned, and
+                # the tolerant reader + next cascade tick self-heal either way.
+                run_sections_migration(persona_dir)
 
                 # Migration folds with COMPACTION_MODEL (haiku), not the chat model.
                 run_backlog_migration(
@@ -937,6 +941,16 @@ def build_app(
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
+        def _is_session_busy(sid: str) -> bool:
+            """Best-effort cross-thread check: is a request in-flight for ``sid``?
+            The supervisor's idle-gate (compaction + weekly rollover) defers a busy
+            session so it never mutates/deletes a buffer mid-request (owner ruling
+            2026-08-13). Reads the async ``in_flight_locks`` from the supervisor
+            thread — ``asyncio.Lock.locked()`` is a plain bool read, safe enough for
+            a best-effort belt; the worst case is deferring one idle tick."""
+            lk = app.state.bridge.in_flight_locks.get(sid)
+            return lk is not None and lk.locked()
+
         stop_event = threading.Event()
         sup_thread = threading.Thread(
             target=run_folded,
@@ -947,6 +961,7 @@ def build_app(
                 "event_bus": bus,
                 "tick_interval_s": tick_interval_s,
                 "silence_minutes": silence_minutes,
+                "is_session_busy": _is_session_busy,
             },
             name="sp7-supervisor",
             daemon=False,
@@ -1214,6 +1229,9 @@ def build_app(
 
         Response: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
         """
+        from contextlib import ExitStack
+
+        from brain.chat.rollover import perform_rollover
         from brain.ingest.buffer import list_active_sessions, read_session
 
         s: BridgeAppState = app.state.bridge
@@ -1224,6 +1242,11 @@ def build_app(
         _ATTACH_MAX_AGE_HOURS = 24.0  # noqa: N806 — local frozen constant
         best_sid: str | None = None
         best_ts: datetime | None = None
+        # Stale (idle > threshold) selection for the 1c-A rollover: roll over the
+        # MOST-RECENTLY-ACTIVE stale buffer (the one the user most plausibly
+        # continues); tie-break the lexicographically-largest sid (stage-3 A1-b).
+        stale_sid: str | None = None
+        stale_ts: datetime | None = None
         for sid in list_active_sessions(s.persona_dir):
             try:
                 turns = read_session(s.persona_dir, sid)
@@ -1246,11 +1269,41 @@ def build_app(
                 continue
             age_hours = (now - last).total_seconds() / 3600.0
             if age_hours >= _ATTACH_MAX_AGE_HOURS:
+                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
+                    stale_ts = last
+                    stale_sid = sid
                 continue
             if best_ts is None or last > best_ts:
                 best_ts = last
                 best_sid = sid
-        return {"session_id": best_sid}
+
+        if best_sid is not None:
+            return {"session_id": best_sid}
+
+        # No attach-eligible session — if a stale buffer exists, SYNC-roll it over
+        # (extract → fold everything → archive → delete old buffer → seed a
+        # summary-only head) and return the NEW session id (1c-A, owner-ratified).
+        if stale_sid is not None:
+            try:
+                with ExitStack() as stack:
+                    store = MemoryStore(s.persona_dir / "memories.db", integrity_check=False)
+                    stack.callback(store.close)
+                    hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
+                    stack.callback(hebbian.close)
+                    embeddings = EmbeddingCache(
+                        s.persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256)
+                    )
+                    stack.callback(embeddings.close)
+                    new_sid = perform_rollover(
+                        s.persona_dir, stale_sid, s.persona,
+                        seed_mode="summary_only", now=now, provider=s.provider,
+                        store=store, hebbian=hebbian, embeddings=embeddings,
+                    )
+                return {"session_id": new_sid}
+            except Exception:
+                logger.exception("sessions_active: stale rollover failed sid=%s", stale_sid)
+                return {"session_id": None}
+        return {"session_id": None}
 
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
@@ -1261,6 +1314,9 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
+        # Redirect: rebind to the RESOLVED sid so a post-rollover old sid reports
+        # the successor's in-flight state, not the gone old id (C20/C21).
+        session_id = sess.session_id
         in_flight = session_id in s.in_flight_locks and s.in_flight_locks[session_id].locked()
         return {
             "session_id": sess.session_id,
@@ -2139,7 +2195,7 @@ def build_app(
                 )
         return {"ok": True}
 
-    # ── POST /upload — multimodal image upload ────────────────────────────
+    # ── POST /upload — file upload (images + non-image files) ──────────────
     # Image upload limit (matches the spec D2 default; per-persona override
     # via PersonaConfig.image_max_bytes can come later if needed).
     _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
@@ -2149,55 +2205,73 @@ def build_app(
 
     @app.post("/upload", dependencies=[Depends(require_http_auth)])
     async def upload(file: UploadFile) -> dict[str, Any]:
-        """Accept a multipart-uploaded image, persist content-addressably.
+        """Accept a multipart-uploaded file, persist content-addressably.
 
-        Returns ``{sha, media_type, size_bytes}`` on success. Image lands at
-        ``<persona_dir>/images/<sha>.<ext>``. Identical content (same sha)
-        is deduped — second upload of the same bytes returns the same sha
-        without writing a duplicate file.
+        Widened for #43: both images and non-image files are accepted.
+
+        * An **image** (bytes sniff as PNG/JPEG/WebP/GIF) lands at
+          ``<persona_dir>/images/<sha>.<ext>`` via ``save_image_bytes`` and
+          returns ``{kind: "image", sha, media_type, size_bytes}``.
+        * Any **other** file lands at ``<persona_dir>/files/<sha>`` via
+          ``save_file_bytes`` (the on-disk name is the validated sha ONLY —
+          the client filename is never a path component, C17) and returns
+          ``{kind: "file", sha, filename, size_bytes}``.
+
+        Identical content (same sha) is deduped in either store. The engine
+        resolves the returned ref to an on-disk path and surfaces it to the
+        model, which reads it back via the read_file MCP tool.
 
         Errors:
-          * 415 — unsupported media_type (only PNG / JPEG / WebP / GIF)
-          * 413 — file exceeds the 20 MB cap
+          * 413 — file exceeds the size cap
+          * 422 — bytes sniff as one image type but the client declared a
+            *different* image type (integrity check on image uploads)
         """
+        from brain import file_store
         from brain.images import save_image_bytes, sniff_media_type
 
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
-        if declared_media_type not in _ALLOWED_UPLOAD_MEDIA_TYPES:
-            raise HTTPException(
-                status_code=415,
-                detail=f"unsupported media_type {declared_media_type!r}; "
-                f"must be one of {sorted(_ALLOWED_UPLOAD_MEDIA_TYPES)}",
-            )
-        # Read up to limit + 1 so we can detect overrun without buffering
-        # arbitrarily large payloads in memory.
-        raw = await file.read(_IMAGE_MAX_BYTES + 1)
-        if len(raw) > _IMAGE_MAX_BYTES:
+        # Read up to the larger of the two caps + 1 so overrun is detectable
+        # without buffering arbitrarily large payloads in memory.
+        max_bytes = max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes())
+        raw = await file.read(max_bytes + 1)
+        if len(raw) > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"file too large; max {_IMAGE_MAX_BYTES} bytes",
+                detail=f"file too large; max {max_bytes} bytes",
             )
         # Sniff the actual bytes — the multipart Content-Type header is
         # client-controlled and a renderer compromise could ship arbitrary
-        # bytes under an image MIME label. The disk's ground truth is
-        # what gets passed to the provider later, so this is the gate.
+        # bytes under a chosen MIME label. The disk's ground truth is what
+        # gets surfaced to the model later.
         sniffed = sniff_media_type(raw)
-        if sniffed is None:
-            raise HTTPException(
-                status_code=422,
-                detail="image bytes don't match any supported format",
-            )
-        if sniffed != declared_media_type:
-            raise HTTPException(
-                status_code=422,
-                detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
-            )
-        record = save_image_bytes(s.persona_dir, raw, sniffed)
+        if sniffed is not None:
+            # Image path (unchanged storage). Keep the sniff-vs-declared
+            # integrity check when the client declared an image type: a
+            # png-claimed-but-jpeg mismatch is still rejected.
+            if (
+                declared_media_type in _ALLOWED_UPLOAD_MEDIA_TYPES
+                and sniffed != declared_media_type
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
+                )
+            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            return {
+                "kind": "image",
+                "sha": record.sha,
+                "media_type": record.media_type,
+                "size_bytes": record.size_bytes,
+            }
+        # Non-image path (#43). The on-disk name is the content sha only; the
+        # client filename is returned as display metadata, never a path part.
+        frecord = file_store.save_file_bytes(s.persona_dir, raw)
         return {
-            "sha": record.sha,
-            "media_type": record.media_type,
-            "size_bytes": record.size_bytes,
+            "kind": "file",
+            "sha": frecord.sha,
+            "filename": file.filename,
+            "size_bytes": frecord.size_bytes,
         }
 
     # ── GET /images — past-image gallery listing ─────────────────────────
@@ -2365,12 +2439,16 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        # Redirect: use the RESOLVED sid for EVERY downstream op (lock key, backend
+        # call via sess, echoed id) so a post-rollover old sid transparently
+        # operates on the successor (C16/C19/C21). Never the raw req.session_id.
+        sid = sess.session_id
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         if lock.locked():
             raise HTTPException(status_code=429, detail="session has an in-flight turn")
         async with lock:
             t0 = datetime.now(UTC)
-            events.publish("chat_started", session_id=req.session_id, client=s.client_origin)
+            events.publish("chat_started", session_id=sid, client=s.client_origin)
             try:
                 result = await asyncio.to_thread(
                     _respond_blocking,
@@ -2378,10 +2456,10 @@ def build_app(
                     sess,
                     req.message,
                     s.provider,
-                    req.image_shas or None,
+                    [r.model_dump() for r in req.shared_files] or None,
                 )
             except Exception as exc:
-                logger.exception("chat failed session=%s", req.session_id)
+                logger.exception("chat failed session=%s", sid)
                 # Audit 2026-05-07 P3-2: keep detailed exception text in
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
@@ -2390,12 +2468,12 @@ def build_app(
             s.last_chat_at = datetime.now(UTC)
             events.publish(
                 "chat_done",
-                session_id=req.session_id,
+                session_id=sid,
                 turn=result.turn,
                 duration_ms=duration_ms,
             )
             return {
-                "session_id": req.session_id,
+                "session_id": sid,
                 "reply": result.content,
                 "turn": result.turn,
                 "tool_invocations": result.tool_invocations,
@@ -2426,6 +2504,10 @@ def build_app(
             await ws.send_json({"type": "error", "code": "session_not_found", "done": True})
             await ws.close()
             return
+        # Redirect: rebind the path id to the RESOLVED sid so every downstream op
+        # (lock key, echoed frames, events) uses the successor after a rollover
+        # (C16/C19/C21). The engine writes to sess's buffer either way.
+        session_id = sess.session_id
         lock = s.in_flight_locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
             await ws.send_json({"type": "error", "code": "session_busy", "done": True})
@@ -2469,23 +2551,22 @@ def build_app(
             await ws.close()
             return
 
-        # Optional image attachments — sha-strings as returned by /upload.
-        # Audit 2026-05-07 P4-1: same item-level constraints as the
-        # HTTP /chat ChatReq path — list of strings only, ≤ 8 entries,
-        # each entry must be 64 lowercase hex chars.
-        raw_shas = req.get("image_shas") or []
-        image_shas: list[str] | None = None
-        if isinstance(raw_shas, list) and raw_shas:
-            valid = (
-                len(raw_shas) <= 8
-                and all(isinstance(x, str) for x in raw_shas)
-                and all(_SHA256_HEX_RE.fullmatch(x) for x in raw_shas)
-            )
-            if not valid:
-                await ws.send_json({"type": "error", "code": "invalid_image_shas", "done": True})
+        # Optional file attachments (images + non-image files) — references as
+        # returned by /upload. Same item-level constraints as the HTTP /chat
+        # ChatReq path: ≤ 8 entries, each a {kind: "image"|"file", sha: 64hex,
+        # media_type?, filename?} dict. Parse into plain dicts for the engine.
+        raw_files = req.get("shared_files") or []
+        shared_files: list[dict] | None = None
+        if isinstance(raw_files, list) and raw_files:
+            try:
+                parsed = [SharedFileRef.model_validate(r).model_dump() for r in raw_files]
+            except Exception:  # noqa: BLE001 — any validation failure → reject
+                parsed = None
+            if parsed is None or len(parsed) > 8:
+                await ws.send_json({"type": "error", "code": "invalid_shared_files", "done": True})
                 await ws.close()
                 return
-            image_shas = list(raw_shas)
+            shared_files = parsed
 
         # Bundle A #4: optional ``reply_to_audit_id`` threads the link from a
         # banner-driven "↩ reply" through to the chat engine. If present, the
@@ -2541,7 +2622,7 @@ def build_app(
                         sess,
                         message,
                         streaming_provider,
-                        image_shas,
+                        shared_files,
                         reply_to_audit_id,
                     )
                 finally:
@@ -2696,29 +2777,33 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        # Redirect: operate on the RESOLVED successor sid, not the deleted old
+        # buffer — else close/snapshot silently no-op and falsely report success
+        # (F1). Never the raw req.session_id (C16/C19/C21).
+        sid = sess.session_id
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             try:
                 report = await asyncio.to_thread(
                     _snapshot_session_blocking,
                     s.persona_dir,
-                    req.session_id,
+                    sid,
                     s.provider,
                 )
             except Exception as exc:
-                logger.exception("snapshot_session failed session=%s", req.session_id)
+                logger.exception("snapshot_session failed session=%s", sid)
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "code": "snapshot_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "errors": 1,
                     },
                 ) from exc
         events.publish(
             "session_snapshot",
-            session_id=req.session_id,
+            session_id=sid,
             committed=report.committed,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
@@ -2726,7 +2811,7 @@ def build_app(
             errors=report.errors,
         )
         return {
-            "session_id": req.session_id,
+            "session_id": sid,
             "closed": False,
             "committed": report.committed,
             "deduped": report.deduped,
@@ -2753,6 +2838,11 @@ def build_app(
         sess = get_or_hydrate_session(s.persona_dir, s.persona, req.session_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
+        # Redirect: close/cleanup act on the RESOLVED successor sid, not the deleted
+        # old buffer — else the close no-ops on the old empty-guard and the
+        # successor's registry entry + lock leak forever (F1/G1). Never the raw
+        # req.session_id downstream (C16/C20/C21).
+        sid = sess.session_id
 
         # Audit 2026-05-07 P2-4: serialise close behind the same per-
         # session lock /chat and /stream use. Without this, a renderer
@@ -2762,7 +2852,7 @@ def build_app(
         # worker still thought the session was active. Acquiring the
         # lock here means close waits for any in-flight turn to
         # finish before running ingest.
-        lock = s.in_flight_locks.setdefault(req.session_id, asyncio.Lock())
+        lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             # H-A: per-call stores inside the worker thread, not shared singletons.
             # Wrap the pipeline call so internal exceptions don't crash the handler.
@@ -2770,14 +2860,14 @@ def build_app(
                 report = await asyncio.to_thread(
                     _close_session_blocking,
                     s.persona_dir,
-                    req.session_id,
+                    sid,
                     s.provider,
                 )
             except Exception as exc:
-                logger.exception("close_session failed session=%s", req.session_id)
+                logger.exception("close_session failed session=%s", sid)
                 events.publish(
                     "session_close_failed",
-                    session_id=req.session_id,
+                    session_id=sid,
                     committed=0,
                     deduped=0,
                     soul_candidates=0,
@@ -2792,7 +2882,7 @@ def build_app(
                     status_code=502,
                     detail={
                         "code": "ingest_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "committed": 0,
                         "deduped": 0,
@@ -2805,7 +2895,7 @@ def build_app(
             if report.errors > 0:
                 events.publish(
                     "session_close_failed",
-                    session_id=req.session_id,
+                    session_id=sid,
                     committed=report.committed,
                     deduped=report.deduped,
                     soul_candidates=report.soul_candidates,
@@ -2821,7 +2911,7 @@ def build_app(
                     status_code=502,
                     detail={
                         "code": "ingest_failed",
-                        "session_id": req.session_id,
+                        "session_id": sid,
                         "closed": False,
                         "committed": report.committed,
                         "deduped": report.deduped,
@@ -2832,12 +2922,12 @@ def build_app(
                 )
 
             # H2: clean up registry + lock so sessions_active stays accurate.
-            remove_session(req.session_id)
-        s.in_flight_locks.pop(req.session_id, None)
+            remove_session(sid)
+        s.in_flight_locks.pop(sid, None)
 
         events.publish(
             "session_closed",
-            session_id=req.session_id,
+            session_id=sid,
             committed=report.committed,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
@@ -2845,7 +2935,7 @@ def build_app(
             errors=report.errors,
         )
         return {
-            "session_id": req.session_id,
+            "session_id": sid,
             "closed": True,
             "committed": report.committed,
             "deduped": report.deduped,

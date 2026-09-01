@@ -18,7 +18,7 @@ vi.mock("../bridge", () => ({
   fetchChatHistory: vi.fn(async () => ({ messages: [], next_before_turn: null })),
   closeSession: vi.fn(async () => undefined),
   snapshotSession: vi.fn(async () => ({ closed: false, errors: 0 })),
-  uploadImage: vi.fn(async () => ({ sha: "deadbeef" })),
+  uploadImage: vi.fn(async () => ({ kind: "image", sha: "deadbeef", media_type: "image/png", size_bytes: 3 })),
   getBridgeCredentials: vi.fn(async () => ({
     url: "http://127.0.0.1:50000",
     port: 50000,
@@ -99,7 +99,7 @@ describe("ChatPanel — image-only + cancel + placeholder (P4-2)", () => {
   it("paperclip + emoji buttons render and are not disabled at idle", () => {
     render(<ChatPanel persona="nell" />);
     expect(
-      screen.getByRole("button", { name: /attach image/i }),
+      screen.getByRole("button", { name: /send file/i }),
     ).toBeEnabled();
     expect(
       screen.getByRole("button", { name: /insert emoji/i }),
@@ -802,7 +802,7 @@ describe("ChatPanel — snapshot on unmount (Task 6)", () => {
 
     const { unmount } = render(<ChatPanel persona="nell" />);
     fireEvent.change(screen.getByPlaceholderText(/write to/i), { target: { value: "hi" } });
-    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await waitFor(() => expect(mockedNew).toHaveBeenCalled());
 
     unmount();
@@ -985,5 +985,55 @@ describe("ChatPanel — reach-out card reply merges into transcript (Task 2)", (
     // 6. Main composer textarea is still empty (untouched).
     const mainTextarea = screen.getByPlaceholderText(/^Write to Nell/i) as HTMLTextAreaElement;
     expect(mainTextarea.value).toBe("");
+  });
+});
+
+// ── P0 image-tool-route — send-file wire shape (C8a) + relabel/types (C8b) ──
+describe("ChatPanel — shared-file send path (P0 image-tool-route)", () => {
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+  });
+
+  afterEach(() => cleanup());
+
+  it("C8a — a staged upload is sent as a sharedFiles ref, not an image_shas payload", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["fake-bytes"], "shot.png", { type: "image/png" });
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } });
+    });
+    // Wait for upload to resolve (staged → ready) so the send button enables.
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await waitFor(() => expect(sendBtn).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalled());
+    // streamChat signature: (persona, sessionId, message, handlers, options?)
+    const args = mockedStreamChat.mock.calls[0] as [
+      string,
+      string,
+      string,
+      unknown,
+      { sharedFiles?: Array<{ kind: string; sha: string }>; imageShas?: unknown } | undefined,
+    ];
+    const opts = args[4];
+    expect(opts?.sharedFiles).toBeTruthy();
+    expect(opts?.sharedFiles?.[0]).toMatchObject({ kind: "image", sha: "deadbeef" });
+    // The old transport payload must NOT be set.
+    expect(opts?.imageShas).toBeUndefined();
+  });
+
+  it("C8b — the attach control is labelled 'send file' and accepts a non-image type", () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    expect(screen.getByRole("button", { name: /send file/i })).toBeInTheDocument();
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const accept = fileInput.getAttribute("accept") ?? "";
+    // At least one non-image type must be accepted (backed by the widened /upload).
+    expect(accept).toMatch(/text\/plain|application\/pdf|\.txt|\.md/);
   });
 });

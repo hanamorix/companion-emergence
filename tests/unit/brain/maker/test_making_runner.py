@@ -5,6 +5,22 @@ from brain.memory.store import MemoryStore
 from brain.works.store import WorksStore
 
 
+def _promote_pending(persona_dir):
+    """Drain the consolidation gate with a promote-all classifier.
+
+    `making` is a GATED type (Root-2 stopgap): make_and_wire enqueues the act-memory; it
+    reaches memories.db only after a consolidation drain."""
+    from brain.engines.consolidation import Decision, run_consolidation
+
+    s = MemoryStore(persona_dir / "memories.db")
+    try:
+        run_consolidation(
+            s, persona_dir=persona_dir, classifier=lambda _c, _ctx: Decision("new")
+        )
+    finally:
+        s.close()
+
+
 class _FakeProvider:
     def complete(self, prompt):  # match maker.make()'s call
         return json.dumps({"type": "vignette", "title": "Dusk", "content": "Light fell slow.",
@@ -30,11 +46,16 @@ def test_make_and_wire_writes_act_memory_with_emotion_for_nondiscard(tmp_path):
     from brain.maker.charge import MakerCharge, save_charge
     save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
     make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
-    mems = store.list_by_type("making", limit=10)
+    # making is GATED: the act-memory enqueues, promoted on drain.
+    assert not store.list_by_type("making", limit=10)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # the emotion delta was applied W8-style: seeded onto the act-memory
     assert mems[0].emotions
-    store.close()
+    store2.close()
 
 
 class _DiscardProvider:
@@ -48,8 +69,13 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     from brain.maker.charge import MakerCharge, save_charge
     save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
     make_and_wire(persona_dir=tmp_path, store=store, provider=_DiscardProvider(), now=None)
-    mems = store.list_by_type("making", limit=10)
+    # making is GATED: the act-memory enqueues, promoted on drain.
+    assert not store.list_by_type("making", limit=10)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # discard moves nothing — empty-emotion act-memory only
     assert not mems[0].emotions
-    store.close()
+    store2.close()

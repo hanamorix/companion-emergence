@@ -23,23 +23,25 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from brain.bridge.chat import ChatMessage, ContentBlock, ImageBlock, TextBlock
+from brain.bridge.chat import ChatMessage
 from brain.bridge.provider import LLMProvider
 from brain.chat import say_vs_do
 from brain.chat.budget import apply_budget
 from brain.chat.prompt import (
     build_static_system_message,
-    build_system_message,
     build_volatile_context,
 )
 from brain.chat.salience import assess_salience
-from brain.chat.session import SessionState, create_session
+from brain.chat.session import (
+    SessionState,
+    create_session,
+    persist_turns_following_successor,
+)
 from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
-from brain.images import media_type_for_sha
-from brain.ingest.buffer import ingest_turn, read_session
+from brain.ingest.buffer import read_session
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -111,7 +113,7 @@ def respond(
     provider: LLMProvider,
     session: SessionState | None = None,
     voice_md_override: str | None = None,
-    image_shas: list[str] | None = None,
+    shared_files: list[dict] | None = None,
     reply_to_audit_id: str | None = None,
 ) -> ChatResult:
     """One chat turn end-to-end.
@@ -145,6 +147,13 @@ def respond(
     voice_md_override:
         If set, use this string instead of loading voice.md from disk.
         Useful for tests that don't want to write files.
+    shared_files:
+        Optional list of file references the user attached this turn, each a
+        dict ``{kind: "image"|"file", sha: <64hex>, media_type?, filename?}``.
+        Each is resolved to its on-disk path and surfaced to the model as a
+        ``[the user shared a file: <path>]`` line appended to the OUTGOING user
+        message (NOT fed into salience/volatile), and read_file is force-
+        recruited so she can read/see it. Replaces the deleted image transport.
     reply_to_audit_id:
         If this turn is an explicit reply to an outbound initiate, the
         audit row id. Surfaced to build_system_message so the system
@@ -190,46 +199,44 @@ def respond(
     try:
         # 5. System message — prompt-caching split (Options A / A+).
         #
-        # Text/stream turns: freeze the system prompt to just the static head
-        # (preamble + voice.md + epistemic) so the system+tools cache unit is
-        # byte-stable cross-call, and carry the per-turn volatile context as a
-        # stdin suffix appended after history + the new user turn (see
-        # provider._format_claude_print_prompt + run_tool_loop chat_options).
+        # Single assembly path (the image transport is gone): freeze the system
+        # prompt to just the static head (preamble + voice.md + epistemic) so
+        # the system+tools cache unit is byte-stable cross-call, and carry the
+        # per-turn volatile context as a stdin suffix appended after history +
+        # the new user turn (see provider._format_claude_print_prompt +
+        # run_tool_loop chat_options). A file-send turn takes THIS same path, so
+        # its volatile_suffix is always built — that is the volatile-drop fix
+        # (there is no longer a transport that bypasses the suffix; C5).
         #
-        # Image turns: keep the pre-change single-system-message shape. The
-        # image path (_chat_with_images) folds prior history into the
-        # --system-prompt-file and sends only the final user turn via
-        # stream-json; it has no stdin tail to carry a suffix, so all volatile
-        # context must stay in the system message. Using the unchanged
-        # build_system_message() here keeps that rare path byte-equivalent to
-        # pre-change (criterion C5).
-        if image_shas:
-            system_msg = build_system_message(
-                persona_dir,
-                voice_md=voice_md,
-                daemon_state=daemon_state,
-                soul_store=soul_store,
-                store=store,
-                user_input=user_input,
-                reply_to_audit_id=reply_to_audit_id,
-            )
-            volatile_suffix: str | None = None
-        else:
-            system_msg = build_static_system_message(persona_dir, voice_md=voice_md)
-            volatile_suffix = build_volatile_context(
-                persona_dir,
-                voice_md=voice_md,
-                daemon_state=daemon_state,
-                soul_store=soul_store,
-                store=store,
-                user_input=user_input,
-                reply_to_audit_id=reply_to_audit_id,
-            )
+        # Salience/volatile are computed on the RAW user_input, never on the
+        # surfaced file path line (that lands only on the outgoing user message
+        # below), so a file-send turn's volatile content is equivalent to the
+        # same text without a file (C14).
+        system_msg = build_static_system_message(persona_dir, voice_md=voice_md)
+        volatile_suffix: str | None = build_volatile_context(
+            persona_dir,
+            voice_md=voice_md,
+            daemon_state=daemon_state,
+            soul_store=soul_store,
+            store=store,
+            user_input=user_input,
+            reply_to_audit_id=reply_to_audit_id,
+        )
     finally:
         soul_store.close()
 
     # 6. Messages list — buffer-driven, with budget guard.
-    user_msg = _build_user_message(persona_dir, user_input, image_shas)
+    #
+    # Resolve any shared files to on-disk paths and append a marked line per
+    # file to the OUTGOING user text only. The path line is NOT fed into
+    # salience/volatile (computed above on raw user_input) — C14.
+    file_lines = _resolve_shared_file_lines(persona_dir, shared_files)
+    if file_lines:
+        file_block = "\n".join(file_lines)
+        outgoing_user_text = f"{user_input}\n{file_block}" if user_input else file_block
+    else:
+        outgoing_user_text = user_input
+    user_msg = ChatMessage(role="user", content=outgoing_user_text)
     try:
         prior_turns = read_session(persona_dir, session.session_id)
         # Note: on call N+1, _persist_turn has already written turn N to
@@ -269,7 +276,11 @@ def respond(
     )
     try:
         signal = assess_salience(user_input, prior_user_text=prior_user_text, persona_dir=persona_dir)
-        allowed = select_tools(signal, gap_open=_self_model_gap_open(persona_dir))
+        allowed = select_tools(
+            signal,
+            force_files=bool(shared_files),
+            gap_open=_self_model_gap_open(persona_dir),
+        )
     except Exception:  # noqa: BLE001 — never let recruitment crash a turn; fall back to full suite
         logger.warning("salience/recruitment failed; using full tool suite", exc_info=True)
         signal = None
@@ -303,15 +314,28 @@ def respond(
     )
     content = response.content or ""
 
-    # 8. Persist turn (best-effort, but surfaced in metadata)
+    # 8. Persist turn (best-effort, but surfaced in metadata). The outgoing
+    # user text (with any shared-file path line) is persisted as PLAIN TEXT —
+    # the buffer needs no image_shas now that the transport is gone, and replay
+    # simply re-sends the path line as ordinary text.
+    #
+    # If read_file opened any viewable image this turn, each carries a
+    # content-addressed rel_path on its invocation record (stored_image_path).
+    # Persist those into the buffer as distinct "image" records so a normal
+    # memory can bind to the image by content hash. Deduped, first-seen order.
+    image_rel_paths: list[str] = []
+    for inv in invocations:
+        rel = inv.get("stored_image_path") if isinstance(inv, dict) else None
+        if rel and rel not in image_rel_paths:
+            image_rel_paths.append(rel)
     persistence_ok, persistence_error = _persist_turn(
         persona_dir=persona_dir,
         session_id=session.session_id,
-        user_text=user_input,
+        user_text=outgoing_user_text,
         assistant_text=content,
-        image_shas=image_shas,
+        image_rel_paths=image_rel_paths,
     )
-    session.append_turn(user_input, content)
+    session.append_turn(outgoing_user_text, content)
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -345,48 +369,63 @@ def respond(
     )
 
 
-def _build_user_message(
+def _resolve_shared_file_lines(
     persona_dir: Path,
-    user_input: str,
-    image_shas: list[str] | None,
-) -> ChatMessage:
-    """Compose the per-turn user ChatMessage.
+    shared_files: list[dict] | None,
+) -> list[str]:
+    """Resolve each shared-file reference to its on-disk path and render a
+    marked line the model can act on.
 
-    Text-only turns produce the legacy str-content shape. Image-bearing
-    turns produce a tuple of TextBlock + ImageBlocks; ImageBlock
-    media_type is sniffed from disk via brain.images.media_type_for_sha.
-    Missing or malformed images are logged and skipped — the chat must
-    not break because an attachment vanished between upload and send.
+    Each ref is ``{kind: "image"|"file", sha: <64hex>, media_type?, filename?}``.
+    Images resolve via ``brain.images.image_path`` (needs the media_type — if
+    absent, it is looked up from disk); non-image files via
+    ``brain.files.file_path``. Both resolve under ``<persona_dir>`` only (sha
+    is validated), so a crafted filename cannot escape (the filename is display
+    metadata only, C17). A missing/malformed reference is logged and skipped so
+    an attachment that vanished between upload and send can't break the turn.
     """
-    if not image_shas:
-        return ChatMessage(role="user", content=user_input)
+    if not shared_files:
+        return []
 
-    from brain.images import media_type_for_sha
+    from brain import file_store
+    from brain.images import image_path, media_type_for_sha
 
-    blocks: list[ContentBlock] = []
-    if user_input:
-        blocks.append(TextBlock(text=user_input))
-    for sha in image_shas:
+    lines: list[str] = []
+    for ref in shared_files:
+        if not isinstance(ref, dict):
+            logger.warning("skipping non-dict shared-file ref: %r", ref)
+            continue
+        kind = ref.get("kind")
+        sha = ref.get("sha")
+        filename = ref.get("filename")
+        media_type = ref.get("media_type")
         try:
-            media_type = media_type_for_sha(persona_dir, sha)
-            blocks.append(ImageBlock(image_sha=sha, media_type=media_type))
-        except (FileNotFoundError, ValueError) as exc:
-            # Don't let a missing or malformed sha break the turn — log
-            # and skip. The user's text portion still goes through.
-            logger.warning("skipping image_sha=%s: %s", sha[:8] if len(sha) >= 8 else sha, exc)
-    if not blocks:
-        # Defensive: every block dropped (unlikely). Fall back to text.
-        return ChatMessage(role="user", content=user_input or "")
-    return ChatMessage(role="user", content=tuple(blocks))
+            if kind == "image":
+                if not media_type:
+                    media_type = media_type_for_sha(persona_dir, sha)
+                path = image_path(persona_dir, sha, media_type)
+            elif kind == "file":
+                path = file_store.file_path(persona_dir, sha)
+            else:
+                logger.warning("skipping shared file with unknown kind=%r", kind)
+                continue
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            short = sha[:8] if isinstance(sha, str) and len(sha) >= 8 else sha
+            logger.warning("skipping shared file sha=%s: %s", short, exc)
+            continue
+        if filename:
+            lines.append(f'[the user shared a file "{filename}": {path}]')
+        else:
+            lines.append(f"[the user shared a file: {path}]")
+    return lines
 
 
 def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[ChatMessage]:
     """Reconstruct ChatMessage list from buffer JSONL records.
 
-    Image-bearing user turns rebuild a (TextBlock, *ImageBlock) content
-    tuple identical to what _build_user_message produces for live turns.
-    Missing or unreadable images are skipped with a warning, matching
-    _build_user_message's defensive behaviour.
+    All turns replay as plain text now that the image transport is gone — a
+    file-send turn persisted its surfaced path line into the user text, so
+    replay needs no image handling.
     """
     out: list[ChatMessage] = []
     summary_text: str | None = None
@@ -409,27 +448,6 @@ def _buffer_turns_to_messages(persona_dir: Path, turns: list[dict]) -> list[Chat
             continue  # skip unknown speakers defensively
 
         ts = t.get("ts") or None
-        image_shas = t.get("image_shas") or []
-        if role == "user" and image_shas:
-            blocks: list[ContentBlock] = []
-            if text:
-                blocks.append(TextBlock(text=text))
-            for sha in image_shas:
-                try:
-                    media_type = media_type_for_sha(persona_dir, sha)
-                    blocks.append(ImageBlock(image_sha=sha, media_type=media_type))
-                except (FileNotFoundError, ValueError) as exc:
-                    logger.warning(
-                        "buffer replay: skipping image_sha=%s: %s",
-                        sha[:8] if len(sha) >= 8 else sha,
-                        exc,
-                    )
-            if blocks:
-                out.append(ChatMessage(role=role, content=tuple(blocks), ts=ts))
-            elif text:
-                out.append(ChatMessage(role=role, content=text, ts=ts))
-            continue
-
         out.append(ChatMessage(role=role, content=text, ts=ts))
 
     if summary_text:
@@ -444,13 +462,27 @@ def _persist_turn(
     session_id: str,
     user_text: str,
     assistant_text: str,
-    image_shas: list[str] | None = None,
+    image_rel_paths: list[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
     Mirrors OG _persist_turn (nell_bridge.py:200-230): failures here must
     never break the chat response. The ingest pipeline will pick up the
     buffer on session close (via nell chat REPL exit or supervisor sweep).
+
+    A file-send turn's surfaced path line is already part of ``user_text``
+    (plain text) — no image_shas metadata is written now that the transport
+    is gone.
+
+    ``image_rel_paths``: content-addressed rel_paths (``images/<sha>.<ext>``)
+    for any image read via read_file this turn. Each is written as a distinct
+    ``speaker="image"`` record, in chronological order between the user and
+    assistant records. A distinct speaker keeps the annotation OUT of the
+    model-replayed prompt (_buffer_turns_to_messages skips unknown speakers)
+    and out of the compaction summary (compaction._render_transcript skips
+    "image"), while memory formation (extract.py) still reads it — so a normal
+    memory can bind to the image by content hash. The line text carries no
+    em-dash / LLM-tell (persona-surface string rule).
     """
     try:
         user_record: dict = {
@@ -458,12 +490,32 @@ def _persist_turn(
             "speaker": "user",
             "text": user_text,
         }
-        if image_shas:
-            user_record["image_shas"] = list(image_shas)
-        ingest_turn(persona_dir, user_record)
-        ingest_turn(
-            persona_dir,
-            {"session_id": session_id, "speaker": "assistant", "text": assistant_text},
+        image_records: list[dict] = [
+            {
+                "session_id": session_id,
+                "speaker": "image",
+                "text": f"[image opened, stored at {rel_path}]",
+            }
+            for rel_path in image_rel_paths or []
+        ]
+        assistant_record: dict = {
+            "session_id": session_id,
+            "speaker": "assistant",
+            "text": assistant_text,
+        }
+        # Persist the pair under the registry lock, redirecting to the rolled-over
+        # successor if this session was rolled over while the turn was in flight.
+        # This closes the resolve-persist race (stage-6 r4): the rollover's
+        # destructive section holds the same lock across its seed re-read → pointer
+        # write, so this append can never resurrect a just-deleted old buffer — it
+        # is either captured into the successor seed or redirected to the live
+        # successor. See brain.chat.session.persist_turns_following_successor.
+        #
+        # The image records ride in the SAME call so a rollover cannot split a
+        # turn across two buffers, landing the user line in the successor and
+        # its image lines in the corpse (or vice versa).
+        persist_turns_following_successor(
+            persona_dir, [user_record, *image_records, assistant_record]
         )
         return True, None
     except Exception as exc:  # noqa: BLE001

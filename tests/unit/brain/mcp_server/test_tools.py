@@ -183,6 +183,67 @@ def test_register_tools_logs_refused_outcome_for_guard_denial(
     assert rec["error"]  # non-null/non-empty — the record must not drop it
 
 
+def test_register_tools_emits_image_content_for_image_result(persona_dir: Path, fake_stores) -> None:
+    """P0 image-tool-route: a dispatch result carrying an ``image`` key is
+    emitted as an MCP ImageContent block (base64 + mimeType), NOT TextContent —
+    this is what lets the model SEE the shared image. The audit summary records
+    a compact ``image/<mt> <N>B`` line, never the base64 (C15)."""
+    from mcp.server import Server
+    from mcp.types import ImageContent
+
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+
+    b64 = "aGVsbG8="  # "hello"
+    img_result = {"path": "/p/x.png", "image": {"media_type": "image/png", "data_b64": b64, "size_bytes": 5}}
+    with patch("brain.mcp_server.tools.dispatch", return_value=img_result):
+        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        call_handler = _get_call_handler(server)
+        result = asyncio.run(call_handler(_call_request("read_file", {"path": "/p/x.png"})))
+
+    block = result.root.content[0]
+    assert isinstance(block, ImageContent)
+    assert block.data == b64
+    assert block.mimeType == "image/png"
+    # C15 — the audit summary is a compact image line, never the base64 payload.
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["name"] == "read_file"
+    assert b64 not in rec["result_summary"]
+    assert "image/png" in rec["result_summary"] and "5B" in rec["result_summary"]
+
+
+def test_register_tools_audits_stored_image_path_not_base64(persona_dir: Path, fake_stores) -> None:
+    """image-path-persist C3/C10 — when a read_file image result carries a
+    ``stored_image`` handle, the MCP audit record surfaces its content-addressed
+    ``stored_image_path`` (a hash, for durable-buffer binding) and NEVER the
+    base64 image bytes."""
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+
+    b64 = "aGVsbG8="  # "hello"
+    rel = "images/" + ("a" * 64) + ".png"
+    img_result = {
+        "path": "/p/x.png",
+        "image": {"media_type": "image/png", "data_b64": b64, "size_bytes": 5},
+        "stored_image": {"sha": "a" * 64, "media_type": "image/png", "rel_path": rel},
+    }
+    with patch("brain.mcp_server.tools.dispatch", return_value=img_result):
+        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        call_handler = _get_call_handler(server)
+        asyncio.run(call_handler(_call_request("read_file", {"path": "/p/x.png"})))
+
+    line = (persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8")
+    rec = json.loads(line)
+    assert rec["stored_image_path"] == rel
+    assert b64 not in line  # no base64 anywhere in the audit record
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 

@@ -459,7 +459,12 @@ class ReflexEngine:
                 "provider": self.provider.name(),
             },
         )
-        self.store.create(mem)
+        from brain.memory.pending import route_write
+
+        # route_write self-classifies by memory_type: a journal_entry arc output
+        # bypasses the gate (deliberate type → direct to memories.db); other arc
+        # output types are gated (enqueued).
+        route_write(self.store, mem, source="reflex")
 
         # Spec §3.4: when reflex fires a journal-shaped arc, emit
         # journal_entry_added to behavioral_log so the brain sees the trajectory.

@@ -10,10 +10,18 @@ import pytest
 
 from brain.bridge.provider import FakeProvider
 from brain.engines._interests import InterestSet
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.research import RESEARCH_SCHEMA_VERSION, ResearchEngine
 from brain.engines.research_notes import read_notes_tail
+from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import NoopWebSearcher
+
+# memory-consolidation migration: the "research" memory_type is GATED, so the
+# engine's route_write enqueues a candidate instead of writing to memories.db.
+# Tests that assert the end-state DB memory promote the queue with a promote-all
+# classifier (candidate id preserved), keeping their store.get() assertions.
+_PROMOTE_ALL = lambda _c, _ctx: Decision("new")  # noqa: E731
 
 DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "default_interests.json"
 
@@ -219,7 +227,7 @@ def test_run_tick_dry_run_reports_would_fire(tmp_path: Path):
 
 def test_run_tick_fire_writes_research_memory(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         # Scripted: select call chooses i1, session call returns a real MEMORY
         # section so a memory actually gets created (the old flow persisted
@@ -234,6 +242,7 @@ def test_run_tick_fire_writes_research_memory(tmp_path: Path):
         engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(days_since_human_override=5.0)
         assert result.fired is not None
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
         mem = store.get(result.fired.output_memory_id)
         assert mem is not None
         assert mem.memory_type == "research"
@@ -250,7 +259,7 @@ def test_run_tick_fire_stamps_research_schema_version(tmp_path: Path):
     Requested by ThinkerOfThoughts for the issue #66 memory-system work.
     """
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -262,6 +271,7 @@ def test_run_tick_fire_stamps_research_schema_version(tmp_path: Path):
         engine = _build_engine(tmp_path, store, provider=provider)
         result = engine.run_tick(days_since_human_override=5.0)
         assert result.fired is not None
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
         mem = store.get(result.fired.output_memory_id)
         assert mem is not None
         assert mem.metadata["schema_version"] == RESEARCH_SCHEMA_VERSION
@@ -420,7 +430,7 @@ def test_select_declines_ends_tick_without_cooldown(tmp_path: Path):
 
 def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -432,6 +442,7 @@ def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
         res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
         assert res.fired is not None
         assert "found X" in read_notes_tail(engine.interests_path.parent, res.fired.interest_id)
+        run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
         mem = store.get(res.fired.output_memory_id)
         assert mem.content == "I liked it."
         saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
@@ -446,15 +457,19 @@ def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
     """§5.3 fail-soft: store.create raising (SQLite lock, disk full, ...) must not
     abort the tick. Cooldown still burns (last_researched_at updates) so the same
     interest doesn't re-fire + duplicate on the next cadence tick, and the fire
-    correctly records no memory was persisted."""
-    import logging
+    correctly records no memory was persisted.
 
-    class RaisingStore(MemoryStore):
-        def create(self, memory):
-            raise RuntimeError("simulated disk full")
+    Migration note: "research" is a gated type, so the write goes through
+    route_write → PendingQueue.enqueue, not store.create. The failure is injected
+    at enqueue (the real write point); the rest of the tick is unchanged."""
+    import logging
+    from unittest.mock import patch
+
+    def _raise_enqueue(self, mem, *, source):
+        raise RuntimeError("simulated disk full")
 
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = RaisingStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -465,7 +480,8 @@ def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
         engine = _build_engine(tmp_path, store, provider=provider)
         caplog.set_level(logging.WARNING)
 
-        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        with patch.object(PendingQueue, "enqueue", _raise_enqueue):
+            res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
 
         # (a) exception did not propagate out of run_tick
         assert res.fired is not None
