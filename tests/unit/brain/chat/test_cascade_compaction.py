@@ -453,8 +453,15 @@ def test_c13_interior_not_starved(tmp_path: Path) -> None:
     store2.close()
 
     # H6: nulling the trace store yields an empty block — proves the oracle
-    # actually discriminates "has content" from "starved".
-    empty_store = MemoryStore(tmp_path / "memories_empty.db")
+    # actually discriminates "has content" from "starved". Interior-continuity
+    # reads the pending queue scoped by persona_dir (= db_path.parent), so
+    # empty_store needs a DISTINCT persona_dir from `store` above — sharing
+    # tmp_path would have both stores read the SAME pending queue and the
+    # discriminator would spuriously see MARKERC13. MemoryStore.__init__ does
+    # not create the dir, so it must be mkdir'd first.
+    empty_dir = tmp_path / "empty_persona"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    empty_store = MemoryStore(empty_dir / "memories_empty.db")
     assert build_interior_continuity_block(empty_store) == ""
     empty_store.close()
 
