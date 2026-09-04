@@ -154,6 +154,9 @@ hooks/leak-rules.local
 # leak-guard's own wording in hooks/denied-paths.txt ("no new files here on
 # public"). The existing tree is frozen, not private. See #163.
 docs/guarded-change/
+# Retired private trees (leak-guard denied-paths.txt) — never stage on public (#163).
+docs/superpowers/
+docs/audits/
 CLAUDE.local.md
 CLAUDE.local.history.md
 
