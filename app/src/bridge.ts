@@ -340,6 +340,7 @@ export interface CloseSessionResponse {
   session_id: string;
   closed: boolean;
   committed: number;
+  enqueued: number;
   deduped: number;
   soul_candidates: number;
   soul_queue_errors: number;

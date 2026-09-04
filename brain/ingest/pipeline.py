@@ -44,6 +44,7 @@ from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
 from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,21 @@ def close_session(
                 embeddings.evict(item.text)
             continue
 
-        report.committed += 1
+        # #167: route_write() (called inside commit_item) returns a non-None id
+        # from BOTH its durable (store.create) and queue-only (PendingQueue.enqueue)
+        # branches, so mem_id alone can't tell them apart. Re-derive the same
+        # classification route_write itself used: it branches on
+        # mem.memory_type in GATE_BYPASS_TYPES, and commit_item always sets
+        # memory_type=item.label, so item.label in GATE_BYPASS_TYPES is the
+        # identical predicate. Real conversation-extraction labels are always
+        # in VALID_LABELS, which is disjoint from GATE_BYPASS_TYPES, so this
+        # branch is a correctness/consistency guarantee rather than something
+        # conversation-ingest can trigger today — see IngestReport.committed's
+        # docstring.
+        if item.label in GATE_BYPASS_TYPES:
+            report.committed += 1
+        else:
+            report.enqueued += 1
         report.memory_ids.append(mem_id)
 
         # Back-fill the committed memory's vector into the dedupe cache so that
@@ -240,12 +255,13 @@ def close_session(
 
     # ── LOG ──────────────────────────────────────────────────────────────────
     logger.info(
-        "conversation_ingested session=%s turns=%d extracted=%d committed=%d "
+        "conversation_ingested session=%s turns=%d extracted=%d committed=%d enqueued=%d "
         "deduped=%d soul_candidates=%d soul_queue_errors=%d errors=%d",
         session_id,
         len(turns),
         report.extracted,
         report.committed,
+        report.enqueued,
         report.deduped,
         report.soul_candidates,
         report.soul_queue_errors,
@@ -396,7 +412,11 @@ def extract_session_snapshot(
             if embeddings is not None:
                 embeddings.evict(item.text)
             continue
-        report.committed += 1
+        # #167: see the identical comment in close_session above.
+        if item.label in GATE_BYPASS_TYPES:
+            report.committed += 1
+        else:
+            report.enqueued += 1
         report.memory_ids.append(mem_id)
 
         # Back-fill the committed memory's vector into the dedupe cache so that
@@ -459,12 +479,13 @@ def extract_session_snapshot(
             )
 
     logger.info(
-        "conversation_snapshot session=%s turns=%d extracted=%d committed=%d "
+        "conversation_snapshot session=%s turns=%d extracted=%d committed=%d enqueued=%d "
         "deduped=%d soul_candidates=%d cursor=%s",
         session_id,
         len(turns),
         report.extracted,
         report.committed,
+        report.enqueued,
         report.deduped,
         report.soul_candidates,
         last_ts,
@@ -606,10 +627,11 @@ def finalize_stale_sessions(
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "
-            "committed=%d deduped=%d errors=%d",
+            "committed=%d enqueued=%d deduped=%d errors=%d",
             sid,
             age / 60.0,
             report.committed,
+            report.enqueued,
             report.deduped,
             report.errors,
         )

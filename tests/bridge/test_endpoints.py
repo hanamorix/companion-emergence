@@ -169,7 +169,7 @@ def test_session_new_rejects_unknown_client_label(persona_dir: Path):
 
 
 def test_sessions_close_returns_ingest_report(persona_dir: Path, monkeypatch):
-    """Close after a chat: should return committed/deduped/etc counts."""
+    """Close after a chat: should return committed/enqueued/deduped/etc counts."""
     _patch_fake_provider(monkeypatch, reply="goodbye")
     with _make_client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
@@ -179,9 +179,31 @@ def test_sessions_close_returns_ingest_report(persona_dir: Path, monkeypatch):
         body = r.json()
         assert body["session_id"] == sid
         assert "committed" in body
+        assert "enqueued" in body
         assert "deduped" in body
         assert "soul_queue_errors" in body
         assert "errors" in body
+
+
+def test_sessions_close_gated_extraction_reports_enqueued_not_committed(
+    persona_dir: Path, monkeypatch
+):
+    """#167 C5 (dynamic-success): a real gated-label extraction closes with
+    committed=0 / enqueued=1 in the HTTP response body, not the old (wrong)
+    committed=1 / enqueued=0."""
+    _patch_fake_provider(
+        monkeypatch,
+        reply="goodbye",
+        extraction='[{"text": "a gated fact from chat", "label": "fact", "importance": 5}]',
+    )
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        c.post("/chat", json={"session_id": sid, "message": "remember this"})
+        r = c.post("/sessions/close", json={"session_id": sid})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["committed"] == 0
+        assert body["enqueued"] == 1
 
 
 def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, monkeypatch):
@@ -196,6 +218,10 @@ def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, mo
         report = IngestReport(session_id=args[1])
         if calls == 1:
             report.errors = 1
+            # #167 C5 (dynamic-error): a distinct, non-zero value chosen so a
+            # copy-paste/typo bug referencing the wrong field on this branch
+            # would be caught, not just "some number appeared".
+            report.enqueued = 3
         return report
 
     monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
@@ -207,6 +233,7 @@ def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, mo
         detail = first.json()["detail"]
         assert detail["closed"] is False
         assert detail["errors"] == 1
+        assert detail["enqueued"] == 3
 
         # The same session id is still known and can be retried.
         assert c.get(f"/state/{sid}").status_code == 200
@@ -233,7 +260,12 @@ def test_sessions_close_exception_stays_retryable(persona_dir: Path, monkeypatch
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         first = c.post("/sessions/close", json={"session_id": sid})
         assert first.status_code == 502
-        assert first.json()["detail"]["closed"] is False
+        detail = first.json()["detail"]
+        assert detail["closed"] is False
+        # #167: the outer exception handler runs before any IngestReport exists,
+        # so both counters are the constant 0 — never mistaken for "0 gated items".
+        assert detail["committed"] == 0
+        assert detail["enqueued"] == 0
 
         second = c.post("/sessions/close", json={"session_id": sid})
         assert second.status_code == 200
