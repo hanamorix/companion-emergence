@@ -47,7 +47,8 @@ def crystallize_vocabulary(
             continue
         first, second = cluster.display_order
         name = f"{first}_{second}_blend"
-        if name in current_names:
+        # #174: the reversed spelling names the same configuration.
+        if name in current_names or f"{second}_{first}_blend" in current_names:
             continue
         evidence = tuple(mem.id for mem in sorted(cluster.memories, key=lambda m: m.created_at))[
             :_MAX_EVIDENCE_MEMORIES
