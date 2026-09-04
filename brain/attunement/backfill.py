@@ -343,6 +343,11 @@ def run_backfill(
     )
     _save_state(persona_dir, state)
 
+    # #144: mirror emotion_backfill's zero-tagged guard — count detector
+    # outcomes so a run where every call errored is not marked complete.
+    attempted_this_run = 0
+    succeeded_this_run = 0
+
     for i in range(start_idx, len(sampled)):
         window = sampled[i]
 
@@ -380,6 +385,7 @@ def run_backfill(
                 _save_state(persona_dir, state)
                 return state
 
+            attempted_this_run += 1
             try:
                 output = detector_fn(buffer_slice=list(window.turns), reply_text="")
             except Exception as exc:  # noqa: BLE001
@@ -387,6 +393,7 @@ def run_backfill(
                     "attunement backfill: detector error on %s: %s", window.id, exc
                 )
                 continue
+            succeeded_this_run += 1
 
             merge_into_learned(
                 persona_dir,
@@ -408,6 +415,14 @@ def run_backfill(
         # Tests pass delay_s=0 to skip the wait (matches emotion_backfill).
         if delay_s > 0:
             time.sleep(delay_s)
+
+    if attempted_this_run > 0 and succeeded_this_run == 0:
+        _log.warning(
+            "attunement backfill: %d detector calls, 0 succeeded (systematic "
+            "failure?); leaving status=running so the next pass retries.",
+            attempted_this_run,
+        )
+        return state
 
     check_crystallisations(persona_dir, now_iso=now_iso)
     state = replace(state, status="complete")
