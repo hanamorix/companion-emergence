@@ -17,6 +17,14 @@ import pytest
 from brain.bridge.supervisor import run_folded
 
 
+def _cadence_dir(persona_dir: Path) -> Path:
+    """#178: cadence state lives under <persona>/cadence/."""
+    d = persona_dir / "cadence"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+
 def _neutralise(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_felt_time_tick", lambda *a, **k: None)
@@ -28,7 +36,7 @@ def test_finalize_fires_from_persisted_due_time_on_fresh_process(
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "finalize_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "finalize_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -56,7 +64,7 @@ def test_finalize_fires_from_persisted_due_time_on_fresh_process(
     watchdog.cancel()
 
     assert calls[0] >= 1, "persisted past-due finalize must fire on a fresh process"
-    saved = json.loads((persona_dir / "finalize_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "finalize_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
 
 
@@ -65,11 +73,11 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "maintenance_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "maintenance_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     # far-future soul state so soul review doesn't interfere
-    (persona_dir / "soul_review_state.json").write_text(
+    (_cadence_dir(persona_dir) / "soul_review_state.json").write_text(
         json.dumps(
             {
                 "next_review_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
@@ -104,7 +112,7 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
     watchdog.cancel()
 
     assert calls[0] >= 1, "persisted past-due maintenance must fire on a fresh process"
-    saved = json.loads((persona_dir / "maintenance_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "maintenance_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)
 
 
@@ -113,7 +121,7 @@ def test_voice_reflection_fires_from_persisted_due_time_on_fresh_process(
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "voice_reflection_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "voice_reflection_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -142,7 +150,7 @@ def test_voice_reflection_fires_from_persisted_due_time_on_fresh_process(
     watchdog.cancel()
 
     assert calls[0] >= 1, "persisted past-due voice reflection must fire on a fresh process"
-    saved = json.loads((persona_dir / "voice_reflection_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "voice_reflection_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=23)
 
 
@@ -155,7 +163,7 @@ def test_cadence_advances_even_when_tick_raises(
     # into the try block (the plan's "major if violated"). Red-team finding M1.
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "finalize_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "finalize_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -185,7 +193,7 @@ def test_cadence_advances_even_when_tick_raises(
 
     assert raised[0] >= 1, "the raising tick must have fired"
     # Despite the tick raising, the cadence advanced to the future (not still past-due):
-    saved = json.loads((persona_dir / "finalize_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "finalize_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
         "advance+save must run in finally even when the tick raises"
     )
@@ -200,7 +208,7 @@ def test_maintenance_advances_even_when_forgetting_raises(
     # structure against a future un-wrapped statement above the advance.
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "maintenance_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "maintenance_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -230,7 +238,7 @@ def test_maintenance_advances_even_when_forgetting_raises(
     watchdog.cancel()
 
     assert raised[0] >= 1
-    saved = json.loads((persona_dir / "maintenance_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "maintenance_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5), (
         "maintenance must advance even when forgetting raises (end-of-block, no finally)"
     )
@@ -266,7 +274,7 @@ def test_disabled_cadence_writes_no_state_file(
     watchdog.cancel()
 
     for name in ("finalize_cadence.json", "maintenance_cadence.json", "voice_reflection_cadence.json"):
-        assert not (persona_dir / name).exists(), f"disabled cadence must not write {name}"
+        assert not (_cadence_dir(persona_dir) / name).exists(), f"disabled cadence must not write {name}"
 
 
 def test_initiate_review_fires_from_persisted_due_time_on_fresh_process(
@@ -274,7 +282,7 @@ def test_initiate_review_fires_from_persisted_due_time_on_fresh_process(
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "initiate_review_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "initiate_review_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -303,7 +311,7 @@ def test_initiate_review_fires_from_persisted_due_time_on_fresh_process(
     watchdog.cancel()
 
     assert calls[0] >= 1, "persisted past-due initiate review must fire on a fresh process"
-    saved = json.loads((persona_dir / "initiate_review_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "initiate_review_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=10)
 
 
@@ -312,7 +320,7 @@ def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
 ) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "log_rotation_cadence.json").write_text(
+    (_cadence_dir(persona_dir) / "log_rotation_cadence.json").write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -341,5 +349,5 @@ def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
     watchdog.cancel()
 
     assert calls[0] >= 1, "persisted past-due log rotation must fire on a fresh process"
-    saved = json.loads((persona_dir / "log_rotation_cadence.json").read_text())
+    saved = json.loads((_cadence_dir(persona_dir) / "log_rotation_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)

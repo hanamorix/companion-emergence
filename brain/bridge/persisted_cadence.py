@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.paths import cadence_state_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +32,7 @@ class CadenceState:
 
 
 def _state_path(persona_dir: Path, filename: str) -> Path:
-    return persona_dir / filename
+    return cadence_state_path(persona_dir, filename)  # <persona>/cadence/ (#178)
 
 
 def _parse_ts(raw: object) -> datetime | None:

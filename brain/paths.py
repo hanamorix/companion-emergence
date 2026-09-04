@@ -141,3 +141,34 @@ def get_log_dir() -> Path:
     if override:
         return (Path(override).expanduser() / "logs").resolve()
     return _dirs.user_log_path.resolve()
+
+
+_CADENCE_SUBDIR = "cadence"
+
+
+def cadence_state_path(persona_dir: Path, filename: str) -> Path:
+    """Resolve a persona-scoped cadence state file under ``<persona>/cadence/``.
+
+    One resolver for every persisted cadence (the generic
+    ``brain/bridge/persisted_cadence.py`` files plus the soul and self-model
+    bespoke ones) so the layout lives in one place (#178). A legacy root-level
+    ``<persona>/<filename>`` from before the subdirectory existed is moved into
+    place the first time it is resolved, unless a file already exists at the
+    new path (then the legacy copy is left alone rather than silently lost).
+    Migration is best-effort: on any OSError the new path is still returned
+    and the caller's missing-file handling (due-now) takes over.
+    """
+    new = persona_dir / _CADENCE_SUBDIR / filename
+    legacy = persona_dir / filename
+    if not new.exists() and legacy.is_file():
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(new)
+        except OSError:
+            warnings.warn(
+                f"cadence_state_path: could not migrate {legacy} → {new}; "
+                "cadence will start due-now",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return new
