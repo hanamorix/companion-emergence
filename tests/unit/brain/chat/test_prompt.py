@@ -1128,8 +1128,10 @@ def test_build_recall_block_ba_fallback_filters_lowercase(tmp_path: Path):
     store = MemoryStore(":memory:")  # empty store: every selected token is unfamiliar
     tokens = ["antique", "yesterday", "slowly", "Marcus", "Kellerman", "Lisbon", "quiet"]
 
+    # #145: capitalisation is re-read from the raw input, so it must carry the words.
+    user_input = "antique yesterday slowly Marcus Kellerman Lisbon quiet"
     with patch("brain.chat.prompt._extract_recall_tokens", return_value=tokens):
-        block = _build_recall_block(store, "query", persona_dir=tmp_path)
+        block = _build_recall_block(store, user_input, persona_dir=tmp_path)
     store.close()
 
     # 7 tokens, all unfamiliar → B→A: keep only initial-caps
