@@ -147,6 +147,32 @@ def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
             f"LoadState={load_state.stdout.strip()!r} stderr={load_state.stderr!r}"
         )
 
+        # 5. (#164) LoadState=loaded can be satisfied by a unit file systemd
+        #    noticed on its own; UnitFileState=enabled additionally proves the
+        #    installer's `enable --now` ran against a daemon-reloaded manager
+        #    (a stale manager reports the pre-reload state). Restores the
+        #    daemon-reload coverage the #160 de-flake dropped, without racing
+        #    the bridge's own exit.
+        unit_file_state = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "-p",
+                "UnitFileState",
+                "--value",
+                "companion-emergence-ci_test",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert unit_file_state.stdout.strip() == "enabled", (
+            "installer did not enable the unit (daemon-reload skipped?); "
+            f"UnitFileState={unit_file_state.stdout.strip()!r} "
+            f"stderr={unit_file_state.stderr!r}"
+        )
+
     finally:
         # Always uninstall so the CI runner is left clean.
         subprocess.run(
