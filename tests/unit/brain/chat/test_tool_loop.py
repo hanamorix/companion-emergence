@@ -362,3 +362,82 @@ def test_run_tool_loop_surfaces_dispatched_invocations(
     assert len(invocations) == 2
     assert [i["name"] for i in invocations] == ["get_soul", "search_memories"]
     assert invocations[1]["arguments"] == {"query": "x"}
+
+
+# ── run_tool_loop — session_id threading (#80) ────────────────────────────────
+
+
+def test_run_tool_loop_threads_session_id_into_provider_options_without_chat_options(
+    store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path
+) -> None:
+    """#80/C7: run_tool_loop's own `session_id` kwarg (always populated by
+    engine.py) must reach provider.chat()'s `options["session_id"]` even when
+    the caller passes no chat_options at all (chat_options's own optional
+    "session_id" key is only set on the volatile-suffix path upstream) — this
+    is what lets a _PROVIDER_TOOLS MCP tool resolve its session on the
+    ClaudeCliProvider MCP-dispatch path."""
+
+    class _CapturingProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.seen_options: list[dict | None] = []
+
+        def name(self) -> str:
+            return "capturing"
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            return ""
+
+        def chat(self, messages, *, tools=None, options=None) -> ChatResponse:
+            self.seen_options.append(options)
+            return ChatResponse(content="done", tool_calls=(), raw=None)
+
+    provider = _CapturingProvider()
+    run_tool_loop(
+        _make_messages(),
+        provider=provider,
+        tools=build_tools_list(),
+        store=store,
+        hebbian=hebbian,
+        persona_dir=persona_dir,
+        chat_options=None,
+        session_id="sess-real-42",
+    )
+
+    assert provider.seen_options, "provider.chat() was never called"
+    assert provider.seen_options[0]["session_id"] == "sess-real-42"
+
+
+def test_run_tool_loop_with_no_session_id_leaves_options_unset(
+    store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path
+) -> None:
+    """Self-test (ST1.5f): the assertion above discriminates — when the caller
+    supplies no session_id at all, options must not gain a spurious key."""
+
+    class _CapturingProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.seen_options: list[dict | None] = []
+
+        def name(self) -> str:
+            return "capturing"
+
+        def generate(self, prompt: str, *, system: str | None = None) -> str:
+            return ""
+
+        def chat(self, messages, *, tools=None, options=None) -> ChatResponse:
+            self.seen_options.append(options)
+            return ChatResponse(content="done", tool_calls=(), raw=None)
+
+    provider = _CapturingProvider()
+    run_tool_loop(
+        _make_messages(),
+        provider=provider,
+        tools=build_tools_list(),
+        store=store,
+        hebbian=hebbian,
+        persona_dir=persona_dir,
+        chat_options=None,
+        session_id=None,
+    )
+
+    assert provider.seen_options, "provider.chat() was never called"
+    assert "session_id" not in provider.seen_options[0]

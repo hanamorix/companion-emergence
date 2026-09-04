@@ -368,6 +368,17 @@ def run_tool_loop(
     invocations: list[dict[str, Any]] = []
     last_response = ChatResponse(content="", tool_calls=(), raw=None)
 
+    # #80: this function's own `session_id` parameter is always populated by
+    # engine.py, unlike chat_options's optional "session_id" key (only set
+    # there on the volatile-suffix path) — merge it into chat_options ONCE so
+    # every downstream use below (call_options, the final forced pass, and the
+    # _maybe_recruit_and_rerun call) reliably carries it into provider.chat()/
+    # chat_stream()'s options, where a _PROVIDER_TOOLS MCP tool (compact_history)
+    # needs it to resolve its session. No-op when chat_options already carried
+    # the same value (today's common case).
+    if session_id is not None:
+        chat_options = {**(chat_options or {}), "session_id": session_id}
+
     # Per-call provider options. chat_options carries the Option A+ volatile
     # suffix (+ include_block_clock / session_id) when the caller supplied it;
     # merged with persona_dir so every provider.chat() in the loop sends the

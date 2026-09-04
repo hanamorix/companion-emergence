@@ -45,12 +45,15 @@ def test_register_tools_advertises_all_dispatched(persona_dir: Path, fake_stores
     assert advertised == expected
 
 
-def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stores) -> None:
+def test_register_tools_dispatches_and_logs_success(
+    persona_dir: Path, fake_stores, monkeypatch
+) -> None:
     """call_tool() must call dispatch() and write an audit log line."""
     from mcp.server import Server
 
     from brain.mcp_server.tools import register_tools
 
+    monkeypatch.delenv("NELL_MCP_SESSION_ID", raising=False)
     store, hebbian = fake_stores
     server = Server("brain-tools")
 
@@ -59,13 +62,16 @@ def test_register_tools_dispatches_and_logs_success(persona_dir: Path, fake_stor
         call_handler = _get_call_handler(server)
         result = asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
 
-    # Dispatch was invoked with the right args + injections
+    # Dispatch was invoked with the right args + injections. #80: session_id is
+    # now always passed (None here — no NELL_MCP_SESSION_ID in the environment)
+    # — harmless for every tool outside dispatch()'s _PROVIDER_TOOLS set.
     mock_dispatch.assert_called_once_with(
         "search_memories",
         {"query": "x"},
         store=store,
         hebbian=hebbian,
         persona_dir=persona_dir,
+        session_id=None,
     )
     # Result content is a JSON-encoded dispatch return
     text = result.root.content[0].text
@@ -242,6 +248,68 @@ def test_register_tools_audits_stored_image_path_not_base64(persona_dir: Path, f
     rec = json.loads(line)
     assert rec["stored_image_path"] == rel
     assert b64 not in line  # no base64 anywhere in the audit record
+
+
+# ── #80 — compact_history reachable via the REAL MCP handler ──────────────────
+#
+# Drives server.request_handlers[CallToolRequest] directly (the same mechanism
+# the dragonfly repro used) with a REAL (unmocked) dispatch() — proving the
+# tool reaches actual compaction logic, not a stub, when NELL_MCP_SESSION_ID is
+# present in the environment the way brain_tools_mcp_entry()/_call_tool wire it.
+
+
+def test_call_tool_compact_history_via_env_session_id_reaches_real_dispatch(
+    persona_dir: Path, fake_stores, monkeypatch
+) -> None:
+    """C1: with NELL_MCP_SESSION_ID set (as the real MCP subprocess spawn sets
+    it, per brain_tools_mcp_entry), a real compact_history call through the
+    real registered handler must NOT return the #80 provider/session_id error
+    — a genuine no-op (reason: cursor_none, on this fresh persona_dir with no
+    ingest cursor) is a valid pass, proving real compaction logic was reached."""
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    monkeypatch.setenv("NELL_MCP_SESSION_ID", "sess-mcp-live")
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+    register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+    call_handler = _get_call_handler(server)
+
+    result = asyncio.run(call_handler(_call_request("compact_history", {"age_hours": 1})))
+
+    text = result.root.content[0].text
+    payload = json.loads(text)
+    assert "error" not in payload, f"compact_history call failed: {payload}"
+    assert payload["reason"] == "cursor_none"  # real no-op, not a stub
+    assert payload["compacted"] is False
+
+
+def test_call_tool_compact_history_without_session_id_env_var_fails_loud(
+    persona_dir: Path, fake_stores, monkeypatch
+) -> None:
+    """C2/ST1.5f (this is the oracle's self-test — it reproduces the ORIGINAL
+    #80 failure class on demand): with NO NELL_MCP_SESSION_ID in the
+    environment, the real handler must still return a loud {"error": ...}
+    naming session_id — dropping the provider requirement must not silently
+    let an unresolvable-session call through, which would corrupt the wrong
+    session's buffer."""
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    monkeypatch.delenv("NELL_MCP_SESSION_ID", raising=False)
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+    register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+    call_handler = _get_call_handler(server)
+
+    result = asyncio.run(call_handler(_call_request("compact_history", {"age_hours": 1})))
+
+    text = result.root.content[0].text
+    payload = json.loads(text)
+    assert "error" in payload
+    assert "session_id" in payload["error"]
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

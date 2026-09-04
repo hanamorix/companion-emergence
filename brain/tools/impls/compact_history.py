@@ -7,7 +7,12 @@ is kept verbatim — this is the append path, fold_existing_summary=False), and 
 raw turns are moved to the lossless archive.
 
 This is the manual sibling of the daily timed cadence and the apply_budget
-backstop; all three share brain/chat/compaction.py.
+backstop; all three share brain/chat/compaction.py — including the provider:
+like every other caller, this tool builds its own cost-pinned
+(COMPACTION_MODEL="haiku") provider via build_compaction_provider(persona_dir)
+rather than requiring one injected. #80: an injected live provider cannot cross
+the parent -> claude-CLI -> mcp_server grandchild process boundary the MCP
+dispatch path runs through, so requiring one made this tool unreachable via MCP.
 """
 
 from __future__ import annotations
@@ -16,8 +21,6 @@ import logging
 from datetime import timedelta
 from pathlib import Path
 
-from brain.bridge.provider import LLMProvider
-
 logger = logging.getLogger(__name__)
 
 
@@ -25,7 +28,6 @@ def compact_history(
     age_hours: float = 24.0,
     *,
     persona_dir: Path,
-    provider: LLMProvider,
     session_id: str,
 ) -> dict:
     """Fade conversation turns older than ``age_hours`` into the summary (append).
@@ -47,9 +49,11 @@ def compact_history(
     # tool_loop → tool_recruit → brain.tools, which cycles if this module is
     # imported (via dispatch) before brain.tools finishes initialising (e.g. the
     # mcp_server subprocess imports brain.tools first). Deferring to call time
-    # breaks the cycle.
-    from brain.chat.compaction import compact_conversation
+    # breaks the cycle. build_compaction_provider lives in the same module as
+    # compact_conversation, so it must stay in this same lazy-import block.
+    from brain.chat.compaction import build_compaction_provider, compact_conversation
 
+    provider = build_compaction_provider(persona_dir)
     result = compact_conversation(
         persona_dir,
         session_id,
