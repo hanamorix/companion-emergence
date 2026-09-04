@@ -279,6 +279,35 @@ _CONTENT_ABSENCE = re.compile(
     r")",
     re.IGNORECASE,
 )
+# D3 explicit-refusal-verb backstop (#77 owner-scoped broadening, 2026-09-04): catches a
+# refusal that is itself first-person and does NOT open with a listed _REFUSAL_LEAD phrase (so
+# it evades that anchored-at-start check too) -- e.g. "I'm not going to produce this memory
+# update. ... I won't proceed without it." Unlike _CONTENT_ABSENCE, this is UNANCHORED (matches
+# anywhere in the text, not only at the start): every alternative pairs a refusal-intent opener
+# with one of the OWNER'S OWN NAMED example objects -- produce / write / proceed -- and nothing
+# else. A wider verb list (generate/create/summarize/fold/condense/comply/continue) was tried
+# and REJECTED by two rounds of red-team: it over-matches ordinary first-person text ("I'm not
+# going to fold the laundry", "I refuse to comply, and I remember standing my ground",
+# "I'm not going to summarize" -- 19/19 constructed non-refusal sentences matched in that
+# widened-list round). Trimming strictly to the three owner-named objects removes nearly all of
+# that over-match while still catching the confirmed evader (matches independently on BOTH
+# "i'm not going to produce" and "i won't proceed"). KNOWN ACCEPTED RESIDUAL (owner-ratified,
+# NOT fixed further -- do not add machinery to eliminate it, see tests +
+# ``changes/fix-77-refusal-verb-broadening/1.5-criteria.md`` C2b): a rare legitimate
+# first-person sentence using produce/write/proceed in an ordinary, non-task sense ("I'm not
+# going to proceed with the changes until I hear back", "I'm not going to write this down
+# anywhere") can still false-positive. This is BENIGN, not corrupting: a wrongly-rejected fold
+# falls to the existing safe lossless/truncation fallback (see _generate_validated_fold's
+# callers), never to garbage -- the cost of this residual is a generic fallback note in place of
+# one memory detail, not data corruption. Deliberately narrow overall: catches the reproduced
+# shape via the owner's own named objects only.
+_REFUSAL_VERB = re.compile(
+    r"\b(?:i'?m|i\s+am)\s+not\s+going\s+to\s+(?:produce|write|proceed)\b"
+    r"|\bi\s+won'?t\s+(?:produce|write|proceed)\b"
+    r"|\bi\s+will\s+not\s+(?:produce|write|proceed)\b"
+    r"|\bi\s+refuse\s+to\s+(?:produce|write|proceed)\b",
+    re.IGNORECASE,
+)
 # Below this word count a bare non-first-person output (e.g. a test stub token) is
 # too short to be a refusal essay; only longer non-first-person prose is rejected.
 _NONTRIVIAL_WORDS = 8
@@ -288,9 +317,11 @@ def _validate_fold_output(text: object) -> str | None:
     """Return the stripped fold output, or ``None`` when it must be rejected (#77).
 
     Rejects: empty/whitespace; a refusal / "I won't proceed"-style completion; an
-    assistant-meta frame ("Here is the summary:" / "As an AI"); or a non-trivial
-    output with no first-person pronoun (the persona fold is first-person by
-    construction). A module-level, unit-testable predicate (criterion C4).
+    assistant-meta frame ("Here is the summary:" / "As an AI"); an explicit
+    refusal-verb phrase anywhere in the text (D3, e.g. "I'm not going to produce
+    this memory update"); or a non-trivial output with no first-person pronoun
+    (the persona fold is first-person by construction). A module-level,
+    unit-testable predicate (criterion C4).
     """
     s = (text or "")
     s = s.strip() if isinstance(s, str) else ""
@@ -301,6 +332,8 @@ def _validate_fold_output(text: object) -> str | None:
     if _REFUSAL_LEAD.match(s):
         return None
     if _CONTENT_ABSENCE.match(s):
+        return None
+    if _REFUSAL_VERB.search(s):
         return None
     if len(s.split()) >= _NONTRIVIAL_WORDS and not _FIRST_PERSON.search(s):
         return None
