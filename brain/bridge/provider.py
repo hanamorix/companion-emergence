@@ -1065,7 +1065,15 @@ class ClaudeCliProvider(LLMProvider):
                             if cli_err is not None:
                                 yield StreamError(stage="claude_cli_error", detail=cli_err)
                             else:
-                                yield StreamDone(content=result_text, metadata=metadata)
+                                # #146: an exit-0 result frame can carry empty
+                                # text. Fall back to what already streamed, as
+                                # the EOF branch does, instead of a blank reply.
+                                content = (
+                                    result_text
+                                    or "".join(delta_chunks)
+                                    or (assistant_snapshot or "")
+                                )
+                                yield StreamDone(content=content, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
                         # to q.get would re-arm the idle-timeout watchdog and, if
