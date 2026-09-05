@@ -14,6 +14,7 @@ SoulStore and inject the top 5 most-recent as brief highlights.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
@@ -1034,8 +1035,15 @@ def _build_recall_block(
     unfamiliar: list[str] = [t for t in tokens if stats.get(t.lower(), (0, 0.0))[0] == 0]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
+    # Tokens are already lowercased, so capitalisation is re-read from the raw
+    # input (#145: the old ``t[0].isupper()`` on lowercased tokens always emptied it).
     if len(unfamiliar) > 5:
-        unfamiliar = [t for t in unfamiliar if t and t[0].isupper()]
+        capitalised = {
+            m.group().lower()
+            for m in re.finditer(r"[A-Za-z0-9]+", user_input)
+            if m.group()[:1].isupper()
+        }
+        unfamiliar = [t for t in unfamiliar if t.lower() in capitalised]
 
     if not active_hits and not fading_hits and not lost_hits and not unfamiliar:
         return ""
