@@ -18,6 +18,8 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.chat.rollover import perform_rollover
 from brain.ingest.buffer import (
     ingest_turn,
@@ -148,8 +150,12 @@ def _load_old_pipeline_module() -> types.ModuleType:
         cwd=repo_root,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if result.returncode != 0:
+        # #169: the base commit was dropped by a branch rewrite and is reachable
+        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
+        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
     mod = types.ModuleType("old_pipeline_pre_finalize_decoupling")
     exec(compile(result.stdout, "<old_pipeline_c2154a97^>", "exec"), mod.__dict__)
     return mod
