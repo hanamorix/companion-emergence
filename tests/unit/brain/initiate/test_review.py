@@ -11,6 +11,14 @@ from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.review import run_initiate_review_tick
 from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
 
+# A fixed non-UTC zone (not the host's OS timezone): check_send_allowed treats a
+# non-zero offset as already user-local and reads the wall-clock hour directly,
+# whereas tzinfo=UTC is re-converted via .astimezone() to whatever timezone the
+# test host runs in — so a "safe noon" could land inside the 23-07 blackout on
+# a UTC+12..+14 or UTC-10..-12 runner (#143, same pattern as #142).
+_LOCAL = ZoneInfo("America/Los_Angeles")
+
+
 
 def _snap() -> EmotionalSnapshot:
     return EmotionalSnapshot(
@@ -230,7 +238,7 @@ def test_review_tick_publishes_initiate_delivered_on_send(tmp_path: Path, monkey
     """
     from brain.bridge import events
 
-    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)  # 14:00 UTC — well outside blackout
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=_LOCAL)  # 14:00 local — well outside blackout
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path,
@@ -454,7 +462,7 @@ def test_initiate_delivered_event_carries_kind_and_diff(tmp_path: Path, monkeypa
     """
     from brain.bridge import events
 
-    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=_LOCAL)  # see _LOCAL
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
 
     # Set up persona subdirectory so review.py can look for voice.md / crystallizations.db
@@ -737,7 +745,7 @@ def test_delivered_reach_out_writes_source_emotions(tmp_path: Path, monkeypatch)
     """
     from brain.memory.store import MemoryStore
 
-    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+    daytime = datetime(2026, 5, 16, 14, 0, tzinfo=_LOCAL)  # see _LOCAL
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
 
     emit_initiate_candidate(

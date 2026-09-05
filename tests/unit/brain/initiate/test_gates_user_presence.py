@@ -1,8 +1,9 @@
 """Tests for UserPresence adjustments in check_send_allowed."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from brain.initiate.audit import append_audit_row
 from brain.initiate.schemas import AuditRow
@@ -41,8 +42,15 @@ def _presence(
     )
 
 
-# UTC noon — outside the default 23-07 blackout
-_SAFE_NOW = datetime(2026, 5, 29, 12, 0, 0, tzinfo=UTC)
+# A fixed non-UTC zone (not the host's OS timezone): check_send_allowed treats a
+# non-zero offset as already user-local and reads the wall-clock hour directly,
+# whereas tzinfo=_LOCAL is re-converted via .astimezone() to whatever timezone the
+# test host runs in — so a "safe noon" could land inside the 23-07 blackout on
+# a UTC+12..+14 or UTC-10..-12 runner (#143, same pattern as #142).
+_LOCAL = ZoneInfo("America/Los_Angeles")
+
+# Local noon — outside the default 23-07 blackout
+_SAFE_NOW = datetime(2026, 5, 29, 12, 0, 0, tzinfo=_LOCAL)
 
 
 def test_presence_none_no_effect(tmp_path: Path) -> None:
@@ -82,7 +90,7 @@ def test_silence_loosens_quota(tmp_path: Path) -> None:
     """silence_days >= 3 raises the notify cap by 1 (default 3 → 4)."""
     # Fill the default notify cap (3) with sends 3h ago — within 24h window but
     # outside the halved 2h silence-loosened gap, so only the cap drives the block.
-    ts_recent = datetime(2026, 5, 29, 9, 0, 0, tzinfo=UTC).isoformat()
+    ts_recent = datetime(2026, 5, 29, 9, 0, 0, tzinfo=_LOCAL).isoformat()
     for i in range(3):
         append_audit_row(tmp_path, _delivered_row(f"ia_{i}", ts_recent, "send_notify"))
 
@@ -105,7 +113,7 @@ def test_silence_loosens_quota(tmp_path: Path) -> None:
 def test_ignore_streak_3_doubles_gap(tmp_path: Path) -> None:
     """ignore_streak >= 3 sets notify gap to 8h; a send 5h ago is blocked."""
     # Last send was 5h ago — passes default 4h gap but fails streak-raised 8h gap
-    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=UTC)
+    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=_LOCAL)
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -123,7 +131,7 @@ def test_ignore_streak_3_doubles_gap(tmp_path: Path) -> None:
 def test_ignore_streak_6_sets_24h_gap(tmp_path: Path) -> None:
     """ignore_streak >= 6 sets notify gap to 24h; a send 10h ago is blocked."""
     # Last send was 10h ago — within the 24h gap
-    last_send = datetime(2026, 5, 29, 2, 0, 0, tzinfo=UTC)
+    last_send = datetime(2026, 5, 29, 2, 0, 0, tzinfo=_LOCAL)
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -141,7 +149,7 @@ def test_ignore_streak_6_sets_24h_gap(tmp_path: Path) -> None:
 def test_response_lag_above_4h_raises_gap(tmp_path: Path) -> None:
     """lag_p50 >= 14400s (4h) raises gap to 8h; a send 5h ago is blocked."""
     # Last send was 5h ago — passes default 4h gap but fails lag-raised 8h gap
-    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=UTC)
+    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=_LOCAL)
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -165,7 +173,7 @@ def test_lag_below_600_is_no_op(tmp_path: Path) -> None:
     """
     # Last send was 3h ago — passes the 2h silence-loosened gap but would fail the
     # default 4h gap that the buggy else-branch restores.
-    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=UTC)  # 3h before noon
+    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=_LOCAL)  # 3h before noon
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -182,7 +190,7 @@ def test_lag_below_600_is_no_op(tmp_path: Path) -> None:
 def test_silence_streak_conflict_backoff_wins(tmp_path: Path) -> None:
     """silence_days >= 3 AND ignore_streak >= 3 → backoff wins, not silence loosening."""
     # Last send was 5h ago — would pass 2h silence-gap but blocked by 8h backoff gap.
-    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=UTC)
+    last_send = datetime(2026, 5, 29, 7, 0, 0, tzinfo=_LOCAL)
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -204,7 +212,7 @@ def test_lag_none_is_no_op(tmp_path: Path) -> None:
     silence_days=3.5 + streak=0 halves the gap to 2h.
     A send 3h ago is outside 2h → allowed. lag=None must not raise the gap.
     """
-    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=UTC)  # 3h before noon
+    last_send = datetime(2026, 5, 29, 9, 0, 0, tzinfo=_LOCAL)  # 3h before noon
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
@@ -224,7 +232,7 @@ def test_lag_proportional_band_raises_gap(tmp_path: Path) -> None:
     lag_p50=3600s (1h) → lag_hours = 1h * 1.5 = 1.5h.
     Last send 1h12min ago (1.2h) < 1.5h gap → blocked.
     """
-    last_send = datetime(2026, 5, 29, 10, 48, 0, tzinfo=UTC)  # 1h12min before noon
+    last_send = datetime(2026, 5, 29, 10, 48, 0, tzinfo=_LOCAL)  # 1h12min before noon
     append_audit_row(tmp_path, _delivered_row("ia_1", last_send.isoformat(), "send_notify"))
 
     from brain.initiate.gates import check_send_allowed
