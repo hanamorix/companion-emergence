@@ -12,6 +12,10 @@ from brain.bridge.server import build_app
 
 
 def _client(persona_dir: Path, **kw) -> TestClient:
+    # This module tests the lifecycle itself (supervisor tick, pruning, shutdown drain),
+    # so it opts back INTO the background threads the root conftest inhibits for
+    # endpoint tests (hunts/bridge-order-pollution-flakes; C7 opt-in list).
+    kw.setdefault("background_threads", True)
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests", **kw))
 
 
