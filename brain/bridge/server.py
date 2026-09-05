@@ -811,6 +811,7 @@ class BridgeAppState:
     in_flight_locks: dict[str, asyncio.Lock]
     last_chat_at: datetime | None = None
     supervisor_thread: Any | None = None
+    migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
 
@@ -818,6 +819,15 @@ class BridgeAppState:
 # ---------------------------------------------------------------------------
 # Lifespan + app factory
 # ---------------------------------------------------------------------------
+
+
+# Test-only inhibit for the lifespan's background threads (the supervisor and the
+# compaction-backlog-migration thread). Mirrors ``pass2_queue._worker_inhibited``:
+# the root ``tests/conftest.py`` sets it True so endpoint tests do not race a live
+# supervisor over the session they just seeded (hunts/bridge-order-pollution-flakes).
+# NOT an ops/user knob — no env var, no config; production never sets it. An
+# explicit ``build_app(background_threads=...)`` always wins over this flag.
+_background_threads_inhibited: bool = False
 
 
 def build_app(
@@ -829,6 +839,7 @@ def build_app(
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
     allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS,
+    background_threads: bool | None = None,
 ) -> FastAPI:
     """Build a FastAPI app for the given persona. Public for tests + daemon.
 
@@ -840,10 +851,25 @@ def build_app(
     allowed_origins: WebSocket Origin header allowlist (extra defense
     against browser-based attacks if someone proxies localhost). "null"
     matches CLI/non-browser clients; "tauri://localhost" matches SP-8.
+
+    background_threads: start the supervisor + compaction-backlog-migration
+    threads in the lifespan. None (default) → ``not _background_threads_inhibited``,
+    resolved at lifespan-enter so a test may flip the flag after constructing the
+    app. Production (runner.py) passes nothing and the flag is False → threads on.
     """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        bg = (
+            background_threads
+            if background_threads is not None
+            else not _background_threads_inhibited
+        )
+        if not bg:
+            logger.warning(
+                "bridge lifespan: background threads OFF (supervisor + backlog migration "
+                "not started) — test/dev inhibit; production never sets this"
+            )
         # Per HA hardening: NO persistent SQLite stores held on app.state.
         # Each worker thread / handler opens its own per-call stores against
         # persona_dir. The lifespan only constructs the provider (stateless),
@@ -944,11 +970,14 @@ def build_app(
             except Exception:  # noqa: BLE001 — startup must not break on the migration
                 logger.exception("compaction backlog migration thread crashed")
 
-        threading.Thread(
-            target=_run_backlog_migration,
-            name="compaction-backlog-migration",
-            daemon=True,
-        ).start()
+        if bg:
+            mig_thread = threading.Thread(
+                target=_run_backlog_migration,
+                name="compaction-backlog-migration",
+                daemon=True,
+            )
+            mig_thread.start()
+            app.state.bridge.migration_thread = mig_thread
 
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
@@ -964,22 +993,24 @@ def build_app(
             return lk is not None and lk.locked()
 
         stop_event = threading.Event()
-        sup_thread = threading.Thread(
-            target=run_folded,
-            kwargs={
-                "stop_event": stop_event,
-                "persona_dir": persona_dir,
-                "provider": provider,
-                "event_bus": bus,
-                "tick_interval_s": tick_interval_s,
-                "silence_minutes": silence_minutes,
-                "is_session_busy": _is_session_busy,
-            },
-            name="sp7-supervisor",
-            daemon=False,
-        )
-        sup_thread.start()
-        app.state.bridge.supervisor_thread = sup_thread
+        sup_thread: threading.Thread | None = None
+        if bg:
+            sup_thread = threading.Thread(
+                target=run_folded,
+                kwargs={
+                    "stop_event": stop_event,
+                    "persona_dir": persona_dir,
+                    "provider": provider,
+                    "event_bus": bus,
+                    "tick_interval_s": tick_interval_s,
+                    "silence_minutes": silence_minutes,
+                    "is_session_busy": _is_session_busy,
+                },
+                name="sp7-supervisor",
+                daemon=False,
+            )
+            sup_thread.start()
+            app.state.bridge.supervisor_thread = sup_thread
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -1051,11 +1082,12 @@ def build_app(
                 except Exception:
                     logger.exception("failed to record drain_errors to state file")
 
-            # 4. Stop supervisor thread
+            # 4. Stop supervisor thread (None when background threads are off)
             stop_event.set()
-            sup_thread.join(timeout=180.0)
-            if sup_thread.is_alive():
-                logger.warning("supervisor thread did not stop within 180s")
+            if sup_thread is not None:
+                sup_thread.join(timeout=180.0)
+                if sup_thread.is_alive():
+                    logger.warning("supervisor thread did not stop within 180s")
 
             # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
             #    In-process import + run_tick(trigger="close"). Best-effort:
@@ -2409,7 +2441,45 @@ def build_app(
         limit = max(1, min(int(limit), 1000))
 
         s: BridgeAppState = app.state.bridge
-        path = s.persona_dir / "active_conversations" / f"{session_id}.jsonl"
+        # Follow a rollover's ``rolled_to`` pointer like /chat does, so a renderer
+        # that reloads history after a rollover sees the successor's turns rather
+        # than an empty "fresh session" (hunts/bridge-order-pollution-flakes, C3).
+        # Divergences from /chat, deliberate for a read-only GET: an unresolvable
+        # (cyclic / corrupt) pointer falls back to the request sid with a WARNING
+        # instead of a 404; ``before_turn`` cursors are not translated across the
+        # redirect and the resolved sid is not echoed back (both deferred).
+        from brain.chat.session import resolve_successor
+        from brain.ingest.buffer import read_rolled_to
+
+        resolved = resolve_successor(s.persona_dir, session_id)
+        if resolved is None:
+            if read_rolled_to(s.persona_dir, session_id) is not None:
+                logger.warning(
+                    "chat_history: rolled_to pointer for %s is unresolvable (cyclic/corrupt); "
+                    "serving the request sid's own buffer",
+                    session_id,
+                )
+            resolved = session_id
+        elif not _BUFFER_SESSION_ID_RE.fullmatch(resolved):
+            # Defence in depth: resolve_successor's walk already validates each
+            # hop, so this branch is unreachable today; it guards a future walk
+            # change because the handler builds its own path and never passes
+            # through read_session's validation (stage-6 L-1).
+            logger.warning(
+                "chat_history: rolled_to successor %r for %s fails sid validation; "
+                "serving the request sid's own buffer",
+                resolved, session_id,
+            )
+            resolved = session_id
+        path = s.persona_dir / "active_conversations" / f"{resolved}.jsonl"
+        if not path.exists() and resolved == session_id:
+            # A rollover may have landed between our resolve and this stat:
+            # pointer written + old buffer deleted. Re-resolve once (stage-6 M-1/C-1)
+            # rather than report a "fresh session" for a conversation that exists.
+            again = resolve_successor(s.persona_dir, session_id)
+            if again is not None and _BUFFER_SESSION_ID_RE.fullmatch(again):
+                resolved = again
+                path = s.persona_dir / "active_conversations" / f"{resolved}.jsonl"
         if not path.exists():
             return ChatHistoryResponse(messages=[], next_before_turn=None)
 

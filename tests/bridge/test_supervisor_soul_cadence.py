@@ -20,6 +20,14 @@ import pytest
 from brain.bridge.supervisor import run_folded
 
 
+def _cadence_dir(persona_dir: Path) -> Path:
+    """#178: cadence state lives under <persona>/cadence/."""
+    d = persona_dir / "cadence"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+
 def _neutralise_other_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", lambda *a, **k: {})
     monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
@@ -36,7 +44,7 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
     would have made wait 6h (the under-firing defect)."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "soul_review_state.json").write_text(
+    (_cadence_dir(persona_dir) / "soul_review_state.json").write_text(
         json.dumps(
             {
                 "next_review_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
@@ -75,7 +83,7 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
 
     assert calls[0] >= 1, "persisted past-due next_review_at must fire on a fresh process"
     # Clean drain → cadence advanced ~6h ahead and was persisted (save works).
-    state = json.loads((persona_dir / "soul_review_state.json").read_text())
+    state = json.loads((_cadence_dir(persona_dir) / "soul_review_state.json").read_text())
     saved_next = datetime.fromisoformat(state["next_review_at"])
     assert saved_next > datetime.now(UTC) + timedelta(hours=5)
 

@@ -584,3 +584,26 @@ def test_chat_stream_with_tools_and_no_session_id_omits_session_env(tmp_path, mo
 
     server_cfg = captured["config"]["mcpServers"]["brain-tools"]
     assert "env" not in server_cfg
+
+
+def test_chat_stream_empty_result_falls_back_to_streamed_text():
+    """#146: a terminal result frame with empty text must not become a blank
+    reply when the stream already carried the assistant's text."""
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    lines = [
+        _delta_line("Hello"),
+        _delta_line(" there"),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Hello there"}]},
+            }
+        )
+        + "\n",
+        _result_line(""),
+    ]
+    with patch("brain.bridge.provider.subprocess.Popen", return_value=_fake_popen(lines)):
+        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    dones = [e for e in events if isinstance(e, StreamDone)]
+    assert len(dones) == 1
+    assert dones[0].content == "Hello there"

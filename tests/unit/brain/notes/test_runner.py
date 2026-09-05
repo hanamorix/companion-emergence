@@ -53,3 +53,21 @@ def test_make_note_and_wire_writes_a_file(tmp_path):
     notes = list(folder.glob("*.md"))
     assert len(notes) == 1
     assert "the sea" in notes[0].read_text().lower()
+
+
+def test_note_prompt_carries_persona_identity(tmp_path):
+    """#170: the note call must tell the model who it is, or it signs '-Claude'."""
+    persona_dir = tmp_path / "Nell"
+    persona_dir.mkdir()
+    folder = tmp_path / "Notes"
+    folder.mkdir()
+    seen = {}
+
+    class _CaptureProvider:
+        def complete(self, prompt):
+            seen["prompt"] = prompt
+            return json.dumps({"subject": "the sea", "body": "I thought of you."})
+
+    make_note_and_wire(persona_dir=persona_dir, config=_Cfg(str(folder)),
+                       provider=_CaptureProvider(), now=datetime(2026, 6, 15, tzinfo=UTC))
+    assert "You are Nell" in seen["prompt"]

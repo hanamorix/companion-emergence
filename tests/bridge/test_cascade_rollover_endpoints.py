@@ -24,6 +24,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -475,8 +476,12 @@ def test_c21_flags_all_five_sites_on_pre_fix_base_commit() -> None:
         cwd=repo_root,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if result.returncode != 0:
+        # #169: the base commit was dropped by a branch rewrite and is reachable
+        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
+        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
     base_source = result.stdout
     blocks = _handler_blocks(base_source)
     failing = []

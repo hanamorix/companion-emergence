@@ -480,6 +480,14 @@ def run_folded(
                 _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
             except Exception:
                 logger.exception("supervisor pending-write sweep raised")
+            # Reap aged .lock.stale-* / .corrupt-* forensic residue (#176).
+            # Fail-isolated for the same reason as the sweep above.
+            try:
+                from brain.health import sidecar_sweep as _sidecar_sweep
+
+                _sidecar_sweep.sweep_stale_sidecars(persona_dir, now=datetime.now(UTC))
+            except Exception:
+                logger.exception("supervisor sidecar sweep raised")
             # End-of-block advance+save (not a finally): every statement above is
             # inside its own try/except, so the block body cannot raise — the
             # advance is unconditionally reached. (defer #21)

@@ -193,3 +193,26 @@ def test_not_recognised_reflects_store(tmp_path: Path) -> None:
         assert "lighthouse" not in absent
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# #145 — when MORE than five query tokens are unrecognised, the display trims
+# to the proper-noun-shaped (capitalised) ones. That branch compared
+# ``t[0].isupper()`` on already-lowercased tokens and always emptied the list.
+# ---------------------------------------------------------------------------
+
+
+def test_not_recognised_over_five_keeps_capitalised_tokens(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    try:
+        block = _build_recall_block(
+            store,
+            "we met Zephyrion and Quillabar near glimmerholt, vantorix, brindlewick, oskaline",
+            persona_dir=tmp_path,
+        )
+        absent = not_recognised_tokens(block)
+        assert "zephyrion" in absent
+        assert "quillabar" in absent
+        assert "glimmerholt" not in absent
+    finally:
+        store.close()
