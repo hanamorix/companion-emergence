@@ -70,3 +70,20 @@ def test_crystallizer_skips_configuration_when_name_already_exists() -> None:
         assert result == []
     finally:
         store.close()
+
+
+def test_crystallizer_treats_reversed_blend_name_as_existing() -> None:
+    """#174: grief_love_blend and love_grief_blend are the same configuration."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(_mem("love and grief braided", {"love": 9, "grief": 8}))
+        store.create(_mem("another love-grief evening", {"love": 8, "grief": 7}))
+        store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
+
+        result = crystallize_vocabulary(
+            store, current_vocabulary_names={"love", "grief", "grief_love_blend"}
+        )
+
+        assert result == []
+    finally:
+        store.close()

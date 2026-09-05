@@ -91,6 +91,7 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
             raise _cli_throttle.ThrottleDeferred("throttle deferred")
         note = _compose.make_note(
             provider,
+            persona_name=persona_dir.name,  # same source as HeartbeatEngine
             user_name=user_name,
             dreams_summary=dreams_summary,
             emotion_summary=emotion_summary,

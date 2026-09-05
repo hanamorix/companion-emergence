@@ -177,3 +177,20 @@ def test_run_backfill_default_detector_threads_identity(tmp_path: Path):
     assert captured, "expected the default detector closure to be invoked"
     assert captured[0]["companion_name"] == tmp_path.name
     assert captured[0]["user_name"] == "Alex"
+
+
+def test_run_backfill_does_not_complete_when_every_detector_call_errors(tmp_path: Path):
+    """#144: a window where every detector call raised must stay retryable,
+    mirroring emotion_backfill's zero-tagged guard."""
+    _make_buffer_file(tmp_path, n_turns=25)
+
+    def exploding_detector(*, buffer_slice, reply_text):
+        raise RuntimeError("provider blip")
+
+    state = run_backfill(
+        tmp_path,
+        detector_fn=exploding_detector,
+        now_dt=datetime(2026, 5, 31, 12, 0, tzinfo=UTC),
+        delay_s=0,
+    )
+    assert state.status != "complete"
