@@ -20,20 +20,21 @@ def _make_client(persona_dir: Path) -> TestClient:
 def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: str = "[]"):
     """Replace get_provider so the lifespan returns a stub that yields `reply`.
 
-    Patches brain.bridge.server.get_provider (not build_provider — Task 4 used
-    get_provider). Must be called BEFORE opening a TestClient so the lifespan
-    picks up the stub at app startup.
+    Must be called BEFORE opening a TestClient so the lifespan picks up the
+    stub at app startup.
 
-    #154: also patches brain.bridge.provider.get_provider (the SOURCE module) —
-    `build_tier_provider` (brain/bridge/model_tier.py, used by e.g. the
-    `/sessions/close` route's housekeeping-tier extraction) does a fresh,
-    function-scoped `from brain.bridge.provider import get_provider` on every
-    call, so it reads whatever `brain.bridge.provider.get_provider` currently
-    is — patching only the name re-exported into `server`'s namespace (a
-    module-level import, resolved once at import time) does not reach it.
+    Patches brain.bridge.provider.get_provider (the SOURCE module) — both
+    `build_tier_provider` (used by e.g. the `/sessions/close` route's
+    housekeeping-tier extraction) and, since #154's completion,
+    `build_interactive_chat_provider` (server.py's live `/chat` provider) do a
+    fresh, function-scoped `from brain.bridge.provider import get_provider` on
+    every call, so patching the source module reaches both. (Previously also
+    patched `brain.bridge.server.get_provider` — server.py no longer imports
+    that name at all now that its lifespan calls
+    `model_tier.build_interactive_chat_provider` instead of `get_provider`
+    directly, so that patch target no longer exists; dropped.)
     """
     import brain.bridge.provider as provider_module
-    import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
     class _Fake:
@@ -47,7 +48,6 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
             return extraction
 
     _fake_factory = lambda _name, **_kw: _Fake()  # noqa: E731
-    monkeypatch.setattr(srv, "get_provider", _fake_factory)
     monkeypatch.setattr(provider_module, "get_provider", _fake_factory)
 
 
@@ -326,6 +326,7 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
     than the client idle budget killed the WS (WebSocketDisconnect 1006)."""
     import time as _time
 
+    import brain.bridge.provider as provider_module
     import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
@@ -346,7 +347,10 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
         def generate(self, prompt, *, system=None):
             return "[]"
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _SlowFake())
+    # #154: server.py's lifespan now calls model_tier.build_interactive_chat_
+    # provider (a function-scoped import of get_provider from the SOURCE
+    # module), not a module-level `server.get_provider` — patch the source.
+    monkeypatch.setattr(provider_module, "get_provider", lambda _name, **_kw: _SlowFake())
 
     with _make_client(persona_dir) as c:
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]

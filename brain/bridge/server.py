@@ -57,8 +57,12 @@ from brain.bridge.chat import (
     TextDelta,
 )
 from brain.bridge.events import EventBus
-from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
-from brain.bridge.provider import LLMProvider, ProviderError, get_provider
+from brain.bridge.model_tier import (
+    TIER_BACKGROUND_HOUSEKEEPING,
+    build_interactive_chat_provider,
+    build_tier_provider,
+)
+from brain.bridge.provider import LLMProvider, ProviderError
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
@@ -875,18 +879,13 @@ def build_app(
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
         #
-        # #154: kept as the original `get_provider(...)` call (NOT routed through
-        # build_tier_provider) — deliberately. TIER_INTERACTIVE_CHAT's model is
-        # unchanged ("sonnet", same as this resolves to today), so migrating it
-        # would be pure churn with no behavior difference — and an extensive,
-        # pre-existing test seam across tests/bridge/ (test_endpoints.py and
-        # ~40 others) patches `brain.bridge.server.get_provider` directly to
-        # inject a fake/stub provider for the live `/chat` route. Routing this
-        # one site through the accessor broke that seam for zero functional
-        # gain; reverted for the same reason the background-generative sites
-        # were (see brain/bridge/supervisor.py, brain/engines/heartbeat.py).
-        config = PersonaConfig.load(persona_dir / "persona_config.json")
-        provider = get_provider(config.provider, persona_dir=persona_dir)
+        # TIER_INTERACTIVE_CHAT (#154) — routed through the model-tier accessor,
+        # but via `build_interactive_chat_provider` specifically (not the plain
+        # `build_tier_provider` every other tier uses): this is the one real
+        # call site that must keep honoring a persona's own `persona_config.json`
+        # `.model` field rather than forcing the tier's nominal model — see
+        # `brain/bridge/model_tier.py`'s docstring on that function for why.
+        provider = build_interactive_chat_provider(persona_dir)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())

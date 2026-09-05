@@ -44,6 +44,12 @@ def test_supervisor_invokes_forgetting_pass_on_soul_review_cadence(
     # a genuine subprocess call once its (unpersisted, "due now") cadence fires —
     # neutralise the tick itself; this test isn't about interest_sweep.
     monkeypatch.setattr("brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None)
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider too, and calls the LLM unconditionally before
+    # its own evidence gate — same hazard, same fix; not about this test either.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     provider = MagicMock()
     event_bus = MagicMock()
@@ -80,6 +86,12 @@ def test_supervisor_forgetting_pass_fault_isolated(
     # a genuine subprocess call once its (unpersisted, "due now") cadence fires —
     # neutralise the tick itself; this test isn't about interest_sweep.
     monkeypatch.setattr("brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None)
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider too, and calls the LLM unconditionally before
+    # its own evidence gate — same hazard, same fix; not about this test either.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     soul_review_calls: list[int] = [0]
     stop_event = threading.Event()

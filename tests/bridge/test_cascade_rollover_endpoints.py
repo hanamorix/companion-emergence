@@ -47,10 +47,13 @@ def _build(persona_dir: Path) -> tuple[FastAPI, TestClient]:
 
 def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: str = "[]"):
     """Mirrors tests/bridge/test_endpoints.py's helper — patches
-    brain.bridge.server.get_provider so the lifespan's provider is a
-    controllable stub. Must be called BEFORE opening the TestClient."""
+    brain.bridge.provider.get_provider (the SOURCE module; server.py's
+    lifespan no longer imports get_provider directly since #154's completion —
+    it calls model_tier.build_interactive_chat_provider, which does its own
+    function-scoped import of get_provider from this source module) so the
+    lifespan's provider is a controllable stub. Must be called BEFORE opening
+    the TestClient."""
     import brain.bridge.provider as _provider_module
-    import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
     class _Fake:
@@ -63,7 +66,6 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
         def generate(self, prompt, *, system=None):
             return extraction
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _Fake())
     monkeypatch.setattr(_provider_module, "get_provider", lambda _name, **_kw: _Fake())
 
 

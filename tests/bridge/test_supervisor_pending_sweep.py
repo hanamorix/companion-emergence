@@ -36,6 +36,13 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider, and calls the LLM unconditionally before its
+    # own evidence gate — a real-subprocess hazard on this bare tmp_path
+    # persona (no persona_config.json); not about this test, neutralise it.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     # Watchdog: if the sweep never fires, stop the loop after a short window so
     # the test fails on the assertion below rather than hanging forever.

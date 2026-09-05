@@ -34,6 +34,14 @@ def _neutralise_other_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_felt_time_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider at its call site, and calls the LLM
+    # UNCONDITIONALLY before its own evidence gate — same real-subprocess
+    # hazard these tests already neutralise interest_sweep for elsewhere.
+    # None of these tests are about voice-reflection; neutralise its tick too.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
 
 def test_soul_review_fires_from_persisted_due_time_on_fresh_process(

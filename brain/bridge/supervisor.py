@@ -60,6 +60,7 @@ from brain.bridge import cli_throttle, persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
+    TIER_BACKGROUND_GENERATIVE,
     TIER_BACKGROUND_HOUSEKEEPING,
     build_tier_provider,
 )
@@ -416,12 +417,10 @@ def run_folded(
         # Soul-review cadence — slowest of the three. Each pass is up to
         # 5 LLM calls (one per candidate). Fault-isolated so a model
         # outage doesn't take the supervisor down.
-        # #154 note: this tick, and voice-reflection/maker/notes below, pass
-        # the bare `provider` (the shared object) DELIBERATELY — all are
-        # `background-generative` tier, same model as `provider` already is.
-        # Routing them through `build_tier_provider` was tried once and
-        # reverted after it broke many pre-existing tests for zero behavior
-        # change. See `brain/bridge/model_tier.py`'s module docstring.
+        # This tick, and voice-reflection/maker/notes below, each build their
+        # OWN `background-generative` tier provider (#154) rather than reusing
+        # the bare ambient `provider` — same model (`MODEL_MEDIUM`) it already
+        # resolves to, so this is routing-only, not a model change.
         # Soul-review cadence — PERSISTED + self-pacing. Unlike the monotonic
         # timers, soul_review_state.json survives restart/sleep, so the 6h
         # interval can't be reset to zero by an app quit/reboot (the defect that
@@ -434,7 +433,9 @@ def run_folded(
             eligible_pending = 0
             try:
                 model_failures, eligible_pending = _run_soul_review_tick(
-                    persona_dir, provider, event_bus
+                    persona_dir,
+                    build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
+                    event_bus,
                 )
             except Exception:
                 logger.exception("supervisor soul-review tick raised")
@@ -610,7 +611,11 @@ def run_folded(
             voice_cadence_state, now=datetime.now(UTC)
         ):
             try:
-                _run_voice_reflection_tick(persona_dir, provider, event_bus)
+                _run_voice_reflection_tick(
+                    persona_dir,
+                    build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
+                    event_bus,
+                )
             except Exception:
                 logger.exception("supervisor voice-reflection tick raised")
             finally:
@@ -653,7 +658,9 @@ def run_folded(
                     _maker_store = MemoryStore(persona_dir / "memories.db")
                     _maker_stack.callback(_maker_store.close)
                     _maybe_run_maker_tick(
-                        persona_dir, store=_maker_store, provider=provider
+                        persona_dir,
+                        store=_maker_store,
+                        provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
                     )
             except Exception:
                 logger.exception("supervisor maker store-open raised")
@@ -670,7 +677,9 @@ def run_folded(
                     _notes_store = MemoryStore(persona_dir / "memories.db")
                     _notes_stack.callback(_notes_store.close)
                     _maybe_run_notes_tick(
-                        persona_dir, store=_notes_store, provider=provider
+                        persona_dir,
+                        store=_notes_store,
+                        provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
                     )
             except Exception:
                 logger.exception("supervisor notes store-open raised")

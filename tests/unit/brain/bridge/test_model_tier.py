@@ -28,6 +28,7 @@ from brain.bridge.model_tier import (
     TIER_INTERACTIVE_CHAT,
     TIER_MODEL,
     TIER_SELF_MODEL_ARTICULATE,
+    build_interactive_chat_provider,
     build_tier_provider,
     model_for_tier,
     model_label_for_provider,
@@ -39,6 +40,15 @@ def _claude_cli_persona(tmp_path: Path) -> Path:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     (persona_dir / "persona_config.json").write_text('{"provider": "claude-cli"}')
+    return persona_dir
+
+
+def _claude_cli_persona_with_model(tmp_path: Path, model: str) -> Path:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        f'{{"provider": "claude-cli", "model": "{model}"}}'
+    )
     return persona_dir
 
 
@@ -118,6 +128,67 @@ def test_build_tier_provider_defaults_provider_kind_when_no_persona_config(tmp_p
 
 
 # ---------------------------------------------------------------------------
+# build_interactive_chat_provider — D1: the ONE tier that does NOT force
+# model_override, so a persona's own persona_config.json `.model` field keeps
+# winning. Completes #154 (dream/reflex/research/soul-review/voice-reflection/
+# maker/notes + interactive-chat routed through the accessor; see
+# changes/154-complete-model-tier-routing/).
+# ---------------------------------------------------------------------------
+
+
+def test_build_interactive_chat_provider_honors_personas_own_model(tmp_path):
+    """C2 (no unintended model change): a persona configured for a NON-default
+    model ("opus") must keep running on "opus" for interactive-chat — the one
+    real call site that honors persona_config.json's own `.model` field.
+    Oracle (C6): this would fail against a naive build_tier_provider-based
+    implementation, which unconditionally forces model_override=MODEL_MEDIUM
+    ("sonnet"), silently stripping the persona's own choice."""
+    persona_dir = _claude_cli_persona_with_model(tmp_path, "opus")
+    provider = build_interactive_chat_provider(persona_dir)
+    assert isinstance(provider, ClaudeCliProvider)
+    assert provider._model == "opus"  # noqa: SLF001
+
+
+def test_build_interactive_chat_provider_defaults_to_default_model_when_unset(tmp_path):
+    """No persona_config.json at all → DEFAULT_PROVIDER + PersonaConfig's own
+    DEFAULT_MODEL fallback (get_provider's existing chain), NOT a tier-forced
+    override — mirrors build_tier_provider's provider-*kind* fallback but
+    without the model_override this function deliberately omits."""
+    from brain.persona_config import DEFAULT_MODEL
+
+    persona_dir = tmp_path / "no_config_persona"
+    persona_dir.mkdir()
+    provider = build_interactive_chat_provider(persona_dir)
+    assert isinstance(provider, ClaudeCliProvider)
+    assert provider._model == DEFAULT_MODEL  # noqa: SLF001
+
+
+def test_interactive_chat_tier_model_entry_is_decorative(monkeypatch, tmp_path):
+    """C9 — reassigning TIER_MODEL[TIER_INTERACTIVE_CHAT] must NOT change what
+    build_interactive_chat_provider actually resolves (unlike every other
+    tier, proven by test_n_model_extensible_new_size_needs_no_call_site_
+    changes above for TIER_BACKGROUND_GENERATIVE). This is the guard against a
+    future maintainer "completing" model_tier.py's own extensibility
+    docstring for this one tier and silently reintroducing the persona-model-
+    override regression D1 exists to prevent."""
+    persona_dir = _claude_cli_persona_with_model(tmp_path, "opus")
+    monkeypatch.setitem(TIER_MODEL, TIER_INTERACTIVE_CHAT, "haiku")
+    provider = build_interactive_chat_provider(persona_dir)
+    # Still "opus" (the persona's own model) — NOT "haiku" (the monkeypatched
+    # TIER_MODEL value), proving model_for_tier(TIER_INTERACTIVE_CHAT) is
+    # never consulted by this function.
+    assert provider._model == "opus"  # noqa: SLF001
+
+
+def test_model_label_for_interactive_chat_reflects_the_real_resolved_model(tmp_path):
+    """C7 — the usage-log label for interactive-chat must reflect whatever
+    model persona_config.json actually specified, not a hardcoded tier value."""
+    persona_dir = _claude_cli_persona_with_model(tmp_path, "opus")
+    provider = build_interactive_chat_provider(persona_dir)
+    assert model_label_for_provider(provider, TIER_INTERACTIVE_CHAT) == "opus"
+
+
+# ---------------------------------------------------------------------------
 # model_label_for_provider
 # ---------------------------------------------------------------------------
 
@@ -145,10 +216,16 @@ def test_model_label_for_provider_falls_back_for_a_provider_with_no_model_attr()
 
 
 def test_n_model_extensible_new_size_needs_no_call_site_changes(monkeypatch):
-    monkeypatch.setitem(TIER_MODEL, TIER_INTERACTIVE_CHAT, "opus")
-    assert model_for_tier(TIER_INTERACTIVE_CHAT) == "opus"
+    """Uses TIER_BACKGROUND_GENERATIVE, NOT TIER_INTERACTIVE_CHAT — the latter
+    is the one documented exception (see build_interactive_chat_provider's
+    docstring + test_interactive_chat_tier_model_entry_is_decorative below):
+    reassigning ITS TIER_MODEL entry does NOT change what actually runs, so it
+    would be a misleading "no call site changes" demonstration subject.
+    TIER_BACKGROUND_GENERATIVE genuinely has the property this test asserts."""
+    monkeypatch.setitem(TIER_MODEL, TIER_BACKGROUND_GENERATIVE, "opus")
+    assert model_for_tier(TIER_BACKGROUND_GENERATIVE) == "opus"
     # Every OTHER tier is untouched by the single reassignment.
-    assert model_for_tier(TIER_BACKGROUND_GENERATIVE) == "sonnet"
+    assert model_for_tier(TIER_INTERACTIVE_CHAT) == "sonnet"
     assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 

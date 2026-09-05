@@ -41,6 +41,17 @@ def _neutralise(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None
     )
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider at this call site too, and (unlike maker/notes)
+    # `run_voice_reflection_tick` calls the LLM UNCONDITIONALLY before checking
+    # its own evidence gate — same real-subprocess hazard as interest_sweep
+    # above. Neutralise it here too; `test_voice_reflection_fires_from_
+    # persisted_due_time_on_fresh_process` re-patches this itself afterward
+    # (same monkeypatch instance, its patch wins) since IT is the one test
+    # that's actually about this cadence.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
 
 def test_finalize_fires_from_persisted_due_time_on_fresh_process(

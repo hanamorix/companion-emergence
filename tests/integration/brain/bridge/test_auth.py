@@ -47,10 +47,11 @@ def persona_dir_for_auth(tmp_path: Path) -> Path:
 
 
 def _patch_provider(monkeypatch, provider: LLMProvider) -> None:
+    # #154: server.py's lifespan no longer imports get_provider directly — it
+    # calls model_tier.build_interactive_chat_provider, a function-scoped
+    # import of get_provider from this SOURCE module; patch that.
     import brain.bridge.provider as _provider_module
-    import brain.bridge.server as srv
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: provider)
     monkeypatch.setattr(_provider_module, "get_provider", lambda _name, **_kw: provider)
 
 
