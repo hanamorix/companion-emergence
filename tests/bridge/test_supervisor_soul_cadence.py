@@ -65,6 +65,12 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
         heartbeat_interval_s=None,
         soul_review_interval_s=6 * 3600.0,  # 6h: monotonic alone would NOT fire
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # soul-review-cadence-focused test, matching heartbeat/finalize above.
+        interest_sweep_interval_s=None,
     )
 
     assert calls[0] >= 1, "persisted past-due next_review_at must fire on a fresh process"

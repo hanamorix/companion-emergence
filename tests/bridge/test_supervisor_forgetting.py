@@ -39,6 +39,11 @@ def test_supervisor_invokes_forgetting_pass_on_soul_review_cadence(
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: no persona_config.json here, so interest_sweep's now-real Haiku-tier
+    # provider construction would default to a real ClaudeCliProvider and attempt
+    # a genuine subprocess call once its (unpersisted, "due now") cadence fires —
+    # neutralise the tick itself; this test isn't about interest_sweep.
+    monkeypatch.setattr("brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None)
 
     provider = MagicMock()
     event_bus = MagicMock()
@@ -70,6 +75,11 @@ def test_supervisor_forgetting_pass_fault_isolated(
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _exploding_pass)
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: no persona_config.json here, so interest_sweep's now-real Haiku-tier
+    # provider construction would default to a real ClaudeCliProvider and attempt
+    # a genuine subprocess call once its (unpersisted, "due now") cadence fires —
+    # neutralise the tick itself; this test isn't about interest_sweep.
+    monkeypatch.setattr("brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None)
 
     soul_review_calls: list[int] = [0]
     stop_event = threading.Event()
@@ -127,6 +137,8 @@ def test_supervisor_passes_intensity_drivers_to_forgetting(
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
+    # #154: neutralise interest_sweep — see the comment on the same patch above.
+    monkeypatch.setattr("brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None)
 
     run_folded(
         stop_event,

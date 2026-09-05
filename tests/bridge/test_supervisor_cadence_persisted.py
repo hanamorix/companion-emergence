@@ -21,6 +21,18 @@ def _neutralise(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_felt_time_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: none of these tests set up a persona_config.json, and the interest-
+    # sweep cadence (default enabled, no persisted state on a fresh persona_dir)
+    # is "due" immediately — it now builds its own real Haiku-tier provider
+    # (brain.bridge.supervisor.build_tier_provider), which defaults to a real
+    # ClaudeCliProvider absent a persona_config.json and would attempt a genuine
+    # subprocess call none of these cadence-focused tests are set up to handle
+    # (a watchdog does not save this — a blocking subprocess call inside one
+    # loop iteration isn't interrupted by stop_event until that call returns).
+    # Neutralise the tick itself so its cadence never actually fires here.
+    monkeypatch.setattr(
+        "brain.engines.interest_sweep.run_sweep_tick", lambda *a, **k: None
+    )
 
 
 def test_finalize_fires_from_persisted_due_time_on_fresh_process(

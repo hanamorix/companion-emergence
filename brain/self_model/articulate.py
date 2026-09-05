@@ -84,15 +84,14 @@ def build_self_model_provider(persona_dir: Path) -> Any:
     passes the result into ``_run_self_model_tick`` in place of the persona
     chat provider — verified the only provider.generate() call anywhere in
     that tick is this module's ``articulate()``, so scoping the whole tick to
-    this provider is safe."""
-    from brain.bridge.provider import get_provider
-    from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
+    this provider is safe.
 
-    name = DEFAULT_PROVIDER
-    cfg = Path(persona_dir) / "persona_config.json"
-    if cfg.exists():
-        name = PersonaConfig.load(cfg).provider
-    return get_provider(name, persona_dir=Path(persona_dir), model_override=SELF_MODEL_MODEL)
+    Thin wrapper over the centralized model-tier accessor (#154) —
+    ``TIER_SELF_MODEL_ARTICULATE``'s model is ``SELF_MODEL_MODEL`` ("haiku"),
+    so this is a routing-only change with no model-value difference."""
+    from brain.bridge.model_tier import TIER_SELF_MODEL_ARTICULATE, build_tier_provider
+
+    return build_tier_provider(persona_dir, TIER_SELF_MODEL_ARTICULATE)
 
 
 def _provider_model_label(provider: Any) -> str:
@@ -104,8 +103,15 @@ def _provider_model_label(provider: Any) -> str:
     SELF_MODEL_MODEL — the constant ``build_self_model_provider`` forces every
     real call site to use — for providers with no such attribute (e.g.
     ``FakeProvider`` in tests). Either way this can no longer drift from the
-    model that was actually invoked."""
-    return getattr(provider, "_model", None) or SELF_MODEL_MODEL
+    model that was actually invoked.
+
+    Thin wrapper over the centralized ``model_label_for_provider`` (#154) —
+    kept as a named, module-local function (rather than inlined at the one
+    call site) since its docstring documents this module's own label
+    contract."""
+    from brain.bridge.model_tier import TIER_SELF_MODEL_ARTICULATE, model_label_for_provider
+
+    return model_label_for_provider(provider, TIER_SELF_MODEL_ARTICULATE)
 
 
 # ---------------------------------------------------------------------------

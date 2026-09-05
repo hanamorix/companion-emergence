@@ -50,6 +50,14 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call) —
+        # disabled, out of scope for this pending-sweep-focused test. The
+        # 3s watchdog above does not save this: a blocking subprocess call
+        # inside one iteration isn't interrupted by stop_event until that
+        # call returns.
+        interest_sweep_interval_s=None,
     )
 
     assert len(sweep_calls) >= 1

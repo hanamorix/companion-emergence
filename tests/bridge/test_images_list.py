@@ -19,6 +19,7 @@ def _make_client(persona_dir: Path, auth_token: str | None = None) -> TestClient
 
 def _patch_fake_provider(monkeypatch):
     """Replace get_provider so bridge lifespan doesn't need a real LLM."""
+    import brain.bridge.provider as _provider_module
     import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
@@ -37,6 +38,7 @@ def _patch_fake_provider(monkeypatch):
             return []
 
     monkeypatch.setattr(srv, "get_provider", lambda _name=None, **_kw: _FakeProvider())
+    monkeypatch.setattr(_provider_module, "get_provider", lambda _name=None, **_kw: _FakeProvider())
 
 
 def _auth_headers(token: str | None = None) -> dict[str, str]:

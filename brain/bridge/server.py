@@ -57,6 +57,7 @@ from brain.bridge.chat import (
     TextDelta,
 )
 from brain.bridge.events import EventBus
+from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
 from brain.bridge.provider import LLMProvider, ProviderError, get_provider
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
@@ -847,6 +848,17 @@ def build_app(
         # Each worker thread / handler opens its own per-call stores against
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
+        #
+        # #154: kept as the original `get_provider(...)` call (NOT routed through
+        # build_tier_provider) — deliberately. TIER_INTERACTIVE_CHAT's model is
+        # unchanged ("sonnet", same as this resolves to today), so migrating it
+        # would be pure churn with no behavior difference — and an extensive,
+        # pre-existing test seam across tests/bridge/ (test_endpoints.py and
+        # ~40 others) patches `brain.bridge.server.get_provider` directly to
+        # inject a fake/stub provider for the live `/chat` route. Routing this
+        # one site through the accessor broke that seam for zero functional
+        # gain; reverted for the same reason the background-generative sites
+        # were (see brain/bridge/supervisor.py, brain/engines/heartbeat.py).
         config = PersonaConfig.load(persona_dir / "persona_config.json")
         provider = get_provider(config.provider, persona_dir=persona_dir)
 
@@ -2863,7 +2875,7 @@ def build_app(
                     _close_session_blocking,
                     s.persona_dir,
                     sid,
-                    s.provider,
+                    build_tier_provider(s.persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                 )
             except Exception as exc:
                 logger.exception("close_session failed session=%s", sid)

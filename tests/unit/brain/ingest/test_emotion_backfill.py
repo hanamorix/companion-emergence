@@ -409,10 +409,21 @@ def test_default_tagger_zero_tagged_does_not_mark_complete(tmp_path):
 
 
 def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
-    """Supervisor must forward its provider arg to _emotion_backfill_run.
+    """Supervisor must call _emotion_backfill_run with a real provider kwarg
+    (never call it with only `(persona_dir,)`, which would leave the default
+    tagger provider-less).
 
     Before the Step 2 wire-up fix, _emotion_backfill_run was called with
     only (persona_dir,) — the provider never reached the default tagger.
+
+    #154 update: supervisor no longer forwards its own ambient `provider`
+    verbatim — it builds a FRESH TIER_BACKGROUND_CLASSIFIER (Haiku) provider
+    via `build_tier_provider(persona_dir, ...)` for this call specifically
+    (emotion tagging is a classifier-tier operation, not a chat-tier one), so
+    the object passed to `_emotion_backfill_run` is intentionally NOT the same
+    object as the `provider` this test constructs — only same-KIND (both
+    resolve through `persona_config.json`'s `"provider": "fake"` to a
+    `FakeProvider`), which is what the assertion below checks.
     """
     import threading
     from unittest.mock import patch
@@ -454,8 +465,15 @@ def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
             voice_reflection_interval_s=None,
         )
 
-        # Must be called with provider= kwarg so the default tagger gets a real provider
-        mock_run.assert_called_once_with(persona_dir, provider=provider)
+        # Must be called with provider= kwarg so the default tagger gets a real provider.
+        # #154: the provider is a FRESH TIER_BACKGROUND_CLASSIFIER build, not the
+        # ambient `provider` object itself — check kind/presence, not identity.
+        from brain.bridge.provider import FakeProvider as _FakeProvider
+
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        assert call_args == (persona_dir,)
+        assert isinstance(call_kwargs.get("provider"), _FakeProvider)
 
 
 # ---------------------------------------------------------------------------

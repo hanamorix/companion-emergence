@@ -62,6 +62,12 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # narrative-memory-focused test.
+        interest_sweep_interval_s=None,
     )
 
     # Forgetting must precede arc_update inside the same cadence tick.
@@ -122,6 +128,12 @@ def test_supervisor_arc_update_failure_is_isolated(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # narrative-memory-focused test.
+        interest_sweep_interval_s=None,
     )
 
     # Soul-review kept running even though arc-update raised each tick.

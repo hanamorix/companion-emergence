@@ -58,6 +58,11 @@ from brain.attunement.backfill import (
 )
 from brain.bridge import cli_throttle, persisted_cadence
 from brain.bridge.events import EventBus
+from brain.bridge.model_tier import (
+    TIER_BACKGROUND_CLASSIFIER,
+    TIER_BACKGROUND_HOUSEKEEPING,
+    build_tier_provider,
+)
 from brain.bridge.provider import LLMProvider
 from brain.chat.session import prune_empty_sessions, remove_session
 from brain.engines import interest_sweep
@@ -266,7 +271,9 @@ def run_folded(
     # startup if needed.  Fault-isolated per autonomous-behaviour recipe item 3.
     try:
         if _emotion_backfill_should_run(persona_dir):
-            _emotion_backfill_run(persona_dir, provider=provider)
+            _emotion_backfill_run(
+                persona_dir, provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("emotion backfill failed during startup: %s", exc)
 
@@ -282,7 +289,11 @@ def run_folded(
             db_path = persona_dir / "memories.db"
             _store = _MemoryStore(str(db_path), integrity_check=False)
             try:
-                _vocab_repair_run(persona_dir, store=_store, provider=provider)
+                _vocab_repair_run(
+                    persona_dir,
+                    store=_store,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
+                )
             finally:
                 _store.close()
     except Exception as exc:  # noqa: BLE001
@@ -341,7 +352,7 @@ def run_folded(
                     silence_minutes=silence_minutes,
                     store=store,
                     hebbian=hebbian,
-                    provider=provider,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                     embeddings=embeddings,
                 )
                 # Snapshot is NON-destructive — do NOT call remove_session
@@ -405,6 +416,12 @@ def run_folded(
         # Soul-review cadence — slowest of the three. Each pass is up to
         # 5 LLM calls (one per candidate). Fault-isolated so a model
         # outage doesn't take the supervisor down.
+        # #154 note: this tick, and voice-reflection/maker/notes below, pass
+        # the bare `provider` (the shared object) DELIBERATELY — all are
+        # `background-generative` tier, same model as `provider` already is.
+        # Routing them through `build_tier_provider` was tried once and
+        # reverted after it broke many pre-existing tests for zero behavior
+        # change. See `brain/bridge/model_tier.py`'s module docstring.
         # Soul-review cadence — PERSISTED + self-pacing. Unlike the monotonic
         # timers, soul_review_state.json survives restart/sleep, so the 6h
         # interval can't be reset to zero by an app quit/reboot (the defect that
@@ -496,7 +513,7 @@ def run_folded(
                         _sweep_stack.callback(_sweep_store.close)
                         interest_sweep.run_sweep_tick(
                             store=_sweep_store,
-                            provider=provider,
+                            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                             interests_path=persona_dir / "interests.json",
                             default_interests_path=(
                                 Path(__file__).resolve().parent.parent
@@ -527,7 +544,7 @@ def run_folded(
             try:
                 _run_finalize_tick(
                     persona_dir,
-                    provider,
+                    build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                     event_bus,
                     finalize_after_hours=finalize_after_hours,
                 )

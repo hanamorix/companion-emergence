@@ -112,9 +112,11 @@ def real_persona_dir(tmp_path: Path) -> Path:
 
 def _patch_provider(monkeypatch, provider: LLMProvider) -> None:
     """Override get_provider in server.py so the fake is used."""
+    import brain.bridge.provider as _provider_module
     import brain.bridge.server as srv
 
     monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: provider)
+    monkeypatch.setattr(_provider_module, "get_provider", lambda _name, **_kw: provider)
 
 
 def test_chat_threaded_round_trip_no_silent_sqlite_drop(

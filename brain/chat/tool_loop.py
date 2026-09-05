@@ -80,12 +80,22 @@ def _spawn_pass2(
     interactive chat, respects the background-concurrency cap).  Raw
     monologue text is persisted synchronously before this call, so
     in-memory queue loss only drops extraction, not the trace itself.
+
+    ``provider`` is accepted but no longer used for the extraction call itself
+    (#154): pass-2 extraction is a classifier-tier operation and must not
+    inherit the live chat provider this parameter historically carried.
+    ``_run()`` builds its own ``TIER_BACKGROUND_CLASSIFIER`` provider from
+    ``persona_dir`` instead. The parameter is kept (not removed) so existing
+    callers/tests are unaffected — a signature change here is exactly the
+    class of break #154's initiate/review.py rework hit four times running.
     """
 
     def _run() -> None:
         try:
+            from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
+
             out = extract_from_thinking(
-                provider=provider,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
                 monologue_blocks=(monologue_text,),
                 visible_reply=visible_reply,
                 recent_turn_context=recent_user_msgs,

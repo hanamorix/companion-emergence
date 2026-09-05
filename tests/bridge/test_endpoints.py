@@ -23,7 +23,16 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
     Patches brain.bridge.server.get_provider (not build_provider — Task 4 used
     get_provider). Must be called BEFORE opening a TestClient so the lifespan
     picks up the stub at app startup.
+
+    #154: also patches brain.bridge.provider.get_provider (the SOURCE module) —
+    `build_tier_provider` (brain/bridge/model_tier.py, used by e.g. the
+    `/sessions/close` route's housekeeping-tier extraction) does a fresh,
+    function-scoped `from brain.bridge.provider import get_provider` on every
+    call, so it reads whatever `brain.bridge.provider.get_provider` currently
+    is — patching only the name re-exported into `server`'s namespace (a
+    module-level import, resolved once at import time) does not reach it.
     """
+    import brain.bridge.provider as provider_module
     import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
@@ -37,7 +46,9 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
         def generate(self, prompt, *, system=None):
             return extraction
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _Fake())
+    _fake_factory = lambda _name, **_kw: _Fake()  # noqa: E731
+    monkeypatch.setattr(srv, "get_provider", _fake_factory)
+    monkeypatch.setattr(provider_module, "get_provider", _fake_factory)
 
 
 def test_health_returns_ok(persona_dir: Path):

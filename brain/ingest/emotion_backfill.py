@@ -55,8 +55,6 @@ _INTER_CALL_DELAY_S = 1.5
 
 _SCHEMA_VERSION = "v1"
 
-# Haiku model constant — mirrors _DETECTOR_MODEL in brain/attunement/detector.py.
-_BACKFILL_MODEL = "claude-haiku-4-5-20251001"
 _BACKFILL_TIMEOUT_SECONDS = 60
 
 
@@ -184,10 +182,11 @@ def _make_default_tagger(provider: LLMProvider | None) -> Callable:
     ``brain/attunement/detector.py``.
     """
     if provider is None:
+        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, model_for_tier
         from brain.bridge.provider import ClaudeCliProvider
 
         provider = ClaudeCliProvider(
-            model=_BACKFILL_MODEL,
+            model=model_for_tier(TIER_BACKGROUND_CLASSIFIER),
             timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
         )
 

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
 
+from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
@@ -499,7 +500,7 @@ class HeartbeatEngine:
                 run_consolidation(
                     self.store,
                     persona_dir=persona_dir,
-                    provider=self.provider,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
                     hebbian=self.hebbian,
                 )
             except Exception:  # noqa: BLE001
@@ -694,7 +695,16 @@ class HeartbeatEngine:
         return pruned
 
     def _try_fire_dream(self) -> str | None:
-        """Run one DreamEngine cycle; return the new dream memory id or None."""
+        """Run one DreamEngine cycle; return the new dream memory id or None.
+
+        #154 note: `provider=self.provider` below is DELIBERATE, not an
+        unmigrated site — dream is `background-generative` tier, same model
+        (`MODEL_MEDIUM`) as `self.provider` already is. Routing this through
+        `build_tier_provider` was tried once and reverted after it broke a
+        wide swath of pre-existing tests (real subprocess hangs on bare
+        `tmp_path` fixtures) for zero behavior change. Same applies to
+        `_try_fire_reflex` and `_try_fire_research` below. See
+        `brain/bridge/model_tier.py`'s module docstring."""
         # Lazy import to avoid module-level circular dependency with dream.py
         from brain.engines.dream import DreamEngine, NoSeedAvailable
         from brain.soul.store import SoulStore

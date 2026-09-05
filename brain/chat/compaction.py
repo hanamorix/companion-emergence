@@ -63,17 +63,14 @@ def build_compaction_provider(persona_dir):
     forced to COMPACTION_MODEL. For a ``fake`` persona (tests) this resolves to a
     FakeProvider, so no real CLI is shelled. Production call sites pass the result
     into ``compact_conversation``; the core keeps its injected ``provider`` param so
-    unit tests can still pass a deterministic stub directly."""
-    from pathlib import Path
+    unit tests can still pass a deterministic stub directly.
 
-    from brain.bridge.provider import get_provider
-    from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
+    Thin wrapper over the centralized model-tier accessor (#154) —
+    ``TIER_COMPACTION``'s model is ``COMPACTION_MODEL`` ("haiku"), so this is a
+    routing-only change with no model-value difference."""
+    from brain.bridge.model_tier import TIER_COMPACTION, build_tier_provider
 
-    name = DEFAULT_PROVIDER
-    cfg = Path(persona_dir) / "persona_config.json"
-    if cfg.exists():
-        name = PersonaConfig.load(cfg).provider
-    return get_provider(name, persona_dir=Path(persona_dir), model_override=COMPACTION_MODEL)
+    return build_tier_provider(persona_dir, TIER_COMPACTION)
 
 
 # Voice + perspective WITHOUT importing voice.md (which can be longer than the text

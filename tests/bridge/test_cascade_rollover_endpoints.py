@@ -48,6 +48,7 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
     """Mirrors tests/bridge/test_endpoints.py's helper — patches
     brain.bridge.server.get_provider so the lifespan's provider is a
     controllable stub. Must be called BEFORE opening the TestClient."""
+    import brain.bridge.provider as _provider_module
     import brain.bridge.server as srv
     from brain.bridge.chat import ChatResponse
 
@@ -62,6 +63,7 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
             return extraction
 
     monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _Fake())
+    monkeypatch.setattr(_provider_module, "get_provider", lambda _name, **_kw: _Fake())
 
 
 def _make_persona(base: Path, name: str) -> Path:
