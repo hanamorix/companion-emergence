@@ -18,7 +18,6 @@ from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-EXTRACTOR_MODEL = "haiku"
 EXTRACTOR_TIMEOUT_SECONDS = 30
 EXTRACTOR_ERROR_LOG = "extractor_errors.jsonl"
 REFLEX_AUDIT_LOG = "reflex_audit.jsonl"

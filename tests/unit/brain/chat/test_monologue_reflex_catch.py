@@ -68,7 +68,7 @@ class _ReflexProvider:
         return "reflex"
 
 
-def test_search_interleaves_with_record_monologue(tmp_path: Path):
+def test_search_interleaves_with_record_monologue(tmp_path: Path, monkeypatch):
     from brain.chat.tool_loop import build_tools_list, run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
@@ -78,6 +78,16 @@ def test_search_interleaves_with_record_monologue(tmp_path: Path):
     provider = _ReflexProvider()
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+
+    # #154: pass-2 extraction now builds its own classifier-tier provider
+    # internally rather than reusing the chat provider above (this file's
+    # `provider.generate_calls` counter tracks calls made ON THAT OBJECT).
+    # Reuse this test's own `_ReflexProvider` for the classifier tier too, so
+    # the counter this test asserts on stays meaningful.
+    monkeypatch.setattr(
+        "brain.bridge.model_tier.build_tier_provider",
+        lambda _persona_dir, _tier: provider,
+    )
 
     try:
         resp, invocations = run_tool_loop(

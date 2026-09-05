@@ -202,10 +202,13 @@ _DISPATCH["record_monologue"] = _dispatch_record_monologue
 
 _WORKS_TOOLS = frozenset({"save_work", "list_works", "search_works", "read_work"})
 
-# Tools that need a live LLM provider injected (compaction summarises via the
-# provider). Routed through a dedicated path so the global injected dict stays
-# clean — existing tools never receive an unexpected ``provider`` or
-# ``session_id`` kwarg.
+# Tools that need a session_id injected (compact_history resolves which
+# session's buffer to fade). Routed through a dedicated path so the global
+# injected dict stays clean — existing tools never receive an unexpected
+# ``session_id`` kwarg. #80: these tools build their OWN provider internally
+# (see brain/tools/impls/compact_history.py) rather than requiring one
+# injected — a live provider object cannot cross the MCP dispatch path's
+# process boundary, so this set no longer gates on `provider`.
 _PROVIDER_TOOLS = frozenset({"compact_history"})
 
 
@@ -231,10 +234,16 @@ def dispatch(
     store, hebbian, persona_dir:
         Injected by the chat engine — not passed by the LLM.
     provider:
-        Live LLM provider — required only for tools in ``_PROVIDER_TOOLS``
-        (currently ``compact_history``). Optional for all other tools.
+        Currently unused/reserved — no tool in ``_PROVIDER_TOOLS`` reads it any
+        more (#80: ``compact_history`` builds its own cost-pinned provider
+        internally instead of requiring one injected, since a live provider
+        object cannot cross the MCP dispatch path's process boundary). Kept in
+        the signature only because ``tool_loop.py``'s in-process caller passes
+        it unconditionally for every tool dispatch; not required by anything.
     session_id:
-        Active session identifier — required only for ``_PROVIDER_TOOLS``.
+        Active session identifier — required only for tools in
+        ``_PROVIDER_TOOLS`` (currently ``compact_history``, to resolve which
+        session's buffer to fade).
 
     Raises
     ------
@@ -310,15 +319,12 @@ def dispatch(
             raise ToolDispatchError(f"bad arguments to tool {name!r}: {exc}") from exc
 
     if name in _PROVIDER_TOOLS:
-        if provider is None:
-            raise ToolDispatchError(f"tool {name!r} requires a provider but none was injected")
         if not session_id:
             raise ToolDispatchError(f"tool {name!r} requires a session_id but none was injected")
         try:
             return fn(
                 **arguments,
                 persona_dir=persona_dir,
-                provider=provider,
                 session_id=session_id,
             )
         except TypeError as exc:

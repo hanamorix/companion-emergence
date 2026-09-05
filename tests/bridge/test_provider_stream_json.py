@@ -19,6 +19,7 @@ frames are ignored — content_block_delta is the source of incremental text.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from brain.bridge.chat import ChatMessage, StreamDone, StreamError, TextDelta
@@ -514,6 +515,75 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
     errs = [e for e in events if isinstance(e, StreamError)]
     assert len(dones) == 1 and dones[0].content == "done"
     assert errs == [], f"result frame should terminate cleanly, got {errs}"
+
+
+# ---------------------------------------------------------------------------
+# #80 — chat_stream()'s own MCP-config construction (tools= branch)
+#
+# This is a SEPARATE code path from ClaudeCliProvider.chat()/_chat_with_mcp_tools
+# (untested here previously) — it's the one _StreamingProxy actually calls in
+# production (brain/bridge/server.py), whenever the real provider defines
+# chat_stream(), which ClaudeCliProvider does. Verifies the MCP subprocess
+# config chat_stream() writes carries session_id via NELL_MCP_SESSION_ID, the
+# same env-var mechanism _chat_with_mcp_tools uses.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_stream_with_tools_writes_session_id_into_mcp_config(tmp_path, monkeypatch):
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    captured: dict = {}
+
+    def _capture_popen(cmd, **kwargs):
+        if "--mcp-config" in cmd:
+            path = cmd[cmd.index("--mcp-config") + 1]
+            captured["config"] = json.loads(Path(path).read_text(encoding="utf-8"))
+        return _fake_popen([_result_line("ok")])
+
+    monkeypatch.setattr("brain.bridge.provider.subprocess.Popen", _capture_popen)
+
+    events = list(
+        provider.chat_stream(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "compact_history", "description": "x"}],
+            options={"persona_dir": str(persona_dir), "session_id": "sess-live-42"},
+        )
+    )
+
+    assert any(isinstance(e, StreamDone) for e in events)
+    assert "config" in captured, "chat_stream did not take the --mcp-config branch"
+    server_cfg = captured["config"]["mcpServers"]["brain-tools"]
+    assert server_cfg["env"]["NELL_MCP_SESSION_ID"] == "sess-live-42"
+
+
+def test_chat_stream_with_tools_and_no_session_id_omits_session_env(tmp_path, monkeypatch):
+    """Self-test (ST1.5f): the assertion above is discriminating, not
+    vacuously true — when options carries no session_id, the config must NOT
+    claim one."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    captured: dict = {}
+
+    def _capture_popen(cmd, **kwargs):
+        if "--mcp-config" in cmd:
+            path = cmd[cmd.index("--mcp-config") + 1]
+            captured["config"] = json.loads(Path(path).read_text(encoding="utf-8"))
+        return _fake_popen([_result_line("ok")])
+
+    monkeypatch.setattr("brain.bridge.provider.subprocess.Popen", _capture_popen)
+
+    list(
+        provider.chat_stream(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "compact_history", "description": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+    )
+
+    server_cfg = captured["config"]["mcpServers"]["brain-tools"]
+    assert "env" not in server_cfg
 
 
 def test_chat_stream_empty_result_falls_back_to_streamed_text():

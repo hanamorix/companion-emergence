@@ -37,6 +37,22 @@ def test_entry_with_request_id_carries_audit_env_and_safe_path(tmp_path: Path) -
     assert entry["args"][:3] == ["-P", "-m", "brain.mcp_server"]
 
 
+def test_entry_with_session_id_only_carries_session_env(tmp_path: Path) -> None:
+    """#80: session_id crosses the process boundary the same way request_id
+    does (its own env key, NELL_MCP_SESSION_ID)."""
+    entry = brain_tools_mcp_entry(tmp_path / "persona", session_id="sess-42")
+    assert entry["env"] == {"NELL_MCP_SESSION_ID": "sess-42"}
+
+
+def test_entry_with_both_request_id_and_session_id_carries_both_env_keys(tmp_path: Path) -> None:
+    """#80: request_id and session_id are additive — neither clobbers the other."""
+    entry = brain_tools_mcp_entry(tmp_path / "persona", request_id="abc123", session_id="sess-42")
+    assert entry["env"] == {
+        "NELL_MCP_AUDIT_REQUEST_ID": "abc123",
+        "NELL_MCP_SESSION_ID": "sess-42",
+    }
+
+
 def test_safe_path_precedes_the_m_flag(tmp_path: Path) -> None:
     args = brain_tools_mcp_entry(tmp_path / "p")["args"]
     assert args.index("-P") < args.index("-m"), "-P must precede -m or CPython ignores it"

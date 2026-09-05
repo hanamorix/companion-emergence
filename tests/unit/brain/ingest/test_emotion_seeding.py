@@ -113,7 +113,8 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
             provider=None,  # provider not reached — patched above
         )
 
-    assert report.committed >= 1
+    assert report.committed == 0
+    assert report.enqueued >= 1
     assert len(report.memory_ids) >= 1
 
     # The gated "feeling" candidate is enqueued; promote it into memories.db so

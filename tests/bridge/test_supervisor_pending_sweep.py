@@ -36,6 +36,13 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider, and calls the LLM unconditionally before its
+    # own evidence gate — a real-subprocess hazard on this bare tmp_path
+    # persona (no persona_config.json); not about this test, neutralise it.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     # Watchdog: if the sweep never fires, stop the loop after a short window so
     # the test fails on the assertion below rather than hanging forever.
@@ -50,6 +57,14 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call) —
+        # disabled, out of scope for this pending-sweep-focused test. The
+        # 3s watchdog above does not save this: a blocking subprocess call
+        # inside one iteration isn't interrupted by stop_event until that
+        # call returns.
+        interest_sweep_interval_s=None,
     )
 
     assert len(sweep_calls) >= 1

@@ -9,6 +9,7 @@ through the same dispatch the chat engine already uses.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -62,12 +63,19 @@ def register_tools(
         name: str, arguments: dict[str, Any]
     ) -> list[TextContent | ImageContent]:
         try:
+            # #80: session_id crosses the parent->claude-CLI->mcp_server process
+            # boundary via env var (NELL_MCP_SESSION_ID, set by
+            # brain_tools_mcp_entry — mirrors NELL_MCP_AUDIT_REQUEST_ID below).
+            # Harmless for every tool outside dispatch()'s _PROVIDER_TOOLS set,
+            # which is the only consumer of this kwarg.
+            session_id = os.environ.get("NELL_MCP_SESSION_ID") or None
             result = dispatch(
                 name,
                 arguments,
                 store=store,
                 hebbian=hebbian,
                 persona_dir=persona_dir,
+                session_id=session_id,
             )
             # Viewable-image result: read_file (and any future image-returning
             # tool) signals an image with a structured `image` key. Emit an MCP

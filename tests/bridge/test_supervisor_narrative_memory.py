@@ -49,6 +49,13 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
     monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider, and calls the LLM unconditionally before its
+    # own evidence gate — a real-subprocess hazard on this bare tmp_path
+    # persona (no persona_config.json); not about this test, neutralise it.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     provider = MagicMock()
     event_bus = MagicMock()
@@ -62,6 +69,12 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # narrative-memory-focused test.
+        interest_sweep_interval_s=None,
     )
 
     # Forgetting must precede arc_update inside the same cadence tick.
@@ -98,6 +111,13 @@ def test_supervisor_arc_update_failure_is_isolated(
     )
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider, and calls the LLM unconditionally before its
+    # own evidence gate — a real-subprocess hazard on this bare tmp_path
+    # persona (no persona_config.json); not about this test, neutralise it.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
     soul_review_calls: list[int] = [0]
     stop_event = threading.Event()
@@ -122,6 +142,12 @@ def test_supervisor_arc_update_failure_is_isolated(
         heartbeat_interval_s=None,
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # narrative-memory-focused test.
+        interest_sweep_interval_s=None,
     )
 
     # Soul-review kept running even though arc-update raised each tick.

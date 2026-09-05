@@ -31,8 +31,10 @@ from brain.memory.store import MemoryStore
 # type, so commit_item now writes via route_write → PendingQueue.enqueue, NOT
 # store.create. The P0 loss-prevention contract is unchanged (a failed write
 # still makes commit_item return None → commit_failure → buffer/cursor held),
-# but the failure must be injected at enqueue, and the committed candidate lands
-# in the pending queue rather than memories.db. These tests patch
+# but the failure must be injected at enqueue, and the enqueued candidate lands
+# in the pending queue rather than memories.db (#167: report.enqueued counts
+# this, not report.committed — committed means a durable memories.db write,
+# which a gated label like "fact" can never produce). These tests patch
 # PendingQueue.enqueue and assert queue end-state accordingly.
 
 _real_enqueue = PendingQueue.enqueue
@@ -300,8 +302,9 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
                 embeddings=embeddings,
             )
 
-        assert report2.committed >= 1, "pass 2 must commit the memory (not dedup it away)"
-        # "Committed" now means enqueued as a candidate; the memory must be
+        assert report2.committed == 0, "gated label never durably commits (#167)"
+        assert report2.enqueued >= 1, "pass 2 must enqueue the memory (not dedup it away)"
+        # A "fact" label is gated (#167: enqueued, not committed); the memory must be
         # findable in the pending queue after pass 2 (not memories.db).
         queued = PendingQueue(persona_dir).read_recent("fact", limit=5)
         assert any(item_text in (m.content or "") for m in queued), (
@@ -453,7 +456,8 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
                 embeddings=embeddings,
             )
 
-        assert report2.committed >= 1, "pass 2 must commit at least item 1"
+        assert report2.committed == 0, "gated label never durably commits (#167)"
+        assert report2.enqueued >= 1, "pass 2 must enqueue at least item 1"
         assert report2.commit_failures == 0, "pass 2 must have no commit failures"
 
         # Final assertion: exactly 3 distinct candidates in the queue, no dups.

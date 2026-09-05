@@ -57,7 +57,12 @@ from brain.bridge.chat import (
     TextDelta,
 )
 from brain.bridge.events import EventBus
-from brain.bridge.provider import LLMProvider, ProviderError, get_provider
+from brain.bridge.model_tier import (
+    TIER_BACKGROUND_HOUSEKEEPING,
+    build_interactive_chat_provider,
+    build_tier_provider,
+)
+from brain.bridge.provider import LLMProvider, ProviderError
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
@@ -873,8 +878,14 @@ def build_app(
         # Each worker thread / handler opens its own per-call stores against
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
-        config = PersonaConfig.load(persona_dir / "persona_config.json")
-        provider = get_provider(config.provider, persona_dir=persona_dir)
+        #
+        # TIER_INTERACTIVE_CHAT (#154) — routed through the model-tier accessor,
+        # but via `build_interactive_chat_provider` specifically (not the plain
+        # `build_tier_provider` every other tier uses): this is the one real
+        # call site that must keep honoring a persona's own `persona_config.json`
+        # `.model` field rather than forcing the tier's nominal model — see
+        # `brain/bridge/model_tier.py`'s docstring on that function for why.
+        provider = build_interactive_chat_provider(persona_dir)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())
@@ -2875,6 +2886,7 @@ def build_app(
             "session_snapshot",
             session_id=sid,
             committed=report.committed,
+            enqueued=report.enqueued,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
             soul_queue_errors=report.soul_queue_errors,
@@ -2884,6 +2896,7 @@ def build_app(
             "session_id": sid,
             "closed": False,
             "committed": report.committed,
+            "enqueued": report.enqueued,
             "deduped": report.deduped,
             "soul_candidates": report.soul_candidates,
             "soul_queue_errors": report.soul_queue_errors,
@@ -2931,7 +2944,7 @@ def build_app(
                     _close_session_blocking,
                     s.persona_dir,
                     sid,
-                    s.provider,
+                    build_tier_provider(s.persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                 )
             except Exception as exc:
                 logger.exception("close_session failed session=%s", sid)
@@ -2939,6 +2952,7 @@ def build_app(
                     "session_close_failed",
                     session_id=sid,
                     committed=0,
+                    enqueued=0,
                     deduped=0,
                     soul_candidates=0,
                     soul_queue_errors=0,
@@ -2955,6 +2969,7 @@ def build_app(
                         "session_id": sid,
                         "closed": False,
                         "committed": 0,
+                        "enqueued": 0,
                         "deduped": 0,
                         "soul_candidates": 0,
                         "soul_queue_errors": 0,
@@ -2967,6 +2982,7 @@ def build_app(
                     "session_close_failed",
                     session_id=sid,
                     committed=report.committed,
+                    enqueued=report.enqueued,
                     deduped=report.deduped,
                     soul_candidates=report.soul_candidates,
                     soul_queue_errors=report.soul_queue_errors,
@@ -2984,6 +3000,7 @@ def build_app(
                         "session_id": sid,
                         "closed": False,
                         "committed": report.committed,
+                        "enqueued": report.enqueued,
                         "deduped": report.deduped,
                         "soul_candidates": report.soul_candidates,
                         "soul_queue_errors": report.soul_queue_errors,
@@ -2999,6 +3016,7 @@ def build_app(
             "session_closed",
             session_id=sid,
             committed=report.committed,
+            enqueued=report.enqueued,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
             soul_queue_errors=report.soul_queue_errors,
@@ -3008,6 +3026,7 @@ def build_app(
             "session_id": sid,
             "closed": True,
             "committed": report.committed,
+            "enqueued": report.enqueued,
             "deduped": report.deduped,
             "soul_candidates": report.soul_candidates,
             "soul_queue_errors": report.soul_queue_errors,

@@ -16,6 +16,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
 
+from brain.bridge.model_tier import (
+    TIER_BACKGROUND_CLASSIFIER,
+    TIER_BACKGROUND_GENERATIVE,
+    TIER_BACKGROUND_HOUSEKEEPING,
+    build_tier_provider,
+)
 from brain.bridge.provider import LLMProvider
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
@@ -499,7 +505,7 @@ class HeartbeatEngine:
                 run_consolidation(
                     self.store,
                     persona_dir=persona_dir,
-                    provider=self.provider,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
                     hebbian=self.hebbian,
                 )
             except Exception:  # noqa: BLE001
@@ -560,7 +566,7 @@ class HeartbeatEngine:
             config, dream_id, edges_pruned, memories_decayed
         ):
             heartbeat_memory_id = self._emit_heartbeat_memory(
-                elapsed_seconds, memories_decayed, edges_pruned, dream_id
+                elapsed_seconds, memories_decayed, edges_pruned, dream_id, persona_dir
             )
 
         # Compute pending alarms (always, before writing audit log).
@@ -694,7 +700,13 @@ class HeartbeatEngine:
         return pruned
 
     def _try_fire_dream(self) -> str | None:
-        """Run one DreamEngine cycle; return the new dream memory id or None."""
+        """Run one DreamEngine cycle; return the new dream memory id or None.
+
+        dream is `background-generative` tier (routed through the model-tier
+        accessor, #154) — same model (`MODEL_MEDIUM`) `self.provider` already
+        resolves to today, so this is a routing-only change, not a model
+        change. Same applies to `_try_fire_reflex` and `_try_fire_research`
+        below. See `brain/bridge/model_tier.py`'s module docstring."""
         # Lazy import to avoid module-level circular dependency with dream.py
         from brain.engines.dream import DreamEngine, NoSeedAvailable
         from brain.soul.store import SoulStore
@@ -705,7 +717,7 @@ class HeartbeatEngine:
             store=self.store,
             hebbian=self.hebbian,
             embeddings=None,
-            provider=self.provider,
+            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
             log_path=self.dream_log_path,
             persona_dir=persona_dir,
             persona_name=self.persona_name,
@@ -741,9 +753,11 @@ class HeartbeatEngine:
             return ((), 0, None)
         from brain.engines.reflex import ReflexEngine
 
+        # Non-None past the guard above — safe to derive persona_dir here.
+        persona_dir = self.reflex_arcs_path.parent
         engine = ReflexEngine(
             store=self.store,
-            provider=self.provider,
+            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
             persona_name=self.persona_name,
             persona_system_prompt=self.persona_system_prompt,
             arcs_path=self.reflex_arcs_path,
@@ -888,10 +902,12 @@ class HeartbeatEngine:
 
         from brain.engines.research import ResearchEngine
 
+        # Non-None past the guard above — safe to derive persona_dir here.
+        persona_dir = self.interests_path.parent
         try:
             engine = ResearchEngine(
                 store=self.store,
-                provider=self.provider,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
                 searcher=self.searcher,
                 persona_name=self.persona_name,
                 persona_system_prompt=self.persona_system_prompt,
@@ -929,10 +945,20 @@ class HeartbeatEngine:
         memories_decayed: int,
         edges_pruned: int,
         dream_id: str | None,
+        persona_dir: Path,
     ) -> str:
-        """Generate and persist a HEARTBEAT: memory via the LLM provider."""
+        """Generate and persist a HEARTBEAT: memory via the LLM provider.
+
+        `background-housekeeping` tier (Haiku) — a newly-decided tier
+        assignment (#154), NOT a routing-only change: this used to reuse
+        `self.provider` (Sonnet). A HEARTBEAT: memory is a cheap, templated
+        one-liner (elapsed/decay/dream-fired stats), closer in kind to the
+        other housekeeping ticks (session snapshot/finalize) than to the
+        persona-voice generative sites (dream/reflex/research).
+        """
         from brain.memory.store import Memory
 
+        provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
         system = (
             f"You are {self.persona_name}. You just finished a background "
             "heartbeat cycle — decay applied, memory graph tended. Reflect in "
@@ -943,7 +969,7 @@ class HeartbeatEngine:
             f"memories_decayed={memories_decayed}, edges_pruned={edges_pruned}, "
             f"dream_fired={'yes' if dream_id else 'no'}"
         )
-        raw = self.provider.generate(user, system=system)
+        raw = provider.generate(user, system=system)
         text = raw if raw.startswith("HEARTBEAT:") else f"HEARTBEAT: {raw}"
         mem = Memory.create_new(
             content=text,
@@ -954,7 +980,7 @@ class HeartbeatEngine:
                 "memories_decayed": memories_decayed,
                 "edges_pruned": edges_pruned,
                 "dream_id": dream_id,
-                "provider": self.provider.name(),
+                "provider": provider.name(),
             },
         )
         from brain.memory.pending import route_write
@@ -1238,8 +1264,12 @@ class HeartbeatEngine:
                     compose_draft_fragment,
                 )
 
+                # `background-housekeeping` tier (Haiku) — a newly-decided tier
+                # assignment (#154), NOT routing-only: a quiet, observational
+                # draft-space fragment is closer in kind to the housekeeping
+                # ticks than to persona-voice generative content.
                 body = compose_draft_fragment(
-                    self.provider,
+                    build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
                     source="emotion_spike",
                     source_id=f"emotion_{tick_count}",
                     linked_memory_excerpts=[],

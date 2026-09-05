@@ -15,7 +15,8 @@ gate lock serialises them — a contended run SKIPS (the next tick catches up), 
 the one non-idempotent action (merge into a committed memory) is never double-folded.
 
 Pass 2 uses a classifier: tests inject a stub; production builds a Haiku-backed one
-from the heartbeat provider. The classifier's *decision quality* is advisory
+from a `TIER_BACKGROUND_CLASSIFIER` provider the caller constructs (#154) — no longer
+the shared heartbeat/chat provider. The classifier's *decision quality* is advisory
 (magnitude/quality deferred to the monologue-volume tune); the gate MECHANISM
 (dispatch on the verdict) is what the gating criteria verify.
 """

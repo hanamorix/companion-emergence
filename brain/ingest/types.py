@@ -75,16 +75,28 @@ class IngestReport:
     Attributes:
         session_id:      The closed session's identifier.
         extracted:       Total candidate items returned by the LLM.
-        committed:       Items that passed dedupe + were written to the store.
+        committed:       Items durably written to memories.db (bypasses the pending-candidate
+                         gate — memory_type/label in brain.memory.pending.GATE_BYPASS_TYPES).
+                         #167: for conversation-ingest specifically this is currently always 0
+                         — the extractor's VALID_LABELS and GATE_BYPASS_TYPES are disjoint by
+                         design, so no conversation-ingest item can ever land in this bucket
+                         today. The field/branch exists for correctness and consistency with
+                         route_write()'s general (multi-caller) contract, not because real
+                         conversation traffic exercises it.
+        enqueued:        Items enqueued as pending candidates (gated types; not yet in
+                         memories.db — see brain/memory/pending.py). This is what "committed"
+                         used to (incorrectly) count for every conversation-ingest item; #167.
         deduped:         Items skipped because they matched an existing memory.
         soul_candidates: Items queued to soul_candidates.jsonl (importance >= threshold).
         errors:          Items that failed the commit step.
-        memory_ids:      IDs of newly created memories (committed items only).
+        memory_ids:      IDs of newly created memories (both durably committed and
+                         enqueued-candidate ids).
     """
 
     session_id: str
     extracted: int = 0
     committed: int = 0
+    enqueued: int = 0
     deduped: int = 0
     soul_candidates: int = 0
     soul_queue_errors: int = 0

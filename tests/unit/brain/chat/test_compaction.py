@@ -17,6 +17,19 @@ Also maps to changes/compaction-defects-fix/1.5-criteria.md:
   C-B2  _render_sections emits oldest->newest; _SECTION_ORDER unchanged (Bug 2)
   C-B3  compact_conversation archive-append is idempotent under a crash-retry
         (Bug 3, commit-marker design)
+
+Also maps to changes/fix-77-refusal-verb-broadening/1.5-criteria.md (issue #77, the
+explicit-refusal-verb backstop, _REFUSAL_VERB):
+  I77-C1   the confirmed evader is now rejected
+  I77-C2   hedge/legitimate first-person outputs (incl. the round-1/round-2
+           red-team break-attempt strings) still accepted -- non-regression
+  I77-C2b  the owner-ratified accepted residual (produce/write/proceed used
+           in an ordinary non-task sense) is still rejected, documented
+  I77-C3   already-caught refusal shapes (_REFUSAL_LEAD/_META_FRAME/
+           _CONTENT_ABSENCE) still rejected -- non-regression
+  I77-C4a  compact_conversation persist path: evader routes to the safe
+           fallback, not verbatim storage (see test_cascade_compaction.py
+           for the I77-C4b cascade/_fold_into_section counterpart)
 """
 
 from __future__ import annotations
@@ -502,6 +515,124 @@ def test_c1c_validator_rejects_content_absence_family_accepts_hedges() -> None:
         assert _META_FRAME.match(s) is None
         assert _REFUSAL_LEAD.match(s) is None
         assert _FIRST_PERSON.search(s) is not None
+
+
+# --------------------------------------------------------------------------- I77
+_I77_EVADER = (
+    "I'm not going to produce this memory update. I don't have enough context "
+    "to write a faithful summary here, and I won't proceed without it."
+)
+
+
+def test_i77_c1_confirmed_evader_rejected() -> None:
+    """#77 issue-77-confirm-pass: the confirmed evader (reproduced live through
+    both real persist paths by the dragonfly hunt) must now be rejected by
+    _validate_fold_output -- pre-D3 code accepted it verbatim (the H6
+    able-to-fail check for this test is recorded in
+    changes/fix-77-refusal-verb-broadening/decisions.md / 8-harness.md)."""
+    assert _validate_fold_output(_I77_EVADER) is None
+
+
+def test_i77_c2_hedge_and_legitimate_first_person_still_accepted() -> None:
+    """1.5-criteria.md C2 (GATING, critical): none of these may flip to
+    rejected. Items 1-6 are the owner-brief hedge/plain-recall table; items
+    7-10 are the exact stage-3 round-1 red-team break-attempt strings (three
+    idioms + a refuse-to idiom) and item 11 a third-party sentence, all of
+    which broke the FIRST _REFUSAL_VERB draft -- re-running them here is the
+    direct empirical proof the FINAL (round-3, owner-ratified) regex closes
+    that MAJOR finding."""
+    accept_table = [
+        "I don't have the full picture, but I remember Bob mentioned the deadline moved.",
+        "I'm not sure about the exact date, but we discussed the migration.",
+        "I recall we talked about X; I don't remember every detail.",
+        "I remember we talked about the weekend plans and decided to meet on Saturday.",
+        "I recall Bob mentioning a new project idea and feeling excited about it.",
+        "I remember the conversation about the budget going long, and we agreed to "
+        "revisit it next week.",
+        # Round-1 break-attempt strings (idioms) -- must NOT match the verb-paired regex.
+        "I'm not going to lie, that conversation was rough, but I remember we worked "
+        "through it together.",
+        "I'm not going to pretend I understood everything, but I recall the gist of "
+        "what we discussed.",
+        "I'm not going to forget the moment Bob told me about the promotion.",
+        # NOTE: the round-1 reviewer's literal string here, "I refuse to let that
+        # moment fade from memory.", was tested by the reviewer against the
+        # standalone _REFUSAL_VERB regex only (not the full validator pipeline).
+        # It turns out to ALREADY be rejected pre-D3 by the pre-existing, anchored
+        # _REFUSAL_LEAD predicate (`^\s*...i\s+refuse\b`, unrelated to this
+        # change) purely because it opens with "I refuse" -- i.e. it was never a
+        # valid D3 non-regression case. Rephrased (mid-sentence, so the
+        # pre-existing anchor doesn't fire) to actually test D3's unanchored
+        # "refuse to VERB" behavior in isolation from that pre-existing rule:
+        "Looking back, I refuse to let that moment fade from memory.",
+        # Round-1 break-attempt string (third-party, pronoun-less "not going to produce").
+        "I remember Bob saying the team was not going to produce a written report, "
+        "so I offered to write one myself.",
+    ]
+    for s in accept_table:
+        assert _validate_fold_output(s) == s, f"expected accept, got reject: {s!r}"
+
+
+def test_i77_c2b_owner_ratified_residual_still_rejected() -> None:
+    """1.5-criteria.md C2b (ADVISORY): the FINAL regex, trimmed to exactly the
+    owner's three named objects (produce/write/proceed), still false-positives
+    on these four strings -- an owner-ratified, documented, accepted residual
+    (see changes/fix-77-refusal-verb-broadening/decisions.md's SEV4-cap entry
+    and the round-2 red-team break-attempt that surfaced them). This is
+    BENIGN (falls to the existing safe fallback, not corruption -- see
+    test_i77_c4a_compact_conversation_evader_falls_soft for the fallback
+    mechanism), so it is pinned here as CURRENT, intentional behavior, not
+    chased further."""
+    residual = [
+        "I recall telling Bob I won't proceed without checking with him first, "
+        "and he understood.",
+        "I'm not going to proceed with the changes until I hear back from the team.",
+        "I'm not going to write this down anywhere, I'll just carry the memory with me.",
+        "I will not produce that children's book until the illustrations are "
+        "finished, Bob said.",
+    ]
+    for s in residual:
+        assert _validate_fold_output(s) is None, f"expected reject (residual), got accept: {s!r}"
+
+
+def test_i77_c3_already_caught_shapes_still_rejected() -> None:
+    """1.5-criteria.md C3 (GATING): representative _REFUSAL_LEAD/_META_FRAME
+    members still rejected -- D3 is purely additive, no regression on the
+    pre-existing predicates. (_CONTENT_ABSENCE's own reject family is
+    re-verified unmodified by test_c1c_... above.)"""
+    already_caught = [
+        "I won't help with that request.",
+        "As an AI, I cannot fold this memory.",
+        "Here is the summary: nothing happened.",
+        "Summary: the conversation continued.",
+    ]
+    for s in already_caught:
+        assert _validate_fold_output(s) is None, f"expected reject, got accept: {s!r}"
+
+
+def test_i77_c4a_compact_conversation_evader_falls_soft(tmp_path: Path) -> None:
+    """1.5-criteria.md C4 (GATING), compact_conversation half: driving the
+    confirmed evader through the REAL persist path (not a re-implementation)
+    results in the safe truncation fallback, and the evader text is NOT
+    stored verbatim. See test_cascade_compaction.py's
+    test_i77_c4b_cascade_evader_falls_soft for the cascade/_fold_into_section
+    counterpart (C4 requires BOTH paths, widened post round-1's Lens-2 minor
+    finding)."""
+    sid = "sess_i77_c4a"
+    base = datetime.now(UTC) - timedelta(hours=10)
+    tss = _seed(tmp_path, sid, 20, base=base)
+    write_cursor(tmp_path, sid, tss[-1])
+    res = compact_conversation(
+        tmp_path, sid, older_than=timedelta(hours=1), fold_existing_summary=False,
+        provider=_StubProvider(_I77_EVADER), min_keep_tail=5,
+    )
+    assert res.compacted is True
+    assert res.fell_soft is True
+    after = read_session(tmp_path, sid)
+    summaries = _summary_rows(after)
+    assert len(summaries) == 1
+    assert _I77_EVADER not in summaries[0]["text"]
+    assert "[truncated" in summaries[0]["text"]
 
 
 # --------------------------------------------------------------------------- C-B2

@@ -187,7 +187,8 @@ def test_c10_finalize_no_delete_interleave(tmp_path: Path) -> None:
             embeddings=embeddings,
         )
         assert len(reports) == 1
-        assert reports[0].committed == 1
+        assert reports[0].committed == 0
+        assert reports[0].enqueued == 1
         assert provider.extract_calls == 1
         # Extraction ran (a memory landed) AND the buffer was NOT deleted —
         # this is the exact assertion that fails against the pre-change

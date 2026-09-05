@@ -308,15 +308,42 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
 
     for tool_name in _DISPATCH:
         if tool_name in _PROVIDER_TOOLS:
-            # Provider tools require a live LLM provider injected via the
-            # _PROVIDER_TOOLS path — they are exercised in the compaction
-            # integration tests, not here.
+            # #80: these tools require a session_id injected via the
+            # _PROVIDER_TOOLS path (and build their own provider internally,
+            # so no live provider is needed) — exercised in the compaction
+            # integration tests and test_dispatch_provider_tools_* below, not
+            # in this generic minimal-args smoke loop.
             continue
         args = minimal_args.get(tool_name, {})
         result = dispatch(tool_name, args, **ctx)
         assert isinstance(result, dict) or isinstance(result, list), (
             f"{tool_name} did not return a dict or list"
         )
+
+
+# ---------------------------------------------------------------------------
+# _PROVIDER_TOOLS gate (#80 — session_id required, provider no longer is)
+# ---------------------------------------------------------------------------
+
+
+def test_provider_tools_requires_session_id_not_provider(tmp_path: Path) -> None:
+    """#80: dispatch() must reject a _PROVIDER_TOOLS call missing session_id,
+    but must NOT require `provider` any more — compact_history builds its own
+    cost-pinned provider internally (it can't accept an injected one; a live
+    provider object can't cross the MCP dispatch path's process boundary)."""
+    ctx = _make_ctx(tmp_path)
+
+    # No session_id at all -> still loud, not a silent no-op (C2).
+    with pytest.raises(ToolDispatchError, match="session_id"):
+        dispatch("compact_history", {"age_hours": 1}, **ctx)
+
+    # session_id present, NO provider kwarg passed at all -> dispatch must not
+    # demand one (this is the C1/C3 gate-level assertion; compact_history's
+    # own behavior with a real/fake persona is covered in the compaction
+    # integration tests).
+    result = dispatch("compact_history", {"age_hours": 1}, session_id="sess-1", **ctx)
+    assert isinstance(result, dict)
+    assert "compacted" in result
 
 
 def test_dispatch_list_open_arcs(tmp_path):
