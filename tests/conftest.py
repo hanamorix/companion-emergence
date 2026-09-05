@@ -26,6 +26,23 @@ def _reset_cli_throttle() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep build_app's lifespan from starting the supervisor + migration threads.
+
+    Every bridge endpoint test enters build_app's lifespan; the real supervisor
+    thread it started ran a startup catch-up compaction that rolled over the
+    months-old session the test had just seeded and deleted its buffer, racing
+    the test's own request (hunts/bridge-order-pollution-flakes/diagnosis.md —
+    #155, #161, and the c8 / WinError-32 CI reds). Mirrors _reset_pass2_queue:
+    tests that genuinely exercise those threads pass background_threads=True.
+    """
+    from brain.bridge import server
+
+    # raising=False: a bisect onto a pre-flag commit must not error every test at setup.
+    monkeypatch.setattr(server, "_background_threads_inhibited", True, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_pass2_queue() -> Iterator[None]:
     """Reset pass2_queue global state before and after each test.
 

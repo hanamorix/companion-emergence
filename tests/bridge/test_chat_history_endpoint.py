@@ -214,3 +214,66 @@ def test_history_early_break_closes_reader_generator(
         r = c.get("/chat/history", params={"session_id": "s_close", "before_turn": 3})
     assert r.status_code == 200
     assert closed["v"], "endpoint abandoned the buffer reader without closing it"
+
+
+# --------------------------------------------------------------------------- rollover pointer
+# hunts/bridge-order-pollution-flakes/diagnosis.md: /chat/history read the old buffer path
+# directly and returned [] after a rollover deleted it, unlike /chat which follows the
+# rolled_to pointer. Criteria C3 / C3b.
+
+
+def _two_turns(sid: str) -> list[dict]:
+    return [
+        {"session_id": sid, "speaker": "user", "text": "hi", "ts": "2026-05-20T10:00:00Z"},
+        {"session_id": sid, "speaker": "assistant", "text": "hello", "ts": "2026-05-20T10:00:05Z"},
+    ]
+
+
+def test_history_follows_rollover_pointer(persona_dir: Path) -> None:
+    from brain.chat.rollover import perform_rollover
+
+    _seed_buffer(persona_dir, "s_a", _two_turns("s_a"))
+    new_sid = perform_rollover(persona_dir, "s_a", persona_dir.name, seed_mode="tiers_plus_tail")
+    assert new_sid is not None
+    assert not (persona_dir / "active_conversations" / "s_a.jsonl").exists()
+
+    with _make_client(persona_dir) as c:
+        r = c.get("/chat/history", params={"session_id": "s_a"})
+    assert r.status_code == 200
+    body = r.json()
+    assert [m["content"] for m in body["messages"]] == ["hi", "hello"]
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+
+
+def test_history_cyclic_pointer_falls_back_and_warns(persona_dir: Path, caplog) -> None:
+    import logging
+
+    _seed_buffer(persona_dir, "s_a", _two_turns("s_a"))
+    (persona_dir / "active_conversations" / "s_a.rolled_to").write_text(
+        '{"successor": "s_a"}', encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.bridge.server"):
+        with _make_client(persona_dir) as c:
+            r = c.get("/chat/history", params={"session_id": "s_a"})
+    assert r.status_code == 200
+    assert len(r.json()["messages"]) == 2  # falls back to the request sid's own buffer
+    assert any(
+        rec.name == "brain.bridge.server" and "rolled_to" in rec.getMessage() for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+
+
+def test_history_invalid_successor_falls_back_and_warns(persona_dir: Path, caplog) -> None:
+    import logging
+
+    _seed_buffer(persona_dir, "s_a", _two_turns("s_a"))
+    (persona_dir / "active_conversations" / "s_a.rolled_to").write_text(
+        '{"successor": "../x"}', encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING):
+        with _make_client(persona_dir) as c:
+            r = c.get("/chat/history", params={"session_id": "s_a"})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["messages"]) == 2
+    names = {rec.name for rec in caplog.records if rec.levelno >= logging.WARNING}
+    assert "brain.chat.session" in names, names  # the walk itself caught the bad successor
+    assert "brain.bridge.server" in names, names
