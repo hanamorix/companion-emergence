@@ -22,7 +22,10 @@ Every bug, feature, or chunk of work gets an issue in the Issues tab.
 - **Before starting work**, check the Issues tab for anything related. If it exists, assign yourself (Assignees field, right sidebar). If it doesn't, open one and assign yourself.
 - **If an issue is assigned to the other person, don't start work on it** without talking first. They might be mid-thought on it even if there's no PR yet.
 - **Labels are optional** but `bug`, `enhancement`, and `question` are worth using so we can filter.
-- **Closing:** if your PR fixes an issue, put `Fixes #12` in the PR description. GitHub auto-closes the issue when the PR merges.
+- **Closing:** put a `Closes #12` line in the PR **description** — one per issue the PR resolves. GitHub auto-closes each when the PR merges. Three things that have bitten us:
+  - **One keyword per issue.** `Closes #12` closes #12; a prose list like "#12/#13" closes nothing. Two issues → two lines.
+  - **Squash-merge only reads the PR description,** not commit messages — so the `Closes` lines have to be in the PR body, not in a commit.
+  - **Check after merging** that each issue actually closed; manually close any that slipped through. (`Fixes` and `Resolves` work the same as `Closes`.)
 - **Out-of-scope follow-ups get their own issue, not a PR note.** If you notice separate follow-up work while doing a PR (a related bug, a deferred cleanup, a "should also do X later"), open an issue for it. A note buried in a PR description disappears once the PR merges; an issue stays on the board.
 
 ## Branches: never commit to main
@@ -120,4 +123,4 @@ If it's a decision that affects the code or the plan, it belongs in an issue or 
 | Mark work as ready | Click "Ready for review" on the draft PR |
 | Catch up to main | `git checkout main && git pull && git checkout your-branch && git merge main` |
 | Claim an issue | Assign yourself in the right sidebar of the issue |
-| Link a PR to an issue | Put `Fixes #N` in the PR description |
+| Close an issue with a PR | One `Closes #N` line per issue, in the PR description (squash-merge ignores commit-message keywords) |

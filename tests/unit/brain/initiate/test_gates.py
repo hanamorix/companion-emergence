@@ -14,6 +14,14 @@ from brain.initiate.gates import (
 )
 from brain.initiate.schemas import AuditRow
 
+# A fixed non-UTC zone (not the host's OS timezone): check_send_allowed treats a
+# non-zero offset as already user-local and reads the wall-clock hour directly,
+# whereas tzinfo=UTC is re-converted via .astimezone() to whatever timezone the
+# test host runs in — so a "safe noon" could land inside the 23-07 blackout on
+# a UTC+12..+14 or UTC-10..-12 runner (#143, same pattern as #142).
+_LOCAL = ZoneInfo("America/Los_Angeles")
+
+
 
 def _delivered_row(audit_id: str, ts: str, urgency: str = "send_quiet") -> AuditRow:
     row = AuditRow(
@@ -61,7 +69,7 @@ def test_count_recent_sends_filters_by_urgency_and_window(tmp_path: Path) -> Non
 
 
 def test_check_send_allowed_passes_when_under_cap(tmp_path: Path) -> None:
-    now = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 11, 12, 0, tzinfo=_LOCAL)  # local noon, see _LOCAL
     allowed, reason = check_send_allowed(tmp_path, urgency="quiet", now=now)
     assert allowed is True
     assert reason is None
@@ -78,7 +86,7 @@ def test_check_send_allowed_blocks_notify_in_blackout(tmp_path: Path) -> None:
 
 
 def test_check_send_allowed_blocks_when_notify_cap_reached(tmp_path: Path) -> None:
-    now = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 11, 12, 0, tzinfo=_LOCAL)  # local noon, see _LOCAL
     for i in range(3):
         append_audit_row(
             tmp_path,
@@ -94,7 +102,7 @@ def test_check_send_allowed_blocks_when_notify_cap_reached(tmp_path: Path) -> No
 
 
 def test_check_send_allowed_blocks_when_min_gap_not_met(tmp_path: Path) -> None:
-    now = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 11, 12, 0, tzinfo=_LOCAL)  # local noon, see _LOCAL
     append_audit_row(
         tmp_path,
         _delivered_row(

@@ -18,8 +18,14 @@ def _make_client(persona_dir: Path, auth_token: str | None = None) -> TestClient
 
 
 def _patch_fake_provider(monkeypatch):
-    """Replace get_provider so bridge lifespan doesn't need a real LLM."""
-    import brain.bridge.server as srv
+    """Replace get_provider so bridge lifespan doesn't need a real LLM.
+
+    Patches brain.bridge.provider.get_provider (the SOURCE module) —
+    server.py's lifespan no longer imports get_provider directly since #154's
+    completion; it calls model_tier.build_interactive_chat_provider, which
+    does its own function-scoped import of get_provider from this module.
+    """
+    import brain.bridge.provider as _provider_module
     from brain.bridge.chat import ChatResponse
 
     class _FakeProvider:
@@ -36,7 +42,7 @@ def _patch_fake_provider(monkeypatch):
         def extract_memories(self, *args, **kwargs):
             return []
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name=None, **_kw: _FakeProvider())
+    monkeypatch.setattr(_provider_module, "get_provider", lambda _name=None, **_kw: _FakeProvider())
 
 
 def _auth_headers(token: str | None = None) -> dict[str, str]:

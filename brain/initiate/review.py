@@ -377,13 +377,23 @@ def run_initiate_review_tick(
         voice_template = voice_template_path.read_text(encoding="utf-8")
     tick_id = f"t_{now.strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(2)}"
 
+    # #154: the D-reflection gate is a classification/decision pass and must run on
+    # Haiku, independent of `provider` (which feeds the compose pipeline below and
+    # must stay on the persona's chat-quality model). Built fully internally, from
+    # `persona_dir` (already this function's own first parameter) — no new parameter
+    # is added anywhere in this chain (see the four-round history in this project's
+    # guarded-change decisions log for why that matters here specifically).
+    from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
+
+    gate_provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
+
     deps = ReflectionDeps(
         companion_name=companion_name,
         user_name=user_name,
         voice_template_path=voice_template_path,
         outbound_recall_block=outbound_block,
-        haiku_call=_make_haiku_call(provider),
-        sonnet_call=_make_sonnet_call(provider),
+        haiku_call=_make_haiku_call(gate_provider),
+        sonnet_call=_make_sonnet_call(gate_provider),
         now=now,
         tick_id=tick_id,
     )

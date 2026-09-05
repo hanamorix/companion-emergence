@@ -25,7 +25,6 @@ from brain.attunement.store import BufferTurn
 
 log = logging.getLogger(__name__)
 
-_DETECTOR_MODEL = "claude-haiku-4-5-20251001"
 _DETECTOR_TIMEOUT_SECONDS = 60
 
 
@@ -88,10 +87,11 @@ def _call_haiku(
 
     Returns empty string on any failure so callers can decline cleanly.
     """
+    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, model_for_tier
     from brain.bridge.provider import ClaudeCliProvider
 
     provider = ClaudeCliProvider(
-        model=_DETECTOR_MODEL,
+        model=model_for_tier(TIER_ATTUNEMENT_DETECTOR),
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
     pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir

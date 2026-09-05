@@ -146,8 +146,24 @@ hunts/
 changes/
 app/src-tauri/python-runtime/
 
-# ── Leak-guard local tier + private local docs (never tracked) ──
+# ── Leak-guard local tier + private local docs ──
 hooks/leak-rules.local
+# docs/guarded-change/ is NOT "never tracked": 52 files under it were committed
+# before this rule and are live on origin/main. .gitignore does not apply to
+# already-tracked files, so this entry only stops NEW ones — which matches the
+# leak-guard's own wording in hooks/denied-paths.txt ("no new files here on
+# public"). The existing tree is frozen, not private. See #163.
 docs/guarded-change/
+# Retired private trees (leak-guard denied-paths.txt) — never stage on public (#163).
+docs/superpowers/
+docs/audits/
 CLAUDE.local.md
 CLAUDE.local.history.md
+
+# temp consolidation-gate queue (Root 2 stopgap) — never committed
+pending_candidates.jsonl
+pending_candidates.jsonl.lock
+
+# Guarded-change process artefacts (spec/plan/red-team drafts) — local
+# working state only, never pushed.
+changes/

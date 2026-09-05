@@ -154,8 +154,12 @@ def _emit_resolution(
                 domain="self",
                 importance=9.0,  # sustained + resolved → high-importance self-knowledge
             )
-            store.create(mem)
-            memory_id = mem.id
+            # Automatic generated write → route through the consolidation gate (enqueue as a
+            # candidate). route_write returns mem.id, so the soul-candidate below still gets an
+            # id (referencing the pending candidate — same accepted pattern as extractor.py).
+            from brain.memory.pending import route_write
+
+            memory_id = route_write(store, mem, source="self_model_resolved")
         finally:
             store.close()
     except Exception as exc:  # noqa: BLE001

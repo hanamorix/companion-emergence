@@ -49,7 +49,9 @@ Do not create `WIP.md`, `CLAIMS.md`, `TODO.md`, or similar files intended to tra
 ## Commits and PRs
 
 - Commit messages: imperative mood, present tense ("fix provider path resolution," not "fixed" or "fixes").
-- If a commit or PR resolves an issue, include `Fixes #N` in the PR description so it auto-closes.
+- **Closing issues: one `Closes #N` line per issue, in the PR description.** For every issue a PR resolves, put a separate `Closes #N` line in the PR **description** — not in a commit body, not as a prose list. "closes #43; #72/#120" closes only #43; the bare `#72/#120` close nothing. Two issues means two lines: `Closes #72` and `Closes #120`. (`Fixes` and `Resolves` are equivalent keywords.)
+- **Squash-merge only honors keywords in the PR description.** On a squash-merge, GitHub ignores closing keywords in individual commit messages — so the `Closes #N` lines must live in the PR body to survive.
+- **Verify after merge.** Once merged, confirm each referenced issue actually closed and manually close any that didn't.
 - Don't squash unrelated changes into one commit. If the user is fixing two different things, suggest two branches.
 - **Out-of-scope follow-ups → a new issue, not a PR-body note.** When you spot follow-up work during a PR that's outside that PR's scope, file it as its own issue rather than leaving a "follow-up" note in the PR description — PR-body notes get lost on merge; issues stay tracked. (Human-facing version in `CONTRIBUTING.md`.)
 

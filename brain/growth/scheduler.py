@@ -147,12 +147,10 @@ def run_growth_tick(
     # Creative DNA crystallization (spec §5)
     if not dry_run and (persona_dir / "persona_config.json").exists():
         try:
-            from brain.bridge.provider import get_provider
+            from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
             from brain.growth.crystallizers.creative_dna import crystallize_creative_dna
-            from brain.persona_config import PersonaConfig
 
-            cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-            provider = get_provider(cfg.provider, persona_dir=persona_dir)
+            provider = build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
             crystallize_creative_dna(
                 store=store,
                 persona_dir=persona_dir,

@@ -43,7 +43,9 @@ class ReviewCadenceState:
 
 
 def _state_path(persona_dir: Path) -> Path:
-    return persona_dir / _STATE_FILENAME
+    from brain.paths import cadence_state_path
+
+    return cadence_state_path(persona_dir, _STATE_FILENAME)  # <persona>/cadence/ (#178)
 
 
 def _parse_ts(raw: object) -> datetime | None:

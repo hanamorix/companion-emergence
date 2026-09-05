@@ -219,7 +219,7 @@ def test_attunement_pass2_writes_learned_patterns_on_substantive_turn(tmp_path: 
 # Scenario 2: both monologue + attunement pass-2s fire on the same turn
 # ---------------------------------------------------------------------------
 
-def test_both_pass2s_fire_on_same_turn(tmp_path: Path):
+def test_both_pass2s_fire_on_same_turn(tmp_path: Path, monkeypatch):
     """One tool_loop call with record_monologue fires BOTH monologue and attunement pass-2s."""
     from brain.chat.tool_loop import build_tools_list, run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
@@ -231,6 +231,16 @@ def test_both_pass2s_fire_on_same_turn(tmp_path: Path):
     provider = _MonologueAndAttunementProvider()
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+
+    # #154: monologue pass-2 extraction now builds its own classifier-tier
+    # provider internally rather than reusing the chat provider above (this
+    # test's `provider.generate_calls` counter, polled below, tracks calls made
+    # ON THAT OBJECT). Reuse this test's own provider for the classifier tier
+    # too, so the counter stays meaningful.
+    monkeypatch.setattr(
+        "brain.bridge.model_tier.build_tier_provider",
+        lambda _persona_dir, _tier: provider,
+    )
 
     fake_output = _fake_detector_output(source_turn_id="msg-0")
 

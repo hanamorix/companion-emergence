@@ -84,7 +84,12 @@ def _seed_aged(persona_dir: Path, sid: str, n: int, *, chars: int = 100,
 # ---------------------------------------------------------------- caller 3: TOOL
 def test_tool_path_compacts_via_real_dispatch(persona_dir, store, hebbian) -> None:
     """The Kindled `compact_history` tool through the REAL dispatch() — proves the
-    provider + session_id threading (F-2) works end-to-end."""
+    session_id threading (#80/F-2) works end-to-end. No `provider` kwarg is
+    passed at all: compact_history builds its own cost-pinned provider
+    internally via build_compaction_provider (resolves to FakeProvider here
+    because `persona_dir`'s persona_config.json sets provider="fake") — this
+    is the same reachability the MCP dispatch path (which never had a live
+    provider to inject) now gets too."""
     sid = "sess_tool"
     tss = _seed_aged(persona_dir, sid, 100)
     write_cursor(persona_dir, sid, tss[-1])  # all extracted
@@ -94,7 +99,6 @@ def test_tool_path_compacts_via_real_dispatch(persona_dir, store, hebbian) -> No
         store=store,
         hebbian=hebbian,
         persona_dir=persona_dir,
-        provider=FakeProvider(),
         session_id=sid,
     )
     assert result["compacted"] is True
@@ -103,14 +107,15 @@ def test_tool_path_compacts_via_real_dispatch(persona_dir, store, hebbian) -> No
     assert read_archive(persona_dir, sid)  # originals archived
 
 
-def test_tool_path_requires_provider_and_session(persona_dir, store, hebbian) -> None:
-    """dispatch must reject the provider-needing tool when wiring is absent
-    (guards the F-2 threading rather than silently no-op'ing)."""
+def test_tool_path_requires_session_id(persona_dir, store, hebbian) -> None:
+    """#80: dispatch must reject compact_history when session_id is absent
+    (guards the threading rather than silently no-op'ing or acting on the
+    wrong session) — provider is no longer required at all, only session_id."""
     from brain.tools.dispatch import ToolDispatchError
 
-    with pytest.raises(ToolDispatchError):
+    with pytest.raises(ToolDispatchError, match="session_id"):
         dispatch("compact_history", {"age_hours": 1}, store=store, hebbian=hebbian,
-                 persona_dir=persona_dir)  # no provider/session_id
+                 persona_dir=persona_dir)  # no session_id
 
 
 # ------------------------------------------------------------- caller 2: CADENCE

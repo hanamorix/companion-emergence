@@ -57,7 +57,7 @@ class _SubstantiveProvider:
         return "substantive"
 
 
-def test_full_turn_updates_all_surfaces(tmp_path: Path):
+def test_full_turn_updates_all_surfaces(tmp_path: Path, monkeypatch):
     from brain.chat.tool_loop import build_tools_list, run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
@@ -67,6 +67,18 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path):
     provider = _SubstantiveProvider()
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+
+    # #154: pass-2 extraction now builds its own classifier-tier provider
+    # internally rather than reusing the chat provider above — this test's
+    # conftest.py autouse fixture already prevents a real subprocess call, but
+    # its generic stand-in returns an empty extraction, so the "Loopy" memory
+    # this test asserts on would never get written. Reuse THIS test's own
+    # `_SubstantiveProvider` (whose `.generate()` already has the crafted
+    # extraction content) for the classifier tier too.
+    monkeypatch.setattr(
+        "brain.bridge.model_tier.build_tier_provider",
+        lambda _persona_dir, _tier: provider,
+    )
 
     try:
         resp, invocations = run_tool_loop(
@@ -91,6 +103,17 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path):
 
         cli_throttle.reset()
         pass2_queue.drain_pending()
+
+        # memory-consolidation migration: the pass-2 "monologue" write is a gated
+        # type → enqueued as a pending candidate, not a memories.db row. Promote
+        # the queue (id preserved) so the end-state list_by_type assertion holds.
+        from brain.engines.consolidation import Decision, run_consolidation
+
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
 
         recent = list(store.list_by_type("monologue", active_only=True, limit=10))
         assert any("Loopy" in m.content for m in recent), (

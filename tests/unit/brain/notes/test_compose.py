@@ -4,7 +4,7 @@ from brain.notes.compose import Note, build_note_prompt, parse_note
 
 
 def test_prompt_includes_interior_and_user():
-    p = build_note_prompt(user_name="Hana", dreams_summary="a dream of the sea",
+    p = build_note_prompt(persona_name="Nell", user_name="Hana", dreams_summary="a dream of the sea",
                           emotion_summary="tenderness 4", last_session_summary="we talked about her book")
     assert "Hana" in p and "the sea" in p and "write" in p.lower()
 

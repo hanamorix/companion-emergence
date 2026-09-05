@@ -18,6 +18,8 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.chat.rollover import perform_rollover
 from brain.ingest.buffer import (
     ingest_turn,
@@ -29,6 +31,7 @@ from brain.ingest.buffer import (
 from brain.ingest.pipeline import extract_session_snapshot, finalize_stale_sessions
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.pending import PendingQueue
 from brain.memory.store import MemoryStore
 
 _PERSONA_NAME = "persona"
@@ -147,8 +150,12 @@ def _load_old_pipeline_module() -> types.ModuleType:
         cwd=repo_root,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if result.returncode != 0:
+        # #169: the base commit was dropped by a branch rewrite and is reachable
+        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
+        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
     mod = types.ModuleType("old_pipeline_pre_finalize_decoupling")
     exec(compile(result.stdout, "<old_pipeline_c2154a97^>", "exec"), mod.__dict__)
     return mod
@@ -180,14 +187,22 @@ def test_c10_finalize_no_delete_interleave(tmp_path: Path) -> None:
             embeddings=embeddings,
         )
         assert len(reports) == 1
-        assert reports[0].committed == 1
+        assert reports[0].committed == 0
+        assert reports[0].enqueued == 1
         assert provider.extract_calls == 1
         # Extraction ran (a memory landed) AND the buffer was NOT deleted —
         # this is the exact assertion that fails against the pre-change
         # finalize (see test_c10_pre_change_finalize_deleted_buffer_fail_demo).
         assert sid in list_active_sessions(persona_dir)
         assert read_cursor(persona_dir, sid) is not None
-        assert store.count() == 1
+        # TEMP (Root-2 consolidation-gate stopgap — see brain/memory/pending.py
+        # and brain/monologue/ambient.py, which disagree on whether the gate
+        # retires at "Phase 4" or "Phase 5"; revert to store.count() when the
+        # dream cycle lands and retires the gate): extraction lands a gated
+        # "note" candidate in the pending queue, not memories.db.
+        pending_notes = PendingQueue(persona_dir).read_recent("note", limit=1000)
+        assert len(pending_notes) == 1
+        assert pending_notes[0].content == "stub extracted memory"
 
         # Now the rollover runs; its seed must survive the finalize that
         # already ran inside its window.
@@ -361,7 +376,17 @@ def test_c18_carried_raw_tail_extraction_state(tmp_path: Path) -> None:
             embeddings=embeddings,
         )
         assert report.errors == 0
-        committed_texts = {m.content for m in store.list_active()}
+        # TEMP (Root-2 consolidation-gate stopgap — see brain/memory/pending.py
+        # and brain/monologue/ambient.py, which disagree on whether the gate
+        # retires at "Phase 4" or "Phase 5"; revert to store.list_active() when
+        # the dream cycle lands and retires the gate): extraction lands gated
+        # "note" candidates in the pending queue, not memories.db. limit=1000
+        # (well above the true count) — read_recent's limit has no default and
+        # returns only the newest `limit` entries, so a small limit (e.g. the
+        # unrelated _AMBIENT_LIMIT=5) would silently drop the oldest entries.
+        committed_texts = {
+            m.content for m in PendingQueue(persona_dir).read_recent("note", limit=1000)
+        }
         # Already-extracted carried turns (10..25) must NOT be re-extracted;
         # not-yet-extracted carried turns (26..49) must be.
         already_extracted = {f"MARK-{i}" for i in range(10, 26)}
@@ -412,7 +437,17 @@ def test_c18_without_carried_cursor_would_reextract_fail_demo(tmp_path: Path) ->
             embeddings=embeddings,
         )
         assert report.errors == 0
-        committed_texts = {m.content for m in store.list_active()}
+        # TEMP (Root-2 consolidation-gate stopgap — see brain/memory/pending.py
+        # and brain/monologue/ambient.py, which disagree on whether the gate
+        # retires at "Phase 4" or "Phase 5"; revert to store.list_active() when
+        # the dream cycle lands and retires the gate): extraction lands gated
+        # "note" candidates in the pending queue, not memories.db. limit=1000
+        # (well above the true count) — read_recent's limit has no default and
+        # returns only the newest `limit` entries, so a small limit (e.g. the
+        # unrelated _AMBIENT_LIMIT=5) would silently drop the oldest entries.
+        committed_texts = {
+            m.content for m in PendingQueue(persona_dir).read_recent("note", limit=1000)
+        }
         already_extracted = {f"MARK-{i}" for i in range(10, 26)}
         # Without the carried cursor, extraction starts from scratch and
         # re-extracts the already-extracted carried turns too.

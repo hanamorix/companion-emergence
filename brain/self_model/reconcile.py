@@ -126,7 +126,11 @@ def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) ->
             emotions=emotions,
             importance=max(emotions.values()),
         )
-        store.create(mem)
+        # Automatic generated write → route through the consolidation gate (enqueue as a
+        # candidate) rather than straight into memories.db. Gated by memory_type.
+        from brain.memory.pending import route_write
+
+        route_write(store, mem, source="self_model_reconcile")
     finally:
         store.close()
     return True

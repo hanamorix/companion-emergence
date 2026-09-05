@@ -750,6 +750,56 @@ def test_chat_with_tools_writes_correct_mcp_config(persona_dir: Path) -> None:
     assert server_cfg["env"]["NELL_MCP_AUDIT_REQUEST_ID"]
 
 
+def test_chat_with_tools_threads_session_id_into_mcp_config_env(persona_dir: Path) -> None:
+    """#80: options['session_id'] must reach the spawned MCP subprocess's env
+    (NELL_MCP_SESSION_ID) via _chat_with_mcp_tools — the ONE dispatch path
+    compact_history can resolve its session on."""
+    provider = ClaudeCliProvider()
+    captured: dict = {}
+
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        captured["config"] = json.loads(Path(path).read_text())
+        return _fake_proc(json.dumps({"result": "ok"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [
+                ChatMessage(role="system", content="sys"),
+                ChatMessage(role="user", content="hi"),
+            ],
+            tools=[{"name": "compact_history", "description": "x"}],
+            options={"persona_dir": str(persona_dir), "session_id": "sess-abc"},
+        )
+
+    server_cfg = captured["config"]["mcpServers"]["brain-tools"]
+    assert server_cfg["env"]["NELL_MCP_SESSION_ID"] == "sess-abc"
+    # request_id (audit correlation) must still be set too — additive, not replaced.
+    assert server_cfg["env"]["NELL_MCP_AUDIT_REQUEST_ID"]
+
+
+def test_chat_with_tools_no_session_id_omits_session_env(persona_dir: Path) -> None:
+    """Self-test (ST1.5f): the assertion above discriminates — no session_id
+    in options means no NELL_MCP_SESSION_ID key, not an empty/None one."""
+    provider = ClaudeCliProvider()
+    captured: dict = {}
+
+    def _capture(cmd, **kwargs):
+        path = cmd[cmd.index("--mcp-config") + 1]
+        captured["config"] = json.loads(Path(path).read_text())
+        return _fake_proc(json.dumps({"result": "ok"}))
+
+    with patch("brain.bridge.provider.subprocess.run", side_effect=_capture):
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            tools=[{"name": "compact_history", "description": "x"}],
+            options={"persona_dir": str(persona_dir)},
+        )
+
+    server_cfg = captured["config"]["mcpServers"]["brain-tools"]
+    assert "NELL_MCP_SESSION_ID" not in server_cfg["env"]
+
+
 def test_read_audit_lines_since_filters_other_request_ids(tmp_path: Path) -> None:
     from brain.bridge.provider import _read_audit_lines_since
 

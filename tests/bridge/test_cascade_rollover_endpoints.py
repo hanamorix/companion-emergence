@@ -24,6 +24,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -46,9 +47,13 @@ def _build(persona_dir: Path) -> tuple[FastAPI, TestClient]:
 
 def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: str = "[]"):
     """Mirrors tests/bridge/test_endpoints.py's helper — patches
-    brain.bridge.server.get_provider so the lifespan's provider is a
-    controllable stub. Must be called BEFORE opening the TestClient."""
-    import brain.bridge.server as srv
+    brain.bridge.provider.get_provider (the SOURCE module; server.py's
+    lifespan no longer imports get_provider directly since #154's completion —
+    it calls model_tier.build_interactive_chat_provider, which does its own
+    function-scoped import of get_provider from this source module) so the
+    lifespan's provider is a controllable stub. Must be called BEFORE opening
+    the TestClient."""
+    import brain.bridge.provider as _provider_module
     from brain.bridge.chat import ChatResponse
 
     class _Fake:
@@ -61,7 +66,7 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
         def generate(self, prompt, *, system=None):
             return extraction
 
-    monkeypatch.setattr(srv, "get_provider", lambda _name, **_kw: _Fake())
+    monkeypatch.setattr(_provider_module, "get_provider", lambda _name, **_kw: _Fake())
 
 
 def _make_persona(base: Path, name: str) -> Path:
@@ -473,8 +478,12 @@ def test_c21_flags_all_five_sites_on_pre_fix_base_commit() -> None:
         cwd=repo_root,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if result.returncode != 0:
+        # #169: the base commit was dropped by a branch rewrite and is reachable
+        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
+        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
     base_source = result.stdout
     blocks = _handler_blocks(base_source)
     failing = []

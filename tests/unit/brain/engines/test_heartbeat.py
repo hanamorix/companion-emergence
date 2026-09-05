@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from brain.bridge.provider import FakeProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.heartbeat import (
     HeartbeatConfig,
     HeartbeatEngine,
@@ -30,6 +31,36 @@ def _find_repo_root() -> Path:
 
 DEFAULT_REFLEX_ARCS_PATH = _find_repo_root() / "brain" / "engines" / "default_reflex_arcs.json"
 DEFAULT_INTERESTS_PATH = _find_repo_root() / "brain" / "engines" / "default_interests.json"
+
+
+@pytest.fixture(autouse=True)
+def _safe_tier_provider_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent heartbeat.py's tier-routed calls (#154: dream/reflex/research —
+    `TIER_BACKGROUND_GENERATIVE`; heartbeat-memory/draft-compose —
+    `TIER_BACKGROUND_HOUSEKEEPING`) from constructing a real `ClaudeCliProvider`
+    in this file's tests, almost all of which use a bare `tmp_path` persona with
+    no `persona_config.json` (`build_tier_provider` would otherwise fall back to
+    `DEFAULT_PROVIDER="claude-cli"` and attempt a genuine `claude` CLI subprocess
+    call, discarding whatever fake the test injected into the engine).
+
+    Default: a plain `FakeProvider()` — safe for the majority of tests here,
+    which construct `HeartbeatEngine(provider=FakeProvider(), ...)` and don't
+    care which instance the generative/housekeeping tier calls use, since
+    `FakeProvider` is a stateless, deterministic hash-echo (identical output
+    regardless of instance identity).
+
+    Tests that inject a CUSTOM provider subclass (`FailingProvider`,
+    `CapturingProvider`, `ScriptedProvider`, ...) to observe or control what
+    dream/reflex/research/heartbeat-memory/draft-compose actually does
+    re-patch `brain.engines.heartbeat.build_tier_provider` themselves, later in
+    the same test body — that per-test patch simply takes over from this one,
+    since both use the same `monkeypatch` fixture instance (mirrors the
+    established pattern in `tests/unit/brain/chat/conftest.py`).
+    """
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider",
+        lambda persona_dir, tier: FakeProvider(),
+    )
 
 
 def test_heartbeat_config_defaults() -> None:
@@ -371,8 +402,14 @@ def test_heartbeat_state_save_rejects_naive_datetime(tmp_path: Path) -> None:
 
 @pytest.fixture
 def live_engine(tmp_path: Path) -> HeartbeatEngine:
-    """Engine with in-memory store/hebbian and tmp log/state paths."""
-    store = MemoryStore(":memory:")
+    """Engine with an on-disk store + in-memory hebbian and tmp log/state paths.
+
+    The store is on-disk (not ":memory:") so store.persona_dir == tmp_path,
+    matching the persona_dir the in-tick consolidation gate uses. Gated
+    candidates (dream/research/heartbeat) then land in tmp_path's pending queue
+    rather than leaking to the CWD.
+    """
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
     return HeartbeatEngine(
         store=store,
@@ -384,6 +421,19 @@ def live_engine(tmp_path: Path) -> HeartbeatEngine:
         heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
         persona_name="Nell",
         persona_system_prompt="You are Nell.",
+    )
+
+
+# memory-consolidation migration: dream/research/heartbeat are gated types. The
+# generative engines enqueue candidates; the in-tick consolidation gate runs
+# BEFORE they fire, so a candidate produced this tick is only promoted next tick.
+# Tests that inspect the end-state DB memory promote the queue explicitly with a
+# promote-all classifier (candidate id preserved).
+def _promote_queue(engine) -> None:
+    run_consolidation(
+        engine.store,
+        persona_dir=engine.store.persona_dir,
+        classifier=lambda _c, _ctx: Decision("new"),
     )
 
 
@@ -548,6 +598,7 @@ def test_heartbeat_memory_emitted_when_always_mode(live_engine: HeartbeatEngine)
     live_engine.run_tick(trigger="open")  # init, no memory
     live_engine.run_tick(trigger="close")
 
+    _promote_queue(live_engine)  # promote the heartbeat candidate into memories.db
     hb_memories = live_engine.store.list_by_type("heartbeat")
     assert len(hb_memories) == 1
     assert hb_memories[0].content.startswith("HEARTBEAT:")
@@ -600,6 +651,7 @@ def test_heartbeat_memory_metadata_links_to_dream_id(
     assert result.dream_id is not None
     assert result.heartbeat_memory_id is not None
 
+    _promote_queue(live_engine)  # promote dream + heartbeat candidates (ids kept)
     hb_mem = live_engine.store.get(result.heartbeat_memory_id)
     assert hb_mem is not None
     assert hb_mem.metadata.get("dream_id") == result.dream_id
@@ -759,7 +811,9 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path) -> None:
         hm.close()
 
 
-def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
+def test_heartbeat_isolates_reflex_llm_failure(
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reflex LLM failure is isolated from the tick — decay/state still run."""
     import logging
 
@@ -788,6 +842,15 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
         def generate(self, prompt, *, system=None):
             raise RuntimeError("simulated LLM failure")
 
+    failing_provider = FailingProvider()
+    # Reflex (background-generative tier, #154) must see THIS instance so its
+    # failure actually reaches the tick — override the file's default-FakeProvider
+    # tier stand-in.
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider",
+        lambda persona_dir, tier: failing_provider,
+    )
+
     store = MemoryStore(":memory:")
     hm = HebbianMatrix(":memory:")
     try:
@@ -806,7 +869,7 @@ def test_heartbeat_isolates_reflex_llm_failure(tmp_path: Path, caplog) -> None:
         engine = HeartbeatEngine(
             store=store,
             hebbian=hm,
-            provider=FailingProvider(),
+            provider=failing_provider,
             state_path=tmp_path / "heartbeat_state.json",
             config_path=config_path,
             dream_log_path=tmp_path / "dreams.log.jsonl",
@@ -1114,7 +1177,9 @@ def test_heartbeat_interest_bump_hook(tmp_path: Path) -> None:
         hm.close()
 
 
-def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
+def test_heartbeat_isolates_research_failure(
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Research LLM failure is isolated — tick completes."""
     import json
     import logging
@@ -1159,6 +1224,15 @@ def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
         def generate(self, prompt, *, system=None):
             raise RuntimeError("simulated LLM failure")
 
+    failing_provider = FailingProvider()
+    # Research (background-generative tier, #154) must see THIS instance so
+    # its failure actually reaches the tick — override the file's
+    # default-FakeProvider tier stand-in.
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider",
+        lambda persona_dir, tier: failing_provider,
+    )
+
     store = MemoryStore(":memory:")
     hm = HebbianMatrix(":memory:")
     try:
@@ -1175,7 +1249,7 @@ def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
         engine = HeartbeatEngine(
             store=store,
             hebbian=hm,
-            provider=FailingProvider(),
+            provider=failing_provider,
             state_path=tmp_path / "heartbeat_state.json",
             config_path=config_path,
             dream_log_path=tmp_path / "dreams.log.jsonl",
@@ -1200,7 +1274,9 @@ def test_heartbeat_isolates_research_failure(tmp_path: Path, caplog) -> None:
         hm.close()
 
 
-def test_heartbeat_memory_uses_persona_name(tmp_path: Path) -> None:
+def test_heartbeat_memory_uses_persona_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_emit_heartbeat_memory must render persona name into system prompt,
     not hardcode 'Nell'.
     """
@@ -1215,6 +1291,15 @@ def test_heartbeat_memory_uses_persona_name(tmp_path: Path) -> None:
         def generate(self, prompt, *, system=None):
             captured["system"] = system
             return "HEARTBEAT: tended"
+
+    capturing_provider = CapturingProvider()
+    # _emit_heartbeat_memory (background-housekeeping tier, #154) must see
+    # THIS instance so its captured system prompt is the one this test
+    # inspects — override the file's default-FakeProvider tier stand-in.
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider",
+        lambda persona_dir, tier: capturing_provider,
+    )
 
     config_path = tmp_path / "heartbeat_config.json"
     HeartbeatConfig(
@@ -1241,7 +1326,7 @@ def test_heartbeat_memory_uses_persona_name(tmp_path: Path) -> None:
         engine = HeartbeatEngine(
             store=store,
             hebbian=hm,
-            provider=CapturingProvider(),
+            provider=capturing_provider,
             state_path=tmp_path / "heartbeat_state.json",
             config_path=config_path,
             dream_log_path=tmp_path / "dreams.log.jsonl",
@@ -1254,6 +1339,90 @@ def test_heartbeat_memory_uses_persona_name(tmp_path: Path) -> None:
         assert captured.get("system") is not None
         assert "Iris" in captured["system"]
         assert "Nell" not in captured["system"]
+    finally:
+        store.close()
+        hm.close()
+
+
+def test_emit_heartbeat_memory_resolves_haiku_via_the_tier_accessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C6/C7 (oracle able to fail + honest usage-log label): _emit_heartbeat_memory
+    is background-housekeeping tier (#154, a real Sonnet->Haiku change, not
+    routing-only) — the persisted memory's metadata.provider must name Haiku,
+    not whatever model the persona's OWN persona_config.json specifies for its
+    (Sonnet) interactive-chat/background-generative tiers.
+
+    Oracle: this test calls through the REAL model-tier accessor (not a
+    monkeypatched stand-in) against a persona_dir with a real
+    persona_config.json pinning provider="claude-cli", model="sonnet" — so it
+    fails against the pre-#154-completion source (which reused self.provider,
+    i.e. whatever model the engine was constructed with) and passes only once
+    _emit_heartbeat_memory routes through build_tier_provider(...,
+    TIER_BACKGROUND_HOUSEKEEPING). Does not call .generate() for real —
+    monkeypatches ClaudeCliProvider.generate directly (construction-only
+    assertion, mirrors test_model_tier.py's RTS style) so no subprocess spawns.
+    """
+    from brain.bridge.model_tier import build_tier_provider as _real_build_tier_provider
+    from brain.bridge.provider import ClaudeCliProvider
+
+    # This test is specifically ABOUT the real tier-routing mechanism (the
+    # whole point of the C6/C7 oracle) — undo the file's default autouse
+    # FakeProvider stand-in (see _safe_tier_provider_default above) so the
+    # REAL build_tier_provider (and hence the real haiku model_override) runs.
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", _real_build_tier_provider)
+    monkeypatch.setattr(ClaudeCliProvider, "generate", lambda self, *a, **k: "HEARTBEAT: tended")
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "claude-cli", "model": "sonnet"}'
+    )
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hm = HebbianMatrix(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="s", memory_type="conversation", domain="us", emotions={"love": 5.0}
+            )
+        )
+        HeartbeatConfig(
+            reflex_enabled=False, research_enabled=False, emit_memory="always"
+        ).save(persona_dir / "heartbeat_config.json")
+        prior = HeartbeatState.fresh("manual")
+        prior.last_tick_at = datetime.now(UTC) - timedelta(hours=1)
+        prior.save(persona_dir / "heartbeat_state.json")
+
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),  # the AMBIENT (Sonnet-tier) provider — must NOT be used here
+            state_path=persona_dir / "heartbeat_state.json",
+            config_path=persona_dir / "heartbeat_config.json",
+            dream_log_path=persona_dir / "dreams.log.jsonl",
+            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+            interests_path=persona_dir / "interests.json",
+            research_log_path=persona_dir / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        import json as _json
+
+        (persona_dir / "interests.json").write_text(
+            _json.dumps({"version": 1, "interests": []}), encoding="utf-8"
+        )
+
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.heartbeat_memory_id is not None
+
+        from brain.memory.pending import PendingQueue
+
+        queue = PendingQueue(persona_dir)
+        candidates = queue.read_recent("heartbeat", limit=1)
+        assert len(candidates) == 1
+        assert candidates[0].metadata.get("provider") == "claude-cli:haiku"
     finally:
         store.close()
         hm.close()
@@ -1833,7 +2002,10 @@ def _make_engine_with_persona_dir(tmp_path: Path) -> tuple[HeartbeatEngine, Path
     """
     interests_path = tmp_path / "interests.json"
     interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
-    store = MemoryStore(":memory:")
+    # On-disk store so store.persona_dir == tmp_path (matches the persona_dir the
+    # in-tick consolidation gate + daemon_state writes use); gated candidates
+    # land in tmp_path's pending queue, not the CWD.
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     engine = HeartbeatEngine(
         store=store,
@@ -1880,7 +2052,11 @@ def test_daemon_state_heartbeat_entry_written_after_tick(tmp_path: Path) -> None
 
 
 def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> None:
-    """When a dream fires, daemon_state.json has last_dream populated."""
+    """When a dream fires, daemon_state.json has last_dream populated.
+
+    Regression fixed: _write_daemon_state_for_dream now reads the just-fired
+    dream from the pending queue (where gated candidates live), not memories.db.
+    """
     from brain.engines.daemon_state import load_daemon_state
 
     engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
@@ -2107,6 +2283,68 @@ def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
         engine.hebbian.close()
 
 
+def test_emotion_spike_draft_compose_resolves_haiku_via_the_tier_accessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C6/C7 oracle for the OTHER newly-decided Haiku tier (#154): the
+    emotion-spike draft-compose call must run on Haiku, not whatever model the
+    persona's own persona_config.json specifies for its Sonnet tiers.
+
+    Oracle: monkeypatches ClaudeCliProvider.generate to return a model-
+    conditional marker (raises for any model other than "haiku"), against a
+    REAL persona_config.json pinning provider="claude-cli", model="sonnet" —
+    so it fails against the pre-#154-completion source (self.provider, i.e.
+    whatever ambient model the engine holds) and passes only once the
+    emotion-spike path routes through build_tier_provider(...,
+    TIER_BACKGROUND_HOUSEKEEPING). Restores the real build_tier_provider for
+    this test only, undoing the file's default autouse FakeProvider stand-in.
+    """
+    from brain.bridge.model_tier import build_tier_provider as _real_build_tier_provider
+    from brain.bridge.provider import ClaudeCliProvider
+    from brain.initiate.emit import read_candidates
+    from brain.memory.store import MemoryStore
+
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", _real_build_tier_provider)
+
+    def _model_conditional_generate(self, prompt, *, system=None):
+        if self._model != "haiku":
+            raise AssertionError(f"expected haiku, draft-compose ran on {self._model!r}")
+        return "a quiet fragment"
+
+    monkeypatch.setattr(ClaudeCliProvider, "generate", _model_conditional_generate)
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "claude-cli", "model": "sonnet"}'
+    )
+    store = MemoryStore(persona_dir / "memories.db")
+    hm = HebbianMatrix(":memory:")
+    engine = HeartbeatEngine(
+        store=store,
+        hebbian=hm,
+        provider=FakeProvider(),  # the AMBIENT (Sonnet-tier) provider — must NOT be used here
+        state_path=persona_dir / "hb_state.json",
+        config_path=persona_dir / "hb_config.json",
+        dream_log_path=persona_dir / "dreams.log.jsonl",
+        heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell.",
+    )
+    try:
+        for i in range(24):
+            engine.run_tick(trigger="close", forced_resonance=5.0 + 0.2 * (i % 3))
+        engine.run_tick(trigger="close", forced_resonance=5.4)  # delta_sigma ~1.13
+
+        assert not any(c.source == "emotion_spike" for c in read_candidates(persona_dir))
+        draft_path = persona_dir / "draft_space.md"
+        assert draft_path.exists()
+        assert "a quiet fragment" in draft_path.read_text(encoding="utf-8")
+    finally:
+        store.close()
+        hm.close()
+
+
 def test_try_fire_dream_passes_soul_store(live_engine: HeartbeatEngine) -> None:
     """The heartbeat's dream tick constructs DreamEngine with a SoulStore so
     crystallization identity congruence can fire in production."""
@@ -2130,6 +2368,7 @@ def test_try_fire_dream_passes_soul_store(live_engine: HeartbeatEngine) -> None:
 
 def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_canary(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ORGAN-DOD CANARY: one heartbeat-driven research fire must (1) append the
     notes file, (2) create the research memory, (3) apply the verdict. If this
@@ -2196,8 +2435,19 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
             "NOTES:\ncanary fact\n\nMEMORY:\nI followed the thread.\n\nVERDICT:\nclose",
         ]
     )
+    # Research (background-generative tier, #154) must see THIS instance so
+    # its scripted, ordered replies (select-interest, then research-fire)
+    # actually drive the tick — override the file's default-FakeProvider tier
+    # stand-in.
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider",
+        lambda persona_dir, tier: provider,
+    )
 
-    store = MemoryStore(":memory:")
+    # On-disk so store.persona_dir == tmp_path (== interests_path.parent, the
+    # heartbeat's persona_dir): the gated "research" candidate lands in that
+    # queue and can be promoted for the end-state DB assertion below.
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         old_mem = Memory.create_new(
@@ -2239,6 +2489,14 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         persona_dir = interests_path.parent
         assert "canary fact" in read_notes_tail(persona_dir, interest_id)
 
+        # The research memory is enqueued as a gated candidate; promote it so the
+        # canary's DB-visibility assertion (research really persisted, not a
+        # vignette) still holds. Candidate id is preserved.
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
         mems = store.list_by_type("research", active_only=True, limit=5)
         assert any("followed the thread" in m.content for m in mems)
 

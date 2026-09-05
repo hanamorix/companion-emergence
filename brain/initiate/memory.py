@@ -153,7 +153,12 @@ def write_initiate_memory(
         emotions=_emotions,
     )
     try:
-        memory_store.create(memory)
+        from brain.memory.pending import route_write
+
+        # initiate_outbound is a gate-bypass type (its own dedup at
+        # list_by_type needs immediate memories.db visibility) → route_write
+        # writes it directly. Routed for uniformity/self-classification.
+        route_write(memory_store, memory, source="initiate")
     except Exception as exc:
         logger.warning("initiate memory create failed for %s: %s", audit_id, exc)
 

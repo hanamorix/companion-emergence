@@ -37,6 +37,22 @@ def test_entry_with_request_id_carries_audit_env_and_safe_path(tmp_path: Path) -
     assert entry["args"][:3] == ["-P", "-m", "brain.mcp_server"]
 
 
+def test_entry_with_session_id_only_carries_session_env(tmp_path: Path) -> None:
+    """#80: session_id crosses the process boundary the same way request_id
+    does (its own env key, NELL_MCP_SESSION_ID)."""
+    entry = brain_tools_mcp_entry(tmp_path / "persona", session_id="sess-42")
+    assert entry["env"] == {"NELL_MCP_SESSION_ID": "sess-42"}
+
+
+def test_entry_with_both_request_id_and_session_id_carries_both_env_keys(tmp_path: Path) -> None:
+    """#80: request_id and session_id are additive — neither clobbers the other."""
+    entry = brain_tools_mcp_entry(tmp_path / "persona", request_id="abc123", session_id="sess-42")
+    assert entry["env"] == {
+        "NELL_MCP_AUDIT_REQUEST_ID": "abc123",
+        "NELL_MCP_SESSION_ID": "sess-42",
+    }
+
+
 def test_safe_path_precedes_the_m_flag(tmp_path: Path) -> None:
     args = brain_tools_mcp_entry(tmp_path / "p")["args"]
     assert args.index("-P") < args.index("-m"), "-P must precede -m or CPython ignores it"
@@ -91,4 +107,6 @@ def test_safe_path_prevents_cwd_shadow(tmp_path: Path) -> None:
     )
     # The fix: -P drops the cwd entry, so brain resolves from the installed/venv location.
     assert str(shadow) not in with_p, f"-P failed to prevent the cwd shadow (got {with_p})"
-    assert with_p.endswith("brain/__init__.py"), with_p
+    # str(Path) is OS-native — on Windows this string uses backslashes, so a
+    # POSIX literal can never match. as_posix() normalises; it is a no-op off Windows.
+    assert Path(with_p).as_posix().endswith("brain/__init__.py"), with_p

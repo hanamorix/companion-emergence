@@ -26,6 +26,11 @@ Also maps to changes/compaction-defects-fix/1.5-criteria.md:
   C-B4d    stale retain-forever docstrings replaced with the replacement model
   C14 (updated)  the two pre-existing gating tests below are updated to the
            owner's replacement model (retired "terminal, re-compacted forever")
+
+Also maps to changes/fix-77-refusal-verb-broadening/1.5-criteria.md (issue #77):
+  I77-C4b  the confirmed evader, caught by the new _REFUSAL_VERB predicate,
+           routes to the safe lossless-leaning fallback via the real
+           cascade_conversation/_fold_into_section path (not verbatim storage)
 """
 
 from __future__ import annotations
@@ -306,6 +311,36 @@ def test_c4_cascade_double_reject_preserves_marker(tmp_path: Path) -> None:
     assert marker not in refusal_provider.resp
 
 
+def test_i77_c4b_cascade_evader_falls_soft(tmp_path: Path) -> None:
+    """changes/fix-77-refusal-verb-broadening/1.5-criteria.md C4 (GATING),
+    cascade/_fold_into_section half: the confirmed #77 evader -- caught by
+    the NEW _REFUSAL_VERB predicate (D3), not by the pre-existing
+    _REFUSAL_LEAD/_META_FRAME/_CONTENT_ABSENCE families this file's C4 test
+    above already exercises -- routes to the safe lossless-leaning fallback
+    via the REAL cascade_conversation path, and the evader text is not stored
+    verbatim. Mirrors test_c4_cascade_double_reject_preserves_marker's
+    pattern. See test_compaction.py's test_i77_c4a_... for the
+    compact_conversation counterpart (C4 requires BOTH persist paths)."""
+    sid = "sess_i77_c4b"
+    now0 = datetime.now(UTC)
+    marker = "MARKERI77C4BXYZ"
+    _seed_turn(tmp_path, sid, now0 - timedelta(hours=30), "user", f"important context {marker}")
+    write_cursor(tmp_path, sid, _iso(now0))
+
+    evader = (
+        "I'm not going to produce this memory update. I don't have enough context "
+        "to write a faithful summary here, and I won't proceed without it."
+    )
+    evader_provider = _Stub(evader)
+    r1 = cascade_conversation(tmp_path, sid, provider=evader_provider, now=now0, min_keep_tail=0)
+    assert r1.compacted is True
+    assert r1.tiers["24h"].validated is False
+    row1 = _summary_row(tmp_path, sid)
+    section_text = row1["compaction"]["sections"]["24h"]["text"]
+    assert evader not in section_text
+    assert marker in section_text  # lossless-leaning fallback, not a dropped/garbage write
+
+
 # --------------------------------------------------------------------------- C5
 
 
@@ -453,8 +488,15 @@ def test_c13_interior_not_starved(tmp_path: Path) -> None:
     store2.close()
 
     # H6: nulling the trace store yields an empty block — proves the oracle
-    # actually discriminates "has content" from "starved".
-    empty_store = MemoryStore(tmp_path / "memories_empty.db")
+    # actually discriminates "has content" from "starved". Interior-continuity
+    # reads the pending queue scoped by persona_dir (= db_path.parent), so
+    # empty_store needs a DISTINCT persona_dir from `store` above — sharing
+    # tmp_path would have both stores read the SAME pending queue and the
+    # discriminator would spuriously see MARKERC13. MemoryStore.__init__ does
+    # not create the dir, so it must be mkdir'd first.
+    empty_dir = tmp_path / "empty_persona"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    empty_store = MemoryStore(empty_dir / "memories_empty.db")
     assert build_interior_continuity_block(empty_store) == ""
     empty_store.close()
 

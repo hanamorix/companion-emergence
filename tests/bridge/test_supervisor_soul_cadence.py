@@ -20,12 +20,28 @@ import pytest
 from brain.bridge.supervisor import run_folded
 
 
+def _cadence_dir(persona_dir: Path) -> Path:
+    """#178: cadence state lives under <persona>/cadence/."""
+    d = persona_dir / "cadence"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+
 def _neutralise_other_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", lambda *a, **k: {})
     monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_heartbeat_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor._run_felt_time_tick", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    # #154: voice-reflection (background-generative tier) now builds its own
+    # real Sonnet-tier provider at its call site, and calls the LLM
+    # UNCONDITIONALLY before its own evidence gate — same real-subprocess
+    # hazard these tests already neutralise interest_sweep for elsewhere.
+    # None of these tests are about voice-reflection; neutralise its tick too.
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
+    )
 
 
 def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
@@ -36,7 +52,7 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
     would have made wait 6h (the under-firing defect)."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "soul_review_state.json").write_text(
+    (_cadence_dir(persona_dir) / "soul_review_state.json").write_text(
         json.dumps(
             {
                 "next_review_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
@@ -65,11 +81,17 @@ def test_soul_review_fires_from_persisted_due_time_on_fresh_process(
         heartbeat_interval_s=None,
         soul_review_interval_s=6 * 3600.0,  # 6h: monotonic alone would NOT fire
         finalize_interval_s=None,
+        # #154: interest_sweep now builds its own real Haiku-tier provider
+        # (persona_dir here has no persona_config.json, so it would default to
+        # a real ClaudeCliProvider and attempt a genuine subprocess call this
+        # test isn't set up to handle) — disabled, out of scope for this
+        # soul-review-cadence-focused test, matching heartbeat/finalize above.
+        interest_sweep_interval_s=None,
     )
 
     assert calls[0] >= 1, "persisted past-due next_review_at must fire on a fresh process"
     # Clean drain → cadence advanced ~6h ahead and was persisted (save works).
-    state = json.loads((persona_dir / "soul_review_state.json").read_text())
+    state = json.loads((_cadence_dir(persona_dir) / "soul_review_state.json").read_text())
     saved_next = datetime.fromisoformat(state["next_review_at"])
     assert saved_next > datetime.now(UTC) + timedelta(hours=5)
 

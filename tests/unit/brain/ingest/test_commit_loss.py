@@ -24,7 +24,24 @@ from brain.ingest.pipeline import (
 from brain.ingest.types import ExtractedItem
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.pending import PendingQueue
 from brain.memory.store import MemoryStore
+
+# NOTE (memory-consolidation migration): the ingest label "fact" is a GATED
+# type, so commit_item now writes via route_write → PendingQueue.enqueue, NOT
+# store.create. The P0 loss-prevention contract is unchanged (a failed write
+# still makes commit_item return None → commit_failure → buffer/cursor held),
+# but the failure must be injected at enqueue, and the enqueued candidate lands
+# in the pending queue rather than memories.db (#167: report.enqueued counts
+# this, not report.committed — committed means a durable memories.db write,
+# which a gated label like "fact" can never produce). These tests patch
+# PendingQueue.enqueue and assert queue end-state accordingly.
+
+_real_enqueue = PendingQueue.enqueue
+
+
+def _always_raise_enqueue(self, mem, *, source):
+    raise RuntimeError("database is locked")
 
 
 class _NoopProvider(LLMProvider):
@@ -62,20 +79,19 @@ def test_close_session_retains_buffer_when_a_commit_fails(tmp_path: Path):
     ]
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    real_create = store.create
     calls: dict[str, int] = {"n": 0}
 
-    def flaky_create(mem):
+    def flaky_enqueue(self, mem, *, source):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("database is locked")
-        return real_create(mem)
+        return _real_enqueue(self, mem, source=source)
 
     try:
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=flaky_create):
+        ), patch.object(PendingQueue, "enqueue", flaky_enqueue):
             report = close_session(
                 persona_dir,
                 sid,
@@ -111,14 +127,11 @@ def test_snapshot_holds_cursor_when_commit_fails(tmp_path: Path):
 
     cursor_before = read_cursor(persona_dir, sid)  # None — no cursor yet
 
-    def always_raise(mem):
-        raise RuntimeError("database is locked")
-
     try:
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=always_raise):
+        ), patch.object(PendingQueue, "enqueue", _always_raise_enqueue):
             report = extract_session_snapshot(
                 persona_dir,
                 sid,
@@ -193,14 +206,11 @@ def test_finalize_holds_buffer_when_commit_fails(tmp_path: Path):
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
 
-    def always_raise(mem):
-        raise RuntimeError("database is locked")
-
     try:
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=always_raise), patch(
+        ), patch.object(PendingQueue, "enqueue", _always_raise_enqueue), patch(
             "brain.ingest.pipeline.session_silence_minutes",
             return_value=99999.0,
         ):
@@ -258,14 +268,11 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
         embeddings.get_or_compute("unrelated prior memory")
         assert embeddings.count() == 1
 
-        # ── Pass 1: commit raises ──────────────────────────────────────────
-        def always_raise(mem):
-            raise RuntimeError("database is locked")
-
+        # ── Pass 1: commit (enqueue) raises ────────────────────────────────
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=always_raise):
+        ), patch.object(PendingQueue, "enqueue", _always_raise_enqueue):
             report1 = extract_session_snapshot(
                 persona_dir,
                 sid,
@@ -295,10 +302,13 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
                 embeddings=embeddings,
             )
 
-        assert report2.committed >= 1, "pass 2 must commit the memory (not dedup it away)"
-        mems = store.search_text(item_text, limit=5)
-        assert any(item_text in (m.content or "") for m in mems), (
-            "memory must be findable in the store after pass 2"
+        assert report2.committed == 0, "gated label never durably commits (#167)"
+        assert report2.enqueued >= 1, "pass 2 must enqueue the memory (not dedup it away)"
+        # A "fact" label is gated (#167: enqueued, not committed); the memory must be
+        # findable in the pending queue after pass 2 (not memories.db).
+        queued = PendingQueue(persona_dir).read_recent("fact", limit=5)
+        assert any(item_text in (m.content or "") for m in queued), (
+            "memory must be findable in the pending queue after pass 2"
         )
     finally:
         store.close()
@@ -326,9 +336,6 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
 
-    def always_raise(mem):
-        raise RuntimeError("database is locked")
-
     try:
         # Drive _BACKOFF_FAILURE_THRESHOLD snapshot passes so the sidecar
         # climbs naturally to the threshold.
@@ -336,7 +343,7 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
             with patch(
                 "brain.ingest.pipeline.extract_items_with_status",
                 return_value=ExtractionOutcome(items=items, failed=False, error=None),
-            ), patch.object(store, "create", side_effect=always_raise):
+            ), patch.object(PendingQueue, "enqueue", _always_raise_enqueue):
                 extract_session_snapshot(
                     persona_dir,
                     sid,
@@ -349,7 +356,7 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=always_raise), patch(
+        ), patch.object(PendingQueue, "enqueue", _always_raise_enqueue), patch(
             "brain.ingest.pipeline.session_silence_minutes",
             return_value=99999.0,
         ):
@@ -401,21 +408,20 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
     embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
 
-    real_create = store.create
     pass1_call: list[int] = [0]
 
-    def flaky_create_pass1(mem):
+    def flaky_enqueue_pass1(self, mem, *, source):
         pass1_call[0] += 1
         if pass1_call[0] == 2:
             raise RuntimeError("database is locked")
-        return real_create(mem)
+        return _real_enqueue(self, mem, source=source)
 
     try:
         # ── Pass 1: item at index 1 fails ─────────────────────────────────
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
             return_value=ExtractionOutcome(items=items, failed=False, error=None),
-        ), patch.object(store, "create", side_effect=flaky_create_pass1):
+        ), patch.object(PendingQueue, "enqueue", flaky_enqueue_pass1):
             report1 = extract_session_snapshot(
                 persona_dir,
                 sid,
@@ -429,9 +435,9 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
         cursor_after_pass1 = read_cursor(persona_dir, sid)
         assert cursor_after_pass1 is None, "cursor must NOT advance when a commit failed"
 
-        # Items 0 and 2 committed in pass 1.
-        active_after_pass1 = store.list_active()
-        committed_texts = {m.content for m in active_after_pass1}
+        # Items 0 and 2 committed (enqueued) in pass 1; item 1 failed.
+        queued_after_pass1 = PendingQueue(persona_dir).read_recent("fact", limit=10)
+        committed_texts = {m.content for m in queued_after_pass1}
         assert texts[0] in committed_texts, "item 0 must have committed in pass 1"
         assert texts[2] in committed_texts, "item 2 must have committed in pass 1"
         assert texts[1] not in committed_texts, "item 1 must NOT have committed in pass 1"
@@ -450,12 +456,13 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
                 embeddings=embeddings,
             )
 
-        assert report2.committed >= 1, "pass 2 must commit at least item 1"
+        assert report2.committed == 0, "gated label never durably commits (#167)"
+        assert report2.enqueued >= 1, "pass 2 must enqueue at least item 1"
         assert report2.commit_failures == 0, "pass 2 must have no commit failures"
 
-        # Final assertion: exactly 3 distinct memories, no duplicates.
-        all_active = store.list_active()
-        final_texts = [m.content for m in all_active if m.content in texts]
+        # Final assertion: exactly 3 distinct candidates in the queue, no dups.
+        all_queued = PendingQueue(persona_dir).read_recent("fact", limit=20)
+        final_texts = [m.content for m in all_queued if m.content in texts]
         assert len(final_texts) == 3, (
             f"expected exactly 3 distinct memories, got {len(final_texts)}: {final_texts}"
         )

@@ -802,7 +802,7 @@ describe("ChatPanel — snapshot on unmount (Task 6)", () => {
 
     const { unmount } = render(<ChatPanel persona="nell" />);
     fireEvent.change(screen.getByPlaceholderText(/write to/i), { target: { value: "hi" } });
-    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await waitFor(() => expect(mockedNew).toHaveBeenCalled());
 
     unmount();

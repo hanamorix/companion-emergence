@@ -18,6 +18,7 @@ session id across a clean bridge restart.
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from brain.bridge.chat import ChatMessage
 # fails. A high ceiling is fine; it never hits the prompt unless the
 # buffer is unreadable.
 HISTORY_MAX_TURNS = 5000
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -220,12 +223,16 @@ def get_or_hydrate_session(
         return state
 
 
-def _resolve_successor(persona_dir: Path, session_id: str) -> str | None:
+def resolve_successor(persona_dir: Path, session_id: str) -> str | None:
     """Full-follow the ``rolled_to`` successor chain from ``session_id`` to its live
     end. Returns the terminal successor sid (the one with no further pointer), or
-    None when ``session_id`` has no pointer at all OR the chain is cyclic (corrupt).
+    None when ``session_id`` has no pointer at all OR the chain is corrupt: cyclic,
+    or a pointer naming a sid that fails validation (a hand-edited / torn file).
     A visited-set guards a cycle — not a depth cap, so a long legitimate chain still
-    resolves (round-6 L-1)."""
+    resolves (round-6 L-1). Never raises on a corrupt pointer: the ``ValueError``
+    from the successor's sid validation is caught and logged so a GET on the
+    original (already validated) sid can fall back instead of 500-ing
+    (hunts/bridge-order-pollution-flakes, C3b)."""
     from brain.ingest.buffer import read_rolled_to
 
     visited: set[str] = set()
@@ -234,10 +241,20 @@ def _resolve_successor(persona_dir: Path, session_id: str) -> str | None:
         if cur in visited:
             return None  # cyclic pointer → abort to 404-then-reattach
         visited.add(cur)
-        nxt = read_rolled_to(persona_dir, cur)
+        try:
+            nxt = read_rolled_to(persona_dir, cur)
+        except ValueError as exc:
+            logger.warning(
+                "rolled_to chain from %s names an invalid successor %r: %s — treating as unresolvable",
+                session_id, cur, exc,
+            )
+            return None
         if nxt is None:
             return None if cur == session_id else cur
         cur = nxt
+
+
+_resolve_successor = resolve_successor  # internal callers (persist-side redirect) keep the old name
 
 
 def registry_lock() -> threading.RLock:

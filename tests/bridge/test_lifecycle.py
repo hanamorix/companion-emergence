@@ -12,6 +12,10 @@ from brain.bridge.server import build_app
 
 
 def _client(persona_dir: Path, **kw) -> TestClient:
+    # This module tests the lifecycle itself (supervisor tick, pruning, shutdown drain),
+    # so it opts back INTO the background threads the root conftest inhibits for
+    # endpoint tests (hunts/bridge-order-pollution-flakes; C7 opt-in list).
+    kw.setdefault("background_threads", True)
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests", **kw))
 
 
@@ -219,7 +223,13 @@ def test_dirty_recovery_real_snapshot_preserves_buffer_and_commits(persona_dir: 
     from brain.ingest.buffer import ingest_turn
     from brain.memory.store import MemoryStore
 
-    # Patch the provider seam used by run_recovery_if_needed (brain.bridge.daemon.get_provider)
+    # Patch the provider seam used by run_recovery_if_needed. #154: daemon.py
+    # now builds its provider via build_tier_provider(persona_dir,
+    # TIER_BACKGROUND_HOUSEKEEPING) (brain/bridge/model_tier.py), which does a
+    # fresh, function-scoped `from brain.bridge.provider import get_provider`
+    # on every call — patch the SOURCE module (brain.bridge.provider), not the
+    # old brain.bridge.daemon.get_provider name (daemon.py no longer imports
+    # or calls that name at all).
     class _FakeProvider:
         def name(self):
             return "fake"
@@ -232,7 +242,9 @@ def test_dirty_recovery_real_snapshot_preserves_buffer_and_commits(persona_dir: 
                 {"text": "User has a dog named Loopy", "label": "fact", "importance": 7, "emotions": {}}
             ])
 
-    monkeypatch.setattr("brain.bridge.daemon.get_provider", lambda _name, **_kw: _FakeProvider())
+    monkeypatch.setattr(
+        "brain.bridge.provider.get_provider", lambda _name, **_kw: _FakeProvider()
+    )
 
     state_file.write(
         persona_dir,
@@ -257,6 +269,17 @@ def test_dirty_recovery_real_snapshot_preserves_buffer_and_commits(persona_dir: 
     assert buffer_path.exists(), "recovery must not delete the replay buffer"
     store = MemoryStore(persona_dir / "memories.db")
     try:
+        # memory-consolidation migration: the recovered "fact" is a gated ingest
+        # label, so it is enqueued as a pending candidate rather than written to
+        # memories.db. Promote the queue (promote-all classifier) so the recovered
+        # turn lands as a real row and the count assertion holds.
+        from brain.engines.consolidation import Decision, run_consolidation
+
+        run_consolidation(
+            store,
+            persona_dir=store.persona_dir,
+            classifier=lambda _c, _ctx: Decision("new"),
+        )
         rows = store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()
         assert rows[0] >= 1
     finally:

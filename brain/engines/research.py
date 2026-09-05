@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
 from brain.engines.research_notes import append_session_notes, read_notes_tail
@@ -324,7 +325,9 @@ class ResearchEngine:
                         provider_name=self.provider.name(),
                         searcher_name=self.searcher.name() if web_used else None,
                     )
-                    self.store.create(mem)
+                    from brain.memory.pending import route_write
+
+                    route_write(self.store, mem, source="research")
                     mem_id = mem.id
                 except Exception as exc:
                     logger.warning("research memory create failed for %r: %s", winner.id, exc)
@@ -376,7 +379,9 @@ class ResearchEngine:
                     interest=winner,
                     mem_id=mem_id,
                     summary_excerpt=session.memory[:1000],
-                    provider=self.provider,
+                    provider=build_tier_provider(
+                        self.interests_path.parent, TIER_BACKGROUND_CLASSIFIER
+                    ),
                     user_name=user_name,
                     now=now,
                 )

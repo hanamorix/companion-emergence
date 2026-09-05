@@ -4,6 +4,7 @@ extract_session_snapshot, snapshot_stale_sessions, finalize_stale_sessions."""
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
+from brain.engines.consolidation import Decision, run_consolidation
 from brain.ingest.buffer import (
     ingest_turn,
     read_backoff,
@@ -26,8 +28,17 @@ from brain.ingest.pipeline import (
     snapshot_stale_sessions,
 )
 from brain.ingest.soul_queue import list_soul_candidates
+from brain.ingest.types import VALID_LABELS
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.pending import PendingQueue
 from brain.memory.store import MemoryStore
+
+# memory-consolidation migration: gated ingest labels (fact/observation/…) are
+# enqueued as candidates, not written to memories.db. Promote them through the
+# consolidation gate (inject a promote-all classifier) so the pre-existing
+# store.get() end-state assertions hold — the candidate id is preserved on
+# promote, so report.memory_ids still resolves.
+_PROMOTE_ALL = lambda _cand, _ctx: Decision("new")  # noqa: E731
 
 # ---------------------------------------------------------------------------
 # Fake providers for pipeline tests
@@ -103,8 +114,10 @@ def tracking_provider() -> _TrackingProvider:
 
 
 @pytest.fixture
-def store() -> MemoryStore:
-    return MemoryStore(":memory:")
+def store(tmp_path) -> MemoryStore:
+    # On-disk so store.persona_dir == the persona_dir passed to close_session:
+    # gated ingest labels enqueue to <persona_dir>/pending_candidates.jsonl.
+    return MemoryStore(tmp_path / "memories.db")
 
 
 @pytest.fixture
@@ -150,7 +163,8 @@ def test_close_session_on_missing_buffer_returns_empty_report(
 def test_close_session_full_path_correct_counts(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    """Full pipeline: 3 turns → extract 2 items → 0 deduped → 2 committed."""
+    """Full pipeline: 3 turns → extract 2 items → 0 deduped → 2 enqueued (both labels are
+    gated, not in GATE_BYPASS_TYPES — #167: 'committed' now means durable-only)."""
     # Ingest 3 turns.
     for speaker, text in [
         ("Hana", "tell me something"),
@@ -175,11 +189,13 @@ def test_close_session_full_path_correct_counts(
     )
 
     assert report.extracted == 2
-    assert report.committed == 2
+    assert report.committed == 0
+    assert report.enqueued == 2
     assert report.deduped == 0
     assert report.errors == 0
     assert len(report.memory_ids) == 2
-    # Both memories should exist in the store.
+    # Gated candidates are enqueued; promote them, then both memories exist.
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     for mid in report.memory_ids:
         assert store.get(mid) is not None
 
@@ -268,7 +284,8 @@ def test_close_session_valid_empty_extraction_deletes_buffer_without_error(
 def test_close_session_memory_and_soul_candidate_both_written(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    """High-importance item: both committed to store AND queued as soul candidate."""
+    """High-importance item: enqueued as a candidate (gated label) AND queued as soul
+    candidate."""
     ingest_turn(tmp_path, {"session_id": "sess_both", "speaker": "Hana", "text": "this matters"})
     provider = _CannedProvider(
         [{"text": "The most important truth", "label": "observation", "importance": 10}]
@@ -281,11 +298,14 @@ def test_close_session_memory_and_soul_candidate_both_written(
         provider=provider,
     )
 
-    assert report.committed == 1
+    assert report.committed == 0
+    assert report.enqueued == 1
     assert report.soul_candidates == 1
     assert len(report.memory_ids) == 1
 
     mem_id = report.memory_ids[0]
+    # Gated candidate — promote it, then it is a real memories.db row (id kept).
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
     memory = store.get(mem_id)
     assert memory is not None
     assert memory.content == "The most important truth"
@@ -298,7 +318,7 @@ def test_close_session_memory_and_soul_candidate_both_written(
 def test_close_session_counts_soul_queue_failure_without_claiming_success(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A committed memory is not reported as queued if the soul queue append fails."""
+    """An enqueued (gated) memory is not reported as queued if the soul queue append fails."""
     ingest_turn(
         tmp_path, {"session_id": "sess_soul_fail", "speaker": "Hana", "text": "this matters"}
     )
@@ -315,10 +335,153 @@ def test_close_session_counts_soul_queue_failure_without_claiming_success(
         provider=provider,
     )
 
-    assert report.committed == 1
+    assert report.committed == 0
+    assert report.enqueued == 1
     assert report.soul_candidates == 0
     assert report.soul_queue_errors == 1
     assert list_soul_candidates(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# #167 — committed vs. enqueued telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_close_session_gated_type_reports_enqueued_not_committed(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C1: a gated (non-GATE_BYPASS_TYPES) label increments enqueued, not committed, and
+    lands in pending_candidates.jsonl, not memories.db."""
+    ingest_turn(tmp_path, {"session_id": "sess_gated", "speaker": "Hana", "text": "hi"})
+    provider = _CannedProvider([{"text": "A gated fact", "label": "fact", "importance": 5}])
+    report = close_session(
+        tmp_path, "sess_gated", store=store, hebbian=hebbian, provider=provider
+    )
+
+    assert report.committed == 0
+    assert report.enqueued == 1
+    mem_id = report.memory_ids[0]
+    assert store.get(mem_id) is None
+    queued = PendingQueue(store.persona_dir).read_recent("fact", limit=5)
+    assert any(m.id == mem_id for m in queued)
+
+
+def test_close_session_bypass_type_reports_committed_not_enqueued(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2 (round-3 revision, BT-dissolved — see changes/fix-167-committed-telemetry/decisions.md):
+    real conversation-extraction can never natively carry a GATE_BYPASS_TYPES label — VALID_LABELS
+    and GATE_BYPASS_TYPES are disjoint by design, and ExtractedItem.normalize() (called
+    unconditionally at the SCORE stage) coerces any out-of-VALID_LABELS label to "observation"
+    before it reaches the branch under test. This test widens VALID_LABELS for its own duration
+    only, so a real "journal_entry"-labeled item survives SCORE intact and reaches the real,
+    unmodified classification branch in pipeline.py — proving that branch is correct, not that
+    real conversation traffic exercises it (it structurally cannot, today)."""
+    monkeypatch.setattr(
+        "brain.ingest.types.VALID_LABELS", frozenset({*VALID_LABELS, "journal_entry"})
+    )
+    ingest_turn(tmp_path, {"session_id": "sess_bypass", "speaker": "Hana", "text": "logging"})
+    provider = _CannedProvider(
+        [{"text": "A deliberate journal entry", "label": "journal_entry", "importance": 6}]
+    )
+    report = close_session(
+        tmp_path, "sess_bypass", store=store, hebbian=hebbian, provider=provider
+    )
+
+    assert report.committed == 1
+    assert report.enqueued == 0
+    mem_id = report.memory_ids[0]
+    memory = store.get(mem_id)
+    assert memory is not None
+    assert memory.content == "A deliberate journal entry"
+
+
+def test_snapshot_bypass_type_reports_committed_not_enqueued(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3: extract_session_snapshot's sibling of test_close_session_bypass_type_reports_
+    committed_not_enqueued above — same VALID_LABELS-widening technique, same rationale."""
+    monkeypatch.setattr(
+        "brain.ingest.types.VALID_LABELS", frozenset({*VALID_LABELS, "journal_entry"})
+    )
+    ingest_turn(tmp_path, {"session_id": "sess_snap_bypass", "speaker": "Hana", "text": "logging"})
+    provider = _CannedProvider(
+        [{"text": "A deliberate journal entry (snapshot)", "label": "journal_entry", "importance": 6}]
+    )
+    report = extract_session_snapshot(
+        tmp_path, "sess_snap_bypass", store=store, hebbian=hebbian, provider=provider
+    )
+
+    assert report.committed == 1
+    assert report.enqueued == 0
+    mem_id = report.memory_ids[0]
+    memory = store.get(mem_id)
+    assert memory is not None
+    assert memory.content == "A deliberate journal entry (snapshot)"
+
+
+def test_close_session_log_line_renders_enqueued_count(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C12: the conversation_ingested log line actually renders enqueued=N, not just that the
+    token 'enqueued' appears in the source format string."""
+    ingest_turn(tmp_path, {"session_id": "sess_log", "speaker": "Hana", "text": "hi"})
+    provider = _CannedProvider([{"text": "A gated fact", "label": "fact", "importance": 5}])
+    with caplog.at_level(logging.INFO, logger="brain.ingest.pipeline"):
+        close_session(tmp_path, "sess_log", store=store, hebbian=hebbian, provider=provider)
+
+    ingested_records = [r for r in caplog.records if r.message.startswith("conversation_ingested")]
+    assert len(ingested_records) == 1
+    assert "committed=0" in ingested_records[0].message
+    assert "enqueued=1" in ingested_records[0].message
+
+
+def test_snapshot_log_line_renders_enqueued_count(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C12: extract_session_snapshot's conversation_snapshot log line renders enqueued=N."""
+    ingest_turn(tmp_path, {"session_id": "sess_snap_log", "speaker": "Hana", "text": "hi"})
+    provider = _CannedProvider([{"text": "A gated fact", "label": "fact", "importance": 5}])
+    with caplog.at_level(logging.INFO, logger="brain.ingest.pipeline"):
+        extract_session_snapshot(
+            tmp_path, "sess_snap_log", store=store, hebbian=hebbian, provider=provider
+        )
+
+    snapshot_records = [r for r in caplog.records if r.message.startswith("conversation_snapshot ")]
+    assert len(snapshot_records) == 1
+    assert "committed=0" in snapshot_records[0].message
+    assert "enqueued=1" in snapshot_records[0].message
+
+
+def test_finalize_log_line_renders_enqueued_count(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C12: finalize_stale_sessions's conversation_finalized log line renders enqueued=N."""
+    ingest_turn(tmp_path, {"session_id": "sess_final_log", "speaker": "Hana", "text": "hi"})
+    old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat(timespec="seconds")
+    buf_file = tmp_path / "active_conversations" / "sess_final_log.jsonl"
+    buf_file.write_text(
+        json.dumps(
+            {
+                "session_id": "sess_final_log",
+                "speaker": "Hana",
+                "text": "hi",
+                "ts": old_ts,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    provider = _CannedProvider([{"text": "A gated fact", "label": "fact", "importance": 5}])
+    with caplog.at_level(logging.INFO, logger="brain.ingest.pipeline"):
+        finalize_stale_sessions(
+            tmp_path, finalize_after_hours=24.0, store=store, hebbian=hebbian, provider=provider
+        )
+
+    finalized_records = [r for r in caplog.records if r.message.startswith("conversation_finalized")]
+    assert len(finalized_records) == 1
+    assert "committed=0" in finalized_records[0].message
+    assert "enqueued=1" in finalized_records[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -1009,7 +1172,8 @@ def test_snapshot_backoff_clears_on_success(
     )
 
     assert report.errors == 0
-    assert report.committed >= 1
+    assert report.committed == 0
+    assert report.enqueued >= 1
     assert read_backoff(tmp_path, sid) is None
 
 

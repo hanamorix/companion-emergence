@@ -14,7 +14,10 @@ When the test runs it verifies:
   3. The unit file's ``ExecStart`` line contains
      ``--client-origin systemd`` (proves the systemd backend was
      invoked, not the launchd one).
-  4. The service reaches ``active`` or ``activating`` state.
+  4. systemd loads the unit (``LoadState=loaded``). Deliberately not
+     ``is-active``: the unit's bridge has no persona to boot under the
+     test's bare ``KINDLED_HOME``, so asserting liveness races its exit
+     (#160).
 
 Teardown via ``nell service uninstall --persona ci_test`` runs in a
 ``try/finally`` so a mid-test assertion failure still cleans up.
@@ -61,8 +64,8 @@ def _systemd_user_available() -> bool:
         return False
 
 
-def test_install_creates_unit_file_and_starts(tmp_path: Path) -> None:
-    """Round-trip: install → assert unit file + active state → uninstall."""
+def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
+    """Round-trip: install → assert unit file + systemd loaded it → uninstall."""
     if not _systemd_user_available():
         pytest.skip("systemd --user not available on this host (expected in CI containers)")
 
@@ -116,16 +119,58 @@ def test_install_creates_unit_file_and_starts(tmp_path: Path) -> None:
             f"unit file ExecStart should contain '--client-origin systemd':\n{unit_content}"
         )
 
-        # 4. Service should be active or activating.
-        status = subprocess.run(
-            ["systemctl", "--user", "is-active", "companion-emergence-ci_test"],
+        # 4. systemd must have LOADED the unit — i.e. parsed it and accepted it
+        #    into the user manager. This is what `service install` actually owns.
+        #
+        #    Deliberately NOT `is-active`: KINDLED_HOME here is a bare tmp_path with
+        #    no persona dir, so the bridge the unit starts exits almost immediately.
+        #    Polling is-active right after install races that exit — a fast crash
+        #    reports "failed", a slow one is still "activating" — which is the
+        #    intermittent failure in #160. Bridge boot-success is a different
+        #    subject with different preconditions; it is not this test's claim.
+        load_state = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "-p",
+                "LoadState",
+                "--value",
+                "companion-emergence-ci_test",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        active_state = status.stdout.strip()
-        assert active_state in ("active", "activating"), (
-            f"service not active after install; is-active returned: {active_state!r}"
+        assert load_state.stdout.strip() == "loaded", (
+            "systemd did not load the installed unit; "
+            f"LoadState={load_state.stdout.strip()!r} stderr={load_state.stderr!r}"
+        )
+
+        # 5. (#164) LoadState=loaded can be satisfied by a unit file systemd
+        #    noticed on its own; UnitFileState=enabled additionally proves the
+        #    installer's `enable --now` ran against a daemon-reloaded manager
+        #    (a stale manager reports the pre-reload state). Restores the
+        #    daemon-reload coverage the #160 de-flake dropped, without racing
+        #    the bridge's own exit.
+        unit_file_state = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "-p",
+                "UnitFileState",
+                "--value",
+                "companion-emergence-ci_test",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert unit_file_state.stdout.strip() == "enabled", (
+            "installer did not enable the unit (daemon-reload skipped?); "
+            f"UnitFileState={unit_file_state.stdout.strip()!r} "
+            f"stderr={unit_file_state.stderr!r}"
         )
 
     finally:

@@ -249,13 +249,11 @@ SCHEMAS: dict[str, dict] = {
     "search_memories": {
         "name": "search_memories",
         "description": (
-            "Search Nell's memories by content keyword and/or emotion. "
-            "Splits multi-word queries into tokens and searches each separately — "
-            "so 'Henryk morning coffee' finds memories mentioning any of those words. "
-            "Returns empty when nothing matches; call recall_forgotten for memories "
-            "that may have faded from active storage. "
-            "Call this when recalling specific events, checking past experiences, "
-            "or finding emotionally resonant memories to inform a response."
+            "Find memories not already in front of you. Searches your whole memory "
+            "pool by keyword (and optional emotion) and returns short snippets with "
+            "ids, ranked by relevance. Use this when nothing already shown fits; try "
+            "recall_forgotten if it returns empty. To open a snippet you already have "
+            "an id for, use read_full_memory."
         ),
         "parameters": {
             "type": "object",
@@ -273,8 +271,36 @@ SCHEMAS: dict[str, dict] = {
                     "description": "Max results to return. Default 5.",
                     "default": 5,
                 },
+                "exclude_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Memory ids to omit from results (already-surfaced or "
+                        "explicitly-rejected) — pass these to fetch the next tranche."
+                    ),
+                },
             },
             "required": ["query"],
+        },
+    },
+    "read_full_memory": {
+        "name": "read_full_memory",
+        "description": (
+            "Open the full text of one memory you already have an id for, from a "
+            "recall-block snippet or a search result. Use this to actually read a "
+            "snippet in front of you. This deliberate read strengthens the memory; "
+            "seeing a snippet does not. To find memories not yet shown, use "
+            "search_memories."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "The id of the memory to read in full (from a snippet result).",
+                },
+            },
+            "required": ["memory_id"],
         },
     },
     "save_work": {

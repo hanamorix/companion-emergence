@@ -265,7 +265,12 @@ def _apply_lean_flags(cmd: list[str]) -> None:
     cmd.append("--strict-mcp-config")
 
 
-def brain_tools_mcp_entry(persona_dir: Path, *, request_id: str | None = None) -> dict:
+def brain_tools_mcp_entry(
+    persona_dir: Path,
+    *,
+    request_id: str | None = None,
+    session_id: str | None = None,
+) -> dict:
     """The ``mcpServers["brain-tools"]`` entry the claude CLI uses to spawn the MCP child.
 
     Single source of truth for the child spawn (issue #138). ``-P`` (PYTHONSAFEPATH) drops the
@@ -281,13 +286,28 @@ def brain_tools_mcp_entry(persona_dir: Path, *, request_id: str | None = None) -
 
     Keeping this the ONE definition lets the harness roster preflight
     (``tests.harness.roster_preflight``) reproduce the child argv/config by construction.
+
+    ``request_id``/``session_id`` cross the process boundary via env vars, the only value
+    transport available to a spawned subprocess (a live object cannot cross it) — mirrors the
+    ``NELL_MCP_AUDIT_REQUEST_ID`` precedent, consumed by ``brain/mcp_server/audit.py``.
+    ``session_id`` (``NELL_MCP_SESSION_ID``, consumed by ``brain/mcp_server/tools.py``) is what
+    lets a ``_PROVIDER_TOOLS`` tool (currently only ``compact_history``, #80) resolve which
+    session's buffer to act on when invoked via MCP. Built additively so either, both, or
+    neither can be set without one clobbering the other, and ``"env"`` is omitted entirely (not
+    left as an empty dict) when neither is given — preserves the pre-#80 entry shape for callers
+    that check ``"env" not in entry``.
     """
     entry: dict = {
         "command": sys.executable,
         "args": ["-P", "-m", "brain.mcp_server", "--persona-dir", str(persona_dir)],
     }
+    env: dict[str, str] = {}
     if request_id is not None:
-        entry["env"] = {"NELL_MCP_AUDIT_REQUEST_ID": request_id}
+        env["NELL_MCP_AUDIT_REQUEST_ID"] = request_id
+    if session_id is not None:
+        env["NELL_MCP_SESSION_ID"] = session_id
+    if env:
+        entry["env"] = env
     return entry
 
 
@@ -696,6 +716,7 @@ class ClaudeCliProvider(LLMProvider):
                 flat_prompt=flat_prompt,
                 system_prompt=system_prompt,
                 persona_dir=Path(persona_dir_str),
+                session_id=(options or {}).get("session_id"),
             )
 
         # Text path for turns without image blocks. Multi-turn history is
@@ -858,9 +879,17 @@ class ClaudeCliProvider(LLMProvider):
                 )
                 return
             allowed_mcp = [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
+            # #80: this is the config the LIVE WS chat path actually uses (see
+            # brain/bridge/server.py's _StreamingProxy, which calls chat_stream()
+            # in preference to chat() whenever the real provider defines it) —
+            # session_id must be threaded here too, not only in
+            # _chat_with_mcp_tools, or a Kindled-invoked compact_history call
+            # still can't resolve its session on the path real traffic runs.
             config = {
                 "mcpServers": {
-                    "brain-tools": brain_tools_mcp_entry(persona_dir_path),
+                    "brain-tools": brain_tools_mcp_entry(
+                        persona_dir_path, session_id=(options or {}).get("session_id")
+                    ),
                 }
             }
             try:
@@ -1065,7 +1094,15 @@ class ClaudeCliProvider(LLMProvider):
                             if cli_err is not None:
                                 yield StreamError(stage="claude_cli_error", detail=cli_err)
                             else:
-                                yield StreamDone(content=result_text, metadata=metadata)
+                                # #146: an exit-0 result frame can carry empty
+                                # text. Fall back to what already streamed, as
+                                # the EOF branch does, instead of a blank reply.
+                                content = (
+                                    result_text
+                                    or "".join(delta_chunks)
+                                    or (assistant_snapshot or "")
+                                )
+                                yield StreamDone(content=content, metadata=metadata)
                         done_emitted = True
                         # The result frame is terminal — stop here. Looping back
                         # to q.get would re-arm the idle-timeout watchdog and, if
@@ -1099,6 +1136,7 @@ class ClaudeCliProvider(LLMProvider):
         flat_prompt: str,
         system_prompt: str | None,
         persona_dir: Path,
+        session_id: str | None = None,
     ) -> ChatResponse:
         """Tool-calling path: claude with --mcp-config pointing at brain.mcp_server.
 
@@ -1112,6 +1150,11 @@ class ClaudeCliProvider(LLMProvider):
         writer interleaves into the snapshot window. Tools dispatched
         here have ALREADY run inside the subprocess — run_tool_loop
         must not re-dispatch them.
+
+        ``session_id``, when given, is threaded into the spawned MCP
+        subprocess's env (NELL_MCP_SESSION_ID) so a ``_PROVIDER_TOOLS`` tool
+        (currently only ``compact_history``, #80) can resolve it on that side
+        of the process boundary — see ``brain_tools_mcp_entry``.
         """
         try:
             import mcp  # noqa: F401
@@ -1125,7 +1168,9 @@ class ClaudeCliProvider(LLMProvider):
         request_id = uuid.uuid4().hex
         config = {
             "mcpServers": {
-                "brain-tools": brain_tools_mcp_entry(persona_dir, request_id=request_id),
+                "brain-tools": brain_tools_mcp_entry(
+                    persona_dir, request_id=request_id, session_id=session_id
+                ),
             }
         }
 
