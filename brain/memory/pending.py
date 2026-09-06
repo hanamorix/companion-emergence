@@ -127,18 +127,53 @@ class PendingQueue:
         `enqueue` — no appraisal and no provider call happen here. The gate
         re-appraises on its own consolidation tick and UPDATES the existing
         row in place (never a new row).
+
+        Single-id convenience wrapper around `enqueue_reappraisals` — see
+        that method if enqueuing more than one id (e.g. every surfaced
+        recall hit in one turn); calling this in a loop reacquires the lock
+        and reopens the file once per id.
         """
-        entry = {
-            "_route": "reappraise_importance",
-            "memory_id": memory_id,
-            "_source": source,
-            "_enqueued_at": datetime.now(UTC).isoformat(),
-        }
-        line = json.dumps(entry, ensure_ascii=False)
+        self.enqueue_reappraisals([memory_id], source=source)
+
+    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str) -> int:
+        """Enqueue MULTIPLE existing-memory re-appraise requests under a
+        SINGLE `file_lock` + single open + single write (P3 retention
+        rework, Change 3 hot-path fix).
+
+        The recall hook (`brain.chat.prompt._build_recall_block`) surfaces
+        up to ~2*limit memory ids per turn and used to call
+        `enqueue_reappraisal` once per id — each call independently
+        acquiring the lock and opening/writing the file, i.e. N lock/open/
+        write syscalls on the recall hot path. This batches the whole list
+        into one lock acquisition and one file write.
+
+        Each written line has the EXACT same shape as a single
+        `enqueue_reappraisal` call (`_route`/`memory_id`/`_source`/
+        `_enqueued_at`) — only the I/O is batched, not the item schema.
+        `drain()` and the consolidation gate see no difference from N
+        individual calls. No-op (returns 0, does not touch the file) on an
+        empty list. Returns the number of lines written.
+        """
+        if not memory_ids:
+            return 0
+        now = datetime.now(UTC).isoformat()
+        lines = [
+            json.dumps(
+                {
+                    "_route": "reappraise_importance",
+                    "memory_id": memory_id,
+                    "_source": source,
+                    "_enqueued_at": now,
+                },
+                ensure_ascii=False,
+            )
+            for memory_id in memory_ids
+        ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with file_lock(self.path):
             with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+                fh.write("\n".join(lines) + "\n")
+        return len(lines)
 
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.

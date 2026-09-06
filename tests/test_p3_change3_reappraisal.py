@@ -9,6 +9,7 @@ Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
 from __future__ import annotations
 
 import inspect
+from unittest.mock import patch
 
 import pytest
 
@@ -160,3 +161,35 @@ def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_p
     assert hi.id in reappraise_ids
     assert lo.id in reappraise_ids
     store.close()
+
+
+def test_c3_3_batch_enqueue_uses_a_single_lock_and_write(tmp_path):
+    """Hot-path fix: enqueuing multiple surfaced ids from one recall turn
+    acquires `file_lock` exactly ONCE and performs exactly ONE write, not
+    one lock/open/write per id (the finding this batch API addresses).
+    Fail-test: a version that still loops per-id internally would report
+    call counts equal to the number of ids instead of 1."""
+    from brain.utils.file_lock import file_lock as real_file_lock
+
+    ids = ["id-a", "id-b", "id-c"]
+    queue = PendingQueue(tmp_path)
+
+    with patch("brain.memory.pending.file_lock", wraps=real_file_lock) as mock_lock:
+        written = queue.enqueue_reappraisals(ids, source="recall")
+
+    assert written == 3
+    assert mock_lock.call_count == 1  # ONE lock acquisition for all 3 ids
+
+    entries = queue.drain()
+    reappraise_ids = {
+        e["memory_id"] for e in entries if e.get("_route") == "reappraise_importance"
+    }
+    assert reappraise_ids == set(ids)
+
+
+def test_c3_3_batch_enqueue_empty_list_is_a_noop(tmp_path):
+    """An empty id list writes nothing and does not touch the queue file."""
+    queue = PendingQueue(tmp_path)
+    written = queue.enqueue_reappraisals([], source="recall")
+    assert written == 0
+    assert queue.drain() == []

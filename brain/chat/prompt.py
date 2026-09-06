@@ -1156,9 +1156,7 @@ def _build_recall_block(
         from brain.memory.pending import PendingQueue
 
         reappraise_ids = full_ids | seen_bump
-        queue = PendingQueue(persona_dir)
-        for mid in reappraise_ids:
-            queue.enqueue_reappraisal(mid, source="recall")
+        PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
 
     return "\n".join(lines)
 
