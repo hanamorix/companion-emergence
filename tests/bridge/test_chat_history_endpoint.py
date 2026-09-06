@@ -54,7 +54,7 @@ def test_history_returns_empty_array_for_missing_session(persona_dir: Path) -> N
     with _make_client(persona_dir) as c:
         r = c.get("/chat/history", params={"session_id": "s_missing"})
         assert r.status_code == 200
-        assert r.json() == {"messages": [], "next_before_turn": None}
+        assert r.json() == {"messages": [], "next_before_turn": None, "session_id": "s_missing"}
 
 
 def test_history_returns_buffered_turns_in_order(persona_dir: Path) -> None:
@@ -277,3 +277,75 @@ def test_history_invalid_successor_falls_back_and_warns(persona_dir: Path, caplo
     names = {rec.name for rec in caplog.records if rec.levelno >= logging.WARNING}
     assert "brain.chat.session" in names, names  # the walk itself caught the bad successor
     assert "brain.bridge.server" in names, names
+
+
+# ── #199: echo the resolved sid; reset the cursor across a rollover redirect ──
+
+
+def test_history_echoes_session_id(persona_dir: Path) -> None:
+    _seed_buffer(persona_dir, "s_plain", _two_turns("s_plain"))
+    with _make_client(persona_dir) as c:
+        r = c.get("/chat/history", params={"session_id": "s_plain"})
+    assert r.status_code == 200
+    assert r.json()["session_id"] == "s_plain"
+
+
+def test_history_echoes_resolved_sid_after_rollover(persona_dir: Path) -> None:
+    from brain.chat.rollover import perform_rollover
+
+    _seed_buffer(persona_dir, "s_a", _two_turns("s_a"))
+    new_sid = perform_rollover(persona_dir, "s_a", persona_dir.name, seed_mode="tiers_plus_tail")
+    assert new_sid is not None
+
+    with _make_client(persona_dir) as c:
+        r = c.get("/chat/history", params={"session_id": "s_a"})
+    assert r.status_code == 200
+    assert r.json()["session_id"] == new_sid
+
+
+def test_history_resets_cursor_across_rollover_redirect(persona_dir: Path) -> None:
+    """A ``before_turn`` cursor was computed against the OLD buffer's line index.
+
+    Applying it to the successor's index returns a different window under the
+    same cursor (#199). On redirect the cursor is dropped and the newest page
+    of the successor is served instead.
+    """
+    from brain.chat.rollover import perform_rollover
+
+    turns = [
+        {"session_id": "s_a", "speaker": "user" if i % 2 == 0 else "assistant",
+         "text": f"t{i}", "ts": f"2026-01-01T00:00:{i:02d}Z"}
+        for i in range(6)
+    ]
+    _seed_buffer(persona_dir, "s_a", turns)
+    new_sid = perform_rollover(persona_dir, "s_a", persona_dir.name, seed_mode="tiers_plus_tail")
+    assert new_sid is not None
+
+    with _make_client(persona_dir) as c:
+        direct = c.get("/chat/history", params={"session_id": new_sid, "limit": 2}).json()
+        redirected = c.get(
+            "/chat/history", params={"session_id": "s_a", "limit": 2, "before_turn": 2}
+        ).json()
+    assert redirected["session_id"] == new_sid
+    # Cursor ignored on redirect → same newest page as a direct, cursorless read.
+    assert redirected["messages"] == direct["messages"]
+    assert redirected["next_before_turn"] == direct["next_before_turn"]
+
+
+# ── #201: one session-id grammar, not two copies kept in sync by a comment ──
+
+
+def test_history_sid_grammar_is_the_buffer_grammar() -> None:
+    """server.py must import the grammar, not re-compile its own copy.
+
+    ``re.compile`` caches identical patterns, so an ``is`` check between the
+    two names passes even with two literals — this is a source oracle instead.
+    """
+    import inspect
+
+    from brain.bridge import server
+    from brain.ingest import buffer
+
+    assert server._BUFFER_SESSION_ID_RE is buffer._SESSION_ID_RE
+    src = inspect.getsource(server)
+    assert "_BUFFER_SESSION_ID_RE = re.compile(" not in src
