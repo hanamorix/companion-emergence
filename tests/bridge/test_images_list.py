@@ -237,6 +237,41 @@ class TestListImages:
             r = c.get("/images", headers=_auth_headers("secret"))
         assert r.status_code == 200
 
+    # ── #197: a buffer deleted between glob and read must not blank the list ──
+
+    def test_survives_buffer_vanishing_mid_scan(self, tmp_path: Path, monkeypatch):
+        """Simulate a rollover landing between ``glob`` and the read of a buffer.
+
+        The first read of the globbed buffer deletes it and writes its
+        successor (carrying the same ``image_shas``) — what ``perform_rollover``
+        does. Before #197 the vanished file yielded zero rows and the successor
+        was never in the glob snapshot, so the response was ``[]``.
+        """
+        import brain.bridge.server as server_mod
+
+        _patch_fake_provider(monkeypatch)
+        persona_dir = tmp_path / "test-persona"
+        persona_dir.mkdir()
+        sha, _ext = _write_real_image(persona_dir, "png")
+        turn = {"ts": "2026-05-01T10:00:00Z", "image_shas": [sha]}
+        old = _write_buffer(persona_dir, "old-sid", [turn])
+        real_read = server_mod._read_jsonl_lines
+        fired = False
+
+        def racing_read(path: Path):
+            nonlocal fired
+            if path == old and not fired:
+                fired = True
+                _write_buffer(persona_dir, "new-sid", [turn])
+                old.unlink()
+            yield from real_read(path)
+
+        monkeypatch.setattr(server_mod, "_read_jsonl_lines", racing_read)
+        with _make_client(persona_dir) as c:
+            r = c.get("/images")
+        assert r.status_code == 200
+        assert [x["sha"] for x in r.json()] == [sha]
+
 
 class TestServeImage:
     def test_serves_image_bytes(self, tmp_path: Path, monkeypatch):

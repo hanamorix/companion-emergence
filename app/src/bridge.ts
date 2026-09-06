@@ -534,6 +534,8 @@ export interface ChatHistoryResponse {
   messages: ChatHistoryEntry[];
   /** Pagination cursor for the next older page — null when no more turns. */
   next_before_turn: number | null;
+  /** The sid actually served — differs from the request sid after a rollover redirect (#199). */
+  session_id?: string;
 }
 
 /**
