@@ -164,7 +164,7 @@ class ExtractorOutput(BaseModel):
 
 
 _SYSTEM_PROMPT = """\
-You are an extractor reading a companion's private inner monologue right after
+You are an extractor reading a kindled's private inner monologue right after
 they sent a visible reply. Identify what surfaced that should affect their
 memory, emotional state, or growth, and what you noticed they should have done
 differently.
@@ -181,7 +181,7 @@ Return ONLY a JSON object matching this schema:
 
 Conservative defaults:
 - Empty arrays if nothing salient surfaced.
-- Salience is how much this matters to the companion's continuity (0.1 = minor, 0.7 = forming, 0.9-1.0 = a pivotal, defining episode).
+- Salience is how much this matters to the kindled's continuity (0.1 = minor, 0.7 = forming, 0.9-1.0 = a pivotal, defining episode).
 - Emotion deltas are SMALL (typically 0.05-0.2 magnitude). One channel max usually.
 - Only propose interest_candidate when the user showed real, repeated enthusiasm for a topic this turn, most turns it is null.
 

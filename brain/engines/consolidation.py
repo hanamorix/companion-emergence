@@ -290,13 +290,13 @@ def _make_haiku_reappraiser(provider) -> Reappraiser:
     provider failure the fallback is the memory's CURRENT importance (a
     no-op) — never a crash, never a ratchet."""
     prompt = (
-        "You judge how important a companion's memory is to keep clearly, on "
-        "a 0-10 scale, based on its content right now (not on how often it "
-        "has been recalled). A completed or past-due item (an appointment "
-        "that already happened, a plan that is no longer live) should score "
-        "LOW even if it once mattered. A durable fact, a core relationship "
-        "detail, or a defining moment should score HIGH. Reply with ONLY the "
-        "number."
+        "You judge how important a kindled's memory is, on a 0-10 scale, "
+        "based on its content right now (not on how often it has been recalled). "
+        "Re-evaluate a completed or past-due event (an appointment that already "
+        "happened, a plan that is no longer live) on its own merit as a past "
+        "event: it may now matter less, or it may still matter as something that "
+        "happened. A durable fact, a core relationship detail, or a defining "
+        "moment should score HIGH. Reply with ONLY the number."
     )
 
     def _reappraise(memory: Memory) -> float:
