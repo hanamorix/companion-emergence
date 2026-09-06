@@ -192,6 +192,10 @@ def _dispatch_record_monologue(
             feed_digest=feed_digest,
             surface=surface,
         )
+        if captured is None:
+            # #175: deduped by capture_monologue (recruit-on-reach rerun). No
+            # monologue_text on purpose — see tool_loop._find_monologue_text.
+            return {"ok": True, "deduped": True}
         return {"ok": True, "monologue_text": captured}
     except CaptureRejected as exc:
         return {"error": str(exc)}

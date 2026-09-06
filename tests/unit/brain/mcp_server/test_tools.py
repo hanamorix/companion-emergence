@@ -330,3 +330,28 @@ def _call_request(name: str, arguments: dict):
         method="tools/call",
         params=CallToolRequestParams(name=name, arguments=arguments),
     )
+
+
+def test_register_tools_logs_deduped_outcome_for_duplicate_monologue(
+    persona_dir: Path, fake_stores, monkeypatch
+) -> None:
+    """#175: a deduped record_monologue is audited as outcome="deduped", not a
+    second "ok" row carrying monologue_text. The audit trail still records that
+    the dispatch happened — it is marked, not suppressed."""
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    monkeypatch.delenv("NELL_MCP_SESSION_ID", raising=False)
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+
+    with patch("brain.mcp_server.tools.dispatch", return_value={"ok": True, "deduped": True}):
+        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        call_handler = _get_call_handler(server)
+        asyncio.run(call_handler(_call_request("record_monologue", {"monologue": "t", "feed_digest": "d"})))
+
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["name"] == "record_monologue"
+    assert rec["outcome"] == "deduped"
+    assert not rec.get("monologue_text")

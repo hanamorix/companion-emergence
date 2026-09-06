@@ -68,8 +68,11 @@ def test_should_run_true_when_stubs_present_no_state(tmp_path: Path) -> None:
     assert should_run_vocab_repair(tmp_path) is True
 
 
-def test_should_run_false_when_state_complete(tmp_path: Path) -> None:
-    """Complete state file → should_run returns False regardless of vocab."""
+def test_should_run_true_when_state_complete_but_placeholder_remains(tmp_path: Path) -> None:
+    """Complete state file no longer silences should_run while a placeholder
+    description remains (#173). The old assertion ("False regardless of vocab")
+    was the bug: nothing ever backfilled placeholders minted after the one-time
+    repair."""
     from brain.health.vocab_repair import should_run_vocab_repair
 
     _write_vocab(tmp_path, [_stub_entry("body_grief")])
@@ -80,7 +83,7 @@ def test_should_run_false_when_state_complete(tmp_path: Path) -> None:
         "completed_at": "2026-06-10T00:00:00Z",
     }
     (tmp_path / "vocab_repair_state.json").write_text(json.dumps(state), encoding="utf-8")
-    assert should_run_vocab_repair(tmp_path) is False
+    assert should_run_vocab_repair(tmp_path) is True
 
 
 def test_should_run_false_when_no_stubs(tmp_path: Path) -> None:
@@ -131,8 +134,9 @@ def test_repair_bumps_only_stub_entries(tmp_path: Path) -> None:
 
 
 def test_repair_idempotent(tmp_path: Path) -> None:
-    """Complete state file → run_vocab_repair returns early without touching the vocab file."""
-    from brain.health.vocab_repair import run_vocab_repair, should_run_vocab_repair
+    """Complete state + no provider → run_vocab_repair returns early without
+    touching the vocab file (Step 1 is done; Step 2 needs a provider)."""
+    from brain.health.vocab_repair import run_vocab_repair
 
     _write_vocab(tmp_path, [_stub_entry("body_grief")])
     state = {
@@ -144,8 +148,6 @@ def test_repair_idempotent(tmp_path: Path) -> None:
     state_path = tmp_path / "vocab_repair_state.json"
     state_path.write_text(json.dumps(state), encoding="utf-8")
     orig_vocab_mtime = (tmp_path / "emotion_vocabulary.json").stat().st_mtime
-
-    assert should_run_vocab_repair(tmp_path) is False
 
     store = _make_store(tmp_path)
     try:
@@ -322,3 +324,69 @@ def test_repair_no_stubs_noop(tmp_path: Path) -> None:
 
     state = json.loads((tmp_path / "vocab_repair_state.json").read_text(encoding="utf-8"))
     assert state["repaired"] == 0
+
+
+# ---------------------------------------------------------------------------
+# #173 — placeholders minted AFTER the one-time repair are never backfilled
+# ---------------------------------------------------------------------------
+
+def _new_placeholder_entry(name: str) -> dict:
+    """An entry as reconstruct.py / persona_loader.py mint it TODAY: placeholder
+    description with the already-correct 14.0 half-life."""
+    return {
+        "name": name,
+        "description": PLACEHOLDER_DESCRIPTION,
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+
+
+def _complete_state(tmp_path: Path, *, repaired: int = 1, described: int = 0) -> None:
+    state = {
+        "status": "complete",
+        "repaired": repaired,
+        "described": described,
+        "completed_at": "2026-06-10T00:00:00Z",
+    }
+    (tmp_path / "vocab_repair_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_should_run_true_for_new_placeholder_after_state_complete(tmp_path: Path) -> None:
+    """A 14.0-half-life placeholder minted after the one-time repair completed
+    still needs a description — should_run must say so."""
+    from brain.health.vocab_repair import should_run_vocab_repair
+
+    _write_vocab(tmp_path, [_new_placeholder_entry("quiet_dread"), _proper_entry("love")])
+    _complete_state(tmp_path)
+    assert should_run_vocab_repair(tmp_path) is True
+
+
+def test_repair_describes_new_placeholders_after_state_complete(tmp_path: Path) -> None:
+    """Step 2 (describe) runs for every placeholder regardless of half-life or
+    prior completion; Step 1 (the 1.0 → 14.0 bump) stays one-time."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_new_placeholder_entry("quiet_dread"), _proper_entry("love")])
+    _complete_state(tmp_path, repaired=1, described=1)
+    provider = _FakeProvider(response=json.dumps({"quiet_dread": "a low hum of unease"}))
+
+    store = _make_store(tmp_path)
+    store.create(Memory.create_new(
+        content="memory referencing quiet_dread",
+        memory_type="conversation",
+        domain="us",
+        emotions={"quiet_dread": 5.0},
+    ))
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+
+    assert report.repaired == 1  # unchanged — Step 1 did not re-run
+    assert report.described == 2  # prior 1 + this run's 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert by_name["quiet_dread"]["description"] == "a low hum of unease"
+    assert by_name["quiet_dread"]["decay_half_life_days"] == 14.0
+    assert by_name["love"]["description"] == "a real description"
