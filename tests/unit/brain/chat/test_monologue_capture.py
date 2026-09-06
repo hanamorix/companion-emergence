@@ -171,3 +171,24 @@ def test_a_different_monologue_still_captures(tmp_path: Path):
     _promote_pending(tmp_path)
 
     assert len(store.list_by_type(MONOLOGUE_TRACE_TYPE, active_only=True)) == 2
+
+
+def test_deduped_capture_returns_none(tmp_path: Path):
+    """#175: the caller must be able to tell a dedupe from a capture.
+
+    Returning the monologue string on the dedupe branch made dispatch emit
+    ``monologue_text`` for the duplicate too — so the audit row (and anything
+    keyed on monologue_text, e.g. the pass-2 trigger) saw two captures.
+    """
+    from brain.chat.monologue_capture import capture_monologue
+
+    store = _store(tmp_path)
+    thought = "A name I could not place, and it bothered me."
+    first = capture_monologue(
+        persona_dir=tmp_path, store=store, monologue=thought, feed_digest="d"
+    )
+    second = capture_monologue(
+        persona_dir=tmp_path, store=store, monologue=thought, feed_digest="d"
+    )
+    assert first == thought
+    assert second is None

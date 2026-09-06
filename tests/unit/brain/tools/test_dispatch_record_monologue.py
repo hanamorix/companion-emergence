@@ -79,3 +79,26 @@ def test_dispatch_record_monologue_rejected_returns_error_dict(tmp_path: Path):
     finally:
         store.close()
         hebbian.close()
+
+
+def test_dispatch_record_monologue_marks_duplicate_without_monologue_text(tmp_path: Path):
+    """#175: the recruit-on-reach rerun dispatches record_monologue twice; the
+    second is deduped by capture_monologue and must NOT come back carrying
+    ``monologue_text`` (that key is what the audit row + pass-2 trigger key on)."""
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+    from brain.tools.dispatch import dispatch
+
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    args = {"monologue": "thought", "feed_digest": "digest"}
+    try:
+        first = dispatch("record_monologue", args, store=store, hebbian=hebbian, persona_dir=persona_dir)
+        second = dispatch("record_monologue", args, store=store, hebbian=hebbian, persona_dir=persona_dir)
+        assert first == {"ok": True, "monologue_text": "thought"}
+        assert second == {"ok": True, "deduped": True}
+    finally:
+        store.close()
+        hebbian.close()
