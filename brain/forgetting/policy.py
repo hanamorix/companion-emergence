@@ -25,6 +25,15 @@ LOST_PASS_COUNT = 2
 RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (see is_exempt), not lived-age — the name is historical. Recent memories stay fully active+verbatim for a month.
 IMPORT_GRACE_LIVED_HOURS = 168.0  # 7 lived-days — settling window for migrated memories
 
+# P3 retention rework, Change 2: importance lowers the EFFECTIVE fade gate
+# (never LOST_THRESHOLD/LOST_PASS_COUNT — those stay the final deletion gate,
+# per the cd808dbc invariant: a lever only delays fading, it does not lower
+# the deletion floor). r = clamp(memory.importance / 10, 0, 1); a no-op at
+# r=0 (importance 0 → today's behavior, byte-identical). Tuned against the
+# C2 simulation so importance-10 survives >= 2 lived-years while importance-0
+# is untouched and the response is monotonic + never-accelerating.
+FADE_IMPORTANCE_GAIN = 2.0
+
 
 class Transition(StrEnum):
     NONE = "none"  # no change
@@ -51,10 +60,18 @@ def next_state(
     A heavy open arc lowers the effective fade threshold so memories resist
     fading during intense narrative periods. LOST_THRESHOLD is unchanged —
     arc pressure only delays the fade gate, not the final deletion gate.
+
+    importance (P3 retention rework, Change 2): reused as a second, additive
+    divisor term alongside narrative_weight — the same idiom, another source
+    of pressure on the same gate. importance=0 contributes nothing (exact
+    no-op); rising importance lowers the effective fade gate further, same
+    direction as narrative_weight, never lowering LOST_THRESHOLD.
     """
-    # Arc pressure lowers the effective threshold proportionally.
-    # narrative_weight=0 → baseline; narrative_weight=1 → threshold halved.
-    effective_fade = FADE_THRESHOLD / (1.0 + narrative_weight)
+    # Arc pressure + importance both lower the effective threshold, additively,
+    # reusing the same divisor idiom. narrative_weight=0 and memory.importance=0
+    # → baseline (unchanged); either pressure source lowers the gate further.
+    r = min(1.0, max(0.0, memory.importance / 10.0))
+    effective_fade = FADE_THRESHOLD / (1.0 + narrative_weight + FADE_IMPORTANCE_GAIN * r)
     if memory.state == "active":
         if salience < effective_fade:
             return Transition.FADE
