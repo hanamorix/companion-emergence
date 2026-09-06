@@ -114,6 +114,32 @@ class PendingQueue:
                 break
         return out
 
+    def enqueue_reappraisal(self, memory_id: str, *, source: str) -> None:
+        """Enqueue an existing-memory importance re-appraise request (P3
+        retention rework, Change 3).
+
+        A minimal item, NOT a full Memory payload: just the target id plus
+        a top-level `_route` discriminator, so the queue file stays small.
+        `drain()` returns it as a raw dict like any other candidate; the
+        gate (`engines.consolidation._run_locked`) branches on `_route` to
+        separate re-appraise items from normal candidates BEFORE Pass 1/2.
+        Off the hot path: this is a cheap file append under lock, same as
+        `enqueue` — no appraisal and no provider call happen here. The gate
+        re-appraises on its own consolidation tick and UPDATES the existing
+        row in place (never a new row).
+        """
+        entry = {
+            "_route": "reappraise_importance",
+            "memory_id": memory_id,
+            "_source": source,
+            "_enqueued_at": datetime.now(UTC).isoformat(),
+        }
+        line = json.dumps(entry, ensure_ascii=False)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.path):
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.
 
