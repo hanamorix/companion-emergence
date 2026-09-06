@@ -69,19 +69,20 @@ def test_chat_one_shot_exits_zero() -> None:
     assert exit_code == 0
 
 
-def test_chat_one_shot_calls_close_session() -> None:
+def test_chat_one_shot_flushes_through_ingest() -> None:
     """One-shot mode must flush the conversation through the SP-4 ingest pipeline.
 
     Without this, every one-shot reply leaves the buffer file orphaned and no
     memories are ever committed (the bug the 2026-04-27 live-exercise stress
-    test surfaced — 0 ingest events across 20 prompts).
+    test surfaced — 0 ingest events across 20 prompts). Since #203 the flush
+    is the non-destructive snapshot, not close_session.
     """
-    with patch("brain.ingest.pipeline.close_session") as mock_close:
+    with patch("brain.ingest.pipeline.extract_session_snapshot") as mock_flush:
         exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     assert exit_code == 0
-    assert mock_close.call_count == 1
+    assert mock_flush.call_count == 1
     # First positional arg is persona_dir; second is session_id (must be set)
-    call_args = mock_close.call_args
+    call_args = mock_flush.call_args
     assert call_args.args[1]  # session_id non-empty
 
 
@@ -91,7 +92,9 @@ def test_chat_one_shot_close_failure_warns_not_raises() -> None:
     Mirrors the REPL's best-effort flush pattern (cli.py:828-845): persistence
     failures must never break the user-visible chat outcome.
     """
-    with patch("brain.ingest.pipeline.close_session", side_effect=RuntimeError("boom")):
+    with patch(
+        "brain.ingest.pipeline.extract_session_snapshot", side_effect=RuntimeError("boom")
+    ):
         with pytest.warns(RuntimeWarning, match="ingest flush failed"):
             exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
     assert exit_code == 0
@@ -221,3 +224,74 @@ def test_chat_via_bridge_labels_reply_with_persona_name(
     assert rc == 0
     assert "phoebe: " in out
     assert "nell: " not in out
+
+
+# ── #203: exit preserves the buffer by default; --close deletes it ────────────
+
+
+def _ok_empty_extraction(*_a, **_k):
+    """Successful, empty extraction — the branch where close_session deletes."""
+    from brain.ingest.extract import ExtractionOutcome
+
+    return ExtractionOutcome(items=[])
+
+
+def test_chat_one_shot_preserves_buffer_on_disk(persona_dir: Path) -> None:
+    """Default exit is a non-destructive snapshot — the buffer file survives.
+
+    #203: close_session() deleted active_conversations/<sid>.jsonl on every
+    CLI exit, so cascade-compaction / archive / rollover never had anything to
+    act on. The GUI only ever snapshots; the CLI must match.
+
+    Extraction is patched to succeed — with the fake provider it fails, and a
+    failed close_session already retains the buffer, which would mask the bug.
+    """
+    with patch("brain.ingest.pipeline.extract_items_with_status", _ok_empty_extraction):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
+    assert exit_code == 0
+    buffers = list((persona_dir / "active_conversations").glob("*.jsonl"))
+    assert len(buffers) == 1, buffers
+
+
+def test_chat_one_shot_default_snapshots_not_closes() -> None:
+    with (
+        patch("brain.ingest.pipeline.extract_session_snapshot") as mock_snap,
+        patch("brain.ingest.pipeline.close_session") as mock_close,
+    ):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
+    assert exit_code == 0
+    assert mock_snap.call_count == 1
+    assert mock_snap.call_args.args[1]  # session_id non-empty
+    assert mock_close.call_count == 0
+
+
+def test_chat_one_shot_close_flag_deletes_buffer(persona_dir: Path) -> None:
+    with patch("brain.ingest.pipeline.extract_items_with_status", _ok_empty_extraction):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge", "--close", "hello"])
+    assert exit_code == 0
+    buffers = list((persona_dir / "active_conversations").glob("*.jsonl"))
+    assert buffers == []
+
+
+def test_chat_repl_default_snapshots_not_closes() -> None:
+    with (
+        patch("builtins.input", side_effect=["hello there", "exit"]),
+        patch("brain.ingest.pipeline.extract_session_snapshot") as mock_snap,
+        patch("brain.ingest.pipeline.close_session") as mock_close,
+    ):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge"])
+    assert exit_code == 0
+    assert mock_snap.call_count == 1
+    assert mock_close.call_count == 0
+
+
+def test_chat_repl_close_flag_calls_close_session() -> None:
+    with (
+        patch("builtins.input", side_effect=["hello there", "exit"]),
+        patch("brain.ingest.pipeline.extract_session_snapshot") as mock_snap,
+        patch("brain.ingest.pipeline.close_session") as mock_close,
+    ):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge", "--close"])
+    assert exit_code == 0
+    assert mock_close.call_count == 1
+    assert mock_snap.call_count == 0

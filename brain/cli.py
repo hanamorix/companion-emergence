@@ -1717,7 +1717,12 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     """
     from brain.chat.engine import respond
     from brain.chat.session import create_session
-    from brain.ingest.pipeline import close_session
+    from brain.ingest.pipeline import close_session, extract_session_snapshot
+
+    # #203: default exit is a NON-destructive snapshot (matches the GUI, which
+    # only ever calls /sessions/snapshot). close_session deletes the buffer,
+    # which starves cascade-compaction / archive / rollover. --close opts in.
+    flush_session = close_session if getattr(args, "close", False) else extract_session_snapshot
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
@@ -1755,7 +1760,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                 # one-shot reply orphans its buffer file and no memories
                 # ever commit (live-exercise 2026-04-27 surfaced the bug).
                 try:
-                    close_session(
+                    flush_session(
                         persona_dir,
                         result.session_id,
                         store=store,
@@ -1800,7 +1805,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             finally:
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
-                    close_session(
+                    flush_session(
                         persona_dir,
                         session.session_id,
                         store=store,
@@ -2912,6 +2917,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Bypass the bridge daemon and call engine.respond() in-process.",
+    )
+    chat_sub.add_argument(
+        "--close",
+        action="store_true",
+        default=False,
+        help=(
+            "On exit, finalise the session and delete its conversation buffer. "
+            "Default is a non-destructive snapshot that preserves the buffer "
+            "for compaction / archive / rollover (same as the GUI)."
+        ),
     )
     chat_sub.add_argument(
         "--bridge-only",
