@@ -601,6 +601,10 @@ def _create_research_memory(
         memory_type="research",
         domain="us",
         emotions={},
+        # P3 retention rework, Change 1: research is durable knowledge the
+        # companion deliberately sought, not the ~0.0 the emotions={} default
+        # would otherwise produce.
+        importance=5.0,
         metadata={
             "schema_version": RESEARCH_SCHEMA_VERSION,
             "interest_id": interest.id,

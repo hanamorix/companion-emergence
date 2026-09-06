@@ -151,6 +151,10 @@ def write_initiate_memory(
             "initiate_ts": ts,
         },
         emotions=_emotions,
+        # P3 retention rework, Change 1: a real message the companion chose
+        # to send, not the <=0.025 the /10.0 default produced on a small or
+        # absent reach_emotions vector.
+        importance=5.0,
     )
     try:
         from brain.memory.pending import route_write

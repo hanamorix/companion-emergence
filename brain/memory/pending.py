@@ -59,10 +59,13 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset(
 
 # Only these monologue-EPISODE types are eligible for the Pass-1 salience drop —
 # they carry a real 0..10 importance signal (extractor sets importance=salience*10).
-# Dreams (importance auto-derives to ~0 when emotion-flat), research/heartbeat/
-# reflex/initiate (same emotion-derived default), and monologue_trace (pinned 0.3)
-# are EXEMPT: they go through dedup only, never salience-drop. Owner directive
-# (Roy, 2026-08-11) — a single flat floor would nuke legitimate flat content.
+# Dreams (importance still auto-derives from the emotion sum when emotion-flat)
+# and monologue_trace (now a per-trace-derived value, P3 retention rework
+# Change 1 — no longer a flat 0.3) are EXEMPT: they go through dedup only,
+# never salience-drop. research/heartbeat/reflex/initiate now carry explicit
+# non-deflated importance (Change 1) but were never SALIENCE_ELIGIBLE anyway —
+# still exempt, same as before. Owner directive (Roy, 2026-08-11) — a single
+# flat floor would nuke legitimate flat content.
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_emotion", "monologue_soul_candidate"}
 )

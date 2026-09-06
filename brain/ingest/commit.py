@@ -7,7 +7,7 @@ threshold is the gate, not a per-call gate in this module.
 Memory type  = ExtractedItem.label  (one of VALID_LABELS)
 Domain       = "brain"              (the conversation's own domain)
 Tags         = ["auto_ingest", "conversation", label]
-Importance   = item.importance / 10.0  (normalized to the store's 0..10.0 float scale)
+Importance   = item.importance  (already on the store's 0..10.0 float scale; no division)
 
 After creation, auto-Hebbian: search the store for the top-3 related
 memories (by keyword overlap) and strengthen each pair.
