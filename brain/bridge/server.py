@@ -841,7 +841,7 @@ def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 5.0,
+    silence_minutes: float = 10.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,

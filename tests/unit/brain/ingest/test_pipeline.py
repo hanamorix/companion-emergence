@@ -814,6 +814,45 @@ def test_snapshot_stale_sessions_skips_fresh_sessions(
     assert reports == []
 
 
+def test_snapshot_stale_sessions_respects_ten_minute_threshold(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    tracking_provider: _TrackingProvider,
+) -> None:
+    """Issue #132 Part B (C14 test 2, regression guard): a fixture session idle 9
+    minutes must NOT be extracted; one idle just over 10 minutes must. This
+    exercises snapshot_stale_sessions's pre-existing, unchanged gate-comparison
+    logic — it does not itself prove the production default changed (that is
+    `test_silence_minutes_defaults_are_ten_minutes` in
+    tests/unit/brain/bridge/test_supervisor_db_overhead.py); it confirms the
+    mechanism the new default now feeds into still works correctly.
+    """
+    fresh_sid = "sess_nine_min"
+    fresh_ts = (datetime.now(UTC) - timedelta(minutes=9)).isoformat()
+    ingest_turn(
+        tmp_path, {"session_id": fresh_sid, "speaker": "user", "text": "still here", "ts": fresh_ts}
+    )
+
+    stale_sid = "sess_ten_min"
+    stale_ts = (datetime.now(UTC) - timedelta(minutes=10, seconds=5)).isoformat()
+    ingest_turn(
+        tmp_path,
+        {"session_id": stale_sid, "speaker": "user", "text": "long gone", "ts": stale_ts},
+    )
+
+    reports = snapshot_stale_sessions(
+        tmp_path,
+        silence_minutes=10.0,
+        store=store,
+        hebbian=hebbian,
+        provider=tracking_provider,
+    )
+
+    assert [r.session_id for r in reports] == [stale_sid]
+    assert tracking_provider.call_count == 1
+
+
 def test_snapshot_stale_sessions_cleans_ghost_buffer(
     tmp_path: Path,
     store: MemoryStore,
