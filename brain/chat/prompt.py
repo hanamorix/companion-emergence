@@ -31,6 +31,7 @@ from brain.memory.relevance import (
 )
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
+from brain.utils.time import format_local, to_local
 
 log = logging.getLogger(__name__)
 
@@ -593,7 +594,7 @@ def _build_ambient_clock_block(now=None) -> str:
     """
     from datetime import UTC, datetime
 
-    now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = format_local(now or datetime.now(UTC))  # tz-local-display: ambient "[current time: ...]" tail anchor
     return (
         f"[current time: {now_iso}]\n"
         "Each conversation entry's `ts` above is the wall-clock time that message "
@@ -1416,7 +1417,9 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
 
     lines = [contract, "", "last 7 days:"]
     for m in entries:
-        date_str = m.created_at.strftime("%Y-%m-%d")
+        # tz-local-display (exception: date-only, not routed through format_local/
+        # local_display — those render full ISO datetimes, not a bare "%Y-%m-%d")
+        date_str = to_local(m.created_at).strftime("%Y-%m-%d")
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")
         source_str = f"reflex_arc({arc_name})" if arc_name else source

@@ -42,6 +42,7 @@ from brain.ingest.buffer import (
     rewrite_session_atomic,
     write_archive_marker,
 )
+from brain.utils.time import to_local
 
 logger = logging.getLogger(__name__)
 
@@ -373,10 +374,18 @@ def _coarse_stamp(raw: object) -> str | None:
     Date + part-of-day only — no per-render clock read, no minute/second — so the
     render stays byte-stable between re-compactions (C6). ``%b %d`` avoids the
     platform-specific ``%-d`` (Windows CI). Returns None on an unparseable ts.
+
+    Converted to local time before formatting (issue #217): the underlying
+    ts is stored UTC, but "morning"/"evening" is a local-wall-clock notion —
+    formatting it from the UTC hour would mislabel the part of day.
     """
     dt = _parse_ts(raw)
     if dt is None:
         return None
+    # tz-local-display (exception: date + part-of-day, not routed through
+    # format_local/local_display — those render full ISO datetimes, not a
+    # coarse "%b %d <part-of-day>" bucket)
+    dt = to_local(dt)
     return f"{dt.strftime('%b %d')} {_part_of_day(dt.hour)}"
 
 

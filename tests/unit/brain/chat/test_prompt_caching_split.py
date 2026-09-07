@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -94,10 +95,22 @@ def test_context_block_omits_clock_when_flag_false() -> None:
     ]
     block = _format_claude_context_block(msgs, includes_latest_user=True, include_block_clock=False)
     assert "Current time" not in block
-    # The per-message ts values still ride in the JSONL records.
+    # The per-message ts values still ride in the JSONL records, rendered in
+    # local wall-clock time (#217) rather than the raw UTC string. Exact
+    # offset depends on the CI runner's OS timezone, so assert what's
+    # deterministic regardless of it: not the raw 'Z'-suffixed string, and
+    # the same underlying instant.
     records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    assert records[0]["ts"] == "2026-05-20T10:00:00Z"
-    assert records[1]["ts"] == "2026-05-20T10:05:00Z"
+    assert records[0]["ts"] != "2026-05-20T10:00:00Z"
+    assert records[1]["ts"] != "2026-05-20T10:05:00Z"
+    assert not records[0]["ts"].endswith("Z")
+    assert not records[1]["ts"].endswith("Z")
+    assert datetime.fromisoformat(records[0]["ts"]).astimezone(UTC) == datetime(
+        2026, 5, 20, 10, 0, 0, tzinfo=UTC
+    )
+    assert datetime.fromisoformat(records[1]["ts"]).astimezone(UTC) == datetime(
+        2026, 5, 20, 10, 5, 0, tzinfo=UTC
+    )
 
 
 def test_context_block_keeps_clock_by_default() -> None:

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from brain.initiate.audit import read_recent_audit
 from brain.memory.store import MemoryStore
+from brain.utils.time import format_local, local_display
 
 
 def build_outbound_recall_block(
@@ -55,15 +56,17 @@ def build_outbound_recall_block(
         urgency = "notify" if r.decision == "send_notify" else "quiet"
         state = r.delivery.get("current_state", "delivered") if r.delivery else "?"
         preview = r.subject[:60] if r.subject else "(no subject)"
-        lines.append(f'- {r.ts} ({urgency}) — "{preview}" — state: {state}')
+        # tz-local-display: outbound-recall "Recent outbound" row ts
+        lines.append(f'- {local_display(r.ts)} ({urgency}) — "{preview}" — state: {state}')
 
     if unclear_rows:
         lines.append("")
         lines.append("Pending uncertainty:")
         for r in unclear_rows:
             preview = r.subject[:60] if r.subject else "(no subject)"
+            # tz-local-display: outbound-recall "Pending uncertainty" row ts
             lines.append(
-                f'- {r.ts} — "{preview}" — acknowledged_unclear '
+                f'- {local_display(r.ts)} — "{preview}" — acknowledged_unclear '
                 "(no clear topical thread since you saw it)"
             )
 
@@ -95,7 +98,11 @@ def build_recent_conversation_excerpt(
         store.close()
 
     recent.sort(key=lambda memory: memory.created_at)
-    excerpt = "\n".join(f"[{memory.created_at.isoformat()}] {memory.content}" for memory in recent)
+    excerpt = "\n".join(
+        # tz-local-display: recent-conversation-excerpt bracket ts (ambient recall)
+        f"[{format_local(memory.created_at)}] {memory.content}"
+        for memory in recent
+    )
 
     if len(excerpt) <= max_chars:
         return excerpt
