@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from brain.utils.time import to_local
+from brain.utils.time import format_local
 from brain.works.storage import read_markdown
 from brain.works.store import WorksStore
 
@@ -30,7 +30,7 @@ def read_work(id: str, *, persona_dir: Path) -> dict:
         "id": work.id,
         "title": work.title,
         "type": work.type,
-        "created_at": to_local(work.created_at).isoformat(timespec="seconds"),
+        "created_at": format_local(work.created_at),  # tz-local-display: read_work full content created_at
         "summary": work.summary,
         "word_count": work.word_count,
         "content": content,

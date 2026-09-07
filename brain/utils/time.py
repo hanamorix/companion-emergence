@@ -2,6 +2,46 @@
 
 Previously triplicated across dream/heartbeat/reflex engines;
 consolidated here before the fourth engine (research) lands.
+
+Persona-facing local-timezone display (issue #217)
+----------------------------------------------------
+Every site below applies a local-timezone offset to a timestamp before it is
+shown to the companion. Storage stays UTC everywhere; these are display-only
+conversions. Grep the tag ``tz-local-display`` across the repo to find every
+call site currently applying the local offset — that grep is the
+authoritative list, kept current by convention (every site below carries the
+tag); this comment is a human-readable index into it, not a substitute for
+running the grep.
+
+Routes through this shared formatter (``format_local()`` / ``local_display()``
+below) — switch the presentation style ONE TIME, here, and all of these
+follow automatically:
+  - brain/bridge/provider.py — block-level "Current time:" anchor
+  - brain/bridge/provider.py — per-message `ts` in the JSONL chat context
+  - brain/chat/prompt.py — ambient "[current time: ...]" tail anchor
+  - brain/initiate/ambient.py — outbound-recall "Recent outbound" row ts
+  - brain/initiate/ambient.py — outbound-recall "Pending uncertainty" row ts
+  - brain/initiate/ambient.py — recent-conversation-excerpt bracket ts
+  - brain/monologue/recall.py — monologue recall snippet ts
+  - brain/tools/impls/_common.py — search/read_full_memory result created_at
+  - brain/tools/impls/list_works.py — list_works summary created_at
+  - brain/tools/impls/read_work.py — read_work full content created_at
+
+Formats independently (exceptions) — these convert via ``to_local()`` but
+build their OWN final string (a coarse date/part-of-day bucket, a bare
+date), so they do NOT follow a ``format_local()``/``local_display()`` edit
+automatically. To switch the presentation style, these two also need their
+own edit:
+  - brain/chat/compaction.py — ``_coarse_stamp()``: "Aug 10 evening" compaction
+    marker (date + part-of-day; not a full ISO datetime)
+  - brain/chat/prompt.py — ``_build_recent_journal_block()``: journal digest
+    date, "%Y-%m-%d" only (no time-of-day)
+
+To switch to a fully-localized presentation later (e.g. locale-aware /
+human-phrase instead of an ISO offset string): change ``format_local()``
+(and/or ``local_display()``, which calls it) here in this file, and every
+site in the first list follows automatically. Then separately edit each
+exception site named above, since those do not route through either helper.
 """
 
 from __future__ import annotations

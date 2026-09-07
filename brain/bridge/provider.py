@@ -1584,6 +1584,7 @@ def _format_claude_context_block(
         "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
     ]
     if include_block_clock:
+        # tz-local-display: block-level "Current time:" anchor (image path etc.)
         now_iso = format_local(now or datetime.now(UTC))
         lines.append(f"Current time: {now_iso}.")
         lines.append(
@@ -1608,7 +1609,7 @@ def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
             "text": msg.content_text(),
         }
         if msg.ts:
-            record["ts"] = local_display(msg.ts)
+            record["ts"] = local_display(msg.ts)  # tz-local-display: per-message ts in JSONL chat context
         if msg.tool_call_id:
             record["tool_call_id"] = msg.tool_call_id
         if msg.tool_calls:

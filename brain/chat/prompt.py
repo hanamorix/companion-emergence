@@ -594,7 +594,7 @@ def _build_ambient_clock_block(now=None) -> str:
     """
     from datetime import UTC, datetime
 
-    now_iso = format_local(now or datetime.now(UTC))
+    now_iso = format_local(now or datetime.now(UTC))  # tz-local-display: ambient "[current time: ...]" tail anchor
     return (
         f"[current time: {now_iso}]\n"
         "Each conversation entry's `ts` above is the wall-clock time that message "
@@ -1417,6 +1417,8 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
 
     lines = [contract, "", "last 7 days:"]
     for m in entries:
+        # tz-local-display (exception: date-only, not routed through format_local/
+        # local_display — those render full ISO datetimes, not a bare "%Y-%m-%d")
         date_str = to_local(m.created_at).strftime("%Y-%m-%d")
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")

@@ -382,6 +382,9 @@ def _coarse_stamp(raw: object) -> str | None:
     dt = _parse_ts(raw)
     if dt is None:
         return None
+    # tz-local-display (exception: date + part-of-day, not routed through
+    # format_local/local_display — those render full ISO datetimes, not a
+    # coarse "%b %d <part-of-day>" bucket)
     dt = to_local(dt)
     return f"{dt.strftime('%b %d')} {_part_of_day(dt.hour)}"
 

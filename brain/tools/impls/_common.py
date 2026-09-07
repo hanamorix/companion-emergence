@@ -8,7 +8,7 @@ _write_gate_check — validate emotion_score + importance against the write gate
 from __future__ import annotations
 
 from brain.memory.store import Memory
-from brain.utils.time import to_local
+from brain.utils.time import format_local
 
 
 def _mem_to_result(memory: Memory) -> dict:
@@ -29,7 +29,7 @@ def _mem_to_result(memory: Memory) -> dict:
         "emotions": dict(memory.emotions),
         "tags": list(memory.tags),
         "importance": memory.importance,
-        "created_at": to_local(memory.created_at).isoformat(timespec="seconds"),
+        "created_at": format_local(memory.created_at),  # tz-local-display: search/read_full_memory result created_at
     }
 
 
