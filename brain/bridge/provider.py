@@ -48,6 +48,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
+from brain.utils.time import format_local, local_display
 
 logger = logging.getLogger(__name__)
 
@@ -1552,14 +1553,19 @@ def _format_claude_context_block(
     newlines or user-supplied delimiter-looking text inside the data field
     instead of creating new transcript lines.
 
-    ``now`` is an optional test seam — when None the real UTC clock is used.
+    ``now`` is an optional test seam — when None the real UTC clock is used
+    internally, then converted to local wall-clock time for display (issue
+    #217: the companion reads its own local time here, not UTC).
 
     ``include_block_clock`` (default True, the pre-change behaviour) controls the
     block-level ``Current time:`` anchor + its elapsed-time explainer at the top
     of the block. The chat path passes False because that anchor moves to the
     Option A+ volatile suffix (it was the one per-call-changing byte sitting
     above the whole transcript, busting the history prefix); the image path and
-    any other caller keep it. Per-message ``ts`` values are unaffected either way.
+    any other caller keep it. Per-message ``ts`` values are unaffected by this
+    toggle either way, but are independently converted to local time for
+    display in ``_claude_context_jsonl_lines`` (stored/passed-through values
+    stay UTC; only the rendered JSONL is localized).
     """
     if includes_latest_user:
         instruction = (
@@ -1578,7 +1584,7 @@ def _format_claude_context_block(
         "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
     ]
     if include_block_clock:
-        now_iso = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = format_local(now or datetime.now(UTC))
         lines.append(f"Current time: {now_iso}.")
         lines.append(
             "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed."
@@ -1590,14 +1596,19 @@ def _format_claude_context_block(
 
 
 def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
-    """Yield one JSON object per chat turn using leak-resistant speaker names."""
+    """Yield one JSON object per chat turn using leak-resistant speaker names.
+
+    ``ts`` (when present) is rendered as local wall-clock time (issue #217) —
+    ``msg.ts`` itself stays the raw stored UTC string; only this rendered
+    copy is converted.
+    """
     for msg in messages:
         record: dict[str, Any] = {
             "speaker": _CLAUDE_SAFE_SPEAKERS.get(msg.role, msg.role),
             "text": msg.content_text(),
         }
         if msg.ts:
-            record["ts"] = msg.ts
+            record["ts"] = local_display(msg.ts)
         if msg.tool_call_id:
             record["tool_call_id"] = msg.tool_call_id
         if msg.tool_calls:

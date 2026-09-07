@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from brain.utils.time import to_local
 from brain.works.store import WorksStore
 
 
@@ -26,7 +27,7 @@ def _to_summary_dict(work) -> dict:
         "id": work.id,
         "title": work.title,
         "type": work.type,
-        "created_at": work.created_at.isoformat(),
+        "created_at": to_local(work.created_at).isoformat(timespec="seconds"),
         "summary": work.summary,
         "word_count": work.word_count,
     }
