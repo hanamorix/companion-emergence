@@ -248,6 +248,55 @@ describe("App brain-login banner", () => {
     expect(screen.getByTestId("chat-messages")).toBeInTheDocument();
   });
 
+  // #172: the login step is claude-code specific. A persona on any other
+  // provider must never see it — and must not even be probed for it.
+  it("skips the claude login probe and offer when the persona's provider is not claude-cli", async () => {
+    brainLoginStatus.mockResolvedValue({ authorized: false });
+    fetchPersonaState.mockResolvedValue({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "ollama", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByTestId("chat-messages")).toBeInTheDocument());
+    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    // Give any (wrong) probe a chance to land before asserting its absence.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("button", { name: /authorize/i })).not.toBeInTheDocument();
+    expect(brainLoginStatus).not.toHaveBeenCalled();
+  });
+
+  it("still probes when the state poll fails, so the offer stays reachable with the bridge down", async () => {
+    brainLoginStatus.mockResolvedValue({ authorized: false });
+    fetchPersonaState.mockRejectedValue(new Error("bridge unreachable"));
+
+    render(<App />);
+
+    await waitFor(() => expect(brainLoginStatus).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /authorize/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("still probes and offers login for a claude-cli persona", async () => {
+    brainLoginStatus.mockResolvedValue({ authorized: false });
+
+    render(<App />);
+
+    await waitFor(() => expect(brainLoginStatus).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /authorize/i })).toBeInTheDocument(),
+    );
+  });
+
   it("swallows brainLoginStatus failures — treated as no banner, chat still renders", async () => {
     brainLoginStatus.mockRejectedValue(new Error("boom"));
 
