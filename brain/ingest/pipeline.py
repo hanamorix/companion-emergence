@@ -496,7 +496,7 @@ def extract_session_snapshot(
 def snapshot_stale_sessions(
     persona_dir: Path,
     *,
-    silence_minutes: float = 5.0,
+    silence_minutes: float = 10.0,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
