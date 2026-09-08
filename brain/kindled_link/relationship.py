@@ -410,6 +410,9 @@ def write_kindled_peer_memory(
         tags=["kindled_peer", f"peer:{peer_id}"], emotions=seeded,
         metadata={"peer_id": peer_id, "session_id": session_id,
                   "speaker": speaker, "relationship_stage": stage},
+        # P3 retention rework, Change 1: a peer-relationship event, not the
+        # near-0 the /10.0 default produced on a small or absent emotion vector.
+        importance=5.0,
     )
     try:
         mem_store.create(mem)

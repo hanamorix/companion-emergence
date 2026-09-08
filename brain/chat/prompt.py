@@ -1145,6 +1145,20 @@ def _build_recall_block(
             amount = 0.8 if n_bump == 1 else 0.8 - 0.7 * (i / (n_bump - 1))
             store.bump_recall(mem.id, amount)
 
+        # CHANGE 3 (P3 retention rework) — re-enqueue every surfaced recalled
+        # memory id as an "existing memory" re-appraise request. Enqueue-only:
+        # a cheap file append under lock, no appraisal and no provider call
+        # happen on this hot path (C3.3) — the gate re-appraises importance
+        # on its own consolidation tick and updates the row in place.
+        # STAGE-3 CORRECTION (finding #5): scope is the UNION of full_ids
+        # (full-inject recalls, the most salient) and bump_targets (snippet
+        # recalls, which already include the fading rows) — not narrowed to
+        # snippet-only, since full_ids is reachable at this hook site.
+        from brain.memory.pending import PendingQueue
+
+        reappraise_ids = full_ids | seen_bump
+        PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+
     return "\n".join(lines)
 
 

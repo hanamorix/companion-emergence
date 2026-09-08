@@ -442,6 +442,36 @@ def _daemon_state_refresh_handler(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _dedup_sweep_handler(args: argparse.Namespace) -> int:
+    """Run the one-time retroactive duplicate cleanup (P3 retention rework,
+    Change 4) over a persona's corpus.
+
+    Deterministic exact-normalize merge only (no provider/near-dup layer from
+    the CLI). Loss-preserving: every removed row's pre-image is archived to
+    consolidation_archive.jsonl (reason "dedup_sweep") before removal.
+    Idempotent — safe to re-run.
+    """
+    from brain.engines.dedup_sweep import run_dedup_sweep
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        report = run_dedup_sweep(store, persona_dir)
+    finally:
+        store.close()
+
+    print(f"groups merged: {report.groups_merged}")
+    print(f"rows removed:  {report.rows_removed}")
+    print(f"archive:       {report.archive_path}")
+    if args.json:
+        print(json.dumps(report.as_log(), indent=2))
+    return 0
+
+
 def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
     """Open a persona memory store for read-only CLI inspection."""
     persona_dir = get_persona_dir(persona)
@@ -2702,6 +2732,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ds_refresh.add_argument("--persona", required=True, help="Persona name (required).")
     ds_refresh.set_defaults(func=_daemon_state_refresh_handler)
+
+    # nell dedup-sweep — P3 retention rework, Change 4: one-time retroactive
+    # duplicate cleanup over an existing corpus.
+    dd_sub = subparsers.add_parser(
+        "dedup-sweep",
+        help="One-time retroactive duplicate cleanup (exact-normalize merge, loss-preserving).",
+    )
+    dd_sub.add_argument("--persona", required=True, help="Persona name (required).")
+    dd_sub.add_argument(
+        "--json", action="store_true", help="Also print the full report as JSON."
+    )
+    dd_sub.set_defaults(func=_dedup_sweep_handler)
 
     # nell works — read-only inspection of brain-authored creative artifacts.
     # Saving is brain-territory via the save_work MCP tool, not a CLI command.

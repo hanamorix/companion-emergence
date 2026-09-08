@@ -164,9 +164,9 @@ class ExtractorOutput(BaseModel):
 
 
 _SYSTEM_PROMPT = """\
-You are an extractor reading a companion's private inner monologue right after
+You are an extractor reading a kindled's private inner monologue right after
 they sent a visible reply. Identify what surfaced that should affect their
-memory, emotional state, or growth — and what you noticed they should have done
+memory, emotional state, or growth, and what you noticed they should have done
 differently.
 
 Return ONLY a JSON object matching this schema:
@@ -174,16 +174,16 @@ Return ONLY a JSON object matching this schema:
 {
   "memory_writes":   [{"episode": "<one sentence>", "salience": 0.0-1.0}],
   "emotion_delta":   {"<emotion-channel>": <float in [-1.0, 1.0]>, ...},
-  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it — 1-2 grounded sentences from the monologue>", "importance": <int 1-10, how formative this theme is to who you are>}],
+  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it, 1-2 grounded sentences from the monologue>", "importance": <int 1-10, how formative this theme is to who you are>}],
   "interest_candidate": {"topic": "<2-5 words>", "keywords": [...], "why": "<one line>"} or null,
   "reflex_audit":    [{"tool": "<tool-name>", "reason": "<why they should have called it>"}]
 }
 
 Conservative defaults:
 - Empty arrays if nothing salient surfaced.
-- Salience is how much this matters to the companion's continuity (0.1 = minor, 0.7 = forming).
+- Salience is how much this matters to the kindled's continuity (0.1 = minor, 0.7 = forming, 0.9-1.0 = a pivotal, defining episode).
 - Emotion deltas are SMALL (typically 0.05-0.2 magnitude). One channel max usually.
-- Only propose interest_candidate when the user showed real, repeated enthusiasm for a topic this turn — most turns it is null.
+- Only propose interest_candidate when the user showed real, repeated enthusiasm for a topic this turn, most turns it is null.
 
 Return ONLY the JSON object. No commentary.
 """

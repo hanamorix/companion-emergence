@@ -21,8 +21,14 @@ from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
 
+_IMPORTANCE_RUBRIC = (
+    'importance rubric: 1 = trivial/passing, 5 = an ordinary durable fact, '
+    '8 = core or defining, 10 = pivotal.'
+)
+
 EXTRACTION_PROMPT_LEGACY = """You are extracting durable memories from a conversation transcript.
 Return ONLY a JSON array. Each item: {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
+For "importance", """ + _IMPORTANCE_RUBRIC + """
 For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
 Skip pleasantries. Keep items concrete. No prose, no commentary.
 
@@ -37,7 +43,7 @@ Speakers in this transcript:
 - {user_name} is the human user the assistant is talking to. Statements
   attributed to {user_name} ({poss} actions, {poss} decisions, {poss} words) belong
   to {user_name}, not to anyone else.
-- {assistant_name} is the assistant — the AI persona. Replies from
+- {assistant_name} is the assistant, the AI persona. Replies from
   {assistant_name} may reference other people by name (from {assistant_name}'s
   memories, soul, or history). Those are HISTORICAL references, not the
   current speaker. Do NOT attribute the current user's actions to anyone
@@ -45,6 +51,7 @@ Speakers in this transcript:
 
 Return ONLY a JSON array. Each item:
 {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
+For "importance", """ + _IMPORTANCE_RUBRIC + """
 For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
 Skip pleasantries. Keep items concrete. No prose, no commentary.
 

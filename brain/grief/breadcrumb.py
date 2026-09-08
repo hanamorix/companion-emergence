@@ -134,5 +134,9 @@ def write_breadcrumb(
         domain="grief",
         emotions=emotions,
         metadata=metadata,
+        # P3 retention rework, Change 1: grief intensity is already on a
+        # ~0-10 scale; pass it through directly instead of letting the
+        # create_new default deflate it to intensity/10.0.
+        importance=_clamp(intensity),
     )
     return store.create(memory)

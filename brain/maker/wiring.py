@@ -64,6 +64,9 @@ def write_making_memory(store, making: Making, *, emotions: dict[str, float]) ->
     mem = Memory.create_new(
         content=content, memory_type="making", domain="interior",
         tags=["making", making.disposition], emotions=emotions or None,
+        # P3 retention rework, Change 1: a creative act, not the <=0.03 the
+        # /10.0 default produced on a small or absent emotion vector.
+        importance=5.0,
     )
     try:
         # Automatic generated write → route through the consolidation gate (gated by memory_type).

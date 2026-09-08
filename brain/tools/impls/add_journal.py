@@ -41,6 +41,10 @@ def add_journal(
         memory_type="journal_entry",
         domain="self",
         emotions={},
+        # P3 retention rework, Change 1: journal entries are companion
+        # self-reflection, framed as important — not the ~0.0 the emotions={}
+        # default would otherwise produce.
+        importance=6.0,
         metadata={
             "private": True,
             "source": "brain_authored",
