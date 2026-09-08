@@ -205,6 +205,76 @@ def test_respond_catches_and_logs_ingest_persistence_error(
     )
 
 
+# ── presence event hook (#225) ─────────────────────────────────────────────────
+
+
+def test_respond_fires_record_inbound_turn_with_persisted_ts(
+    persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix, provider: FakeProvider
+) -> None:
+    """After a real chat turn, presence_state.json reflects the persisted
+    user-turn ts (the actual event hook, not a hand-built UserPresence)."""
+    from brain.initiate import presence_state
+
+    before = respond(
+        persona_dir,
+        "hello there",
+        store=store,
+        hebbian=hebbian,
+        provider=provider,
+        voice_md_override="# Nell",
+    )
+    assert before.metadata["persistence_ok"] is True
+
+    state = presence_state.load_presence_state(persona_dir)
+    assert state.last_seen_ts is not None
+
+    # Cross-check against the actual persisted buffer record's own ts.
+    active_dir = persona_dir / "active_conversations"
+    buffer_file = next(active_dir.glob("*.jsonl"))
+    lines = [line for line in buffer_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    import json as _json
+
+    user_lines = [_json.loads(line) for line in lines if _json.loads(line).get("speaker") == "user"]
+    assert user_lines, "expected at least one persisted user record"
+    assert state.last_seen_ts == user_lines[-1]["ts"]
+
+
+def test_respond_record_inbound_turn_failure_does_not_break_reply_or_misattribute(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: FakeProvider,
+    caplog,
+) -> None:
+    """A presence-hook bug must never surface as a persistence error and
+    must never break the chat reply -- own dedicated try/except, separate
+    from the broad persistence try/except."""
+    from unittest.mock import patch
+
+    with (
+        patch(
+            "brain.chat.engine.presence_state.record_inbound_turn",
+            side_effect=RuntimeError("presence hook exploded"),
+        ),
+        caplog.at_level(logging.DEBUG, logger="brain.chat.engine"),
+    ):
+        result = respond(
+            persona_dir,
+            "hello despite the hook bug",
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            voice_md_override="# Nell",
+        )
+
+    assert result.content.startswith("FAKE_CHAT")
+    # Persistence itself must be reported as OK -- the presence-hook failure
+    # must not be misattributed as a persistence_error.
+    assert result.metadata["persistence_ok"] is True
+    assert result.metadata["persistence_error"] is None
+    assert any("record_inbound_turn failed" in r.message for r in caplog.records)
+
+
 # ── Tool calls (passthrough) ──────────────────────────────────────────────────
 
 
