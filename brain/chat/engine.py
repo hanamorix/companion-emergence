@@ -42,6 +42,7 @@ from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
 from brain.ingest.buffer import read_session
+from brain.initiate import presence_state
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -514,10 +515,9 @@ def _persist_turn(
         # The image records ride in the SAME call so a rollover cannot split a
         # turn across two buffers, landing the user line in the successor and
         # its image lines in the corpse (or vice versa).
-        persist_turns_following_successor(
+        resolved_user_ts = persist_turns_following_successor(
             persona_dir, [user_record, *image_records, assistant_record]
         )
-        return True, None
     except Exception as exc:  # noqa: BLE001
         # The contract here is explicit (per OG nell_bridge.py:200-230):
         # persistence errors must NEVER break the chat response. The chat
@@ -528,3 +528,19 @@ def _persist_turn(
             session_id,
         )
         return False, str(exc)
+
+    # Presence event hook (#225): update the silence-days last-seen
+    # timestamp AFTER persistence succeeds and session.py's registry lock
+    # has released. Own dedicated try/except, deliberately separate from
+    # the persistence try/except above — a presence-hook bug must never be
+    # misreported as a persistence error, and must never break the chat
+    # reply (the turn is already durably persisted by this point).
+    if resolved_user_ts is not None:
+        try:
+            presence_state.record_inbound_turn(persona_dir, resolved_user_ts)
+        except Exception:
+            logger.debug(
+                "record_inbound_turn failed session=%s", session_id, exc_info=True
+            )
+
+    return True, None

@@ -172,3 +172,16 @@ def cadence_state_path(persona_dir: Path, filename: str) -> Path:
                 stacklevel=2,
             )
     return new
+
+
+def presence_state_path(persona_dir: Path) -> Path:
+    """Resolve the persona-scoped ``presence_state.json`` sidecar path (#225).
+
+    One resolver for this file, mirroring ``cadence_state_path``'s "one
+    resolver, one place" convention. Unlike the cadence files, this sidecar
+    lives directly under ``<persona_dir>/`` rather than the ``cadence/``
+    subdirectory: it holds live signal state (last-seen timestamp, the
+    active-hour histogram, the reply-lag running mean), not a next-due
+    cadence pointer.
+    """
+    return persona_dir / "presence_state.json"

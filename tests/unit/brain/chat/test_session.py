@@ -366,3 +366,81 @@ def test_hydrate_malformed_last_ts_leaves_last_turn_at_none(tmp_path: Path) -> N
     assert result is not None
     assert result.turns == 1
     assert result.last_turn_at is None
+
+
+# ── persist_turns_following_successor resolves + returns the user ts (#225) ───
+
+
+def test_persist_turns_resolves_and_returns_user_ts_when_present(tmp_path: Path) -> None:
+    from brain.chat.session import persist_turns_following_successor
+
+    persona_dir = _persona_dir(tmp_path)
+    sid = "55555555-5555-5555-5555-555555555555"
+    ts = "2026-06-01T12:00:00+00:00"
+    result = persist_turns_following_successor(
+        persona_dir,
+        [
+            {"session_id": sid, "speaker": "user", "text": "hi", "ts": ts},
+            {"session_id": sid, "speaker": "assistant", "text": "hello"},
+        ],
+    )
+    assert result == ts
+
+
+def test_persist_turns_resolves_missing_ts_to_now(tmp_path: Path) -> None:
+    """When the user record carries no ts, one is resolved (defaulted to
+    now) BEFORE ingest_turn is called, and that same resolved value is
+    returned -- not None, and not silently left to buffer.ingest_turn's own
+    invisible default."""
+    from brain.chat.session import persist_turns_following_successor
+    from brain.ingest.buffer import read_session
+
+    persona_dir = _persona_dir(tmp_path)
+    sid = "66666666-6666-6666-6666-666666666666"
+    before = datetime.now(UTC)
+    result = persist_turns_following_successor(
+        persona_dir,
+        [{"session_id": sid, "speaker": "user", "text": "hi"}],
+    )
+    after = datetime.now(UTC)
+    assert result is not None
+    resolved = datetime.fromisoformat(result)
+    # _now_iso() truncates to seconds precision, so `resolved` may be a
+    # fraction of a second before `before` after truncation -- allow that.
+    assert before.replace(microsecond=0) <= resolved <= after
+
+    # The persisted buffer record must carry the SAME resolved ts returned
+    # to the caller (not a second, independently-defaulted ts).
+    turns = read_session(persona_dir, sid)
+    assert turns[0]["ts"] == result
+
+
+def test_persist_turns_returns_none_when_no_user_record(tmp_path: Path) -> None:
+    from brain.chat.session import persist_turns_following_successor
+
+    persona_dir = _persona_dir(tmp_path)
+    sid = "77777777-7777-7777-7777-777777777777"
+    result = persist_turns_following_successor(
+        persona_dir,
+        [{"session_id": sid, "speaker": "assistant", "text": "hello"}],
+    )
+    assert result is None
+
+
+def test_persist_turns_multiple_user_records_returns_last_and_logs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.chat.session import persist_turns_following_successor
+
+    persona_dir = _persona_dir(tmp_path)
+    sid = "88888888-8888-8888-8888-888888888888"
+    with caplog.at_level("DEBUG", logger="brain.chat.session"):
+        result = persist_turns_following_successor(
+            persona_dir,
+            [
+                {"session_id": sid, "speaker": "user", "text": "first", "ts": "2026-06-01T10:00:00+00:00"},
+                {"session_id": sid, "speaker": "user", "text": "second", "ts": "2026-06-01T11:00:00+00:00"},
+            ],
+        )
+    assert result == "2026-06-01T11:00:00+00:00"
+    assert any("user-speaker records in one" in r.message for r in caplog.records)
