@@ -25,9 +25,12 @@ def test_preamble_includes_current_time_in_local_zone():
     ]
     now = datetime(2026, 5, 20, 7, 30, 0, tzinfo=_LOCAL)
     block = _format_claude_context_block(msgs, includes_latest_user=True, now=now)
-    # Local-offset ISO-8601, no UTC 'Z' suffix — LA is UTC-7 in May (PDT).
-    assert "Current time: 2026-05-20T07:30:00-07:00." in block
+    # Naive-local ISO-8601: no UTC 'Z' suffix, and no offset suffix either
+    # (issue #218 — the offset token was itself the thing the substrate was
+    # echoing back, so format_local() now drops tzinfo before isoformat).
+    assert "Current time: 2026-05-20T07:30:00." in block
     assert re.search(r"Current time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", block) is None
+    assert re.search(r"Current time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", block) is None
 
 
 def test_preamble_explains_ts_field():
