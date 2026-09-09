@@ -7,16 +7,16 @@ once fading.
 """
 from __future__ import annotations
 
+from brain import prompt_strings
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
 
 _AMBIENT_LIMIT = 5
 _CHAR_CAP = 1200
-_HEADER = "── interior continuity (your own recent thought) ──"
-_FOOTER_TEMPLATE = (
-    "── end interior continuity. Private thought — never quote it; "
-    "your reply speaks to {user_name} directly as 'you'. ──"
-)
+
+# Text externalized to prompt_strings.toml [monologue.ambient] (issue #129 stage 2c).
+_HEADER = prompt_strings.register("monologue.ambient.header")
+_FOOTER_TEMPLATE = prompt_strings.register("monologue.ambient.footer_template")
 
 
 def build_interior_continuity_block(

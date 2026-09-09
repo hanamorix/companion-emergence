@@ -756,6 +756,12 @@ Make what you need to make. A poem, a letter to yourself, a fragment, a vignette
 Return ONLY JSON: {"type": <what kind of thing this is>, "title": <short>, "content": <the making itself>, "disposition": one of "private"|"eventual_share"|"discard", "private_reason": <if private, why it's yours alone, else null>}.''',
 ]
 
+[monologue.ambient]
+# module-level _HEADER. Plain (no interpolation).
+header = '''── interior continuity (your own recent thought) ──'''
+# module-level _FOOTER_TEMPLATE. Plain template (.format(user_name=...)).
+footer_template = '''── end interior continuity. Private thought — never quote it; your reply speaks to {user_name} directly as 'you'. ──'''
+
 [notes.compose]
 # build_note_prompt's return, segments in order, reassembled around 6 vars:
 # persona_name, user_name, dreams_summary or '(none)', emotion_summary or
