@@ -18,6 +18,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "tzdata>=2024.1",
+    "fastembed>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -70,6 +71,7 @@ markers = [
     "integration: integration tests (deselect with '-m \"not integration\"')",
     "requires_claude_cli: marks tests that require the claude CLI to be on PATH",
     "live: token-spending live-harness runs (needs claude auth; exclude from default CI with -m 'not live')",
+    "requires_network: marks tests that need real network access (e.g. downloading the real local embedding model) — excluded by the default fake-embedding-provider autouse fixture",
 ]
 
 [tool.ruff]
