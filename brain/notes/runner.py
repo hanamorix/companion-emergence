@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain import prompt_strings
 from brain.bridge import cli_throttle as _cli_throttle
 from brain.notes import compose as _compose
 from brain.notes import write as _write
@@ -23,6 +24,11 @@ from brain.notes import write as _write
 logger = logging.getLogger(__name__)
 
 _DREAM_LIMIT = 3
+
+# Text externalized to prompt_strings.toml [notes.runner] (issue #129 stage 2c).
+_WIRE_NOTE_BACK_MESSAGE_SEGMENTS = prompt_strings.register_segments(
+    "notes.runner.wire_note_back_message_segments"
+)
 
 
 def _dreams_summary(store: Any) -> str:
@@ -122,11 +128,12 @@ def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: st
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
+        seg = _WIRE_NOTE_BACK_MESSAGE_SEGMENTS
         write_initiate_memory(
             store,
             audit_id=uuid4().hex,
             subject=note.subject,
-            message=f"I left {user_name} a note in {folder}",
+            message=seg[0] + user_name + seg[1] + str(folder),
             state="note",
             ts=now.isoformat(),
             user_name=user_name,
