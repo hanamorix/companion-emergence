@@ -2,12 +2,18 @@
 
 Provider interface: EmbeddingProvider ABC. Two concrete providers:
 - FakeEmbeddingProvider: deterministic hash-based, zero network, used in tests.
-- OllamaEmbeddingProvider: calls local Ollama /api/embeddings endpoint
-  (will be added in Week 5 when the bridge lands).
+- FastEmbedProvider: real local embeddings via `fastembed` (ONNX, no torch,
+  no network at inference — the model file is downloaded once into the
+  shared cache dir and used offline after). Production default.
 
 Cache: EmbeddingCache layers a SQLite content-hash cache on top of any
 provider. `get_or_compute(content)` returns the vector, hitting cache on
 repeat calls. Content hashed via SHA-256; first 32 hex chars used as key.
+Cache rows also carry a `model_id` — the id of the model that produced the
+vector — so swapping providers (e.g. FakeEmbeddingProvider → a real model,
+or one real model → another) is a targeted invalidation instead of silently
+serving a vector some other model made. `get_or_compute` only ever considers
+rows whose `model_id` matches the cache's own provider.
 
 Design per spec Section 4.1 (brain/memory/embeddings.py) and Section 10.1
 (content-hash embedding cache).
@@ -26,7 +32,8 @@ _DEFAULT_DIM = 256
 
 
 class EmbeddingProvider(ABC):
-    """Abstract embedding provider. Subclasses implement `embed` and `embedding_dim`."""
+    """Abstract embedding provider. Subclasses implement `embed`, `embedding_dim`
+    and `model_id`."""
 
     @abstractmethod
     def embed(self, text: str) -> np.ndarray:
@@ -35,6 +42,18 @@ class EmbeddingProvider(ABC):
     @abstractmethod
     def embedding_dim(self) -> int:
         """Return the output dimension of vectors this provider produces."""
+
+    @abstractmethod
+    def model_id(self) -> str:
+        """Return a stable identifier for the model producing these vectors.
+
+        Stored alongside every cached vector (`embedding_cache.model_id`) so
+        a provider swap is a targeted cache invalidation — a vector made by
+        one model/dim is never read back as if it came from another. Two
+        providers that produce incompatible vectors MUST return different
+        ids (dimension alone is not a safe proxy: two different models can
+        share a dimension).
+        """
 
 
 class FakeEmbeddingProvider(EmbeddingProvider):
@@ -61,13 +80,61 @@ class FakeEmbeddingProvider(EmbeddingProvider):
     def embedding_dim(self) -> int:
         return self._dim
 
+    def model_id(self) -> str:
+        # Dim-qualified so two Fake instances of different dims (seen across
+        # the test suite) never collide on the same cache rows.
+        return f"fake-{self._dim}"
+
+
+class FastEmbedProvider(EmbeddingProvider):
+    """Real local embedding provider via `fastembed` (ONNX runtime, no torch).
+
+    Production default. Model id comes from `model_tier.py`
+    (`model_for_tier(TIER_EMBEDDING)`), never hardcoded here — see that
+    module's docstring for why every model selection routes through it.
+
+    The model file is downloaded once (fastembed's own lazy-download-on-first-
+    use behavior) into `cache_dir` and used fully offline after — no network
+    call happens at embed() time once the file is cached. Construction itself
+    does NOT download; the download is deferred to fastembed's own internals
+    on first `embed()` call, same as fastembed's default behavior.
+    """
+
+    def __init__(self, model_id: str, cache_dir: str | Path, dim: int) -> None:
+        # Imported lazily so importing this module never requires fastembed/
+        # onnxruntime to be installed unless the real provider is actually
+        # constructed (tests exclusively use FakeEmbeddingProvider).
+        from fastembed import TextEmbedding
+
+        self._model_id = model_id
+        self._dim = dim
+        # lazy_load=True: defer the (one-time) model-file load/download to
+        # the first embed() call rather than construction time. Every current
+        # call site constructs this off the message hot path already, but
+        # deferring keeps construction itself cheap and never network-bound.
+        self._model = TextEmbedding(model_name=model_id, cache_dir=str(cache_dir), lazy_load=True)
+
+    def embed(self, text: str) -> np.ndarray:
+        # TextEmbedding.embed() takes an iterable and yields one vector per
+        # input; we pass exactly one string and take the one result.
+        (vec,) = self._model.embed([text])
+        return np.asarray(vec, dtype=np.float32)
+
+    def embedding_dim(self) -> int:
+        return self._dim
+
+    def model_id(self) -> str:
+        return self._model_id
+
 
 class EmbeddingCache:
     """Content-hash cache on top of any EmbeddingProvider.
 
     Storage: SQLite table with (content_hash TEXT PRIMARY KEY, vector BLOB,
-    dim INTEGER, created_at TEXT). Hash is SHA-256 hex (first 32 chars).
-    Vector stored as raw float32 bytes via np.ndarray.tobytes().
+    dim INTEGER, model_id TEXT, created_at TEXT). Hash is SHA-256 hex (first
+    32 chars). Vector stored as raw float32 bytes via np.ndarray.tobytes().
+    model_id is the producing provider's id (see EmbeddingProvider.model_id);
+    every read/write here is scoped to it.
     """
 
     _SCHEMA = """
@@ -75,6 +142,7 @@ class EmbeddingCache:
         content_hash TEXT PRIMARY KEY,
         vector BLOB NOT NULL,
         dim INTEGER NOT NULL,
+        model_id TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """
@@ -91,26 +159,52 @@ class EmbeddingCache:
             pass
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(self._SCHEMA)
+        # Idempotent column migration for personas/dbs created before the
+        # model_id column existed — CREATE TABLE IF NOT EXISTS above leaves a
+        # pre-existing table alone, so check + ALTER, mirroring the
+        # recall_count ALTER-guard pattern in store.py.
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(embedding_cache)").fetchall()}
+        if "model_id" not in existing:
+            self._conn.execute(
+                "ALTER TABLE embedding_cache ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.commit()
         self._provider = provider
+        self._model_id = provider.model_id()
+
+    @property
+    def model_id(self) -> str:
+        """The model id this cache's provider produces — every read/write
+        here is scoped to rows carrying this id."""
+        return self._model_id
 
     def close(self) -> None:
         """Close the underlying connection."""
         self._conn.close()
 
     def get_or_compute(self, content: str) -> np.ndarray:
-        """Return the cached embedding for content, computing + storing on miss."""
+        """Return the cached embedding for content, computing + storing on miss.
+
+        Cache rows are keyed by (content_hash, model_id) — a row written by a
+        DIFFERENT provider (e.g. FakeEmbeddingProvider's 256-dim vectors vs a
+        real 384-dim model) is never returned; a miss on model_id mismatch
+        recomputes and overwrites the row with this provider's vector (a
+        stale row from a prior model is targeted, lazy invalidation, not a
+        silent dim mismatch).
+        """
         key = self._hash(content)
         row = self._conn.execute(
-            "SELECT vector, dim FROM embedding_cache WHERE content_hash = ?", (key,)
+            "SELECT vector, dim FROM embedding_cache WHERE content_hash = ? AND model_id = ?",
+            (key, self._model_id),
         ).fetchone()
         if row is not None:
             return np.frombuffer(row[0], dtype=np.float32).copy().reshape(row[1])
 
         vec = self._provider.embed(content).astype(np.float32)
         self._conn.execute(
-            "INSERT INTO embedding_cache (content_hash, vector, dim) VALUES (?, ?, ?)",
-            (key, vec.tobytes(), vec.shape[0]),
+            "INSERT OR REPLACE INTO embedding_cache (content_hash, vector, dim, model_id) "
+            "VALUES (?, ?, ?, ?)",
+            (key, vec.tobytes(), vec.shape[0], self._model_id),
         )
         self._conn.commit()
         # Return a float32 copy for consistency with cache hits.
@@ -145,3 +239,37 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0.0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def build_embedding_provider() -> EmbeddingProvider:
+    """The production embedding provider: FastEmbedProvider pinned to
+    `model_tier.TIER_EMBEDDING`'s model id, caching the model file in the
+    shared `get_cache_dir()` (one download across every persona on the box,
+    per the build-plan recommendation — the model isn't persona-specific
+    data, just a local asset).
+
+    The model id/dim come from `model_tier.py`, never hardcoded here — same
+    convention as every Claude tier in that module.
+    """
+    from brain.bridge.model_tier import MODEL_EMBEDDING_DIM, TIER_EMBEDDING, model_for_tier
+    from brain.paths import get_cache_dir
+
+    return FastEmbedProvider(
+        model_id=model_for_tier(TIER_EMBEDDING),
+        cache_dir=get_cache_dir(),
+        dim=MODEL_EMBEDDING_DIM,
+    )
+
+
+def build_embedding_cache(persona_dir: str | Path) -> EmbeddingCache:
+    """The production EmbeddingCache for a persona: `embeddings.db` under
+    `persona_dir`, backed by `build_embedding_provider()`.
+
+    ONE construction helper instead of every call site repeating
+    `EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(...))`
+    — centralizes the production provider choice so a future model swap (or
+    provider change) is a one-function edit, not an N-call-site hunt.
+    Tests that need a cache under the fake provider construct EmbeddingCache
+    directly with FakeEmbeddingProvider, as before.
+    """
+    return EmbeddingCache(Path(persona_dir) / "embeddings.db", build_embedding_provider())
