@@ -872,6 +872,28 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def list_active_since(self, cursor_iso: str | None, *, limit: int) -> list[Memory]:
+        """Return up to `limit` active memories with created_at > cursor_iso,
+        ordered ASCENDING by created_at (oldest-of-the-remainder first).
+
+        `cursor_iso=None` starts from the beginning of history. A bounded,
+        cursor-paged sibling of `list_active()` for callers (the embedding
+        backfill, brain/memory/embedding_backfill.py) that walk the WHOLE
+        corpus a little at a time across many calls rather than loading it
+        all at once — same `active = 1` filter as `list_active()`.
+        """
+        if cursor_iso is None:
+            sql = "SELECT * FROM memories WHERE active = 1 ORDER BY created_at ASC LIMIT ?"
+            params: list[Any] = [limit]
+        else:
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 AND created_at > ? "
+                "ORDER BY created_at ASC LIMIT ?"
+            )
+            params = [cursor_iso, limit]
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
     def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
         """Return True if a grief_event memory with grief_referent_id == referent_id
         exists in the memories table created within the last `hours`.

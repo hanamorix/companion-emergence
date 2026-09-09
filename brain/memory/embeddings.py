@@ -210,6 +210,23 @@ class EmbeddingCache:
         # Return a float32 copy for consistency with cache hits.
         return vec.copy()
 
+    def has(self, content: str) -> bool:
+        """True iff `content` already has a cached vector under THIS cache's
+        model_id — i.e. a call to `get_or_compute(content)` would cache-hit
+        rather than compute.
+
+        Used by the idle embedding backfill (brain/memory/embedding_backfill.py)
+        to tell "already embedded" apart from "needs an embed" without paying
+        for a real embed computation just to check. Scoped to `model_id` the
+        same way `get_or_compute` is — a row left by a different/prior
+        provider never counts as "has" for this cache.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM embedding_cache WHERE content_hash = ? AND model_id = ?",
+            (self._hash(content), self._model_id),
+        ).fetchone()
+        return row is not None
+
     def count(self) -> int:
         """Return the number of cached embeddings."""
         return int(self._conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0])

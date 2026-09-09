@@ -105,6 +105,25 @@ def test_cache_count_reflects_stored_entries(cache: EmbeddingCache) -> None:
     assert cache.count() == 2
 
 
+def test_has_false_before_compute_true_after(cache: EmbeddingCache) -> None:
+    """has() reflects cache membership without itself computing anything."""
+    assert cache.has("not yet embedded") is False
+    cache.get_or_compute("not yet embedded")
+    assert cache.has("not yet embedded") is True
+
+
+def test_has_scoped_to_this_caches_model_id(tmp_path: Path) -> None:
+    """A row cached under a DIFFERENT model_id must not count as has()."""
+    db_path = tmp_path / "embeddings.db"
+    EmbeddingCache(db_path, FakeEmbeddingProvider(dim=256)).get_or_compute("shared")
+
+    new_cache = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=384))
+    try:
+        assert new_cache.has("shared") is False
+    finally:
+        new_cache.close()
+
+
 def test_cosine_similarity_self_is_one() -> None:
     """cosine_similarity(v, v) == 1.0."""
     v = np.array([1.0, 0.0, 0.0])
