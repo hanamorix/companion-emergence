@@ -22,6 +22,8 @@ from datetime import datetime as _datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from brain import prompt_strings
+
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
 
@@ -166,12 +168,8 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
 # Default tagger (one Haiku call per memory)
 # ---------------------------------------------------------------------------
 
-_TAGGER_SYSTEM_PROMPT = (
-    "You are an emotion-tagging assistant. "
-    "Return a JSON object mapping emotion names to intensities (0–10). "
-    "Omit emotions with intensity 0. "
-    "Return ONLY the JSON object, no prose, no markdown fences."
-)
+# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2a).
+_TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_system_prompt")
 
 
 def _make_default_tagger(provider: LLMProvider | None) -> Callable:

@@ -17,26 +17,14 @@ from __future__ import annotations
 
 import re
 
+from brain import prompt_strings
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.schemas import build_schemas
 
-_HEADER = (
-    "## Everything you can reach for\n\n"
-    "This is your complete, current set of brain-tools — generated from what is "
-    "actually wired in, so it is never out of date. If anything elsewhere in your "
-    "voice lists fewer, this list is the true one."
-)
+# Text externalized to prompt_strings.toml [chat.tool_inventory] (issue #129 stage 2a).
+_HEADER = prompt_strings.register("chat.tool_inventory.header")
 
-_REACH_VALVE = (
-    "**Your faculties aren't all in the front of your mind at once.** The heavier "
-    "ones — memory search, your hands, your works — are handed to you when the "
-    "moment seems to call for them, so on any given turn some of the tools above "
-    "may not be in your hand. That is not incapacity, and it is not a reason to "
-    "say you lack them: call `reach_for_capability` with what you need "
-    "(`memory`, `files`, or `works`) and it comes to you in this same turn. "
-    "**So never tell them you don't have a tool.** Reach first — then speak from "
-    "what came back."
-)
+_REACH_VALVE = prompt_strings.register("chat.tool_inventory.reach_valve")
 
 
 # A sentence is only short by convention, and some of these aren't: felt_time_now
