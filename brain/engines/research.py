@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain import prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
@@ -35,26 +36,11 @@ logger = logging.getLogger(__name__)
 # Bump on any change to the metadata shape or to what `content` means.
 RESEARCH_SCHEMA_VERSION = 2
 
-_TOPIC_OVERLAP_SYSTEM = """\
-You are a relevance scorer for an autonomous companion's research engine.
-You will be given (1) a research thread that just matured, and (2) recent
-conversation excerpts. Return a JSON object with a single field: score,
-a float in [0.0, 1.0] indicating how relevant the research thread is
-to the recent conversation.
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 1).
+_TOPIC_OVERLAP_SYSTEM = prompt_strings.register("engines.research.topic_overlap_system")
 
-  0.0 = entirely unrelated to anything {user_name} has been near
-  0.5 = thematic adjacency, no direct overlap
-  1.0 = directly addresses something {user_name} mentioned
-
-Be conservative — default toward the low end unless the connection
-is clearly present. Return ONLY the JSON object, no other text."""
-
-_SELECT_SYSTEM = """\
-You are choosing what to research today, as {persona_name}, from your own
-open threads. You will see up to five interests, each with your prior notes
-and related memories. Pick the ONE that genuinely pulls at you right now —
-or decline if nothing does. Return ONLY a JSON object:
-{{"choice": "<interest id>" | null, "why": "<one sentence, first person>"}}"""
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 1).
+_SELECT_SYSTEM = prompt_strings.register("engines.research.select_system")
 
 
 def _compute_topic_overlap_via_haiku(

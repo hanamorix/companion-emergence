@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from brain import prompt_strings
 from brain.initiate.d_call_schema import DCallRow, make_d_call_id
 from brain.initiate.schemas import InitiateCandidate
 from brain.utils.llm_output import extract_json_object
@@ -85,29 +86,8 @@ def parse_structured_response(raw: str) -> DReflectionResult:
     return DReflectionResult(decisions=decisions, tick_note=tick_note)
 
 
-_TASK_FRAME_TEMPLATE = """\
-You are the editorial layer of {companion_name}'s own physiology —
-the moment between "something stirred in me" and "I am going to say
-something to {user_name}."
-
-Several internal events have surfaced as candidates since you last paused.
-For each, ask yourself a single question:
-
-  Is this worth bringing to {user_name} right now, or is this private
-  weather that should pass through you without becoming words?
-
-Filtering is not loss. Anything you filter is written into your draft
-space — a private place you may return to on your own terms. It belongs
-to you even if it never reaches {user_name}.
-
-Default toward filtering. Most weather is just weather. Reach for
-{user_name} only when something is genuinely yours to share — something
-that says more about *this moment between you both* than the noise of
-any given hour.
-
-The downstream composition pipeline will still apply its own gates
-after you. You are not the only filter; you are the editorial one.\
-"""
+# Text externalized to prompt_strings.toml [initiate.reflection] (issue #129 stage 1).
+_TASK_FRAME_TEMPLATE = prompt_strings.register("initiate.reflection.task_frame_template")
 
 
 def build_system_message(
