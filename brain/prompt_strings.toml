@@ -12,6 +12,28 @@
 #
 # Organized into subsystem sections mirroring brain/'s package layout.
 
+# -----------------------------------------------------------------------------
+# Prompt sites intentionally LEFT IN CODE (issue #129 run 1) — candidates for a
+# future prompts pass. These build or SELECT different text via control flow
+# (branches/loops), so they don't fit this file's plain-template / straight-line-
+# segment model without extending the mechanism. Listed here so a later pass
+# finds them without re-scanning the tree:
+#   chat/extractor.py::_build_user_prompt              - optional section + unbounded loop into the output list
+#   chat/monologue_prompts.py::build_monologue_frame   - 4 independent if-appends
+#   chat/tool_loop.py (recruit-nudge literal)          - inline, not module-level
+#   initiate/compose.py::compose_tone / compose_decision - state-dependent line selection
+#   kindled_link/privacy_gate.py                       - branch-selected reason/constraint literals
+#   grief/breadcrumb.py::drop_phrase / recall_touch_phrase - branch across return paths
+#   forgetting/prompt.py                               - procedural; but 2 lines are arguably a 2-way full-string SELECTION (a letter-vs-intent call)
+#   engines/research.py::_select_interest / _seed_interests_from_voice - selection prompts
+#   engines/interest_sweep.py::_lived_sample           - assembled
+#   attunement/detector.py::_build_user_message / _format_buffer
+#   health/vocab_repair.py                             - stub-loop build
+#   growth/crystallizers/creative_dna.py::_render_prompt - ternaries
+#   grief/prompt.py                                    - whole-file procedural builder
+#   tools/schemas.py::SCHEMAS / LOVE_TYPES             - tool-definition text; unclear if a "prompt string" in scope
+# -----------------------------------------------------------------------------
+
 [attunement.prompts]
 detector_system_prompt = '''You are extracting attunement signals from a conversation.
 
