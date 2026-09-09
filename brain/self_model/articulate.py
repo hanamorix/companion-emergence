@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain import tunables
+from brain import prompt_strings, tunables
 from brain.bridge import cli_throttle
 from brain.bridge.usage_log import log_usage
 from brain.self_model.gap import Gap
@@ -48,6 +48,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Text externalized to prompt_strings.toml [self_model.articulate] (issue #129 stage 2b).
+_PROMPT_SEGMENTS = prompt_strings.register_segments("self_model.articulate.prompt_segments")
 
 _GAP_THRESHOLD: float = 0.4          # below this magnitude → skip articulation
 _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
@@ -274,12 +277,8 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
         "'curiosity's been running quieter than usual this week,' or "
         "'warmth's been stronger than my baseline lately.'"
     )
-    prompt = (
-        f"Recent vs baseline, per channel (positive is running above your "
-        f"baseline lately, negative is below): {deltas_text}. "
-        f"Unnamed pressure: {gap.unnamed_pressure:.2f}. "
-        "What's the (metaphorical) weather?"
-    )
+    seg = _PROMPT_SEGMENTS
+    prompt = seg[0] + deltas_text + seg[1] + f"{gap.unnamed_pressure:.2f}" + seg[2]
 
     # 3. Throttle: single non-blocking acquire, min_idle=articulate_min_idle_seconds()
     #    (default 30s, not cli_throttle's 300s default). No retry loop here - a

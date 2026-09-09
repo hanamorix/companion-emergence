@@ -170,6 +170,8 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
 
 # Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2a).
 _TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_system_prompt")
+# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2b).
+_TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backfill.tagger_prompt_segments")
 
 
 def _make_default_tagger(provider: LLMProvider | None) -> Callable:
@@ -192,12 +194,8 @@ def _make_default_tagger(provider: LLMProvider | None) -> Callable:
         try:
             vocab = _load_vocab()
             vocab_str = ", ".join(sorted(vocab)) if vocab else "(any emotion name)"
-            prompt = (
-                f"Return a JSON object mapping emotion names to intensities (0-10) "
-                f"for the following memory. Use ONLY names from this list: {vocab_str}. "
-                f"Omit emotions with intensity 0. Return ONLY the JSON object, no other text.\n\n"
-                f"Memory: {memory.content}"
-            )
+            seg = _TAGGER_PROMPT_SEGMENTS
+            prompt = seg[0] + vocab_str + seg[1] + memory.content + seg[2]
             raw_text = provider.generate(prompt, system=_TAGGER_SYSTEM_PROMPT)
             raw = json.loads(raw_text)
             return _normalize(raw, vocab)
