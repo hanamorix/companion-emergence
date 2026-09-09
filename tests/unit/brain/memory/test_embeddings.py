@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -412,3 +414,180 @@ def test_build_embedding_cache_targets_embeddings_db_under_persona_dir(
         assert vec.shape == (384,)
     finally:
         cache.close()
+
+
+# ---------------------------------------------------------------------------
+# build_embedding_provider() process-wide caching — the Stage-3 hot-path-
+# latency fix (was: a fresh FastEmbedProvider/TextEmbedding, i.e. a fresh
+# ONNX session, built on EVERY recall call; now: built once per process per
+# model_id and reused).
+# ---------------------------------------------------------------------------
+
+
+def test_build_embedding_provider_constructs_the_model_only_once_across_n_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test for the Stage-3 hot-path-latency defect: calling
+    build_embedding_provider() N times with the same model_id must construct
+    the underlying TextEmbedding exactly ONCE — every call after the first
+    must return the SAME cached instance, not pay the ~300-450ms
+    construction cost again."""
+    construct_count = {"n": 0}
+
+    class _CountingStubTextEmbedding(_StubTextEmbedding):
+        def __init__(self, *args, **kwargs) -> None:
+            construct_count["n"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _CountingStubTextEmbedding)
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
+
+    first = build_embedding_provider()
+    for _ in range(4):
+        again = build_embedding_provider()
+        assert again is first, "every call after the first must return the SAME cached provider"
+
+    assert construct_count["n"] == 1, "the model must be constructed exactly once across 5 calls"
+
+
+def test_build_embedding_provider_cache_is_keyed_by_model_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two different model_ids must each get their OWN cached provider —
+    caching by model_id (not a bare singleton) must not silently serve one
+    model's provider for a different model_id."""
+    from brain.bridge import model_tier
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _StubTextEmbedding)
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
+
+    first = build_embedding_provider()
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "some/other-model")
+    second = build_embedding_provider()
+
+    assert first is not second
+    assert first.model_id() != second.model_id()
+
+
+def test_build_embedding_provider_cache_reset_hook_forces_a_fresh_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The test-only reset hook (wired into conftest's autouse fixture)
+    actually clears the cache — proves the isolation mechanism the conftest
+    fixture relies on is real, not a no-op."""
+    from brain.memory.embeddings import _reset_embedding_provider_cache
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _StubTextEmbedding)
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
+
+    first = build_embedding_provider()
+    _reset_embedding_provider_cache()
+    second = build_embedding_provider()
+
+    assert first is not second, "resetting the cache must force a fresh construction"
+
+
+class _LazyLoadRaceStubTextEmbedding:
+    """Stand-in for fastembed.TextEmbedding that reproduces the ACTUAL race
+    pattern found in fastembed's real `OnnxTextModel._embed_documents`:
+
+        if not hasattr(self, "model") or self.model is None:
+            self.load_onnx_model()
+
+    an unguarded check-then-act on first use. A `time.sleep` between the
+    check and the "load" widens the race window so that two threads calling
+    `embed()` on the SAME instance without any external serialization would
+    both observe "not yet loaded" and both "load" concurrently —
+    `max_concurrent_loads` would exceed 1. Used to prove
+    FastEmbedProvider.embed()'s own lock actually serializes against this,
+    rather than merely trusting it by inspection.
+    """
+
+    _cls_lock = threading.Lock()
+
+    def __init__(self, model_name: str, cache_dir: str, lazy_load: bool = False, **kwargs) -> None:
+        self.model_name = model_name
+        self.cache_dir = cache_dir
+        self.lazy_load = lazy_load
+        self._loaded = False
+        self.concurrent_loads = 0
+        self.max_concurrent_loads = 0
+
+    def embed(self, texts):
+        if not self._loaded:
+            with self._cls_lock:
+                self.concurrent_loads += 1
+                self.max_concurrent_loads = max(self.max_concurrent_loads, self.concurrent_loads)
+            time.sleep(0.05)  # widen the race window past a normal context switch
+            self._loaded = True
+            with self._cls_lock:
+                self.concurrent_loads -= 1
+        for _ in texts:
+            yield np.ones(384, dtype=np.float32)
+
+
+def test_fastembed_provider_embed_serializes_the_lazy_load_race_across_threads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two threads calling FastEmbedProvider.embed() concurrently on the SAME
+    (shared/cached) instance must not race fastembed's own unguarded
+    check-then-act lazy-load — proven by `max_concurrent_loads` staying at 1
+    under FastEmbedProvider's lock, using a stub that widens the real race
+    window (see _LazyLoadRaceStubTextEmbedding). Also asserts no
+    exception/deadlock and that every thread gets a correct, consistent
+    vector back."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _LazyLoadRaceStubTextEmbedding)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+
+    results: list[np.ndarray] = []
+    errors: list[BaseException] = []
+    results_lock = threading.Lock()
+
+    def worker(text: str) -> None:
+        try:
+            vec = provider.embed(text)
+            with results_lock:
+                results.append(vec)
+        except BaseException as exc:  # noqa: BLE001 — capture for the assertion, not swallow
+            with results_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(f"text-{i}",)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"concurrent embed() calls raised: {errors}"
+    assert len(results) == 8
+    for vec in results:
+        assert vec.shape == (384,)
+        assert vec.dtype == np.float32
+
+    assert provider._model.max_concurrent_loads == 1, (  # noqa: SLF001
+        "FastEmbedProvider.embed() must serialize calls so fastembed's own "
+        "unguarded lazy-load check-then-act never overlaps across threads"
+    )
+
+
+def test_stub_race_detector_actually_detects_the_race_when_unserialized(tmp_path: Path) -> None:
+    """Control test: proves _LazyLoadRaceStubTextEmbedding's race window is
+    real (not a test that could never fail) by calling the stub's embed()
+    DIRECTLY from multiple threads with no FastEmbedProvider lock in the
+    way — max_concurrent_loads must exceed 1 in that unserialized case,
+    which is exactly what FastEmbedProvider.embed()'s lock prevents."""
+    stub = _LazyLoadRaceStubTextEmbedding(model_name="some/model", cache_dir=str(tmp_path))
+
+    def worker() -> None:
+        list(stub.embed(["hi"]))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert stub.max_concurrent_loads > 1, (
+        "the race stub itself must race when nothing external serializes calls to it "
+        "-- otherwise the serialization test above wouldn't actually be testing anything"
+    )

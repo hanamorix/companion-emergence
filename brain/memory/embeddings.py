@@ -17,12 +17,17 @@ rows whose `model_id` matches the cache's own provider.
 
 Design per spec Section 4.1 (brain/memory/embeddings.py) and Section 10.1
 (content-hash embedding cache).
+
+`build_embedding_provider()` caches the constructed provider PROCESS-WIDE
+(keyed by model_id, thread-safe) — see its own docstring — so the expensive
+model/ONNX-session load happens once per process, not once per call.
 """
 
 from __future__ import annotations
 
 import hashlib
 import sqlite3
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -113,11 +118,29 @@ class FastEmbedProvider(EmbeddingProvider):
         # call site constructs this off the message hot path already, but
         # deferring keeps construction itself cheap and never network-bound.
         self._model = TextEmbedding(model_name=model_id, cache_dir=str(cache_dir), lazy_load=True)
+        # A shared instance of this provider (see build_embedding_provider's
+        # process-wide cache) can have .embed() called concurrently from two
+        # threads — the turn thread (recall) and the supervisor's background
+        # backfill thread. fastembed's own lazy first-load
+        # (`OnnxTextModel._embed_documents`: `if not hasattr(self, "model")
+        # or self.model is None: self.load_onnx_model()`) is an unguarded
+        # check-then-act with no lock of its own, so two threads racing the
+        # FIRST embed() call on one instance can both see `model is None` and
+        # both call load_onnx_model() concurrently — a real data race on
+        # `self.model`/`self.tokenizer`, not merely a wasted duplicate load.
+        # ONNX Runtime's InferenceSession.Run() is documented thread-safe for
+        # concurrent inference once a session exists, but that guarantee
+        # doesn't cover this lazy-construction race, so the conservative
+        # choice is to serialize the whole embed() call (construction +
+        # inference) behind one instance lock rather than assume safety we
+        # can't confirm for the part that actually races.
+        self._embed_lock = threading.Lock()
 
     def embed(self, text: str) -> np.ndarray:
         # TextEmbedding.embed() takes an iterable and yields one vector per
         # input; we pass exactly one string and take the one result.
-        (vec,) = self._model.embed([text])
+        with self._embed_lock:
+            (vec,) = self._model.embed([text])
         return np.asarray(vec, dtype=np.float32)
 
     def embedding_dim(self) -> int:
@@ -309,6 +332,14 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+# Process-wide provider cache keyed by model_id (see build_embedding_provider).
+# Kept at module scope rather than a closure so `_reset_embedding_provider_cache`
+# (test-only) can reach it, and so monkeypatching the *function* (the whole
+# object, this cache included — see that fixture) fully controls behavior.
+_provider_cache: dict[str, EmbeddingProvider] = {}
+_provider_cache_lock = threading.Lock()
+
+
 def build_embedding_provider() -> EmbeddingProvider:
     """The production embedding provider: FastEmbedProvider pinned to
     `model_tier.TIER_EMBEDDING`'s model id, caching the model file in the
@@ -318,15 +349,79 @@ def build_embedding_provider() -> EmbeddingProvider:
 
     The model id/dim come from `model_tier.py`, never hardcoded here — same
     convention as every Claude tier in that module.
+
+    PROCESS-WIDE CACHING: constructing a FastEmbedProvider builds a real
+    fastembed/ONNX inference session — a one-time ~300-450ms cost. Before
+    this cache existed, `semantic_recall.run_semantic_recall` called
+    `build_embedding_cache()` -> this function fresh on EVERY recall (i.e.
+    every conversational turn), so every turn paid that cost again. Now the
+    provider for a given model_id is built once per process and reused for
+    every subsequent call with that same model_id — steady-state calls pay
+    only the per-query embed (tens of ms), not another full reload. Keyed by
+    model_id (not a bare singleton) because model_id is the one legitimate
+    reason this should ever return a DIFFERENT provider (see model_tier.py);
+    in practice there's a single model_id, but keying by it is the robust
+    choice if that ever changes.
+
+    THREAD SAFETY: the supervisor's idle embedding backfill runs on a
+    background thread while turn-time recall runs on the request/turn
+    thread, so two threads can race to build the first provider for a given
+    model_id. Guarded with double-checked locking: an unlocked fast-path
+    read handles the (overwhelmingly common) already-cached case with no
+    lock at all; the lock is only acquired — then re-checked, in case another
+    thread won the race while this one was waiting — the first time a given
+    model_id actually needs constructing. So the lock is never held across
+    concurrent reads of an already-built provider, only across the one real
+    construction race. (`FastEmbedProvider.embed()` carries its own separate
+    per-instance lock for concurrent `.embed()` calls — see that class.)
+
+    TEST ISOLATION: this dict is process-global, so `tests/conftest.py`'s
+    autouse `_reset_embedding_provider_cache` fixture clears it before and
+    after every test — needed because a couple of tests in
+    `test_embeddings.py` import `build_embedding_provider` by name and call
+    the real function directly (bypassing the suite-wide fake-provider
+    monkeypatch below, which only intercepts callers that look the function
+    up via `brain.memory.embeddings.build_embedding_provider` at call time).
+    Every other test goes through that monkeypatch instead:
+    `monkeypatch.setattr(embeddings, "build_embedding_provider", lambda: ...)`
+    replaces this ENTIRE function object — this cache included — so the fake
+    path never reads or writes `_provider_cache` at all, and a cached REAL
+    provider can never leak into a test expecting the fake (nor vice versa).
     """
     from brain.bridge.model_tier import MODEL_EMBEDDING_DIM, TIER_EMBEDDING, model_for_tier
     from brain.paths import get_cache_dir
 
-    return FastEmbedProvider(
-        model_id=model_for_tier(TIER_EMBEDDING),
-        cache_dir=get_cache_dir(),
-        dim=MODEL_EMBEDDING_DIM,
-    )
+    model_id = model_for_tier(TIER_EMBEDDING)
+
+    provider = _provider_cache.get(model_id)
+    if provider is not None:
+        return provider
+
+    with _provider_cache_lock:
+        provider = _provider_cache.get(model_id)  # re-check: lost the race?
+        if provider is not None:
+            return provider
+        provider = FastEmbedProvider(
+            model_id=model_id,
+            cache_dir=get_cache_dir(),
+            dim=MODEL_EMBEDDING_DIM,
+        )
+        _provider_cache[model_id] = provider
+        return provider
+
+
+def _reset_embedding_provider_cache() -> None:
+    """Test-only: clear the process-level cache `build_embedding_provider()`
+    builds up.
+
+    Wired into `tests/conftest.py`'s autouse `_reset_embedding_provider_cache`
+    fixture (before AND after every test) so a test that calls the REAL
+    `build_embedding_provider()` directly always gets an independently-built
+    provider rather than one a prior/later test's call happened to cache
+    (see that function's TEST ISOLATION note).
+    """
+    with _provider_cache_lock:
+        _provider_cache.clear()
 
 
 def build_embedding_cache(persona_dir: str | Path) -> EmbeddingCache:

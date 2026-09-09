@@ -90,6 +90,29 @@ def _fake_embedding_provider_by_default(
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_embedding_provider_cache() -> Iterator[None]:
+    """Reset embeddings.build_embedding_provider()'s process-level provider
+    cache before and after each test.
+
+    Most tests never touch this cache at all — the fake-provider override
+    above replaces build_embedding_provider() wholesale (cache included), so
+    the fake path never reads or writes it. But a couple of tests in
+    test_embeddings.py import `build_embedding_provider` by NAME and call the
+    real function directly to exercise its own model_tier wiring, which
+    bypasses that monkeypatch entirely (the import binds the original
+    function object before any fixture runs). Without this reset, whichever
+    such test ran first would cache a provider that a later one — expecting
+    to build its own, under its own patched tmp_path / stubbed TextEmbedding
+    — would get served back instead.
+    """
+    from brain.memory import embeddings
+
+    embeddings._reset_embedding_provider_cache()
+    yield
+    embeddings._reset_embedding_provider_cache()
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     """Walk upward from this file to find the repo root (pyproject.toml).
