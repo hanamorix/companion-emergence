@@ -293,10 +293,19 @@ def run_semantic_recall(
       - a bunched clump / no clean cliff,
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
-      - ANY failure constructing the local embedding provider/cache or
-        embedding the query (fail-soft: a broken/missing local model must
-        never break recall — it only demotes this turn to lexical-primary,
-        matching the spec's warm-up contract).
+      - ANY failure ANYWHERE in this function — constructing the local
+        embedding provider/cache, embedding the query, building the
+        candidate pool, cosine scoring, or shape classification/surfacing
+        (fail-soft: a broken/missing local model, or a transient store
+        error such as a locked sqlite db during the background backfill,
+        must never break recall — it only demotes this turn to
+        lexical-primary, matching the spec's warm-up contract). The whole
+        body is wrapped in a broad `except Exception` for exactly this
+        reason: earlier revisions only caught the cache-open and query-embed
+        steps, leaving pool-build/scoring/classification exceptions to
+        propagate straight out — this function's own contract (and this
+        docstring) always said "ANY failure", so the catch now actually
+        matches it.
 
     Never renders anything and never bumps `recall_count` itself — the
     caller (`brain.chat.prompt._build_recall_block`) owns rendering and the
@@ -311,25 +320,33 @@ def run_semantic_recall(
         log.exception("run_semantic_recall: failed to open embedding cache — falling back to lexical")
         return None
     try:
-        pool = build_semantic_candidate_pool(store, embeddings_cache)
-        if not pool:
-            return None
         try:
-            query_vec = embeddings_cache.embed_query(user_input)
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("run_semantic_recall: query embed failed — falling back to lexical")
+            pool = build_semantic_candidate_pool(store, embeddings_cache)
+            if not pool:
+                return None
+            try:
+                query_vec = embeddings_cache.embed_query(user_input)
+            except Exception:  # noqa: BLE001 — fail-soft
+                log.exception("run_semantic_recall: query embed failed — falling back to lexical")
+                return None
+
+            scored = [(mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()]
+            scored.sort(key=lambda pair: -pair[1])
+
+            shape = classify_semantic_shape(scored, calibration=calibration)
+            tiers = surfacing_tiers(scored, shape)
+            if tiers is None:
+                return None
+
+            full = [pool[mid][0] for mid in tiers.full_ids]
+            snippet = [pool[mid][0] for mid in tiers.snippet_ids]
+            return SemanticRecallResult(full=full, snippet=snippet, scores=dict(scored))
+        except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
+            log.warning(
+                "run_semantic_recall: semantic path failed after opening the embedding cache "
+                "— falling back to lexical",
+                exc_info=True,
+            )
             return None
-
-        scored = [(mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()]
-        scored.sort(key=lambda pair: -pair[1])
-
-        shape = classify_semantic_shape(scored, calibration=calibration)
-        tiers = surfacing_tiers(scored, shape)
-        if tiers is None:
-            return None
-
-        full = [pool[mid][0] for mid in tiers.full_ids]
-        snippet = [pool[mid][0] for mid in tiers.snippet_ids]
-        return SemanticRecallResult(full=full, snippet=snippet, scores=dict(scored))
     finally:
         embeddings_cache.close()

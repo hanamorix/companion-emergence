@@ -1034,7 +1034,18 @@ def _build_recall_block(
     # — graceful warm-up — or any embedding-infra failure) falls through
     # UNCHANGED to the existing lexical/importance/hebbian/recency blend
     # below, exactly as it behaved before this stage.
-    semantic_result = run_semantic_recall(store, persona_dir, user_input)
+    try:
+        semantic_result = run_semantic_recall(store, persona_dir, user_input)
+    except Exception:  # noqa: BLE001
+        # Defense-in-depth: run_semantic_recall already wraps its own body in
+        # a broad except (its docstring's fail-soft contract: ANY failure ->
+        # None, never raises). This mirrors build_outbound_recall_block's
+        # wrap above so recall doesn't depend SOLELY on that callee's internal
+        # safety net — a failure reaching here must still never break chat
+        # composition; fall through to the lexical/blend path below exactly
+        # as an inconclusive (None) semantic result would.
+        log.exception("_build_recall_block: run_semantic_recall raised — falling back to lexical")
+        semantic_result = None
     if semantic_result is not None:
         return _render_semantic_recall_block(store, semantic_result, persona_dir=persona_dir)
 
