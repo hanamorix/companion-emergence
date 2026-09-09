@@ -29,6 +29,7 @@ from brain.memory.relevance import (
     SNIPPET_MODE_ENABLED,
     snippet_length,
 )
+from brain.memory.semantic_recall import SemanticRecallResult, run_semantic_recall
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
 from brain.utils.time import format_local, to_local
@@ -874,6 +875,72 @@ def _recall_snippet(mem, *, full: bool) -> str:
     return body
 
 
+def _render_semantic_recall_block(
+    store: MemoryStore, result: SemanticRecallResult, *, persona_dir: Path
+) -> str:
+    """Render a CONCLUSIVE semantic-primary recall result and apply its
+    recall-counter ticks (spec decision 5's "Counter" bullet).
+
+    Presentation reuses the EXACT bullet format the lexical path's
+    "active:" section already uses (`- <id>: "<snippet>"`) so the model
+    sees one consistent recall shape regardless of which retrieval
+    mechanism produced it — nothing downstream needs to special-case
+    semantic vs lexical recall.
+
+    Full tier renders in cosine-SELECTION order (mirrors how the lexical
+    path's importance-based `full_ids` render in their own unsorted
+    selection order). Snippet-tier PRESENTATION is re-ordered by
+    `_recall_sort_key` per the spec's explicit requirement ("cosine selects
+    the candidates; the normal sort orders the presentation of what's
+    surfaced, not cosine order") — cosine only decided membership in this
+    tier, not read order.
+
+    Counter ticks: full-surfaced memories each get a FULL tick
+    (`store.bump_recall(id, 1.0)`) — this is a SEPARATE id population from
+    the importance-threshold `full_ids` used by the lexical path elsewhere
+    in this module (which are deliberately EXCLUDED from any bump, "already
+    maximally salient" — see the CHANGE-1 comment in `_build_recall_block`
+    below). The spec is explicit that semantic full-injects ARE bumped, at
+    full strength. Snippet-tier gets the SAME rank-weighted fractional bump
+    (0.8 top -> 0.1 bottom, linear; a lone snippet -> 0.8) the lexical
+    path's own bump loop already uses — same mechanic, reused, fed this
+    candidate set in PRESENTATION order.
+
+    Also enqueues the same pending-reappraisal request
+    (`PendingQueue.enqueue_reappraisals`, CHANGE 3 / P3 retention rework)
+    the lexical path issues for every surfaced memory id — that mechanic is
+    keyed on "was surfaced this turn," not on which retrieval mechanism did
+    the surfacing.
+    """
+    full_ids = {m.id for m in result.full}
+    snippet_ordered = sorted(result.snippet, key=_recall_sort_key)
+
+    lines = ["recall"]
+    if SNIPPET_MODE_ENABLED:
+        lines.insert(0, _RECALL_SNIPPET_INVITATION)
+    lines.append("  active:")
+    for mem in result.full:
+        snippet = _recall_snippet(mem, full=True)
+        lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
+    for mem in snippet_ordered:
+        snippet = _recall_snippet(mem, full=False)
+        lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
+
+    for mem in result.full:
+        store.bump_recall(mem.id, 1.0)
+    n_snip = len(snippet_ordered)
+    for i, mem in enumerate(snippet_ordered):
+        amount = 0.8 if n_snip == 1 else 0.8 - 0.7 * (i / (n_snip - 1))
+        store.bump_recall(mem.id, amount)
+
+    from brain.memory.pending import PendingQueue
+
+    reappraise_ids = full_ids | {m.id for m in snippet_ordered}
+    PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+
+    return "\n".join(lines)
+
+
 def _build_recall_block(
     store: MemoryStore,
     user_input: str,
@@ -958,7 +1025,21 @@ def _build_recall_block(
 
         return "\n".join(lines)
 
-    # Forgetting-aware path — partitions into active / fading / lost.
+    # Semantic-PRIMARY attempt (Stage 3, local semantic-retrieval build,
+    # decisions 3-5: semantic cosine is PRIMARY, the lexical/blend path
+    # below is the FALLBACK/backstop). Runs BEFORE the lexical path: when it
+    # returns a CONCLUSIVE result (clear standouts), render it and return
+    # immediately for this turn — the lexical path below never runs. An
+    # INCONCLUSIVE result (None: bunched clump, empty/sparse candidate pool
+    # — graceful warm-up — or any embedding-infra failure) falls through
+    # UNCHANGED to the existing lexical/importance/hebbian/recency blend
+    # below, exactly as it behaved before this stage.
+    semantic_result = run_semantic_recall(store, persona_dir, user_input)
+    if semantic_result is not None:
+        return _render_semantic_recall_block(store, semantic_result, persona_dir=persona_dir)
+
+    # Forgetting-aware LEXICAL FALLBACK path (unchanged from pre-Stage-3) —
+    # partitions into active / fading / lost.
     from brain.forgetting.recall import search_with_loss
     from brain.memory.hebbian import HebbianMatrix
 

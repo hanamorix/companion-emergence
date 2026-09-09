@@ -210,6 +210,25 @@ class EmbeddingCache:
         # Return a float32 copy for consistency with cache hits.
         return vec.copy()
 
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embed ad-hoc query text through this cache's provider WITHOUT
+        touching the content-hash table.
+
+        Used by Stage 3 of the local semantic-retrieval build
+        (``brain/memory/semantic_recall.py``) for the ONE per-recall
+        synchronous in-turn embed (spec decision 4): a user's turn text is
+        ephemeral, one-off query text, not a memory to persist, so caching
+        it in ``embedding_cache`` would bloat that table with rows that are
+        never read again. Routing through THIS cache's provider (rather than
+        constructing a second, separate provider elsewhere) guarantees the
+        query vector shares this cache's model_id/dim with every vector
+        `all_hashes_and_vectors()` returns, and — in tests — automatically
+        inherits whatever provider this cache was built with (e.g. the
+        suite-wide `FakeEmbeddingProvider` override), with no second
+        construction site to keep in sync.
+        """
+        return self._provider.embed(text).astype(np.float32)
+
     def all_hashes_and_vectors(self, *, limit: int | None = None) -> list[tuple[str, np.ndarray]]:
         """Return every ``(content_hash, vector)`` pair cached under THIS
         cache's model_id.
