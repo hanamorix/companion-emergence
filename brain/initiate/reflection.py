@@ -89,6 +89,9 @@ def parse_structured_response(raw: str) -> DReflectionResult:
 # Text externalized to prompt_strings.toml [initiate.reflection] (issue #129 stage 1).
 _TASK_FRAME_TEMPLATE = prompt_strings.register("initiate.reflection.task_frame_template")
 
+# Text externalized to prompt_strings.toml [initiate.reflection] (issue #129 stage 2a).
+_USER_MESSAGE_SEGMENTS = prompt_strings.register_segments("initiate.reflection.user_message_segments")
+
 
 def build_system_message(
     *,
@@ -149,16 +152,21 @@ def build_user_message(
     part_of_day = _part_of_day(now_local.hour)
     weekday = now_local.strftime("%A")
     indexed = "\n\n".join(f"[{i + 1}] {summary}" for i, summary in enumerate(candidate_summaries))
+    seg = _USER_MESSAGE_SEGMENTS
     return (
-        f"=== Current time ({user_name}'s local) ===\n"
-        f"{now_local.isoformat(timespec='minutes')}  —  {part_of_day}  —  {weekday}\n\n"
-        f"=== Recent outbound (last 5 sends + acknowledged_unclear from last 24h) ===\n"
-        f"{outbound_recall_block}\n\n"
-        f"=== Candidates surfaced since last tick ===\n"
-        f"{indexed}\n\n"
-        f"=== Your task ===\n"
-        f"For each candidate, decide: promote or filter.\n"
-        f"Promote at most 2. The default is filter.\n"
+        seg[0]
+        + user_name
+        + seg[1]
+        + now_local.isoformat(timespec="minutes")
+        + seg[2]
+        + part_of_day
+        + seg[3]
+        + weekday
+        + seg[4]
+        + outbound_recall_block
+        + seg[5]
+        + indexed
+        + seg[6]
     )
 
 

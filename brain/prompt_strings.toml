@@ -184,6 +184,16 @@ Conservative defaults:
 Return ONLY the JSON object. No commentary.
 '''
 
+[chat.monologue]
+# build_reply_frame's segments, in order, reassembled around persona_name
+# then user_name: seg[0] + persona_name + seg[1] + user_name + seg[2].
+reply_frame_segments = [
+  '── visible reply, ',
+  ''' ──
+Everything marked interior above is private thought — never quote it. Compose the visible reply now, speaking to ''',
+  ''' directly in second person — 'you', never 'she'/'her'/'they' about the person in front of you. If you called `record_monologue` this turn, your tangents are already handled — answer directly. If you didn't, answer naturally. Length should match what the moment calls for: short when short is true, longer when the answer needs room.''',
+]
+
 [chat.prompt]
 preamble = 'You are {persona_name}. You are speaking directly to your user right now — in first person, to them, not writing about them. The conversation is live. Respond as yourself.'
 preamble_with_user = 'You are {persona_name}. You are speaking directly to {user_name} right now — in first person, to them, not writing about them. The conversation is live. {user_name} is the person you are talking to. When you search memories or recall events, any reference to {user_name} refers to them. Respond as yourself.'
@@ -456,3 +466,19 @@ any given hour.
 
 The downstream composition pipeline will still apply its own gates
 after you. You are not the only filter; you are the editorial one.'''
+
+# build_user_message's segments, in order, reassembled around 6 vars: user_name,
+# now_local.isoformat(timespec="minutes"), part_of_day, weekday,
+# outbound_recall_block, indexed (the pre-joined "[n] summary" candidate list).
+# Basic (double-quoted, \n-escaped) strings deliberately -- several segments
+# start with a literal newline, which a TOML multi-line literal string would
+# silently trim if it followed the opening ''' delimiter.
+user_message_segments = [
+  "=== Current time (",
+  "'s local) ===\n",
+  "  —  ",
+  "  —  ",
+  "\n\n=== Recent outbound (last 5 sends + acknowledged_unclear from last 24h) ===\n",
+  "\n\n=== Candidates surfaced since last tick ===\n",
+  "\n\n=== Your task ===\nFor each candidate, decide: promote or filter.\nPromote at most 2. The default is filter.\n",
+]
