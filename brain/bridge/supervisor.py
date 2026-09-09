@@ -148,6 +148,7 @@ def run_folded(
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+    clustering_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
@@ -172,6 +173,20 @@ def run_folded(
     sweep cadence is non-destructive (Task 3); finalize is the only path
     that deletes buffers + cursors and evicts from _SESSIONS, so it
     paces hourly because the threshold is days, not minutes.
+
+    ``clustering_interval_s=None`` disables the autonomous memory-vector
+    clustering cadence (Stage 5, #157, local semantic-retrieval build).
+    Default 6h — same value as ``soul_review_interval_s``/the maintenance
+    cadence, but its OWN persisted state file (mirrors the log-rotation/
+    finalize/maintenance decoupling pattern: a slow, independent, idle-cadence
+    batch pass, not chained to any other cadence's pacing). 6h is a
+    documented default, not spec-pinned — the spec/plan intentionally leave
+    cadence choice to the build (see ``hunts/semantic-retrieval/plan.md``
+    Stage 5); chosen to match the other "whole-corpus batch pass" cadences in
+    this file rather than the much tighter embedding-backfill tick (which
+    chips a small per-row batch every base tick — clustering instead
+    recomputes over the WHOLE cached vector set each firing, so it doesn't
+    need or want that tight a cadence).
     """
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
@@ -231,6 +246,14 @@ def run_folded(
     compaction_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "compaction_cadence.json")
         if compaction_interval_s is not None
+        else None
+    )
+    # Memory-vector clustering (Stage 5, #157) — own persisted wall-clock
+    # cadence, decoupled from every other cadence (see clustering_interval_s
+    # docstring above).
+    clustering_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "clustering_cadence.json")
+        if clustering_interval_s is not None
         else None
     )
 
@@ -627,6 +650,30 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "log_rotation_cadence.json", log_rotation_cadence_state
+                    )
+
+            # Memory-vector clustering cadence (Stage 5, #157) — own
+            # persisted wall-clock cadence, default 6h (see
+            # clustering_interval_s docstring). A full numpy k-means pass
+            # over the persona's currently-embedded vectors; off the message
+            # hot path by construction (only ever called from here). Own
+            # ExitStack ownership inside _run_clustering_tick (mirrors
+            # _run_log_rotation_tick/_run_narrative_memory_pass) since the
+            # per-tick `embeddings` handle opened earlier in this loop is
+            # already closed by the time this block runs.
+            if clustering_cadence_state is not None and persisted_cadence.is_due(
+                clustering_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_clustering_tick(persona_dir)
+                except Exception:
+                    logger.exception("supervisor clustering tick raised")
+                finally:
+                    clustering_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=clustering_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "clustering_cadence.json", clustering_cadence_state
                     )
 
             # Initiate review cadence — mirrors soul_review. Per-pass cost cap
@@ -2178,6 +2225,37 @@ def _run_log_rotation_tick(
                     "at": _now_iso(),
                 }
             )
+
+
+def _run_clustering_tick(persona_dir: Path) -> None:
+    """Stage 5 (#157) — one full numpy k-means pass over the persona's
+    currently-embedded vectors, off the message hot path (own persisted
+    cadence — see ``clustering_interval_s`` on ``run_folded``, default 6h).
+
+    Opens its own ``EmbeddingCache`` + ``MemoryClusterStore`` (ExitStack —
+    mirrors ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s
+    per-call ownership pattern) since the per-tick handles opened earlier in
+    ``run_folded``'s loop are already closed by the time this cadence block
+    runs. Local import keeps the module-load surface light — clustering is
+    only exercised on its own slow cadence, same rationale as narrative
+    memory's local imports above.
+    """
+    from brain.memory.clustering import MemoryClusterStore, run_clustering_pass
+
+    with ExitStack() as stack:
+        embeddings = build_embedding_cache(persona_dir)
+        stack.callback(embeddings.close)
+        cluster_store = MemoryClusterStore(persona_dir / "embeddings.db")
+        stack.callback(cluster_store.close)
+
+        result = run_clustering_pass(embeddings, cluster_store)
+        logger.info(
+            "clustering tick: ran=%s n_vectors=%d k=%d reason=%s",
+            result.ran,
+            result.n_vectors,
+            result.k,
+            result.reason,
+        )
 
 
 def _now_iso() -> str:
