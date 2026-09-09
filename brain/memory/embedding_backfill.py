@@ -1,7 +1,7 @@
 """Idle-chipped embedding backfill.
 
 Stage 2 of the local semantic-retrieval build (companion-emergence). Most
-memories are committed via ``MemoryStore.create()`` at ~11 call sites
+memories are committed via ``MemoryStore``'s ``create`` method at ~11 call sites
 (``brain/tools/impls/add_memory.py``, ``crystallize_soul.py``,
 ``add_journal.py``, ``brain/recovery/engine.py``,
 ``brain/kindled_link/relationship.py``, ``brain/migrator/cli.py``,

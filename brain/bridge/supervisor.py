@@ -379,7 +379,7 @@ def run_folded(
                 # scan_cap), so it is cheap when caught up and never spikes
                 # CPU on a cold-start backlog. This is the primary embed-on-
                 # write mechanism for the ~11 write sites that call
-                # MemoryStore.create() directly and never touch EmbeddingCache
+                # MemoryStore's create method directly and never touch EmbeddingCache
                 # (see brain/memory/embedding_backfill.py's module docstring)
                 # — fault-isolated so a backfill error never takes down the
                 # session-cleanup tick.
