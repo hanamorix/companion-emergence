@@ -210,6 +210,29 @@ class EmbeddingCache:
         # Return a float32 copy for consistency with cache hits.
         return vec.copy()
 
+    def all_hashes_and_vectors(self, *, limit: int | None = None) -> list[tuple[str, np.ndarray]]:
+        """Return every ``(content_hash, vector)`` pair cached under THIS
+        cache's model_id.
+
+        Used by the memory-clustering batch pass
+        (``brain/memory/clustering.py``, Stage 5 of the local semantic-
+        retrieval build) to build its candidate pool without reaching into
+        ``_conn`` directly (the pattern ``brain/ingest/dedupe.py`` uses,
+        flagged there as a wart). Scoped to `model_id` like every other read
+        here — a vector from a prior/different provider never enters a
+        clustering pass run under a different model.
+        """
+        query = "SELECT content_hash, vector, dim FROM embedding_cache WHERE model_id = ?"
+        params: list[object] = [self._model_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [
+            (content_hash, np.frombuffer(vec, dtype=np.float32).copy().reshape(dim))
+            for content_hash, vec, dim in rows
+        ]
+
     def has(self, content: str) -> bool:
         """True iff `content` already has a cached vector under THIS cache's
         model_id — i.e. a call to `get_or_compute(content)` would cache-hit
@@ -247,7 +270,16 @@ class EmbeddingCache:
 
     @staticmethod
     def _hash(content: str) -> str:
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+        return hash_content(content)
+
+
+def hash_content(content: str) -> str:
+    """The content-hash key used by ``embedding_cache`` (SHA-256, first 32
+    hex chars). Public so other content-hash-keyed side tables — e.g.
+    ``brain/memory/clustering.py``'s cluster-membership table — key their
+    rows identically without duplicating the hashing scheme.
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
