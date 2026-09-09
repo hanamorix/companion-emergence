@@ -60,6 +60,36 @@ def _reset_pass2_queue() -> Iterator[None]:
     pass2_queue.reset()
 
 
+@pytest.fixture(autouse=True)
+def _fake_embedding_provider_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force brain.memory.embeddings.build_embedding_provider() to the
+    deterministic, offline FakeEmbeddingProvider for the whole suite by
+    default.
+
+    build_embedding_provider() is the PRODUCTION default (FastEmbedProvider —
+    a real local ONNX model, downloaded once over the network into a shared
+    cache dir). Every brain/bridge/{server,supervisor,daemon}.py call site
+    that used to hardcode FakeEmbeddingProvider(dim=256) directly now goes
+    through build_embedding_cache()/build_embedding_provider() (Stage 1 of
+    the local semantic-retrieval build), so ANY test that exercises those
+    code paths — even indirectly, via a background thread the test itself
+    never awaits — would otherwise attempt a real model download: slow,
+    network-dependent, and (seen while landing this fixture) capable of
+    retrying for minutes past the test's own teardown in a now-deleted tmp
+    dir. A test that genuinely needs the real provider opts out with
+    `@pytest.mark.requires_network`.
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import embeddings
+
+    monkeypatch.setattr(
+        embeddings, "build_embedding_provider", lambda: embeddings.FakeEmbeddingProvider(dim=256)
+    )
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     """Walk upward from this file to find the repo root (pyproject.toml).
