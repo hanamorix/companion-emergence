@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
 
+from brain import prompt_strings
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
     TIER_BACKGROUND_GENERATIVE,
@@ -33,6 +34,17 @@ from brain.search.base import NoopWebSearcher, WebSearcher
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [engines.heartbeat] (issue #129 stage 2c).
+_TRY_FIRE_DREAM_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "engines.heartbeat.try_fire_dream_system_prompt_segments"
+)
+_EMIT_HEARTBEAT_SYSTEM_SEGMENTS = prompt_strings.register_segments(
+    "engines.heartbeat.emit_heartbeat_system_segments"
+)
+_EMIT_HEARTBEAT_USER_SEGMENTS = prompt_strings.register_segments(
+    "engines.heartbeat.emit_heartbeat_user_segments"
+)
 
 EmitMemoryMode = Literal["always", "conditional", "never"]
 # Single source of truth — derived from the Literal so a new mode added
@@ -722,10 +734,9 @@ class HeartbeatEngine:
             persona_dir=persona_dir,
             persona_name=self.persona_name,
             persona_system_prompt=(
-                f"You are {self.persona_name}. You just woke from a dream "
-                "about interconnected memories. Reflect in first person, 2-3 "
-                "sentences, starting with 'DREAM: '. Be honest and specific, "
-                "not abstract."
+                _TRY_FIRE_DREAM_SYSTEM_PROMPT_SEGMENTS[0]
+                + self.persona_name
+                + _TRY_FIRE_DREAM_SYSTEM_PROMPT_SEGMENTS[1]
             ),
             # lookback_hours=100000 ≈ "any conversation memory ever" — heartbeat
             # picks dream seeds by importance, not recency.
@@ -959,15 +970,13 @@ class HeartbeatEngine:
         from brain.memory.store import Memory
 
         provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
-        system = (
-            f"You are {self.persona_name}. You just finished a background "
-            "heartbeat cycle — decay applied, memory graph tended. Reflect in "
-            "first person, one short sentence, starting with 'HEARTBEAT: '."
-        )
+        sys_seg = _EMIT_HEARTBEAT_SYSTEM_SEGMENTS
+        system = sys_seg[0] + self.persona_name + sys_seg[1]
+        user_seg = _EMIT_HEARTBEAT_USER_SEGMENTS
         user = (
-            f"elapsed={elapsed_seconds / 3600:.1f}h, "
-            f"memories_decayed={memories_decayed}, edges_pruned={edges_pruned}, "
-            f"dream_fired={'yes' if dream_id else 'no'}"
+            user_seg[0] + f"{elapsed_seconds / 3600:.1f}" + user_seg[1]
+            + str(memories_decayed) + user_seg[2] + str(edges_pruned) + user_seg[3]
+            + ("yes" if dream_id else "no")
         )
         raw = provider.generate(user, system=system)
         text = raw if raw.startswith("HEARTBEAT:") else f"HEARTBEAT: {raw}"

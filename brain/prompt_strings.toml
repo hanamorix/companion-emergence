@@ -405,6 +405,30 @@ research_system_prompt_segments = [
   '.',
 ]
 
+[engines.heartbeat]
+# _try_fire_dream's local persona_system_prompt segments, in order,
+# reassembled around 1 var: self.persona_name -- seg[0] + persona_name + seg[1].
+try_fire_dream_system_prompt_segments = [
+  '''You are ''',
+  '''. You just woke from a dream about interconnected memories. Reflect in first person, 2-3 sentences, starting with 'DREAM: '. Be honest and specific, not abstract.''',
+]
+# _emit_heartbeat_memory's local system segments, in order, reassembled
+# around 1 var: self.persona_name -- seg[0] + persona_name + seg[1].
+emit_heartbeat_system_segments = [
+  '''You are ''',
+  '''. You just finished a background heartbeat cycle — decay applied, memory graph tended. Reflect in first person, one short sentence, starting with 'HEARTBEAT: '.''',
+]
+# _emit_heartbeat_memory's local user segments, in order, reassembled
+# around 4 vars: f"{elapsed_seconds / 3600:.1f}", memories_decayed,
+# edges_pruned, ("yes" if dream_id else "no") -- seg[0] + elapsed_h + seg[1]
+# + memories_decayed + seg[2] + edges_pruned + seg[3] + dream_fired.
+emit_heartbeat_user_segments = [
+  '''elapsed=''',
+  '''h, memories_decayed=''',
+  ''', edges_pruned=''',
+  ''', dream_fired=''',
+]
+
 [engines.interest_sweep]
 system = '''You maintain a companion's interest list. Given her current interests and a
 sample of her recent lived life (conversations, dreams, inner monologue),
