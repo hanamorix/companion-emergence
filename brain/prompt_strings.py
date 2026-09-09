@@ -113,6 +113,48 @@ def register(key: str) -> str:
     return get(key)
 
 
+def get_segments(key: str) -> list[str]:
+    """Return the list-of-strings value at dotted *key*.
+
+    For a straight-line interpolation (``"literal" + var + "literal"`` —
+    f-string / concat / ``.format`` with no branching or looping that
+    changes which literal text appears), the fixed literal SEGMENTS are
+    stored here as an array; the call site reassembles
+    ``seg[0] + var_1 + seg[1] + var_2 + ... + seg[n]`` with the same
+    variables, in the same order, the original expression interpolated.
+
+    Missing key, wrong type (not a list, or containing a non-string
+    element), or unreadable/malformed file all raise PromptStringError —
+    a hard error, by design (no code fallback; see module docstring).
+    """
+    with _lock:
+        data = _load_locked()
+    node: Any = data
+    consumed: list[str] = []
+    for part in key.split("."):
+        consumed.append(part)
+        if not isinstance(node, dict) or part not in node:
+            raise PromptStringError(
+                f"prompt_strings: missing key {'.'.join(consumed)!r} "
+                f"(looking up {key!r} in {_file_path()})"
+            )
+        node = node[part]
+    if not isinstance(node, list) or not all(isinstance(x, str) for x in node):
+        raise PromptStringError(
+            f"prompt_strings: key {key!r} is not a list of strings (got {type(node).__name__})"
+        )
+    return node
+
+
+def register_segments(key: str) -> list[str]:
+    """Record that *key* is used by a call site, and return its resolved
+    segment list immediately — the ``get_segments`` counterpart to
+    ``register``, same fail-at-import-time rationale."""
+    with _lock:
+        _registry.add(key)
+    return get_segments(key)
+
+
 def _reset_for_tests() -> None:
     global _cache, _cache_mtime
     with _lock:
