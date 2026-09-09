@@ -98,7 +98,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
@@ -350,10 +350,7 @@ def run_folded(
             with ExitStack() as stack:
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
-                embeddings = EmbeddingCache(
-                    persona_dir / "embeddings.db",
-                    FakeEmbeddingProvider(dim=256),
-                )
+                embeddings = build_embedding_cache(persona_dir)
                 stack.callback(embeddings.close)
 
                 reports = snapshot_stale_sessions(
@@ -1713,10 +1710,7 @@ def _run_narrative_memory_pass(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings_cache = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings_cache = build_embedding_cache(persona_dir)
         stack.callback(embeddings_cache.close)
 
         # FeltTime read — get_state() is cheap, doesn't tick.
@@ -1820,10 +1814,7 @@ def _run_compaction_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
 
         for session_id in list_active_sessions(persona_dir):
@@ -1873,10 +1864,7 @@ def _run_finalize_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
 
         reports = finalize_stale_sessions(

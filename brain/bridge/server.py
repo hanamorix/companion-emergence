@@ -73,7 +73,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
@@ -483,10 +483,7 @@ def _close_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return close_session(
             persona_dir,
@@ -518,10 +515,7 @@ def _snapshot_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return extract_session_snapshot(
             persona_dir,
@@ -669,10 +663,7 @@ def _drain_sessions_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return snapshot_stale_sessions(
             persona_dir,
@@ -1336,9 +1327,7 @@ def build_app(
                     stack.callback(store.close)
                     hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
                     stack.callback(hebbian.close)
-                    embeddings = EmbeddingCache(
-                        s.persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256)
-                    )
+                    embeddings = build_embedding_cache(s.persona_dir)
                     stack.callback(embeddings.close)
                     new_sid = perform_rollover(
                         s.persona_dir, stale_sid, s.persona,
