@@ -467,7 +467,7 @@ def test_store_list_active_since_none_cursor_returns_from_beginning(
 def test_store_list_active_since_excludes_at_or_before_cursor(
     store: MemoryStore,
 ) -> None:
-    """Only rows strictly AFTER cursor_iso are returned."""
+    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
     a = _mem("a")
     a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
     b = _mem("b")
@@ -478,9 +478,41 @@ def test_store_list_active_since_excludes_at_or_before_cursor(
     store.create(b)
     store.create(c)
 
-    results = store.list_active_since(b.created_at.isoformat(), limit=10)
+    results = store.list_active_since((b.created_at.isoformat(), b.id), limit=10)
 
     assert [m.id for m in results] == [c.id]
+
+
+def test_store_list_active_since_tie_inclusive_on_shared_created_at(
+    store: MemoryStore,
+) -> None:
+    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
+    sharing that EXACT created_at, provided its id sorts after the cursor's.
+
+    Regression for the keyset-pagination fix: the old cursor was a bare
+    `created_at > ?` filter, so pinning it at the created_at of a row that
+    shared its timestamp with siblings made every sibling but the pinned one
+    permanently invisible to every future call — exactly the shape produced
+    by a bulk migrator import (brain/migrator/emergence_kit.py) where many
+    rows commonly share a second-granularity created_at.
+    """
+    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    first = _mem("first")
+    first.created_at = shared_ts
+    second = _mem("second")
+    second.created_at = shared_ts
+    # Force a deterministic id ordering regardless of uuid4 randomness, so
+    # the test asserts the intended tie-break rather than depending on luck.
+    first.id = "aaaa0000-0000-0000-0000-000000000000"
+    second.id = "bbbb0000-0000-0000-0000-000000000000"
+    store.create(first)
+    store.create(second)
+
+    # Pin the cursor exactly at `first`'s (created_at, id) — as
+    # embedding_backfill does after processing `first`.
+    results = store.list_active_since((shared_ts.isoformat(), first.id), limit=10)
+
+    assert [m.id for m in results] == [second.id]
 
 
 def test_store_list_active_since_respects_limit(store: MemoryStore) -> None:

@@ -891,25 +891,47 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
-    def list_active_since(self, cursor_iso: str | None, *, limit: int) -> list[Memory]:
-        """Return up to `limit` active memories with created_at > cursor_iso,
-        ordered ASCENDING by created_at (oldest-of-the-remainder first).
+    def list_active_since(
+        self, cursor: tuple[str, str] | None, *, limit: int
+    ) -> list[Memory]:
+        """Return up to `limit` active memories strictly after `cursor`,
+        ordered ASCENDING by (created_at, id) (oldest-of-the-remainder
+        first).
 
-        `cursor_iso=None` starts from the beginning of history. A bounded,
-        cursor-paged sibling of `list_active()` for callers (the embedding
-        backfill, brain/memory/embedding_backfill.py) that walk the WHOLE
-        corpus a little at a time across many calls rather than loading it
-        all at once — same `active = 1` filter as `list_active()`.
+        `cursor` is `(created_at_iso, id)` of the last row already
+        processed, or `None` to start from the beginning of history. Uses a
+        composite keyset comparison — `created_at > ts OR (created_at = ts
+        AND id > id)` — rather than filtering on `created_at` alone, so that
+        multiple rows sharing an IDENTICAL `created_at` (common after a bulk
+        migrator import — see `brain/migrator/emergence_kit.py` — since
+        `brain/migrator/transform.py` derives `created_at` from the source
+        export's own timestamp string) are still individually reachable: a
+        strict `created_at > ts` filter would make every row but the last
+        one at a shared timestamp permanently invisible to a caller that
+        pins its cursor at that timestamp (the embedding backfill did
+        exactly this — see brain/memory/embedding_backfill.py). `id` is a
+        UUID4 string (TEXT PRIMARY KEY); the comparison is a plain
+        lexicographic tiebreak, not creation order — it only needs to be a
+        stable TOTAL order so no row at a shared timestamp is skipped or
+        revisited, not a meaningful one. A bounded, cursor-paged sibling of
+        `list_active()` for callers (the embedding backfill) that walk the
+        WHOLE corpus a little at a time across many calls rather than
+        loading it all at once — same `active = 1` filter as `list_active()`.
         """
-        if cursor_iso is None:
-            sql = "SELECT * FROM memories WHERE active = 1 ORDER BY created_at ASC LIMIT ?"
+        if cursor is None:
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
             params: list[Any] = [limit]
         else:
+            cursor_ts, cursor_id = cursor
             sql = (
-                "SELECT * FROM memories WHERE active = 1 AND created_at > ? "
-                "ORDER BY created_at ASC LIMIT ?"
+                "SELECT * FROM memories WHERE active = 1 AND "
+                "(created_at > ? OR (created_at = ? AND id > ?)) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
             )
-            params = [cursor_iso, limit]
+            params = [cursor_ts, cursor_ts, cursor_id, limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
