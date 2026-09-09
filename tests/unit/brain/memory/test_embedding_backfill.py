@@ -9,16 +9,19 @@ in-memory db would not survive that.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.memory.embedding_backfill import (
     DEFAULT_SCAN_CAP,
     MIN_CHARS_TO_EMBED,
+    _load_cursor,
     run_embedding_backfill_tick,
 )
 from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider, FakeEmbeddingProvider
 from brain.memory.store import Memory, MemoryStore
+from brain.paths import cadence_state_path
 
 
 def _mem(content: str, *, created_at: datetime) -> Memory:
@@ -473,3 +476,88 @@ def test_model_swap_reopens_the_full_backlog(tmp_path: Path) -> None:
     cache_new.close()
 
     assert result.embedded == 4  # full re-embed under the new model_id, cursor ignored
+
+
+# ---------------------------------------------------------------------------
+# Old-format (pre-keyset, bare-timestamp) cursor migration
+# ---------------------------------------------------------------------------
+
+
+def test_old_bare_timestamp_cursor_resets_to_none_and_rescans_idempotently(
+    tmp_path: Path,
+) -> None:
+    """A cursor file written by a pre-keyset build of this module stores
+    ``cursor`` as a bare ISO-timestamp STRING (``{"model_id": ..., "cursor":
+    "2020-01-03T00:00:00+00:00"}``), not the current ``{"created_at", "id"}``
+    dict. See the module docstring / ``_load_cursor``: that old shape is
+    deliberately NOT half-interpreted (e.g. paired with a sentinel id) -- it
+    is treated as unparseable and reset to ``None``, reopening the whole
+    backlog for a full rescan. This is a manually-reviewed path with no
+    regression coverage before this test."""
+    _seed(tmp_path, 5)
+
+    # Discover the real model_id the way the module itself would, then hand-
+    # write an old-format cursor file under the SAME model_id (a mismatched
+    # model_id would reset to None for a different reason -- the model-swap
+    # path already covered above -- and wouldn't prove THIS branch fires).
+    probe_cache = _open_cache(tmp_path)
+    model_id = probe_cache.model_id
+    probe_cache.close()
+
+    old_format_payload = {
+        "model_id": model_id,
+        "cursor": "2020-01-03T00:00:00+00:00",  # bare string, not a dict
+    }
+    cursor_path = cadence_state_path(tmp_path, "embedding_backfill_cursor.json")
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    cursor_path.write_text(json.dumps(old_format_payload), encoding="utf-8")
+
+    # Sanity check (not the acceptance criterion itself): confirm this old
+    # shape actually exercises the old-format branch of _load_cursor -- i.e.
+    # it is NOT silently accepted as if it were the new {"created_at", "id"}
+    # dict form. If this assertion ever failed, the test below would be
+    # exercising the wrong code path.
+    assert _load_cursor(tmp_path, model_id) is None
+
+    # (a) Reset to None cleanly: a tick against this file must not crash, and
+    # must behave exactly like a fresh/no-cursor start -- scanning from the
+    # top rather than from (or after) "2020-01-03".
+    store = _open_store(tmp_path)
+    cache = _open_cache(tmp_path)
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, cache, batch_size=10, scan_cap=10)
+    finally:
+        store.close()
+        cache.close()
+
+    assert result.scanned == 5  # full rescan from the top, not from "2020-01-03"
+    assert result.errors == 0
+    assert result.embedded == 5
+
+    # (b) Idempotent rescan: nothing skipped, nothing double-counted -- all 5
+    # rows end up embedded exactly once, including the ones with a
+    # created_at BEFORE the stale old-format cursor's timestamp (rows that a
+    # half-interpreted cursor could have wrongly treated as "already past").
+    final_cache = _open_cache(tmp_path)
+    assert final_cache.count() == 5
+    check_store = _open_store(tmp_path)
+    try:
+        for m in check_store.list_active():
+            assert final_cache.has(m.content) is True
+    finally:
+        check_store.close()
+    final_cache.close()
+
+    # A second tick confirms the rescan didn't leave a corrupt/odd cursor
+    # behind either: fully caught up, no further work, no errors.
+    store2 = _open_store(tmp_path)
+    cache2 = _open_cache(tmp_path)
+    try:
+        result2 = run_embedding_backfill_tick(tmp_path, store2, cache2, batch_size=10, scan_cap=10)
+    finally:
+        store2.close()
+        cache2.close()
+
+    assert result2.embedded == 0
+    assert result2.scanned == 0  # cursor now resolved past everything -- no candidates left
+    assert result2.errors == 0
