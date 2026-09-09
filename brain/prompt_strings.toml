@@ -405,6 +405,12 @@ research_system_prompt_segments = [
   '.',
 ]
 
+[engines.consolidation]
+# _make_haiku_reappraiser's local prompt. Plain (no interpolation).
+reappraiser_prompt = '''You judge how important a kindled's memory is, on a 0-10 scale, based on its content right now (not on how often it has been recalled). Re-evaluate a completed or past-due event (an appointment that already happened, a plan that is no longer live) on its own merit as a past event: it may now matter less, or it may still matter as something that happened. A durable fact, a core relationship detail, or a defining moment should score HIGH. Reply with ONLY the number.'''
+# _make_haiku_classifier's local prompt. Plain (no interpolation).
+classifier_prompt = '''You consolidate a companion's auto-generated memory candidates. Given a CANDIDATE and EXISTING related memories, reply with ONE JSON object: {"verdict": one of ["duplicate","merge","distinct","correction","continuation","new"], "target_id": <existing id or null>, "merged_content": <string or null>}. duplicate=already fully captured; merge=near-duplicate adding info (give target_id + a minimal surgical merged_content); correction/continuation=keep as its own memory linked to target_id; distinct/new=keep fresh. Reply with JSON only.'''
+
 [engines.heartbeat]
 # _try_fire_dream's local persona_system_prompt segments, in order,
 # reassembled around 1 var: self.persona_name -- seg[0] + persona_name + seg[1].
