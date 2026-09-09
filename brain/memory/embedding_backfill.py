@@ -32,6 +32,19 @@ row is skipped. The cursor resets automatically on a model swap (its
 ``model_id`` no longer matches the cache's), so a new model reopens the
 whole backlog rather than silently under-covering it.
 
+The cursor is a COMPOSITE ``(created_at, id)`` keyset position, not a bare
+timestamp — see ``MemoryStore.list_active_since``. A bare-timestamp cursor
+made any row sharing its exact ``created_at`` with the pinned row permanently
+unreachable (bulk migrator imports routinely produce duplicate/second-
+granularity timestamps — ``brain/migrator/emergence_kit.py`` via
+``brain/migrator/transform.py``'s ``_coerce_utc``); pairing the timestamp
+with the row's own ``id`` gives every row a distinct position in the scan
+order, so a shared timestamp can never hide a row from the backfill. A
+cursor file written before this change is timestamp-only and is treated as
+unparseable — see ``_load_cursor`` — which resets to the top of history
+rather than guessing; safe and cheap, since a rescan only re-confirms rows
+already in ``embeddings.db`` via ``EmbeddingCache.has()``.
+
 Stays off the message hot path: ``run_embedding_backfill_tick`` is only
 ever called from the supervisor's own per-tick maintenance block
 (``brain/bridge/supervisor.py``), never from a chat-turn code path — no
@@ -84,11 +97,22 @@ class BackfillTickResult:
     errors: int  # embed attempts that raised (left in the backlog for retry)
 
 
-def _load_cursor(persona_dir, current_model_id: str) -> str | None:  # noqa: ANN001
-    """Best-effort cursor read. Missing/corrupt/model-mismatched -> None
-    (start of history) — fail toward re-scanning, never toward silently
-    skipping a row. See module docstring: the cursor is an optimization,
-    not the correctness mechanism."""
+def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None:  # noqa: ANN001
+    """Best-effort cursor read. Missing/corrupt/model-mismatched/old-format
+    -> None (start of history) — fail toward re-scanning, never toward
+    silently skipping a row. See module docstring: the cursor is an
+    optimization, not the correctness mechanism.
+
+    The persisted cursor is the COMPOSITE ``{"created_at": ..., "id": ...}``
+    form (see ``MemoryStore.list_active_since``). A cursor file written by a
+    pre-keyset build of this module is timestamp-only (a bare string) — that
+    old format is deliberately NOT half-interpreted (e.g. paired with an
+    empty/sentinel id, which would silently reintroduce the same-timestamp
+    blind spot this format exists to close); it is treated exactly like any
+    other unparseable cursor and reset to ``None``, which just rescans from
+    the top. Safe and cheap: ``EmbeddingCache.has()``/``get_or_compute`` are
+    idempotent, so re-scanning only re-confirms rows already embedded.
+    """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -102,16 +126,32 @@ def _load_cursor(persona_dir, current_model_id: str) -> str | None:  # noqa: ANN
         # new model_id, since embedding_cache rows are scoped to model_id.
         return None
     cursor = raw.get("cursor")
-    return cursor if isinstance(cursor, str) and cursor else None
+    if not isinstance(cursor, dict):
+        # Includes the pre-keyset bare-string format, and None/missing.
+        return None
+    created_at = cursor.get("created_at")
+    row_id = cursor.get("id")
+    if not isinstance(created_at, str) or not created_at:
+        return None
+    if not isinstance(row_id, str) or not row_id:
+        return None
+    return (created_at, row_id)
 
 
-def _save_cursor(persona_dir, current_model_id: str, cursor: str | None) -> None:  # noqa: ANN001
+def _save_cursor(
+    persona_dir,  # noqa: ANN001
+    current_model_id: str,
+    cursor: tuple[str, str] | None,
+) -> None:
     """Best-effort cursor write (temp file + rename). Failure is swallowed —
     mirrors persisted_cadence.save_cadence's posture: a failed save only
     means the NEXT tick re-scans a bit more than necessary, never that a
     row goes unembedded."""
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
-    payload = {"model_id": current_model_id, "cursor": cursor}
+    cursor_payload = (
+        {"created_at": cursor[0], "id": cursor[1]} if cursor is not None else None
+    )
+    payload = {"model_id": current_model_id, "cursor": cursor_payload}
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,10 +183,18 @@ def run_embedding_backfill_tick(
     (possibly killed) tick, or by the ingest pipeline's own embed-on-write
     side effect, is simply skipped here, never re-embedded or duplicated.
 
-    Fault-isolated: an embed failure (e.g. a transient provider error) is
-    logged and the tick stops advancing there — the persisted cursor is
-    pinned just before the failing row, so THAT row is retried first on the
-    next tick rather than being silently skipped forever. Rows already
+    Fault-isolated WITHOUT starving later rows: a per-row failure (cache
+    lookup or embed compute — e.g. a transient provider error, or a row that
+    permanently trips a real embedding-runtime limit) is logged and the tick
+    CONTINUES to the next candidate rather than stopping there. The
+    persisted cursor still only advances up to the position just BEFORE the
+    EARLIEST failed row this tick — even if later rows in the same batch
+    embed successfully — so that row is retried first on the next tick
+    (transient failures get their retry). But because scanning does not stop
+    at the first failure, a row that fails on EVERY attempt (a permanent
+    failure) never blocks the rows after it from being embedded — it simply
+    never lets the cursor advance past itself, and is re-examined (and
+    re-skipped-with-a-warning) every tick indefinitely. Rows already
     resolved earlier in the same tick (embedded or found already-cached)
     keep their progress either way, since `has()` reflects them regardless
     of where the cursor sits.
@@ -161,13 +209,19 @@ def run_embedding_backfill_tick(
     skipped_short = 0
     errors = 0
     resolved_up_to = cursor  # last row the cursor can safely advance past
+    # Once a row fails, resolved_up_to must never advance again THIS tick —
+    # a later success at a higher position must not skip the persisted
+    # cursor past the earlier, still-unresolved failure.
+    failed_this_tick = False
 
     for memory in candidates:
         scanned += 1
+        row_cursor = (memory.created_at.isoformat(), memory.id)
 
         if len(memory.content) < MIN_CHARS_TO_EMBED:
             skipped_short += 1
-            resolved_up_to = memory.created_at.isoformat()
+            if not failed_this_tick:
+                resolved_up_to = row_cursor
             continue
 
         try:
@@ -177,16 +231,19 @@ def run_embedding_backfill_tick(
                 "embedding_backfill: cache lookup failed for memory %s: %s", memory.id, exc
             )
             errors += 1
-            break  # stop here this tick; cursor stays pinned before this row
+            failed_this_tick = True
+            continue  # keep scanning — a later row must not be starved
 
         if cached:
             already_cached += 1
-            resolved_up_to = memory.created_at.isoformat()
+            if not failed_this_tick:
+                resolved_up_to = row_cursor
             continue
 
         if embedded >= batch_size:
             # Batch budget spent — leave this (and anything after it) for
-            # next tick. Cursor stays pinned before this row.
+            # next tick. This is ordinary pacing, not a failure, so it's a
+            # clean stop rather than a continue.
             break
 
         try:
@@ -196,10 +253,12 @@ def run_embedding_backfill_tick(
                 "embedding_backfill: embed failed for memory %s: %s", memory.id, exc
             )
             errors += 1
-            break  # stop here this tick; cursor stays pinned before this row
+            failed_this_tick = True
+            continue  # keep scanning — a later row must not be starved
 
         embedded += 1
-        resolved_up_to = memory.created_at.isoformat()
+        if not failed_this_tick:
+            resolved_up_to = row_cursor
 
     _save_cursor(persona_dir, model_id, resolved_up_to)
 

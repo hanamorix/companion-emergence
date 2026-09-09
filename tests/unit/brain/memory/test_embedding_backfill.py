@@ -234,10 +234,69 @@ def test_kill_and_rerun_resumes_without_dupes(tmp_path: Path) -> None:
     final_cache.close()
 
 
-def test_provider_failure_does_not_lose_progress_or_crash(tmp_path: Path) -> None:
-    """A raising provider stops the tick early (fault-isolated) without
-    losing already-embedded rows or crashing the caller; the failing row is
-    retried on the next tick."""
+# ---------------------------------------------------------------------------
+# Keyset pagination / tied created_at — the DEFECT 1 regression
+# ---------------------------------------------------------------------------
+
+
+def test_tied_created_at_row_is_reachable_and_gets_embedded_across_ticks(
+    tmp_path: Path,
+) -> None:
+    """Mirrors the red-team repro directly: 3 memories share an IDENTICAL
+    created_at (the shape a bulk migrator import produces — see
+    brain/migrator/emergence_kit.py). Under the old bare-timestamp cursor, a
+    tick that embedded 2 of the 3 pinned the cursor at their shared
+    created_at, and `list_active_since(cursor)` then returned ZERO rows on
+    every future tick — the 3rd memory was permanently unreachable. With the
+    (created_at, id) keyset cursor, the 3rd memory must still be embedded."""
+    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    store = _open_store(tmp_path)
+    made = []
+    for i, suffix in enumerate(("aaaa", "bbbb", "cccc")):
+        m = _mem(f"memory content long enough number {i}", created_at=shared_ts)
+        m.id = f"{suffix}0000-0000-0000-0000-000000000000"
+        store.create(m)
+        made.append(m)
+    store.close()
+
+    # Tick 1: batch_size=2 processes the first 2 (by id, since created_at
+    # ties) and pins the cursor at the shared timestamp + the 2nd row's id.
+    store = _open_store(tmp_path)
+    cache = _open_cache(tmp_path)
+    result1 = run_embedding_backfill_tick(tmp_path, store, cache, batch_size=2, scan_cap=10)
+    store.close()
+    cache.close()
+    assert result1.embedded == 2
+
+    cache_check = _open_cache(tmp_path)
+    assert cache_check.has(made[0].content) is True
+    assert cache_check.has(made[1].content) is True
+    assert cache_check.has(made[2].content) is False  # not embedded yet
+    cache_check.close()
+
+    # Tick 2: the 3rd memory — sharing the exact created_at with the row the
+    # cursor is pinned at — must still be reachable and get embedded. Under
+    # the old strict `created_at > cursor` bug this tick would scan 0 rows.
+    store = _open_store(tmp_path)
+    cache = _open_cache(tmp_path)
+    result2 = run_embedding_backfill_tick(tmp_path, store, cache, batch_size=2, scan_cap=10)
+    store.close()
+    cache.close()
+
+    assert result2.scanned == 1  # the 3rd row IS reachable, not silently skipped
+    assert result2.embedded == 1
+
+    final_cache = _open_cache(tmp_path)
+    assert final_cache.has(made[2].content) is True
+    assert final_cache.count() == 3
+    final_cache.close()
+
+
+def test_provider_failure_does_not_lose_progress_or_starve_later_rows(tmp_path: Path) -> None:
+    """A raising provider is fault-isolated to the failing row: the tick
+    keeps scanning past it (no starvation of later rows), while the
+    persisted cursor freezes just before the failing row so it's retried
+    first on the next tick."""
     _seed(tmp_path, 3)
 
     class _FlakyProvider(EmbeddingProvider):
@@ -265,17 +324,18 @@ def test_provider_failure_does_not_lose_progress_or_crash(tmp_path: Path) -> Non
     store.close()
     cache.close()
 
-    assert result.embedded == 1  # the first row succeeded before the failure
     assert result.errors == 1
-    assert result.scanned == 2  # stopped at the failing row, never reached the third
+    assert result.scanned == 3  # keeps scanning past the failing (2nd) row
+    assert result.embedded == 2  # 1st and 3rd rows succeed despite the 2nd failing
     # Same-model retry semantics (does the failed row get picked up again
-    # without re-embedding the one that already succeeded?) are covered by
+    # without re-embedding the ones that already succeeded?) are covered by
     # test_same_model_retry_after_failure_reembeds_only_the_failed_row below.
 
 
 def test_same_model_retry_after_failure_reembeds_only_the_failed_row(tmp_path: Path) -> None:
     """A same-model second tick after a mid-batch failure only needs to
-    embed the row(s) still missing — already-embedded ones are cache hits."""
+    embed the row(s) still missing — already-embedded ones (including rows
+    AFTER the failed one, which the tick does not starve) are cache hits."""
     _seed(tmp_path, 3)
 
     class _FailsOnce(EmbeddingProvider):
@@ -304,7 +364,7 @@ def test_same_model_retry_after_failure_reembeds_only_the_failed_row(tmp_path: P
     store.close()
     cache.close()
     assert result1.errors == 1
-    assert result1.embedded == 1
+    assert result1.embedded == 2  # "number 0" and "number 2"; "number 1" failed
 
     # Reopen with a provider under the SAME model_id that no longer fails.
     class _NowWorks(EmbeddingProvider):
@@ -326,11 +386,64 @@ def test_same_model_retry_after_failure_reembeds_only_the_failed_row(tmp_path: P
     cache2.close()
 
     assert result2.errors == 0
-    assert result2.embedded == 2  # the previously-failed row + the third row
+    assert result2.embedded == 1  # only the previously-failed row; the third
+    # row was already embedded in tick 1 despite the failure ahead of it.
 
     final_cache = EmbeddingCache(tmp_path / "embeddings.db", _NowWorks())
     assert final_cache.count() == 3
     final_cache.close()
+
+
+def test_permanently_failing_row_does_not_starve_rows_after_it(tmp_path: Path) -> None:
+    """A row that fails on EVERY attempt (a permanent failure, e.g. content
+    that trips a real runtime/ONNX limit) must not block rows after it from
+    being embedded — neither within the same tick nor across many ticks.
+    Only the permanently-failing row itself stays stuck."""
+    _seed(tmp_path, 5)
+
+    class _AlwaysFailsOnOne(EmbeddingProvider):
+        """Every call for content ending "number 1" raises; everything else
+        succeeds, every time — a permanent, not transient, failure."""
+
+        def __init__(self) -> None:
+            self._model_id = "always-fails-test"
+
+        def embed(self, text: str):  # noqa: ANN201
+            if text.endswith("number 1"):
+                raise RuntimeError("simulated PERMANENT provider failure")
+            import numpy as np
+
+            return np.ones(8, dtype="float32")
+
+        def embedding_dim(self) -> int:
+            return 8
+
+        def model_id(self) -> str:
+            return self._model_id
+
+    provider = _AlwaysFailsOnOne()
+
+    total_embedded = 0
+    total_errors = 0
+    for _ in range(3):  # several ticks — the permanent failure never clears
+        store = _open_store(tmp_path)
+        cache = EmbeddingCache(tmp_path / "embeddings.db", provider)
+        result = run_embedding_backfill_tick(tmp_path, store, cache, batch_size=10, scan_cap=10)
+        store.close()
+        cache.close()
+        total_embedded += result.embedded
+        total_errors += result.errors
+
+    # The 4 embeddable rows ("number 0", "number 2", "number 3", "number 4")
+    # all get embedded — across ticks, not starved by "number 1" ahead of
+    # some of them in scan order.
+    final_cache = EmbeddingCache(tmp_path / "embeddings.db", provider)
+    assert final_cache.count() == 4
+    final_cache.close()
+    assert total_embedded == 4
+    # The permanent failure is retried every tick (never silently dropped),
+    # so it contributes an error each time.
+    assert total_errors == 3
 
 
 # ---------------------------------------------------------------------------
