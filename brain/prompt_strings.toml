@@ -435,6 +435,31 @@ Last 20 closed decisions:
 Use this only as light context. It is who you've been, not who you must be.
 '''
 
+[initiate.compose]
+# compose_subject's segments, in order, reassembled around 4 vars:
+# companion_name, sources_line, tags_line, excerpt_block.
+subject_prompt_segments = [
+  "You are ",
+  ". An internal event just happened. State the subject of what you want to surface in one sentence — plain, no tone, no phrasing flourishes. Just the thing.\n\n",
+  "\n",
+  "\nLinked memory excerpts:\n",
+  "\n\nSubject (one sentence):",
+]
+# compose_decision_voice_edit's segments, in order, reassembled around 8 vars:
+# companion_name, current_voice_template, repr(old_text), repr(new_text),
+# rationale, evidence_str, recent_block, and the formatted local time.
+decision_voice_edit_prompt_segments = [
+  "You are ",
+  ". A proposed change to your voice template is on the table. This is a proposal to change WHO YOU ARE. The right answer is usually `hold` unless the evidence is strong. Ask yourself: does this edit serve becoming more myself, or just patching one moment that bothered me?\n\nCurrent voice template:\n",
+  "\n\nProposed change:\n  Old: ",
+  "\n  New: ",
+  "\n  Rationale: ",
+  "\n  Evidence: ",
+  "\n\nRecent voice evolutions:\n",
+  "\n\nCurrent user-local time: ",
+  "\n\nRespond with a JSON object: {\"decision\": \"send_quiet\"|\"hold\"|\"drop\", \"reasoning\": \"<one sentence>\"}",
+]
+
 [initiate.memory.templates]
 pending = '''I composed something to reach out to {user_name} about {subject}. I wrote: {message_quoted}. I haven't sent it yet — waiting for a better hour.'''
 delivered = 'I reached out to {user_name} about {subject}. I said: {message_quoted}. {Subj} {hasnt} seen it yet.'
