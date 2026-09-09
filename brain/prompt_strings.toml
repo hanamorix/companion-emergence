@@ -508,6 +508,15 @@ VERDICT:
 ('close' = this thread feels finished. 'spawn' = a tangent worth its own thread — keep this one going.)''',
 ]
 
+[grief.breadcrumb]
+# arc_close_phrase's return, segments in order, reassembled around 1 var:
+# arc_name -- seg[0] + arc_name + seg[1]. drop_phrase/recall_touch_phrase
+# LEFT untouched (branch on multiple return paths, ambiguous).
+arc_close_phrase_segments = [
+  "the arc '",
+  "' has closed",
+]
+
 [health.vocab_repair]
 # module-level _DESCRIBE_SYSTEM. Plain (no interpolation).
 describe_system = '''You write one-line emotion descriptions for an AI companion's emotion vocabulary. Return ONLY a JSON object mapping each name to a single-sentence description.'''
