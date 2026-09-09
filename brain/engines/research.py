@@ -42,6 +42,14 @@ _TOPIC_OVERLAP_SYSTEM = prompt_strings.register("engines.research.topic_overlap_
 # Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 1).
 _SELECT_SYSTEM = prompt_strings.register("engines.research.select_system")
 
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 2c).
+_TOPIC_OVERLAP_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "engines.research.topic_overlap_prompt_segments"
+)
+_RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "engines.research.render_system_prompt_segments"
+)
+
 
 def _compute_topic_overlap_via_haiku(
     *,
@@ -53,14 +61,10 @@ def _compute_topic_overlap_via_haiku(
 ) -> float:
     """Score how relevant a matured research thread is to recent conversation."""
     system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
+    seg = _TOPIC_OVERLAP_PROMPT_SEGMENTS
     prompt = (
-        "=== Research thread ===\n"
-        f"Topic: {thread_topic}\n"
-        f"Summary: {thread_summary}\n\n"
-        "=== Recent conversation (last 48 hours, oldest first) ===\n"
-        f"{recent_conversation_excerpt}\n\n"
-        "=== Your task ===\n"
-        'Return: {"score": <float in [0.0, 1.0]>}'
+        seg[0] + thread_topic + seg[1] + thread_summary + seg[2]
+        + recent_conversation_excerpt + seg[3]
     )
 
     try:
@@ -523,21 +527,8 @@ class ResearchEngine:
         )
 
     def _render_system_prompt(self) -> str:
-        return (
-            f"You are {self.persona_name}, spending quiet time on a research thread "
-            "of your own. Write plain prose under exactly three markers, nothing else:\n\n"
-            "NOTES:\n"
-            "<what you found — facts with sources, reactions, opinions, lists if lists "
-            "fit the subject. Free format. Continue from your prior notes; don't repeat "
-            "what's already written there.>\n\n"
-            "MEMORY:\n"
-            f"<2-4 sentences, first person as {self.persona_name} — how this session "
-            "felt, what surprised you.>\n\n"
-            "VERDICT:\n"
-            "<one line: continue | close | spawn: <new topic>; <new topic>>\n"
-            "('close' = this thread feels finished. 'spawn' = a tangent worth its own "
-            "thread — keep this one going.)"
-        )
+        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS
+        return seg[0] + self.persona_name + seg[1] + self.persona_name + seg[2]
 
     def _render_prompt(
         self,

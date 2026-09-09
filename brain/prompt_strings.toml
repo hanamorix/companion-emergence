@@ -413,6 +413,15 @@ material but are missing from the list, and at most 3 existing interest ids
 to retire (nothing in the lived material touches them and their thread feels
 done). Be conservative — empty lists are a fine answer. Return ONLY:
 {"new": [{"topic": "...", "keywords": ["..."], "why": "..."}], "retire": ["<id>"]}'''
+# run_sweep_tick's local prompt segments, in order, reassembled around 2
+# vars: listing, _lived_sample(store) -- seg[0] + listing + seg[1] +
+# lived_sample + seg[2].
+sweep_prompt_segments = [
+  '''=== Current interests ===
+''',
+  "\n\n=== Recent lived life ===\n",
+  "\n\nReturn: {\"new\": [...], \"retire\": [...]}",
+]
 
 [engines.research]
 topic_overlap_system = '''You are a relevance scorer for an autonomous companion's research engine.
@@ -432,6 +441,35 @@ open threads. You will see up to five interests, each with your prior notes
 and related memories. Pick the ONE that genuinely pulls at you right now —
 or decline if nothing does. Return ONLY a JSON object:
 {{"choice": "<interest id>" | null, "why": "<one sentence, first person>"}}'''
+# _compute_topic_overlap_via_haiku's local prompt segments, in order,
+# reassembled around 3 vars: thread_topic, thread_summary,
+# recent_conversation_excerpt -- seg[0] + thread_topic + seg[1] +
+# thread_summary + seg[2] + recent_conversation_excerpt + seg[3].
+topic_overlap_prompt_segments = [
+  '''=== Research thread ===
+Topic: ''',
+  "\nSummary: ",
+  "\n\n=== Recent conversation (last 48 hours, oldest first) ===\n",
+  "\n\n=== Your task ===\nReturn: {\"score\": <float in [0.0, 1.0]>}",
+]
+# _render_system_prompt's return, segments in order, reassembled around 2
+# vars: self.persona_name, self.persona_name (same var, used twice) --
+# seg[0] + persona_name + seg[1] + persona_name + seg[2].
+render_system_prompt_segments = [
+  '''You are ''',
+  ''', spending quiet time on a research thread of your own. Write plain prose under exactly three markers, nothing else:
+
+NOTES:
+<what you found — facts with sources, reactions, opinions, lists if lists fit the subject. Free format. Continue from your prior notes; don't repeat what's already written there.>
+
+MEMORY:
+<2-4 sentences, first person as ''',
+  ''' — how this session felt, what surprised you.>
+
+VERDICT:
+<one line: continue | close | spawn: <new topic>; <new topic>>
+('close' = this thread feels finished. 'spawn' = a tangent worth its own thread — keep this one going.)''',
+]
 
 [ingest.emotion_backfill]
 tagger_system_prompt = 'You are an emotion-tagging assistant. Return a JSON object mapping emotion names to intensities (0–10). Omit emotions with intensity 0. Return ONLY the JSON object, no prose, no markdown fences.'

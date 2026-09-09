@@ -26,6 +26,9 @@ _CAP = 3
 # Text externalized to prompt_strings.toml [engines.interest_sweep] (issue #129 stage 1).
 _SYSTEM = prompt_strings.register("engines.interest_sweep.system")
 
+# Text externalized to prompt_strings.toml [engines.interest_sweep] (issue #129 stage 2c).
+_SWEEP_PROMPT_SEGMENTS = prompt_strings.register_segments("engines.interest_sweep.sweep_prompt_segments")
+
 
 def _lived_sample(store) -> str:
     lines: list[str] = []
@@ -63,11 +66,8 @@ def run_sweep_tick(
             f"- id={i.id} topic={i.topic!r} status={i.status} pull={i.pull_score:.1f}"
             for i in interests.interests
         ) or "(empty)"
-        prompt = (
-            f"=== Current interests ===\n{listing}\n\n"
-            f"=== Recent lived life ===\n{_lived_sample(store)}\n\n"
-            'Return: {"new": [...], "retire": [...]}'
-        )
+        seg = _SWEEP_PROMPT_SEGMENTS
+        prompt = seg[0] + listing + seg[1] + _lived_sample(store) + seg[2]
         raw = provider.generate(prompt, system=_SYSTEM)
         data = json.loads(extract_json_object(raw))
 
