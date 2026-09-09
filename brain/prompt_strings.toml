@@ -677,4 +677,9 @@ prompt_segments = [
   '. Unnamed pressure: ',
   '''. What's the (metaphorical) weather?''',
 ]
+# articulate()'s local `system` string. Plain (no interpolation). Basic
+# (double-quoted) string deliberately -- the text ends in a literal single
+# quote, which would collide with a '''-delimited literal string's closing
+# delimiter.
+system = "You are noticing how some of your feelings have been running lately compared to where they usually sit. Write one plain first-person sentence about how they've been running: present tense, directional, no judgment about whether a feeling is real or performed. Think 'curiosity's been running quieter than usual this week,' or 'warmth's been stronger than my baseline lately.'"
 

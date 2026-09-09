@@ -49,8 +49,9 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Text externalized to prompt_strings.toml [self_model.articulate] (issue #129 stage 2b).
+# Text externalized to prompt_strings.toml [self_model.articulate] (issue #129 stage 2b/2c).
 _PROMPT_SEGMENTS = prompt_strings.register_segments("self_model.articulate.prompt_segments")
+_SYSTEM = prompt_strings.register("self_model.articulate.system")
 
 _GAP_THRESHOLD: float = 0.4          # below this magnitude → skip articulation
 _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
@@ -269,14 +270,7 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     deltas_text = ", ".join(
         f"{ch}: {delta:+.2f}" for ch, delta in sorted(gap.per_channel.items())
     )
-    system = (
-        "You are noticing how some of your feelings have been running lately "
-        "compared to where they usually sit. Write one plain first-person "
-        "sentence about how they've been running: present tense, directional, no "
-        "judgment about whether a feeling is real or performed. Think "
-        "'curiosity's been running quieter than usual this week,' or "
-        "'warmth's been stronger than my baseline lately.'"
-    )
+    system = _SYSTEM
     seg = _PROMPT_SEGMENTS
     prompt = seg[0] + deltas_text + seg[1] + f"{gap.unnamed_pressure:.2f}" + seg[2]
 
