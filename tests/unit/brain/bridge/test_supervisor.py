@@ -313,6 +313,53 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
     reset_registry()
 
 
+def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
+    """Live-path proof for the Stage 2 embedding backfill wiring: a memory
+    committed straight via MemoryStore.create() (bypassing the ingest
+    pipeline's own embed-on-write, like ~11 real write sites do) gets
+    embedded by the supervisor's own per-tick block — not a mock-call
+    assertion, an actual vector landing in embeddings.db."""
+    from brain.memory.embeddings import build_embedding_cache
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)
+    store.close()
+
+    bus = _CapturingBus()
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "silence_minutes": 5.0,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    _wait_until(lambda: "supervisor_tick" in [e.get("type") for e in bus.events])
+    stop.set()
+    t.join(timeout=30.0)
+
+    cache = build_embedding_cache(persona_dir)
+    try:
+        assert cache.has(memory.content) is True
+    finally:
+        cache.close()
+
+
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     """The hourly finalize cadence at 24h silence runs, deletes the buffer
     + cursor, evicts from _SESSIONS, and publishes session_finalized."""

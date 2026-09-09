@@ -98,6 +98,9 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
+from brain.memory.embedding_backfill import (
+    run_embedding_backfill_tick as _embedding_backfill_run_tick,
+)
 from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -368,6 +371,22 @@ def run_folded(
                     older_than_seconds=silence_minutes * 60.0,
                     persona_name=persona_dir.name,
                 )
+
+                # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
+                # build) — reuses the `store`/`embeddings` handles already open
+                # for the snapshot above, so no extra connections. Runs every
+                # base tick (default 60s): internally bounded (batch_size +
+                # scan_cap), so it is cheap when caught up and never spikes
+                # CPU on a cold-start backlog. This is the primary embed-on-
+                # write mechanism for the ~11 write sites that call
+                # MemoryStore.create() directly and never touch EmbeddingCache
+                # (see brain/memory/embedding_backfill.py's module docstring)
+                # — fault-isolated so a backfill error never takes down the
+                # session-cleanup tick.
+                try:
+                    _embedding_backfill_run_tick(persona_dir, store, embeddings)
+                except Exception:
+                    logger.exception("supervisor embedding backfill tick raised")
 
             # Publish events outside the with-block — events don't need stores.
             for r in reports:
