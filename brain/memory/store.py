@@ -471,7 +471,26 @@ class MemoryStore:
         return self._db_path.parent
 
     def create(self, memory: Memory) -> str:
-        """Insert a memory. Returns the id. Raises on duplicate id."""
+        """Insert a memory. Returns the id. Raises on duplicate id.
+
+        Deliberately does NOT touch embeddings/EmbeddingCache — MemoryStore
+        has no dependency on the embeddings subsystem (~11 call sites use
+        `create()` directly: brain/tools/impls/add_memory.py,
+        crystallize_soul.py, brain/memory/pending.py, etc.). Embedding a
+        memory on write, everywhere, would mean either threading an
+        EmbeddingCache dependency through every one of those call sites, or
+        this method spawning off-thread work itself (its own new sqlite
+        connection per call, on a hot synchronous path some of those sites
+        sit on) — both more invasive and riskier than the alternative that
+        was chosen instead: the idle-chipped embedding backfill
+        (brain/memory/embedding_backfill.py), which scans `memories` every
+        supervisor tick and catches whatever `create()` didn't embed,
+        regardless of which call site wrote it. New memories are lexically
+        recallable immediately either way; they become semantically
+        recallable within one backfill tick. See that module's docstring
+        and hunts/semantic-retrieval/plan.md Part A #7 for the full
+        reasoning (Stage 2 of the local semantic-retrieval build).
+        """
         try:
             metadata_json = json.dumps(memory.metadata)
         except TypeError as exc:
