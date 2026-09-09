@@ -35,10 +35,13 @@ returns nothing, not a mix of old and new.
 Runs as a periodic BATCH pass (own persisted supervisor cadence — see
 `_run_clustering_tick` in `brain/bridge/supervisor.py`), never on the message
 hot path — same posture as Stage 2's idle-chipped embedding backfill, though
-the mechanics differ: this is a single full recompute per firing (bounded by
-`MAX_VECTORS_PER_PASS`), not a chipped per-row batch, since a from-scratch
-k-means pass needs the whole candidate pool at once to produce meaningful
-clusters.
+the mechanics differ: this is a single full recompute over the ENTIRE
+model-scoped vector set per firing (no row cap — a from-scratch k-means pass
+needs the whole candidate pool at once to produce meaningful clusters, and a
+fixed-size cap would silently and permanently starve any row embedded after
+the cap was first reached), not a chipped per-row batch. Clustering is an
+off-hot-path background job on a ~6h supervisor cadence and companion corpora
+are bounded in size, so a full recompute every pass is affordable.
 
 Graceful with sparse data: below `MIN_VECTORS_TO_CLUSTER` cached vectors, a
 pass is a clean no-op (`ClusteringPassResult.ran=False`) — no crash, no
@@ -83,13 +86,6 @@ MIN_VECTORS_TO_CLUSTER = 8
 # single pass's compute bounded even against a very large corpus.
 K_MIN = 2
 K_MAX = 50
-
-# Safety cap on how many cached vectors one pass considers, so a very large
-# corpus can't make a single background firing spike CPU/RAM unboundedly.
-# `EmbeddingCache.all_hashes_and_vectors(limit=...)` applies this as a bare
-# SQL LIMIT (arbitrary row order) — acceptable for a periodic full recompute;
-# revisit if corpora in practice exceed this before every row gets a turn.
-MAX_VECTORS_PER_PASS = 5000
 
 DEFAULT_SEED = 0
 DEFAULT_MAX_ITER = 100
@@ -311,19 +307,32 @@ class MemoryClusterStore:
         kill just redoes the whole (cheap, local, numpy-only) computation and
         writes it in one more atomic replace.
 
-        Existing `memory_clusters` rows for content NOT present in
-        `memberships` (e.g. content embedded under a different model_id, or
-        excluded by `MAX_VECTORS_PER_PASS`) are left untouched — this is a
-        targeted upsert of the rows this pass actually computed, not a
-        blanket delete-then-reinsert of the whole table. A row for content
-        THAT IS present gets its `model_id`/`cluster_id` overwritten
-        in place (`content_hash` is the PRIMARY KEY — one row per content,
-        always pointing at whichever model most recently clustered it,
-        exactly mirroring `EmbeddingCache.get_or_compute`'s own
-        INSERT-OR-REPLACE-by-content_hash behavior on a model swap): a
-        lookup still scoped to that content's PRIOR model_id then correctly
-        finds nothing, rather than a stale tag.
+        `memory_clusters` is WHOLESALE-REPLACED for `model_id`, exactly
+        mirroring `memory_cluster_centroids` below: every existing row for
+        this `model_id` is deleted, then this pass's `memberships` are
+        (re)inserted. A content_hash present in a PRIOR pass but absent from
+        `memberships` (e.g. its pool composition changed — it fell out of the
+        embedding cache via `EmbeddingCache.evict()`, or simply wasn't part
+        of this pass's candidate pool) ends up with NO row at all, not a
+        dangling one: `cluster_for()`/`cluster_tag_for_memory()` then
+        correctly return `None` for it instead of a stale `cluster_id` that
+        points at a centroid this pass just deleted. (An earlier version
+        upserted memberships without ever deleting — asymmetric against the
+        centroid table's delete-then-reinsert below — so a content_hash that
+        dropped out of the pool kept its old `cluster_id` pointing at a
+        centroid row that no longer existed.) A content_hash present in BOTH
+        the prior and current pass still gets its `model_id`/`cluster_id`
+        overwritten in place via the reinsert (`content_hash` is the PRIMARY
+        KEY — one row per content, always pointing at whichever model most
+        recently clustered it, exactly mirroring
+        `EmbeddingCache.get_or_compute`'s own INSERT-OR-REPLACE-by-
+        content_hash behavior on a model swap): a lookup still scoped to that
+        content's PRIOR model_id then correctly finds nothing, rather than a
+        stale tag.
         """
+        self._conn.execute(
+            "DELETE FROM memory_clusters WHERE model_id = ?", (model_id,)
+        )
         self._conn.executemany(
             "INSERT INTO memory_clusters (content_hash, model_id, cluster_id, updated_at) "
             "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
@@ -362,7 +371,6 @@ def run_clustering_pass(
     cluster_store: MemoryClusterStore,
     *,
     seed: int = DEFAULT_SEED,
-    max_vectors: int = MAX_VECTORS_PER_PASS,
     min_vectors: int = MIN_VECTORS_TO_CLUSTER,
 ) -> ClusteringPassResult:
     """Run one full clustering pass over `embeddings`' currently cached
@@ -373,6 +381,16 @@ def run_clustering_pass(
     from a periodic background tick (see `_run_clustering_tick` in
     `brain/bridge/supervisor.py`), never from a chat-turn code path.
 
+    Considers the ENTIRE model-scoped vector set every pass — no row cap.
+    An earlier version applied a fixed `LIMIT` (`MAX_VECTORS_PER_PASS`) with
+    no `ORDER BY`, which SQLite serves in insertion order: once a persona's
+    embedding_cache exceeded that cap, the SAME first-N-inserted rows were
+    returned every pass and every later-embedded row was silently and
+    PERMANENTLY excluded from clustering. Removed rather than replaced with a
+    rotating/sampled bound: this is an off-hot-path background job on a ~6h
+    supervisor cadence and companion corpora are bounded in size, so a full
+    recompute every pass is affordable.
+
     Sparse-data floor: fewer than `min_vectors` cached vectors -> clean no-op
     (`ClusteringPassResult(ran=False, reason="sparse-skip")`), no write, no
     crash. Idempotent: re-running with the same cached vectors + `seed`
@@ -381,7 +399,7 @@ def run_clustering_pass(
     values) — safe to call every cadence firing indefinitely.
     """
     model_id = embeddings.model_id
-    pairs = embeddings.all_hashes_and_vectors(limit=max_vectors)
+    pairs = embeddings.all_hashes_and_vectors()
     n = len(pairs)
 
     if n < min_vectors:

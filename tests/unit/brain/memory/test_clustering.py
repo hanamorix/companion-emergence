@@ -304,6 +304,94 @@ def test_replace_pass_is_atomic_a_failed_write_leaves_prior_state_intact(
         reopened.close()
 
 
+def test_replace_pass_deletes_stale_membership_when_pool_composition_changes(
+    tmp_path: Path,
+) -> None:
+    """Regression for the dangling/stale cluster_id bug: an earlier version
+    upserted `memory_clusters` rows only for content in the CURRENT pass's
+    memberships and never deleted rows for content that fell OUT of the pool
+    since the previous pass — while wholesale-replacing
+    `memory_cluster_centroids` every pass. A content_hash that dropped out
+    (e.g. evicted from the embedding cache) then kept its OLD cluster_id
+    pointing at a centroid row that no longer existed.
+
+    Runs two passes under the SAME model_id where pool composition changes
+    between them (hash-b present in pass 1, absent from pass 2) and asserts:
+    (a) hash-b's lookup returns None after pass 2, not a dangling cluster_id;
+    (b) every cluster_id returned by any lookup after pass 2 has a matching
+    live centroid row for that model_id.
+    """
+    store = MemoryClusterStore(tmp_path / "embeddings.db")
+    try:
+        # Pass 1: hash-a -> cluster 0, hash-b -> cluster 1, two centroids.
+        store.replace_pass(
+            {"hash-a": 0, "hash-b": 1},
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            model_id="m",
+        )
+        assert store.cluster_for("hash-a", model_id="m") == 0
+        assert store.cluster_for("hash-b", model_id="m") == 1
+
+        # Pass 2: hash-b has fallen out of the pool (e.g. evicted); only
+        # hash-a remains, now the sole member of the sole cluster.
+        store.replace_pass(
+            {"hash-a": 0},
+            np.array([[1.0, 0.0]]),
+            model_id="m",
+        )
+
+        # (a) The dropped hash must be genuinely absent, not dangling.
+        assert store.cluster_for("hash-b", model_id="m") is None
+
+        # (b) Every surviving lookup's cluster_id has a live centroid.
+        live_centroids = store.centroids(model_id="m")
+        for content_hash in ("hash-a", "hash-b"):
+            cid = store.cluster_for(content_hash, model_id="m")
+            if cid is not None:
+                assert cid in live_centroids
+    finally:
+        store.close()
+
+
+def test_run_clustering_pass_drops_stale_membership_for_evicted_content(
+    tmp_path: Path,
+) -> None:
+    """End-to-end version of the same regression via the real
+    embedding-cache -> clustering-pass path: content evicted from
+    `EmbeddingCache` between two passes under the same model_id must lose its
+    cluster membership entirely, never keep a stale cluster_id."""
+    db_path = tmp_path / "embeddings.db"
+    cache = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=8))
+    cluster_store = MemoryClusterStore(db_path)
+    try:
+        # Seed one more than the sparse-data floor so eviction still leaves
+        # enough vectors for pass 2 to actually run (not sparse-skip).
+        texts = _seed_embedding_cache(cache, MIN_VECTORS_TO_CLUSTER + 1)
+        result1 = run_clustering_pass(cache, cluster_store, seed=3)
+        assert result1.ran is True
+
+        evicted_text = texts[0]
+        assert cluster_store.cluster_for_content(evicted_text, model_id=cache.model_id) is not None
+        cache.evict(evicted_text)
+
+        result2 = run_clustering_pass(cache, cluster_store, seed=3)
+        assert result2.ran is True
+        assert result2.n_vectors == MIN_VECTORS_TO_CLUSTER
+
+        # The evicted content's membership must be gone, not stale.
+        assert cluster_store.cluster_for_content(evicted_text, model_id=cache.model_id) is None
+
+        # Every remaining membership under this model_id has a live centroid.
+        live_centroids = cluster_store.centroids(model_id=cache.model_id)
+        for t in texts[1:]:
+            cid = cluster_store.cluster_for_content(t, model_id=cache.model_id)
+            assert cid is not None
+            assert cid in live_centroids
+    finally:
+        cache.close()
+        cluster_store.close()
+
+
 # ---------------------------------------------------------------------------
 # run_clustering_pass — sparse-data skip + idempotency
 # ---------------------------------------------------------------------------
@@ -405,6 +493,60 @@ def test_kill_mid_pass_then_rerun_leaves_consistent_state(tmp_path: Path) -> Non
     finally:
         cache_b.close()
         cluster_store_b.close()
+
+
+def _bulk_seed_cache_directly(cache: EmbeddingCache, n: int, *, label: str) -> list[str]:
+    """Insert `n` embedding_cache rows for `cache`'s model_id via a single
+    bulk executemany, bypassing `get_or_compute`'s per-call commit — used
+    only to seed corpora too large to build one text at a time within a
+    reasonable test runtime. Vectors/hashes are computed exactly the way
+    `get_or_compute` computes them, just written in one batch."""
+    texts = [f"{label} bulk-seeded vector number {i}" for i in range(n)]
+    rows = []
+    for t in texts:
+        vec = cache._provider.embed(t).astype(np.float32)  # noqa: SLF001 — test-only bulk seed
+        rows.append((EmbeddingCache._hash(t), vec.tobytes(), vec.shape[0], cache.model_id))  # noqa: SLF001
+    cache._conn.executemany(  # noqa: SLF001
+        "INSERT OR REPLACE INTO embedding_cache (content_hash, vector, dim, model_id) "
+        "VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    cache._conn.commit()  # noqa: SLF001
+    return texts
+
+
+def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(tmp_path: Path) -> None:
+    """Regression for the fixed-window-LIMIT-with-no-ORDER-BY starvation bug:
+    the old `run_clustering_pass` ran `all_hashes_and_vectors(limit=5000)`
+    (`MAX_VECTORS_PER_PASS`) against a query with NO `ORDER BY`. SQLite serves
+    that in insertion order, so once embedding_cache exceeded 5000 rows, the
+    SAME first-5000-inserted rows were returned every single pass and every
+    LATER-embedded row was silently and PERMANENTLY excluded from clustering
+    — forever, not just until the next pass.
+
+    Seeds well past that old 5000-row boundary and confirms clustering now
+    covers the FULL model-scoped vector set: every seeded row, including ones
+    inserted long after the old cap would have been reached, ends up with a
+    cluster membership."""
+    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
+    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
+    try:
+        old_cap = 5000
+        total = old_cap + 50
+        texts = _bulk_seed_cache_directly(cache, total, label="starvation-regression")
+
+        result = run_clustering_pass(cache, cluster_store)
+
+        assert result.ran is True
+        assert result.n_vectors == total  # not silently capped at the old 5000
+        assert cluster_store.count(model_id=cache.model_id) == total
+
+        # Rows inserted well past the old fixed window must be clustered too.
+        for late_text in texts[-10:]:
+            assert cluster_store.cluster_for_content(late_text, model_id=cache.model_id) is not None
+    finally:
+        cache.close()
+        cluster_store.close()
 
 
 # ---------------------------------------------------------------------------
