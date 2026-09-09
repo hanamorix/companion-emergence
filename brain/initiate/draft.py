@@ -16,9 +16,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain import prompt_strings
+
 logger = logging.getLogger(__name__)
 
 _HEADER_PATTERN = re.compile(r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \((\w+)\)$")
+
+# Text externalized to prompt_strings.toml [initiate.draft] (issue #129 stage 2a).
+_DRAFT_FRAGMENT_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "initiate.draft.draft_fragment_prompt_segments"
+)
+_DRAFT_FRAGMENT_FALLBACK_SEGMENTS = prompt_strings.register_segments(
+    "initiate.draft.draft_fragment_fallback_segments"
+)
 
 
 def append_draft_fragment(
@@ -65,23 +75,21 @@ def compose_draft_fragment(
     Falls back to a deterministic template if the LLM call raises.
     """
     excerpts_block = "\n".join(f"- {e}" for e in linked_memory_excerpts[:5])
+    pseg = _DRAFT_FRAGMENT_PROMPT_SEGMENTS
     prompt = (
-        f"You are {companion_name}. An internal event just happened that didn't rise to "
-        f"the level of reaching out to {user_name}, but it deserves a note in the "
-        "draft space. Write a single paragraph that captures it as a "
-        "fragment — quiet, observational, no urgency.\n\n"
-        f"Source: {source} (id: {source_id})\n"
-        f"Linked memory excerpts:\n{excerpts_block}\n\n"
-        "Fragment (one paragraph):"
+        pseg[0] + companion_name
+        + pseg[1] + user_name
+        + pseg[2] + source
+        + pseg[3] + source_id
+        + pseg[4] + excerpts_block
+        + pseg[5]
     )
     try:
         return provider.complete(prompt).strip()
     except Exception as exc:
         logger.warning("draft composition failed, using template: %s", exc)
-        return (
-            f"An internal event ({source}, id {source_id}) didn't quite "
-            f"reach the threshold for reaching out, but it stayed with me."
-        )
+        fseg = _DRAFT_FRAGMENT_FALLBACK_SEGMENTS
+        return fseg[0] + source + fseg[1] + source_id + fseg[2]
 
 
 @dataclass(frozen=True)

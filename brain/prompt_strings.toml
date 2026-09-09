@@ -460,6 +460,25 @@ decision_voice_edit_prompt_segments = [
   "\n\nRespond with a JSON object: {\"decision\": \"send_quiet\"|\"hold\"|\"drop\", \"reasoning\": \"<one sentence>\"}",
 ]
 
+[initiate.draft]
+# compose_draft_fragment's prompt segments, in order, reassembled around 5
+# vars: companion_name, user_name, source, source_id, excerpts_block.
+draft_fragment_prompt_segments = [
+  "You are ",
+  ". An internal event just happened that didn't rise to the level of reaching out to ",
+  ", but it deserves a note in the draft space. Write a single paragraph that captures it as a fragment — quiet, observational, no urgency.\n\nSource: ",
+  " (id: ",
+  ")\nLinked memory excerpts:\n",
+  "\n\nFragment (one paragraph):",
+]
+# compose_draft_fragment's except-fallback segments, in order, reassembled
+# around 2 vars: source, source_id.
+draft_fragment_fallback_segments = [
+  "An internal event (",
+  ", id ",
+  ") didn't quite reach the threshold for reaching out, but it stayed with me.",
+]
+
 [initiate.memory.templates]
 pending = '''I composed something to reach out to {user_name} about {subject}. I wrote: {message_quoted}. I haven't sent it yet — waiting for a better hour.'''
 delivered = 'I reached out to {user_name} about {subject}. I said: {message_quoted}. {Subj} {hasnt} seen it yet.'
