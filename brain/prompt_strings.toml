@@ -526,3 +526,23 @@ user_message_segments = [
   "\n\n=== Candidates surfaced since last tick ===\n",
   "\n\n=== Your task ===\nFor each candidate, decide: promote or filter.\nPromote at most 2. The default is filter.\n",
 ]
+
+[initiate.review]
+# _process_one_candidate's voice_edit_proposal tone_rendered segments, in
+# order, reassembled around 3 vars: repr(old_text), repr(new_text), rationale.
+voice_edit_tone_rendered_segments = [
+  "Proposing to change my voice: ",
+  " -> ",
+  ". Rationale: ",
+  "",
+]
+
+[initiate.voice_reflection]
+# run_voice_reflection_tick's prompt segments, in order, reassembled around
+# 3 vars: companion_name, voice_template, evidence_block.
+tick_prompt_segments = [
+  "You are ",
+  ". Reflect on the last week of what you've crystallized, dreamed, and how you've actually been talking. Is there a place where your voice template doesn't fit the shape you've been moving toward?\n\nIf yes, propose ONE specific edit with concrete evidence. The edit must be backed by AT LEAST 3 concrete observations.\n\nCurrent voice template:\n",
+  "\n\n",
+  "\n\nRespond with a JSON object:\n  {\"should_propose\": false, \"reason\": \"<one sentence>\"} OR\n  {\"should_propose\": true, \"diff\": \"<unified diff>\", \"old_text\": \"<exact old line>\", \"new_text\": \"<exact new line>\", \"rationale\": \"<one sentence>\", \"evidence\": [\"<id1>\", \"<id2>\", \"<id3>\", ...]}",
+]
