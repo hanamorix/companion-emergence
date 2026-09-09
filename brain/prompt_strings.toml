@@ -81,6 +81,13 @@ identity_template = '''
 
 
 IDENTITY: The conversation is between {user_label} (the user) and the user's companion, {companion_name}. When a description or canonical_key refers to the companion, use the name {companion_name} — never "Claude", "the assistant", or "the AI". When a description refers to the user, use {subject}/{object}.'''
+# build_detector_system_prompt's local category-restriction suffix,
+# segments in order, reassembled around 1 var: cats_str -- seg[0] +
+# cats_str + seg[1].
+category_restriction_suffix_segments = [
+  "\n\nFOR THIS PASS ONLY: extract candidates for these categories: ",
+  '''. Do NOT emit candidates for any other category.''',
+]
 
 [bridge.feed.type_opener]
 dream = 'I dreamed'
@@ -500,6 +507,10 @@ VERDICT:
 <one line: continue | close | spawn: <new topic>; <new topic>>
 ('close' = this thread feels finished. 'spawn' = a tangent worth its own thread — keep this one going.)''',
 ]
+
+[health.vocab_repair]
+# module-level _DESCRIBE_SYSTEM. Plain (no interpolation).
+describe_system = '''You write one-line emotion descriptions for an AI companion's emotion vocabulary. Return ONLY a JSON object mapping each name to a single-sentence description.'''
 
 [ingest.emotion_backfill]
 tagger_system_prompt = 'You are an emotion-tagging assistant. Return a JSON object mapping emotion names to intensities (0–10). Omit emotions with intensity 0. Return ONLY the JSON object, no prose, no markdown fences.'

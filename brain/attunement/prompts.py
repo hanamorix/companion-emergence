@@ -9,6 +9,11 @@ _DETECTOR_SYSTEM_PROMPT = prompt_strings.register("attunement.prompts.detector_s
 
 _IDENTITY_TEMPLATE = prompt_strings.register("attunement.prompts.identity_template")
 
+# Text externalized to prompt_strings.toml [attunement.prompts] (issue #129 stage 2c).
+_CATEGORY_RESTRICTION_SUFFIX_SEGMENTS = prompt_strings.register_segments(
+    "attunement.prompts.category_restriction_suffix_segments"
+)
+
 
 def build_detector_system_prompt(
     only_categories: frozenset[str] | None = None,
@@ -39,10 +44,8 @@ def build_detector_system_prompt(
     prompt = _DETECTOR_SYSTEM_PROMPT
     if only_categories is not None:
         cats_str = ", ".join(sorted(only_categories))
-        prompt += (
-            f"\n\nFOR THIS PASS ONLY: extract candidates for these categories: "
-            f"{cats_str}. Do NOT emit candidates for any other category."
-        )
+        seg = _CATEGORY_RESTRICTION_SUFFIX_SEGMENTS
+        prompt += seg[0] + cats_str + seg[1]
     if companion_name:
         from brain.pronouns import resolve
 

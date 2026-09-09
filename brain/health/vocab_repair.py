@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain import prompt_strings
+
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
     from brain.memory.store import MemoryStore
@@ -35,10 +37,8 @@ _DESCRIBE_BATCH: int = 20
 _EXCERPT_CHAR_LIMIT: int = 140
 _MAX_EXCERPTS_PER_NAME: int = 3
 
-_DESCRIBE_SYSTEM = (
-    "You write one-line emotion descriptions for an AI companion's emotion vocabulary. "
-    "Return ONLY a JSON object mapping each name to a single-sentence description."
-)
+# Text externalized to prompt_strings.toml [health.vocab_repair] (issue #129 stage 2c).
+_DESCRIBE_SYSTEM = prompt_strings.register("health.vocab_repair.describe_system")
 
 
 # ---------------------------------------------------------------------------
