@@ -118,13 +118,17 @@ def register_tools(
             # committed one in the invocation record. Mirrors tool_loop.py's
             # in-process outcome semantics exactly.
             refusal_error = result.get("error") if isinstance(result, dict) else None
+            # #175: a record_monologue the capture layer deduped is still a
+            # dispatch that happened — audit it, but marked, so the log no
+            # longer shows two "ok" captures per turn.
+            deduped = isinstance(result, dict) and result.get("deduped") is True
             log_invocation(
                 persona_dir,
                 name=name,
                 arguments=arguments,
                 result_summary=_summarize(payload),
                 error=refusal_error,
-                outcome="refused" if refusal_error else "ok",
+                outcome="refused" if refusal_error else ("deduped" if deduped else "ok"),
                 monologue_text=monologue_text,
             )
             return [TextContent(type="text", text=payload)]

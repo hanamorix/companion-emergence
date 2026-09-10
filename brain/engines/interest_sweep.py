@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from brain import prompt_strings
 from brain.engines._interests import InterestSet, spawn_interest
 from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import list_conversation_memories
@@ -22,14 +23,11 @@ SWEEP_CADENCE_FILE = "interest_sweep_cadence.json"
 SWEEP_INTERVAL_HOURS = 168.0
 _CAP = 3
 
-_SYSTEM = """\
-You maintain a companion's interest list. Given her current interests and a
-sample of her recent lived life (conversations, dreams, inner monologue),
-propose at most 3 NEW research interests that clearly recur in the lived
-material but are missing from the list, and at most 3 existing interest ids
-to retire (nothing in the lived material touches them and their thread feels
-done). Be conservative — empty lists are a fine answer. Return ONLY:
-{"new": [{"topic": "...", "keywords": ["..."], "why": "..."}], "retire": ["<id>"]}"""
+# Text externalized to prompt_strings.toml [engines.interest_sweep] (issue #129 stage 1).
+_SYSTEM = prompt_strings.register("engines.interest_sweep.system")
+
+# Text externalized to prompt_strings.toml [engines.interest_sweep] (issue #129 stage 2c).
+_SWEEP_PROMPT_SEGMENTS = prompt_strings.register_segments("engines.interest_sweep.sweep_prompt_segments")
 
 
 def _lived_sample(store) -> str:
@@ -68,11 +66,8 @@ def run_sweep_tick(
             f"- id={i.id} topic={i.topic!r} status={i.status} pull={i.pull_score:.1f}"
             for i in interests.interests
         ) or "(empty)"
-        prompt = (
-            f"=== Current interests ===\n{listing}\n\n"
-            f"=== Recent lived life ===\n{_lived_sample(store)}\n\n"
-            'Return: {"new": [...], "retire": [...]}'
-        )
+        seg = _SWEEP_PROMPT_SEGMENTS
+        prompt = seg[0] + listing + seg[1] + _lived_sample(store) + seg[2]
         raw = provider.generate(prompt, system=_SYSTEM)
         data = json.loads(extract_json_object(raw))
 

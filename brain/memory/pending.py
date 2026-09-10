@@ -59,10 +59,13 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset(
 
 # Only these monologue-EPISODE types are eligible for the Pass-1 salience drop —
 # they carry a real 0..10 importance signal (extractor sets importance=salience*10).
-# Dreams (importance auto-derives to ~0 when emotion-flat), research/heartbeat/
-# reflex/initiate (same emotion-derived default), and monologue_trace (pinned 0.3)
-# are EXEMPT: they go through dedup only, never salience-drop. Owner directive
-# (Roy, 2026-08-11) — a single flat floor would nuke legitimate flat content.
+# Dreams (importance still auto-derives from the emotion sum when emotion-flat)
+# and monologue_trace (now a per-trace-derived value, P3 retention rework
+# Change 1 — no longer a flat 0.3) are EXEMPT: they go through dedup only,
+# never salience-drop. research/heartbeat/reflex/initiate now carry explicit
+# non-deflated importance (Change 1) but were never SALIENCE_ELIGIBLE anyway —
+# still exempt, same as before. Owner directive (Roy, 2026-08-11) — a single
+# flat floor would nuke legitimate flat content.
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_emotion", "monologue_soul_candidate"}
 )
@@ -110,6 +113,67 @@ class PendingQueue:
             if len(out) >= limit:
                 break
         return out
+
+    def enqueue_reappraisal(self, memory_id: str, *, source: str) -> None:
+        """Enqueue an existing-memory importance re-appraise request (P3
+        retention rework, Change 3).
+
+        A minimal item, NOT a full Memory payload: just the target id plus
+        a top-level `_route` discriminator, so the queue file stays small.
+        `drain()` returns it as a raw dict like any other candidate; the
+        gate (`engines.consolidation._run_locked`) branches on `_route` to
+        separate re-appraise items from normal candidates BEFORE Pass 1/2.
+        Off the hot path: this is a cheap file append under lock, same as
+        `enqueue` — no appraisal and no provider call happen here. The gate
+        re-appraises on its own consolidation tick and UPDATES the existing
+        row in place (never a new row).
+
+        Single-id convenience wrapper around `enqueue_reappraisals` — see
+        that method if enqueuing more than one id (e.g. every surfaced
+        recall hit in one turn); calling this in a loop reacquires the lock
+        and reopens the file once per id.
+        """
+        self.enqueue_reappraisals([memory_id], source=source)
+
+    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str) -> int:
+        """Enqueue MULTIPLE existing-memory re-appraise requests under a
+        SINGLE `file_lock` + single open + single write (P3 retention
+        rework, Change 3 hot-path fix).
+
+        The recall hook (`brain.chat.prompt._build_recall_block`) surfaces
+        up to ~2*limit memory ids per turn and used to call
+        `enqueue_reappraisal` once per id — each call independently
+        acquiring the lock and opening/writing the file, i.e. N lock/open/
+        write syscalls on the recall hot path. This batches the whole list
+        into one lock acquisition and one file write.
+
+        Each written line has the EXACT same shape as a single
+        `enqueue_reappraisal` call (`_route`/`memory_id`/`_source`/
+        `_enqueued_at`) — only the I/O is batched, not the item schema.
+        `drain()` and the consolidation gate see no difference from N
+        individual calls. No-op (returns 0, does not touch the file) on an
+        empty list. Returns the number of lines written.
+        """
+        if not memory_ids:
+            return 0
+        now = datetime.now(UTC).isoformat()
+        lines = [
+            json.dumps(
+                {
+                    "_route": "reappraise_importance",
+                    "memory_id": memory_id,
+                    "_source": source,
+                    "_enqueued_at": now,
+                },
+                ensure_ascii=False,
+            )
+            for memory_id in memory_ids
+        ]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.path):
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        return len(lines)
 
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.

@@ -72,7 +72,10 @@ def test_transform_uses_emotion_score_as_score() -> None:
 
 
 def test_transform_defaults_missing_optional_fields() -> None:
-    """Missing tags / importance / active fall back to sensible defaults."""
+    """Missing tags / active fall back to sensible defaults. Missing
+    importance with no emotions to backfill from defaults to a moderate 4.0
+    (P3 retention rework, Change 1 — OG-0 backfill: migrated history must
+    not mass-evict at an importance-driven decay baseline of 0.0)."""
     minimal = {
         "id": "m2",
         "content": "x",
@@ -84,7 +87,7 @@ def test_transform_defaults_missing_optional_fields() -> None:
     assert skipped is None
     assert mem is not None
     assert mem.tags == []
-    assert mem.importance == 0.0
+    assert mem.importance == 4.0
     assert mem.active is True
     assert mem.emotions == {}
     assert mem.score == 0.0
@@ -184,20 +187,25 @@ def test_skipped_memory_dataclass_shape() -> None:
     assert s.raw_snippet == "..."
 
 
-def test_transform_non_numeric_importance_degrades_to_zero() -> None:
-    """Non-numeric importance (e.g. 'high') must not crash float() — degrade to 0.0."""
+def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None:
+    """Non-numeric importance (e.g. 'high') must not crash float() — it is
+    treated as malformed/missing and backfilled from emotions (P3 retention
+    rework, Change 1: `_og()`'s default emotions={"love": 9.0} -> emotion_score
+    9.0 -> bucket 3.0), not a hard 0.0."""
     mem, skipped = transform_memory(_og(importance="high"))
     assert skipped is None
     assert mem is not None
-    assert mem.importance == 0.0
+    assert mem.importance == 3.0
 
 
-def test_transform_list_importance_degrades_to_zero() -> None:
-    """A list-valued importance field degrades to 0.0 rather than crashing."""
+def test_transform_list_importance_degrades_to_emotion_backfill() -> None:
+    """A list-valued importance field degrades gracefully (no crash) and is
+    backfilled from emotions the same way a missing importance is, not a
+    hard 0.0."""
     mem, skipped = transform_memory(_og(importance=[1, 2, 3]))
     assert skipped is None
     assert mem is not None
-    assert mem.importance == 0.0
+    assert mem.importance == 3.0
 
 
 def test_transform_string_tags_degrades_to_empty_list() -> None:

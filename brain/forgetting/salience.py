@@ -33,6 +33,13 @@ _HEBBIAN_DENOMINATOR = 20.0
 _RECALL_DENOMINATOR = 10.0
 _FRESHNESS_LIVED_HOURS_HORIZON = 2160.0  # 90 lived-days — soft landing past the 30-day recency grace
 
+# P3 retention rework, Change 2: importance extends the freshness age-horizon
+# (the OTHER decay lever, alongside policy.FADE_IMPORTANCE_GAIN). r =
+# clamp(memory.importance / 10, 0, 1); a no-op at r=0 (importance 0 → the
+# horizon above, unchanged). Tuned against the C2 simulation alongside
+# FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
+HORIZON_IMPORTANCE_GAIN = 52.0
+
 # v0.0.33 Track 3 — peak blend. The FIELD never decays; its salience
 # contribution lingers over a long lived-time horizon so forgetting stays
 # reachable (spec constraint: sticky, never immortal). Calibration per the
@@ -126,7 +133,13 @@ def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> f
     lived = _lived_hours_since(anchor, felt_time_state)
     if lived is None:
         return 1.0  # cold-start cases — treat as fresh (spec §7)
-    return 1.0 - _clamp(lived / _FRESHNESS_LIVED_HOURS_HORIZON)
+    # P3 retention rework, Change 2: importance extends the effective horizon.
+    # r=0 (importance 0) -> horizon_eff == _FRESHNESS_LIVED_HOURS_HORIZON,
+    # byte-identical to pre-change. Rising importance stretches the horizon,
+    # slowing freshness decay proportionally; never shrinks it below baseline.
+    r = min(1.0, max(0.0, memory.importance / 10.0))
+    horizon_eff = _FRESHNESS_LIVED_HOURS_HORIZON * (1.0 + HORIZON_IMPORTANCE_GAIN * r)
+    return 1.0 - _clamp(lived / horizon_eff)
 
 
 def _peak_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:

@@ -118,19 +118,22 @@ def test_oracle_fails_against_the_pre_fix_source(monkeypatch):
     assert _emotion_backfill_call_site_tier(pre_fix_src) is None
 
 
+# The last main commit BEFORE #194 completed the #154 tier routing (first
+# parent of its merge commit 5589f096). Pinned, not computed: the previous
+# ``git merge-base HEAD origin/main`` was only "pre-fix" while #154 lived on a
+# feature branch — once merged, every main checkout's merge-base was post-fix
+# and the oracle failed on main (#205).
+_PRE_154_BASE_SHA = "44b4d5227b791ccf0756294f08f82223e726a979"
+
+
 def _find_pre_154_base_sha() -> str | None:
-    """The commit this branch's #154 work is based on top of — the merge of
-    #166 per this project's handoff notes. Resolved dynamically (not
-    hardcoded) via the merge-base with origin/main, falling back to None
-    (skip) if that ref isn't available in this checkout (e.g. a shallow
-    clone or CI worker without the remote configured)."""
+    """Return the pinned pre-#154 sha if this checkout has it, else None (skip)
+    — e.g. a shallow clone on a CI worker."""
     result = subprocess.run(
-        ["git", "merge-base", "HEAD", "origin/main"],
+        ["git", "cat-file", "-e", f"{_PRE_154_BASE_SHA}^{{commit}}"],
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return result.stdout.strip()
+    return _PRE_154_BASE_SHA if result.returncode == 0 else None

@@ -343,8 +343,32 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [brainPromptDismissed, setBrainPromptDismissed] = useState(false);
   const restartBridge = useRestartBridge(persona, state?.mode ?? "live");
 
+  // #172: the login step is claude-code specific. Probe only once the
+  // persona's state reports provider === "claude-cli", or when the state
+  // poll has failed (bridge unreachable — keep the offer reachable rather
+  // than hide it behind a state we can't read). While state is still
+  // loading: hold (null → no banner). Any other provider: never probed.
+  const stateProvider = state?.connection?.provider ?? null;
+  const loginProbe: "probe" | "skip" | "hold" =
+    stateProvider === "claude-cli" || stateError !== null
+      ? "probe"
+      : stateProvider === null
+        ? "hold"
+        : "skip";
+
   useEffect(() => {
     let cancelled = false;
+    if (loginProbe === "hold") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (loginProbe === "skip") {
+      setBrainAuthorized(true);
+      return () => {
+        cancelled = true;
+      };
+    }
     brainLoginStatus()
       .then((res) => {
         if (!cancelled) setBrainAuthorized(res.authorized);
@@ -357,7 +381,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
     return () => {
       cancelled = true;
     };
-  }, [persona]);
+  }, [persona, loginProbe]);
 
   const refetchState = useCallback(async () => {
     try {

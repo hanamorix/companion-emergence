@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from brain import prompt_strings
+
+# Text externalized to prompt_strings.toml [chat.monologue] (issue #129 stage 2a).
+_REPLY_FRAME_SEGMENTS = prompt_strings.register_segments("chat.monologue.reply_frame_segments")
+
 
 def build_monologue_frame(
     *,
@@ -68,13 +73,5 @@ def build_reply_frame(*, persona_name: str, user_name: str = "the user") -> str:
     third person. Trust the model: the tangents have already been thought
     through in the monologue pass. The reply answers what was asked, directly.
     """
-    return (
-        f"── visible reply, {persona_name} ──\n"
-        f"Everything marked interior above is private thought — never quote it. "
-        f"Compose the visible reply now, speaking to {user_name} directly in "
-        f"second person — 'you', never 'she'/'her'/'they' about the person in "
-        f"front of you. If you called `record_monologue` this turn, your "
-        "tangents are already handled — answer directly. If you didn't, answer "
-        "naturally. Length should match what the moment calls for: short when "
-        "short is true, longer when the answer needs room."
-    )
+    seg = _REPLY_FRAME_SEGMENTS
+    return seg[0] + persona_name + seg[1] + user_name + seg[2]

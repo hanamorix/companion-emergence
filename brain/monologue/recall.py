@@ -11,6 +11,7 @@ from pathlib import Path
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
+from brain.utils.time import format_local
 
 _DEFAULT_LIMIT = 5
 
@@ -51,7 +52,7 @@ def recall_monologue(
             {
                 "content": mem.content,
                 "state": mem.state,  # always 'active' (active_only=True; fading traces not fetched)
-                "ts": mem.created_at.isoformat(),
+                "ts": format_local(mem.created_at),  # tz-local-display: monologue recall snippet ts
             }
         )
     return {"query": query, "count": len(results), "monologues": results}

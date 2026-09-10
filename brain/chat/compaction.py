@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     acquire_compaction_lock,
@@ -42,6 +43,7 @@ from brain.ingest.buffer import (
     rewrite_session_atomic,
     write_archive_marker,
 )
+from brain.utils.time import to_local
 
 logger = logging.getLogger(__name__)
 
@@ -83,62 +85,13 @@ def build_compaction_provider(persona_dir):
 # ``{target_words}`` ≈ half the source keeps it from over-compressing.
 
 # First-ever summary (or any no-prior summarise): condense raw turns only.
-_SUMMARY_PROMPT = """Write {name}'s own first-person memory of the conversation below.
-"I" is {name} — mirror the style, tone, and phrasing of the messages labelled
-"{name}:". Refer to the other speaker (labelled "user") as "the user", or by their
-actual name if the transcript gives one.
-ACCURACY FIRST: record only what the transcript actually says. Do not invent, infer
-beyond the text, or reverse who did what to whom — if the transcript says X, the
-memory says X. Preserve names, decisions, emotional beats, unresolved threads,
-ongoing projects, and concrete specifics (names, numbers, what was decided and why).
-Drop only pleasantries, repetition, and formatting noise.
-Length: aim for about {target_words} words — roughly {target_pct}% of the source.
-That is the target: do not over-compress below it, and do not pad to reach it.
-Output plain first-person prose ONLY: begin directly with the recollection. No title,
-no name/description/metadata fields, no frontmatter, no headers, no lists, no
-preamble, no closing sign-off.
-
-CONVERSATION:
-{transcript}
-
-MEMORY:"""
+# Text externalized to prompt_strings.toml [chat.compaction] (issue #129 stage 1).
+_SUMMARY_PROMPT = prompt_strings.register("chat.compaction.summary_prompt")
 
 # Fold: integrate new messages INTO the running memory, preserving a fading trace
 # of everything already there (the fix for "no trace of the previous summary").
-_FOLD_PROMPT = """Update {name}'s own running, first-person memory of a long, ongoing
-conversation. Below is the EXISTING MEMORY (everything remembered so far) followed by
-NEW MESSAGES not yet folded in. Produce an UPDATED MEMORY in the first person — "I" is
-{name}; mirror the style, tone, and phrasing of the messages labelled "{name}:". Refer
-to the other speaker (labelled "user") as "the user", or by their actual name if it
-appears.
-
-ACCURACY FIRST: record only what the sources actually say. Do not invent, infer beyond
-the text, or reverse who did what to whom — if a source says X, the memory says X.
-
-How to update:
-- Carry the existing memory forward. Keep its names of people and places, decisions,
-  emotional beats, unresolved threads, and ongoing projects — do not discard older
-  material just because it is older. The newest messages may be richer in detail;
-  older material should persist as a briefer but still-present trace, fading
-  gradually rather than vanishing in one step.
-- Integrate, don't staple: weave the new messages into the existing memory so the
-  result reads as one continuous recollection, not two halves.
-- Preserve concrete specifics: names, numbers, what was decided and why.
-- Drop only pleasantries, repetition, and formatting noise.
-- Length: aim for about {target_words} words — roughly {target_pct}% of the combined
-  source below (existing memory + new messages). That is the target: do not
-  over-compress below it, and do not pad to reach it.
-- Output plain first-person prose ONLY: begin directly with the recollection. No
-  title, no name/description/metadata fields, no frontmatter, no headers, no lists,
-  no preamble, no closing sign-off.
-
-EXISTING MEMORY:
-{prior_summary}
-
-NEW MESSAGES:
-{transcript}
-
-UPDATED MEMORY:"""
+# Text externalized to prompt_strings.toml [chat.compaction] (issue #129 stage 1).
+_FOLD_PROMPT = prompt_strings.register("chat.compaction.fold_prompt")
 
 # Pure re-compaction: an existing memory with no new raw this pass (a section
 # graduating into an older tier with nothing new in its band). Purpose-built
@@ -146,28 +99,8 @@ UPDATED MEMORY:"""
 # Bug 1: haiku correctly refuses to integrate nothing, and the refusal then gets
 # stored as the memory) or _SUMMARY_PROMPT (framed for a raw dialogue transcript,
 # not memory prose already in the persona's own voice).
-_CONDENSE_PROMPT = """Shorten {name}'s own existing first-person memory below to about
-{target_words} words, roughly {target_pct}% of its current length. "I" is {name}: keep
-the same first-person voice, tone, and phrasing already present in the memory.
-
-ACCURACY FIRST: shorten only. Do not invent, infer beyond the text, or reverse who did
-what to whom.
-
-How to shorten:
-- Preserve names of people and places, decisions, emotional beats, unresolved threads,
-  and ongoing projects.
-- Drop repetition and formatting noise, not substance.
-- Keep concrete specifics: names, numbers, what was decided and why.
-- Length: aim for about {target_words} words. That is the target, do not over-compress
-  below it, and do not pad to reach it.
-- Output plain first-person prose ONLY: begin directly with the recollection. No title,
-  no name/description/metadata fields, no frontmatter, no headers, no lists, no
-  preamble, no closing sign-off.
-
-EXISTING MEMORY:
-{prior_summary}
-
-SHORTENED MEMORY:"""
+# Text externalized to prompt_strings.toml [chat.compaction] (issue #129 stage 1).
+_CONDENSE_PROMPT = prompt_strings.register("chat.compaction.condense_prompt")
 
 # The summary's target length as a fraction of the source being summarised. This is
 # the HONEST target the prompt states (number + percent both derived from it), so it
@@ -373,10 +306,18 @@ def _coarse_stamp(raw: object) -> str | None:
     Date + part-of-day only — no per-render clock read, no minute/second — so the
     render stays byte-stable between re-compactions (C6). ``%b %d`` avoids the
     platform-specific ``%-d`` (Windows CI). Returns None on an unparseable ts.
+
+    Converted to local time before formatting (issue #217): the underlying
+    ts is stored UTC, but "morning"/"evening" is a local-wall-clock notion —
+    formatting it from the UTC hour would mislabel the part of day.
     """
     dt = _parse_ts(raw)
     if dt is None:
         return None
+    # tz-local-display (exception: date + part-of-day, not routed through
+    # format_local/local_display — those render full ISO datetimes, not a
+    # coarse "%b %d <part-of-day>" bucket)
+    dt = to_local(dt)
     return f"{dt.strftime('%b %d')} {_part_of_day(dt.hour)}"
 
 

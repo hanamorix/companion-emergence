@@ -36,6 +36,21 @@ def _coerce_utc(ts: str) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
+def clamp_importance(x: float) -> float:
+    """Clamp a raw importance value into the store's [0.0, 10.0] scale.
+
+    Shared boundary guard (P3 retention rework, Change 1): every producer's
+    importance, however derived, passes through here before it can reach a
+    Memory row. Applied inside Memory.create_new (covers an unclamped
+    emotion-sum default, e.g. engines/dream.py's saturated aggregate) AND
+    inside migrator/transform.py's bespoke Memory(...) construction (which
+    bypasses create_new). One helper, both boundaries: no producer can ever
+    emit importance > 10.0, and a legitimate value already in range is
+    never altered.
+    """
+    return min(10.0, max(0.0, float(x)))
+
+
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
     """Decode a metadata_json column value into a dict, defending against
     manual DB edits or legacy writers that stored the string "null",
@@ -117,6 +132,7 @@ class Memory:
         tags = list(tags or [])
         score = float(sum(emotions.values()))
         metadata = dict(metadata or {})
+        raw_importance = importance if importance is not None else score / 10.0
         return cls(
             id=str(uuid.uuid4()),
             content=content,
@@ -125,7 +141,7 @@ class Memory:
             created_at=datetime.now(UTC),
             emotions=emotions,
             tags=tags,
-            importance=importance if importance is not None else score / 10.0,
+            importance=clamp_importance(raw_importance),
             score=score,
             metadata=metadata,
             peak_emotion_intensity=max(

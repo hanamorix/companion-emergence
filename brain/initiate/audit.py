@@ -14,17 +14,37 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.jsonl_reader import iter_jsonl_streaming
+from brain.initiate import presence_state
 from brain.initiate.d_call_schema import DCallRow
 from brain.initiate.schemas import AuditRow, StateName
 
 logger = logging.getLogger(__name__)
 
 _ARCHIVE_PATTERN = re.compile(r"^initiate_audit\.(\d{4})\.jsonl\.gz$")
+
+# Decisions whose reply-lag matters for compute_user_presence's
+# response_lag_p50 signal (#225). Mirrors user_pattern._SEND_DECISIONS —
+# duplicated here (rather than imported) to keep this module's transition
+# classification self-contained; not derived from user_pattern to avoid a
+# reverse dependency (user_pattern doesn't import audit.py).
+_SEND_DECISIONS = frozenset({"send_notify", "send_quiet"})
+
+# Guards update_audit_state's read-all/mutate/rewrite-all body (#225 round 2,
+# stage-3 finding 4). No lock existed for this before: the old full-rescan
+# design tolerated that because it always re-derived from whatever was
+# currently on disk. This change's reply-lag event-counter now mutates
+# presence_state.json in memory at the moment a transition is applied, so a
+# lost update inside this read-modify-write could leave presence_state.json
+# diverged from the audit trail — a new failure mode this lock exists to
+# close. Atomicity only; the O(file size) rewrite algorithm is unchanged
+# (out of scope per the task brief).
+_AUDIT_LOCK = threading.Lock()
 
 
 def append_audit_row(persona_dir: Path, row: AuditRow) -> None:
@@ -50,37 +70,80 @@ def update_audit_state(
     Atomic via temp + rename. The audit log row mutates in place — the
     delivery.state_transitions array carries the full timeline, but the
     current_state field reflects the latest.
+
+    #225: also the reply-lag event hook. At the point the target row is
+    found, its PRE-transition delivery.current_state and original send ts
+    are already in memory (zero extra I/O) BEFORE record_transition mutates
+    it. If this transition is the row's first entry into replied_explicit
+    (edge-triggered — a duplicate/retried post for an already-replied row
+    must not double-fold) and the row was a real send, the lag is folded
+    into presence_state.json's running reply-lag mean. The whole
+    read-modify-write body is now guarded by `_AUDIT_LOCK`: a lost update
+    here could otherwise leave presence_state.json diverged from what
+    initiate_audit.jsonl actually contains.
     """
     path = persona_dir / "initiate_audit.jsonl"
     if not path.exists():
         return
-    rows: list[AuditRow] = []
-    found = False
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\r\n")
-            if not stripped.strip():
-                continue
+    with _AUDIT_LOCK:
+        rows: list[AuditRow] = []
+        found = False
+        lag_seconds: float | None = None
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.rstrip("\r\n")
+                if not stripped.strip():
+                    continue
+                try:
+                    row = AuditRow.from_jsonl(stripped)
+                except (json.JSONDecodeError, KeyError) as exc:
+                    logger.warning("skipping corrupt audit row in %s: %s", path, exc)
+                    continue
+                if row.audit_id == audit_id:
+                    old_state = (row.delivery or {}).get("current_state")
+                    send_ts_str = row.ts
+                    row.record_transition(new_state, at)
+                    found = True
+                    if (
+                        row.decision in _SEND_DECISIONS
+                        and new_state == "replied_explicit"
+                        and old_state != "replied_explicit"
+                    ):
+                        lag_seconds = _reply_lag_seconds(send_ts_str, at)
+                rows.append(row)
+        if not found:
+            return
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(r.to_jsonl() + "\n")
+            tmp.replace(path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            logger.warning("audit state update failed for %s: %s", path, exc)
+            return
+        if lag_seconds is not None:
             try:
-                row = AuditRow.from_jsonl(stripped)
-            except (json.JSONDecodeError, KeyError) as exc:
-                logger.warning("skipping corrupt audit row in %s: %s", path, exc)
-                continue
-            if row.audit_id == audit_id:
-                row.record_transition(new_state, at)
-                found = True
-            rows.append(row)
-    if not found:
-        return
-    tmp = path.with_suffix(path.suffix + ".tmp")
+                presence_state.fold_reply_lag(persona_dir, lag_seconds)
+            except Exception:
+                logger.debug("update_audit_state: fold_reply_lag failed", exc_info=True)
+
+
+def _reply_lag_seconds(send_ts_str: str, reply_at_str: str) -> float | None:
+    """Return the non-negative lag in seconds between a send ts and a reply
+    transition's `at`, or None on any parse failure or a negative lag."""
     try:
-        with tmp.open("w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(r.to_jsonl() + "\n")
-        tmp.replace(path)
-    except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        logger.warning("audit state update failed for %s: %s", path, exc)
+        send_ts = datetime.fromisoformat(send_ts_str)
+        reply_ts = datetime.fromisoformat(reply_at_str)
+        if send_ts.tzinfo is None:
+            send_ts = send_ts.replace(tzinfo=UTC)
+        if reply_ts.tzinfo is None:
+            reply_ts = reply_ts.replace(tzinfo=UTC)
+        lag = (reply_ts - send_ts).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return lag if lag >= 0 else None
 
 
 def read_recent_audit(

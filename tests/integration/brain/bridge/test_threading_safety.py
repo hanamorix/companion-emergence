@@ -167,10 +167,15 @@ def test_chat_threaded_round_trip_no_silent_sqlite_drop(
         body = r.json()
         assert body["closed"] is True
 
-        # The load-bearing assertion: at least one memory committed. If the
-        # threading bug were back, committed would be 0 with errors > 0.
-        assert body["committed"] >= 1, (
-            f"expected >= 1 memory committed; got {body}\ncaplog: {caplog.text[:1000]}"
+        # The load-bearing assertion: the extracted memory reached persistence
+        # with no errors. If the threading bug were back, both counters would
+        # be 0 with errors > 0. Since #167 conversation-extraction labels route
+        # through the pending gate (``enqueued``) rather than a direct
+        # ``store.create`` (``committed``), so either counter proves the write
+        # landed (#206).
+        assert body["committed"] + body["enqueued"] >= 1 and body["errors"] == 0, (
+            f"expected >= 1 memory persisted with no errors; got {body}\n"
+            f"caplog: {caplog.text[:1000]}"
         )
 
     # Sanity: no SQLite cross-thread errors in the captured log.

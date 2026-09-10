@@ -17,8 +17,12 @@ from __future__ import annotations
 
 from typing import Literal
 
+from brain import prompt_strings
 from brain.grief import policy
 from brain.memory.store import Memory, MemoryStore
+
+# Text externalized to prompt_strings.toml [grief.breadcrumb] (issue #129 stage 2c).
+_ARC_CLOSE_PHRASE_SEGMENTS = prompt_strings.register_segments("grief.breadcrumb.arc_close_phrase_segments")
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
@@ -93,7 +97,8 @@ def recall_touch_phrase(summary: str) -> str:
 
 def arc_close_phrase(arc_name: str) -> str:
     """Deterministic arc-close content phrase per spec §4."""
-    return f"the arc '{arc_name}' has closed"
+    seg = _ARC_CLOSE_PHRASE_SEGMENTS
+    return seg[0] + arc_name + seg[1]
 
 
 SubtypeLiteral = Literal["drop", "arc_close", "recall_touch"]
@@ -134,5 +139,9 @@ def write_breadcrumb(
         domain="grief",
         emotions=emotions,
         metadata=metadata,
+        # P3 retention rework, Change 1: grief intensity is already on a
+        # ~0-10 scale; pass it through directly instead of letting the
+        # create_new default deflate it to intensity/10.0.
+        importance=_clamp(intensity),
     )
     return store.create(memory)

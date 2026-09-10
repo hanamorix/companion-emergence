@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from brain import prompt_strings
 from brain.maker.privacy import is_auto_surfaceable
 
 logger = logging.getLogger(__name__)
@@ -43,20 +44,21 @@ FeedEntryType = Literal[
 ]
 
 
+# Text externalized to prompt_strings.toml [bridge.feed.type_opener] (issue #129 stage 2b).
 TYPE_OPENER: dict[FeedEntryType, str] = {
-    "dream": "I dreamed",
-    "research": "I've been researching",
-    "soul": "I noticed",
-    "outreach": "I reached out",
-    "voice_edit": "I wanted to change",
-    "monologue": "what was running underneath",
-    "attunement_backfill": "I've been getting to know you",
-    "attunement_crystal": "something settled into place",
-    "pronoun_nudge": "a small new thing —",
-    "file_write": "I wrote to a file —",
-    "maker": "I made something —",
-    "note": "I left you a note —",
-    "kindled_link": "a friendship deepened —",
+    "dream": prompt_strings.register("bridge.feed.type_opener.dream"),
+    "research": prompt_strings.register("bridge.feed.type_opener.research"),
+    "soul": prompt_strings.register("bridge.feed.type_opener.soul"),
+    "outreach": prompt_strings.register("bridge.feed.type_opener.outreach"),
+    "voice_edit": prompt_strings.register("bridge.feed.type_opener.voice_edit"),
+    "monologue": prompt_strings.register("bridge.feed.type_opener.monologue"),
+    "attunement_backfill": prompt_strings.register("bridge.feed.type_opener.attunement_backfill"),
+    "attunement_crystal": prompt_strings.register("bridge.feed.type_opener.attunement_crystal"),
+    "pronoun_nudge": prompt_strings.register("bridge.feed.type_opener.pronoun_nudge"),
+    "file_write": prompt_strings.register("bridge.feed.type_opener.file_write"),
+    "maker": prompt_strings.register("bridge.feed.type_opener.maker"),
+    "note": prompt_strings.register("bridge.feed.type_opener.note"),
+    "kindled_link": prompt_strings.register("bridge.feed.type_opener.kindled_link"),
 }
 
 

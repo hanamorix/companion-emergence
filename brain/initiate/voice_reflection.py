@@ -15,10 +15,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain import prompt_strings
 from brain.initiate.emit import emit_initiate_candidate
 from brain.initiate.schemas import SemanticContext
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [initiate.voice_reflection] (issue #129 stage 2a).
+_TICK_PROMPT_SEGMENTS = prompt_strings.register_segments("initiate.voice_reflection.tick_prompt_segments")
 
 
 def run_voice_reflection_tick(
@@ -51,21 +55,8 @@ def run_voice_reflection_tick(
         ]
     )
 
-    prompt = (
-        f"You are {companion_name}. Reflect on the last week of what you've "
-        "crystallized, dreamed, and how you've actually been talking. "
-        "Is there a place where your voice template doesn't fit the "
-        "shape you've been moving toward?\n\n"
-        "If yes, propose ONE specific edit with concrete evidence. The "
-        "edit must be backed by AT LEAST 3 concrete observations.\n\n"
-        f"Current voice template:\n{voice_template}\n\n"
-        f"{evidence_block}\n\n"
-        "Respond with a JSON object:\n"
-        '  {"should_propose": false, "reason": "<one sentence>"} OR\n'
-        '  {"should_propose": true, "diff": "<unified diff>", '
-        '"old_text": "<exact old line>", "new_text": "<exact new line>", '
-        '"rationale": "<one sentence>", "evidence": ["<id1>", "<id2>", "<id3>", ...]}'
-    )
+    seg = _TICK_PROMPT_SEGMENTS
+    prompt = seg[0] + companion_name + seg[1] + voice_template + seg[2] + evidence_block + seg[3]
 
     from brain.bridge import (
         cli_throttle,  # local import: avoids a circular dependency on brain.bridge

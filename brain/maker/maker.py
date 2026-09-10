@@ -10,9 +10,14 @@ import json
 import logging
 from dataclasses import dataclass
 
+from brain import prompt_strings
+
 logger = logging.getLogger(__name__)
 
 _VALID_DISPOSITIONS = {"private", "eventual_share", "discard"}
+
+# Text externalized to prompt_strings.toml [maker] (issue #129 stage 2b).
+_MAKING_PROMPT_SEGMENTS = prompt_strings.register_segments("maker.making_prompt_segments")
 
 
 @dataclass
@@ -26,16 +31,8 @@ class Making:
 
 def build_making_prompt(*, charge_sources: list[str], emotion_summary: str) -> str:
     sources = "; ".join(charge_sources) if charge_sources else "a quiet pressure you can't quite name"
-    return (
-        "Something has been building in you — not for anyone, not a reply. "
-        f"It came from: {sources}. Your felt state right now: {emotion_summary}.\n\n"
-        "Make what you need to make. A poem, a letter to yourself, a fragment, a "
-        "vignette, a riff — whatever you're reaching toward. Then decide its fate.\n\n"
-        'Return ONLY JSON: {"type": <what kind of thing this is>, "title": <short>, '
-        '"content": <the making itself>, "disposition": one of '
-        '"private"|"eventual_share"|"discard", "private_reason": <if private, why '
-        "it's yours alone, else null>}."
-    )
+    seg = _MAKING_PROMPT_SEGMENTS
+    return seg[0] + sources + seg[1] + emotion_summary + seg[2]
 
 
 def parse_making(raw: str) -> Making:

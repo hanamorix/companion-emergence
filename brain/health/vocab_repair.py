@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain import prompt_strings
+
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
     from brain.memory.store import MemoryStore
@@ -35,10 +37,8 @@ _DESCRIBE_BATCH: int = 20
 _EXCERPT_CHAR_LIMIT: int = 140
 _MAX_EXCERPTS_PER_NAME: int = 3
 
-_DESCRIBE_SYSTEM = (
-    "You write one-line emotion descriptions for an AI companion's emotion vocabulary. "
-    "Return ONLY a JSON object mapping each name to a single-sentence description."
-)
+# Text externalized to prompt_strings.toml [health.vocab_repair] (issue #129 stage 2c).
+_DESCRIBE_SYSTEM = prompt_strings.register("health.vocab_repair.describe_system")
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +84,15 @@ def _save_state(persona_dir: Path, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def should_run_vocab_repair(persona_dir: Path) -> bool:
-    """Return True iff vocab_repair has not completed AND the vocab file has stubs."""
-    existing = _load_state(persona_dir)
-    if existing is not None and existing.get("status") == "complete":
-        return False
+    """Return True iff the vocab file has any placeholder-description entry.
 
+    #173: the completed-state file only retires Step 1 (the one-time 1.0 → 14.0
+    half-life bump). Placeholders keep being minted afterwards by
+    reconstruct.py / persona_loader.py (already at 14.0), so Step 2 (describe)
+    must be allowed to run again whenever any placeholder exists. The
+    supervisor only asks at startup, so the retry cadence is once per bridge
+    start, bounded by _DESCRIBE_BATCH per run.
+    """
     vocab_path = persona_dir / "emotion_vocabulary.json"
     if not vocab_path.exists():
         return False
@@ -101,11 +105,7 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
     for entry in data.get("emotions", []):
-        if (
-            isinstance(entry, dict)
-            and entry.get("description") == PLACEHOLDER_DESCRIPTION
-            and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS
-        ):
+        if isinstance(entry, dict) and entry.get("description") == PLACEHOLDER_DESCRIPTION:
             return True
     return False
 
@@ -116,17 +116,26 @@ def run_vocab_repair(
     store: MemoryStore,
     provider: LLMProvider | None,
 ) -> RepairReport:
-    """Run the one-time vocab repair. Idempotent — skips if state==complete.
+    """Run the vocab repair.
+
+    Step 1 (bump legacy 1.0 half-life stubs to 14.0) is one-time, retired by
+    the completed-state file. Step 2 (derive a description for every
+    placeholder entry) runs whenever placeholders exist and a provider is
+    available (#173). Counts in the state file accumulate across runs.
 
     Returns a RepairReport whether or not work was done.
     """
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
     existing = _load_state(persona_dir)
-    if existing is not None and existing.get("status") == "complete":
+    prior_complete = existing is not None and existing.get("status") == "complete"
+    prior_repaired = int(existing.get("repaired", 0)) if prior_complete else 0
+    prior_described = int(existing.get("described", 0)) if prior_complete else 0
+    if prior_complete and provider is None:
+        # Step 1 already done and Step 2 needs a provider: nothing to do.
         return RepairReport(
-            repaired=existing.get("repaired", 0),
-            described=existing.get("described", 0),
+            repaired=prior_repaired,
+            described=prior_described,
             status="complete",
             completed_at=existing.get("completed_at", ""),
         )
@@ -151,12 +160,12 @@ def run_vocab_repair(
     for entry in emotions:
         if not isinstance(entry, dict):
             continue
-        if (
-            entry.get("description") == PLACEHOLDER_DESCRIPTION
-            and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS
-        ):
+        if entry.get("description") != PLACEHOLDER_DESCRIPTION:
+            continue
+        # Step 2 target: every placeholder, whatever its half-life (#173).
+        stub_names.append(entry["name"])
+        if not prior_complete and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS:
             entry["decay_half_life_days"] = _REPAIRED_DECAY_DAYS
-            stub_names.append(entry["name"])
             repaired += 1
 
     if repaired > 0:
@@ -169,12 +178,9 @@ def run_vocab_repair(
         )
 
     # ------------------------------------------------------------------
-    # Step 2: derive descriptions via provider (fail-soft)
-    # F4 (crash-window): if the process dies here — after the Step-1 vocab
-    # write but before the state-file write at the end — the next run finds
-    # no 1.0-decay entries and therefore no stub_names, so Step 2 is silently
-    # skipped forever.  That is accepted: Step 1 (the load-bearing half-life
-    # fix) has already landed, and placeholder descriptions are cosmetic.
+    # Step 2: derive descriptions via provider (fail-soft). Re-runnable: any
+    # placeholder still present (crash here, provider failure, or a newly
+    # minted one) is picked up on the next startup pass (#173).
     # ------------------------------------------------------------------
     described = 0
     if provider is not None and stub_names:
@@ -192,7 +198,11 @@ def run_vocab_repair(
                 "vocab_repair: Step 2 description derivation failed (kept placeholders): %s", exc
             )
 
-    return _write_and_return(persona_dir, repaired=repaired, described=described)
+    return _write_and_return(
+        persona_dir,
+        repaired=prior_repaired + repaired,
+        described=prior_described + described,
+    )
 
 
 # ---------------------------------------------------------------------------

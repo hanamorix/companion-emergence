@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from brain.memory.store import Memory, _coerce_utc
+from brain.memory.store import Memory, _coerce_utc, clamp_importance
+from brain.tools.impls._common import _calc_importance_from_emotions
 
 # OG fields with direct first-class mapping in the new schema.
 _FIRST_CLASS_OG_FIELDS = frozenset(
@@ -121,11 +122,21 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
 
     # importance: only coerce real numbers. Strings like "high" would crash
     # float(); lists/dicts too. Protects the never-raises contract.
+    # P3 retention rework, Change 1 (OG-0 backfill): a missing/malformed OG
+    # importance no longer hard-defaults to 0.0 (which would mass-evict
+    # migrated history at the new importance-driven decay baseline). Backfill
+    # from emotions when present (reusing the OG add_memory auto-importance
+    # bucket), else a moderate flat default — migrated history should not
+    # start at the bottom of the scale. A numeric-but-oversized OG value
+    # (e.g. 50.0) is clamped, same as every other create_new/Memory(...)
+    # boundary (finding #4).
     importance_raw = og.get("importance")
     if isinstance(importance_raw, (int, float)) and not isinstance(importance_raw, bool):
-        importance = float(importance_raw)
+        importance = clamp_importance(importance_raw)
+    elif emotions:
+        importance = float(_calc_importance_from_emotions(emotions))
     else:
-        importance = 0.0
+        importance = 4.0
 
     # tags: only accept a real list. list("mytag") would explode a string
     # into ['m','y','t','a','g']; list({"a":1}) would pull dict keys. Both

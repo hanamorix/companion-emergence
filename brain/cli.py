@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from brain import __version__
+from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion.persona_loader import load_persona_vocabulary
@@ -43,6 +43,12 @@ from brain.setup import (
     write_persona_config,
 )
 from brain.utils.time import iso_utc
+
+# Text externalized to prompt_strings.toml [cli] (issue #129 stage 2b).
+_DREAM_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.dream_system_prompt_segments")
+_HEARTBEAT_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.heartbeat_system_prompt_segments")
+_REFLEX_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.reflex_system_prompt_segments")
+_RESEARCH_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.research_system_prompt_segments")
 
 
 def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
@@ -442,6 +448,36 @@ def _daemon_state_refresh_handler(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _dedup_sweep_handler(args: argparse.Namespace) -> int:
+    """Run the one-time retroactive duplicate cleanup (P3 retention rework,
+    Change 4) over a persona's corpus.
+
+    Deterministic exact-normalize merge only (no provider/near-dup layer from
+    the CLI). Loss-preserving: every removed row's pre-image is archived to
+    consolidation_archive.jsonl (reason "dedup_sweep") before removal.
+    Idempotent — safe to re-run.
+    """
+    from brain.engines.dedup_sweep import run_dedup_sweep
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        report = run_dedup_sweep(store, persona_dir)
+    finally:
+        store.close()
+
+    print(f"groups merged: {report.groups_merged}")
+    print(f"rows removed:  {report.rows_removed}")
+    print(f"archive:       {report.archive_path}")
+    if args.json:
+        print(json.dumps(report.as_log(), indent=2))
+    return 0
+
+
 def _open_memory_store_for_cli(persona: str) -> tuple[MemoryStore | None, int]:
     """Open a persona memory store for read-only CLI inspection."""
     persona_dir = get_persona_dir(persona)
@@ -663,9 +699,8 @@ def _dream_handler(args: argparse.Namespace) -> int:
                 persona_dir=persona_dir,
                 persona_name=args.persona,
                 persona_system_prompt=(
-                    f"You are {args.persona}. You just woke from a dream about "
-                    "interconnected memories. Reflect in first person, 2-3 sentences, "
-                    "starting with 'DREAM: '. Be honest and specific, not abstract."
+                    _DREAM_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                    + _DREAM_SYSTEM_PROMPT_SEGMENTS[1]
                 ),
                 soul_store=soul_store,
             )
@@ -732,7 +767,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
                 research_log_path=persona_dir / "research_log.json",
                 default_interests_path=_default_interests_path(),
                 persona_name=args.persona,
-                persona_system_prompt=f"You are {args.persona}.",
+                persona_system_prompt=(
+                    _HEARTBEAT_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                    + _HEARTBEAT_SYSTEM_PROMPT_SEGMENTS[1]
+                ),
             )
             result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
         finally:
@@ -837,7 +875,10 @@ def _reflex_handler(args: argparse.Namespace) -> int:
             store=store,
             provider=provider,
             persona_name=args.persona,
-            persona_system_prompt=f"You are {args.persona}.",
+            persona_system_prompt=(
+                _REFLEX_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                + _REFLEX_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
             arcs_path=persona_dir / "reflex_arcs.json",
             log_path=persona_dir / "reflex_log.json",
             default_arcs_path=default_arcs_path,
@@ -892,7 +933,10 @@ def _research_handler(args: argparse.Namespace) -> int:
             provider=provider,
             searcher=searcher,
             persona_name=args.persona,
-            persona_system_prompt=f"You are {args.persona}.",
+            persona_system_prompt=(
+                _RESEARCH_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                + _RESEARCH_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=_default_interests_path(),
@@ -1717,7 +1761,12 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     """
     from brain.chat.engine import respond
     from brain.chat.session import create_session
-    from brain.ingest.pipeline import close_session
+    from brain.ingest.pipeline import close_session, extract_session_snapshot
+
+    # #203: default exit is a NON-destructive snapshot (matches the GUI, which
+    # only ever calls /sessions/snapshot). close_session deletes the buffer,
+    # which starves cascade-compaction / archive / rollover. --close opts in.
+    flush_session = close_session if getattr(args, "close", False) else extract_session_snapshot
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
@@ -1755,7 +1804,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                 # one-shot reply orphans its buffer file and no memories
                 # ever commit (live-exercise 2026-04-27 surfaced the bug).
                 try:
-                    close_session(
+                    flush_session(
                         persona_dir,
                         result.session_id,
                         store=store,
@@ -1800,7 +1849,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             finally:
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
-                    close_session(
+                    flush_session(
                         persona_dir,
                         session.session_id,
                         store=store,
@@ -2698,6 +2747,18 @@ def _build_parser() -> argparse.ArgumentParser:
     ds_refresh.add_argument("--persona", required=True, help="Persona name (required).")
     ds_refresh.set_defaults(func=_daemon_state_refresh_handler)
 
+    # nell dedup-sweep — P3 retention rework, Change 4: one-time retroactive
+    # duplicate cleanup over an existing corpus.
+    dd_sub = subparsers.add_parser(
+        "dedup-sweep",
+        help="One-time retroactive duplicate cleanup (exact-normalize merge, loss-preserving).",
+    )
+    dd_sub.add_argument("--persona", required=True, help="Persona name (required).")
+    dd_sub.add_argument(
+        "--json", action="store_true", help="Also print the full report as JSON."
+    )
+    dd_sub.set_defaults(func=_dedup_sweep_handler)
+
     # nell works — read-only inspection of brain-authored creative artifacts.
     # Saving is brain-territory via the save_work MCP tool, not a CLI command.
     w_sub = subparsers.add_parser(
@@ -2912,6 +2973,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Bypass the bridge daemon and call engine.respond() in-process.",
+    )
+    chat_sub.add_argument(
+        "--close",
+        action="store_true",
+        default=False,
+        help=(
+            "On exit, finalise the session and delete its conversation buffer. "
+            "Default is a non-destructive snapshot that preserves the buffer "
+            "for compaction / archive / rollover (same as the GUI)."
+        ),
     )
     chat_sub.add_argument(
         "--bridge-only",

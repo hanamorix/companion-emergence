@@ -284,7 +284,7 @@ def registry_lock() -> threading.RLock:
     return _LOCK
 
 
-def persist_turns_following_successor(persona_dir: Path, records: list[dict]) -> None:
+def persist_turns_following_successor(persona_dir: Path, records: list[dict]) -> str | None:
     """Append ``records`` to their session buffer, redirecting each to the rolled-over
     successor when one exists — all under ``registry_lock()`` so the redirect+append
     is atomic against a concurrent rollover's pointer-write-then-buffer-delete.
@@ -302,8 +302,22 @@ def persist_turns_following_successor(persona_dir: Path, records: list[dict]) ->
         recreated (no resurrection / orphaned turn).
 
     Errors propagate to the caller (``_persist_turn`` wraps them in its best-effort
-    try/except, preserving the "persist failure never breaks the reply" contract)."""
-    from brain.ingest.buffer import ingest_turn
+    try/except, preserving the "persist failure never breaks the reply" contract).
+
+    #225: for any ``speaker == "user"`` record in ``records``, resolves its ``ts``
+    (``rec.get("ts") or`` now, same default ``ingest_turn`` would otherwise apply
+    invisibly) BEFORE calling ``ingest_turn``, and returns that resolved ts to the
+    caller — so ``engine.py``'s ``_persist_turn`` can fire
+    ``presence_state.record_inbound_turn(...)`` with the exact persisted timestamp,
+    without a second buffer read. Returns None if no user-speaker record was in this
+    batch. If more than one appears, the ts of the LAST one is returned and a debug
+    log is emitted — a signal for a future multi-user-turn batch, not an error; every
+    current caller passes at most one user-speaker record per batch.
+    """
+    from brain.ingest.buffer import _now_iso, ingest_turn
+
+    resolved_user_ts: str | None = None
+    user_record_count = 0
 
     with _LOCK:
         for rec in records:
@@ -312,7 +326,21 @@ def persist_turns_following_successor(persona_dir: Path, records: list[dict]) ->
                 successor = _resolve_successor(persona_dir, sid)
                 if successor is not None:
                     rec = {**rec, "session_id": successor}
+            if rec.get("speaker") == "user":
+                ts = rec.get("ts") or _now_iso()
+                rec = {**rec, "ts": ts}
+                resolved_user_ts = ts
+                user_record_count += 1
             ingest_turn(persona_dir, rec)
+
+    if user_record_count > 1:
+        logger.debug(
+            "persist_turns_following_successor: %d user-speaker records in one "
+            "batch; returning ts of the last one (%s)",
+            user_record_count,
+            resolved_user_ts,
+        )
+    return resolved_user_ts
 
 
 def all_sessions() -> list[SessionState]:

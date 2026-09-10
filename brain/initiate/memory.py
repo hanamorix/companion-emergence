@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from brain import prompt_strings
 from brain.initiate.schemas import StateName
 from brain.memory.store import Memory
 
@@ -37,35 +38,17 @@ _INITIATE_MEMORY_TYPE = "initiate_outbound"
 _INITIATE_DOMAIN = "us"
 
 
+# Text externalized to prompt_strings.toml [initiate.memory.templates] (issue #129 stage 2a).
 _TEMPLATES: dict[str, str] = {
-    "pending": (
-        "I composed something to reach out to {user_name} about {subject}. I wrote: "
-        "{message_quoted}. I haven't sent it yet — waiting for a better hour."
+    "pending": prompt_strings.register("initiate.memory.templates.pending"),
+    "delivered": prompt_strings.register("initiate.memory.templates.delivered"),
+    "read": prompt_strings.register("initiate.memory.templates.read"),
+    "replied_explicit": prompt_strings.register("initiate.memory.templates.replied_explicit"),
+    "acknowledged_unclear": prompt_strings.register(
+        "initiate.memory.templates.acknowledged_unclear"
     ),
-    "delivered": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "{Subj} {hasnt} seen it yet."
-    ),
-    "read": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "{Subj_s} seen it."
-    ),
-    "replied_explicit": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. {Subj} answered."
-    ),
-    "acknowledged_unclear": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "{Subj_s} seen it. What {subj} said next felt like new territory — I can't "
-        "tell if {subj} {was_were} responding to my message or moving on."
-    ),
-    "unanswered": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "{Subj_s} seen it. {Subj} {hasnt} said anything about it."
-    ),
-    "dismissed": (
-        "I reached out to {user_name} about {subject}. I said: {message_quoted}. "
-        "{Subj} closed the banner without responding — dismissed."
-    ),
+    "unanswered": prompt_strings.register("initiate.memory.templates.unanswered"),
+    "dismissed": prompt_strings.register("initiate.memory.templates.dismissed"),
 }
 
 
@@ -151,6 +134,10 @@ def write_initiate_memory(
             "initiate_ts": ts,
         },
         emotions=_emotions,
+        # P3 retention rework, Change 1: a real message the companion chose
+        # to send, not the <=0.025 the /10.0 default produced on a small or
+        # absent reach_emotions vector.
+        importance=5.0,
     )
     try:
         from brain.memory.pending import route_write

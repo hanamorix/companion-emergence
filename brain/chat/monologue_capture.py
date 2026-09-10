@@ -48,7 +48,7 @@ def capture_monologue(
     monologue: str,
     feed_digest: str,
     surface: bool = True,
-) -> str:
+) -> str | None:
     """Validate, persist the Tier-2 trace memory + the gated Tier-3 digest line.
 
     Returns the monologue text. Raises CaptureRejected on validation failure
@@ -88,7 +88,10 @@ def capture_monologue(
 
         recent = PendingQueue(store.persona_dir).read_recent(MONOLOGUE_TRACE_TYPE, limit=1)
         if recent and recent[0].content == monologue:
-            return monologue
+            # #175: None tells the caller this was a dedupe, not a capture, so
+            # dispatch does not emit monologue_text for the duplicate (the key
+            # the audit row and the pass-2 trigger key on).
+            return None
     except Exception:  # noqa: BLE001
         logger.debug("monologue dedupe lookup failed; capturing anyway", exc_info=True)
 

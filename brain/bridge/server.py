@@ -47,7 +47,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
-from brain import tunables
+from brain import prompt_strings, tunables
 from brain.bridge import events
 from brain.bridge.chat import (
     ChatMessage,
@@ -72,12 +72,18 @@ from brain.chat.session import (
 from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
+from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [bridge.server] (issue #129 stage 2b).
+_HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "bridge.server.heartbeat_close_system_prompt_segments"
+)
 
 # Browser/WebView origins that are allowed to call the localhost bridge.
 # HTTP routes are still bearer-token protected; CORS is only the browser's
@@ -638,7 +644,10 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
             / "engines"
             / "default_interests.json",
             persona_name=persona_dir.name,
-            persona_system_prompt=f"You are {persona_dir.name}.",
+            persona_system_prompt=(
+                _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[0] + persona_dir.name
+                + _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
         )
         engine.run_tick(trigger="close", dry_run=False)
 
@@ -777,13 +786,15 @@ class ChatHistoryResponse(BaseModel):
 
     messages: list[ChatHistoryEntry]
     next_before_turn: int | None
+    # The sid actually served — differs from the request sid after a rollover
+    # redirect (#199), mirroring /chat's echo of the resolved sid.
+    session_id: str
 
 
-# Buffer session_id grammar — matches brain.ingest.buffer._SESSION_ID_RE
-# so /chat/history can serve any legitimately written session file (UUIDs
-# from the bridge plus the ``sess_<8hex>`` fallback). Stricter than
+# Buffer session_id grammar — THE buffer grammar, imported rather than copied
+# (#201), so /chat/history can serve any legitimately written session file
+# (UUIDs from the bridge plus the ``sess_<8hex>`` fallback). Stricter than
 # ChatReq (which requires UUIDs) but still rejects path traversal.
-_BUFFER_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +849,7 @@ def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 5.0,
+    silence_minutes: float = 10.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -2344,7 +2355,8 @@ def build_app(
         # Collect (sha, first_ts) pairs from buffer files
         seen: dict[str, str] = {}  # sha → first_seen_ts
         if buffers_dir.is_dir():
-            for buf_path in sorted(buffers_dir.glob("*.jsonl")):
+
+            def _scan(buf_path: Path) -> None:
                 try:
                     for line in _read_jsonl_lines(buf_path):
                         turn_ts = line.get("ts") or line.get("at", "")
@@ -2363,6 +2375,21 @@ def build_app(
                         buf_path,
                         exc_info=True,
                     )
+
+            # A rollover can delete a globbed buffer (and write its successor)
+            # between this snapshot and the read — before OR during the read.
+            # If any globbed file is gone afterwards, re-glob once and scan
+            # only the paths not yet seen, so the successor's image_shas are
+            # served instead of a silent [] (#197). Dedupe is min-by-ts, so
+            # the extra scan is safe.
+            paths = sorted(buffers_dir.glob("*.jsonl"))
+            for buf_path in paths:
+                _scan(buf_path)
+            if any(not p.exists() for p in paths):
+                scanned = set(paths)
+                for buf_path in sorted(buffers_dir.glob("*.jsonl")):
+                    if buf_path not in scanned:
+                        _scan(buf_path)
 
         # Filter by before_ts
         if before_ts is not None:
@@ -2443,10 +2470,11 @@ def build_app(
         # Follow a rollover's ``rolled_to`` pointer like /chat does, so a renderer
         # that reloads history after a rollover sees the successor's turns rather
         # than an empty "fresh session" (hunts/bridge-order-pollution-flakes, C3).
-        # Divergences from /chat, deliberate for a read-only GET: an unresolvable
+        # Divergence from /chat, deliberate for a read-only GET: an unresolvable
         # (cyclic / corrupt) pointer falls back to the request sid with a WARNING
-        # instead of a 404; ``before_turn`` cursors are not translated across the
-        # redirect and the resolved sid is not echoed back (both deferred).
+        # instead of a 404. On a redirect the ``before_turn`` cursor is dropped
+        # (#199): it was computed against the OLD buffer's line index and means
+        # nothing against the successor's — serve the newest page instead.
         from brain.chat.session import resolve_successor
         from brain.ingest.buffer import read_rolled_to
 
@@ -2479,8 +2507,10 @@ def build_app(
             if again is not None and _BUFFER_SESSION_ID_RE.fullmatch(again):
                 resolved = again
                 path = s.persona_dir / "active_conversations" / f"{resolved}.jsonl"
+        if resolved != session_id:
+            before_turn = None
         if not path.exists():
-            return ChatHistoryResponse(messages=[], next_before_turn=None)
+            return ChatHistoryResponse(messages=[], next_before_turn=None, session_id=resolved)
 
         entries: list[ChatHistoryEntry] = []
         # 1-based line index = turn cursor. Corrupt lines are dropped by
@@ -2509,7 +2539,9 @@ def build_app(
         # order returned; older pages come back via ``before_turn``.
         trimmed = entries[-limit:]
         next_cursor = trimmed[0].turn if trimmed and len(entries) > len(trimmed) else None
-        return ChatHistoryResponse(messages=trimmed, next_before_turn=next_cursor)
+        return ChatHistoryResponse(
+            messages=trimmed, next_before_turn=next_cursor, session_id=resolved
+        )
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])

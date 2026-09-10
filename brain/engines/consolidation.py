@@ -31,12 +31,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain import prompt_strings
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [engines.consolidation] (issue #129 stage 2c).
+_REAPPRAISER_PROMPT = prompt_strings.register("engines.consolidation.reappraiser_prompt")
+_CLASSIFIER_PROMPT = prompt_strings.register("engines.consolidation.classifier_prompt")
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
@@ -66,6 +71,12 @@ class Decision:
 
 Classifier = Callable[[Memory, list[Memory]], Decision]
 
+# P3 retention rework, Change 3: importance re-rating on recall, via the
+# pending queue. A Reappraiser judges a fresh importance for an EXISTING
+# memory (not a Pass-2 candidate decision) — same injectable-seam shape as
+# Classifier, so tests pass a fake returning a known value.
+Reappraiser = Callable[[Memory], float]
+
 
 @dataclass
 class ConsolidationResult:
@@ -79,6 +90,7 @@ class ConsolidationResult:
     corrections: int = 0
     continuations: int = 0
     deferred: int = 0
+    reappraised: int = 0
 
     def as_log(self) -> dict:
         return {
@@ -91,6 +103,7 @@ class ConsolidationResult:
             "corrections": self.corrections,
             "continuations": self.continuations,
             "deferred": self.deferred,
+            "reappraised": self.reappraised,
             "skipped": self.skipped,
         }
 
@@ -119,11 +132,17 @@ def run_consolidation(
     provider=None,
     hebbian: HebbianMatrix | None = None,
     salience_floor: float | None = None,
+    reappraiser: Reappraiser | None = None,
 ) -> ConsolidationResult:
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
     Returns a ConsolidationResult; ``skipped=True`` when a concurrent gate holds
     the lock. Does not raise on a bad candidate (skips it).
+
+    reappraiser: Change 3's injectable importance re-appraiser. None (default)
+        builds the Haiku-backed default when `provider` is given, else
+        degrades to the no-op fallback (importance unchanged) — mirrors the
+        classifier's degrade-to-`_promote_all_classifier` pattern.
     """
     persona_dir = Path(persona_dir)
     lock_path = persona_dir / _GATE_LOCK_FILENAME
@@ -141,9 +160,15 @@ def run_consolidation(
                     "degrading to promote-all (Pass-1 dedup only)"
                 )
                 classifier = _promote_all_classifier
-        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor)
+        if reappraiser is None:
+            reappraiser = _make_haiku_reappraiser(provider) if provider is not None else _noop_reappraiser
+        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
+
+
+def _is_reappraise_item(entry: dict) -> bool:
+    return isinstance(entry, dict) and entry.get("_route") == "reappraise_importance"
 
 
 def _run_locked(
@@ -152,15 +177,27 @@ def _run_locked(
     classifier: Classifier,
     hebbian: HebbianMatrix | None,
     salience_floor: float | None,
+    reappraiser: Reappraiser | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
     batch = pending.drain()
-    result = ConsolidationResult(batch=len(batch))
-    if not batch:
+
+    # Change 3: split out existing-memory re-appraise items BEFORE the normal
+    # Pass-1/Pass-2 candidate pipeline — they are not candidates (no dedup,
+    # no promotion), just an in-place importance UPDATE on an already-committed
+    # row. `result.batch` counts only true candidates, matching its pre-Change-3
+    # meaning.
+    reappraise_entries = [e for e in batch if _is_reappraise_item(e)]
+    candidate_entries = [e for e in batch if not _is_reappraise_item(e)]
+
+    result = ConsolidationResult(batch=len(candidate_entries))
+    if reappraise_entries:
+        _handle_reappraisals(store, reappraise_entries, reappraiser or _noop_reappraiser, result)
+    if not candidate_entries:
         return result
 
     candidates: list[Memory] = []
-    for entry in batch:
+    for entry in candidate_entries:
         try:
             candidates.append(Memory.from_dict(entry))
         except (KeyError, ValueError, TypeError):
@@ -237,6 +274,78 @@ def _related_existing(store: MemoryStore, cand: Memory, *, limit: int = 8) -> li
                 if len(out) >= limit:
                     return out
     return out
+
+
+def _noop_reappraiser(memory: Memory) -> float:
+    """No-provider fallback (Change 3 default when no provider is configured):
+    importance unchanged. There is NO mechanism-driven monotone climb — this
+    is what dissolves the recall-frequency-ratchet risk at the root (STAGE-3
+    CORRECTION finding #2)."""
+    return memory.importance
+
+
+def _make_haiku_reappraiser(provider) -> Reappraiser:
+    """Build the Haiku-backed default importance re-appraiser (Change 3).
+
+    Judges importance fresh from the memory's content in the moment it is
+    re-appraised, not from how often it has been recalled: a still-relevant
+    journal entry keeps or raises its importance, a past-due appointment
+    (Roy's jury-duty case) drops. Output is clamped [0, 10] by the caller
+    (`_handle_reappraisals`) via the shared `clamp_importance`. On any parse/
+    provider failure the fallback is the memory's CURRENT importance (a
+    no-op) — never a crash, never a ratchet."""
+    prompt = _REAPPRAISER_PROMPT
+
+    def _reappraise(memory: Memory) -> float:
+        try:
+            raw = provider.generate(memory.content[:400], system=prompt)
+            match = re.search(r"-?\d+(\.\d+)?", raw)
+            if not match:
+                return memory.importance
+            return float(match.group(0))
+        except Exception:  # noqa: BLE001 — a provider fault must not lose the row
+            logger.warning("consolidation Haiku reappraise failed; importance unchanged")
+            return memory.importance
+
+    return _reappraise
+
+
+def _handle_reappraisals(
+    store: MemoryStore,
+    entries: list[dict],
+    reappraiser: Reappraiser,
+    result: ConsolidationResult,
+) -> None:
+    """Process Change-3 existing-memory re-appraise items: load the target
+    row, compute a new importance via the injectable `reappraiser`, and
+    UPDATE it in place (never an INSERT — C3.1).
+
+    A row missing at the read (already gone before this tick) or hard-deleted
+    between the read and the write (a concurrent forgetting LOSE, or a delete
+    triggered mid-appraisal) is skipped: no resurrection, no crash (C3.2).
+    The `store.update` call is wrapped in `try/except KeyError`, mirroring
+    the merge-dispatch idiom above (`_dispatch`'s `verdict == "merge"` branch).
+    """
+    for entry in entries:
+        memory_id = entry.get("memory_id")
+        if not memory_id or not isinstance(memory_id, str):
+            logger.warning("consolidation gate: dropping unparseable reappraise item")
+            continue
+        memory = store.get(memory_id, bump=False)
+        if memory is None:
+            continue  # already gone — no resurrection
+        try:
+            new_importance = reappraiser(memory)
+        except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
+            logger.exception("consolidation gate: reappraiser raised; skipping")
+            continue
+        try:
+            store.update(memory_id, importance=clamp_importance(new_importance))
+        except KeyError:
+            # Deleted between the read above and this write — absorbed, not
+            # raised (finding #3).
+            continue
+        result.reappraised += 1
 
 
 def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None:
@@ -324,17 +433,7 @@ def _make_haiku_classifier(provider) -> Classifier:
     the gating criteria verify. On any parse/provider failure the candidate is
     promoted (fail-open toward keeping content).
     """
-    prompt = (
-        "You consolidate a companion's auto-generated memory candidates. Given a "
-        "CANDIDATE and EXISTING related memories, reply with ONE JSON object: "
-        '{"verdict": one of ["duplicate","merge","distinct","correction",'
-        '"continuation","new"], "target_id": <existing id or null>, '
-        '"merged_content": <string or null>}. '
-        "duplicate=already fully captured; merge=near-duplicate adding info "
-        "(give target_id + a minimal surgical merged_content); correction/"
-        "continuation=keep as its own memory linked to target_id; distinct/new="
-        "keep fresh. Reply with JSON only."
-    )
+    prompt = _CLASSIFIER_PROMPT
 
     def _classify(cand: Memory, context: list[Memory]) -> Decision:
         ctx = "\n".join(f"- id={m.id}: {m.content[:200]}" for m in context) or "(none)"

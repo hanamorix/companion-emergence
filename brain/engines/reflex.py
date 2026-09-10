@@ -447,11 +447,18 @@ class ReflexEngine:
 
         trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
 
+        # P3 retention rework, Change 1: reflex arc output is reflexive
+        # self-behavior with moderate retention value, not the ~0.0 the
+        # emotions={} default would otherwise produce. A journal-shaped arc
+        # output gets the journal_entry importance (6.0) for parity with
+        # add_journal's direct-write path.
+        reflex_importance = 6.0 if arc.output_memory_type == "journal_entry" else 4.0
         mem = Memory.create_new(
             content=raw,
             memory_type=arc.output_memory_type,
             domain="us",
             emotions={},
+            importance=reflex_importance,
             metadata={
                 "arc_name": arc.name,
                 "trigger_state": trigger_state,
