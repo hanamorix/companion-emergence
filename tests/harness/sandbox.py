@@ -680,6 +680,11 @@ def _run_live_check(
 _HARNESS_AUTHED_MARKER = ".harness-authed"
 
 
+def _is_darwin() -> bool:
+    """Seam for tests (patching ``sys.platform`` globally breaks unrelated stdlib paths on Windows)."""
+    return sys.platform == "darwin"
+
+
 def _harness_config_dir() -> Path:
     """The stable, harness-owned ``CLAUDE_CONFIG_DIR`` a developer logs into ONCE (#236).
 
@@ -709,7 +714,7 @@ def _seed_auth(claude_config_dir: Path) -> str:
     cred = Path.home() / ".claude" / ".credentials.json"
     # On macOS the real credential is a per-dir Keychain entry; any ~/.claude/.credentials.json is a
     # stale leftover that does NOT authenticate a fresh dir (#236). Only the authed harness dir counts.
-    if cred.is_file() and sys.platform != "darwin":
+    if cred.is_file() and not _is_darwin():
         shutil.copy2(cred, claude_config_dir / ".credentials.json")
         return "credentials-file"
     # No cred file. On a Mac the credential may be in the Keychain (a fresh CLAUDE_CONFIG_DIR still
@@ -975,10 +980,19 @@ def sandbox(
         work_dir = root / "work"
         work_dir.mkdir(parents=True, exist_ok=True)
         # Carrier C — synthetic HOME: an empty ~/.claude (no CLAUDE.md) so the CLI's global user-memory
-        # resolves to nothing real whichever way it keys (HOME vs CLAUDE_CONFIG_DIR). Auth is unaffected:
-        # the credentials live under CLAUDE_CONFIG_DIR (seeded), not HOME.
+        # resolves to nothing real whichever way it keys (HOME vs CLAUDE_CONFIG_DIR). Auth lives under
+        # CLAUDE_CONFIG_DIR (or, on macOS, in the Keychain — see the symlink below), not HOME.
         syn_home = root / "home"
         (syn_home / ".claude").mkdir(parents=True, exist_ok=True)
+        # #236: on macOS the CLI's per-dir credential is a Keychain entry, and the Keychain is found
+        # via $HOME/Library/Keychains — so a bare synthetic HOME hides it and every live turn fails
+        # with "Not logged in". Link the REAL Keychains dir into the synthetic HOME (read via
+        # `security`; the login keychain itself stays where it is). Nothing else from ~/Library.
+        if _is_darwin():
+            real_keychains = Path.home() / "Library" / "Keychains"  # HOME is still REAL here
+            if real_keychains.is_dir():
+                (syn_home / "Library").mkdir(parents=True, exist_ok=True)
+                (syn_home / "Library" / "Keychains").symlink_to(real_keychains, target_is_directory=True)
         if saved_cwd is not None:
             os.chdir(work_dir)
         os.environ["HOME"] = str(syn_home)

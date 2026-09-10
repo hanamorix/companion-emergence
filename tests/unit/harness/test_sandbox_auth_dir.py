@@ -95,7 +95,7 @@ def test_darwin_never_trusts_a_copied_credentials_file(
     fake_home = _fake_home_without_credentials(monkeypatch, tmp_path)
     (fake_home / ".claude" / ".credentials.json").write_text('{"stale": true}')
     monkeypatch.setattr(sandbox_mod, "_harness_config_dir", lambda: tmp_path / "absent")
-    monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox_mod, "_is_darwin", lambda: True)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -110,8 +110,50 @@ def test_non_darwin_still_seeds_the_credentials_file(
     fake_home = _fake_home_without_credentials(monkeypatch, tmp_path)
     (fake_home / ".claude" / ".credentials.json").write_text('{"fake": true}')
     monkeypatch.setattr(sandbox_mod, "_harness_config_dir", lambda: tmp_path / "absent")
-    monkeypatch.setattr(sandbox_mod.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox_mod, "_is_darwin", lambda: False)
 
     with sandbox() as sb:
         assert sb.auth_source == "credentials-file"
         assert (sb.claude_config_dir / ".credentials.json").is_file()
+
+
+def test_synthetic_home_exposes_the_real_keychain_on_darwin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Carrier C swaps HOME for an empty synthetic one; on macOS the CLI's Keychain lives under
+    ``$HOME/Library/Keychains``, so the swap alone hides the per-dir credential and every live turn
+    fails with ``Not logged in`` (#236). The synthetic HOME must link the real Keychains dir."""
+    fake_home = _fake_home_without_credentials(monkeypatch, tmp_path)
+    (fake_home / "Library" / "Keychains").mkdir(parents=True)
+    monkeypatch.setattr(sandbox_mod, "_harness_config_dir", lambda: tmp_path / "absent")
+    monkeypatch.setattr(sandbox_mod, "_is_darwin", lambda: True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with sandbox():
+            link = Path(os.environ["HOME"]) / "Library" / "Keychains"
+            assert link.is_symlink()
+            assert link.resolve() == (fake_home / "Library" / "Keychains").resolve()
+
+
+def test_synthetic_home_has_no_keychain_link_off_darwin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_home = _fake_home_without_credentials(monkeypatch, tmp_path)
+    (fake_home / "Library" / "Keychains").mkdir(parents=True)
+    monkeypatch.setattr(sandbox_mod, "_harness_config_dir", lambda: tmp_path / "absent")
+    monkeypatch.setattr(sandbox_mod, "_is_darwin", lambda: False)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with sandbox():
+            assert not (Path(os.environ["HOME"]) / "Library" / "Keychains").exists()
+
+
+def test_setup_script_logs_in_as_the_synthetic_user() -> None:
+    """macOS stores the CLI credential with account=$USER and looks it up by $USER; the sandbox runs
+    the CLI as ``SYNTHETIC_USER``, so the one-time login must happen under that name (#236)."""
+    script = Path("scripts/setup_harness_claude_login.sh").read_text(encoding="utf-8")
+    assert "from tests.harness.config import SYNTHETIC_USER" in script
+    assert 'export USER="$SYN_USER" LOGNAME="$SYN_USER"' in script
+    assert script.index("export USER=") < script.index("claude auth login")

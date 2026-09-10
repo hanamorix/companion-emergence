@@ -18,11 +18,19 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Resolve the dir exactly as tests/harness/sandbox.py::_harness_config_dir does.
+# Resolve the dir exactly as tests/harness/sandbox.py::_harness_config_dir does, and the synthetic
+# user exactly as the sandbox's de-id installs it.
 HARNESS_CFG="$(uv run python -c 'import importlib; print(importlib.import_module("tests.harness.sandbox")._harness_config_dir())')"
+SYN_USER="$(uv run python -c 'from tests.harness.config import SYNTHETIC_USER; print(SYNTHETIC_USER)')"
 MARKER="$HARNESS_CFG/.harness-authed"
 
+# On macOS the CLI stores the credential in the Keychain with account = $USER and looks it up by
+# $USER. The sandbox runs the CLI with the SYNTHETIC user (env-only de-id), so the login must be
+# performed AS that user or the sandbox can never find it ("Not logged in"). Harmless elsewhere.
+export USER="$SYN_USER" LOGNAME="$SYN_USER"
+
 echo "Harness claude config dir: $HARNESS_CFG"
+echo "Login stored under synthetic user: $SYN_USER (what the sandbox presents to the CLI)"
 mkdir -p "$HARNESS_CFG"
 
 if ! command -v claude >/dev/null 2>&1; then
