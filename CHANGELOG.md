@@ -9,9 +9,10 @@ what each release has to clear.
 
 ## 0.0.42 — 2026-09-10
 
-**Images work again, memory learned to rank and forget on purpose, and the bridge stopped dropping things across a session rollover.**
+**Images work again, her memory stopped talking to itself, and the bridge stopped dropping things across a session rollover.**
 
 ### Added
+- **Memory gate: generated vs genuine.** Inner activity — monologue, dream fragments, reflex notes — used to be written straight into the same database as memories. Recall pulled the most recent rows first, so a thought she had just written came back the very next turn as if it were something remembered: the memory store had become an ad-hoc chain-of-thought loop, recirculating recent thinking as fact and crowding her context with generated noise. Generated content now lands in a holding queue and passes a consolidation gate (a mechanical salience and dedup check, then a Haiku-judged near-duplicate check) before anything reaches the memory store. Together with the recency-to-relevance retrieval change below, that breaks the loop: memory is a record of what happened and impressions of it, not a feedback path for thoughts.
 - **Cascade compaction + session rollover.** Long conversations are now summarised in three age-stratified tiers instead of one flat summary, and a session rolls over on an idle gate rather than a hard wall. The old summary could be truncated by budget; the new one survives.
 - **Memory relevance overhaul.** Recall now ranks with FTS5/BM25, reads a snippet before committing to a full memory, and retrieves iteratively — so "search_memories" surfaces what matters rather than what is newest.
 - **Retention rework.** Forgetting is importance-driven: memories re-rate themselves on recall, weak duplicates are swept, and a one-time cleanup pass removes identical rows already accumulated.
