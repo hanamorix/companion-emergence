@@ -77,6 +77,7 @@ def test_generic_live_run(tmp_path) -> None:
 
     # 2. Run inside the sandbox: seed Canary, stand up the real bridge, drive a few turns.
     with sandbox() as sb:
+        _skip_unless_authed(sb)
         spec = PersonaSpec(memories=[
             MemorySeed(content="Bob is teaching himself to bake sourdough."),
             MemorySeed(content="Bob's weekend plan is a hike if the weather holds."),
@@ -107,6 +108,15 @@ def test_generic_live_run(tmp_path) -> None:
                     print(f"[turn {turn}] demo detector TRIP: {score.signals}")
         finally:
             server.stop()
+
+
+def _skip_unless_authed(sb) -> None:
+    """A sandbox with no usable CLI login can only fail at the first turn (#236) — skip, loudly."""
+    if sb.auth_source == "unauthenticated":
+        pytest.skip(
+            "sandbox has no claude login: run `bash scripts/setup_harness_claude_login.sh` once "
+            "(gives the harness its own CLAUDE_CONFIG_DIR + Keychain entry)"
+        )
 
 
 def _new_session(server: BridgeServer) -> str:

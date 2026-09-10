@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import warnings
 from pathlib import Path
 
@@ -81,7 +82,8 @@ def test_real_engine_precedence_is_used_not_a_proxy(
         assert get_home() == sb.root.resolve()
         assert os.environ["CLAUDE_CONFIG_DIR"] == str(sb.claude_config_dir)
         assert sb.claude_config_dir.is_relative_to(sb.root)
-        assert (sb.claude_config_dir / ".credentials.json").exists()  # auth seeded (G1c)
+        # auth seeded (G1c) — except on macOS, where a copied file never authenticates (#236)
+        assert (sb.claude_config_dir / ".credentials.json").exists() == (sys.platform != "darwin")
 
 
 def test_nellbrain_home_is_unset_inside(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

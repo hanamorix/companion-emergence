@@ -47,9 +47,14 @@ Every run is a `with sandbox() as sb:` block. Inside it:
   (`brain/bridge/provider.py:174`), so the `claude` CLI reads the sandbox's config, not your
   `~/.claude`.
 - `NELLBRAIN_HOME` is **unset** (a stray value would otherwise win the fallback).
-- **Auth-only seed:** only `~/.claude/.credentials.json` is copied in — never your `CLAUDE.md`,
-  settings, skills, or plugins. On a Mac the credential may be in the Keychain; a fresh
-  `CLAUDE_CONFIG_DIR` still authenticates via Keychain (recorded on `sb.auth_source`).
+- **Auth (#236):** run `bash scripts/setup_harness_claude_login.sh` once. It logs `claude` in under a
+  stable harness-owned dir (`…/companion-emergence-harness/claude-config`, outside every guarded root)
+  and writes `.harness-authed`; the sandbox then uses that dir as `CLAUDE_CONFIG_DIR`
+  (`sb.auth_source == "harness-dir"`). An explicit `CLAUDE_CONFIG_DIR` keys its own per-path Keychain
+  credential and never falls back to your default login, so a fresh tempdir is always "Not logged in"
+  on a Mac. Fallback on non-Mac hosts: only `~/.claude/.credentials.json` is copied into the tempdir
+  config — never your `CLAUDE.md`, settings, skills, or plugins. Neither ⇒ `"unauthenticated"` and the
+  live examples skip with the setup command in the reason.
 - The persona's config stays at its safe brain defaults (`notes_enabled=false` +
   `kindled_relay_url=null`) — the harness does **not** force them. The real guard is the isolation
   layer (this redirect + the leak fingerprint), not forcing config values. An author may opt in:
