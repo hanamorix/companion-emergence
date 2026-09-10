@@ -109,9 +109,8 @@ def test_generic_live_run(tmp_path) -> None:
             server.stop()
 
 
-def _new_session(server: BridgeServer) -> str:  # pragma: no cover - needs live bridge
-    import httpx
+def _new_session(server: BridgeServer) -> str:
+    # Reuse the harness client: /session/new takes a required JSON body (#234 — a bare POST is 422).
+    from tests.harness.agent_send import new_session
 
-    r = httpx.post(f"http://{server.host}:{server.port}/session/new", timeout=30)
-    r.raise_for_status()
-    return r.json()["session_id"]
+    return new_session(server.port, None)

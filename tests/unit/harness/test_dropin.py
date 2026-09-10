@@ -371,3 +371,19 @@ def test_c5_fires_on_known_bad_inputs(tmp_path: Path) -> None:
     inside_origin = build.repo / "brain" / "__init__.py"
     assert not dropin_mod._is_under(outside_origin, build.repo)
     assert dropin_mod._is_under(inside_origin, build.repo)
+
+
+# --- #235: dangling symlinks in the source tree must not abort the copy -------------------------
+
+
+def test_ingest_survives_dangling_symlink_in_source(tmp_path: Path) -> None:
+    """A tool-left dangling symlink (e.g. an untracked ``.claude/skills/x``) is not part of the
+    version under test and must not abort ``ingest_version`` (#235)."""
+    src = _source_repo(tmp_path)
+    (src / ".claude" / "skills").mkdir(parents=True)
+    (src / ".claude" / "skills" / "dangling").symlink_to(tmp_path / "does-not-exist")
+    dest = tmp_path / "dest"
+
+    build = ingest_version(src, dest, deps="none", install_guard=False)
+
+    assert (build.repo / "brain" / "__init__.py").is_file()
