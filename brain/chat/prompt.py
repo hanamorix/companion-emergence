@@ -1332,6 +1332,36 @@ def _build_recall_block(
             amount = 0.8 if n_fade == 1 else 0.8 - 0.7 * (i / (n_fade - 1))
             store.bump_recall(mem.id, amount)
 
+    # #231 Fix 2 (owner ruling, reappraisal-enqueue path-independence):
+    # "if a memory gets opened, it doesn't matter how it surfaced ... it
+    # goes back into the reappraisal queue." The fading bump above is
+    # already path-independent (runs regardless of `semantic_result`); the
+    # reappraisal ENQUEUE for those same surfaced fading ids must now match
+    # that, instead of staying gated to the inconclusive branch below.
+    #
+    # On the INCONCLUSIVE branch, the block below still folds these
+    # `seen_bump` fading ids into its own single enqueue call unchanged
+    # (`full_ids | seen_bump`) — untouched by this fix. So this block only
+    # needs to cover the CONCLUSIVE branch, where that block never runs.
+    #
+    # On the CONCLUSIVE branch, `_render_semantic_active_lines` already
+    # issued its OWN enqueue for its own surfaced ids (semantic full +
+    # snippet tiers) inside the call above. Fading state and the
+    # `list_active()`-sourced semantic candidate pool are mutually
+    # exclusive (a fading memory isn't part of `list_active()`), so
+    # `seen_bump` here should never overlap that call's ids in practice —
+    # but the overlap is subtracted defensively anyway so this can never
+    # double-enqueue an id even if that invariant is ever violated.
+    if semantic_result is not None and seen_bump:
+        from brain.memory.pending import PendingQueue
+
+        semantic_active_ids = {m.id for m in semantic_result.full} | {
+            m.id for m in semantic_result.snippet
+        }
+        fading_only_ids = seen_bump - semantic_active_ids
+        if fading_only_ids:
+            PendingQueue(persona_dir).enqueue_reappraisals(list(fading_only_ids), source="recall")
+
     if semantic_result is None and SNIPPET_MODE_ENABLED:
         bump_targets: list = []
         for mem in active_top:

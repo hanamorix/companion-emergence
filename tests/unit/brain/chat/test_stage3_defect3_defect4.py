@@ -52,6 +52,7 @@ from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
 from brain.forgetting import graveyard as gv
 from brain.forgetting.salience import SalienceInputs
+from brain.memory.pending import PendingQueue
 from brain.memory.semantic_recall import SemanticRecallResult
 from brain.memory.store import Memory, MemoryStore
 
@@ -381,3 +382,88 @@ def test_active_top_bump_stays_gated_to_inconclusive_branch(tmp_path: Path) -> N
     # reinforce a memory the user never actually saw.
     assert lexical_active_mem.id not in block
     assert _rc(store, lexical_active_mem.id) == before_lexical
+
+
+# ---------------------------------------------------------------------------
+# #231 Fix 2 — reappraisal-ENQUEUE is now PATH-INDEPENDENT (owner ruling: "if
+# a memory gets opened, it doesn't matter how it surfaced, it's been opened,
+# so treat it as a memory that's been opened ... it goes back into the
+# reappraisal queue"). Fix 1 (above) made the fading recall_count BUMP
+# path-independent but left the reappraisal ENQUEUE gated to
+# `semantic_result is None` — a surfaced fading memory on a CONCLUSIVE turn
+# got bumped but was never queued for reappraisal. These tests prove the
+# enqueue now fires on both branches, matching the bump's parity, and that a
+# conclusive turn's fading id is enqueued exactly once (no double-enqueue
+# against `_render_semantic_active_lines`'s own enqueue for the semantic
+# active ids).
+# ---------------------------------------------------------------------------
+
+
+def _reappraisal_ids(rows: list[dict]) -> list[str]:
+    return [r["memory_id"] for r in rows if r.get("_route") == "reappraise_importance"]
+
+
+def test_reappraisal_enqueue_fires_on_conclusive_semantic_turn(tmp_path: Path) -> None:
+    """Pre-fix (enqueue path-parity bug): the fading memory is bumped (Fix 1)
+    on a conclusive-semantic turn but never enqueued for reappraisal, because
+    the enqueue call was gated entirely on `semantic_result is None`.
+    Post-fix: the fading id is enqueued here too, exactly once — alongside
+    (not instead of) the semantic active id's own enqueue from
+    `_render_semantic_active_lines`."""
+    store, active_mem, fading_mem = _seed_fixture(tmp_path)
+    PendingQueue(tmp_path).drain()  # clear anything a fixture helper may have queued
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        block = _build_recall_block(store, "workshop rooftop Marcus", persona_dir=tmp_path)
+
+    assert "softened (fading" in block
+
+    reappraisal_ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+
+    # The fading memory is now enqueued for reappraisal on the conclusive
+    # branch, matching the inconclusive branch's existing behaviour.
+    assert reappraisal_ids.count(fading_mem.id) == 1
+
+    # The semantic-active standout is ALSO enqueued (its own pre-existing
+    # `_render_semantic_active_lines` enqueue) — both ids present, neither
+    # duplicated: no double-enqueue between the two enqueue call sites.
+    assert reappraisal_ids.count(active_mem.id) == 1
+    assert len(reappraisal_ids) == len(set(reappraisal_ids))
+
+
+def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tmp_path: Path) -> None:
+    """The core enqueue path-parity assertion: the SAME fading memory,
+    surfaced on a CONCLUSIVE-semantic turn, is enqueued for reappraisal just
+    as it is on an INCONCLUSIVE turn — proving the enqueue no longer depends
+    on which retrieval path produced the surfacing."""
+    store_a, active_mem, fading_a = _seed_fixture(tmp_path)
+    PendingQueue(tmp_path).drain()
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        _build_recall_block(store_a, "workshop rooftop Marcus", persona_dir=tmp_path)
+    ids_conclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert fading_a.id in ids_conclusive
+
+    store_b, _active_mem_b, fading_b = _seed_fixture(tmp_path)
+    PendingQueue(tmp_path).drain()
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
+    ids_inconclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert fading_b.id in ids_inconclusive

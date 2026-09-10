@@ -292,6 +292,15 @@ SCHEMAS: dict[str, dict] = {
                         "falls back to lexical automatically."
                     ),
                 },
+                "order": {
+                    "type": "string",
+                    "enum": ["relevance", "age"],
+                    "default": "relevance",
+                    "description": (
+                        "Match ordering: sorts by relevance (best fit, default). Age "
+                        "sorts by newest to oldest."
+                    ),
+                },
             },
             "required": ["query"],
         },

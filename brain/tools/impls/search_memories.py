@@ -8,7 +8,7 @@ from typing import Literal
 
 from brain.memory.embeddings import build_embedding_cache, cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.relevance import rank_memories, snippet_length
+from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
@@ -20,6 +20,7 @@ _CORECALL_FANOUT = 4        # anchor links to at most this many other results
 _CORECALL_MIN_RESULTS = 2   # below this there is nothing to associate
 
 SearchMode = Literal["semantic", "lexical"]
+SearchOrder = Literal["relevance", "age"]
 
 
 def _reinforce_corecall(hebbian, memories: list) -> None:
@@ -153,6 +154,7 @@ def search_memories(
     limit: int = 5,
     exclude_ids: list[str] | None = None,
     mode: SearchMode = "semantic",
+    order: SearchOrder = "relevance",
     *,
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -175,6 +177,25 @@ def search_memories(
         ``store._to_fts_match`` (so 'Henryk preferences personality' finds
         memories mentioning ANY token, as a union, not the empty
         AND-intersection).
+
+    ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
+    ordered before the final ``limit`` slice (#231, Planning-signed-off
+    option A):
+      - ``"relevance"`` (default): today's behavior, byte-identical — the
+        matched candidates are fetched at ``limit`` and used as-is, in
+        whatever order ``mode`` already ranked them.
+      - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
+        for BOTH modes — lexical calls ``rank_memories(..., limit=
+        CANDIDATE_POOL)``; semantic takes the top-``CANDIDATE_POOL`` by
+        cosine in ``_semantic_top_k`` (no relevance floor pulled in) — THEN
+        sorts that wider matched set by ``created_at`` DESC, THEN slices to
+        the caller's real ``limit``. A naive re-sort of an already-``limit``-
+        capped set would be subtly broken (it could only ever re-order the
+        few candidates ``mode`` happened to already rank highest) — widening
+        the fetch first is what makes an "age" ordering actually surface the
+        newest matches, not just the newest of the top few relevance hits.
+        Matching still happens FIRST by ``mode``; ``order`` only re-sorts the
+        matched set, never changes which memories matched.
 
     Both modes return at most ``limit`` candidates, already ranked;
     ``exclude_ids`` (already-surfaced + explicitly-rejected ids) are dropped
@@ -203,6 +224,9 @@ def search_memories(
                           fail-soft fallback, and any non-"semantic" request
                           — including an invalid/garbage value — is reported
                           as "lexical", the path that actually ran)
+        resolved_order — the ordering actually applied ("relevance" or
+                          "age" — any non-"age" requested value, including
+                          an invalid/garbage one, is reported as "relevance")
         emotion_filter — the emotion filter (or None)
         count          — number of results returned
         memories       — list of snippet-result dicts (``snippet: true`` + id)
@@ -216,13 +240,27 @@ def search_memories(
     # treated as "lexical" from the start, so `resolved_mode` always names
     # the retrieval path that is actually about to run, before it runs.
     resolved_mode: SearchMode = "semantic" if mode == "semantic" else "lexical"
+
+    # #231 Change 2: same advisory-enum posture as `mode` — any value other
+    # than "age" (including garbage/invalid) normalizes to "relevance".
+    resolved_order: SearchOrder = "age" if order == "age" else "relevance"
+
+    # "age" widens the internal fetch to CANDIDATE_POOL so there is an
+    # actually-wide matched set to age-sort before the real `limit` slice;
+    # "relevance" fetches exactly `limit`, unchanged from before this
+    # toggle existed — byte-identical default behavior.
+    fetch_limit = CANDIDATE_POOL if resolved_order == "age" else limit
+
     candidates: list[Memory] | None = None
     if resolved_mode == "semantic":
-        candidates = _semantic_top_k(store, persona_dir, query, limit=limit, exclude=exclude)
+        candidates = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
         if candidates is None:
             resolved_mode = "lexical"
     if candidates is None:
-        candidates = _lexical_candidates(store, hebbian, query, limit=limit, exclude=exclude)
+        candidates = _lexical_candidates(store, hebbian, query, limit=fetch_limit, exclude=exclude)
+
+    if resolved_order == "age":
+        candidates = sorted(candidates, key=lambda m: m.created_at, reverse=True)
 
     if emotion is not None:
         emotion_lower = emotion.lower().strip()
@@ -241,6 +279,7 @@ def search_memories(
     return {
         "query": query,
         "mode": resolved_mode,
+        "resolved_order": resolved_order,
         "emotion_filter": emotion,
         "count": len(results),
         "memories": results,
