@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain import prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
@@ -35,26 +36,19 @@ logger = logging.getLogger(__name__)
 # Bump on any change to the metadata shape or to what `content` means.
 RESEARCH_SCHEMA_VERSION = 2
 
-_TOPIC_OVERLAP_SYSTEM = """\
-You are a relevance scorer for an autonomous companion's research engine.
-You will be given (1) a research thread that just matured, and (2) recent
-conversation excerpts. Return a JSON object with a single field: score,
-a float in [0.0, 1.0] indicating how relevant the research thread is
-to the recent conversation.
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 1).
+_TOPIC_OVERLAP_SYSTEM = prompt_strings.register("engines.research.topic_overlap_system")
 
-  0.0 = entirely unrelated to anything {user_name} has been near
-  0.5 = thematic adjacency, no direct overlap
-  1.0 = directly addresses something {user_name} mentioned
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 1).
+_SELECT_SYSTEM = prompt_strings.register("engines.research.select_system")
 
-Be conservative — default toward the low end unless the connection
-is clearly present. Return ONLY the JSON object, no other text."""
-
-_SELECT_SYSTEM = """\
-You are choosing what to research today, as {persona_name}, from your own
-open threads. You will see up to five interests, each with your prior notes
-and related memories. Pick the ONE that genuinely pulls at you right now —
-or decline if nothing does. Return ONLY a JSON object:
-{{"choice": "<interest id>" | null, "why": "<one sentence, first person>"}}"""
+# Text externalized to prompt_strings.toml [engines.research] (issue #129 stage 2c).
+_TOPIC_OVERLAP_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "engines.research.topic_overlap_prompt_segments"
+)
+_RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "engines.research.render_system_prompt_segments"
+)
 
 
 def _compute_topic_overlap_via_haiku(
@@ -67,14 +61,10 @@ def _compute_topic_overlap_via_haiku(
 ) -> float:
     """Score how relevant a matured research thread is to recent conversation."""
     system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
+    seg = _TOPIC_OVERLAP_PROMPT_SEGMENTS
     prompt = (
-        "=== Research thread ===\n"
-        f"Topic: {thread_topic}\n"
-        f"Summary: {thread_summary}\n\n"
-        "=== Recent conversation (last 48 hours, oldest first) ===\n"
-        f"{recent_conversation_excerpt}\n\n"
-        "=== Your task ===\n"
-        'Return: {"score": <float in [0.0, 1.0]>}'
+        seg[0] + thread_topic + seg[1] + thread_summary + seg[2]
+        + recent_conversation_excerpt + seg[3]
     )
 
     try:
@@ -537,21 +527,8 @@ class ResearchEngine:
         )
 
     def _render_system_prompt(self) -> str:
-        return (
-            f"You are {self.persona_name}, spending quiet time on a research thread "
-            "of your own. Write plain prose under exactly three markers, nothing else:\n\n"
-            "NOTES:\n"
-            "<what you found — facts with sources, reactions, opinions, lists if lists "
-            "fit the subject. Free format. Continue from your prior notes; don't repeat "
-            "what's already written there.>\n\n"
-            "MEMORY:\n"
-            f"<2-4 sentences, first person as {self.persona_name} — how this session "
-            "felt, what surprised you.>\n\n"
-            "VERDICT:\n"
-            "<one line: continue | close | spawn: <new topic>; <new topic>>\n"
-            "('close' = this thread feels finished. 'spawn' = a tangent worth its own "
-            "thread — keep this one going.)"
-        )
+        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS
+        return seg[0] + self.persona_name + seg[1] + self.persona_name + seg[2]
 
     def _render_prompt(
         self,

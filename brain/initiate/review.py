@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain import prompt_strings
 from brain.initiate.adaptive import detect_drift
 from brain.initiate.audit import (
     append_audit_row,
@@ -66,6 +67,11 @@ logger = logging.getLogger(__name__)
 # crystallizations) are unaffected — this is a targeted soft gate, not a
 # global silence.  Fail-open: if body state is unreadable she keeps firing.
 _REST_ENERGY_THRESHOLD: int = 3
+
+# Text externalized to prompt_strings.toml [initiate.review] (issue #129 stage 2a).
+_VOICE_EDIT_TONE_RENDERED_SEGMENTS = prompt_strings.register_segments(
+    "initiate.review.voice_edit_tone_rendered_segments"
+)
 
 
 def _rest_state_from_energy(energy: int | None) -> bool:
@@ -117,11 +123,15 @@ def _process_one_candidate(
         if candidate.kind == "voice_edit_proposal":
             proposal = candidate.proposal or {}
             subject = proposal.get("rationale", "voice edit proposal")
+            tseg = _VOICE_EDIT_TONE_RENDERED_SEGMENTS
             tone_rendered = (
-                f"Proposing to change my voice: "
-                f"{proposal.get('old_text', '')!r} -> "
-                f"{proposal.get('new_text', '')!r}. Rationale: "
-                f"{proposal.get('rationale', '')}"
+                tseg[0]
+                + repr(proposal.get("old_text", ""))
+                + tseg[1]
+                + repr(proposal.get("new_text", ""))
+                + tseg[2]
+                + proposal.get("rationale", "")
+                + tseg[3]
             )
             # Pull recent accepted voice evolutions so the decision prompt
             # can see Nell's evolution arc. Best-effort — a missing/locked

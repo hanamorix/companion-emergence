@@ -16,49 +16,22 @@ import json
 import logging
 from dataclasses import dataclass
 
+from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
 from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
 
-_IMPORTANCE_RUBRIC = (
-    'importance rubric: 1 = trivial/passing, 5 = an ordinary durable fact, '
-    '8 = core or defining, 10 = pivotal.'
-)
+# Text externalized to prompt_strings.toml [ingest.extract] (issue #129 stage 1).
+# The two prompts below used to be built by concatenating this rubric fragment
+# into a literal; the TOML now holds each already-concatenated final string
+# byte-for-byte, so the concatenation itself is gone but the rendered result
+# is unchanged.
+_IMPORTANCE_RUBRIC = prompt_strings.register("ingest.extract.importance_rubric")
 
-EXTRACTION_PROMPT_LEGACY = """You are extracting durable memories from a conversation transcript.
-Return ONLY a JSON array. Each item: {{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
-For "importance", """ + _IMPORTANCE_RUBRIC + """
-For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
-Skip pleasantries. Keep items concrete. No prose, no commentary.
+EXTRACTION_PROMPT_LEGACY = prompt_strings.register("ingest.extract.extraction_prompt_legacy")
 
-TRANSCRIPT:
-{transcript}
-
-JSON:"""
-
-EXTRACTION_PROMPT_NAMED = """You are extracting durable memories from a conversation transcript.
-
-Speakers in this transcript:
-- {user_name} is the human user the assistant is talking to. Statements
-  attributed to {user_name} ({poss} actions, {poss} decisions, {poss} words) belong
-  to {user_name}, not to anyone else.
-- {assistant_name} is the assistant, the AI persona. Replies from
-  {assistant_name} may reference other people by name (from {assistant_name}'s
-  memories, soul, or history). Those are HISTORICAL references, not the
-  current speaker. Do NOT attribute the current user's actions to anyone
-  {assistant_name} mentioned by name.
-
-Return ONLY a JSON array. Each item:
-{{"text": str, "label": one of [observation, feeling, decision, question, fact, note], "importance": 1-10, "emotions": {{"<name>": 0-10}}}}.
-For "importance", """ + _IMPORTANCE_RUBRIC + """
-For "emotions", use ONLY these names (omit any you're unsure of): {emotion_vocab}.
-Skip pleasantries. Keep items concrete. No prose, no commentary.
-
-TRANSCRIPT:
-{transcript}
-
-JSON:"""
+EXTRACTION_PROMPT_NAMED = prompt_strings.register("ingest.extract.extraction_prompt_named")
 
 # Backward-compat alias — older callers still import EXTRACTION_PROMPT.
 EXTRACTION_PROMPT = EXTRACTION_PROMPT_LEGACY

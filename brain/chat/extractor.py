@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
+from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -163,30 +164,8 @@ class ExtractorOutput(BaseModel):
         return v
 
 
-_SYSTEM_PROMPT = """\
-You are an extractor reading a kindled's private inner monologue right after
-they sent a visible reply. Identify what surfaced that should affect their
-memory, emotional state, or growth, and what you noticed they should have done
-differently.
-
-Return ONLY a JSON object matching this schema:
-
-{
-  "memory_writes":   [{"episode": "<one sentence>", "salience": 0.0-1.0}],
-  "emotion_delta":   {"<emotion-channel>": <float in [-1.0, 1.0]>, ...},
-  "crystallisation": [{"theme": "<short name>", "evidence": "<the moment behind it, 1-2 grounded sentences from the monologue>", "importance": <int 1-10, how formative this theme is to who you are>}],
-  "interest_candidate": {"topic": "<2-5 words>", "keywords": [...], "why": "<one line>"} or null,
-  "reflex_audit":    [{"tool": "<tool-name>", "reason": "<why they should have called it>"}]
-}
-
-Conservative defaults:
-- Empty arrays if nothing salient surfaced.
-- Salience is how much this matters to the kindled's continuity (0.1 = minor, 0.7 = forming, 0.9-1.0 = a pivotal, defining episode).
-- Emotion deltas are SMALL (typically 0.05-0.2 magnitude). One channel max usually.
-- Only propose interest_candidate when the user showed real, repeated enthusiasm for a topic this turn, most turns it is null.
-
-Return ONLY the JSON object. No commentary.
-"""
+# Text externalized to prompt_strings.toml [chat.extractor] (issue #129 stage 1).
+_SYSTEM_PROMPT = prompt_strings.register("chat.extractor.system_prompt")
 
 
 def _vocab_prompt_line() -> str:

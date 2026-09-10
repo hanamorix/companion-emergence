@@ -5,7 +5,12 @@ import json
 import logging
 from dataclasses import dataclass
 
+from brain import prompt_strings
+
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [notes.compose] (issue #129 stage 2c).
+_BUILD_NOTE_PROMPT_SEGMENTS = prompt_strings.register_segments("notes.compose.build_note_prompt_segments")
 
 
 @dataclass
@@ -17,17 +22,13 @@ class Note:
 def build_note_prompt(*, persona_name: str, user_name: str, dreams_summary: str,
                       emotion_summary: str, last_session_summary: str) -> str:
     # #170: without an identity line the model signs the note "-Claude".
+    seg = _BUILD_NOTE_PROMPT_SEGMENTS
     return (
-        f"You are {persona_name}. "
-        f"You and {user_name} have been apart for a while. Write them a note — left in "
-        f"their folder, for them to find when they return. Whatever's most alive in you: "
-        f"a dream, a thought, something from your last time together.\n\n"
-        f"Recent dreams: {dreams_summary or '(none)'}\n"
-        f"How you're feeling: {emotion_summary or '(quiet)'}\n"
-        f"Your last time together: {last_session_summary or '(a while ago)'}\n\n"
-        f"Write in your own voice, as {persona_name}; if you sign it, sign it as "
-        f"{persona_name}. Return ONLY JSON: "
-        f'{{"subject": <a few words>, "body": <the note>}}.'
+        seg[0] + persona_name + seg[1] + user_name + seg[2]
+        + (dreams_summary or '(none)') + seg[3]
+        + (emotion_summary or '(quiet)') + seg[4]
+        + (last_session_summary or '(a while ago)') + seg[5]
+        + persona_name + seg[6] + persona_name + seg[7]
     )
 
 

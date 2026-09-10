@@ -31,12 +31,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain import prompt_strings
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
 from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [engines.consolidation] (issue #129 stage 2c).
+_REAPPRAISER_PROMPT = prompt_strings.register("engines.consolidation.reappraiser_prompt")
+_CLASSIFIER_PROMPT = prompt_strings.register("engines.consolidation.classifier_prompt")
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
@@ -289,15 +294,7 @@ def _make_haiku_reappraiser(provider) -> Reappraiser:
     (`_handle_reappraisals`) via the shared `clamp_importance`. On any parse/
     provider failure the fallback is the memory's CURRENT importance (a
     no-op) — never a crash, never a ratchet."""
-    prompt = (
-        "You judge how important a kindled's memory is, on a 0-10 scale, "
-        "based on its content right now (not on how often it has been recalled). "
-        "Re-evaluate a completed or past-due event (an appointment that already "
-        "happened, a plan that is no longer live) on its own merit as a past "
-        "event: it may now matter less, or it may still matter as something that "
-        "happened. A durable fact, a core relationship detail, or a defining "
-        "moment should score HIGH. Reply with ONLY the number."
-    )
+    prompt = _REAPPRAISER_PROMPT
 
     def _reappraise(memory: Memory) -> float:
         try:
@@ -436,17 +433,7 @@ def _make_haiku_classifier(provider) -> Classifier:
     the gating criteria verify. On any parse/provider failure the candidate is
     promoted (fail-open toward keeping content).
     """
-    prompt = (
-        "You consolidate a companion's auto-generated memory candidates. Given a "
-        "CANDIDATE and EXISTING related memories, reply with ONE JSON object: "
-        '{"verdict": one of ["duplicate","merge","distinct","correction",'
-        '"continuation","new"], "target_id": <existing id or null>, '
-        '"merged_content": <string or null>}. '
-        "duplicate=already fully captured; merge=near-duplicate adding info "
-        "(give target_id + a minimal surgical merged_content); correction/"
-        "continuation=keep as its own memory linked to target_id; distinct/new="
-        "keep fresh. Reply with JSON only."
-    )
+    prompt = _CLASSIFIER_PROMPT
 
     def _classify(cand: Memory, context: list[Memory]) -> Decision:
         ctx = "\n".join(f"- id={m.id}: {m.content[:200]}" for m in context) or "(none)"

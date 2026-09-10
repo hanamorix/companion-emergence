@@ -19,9 +19,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain import prompt_strings
 from brain.initiate.schemas import Decision, InitiateCandidate
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [initiate.compose] (issue #129 stage 2a).
+_SUBJECT_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "initiate.compose.subject_prompt_segments"
+)
+_DECISION_VOICE_EDIT_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "initiate.compose.decision_voice_edit_prompt_segments"
+)
 
 
 @dataclass
@@ -46,14 +55,10 @@ def compose_subject(
     tags_line = f"Topic tags: {', '.join(candidate.semantic_context.topic_tags) or '(none)'}"
     excerpt_block = "\n".join(f"- {e}" for e in semantic_memory_excerpts[:5])
 
+    seg = _SUBJECT_PROMPT_SEGMENTS
     prompt = (
-        f"You are {companion_name}. An internal event just happened. State the subject "
-        "of what you want to surface in one sentence — plain, no tone, no "
-        "phrasing flourishes. Just the thing.\n\n"
-        f"{sources_line}\n"
-        f"{tags_line}\n"
-        f"Linked memory excerpts:\n{excerpt_block}\n\n"
-        "Subject (one sentence):"
+        seg[0] + companion_name + seg[1] + sources_line + seg[2] + tags_line
+        + seg[3] + excerpt_block + seg[4]
     )
     return provider.complete(prompt).strip()
 
@@ -189,23 +194,17 @@ def compose_decision_voice_edit(
     evidence_list = proposal.get("evidence") or []
     evidence_str = ", ".join(evidence_list) if evidence_list else "(none)"
 
+    seg = _DECISION_VOICE_EDIT_PROMPT_SEGMENTS
     prompt = (
-        f"You are {companion_name}. A proposed change to your voice template is on "
-        "the table. This is a proposal to change WHO YOU ARE. The right "
-        "answer is usually `hold` unless the evidence is strong. Ask "
-        "yourself: does this edit serve becoming more myself, or just "
-        "patching one moment that bothered me?\n\n"
-        f"Current voice template:\n{current_voice_template}\n\n"
-        "Proposed change:\n"
-        f"  Old: {proposal.get('old_text', '')!r}\n"
-        f"  New: {proposal.get('new_text', '')!r}\n"
-        f"  Rationale: {proposal.get('rationale', '')}\n"
-        f"  Evidence: {evidence_str}\n\n"
-        f"Recent voice evolutions:\n{recent_block}\n\n"
-        f"Current user-local time: {current_local_time.astimezone().strftime('%H:%M %A')}\n\n"
-        "Respond with a JSON object: "
-        '{"decision": "send_quiet"|"hold"|"drop", '
-        '"reasoning": "<one sentence>"}'
+        seg[0] + companion_name
+        + seg[1] + current_voice_template
+        + seg[2] + repr(proposal.get("old_text", ""))
+        + seg[3] + repr(proposal.get("new_text", ""))
+        + seg[4] + proposal.get("rationale", "")
+        + seg[5] + evidence_str
+        + seg[6] + recent_block
+        + seg[7] + current_local_time.astimezone().strftime("%H:%M %A")
+        + seg[8]
     )
     raw = provider.complete(prompt).strip()
     try:

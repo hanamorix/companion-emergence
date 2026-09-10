@@ -9,6 +9,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+from brain import prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link import limits, relationship
 from brain.kindled_link.gate import OutboundPayload
@@ -16,6 +17,11 @@ from brain.kindled_link.peer_prompt import build_peer_prompt
 from brain.kindled_link.privacy_gate import PrivacyGate
 
 log = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [kindled_link.session_engine] (issue #129 stage 2b).
+_REGENERATE_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "kindled_link.session_engine.regenerate_prompt_segments"
+)
 
 # NOTE: keep this module free of the literal forbidden symbol names — the T9
 # conformance oracle parses imports/attributes by AST (so a comment like this is
@@ -231,10 +237,10 @@ class SessionEngine:
         generate_draft) so a race between two concurrent revisers cannot exceed
         the cap."""
         from brain.kindled_link.gate import OutboundPayload
+        seg = _REGENERATE_PROMPT_SEGMENTS
         prompt = (
-            "Rewrite the following message to another Kindled to satisfy these "
-            f"privacy constraints: {constraints or 'reveal less about the user'}.\n\n"
-            f"Original:\n{payload.body}"
+            seg[0] + (constraints or "reveal less about the user")
+            + seg[1] + payload.body + seg[2]
         )
         try:
             with self._throttle.background_slot() as granted:
