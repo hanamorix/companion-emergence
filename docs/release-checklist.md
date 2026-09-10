@@ -36,7 +36,7 @@ Run these commands locally — same shape as CI runs on every PR (`uv`
 ## Packaging/versioning
 
 - Set the intended version in `pyproject.toml`.
-- Add or update `.public-sync/changelog-public.md` before tagging or sharing a build; local `CHANGELOG.md` is substituted at public sync time.
+- Add the release entry to `CHANGELOG.md` before tagging (the public-sync substitution was retired in v0.0.41; `CHANGELOG.md` is the published changelog). After the release workflow publishes, restore the curated notes over CI's auto-notes with `gh release edit <tag> --notes-file <that section>` — the preflight script prints the exact commands.
 - Review `docs/roadmap.md` and confirm known stubs/incomplete surfaces are documented.
 - Build the wheel/sdist only after tests and lint pass.
 - **Run `bash scripts/smoke_test_wheel.sh`** — builds the wheel + sdist,
