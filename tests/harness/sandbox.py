@@ -565,7 +565,7 @@ def _validate_editable_paths(paths: Iterable[Path] | None) -> list[Path]:
     return out
 
 
-def _live_bridges() -> list[tuple[int, str]]:
+def _live_bridges(home: Path | None = None) -> list[tuple[int, str]]:
     """Scan for RUNNING companion bridges (the load-bearing live-service detector, Phase 2).
 
     A live bridge writes ``bridge.json`` into its ``persona_dir`` carrying its ``pid``
@@ -580,6 +580,10 @@ def _live_bridges() -> list[tuple[int, str]]:
     accepted gap: a live bridge whose primary ``bridge.json`` is corrupt-but-``.bak``-recoverable is
     NOT detected here (backstopped by the post-run :class:`SandboxLeak`).
 
+    ``home`` is the REAL engine home, captured by ``sandbox()`` BEFORE it swaps ``KINDLED_HOME`` to
+    the tempdir (#241: scanning after the swap resolved to the empty sandbox and missed every
+    running bridge, so the run died at teardown with a misleading SandboxLeak). ``None`` ⇒ resolve now.
+
     Returns a list of ``(pid, persona_name)`` for each live bridge found (empty = none live).
     Tolerant: a missing home, a missing/corrupt/unreadable ``bridge.json`` is skipped, never raised.
     """
@@ -590,7 +594,7 @@ def _live_bridges() -> list[tuple[int, str]]:
 
     live: list[tuple[int, str]] = []
     try:
-        personas = get_home() / "personas"
+        personas = (home if home is not None else get_home()) / "personas"
         candidates = list(personas.glob("*/bridge.json"))
     except OSError:
         return live
@@ -633,7 +637,7 @@ def _probe_external_writer(snapshot_fn, wait_s: float) -> bool:
 
 
 def _run_live_check(
-    policy: str, snapshot_fn, *, probe: bool, probe_wait: float
+    policy: str, snapshot_fn, *, probe: bool, probe_wait: float, engine_home: Path | None = None
 ) -> str | None:
     """Run the live-service pre-check and dispatch by ``policy`` (stage-3 M1/L4).
 
@@ -652,7 +656,7 @@ def _run_live_check(
         return None
 
     parts: list[str] = []
-    bridges = _live_bridges()
+    bridges = _live_bridges(engine_home)
     if bridges:
         listed = ", ".join(f"pid {pid} (persona {name})" for pid, name in bridges)
         parts.append(
@@ -864,6 +868,14 @@ def sandbox(
         _agg._warned_unregistered.update(_saved_warned)
 
     try:
+        # #241: resolve the REAL engine home BEFORE the swap below — the live-service pre-check must
+        # scan where a running bridge actually writes its bridge.json, not the empty sandbox.
+        from brain.paths import get_home as _real_get_home
+
+        try:
+            real_engine_home: Path | None = _real_get_home()
+        except Exception:  # noqa: BLE001 — a broken resolver must not break the sandbox
+            real_engine_home = None
         os.environ["KINDLED_HOME"] = str(root)
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
         os.environ.pop("NELLBRAIN_HOME", None)  # a stray value would win the fallback (paths.py:60)
@@ -962,7 +974,7 @@ def sandbox(
         # + rmtree in the finally still run — no stale KINDLED_HOME leaks; P14). "warn" returns a
         # message we use to annotate a later SandboxLeak (P5); "off" is a no-op.
         live_note = _run_live_check(
-            live_check, _snapshot, probe=probe, probe_wait=probe_wait
+            live_check, _snapshot, probe=probe, probe_wait=probe_wait, engine_home=real_engine_home
         )
 
         before = _snapshot()
@@ -1018,9 +1030,20 @@ def sandbox(
             after = _snapshot()
             changed = [g for g in before if before[g] != after.get(g)]
             if changed:
+                # #241: name WHICH entries moved (first few per root) — a bare root name forced a
+                # manual fingerprint diff to learn the culprit was one live-bridge persona file.
+                _detail: list[str] = []
+                for g in changed:
+                    b_, a_ = before[g], after.get(g) or {}
+                    if isinstance(b_, dict) and isinstance(a_, dict):
+                        keys = sorted(k for k in set(b_) | set(a_) if b_.get(k) != a_.get(k))
+                        shown = ", ".join(str(k) for k in keys[:5])
+                        more = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+                        _detail.append(f"{g}: {shown}{more}")
                 msg = (
                     "guarded real-home root(s) mutated during a sandboxed run: "
                     + ", ".join(changed)
+                    + (" — changed entries: " + "; ".join(_detail) if _detail else "")
                 )
                 if live_note is not None:
                     # warn-mode pre-check saw a live service — attribute the leak correctly (P5).

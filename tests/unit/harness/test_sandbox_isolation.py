@@ -805,3 +805,18 @@ def test_cli_housekeeping_constant_and_helper_pinned() -> None:
     excluded_names = {e.name for e in _claude_session_log_excludes()}
     for name in _CLAUDE_CLI_HOUSEKEEPING_FILES:
         assert name not in excluded_names, f"{name} must NOT be name-excluded (it is content-guarded)"
+
+
+def test_leak_message_names_the_changed_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#241: a bare root name forced a manual fingerprint diff to learn WHICH file moved."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    guarded = tmp_path / "guarded-root"
+    guarded.mkdir()
+    (guarded / "existing.txt").write_text("original")
+
+    with pytest.raises(SandboxLeak) as ei:
+        with sandbox(extra_guard_roots=[guarded]):
+            (guarded / "leaked.txt").write_text("this escaped the sandbox")
+    assert "leaked.txt" in str(ei.value)
