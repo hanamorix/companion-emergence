@@ -124,6 +124,8 @@ fi
 echo "✅ PREFLIGHT GREEN — safe to tag${TAG:+ $TAG}."
 echo
 echo "After the release workflow publishes the GitHub Release, CI's"
-echo "generate_release_notes OVERWRITES the curated changelog. Restore it with:"
-echo "    gh release edit ${TAG:-<tag>} --notes-file .public-sync/changelog-public.md"
+echo "generate_release_notes OVERWRITES the curated changelog. Restore it with the"
+echo "tag's own CHANGELOG.md section (extracted to a temp file):"
+echo "    awk '/^## ${TAG#v}/{f=1;next} /^## /{f=0} f' CHANGELOG.md > /tmp/notes-${TAG:-<tag>}.md"
+echo "    gh release edit ${TAG:-<tag>} --notes-file /tmp/notes-${TAG:-<tag>}.md"
 rm -rf "$LOG_DIR"
