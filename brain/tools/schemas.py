@@ -250,10 +250,11 @@ SCHEMAS: dict[str, dict] = {
         "name": "search_memories",
         "description": (
             "Find memories not already in front of you. Searches your whole memory "
-            "pool by keyword (and optional emotion) and returns short snippets with "
-            "ids, ranked by relevance. Use this when nothing already shown fits; try "
-            "recall_forgotten if it returns empty. To open a snippet you already have "
-            "an id for, use read_full_memory."
+            "pool (with an optional emotion filter) and returns short snippets with "
+            "ids, ranked by relevance. By default the search goes by meaning, so a "
+            "memory worded differently from your query can still surface. Use this "
+            "when nothing already shown fits; try recall_forgotten if it returns "
+            "empty. To open a snippet you already have an id for, use read_full_memory."
         ),
         "parameters": {
             "type": "object",
@@ -277,6 +278,18 @@ SCHEMAS: dict[str, dict] = {
                     "description": (
                         "Memory ids to omit from results (already-surfaced or "
                         "explicitly-rejected) — pass these to fetch the next tranche."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["semantic", "lexical"],
+                    "default": "semantic",
+                    "description": (
+                        "Which search to run. semantic (default) compares meaning, so a "
+                        "memory worded differently from the query can still surface. "
+                        "lexical matches the actual words in the query, the older keyword "
+                        "search. If semantic search has no memories to compare against "
+                        "yet, it falls back to lexical automatically."
                     ),
                 },
             },
