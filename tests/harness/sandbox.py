@@ -12,10 +12,13 @@ What it does (see the module ``README.md`` for the guarantees):
    ``brain/paths.py:58-82`` routes all persona state to ``KINDLED_HOME``; the provider respects an
    upstream ``CLAUDE_CONFIG_DIR`` (``brain/bridge/provider.py:174``) so the CLI subprocess reads our
    seeded config, not the user's real ``~/.claude``.
-3. Auth-only seed — copy ONLY ``~/.claude/.credentials.json`` into the sandbox config dir. Never
-   ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. On Mac the credential may live in the
-   Keychain; a fresh ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so the branch is
-   recorded, not hard-failed.
+3. Auth. Preferred (#236): a STABLE harness-owned config dir the developer logged into once
+   (``scripts/setup_harness_claude_login.sh`` → ``.harness-authed`` marker) is used as
+   ``CLAUDE_CONFIG_DIR`` instead of the tempdir — an explicit config dir keys its own per-path
+   Keychain credential and never falls back to the default entry, so a fresh tempdir is always
+   "Not logged in" on a Mac. Fallback: copy ONLY ``~/.claude/.credentials.json`` into the tempdir
+   config (non-Mac). Never ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. Neither ⇒
+   ``auth_source == "unauthenticated"`` + a RuntimeWarning naming the setup script.
 3b. STORED-CHANNEL DE-ID (the next increment after the F1/F2 input-side ``$USER``/``$LOGNAME`` de-id):
    seal the three RUNTIME carriers by which the ``claude`` CLI's auto-injected context leaks the REAL
    owner name / project into the companion's STORED channels (``memories.db``, ``works/*.md``,
@@ -48,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sys
 import tempfile
 import warnings
 from collections.abc import Iterable, Iterator
@@ -128,7 +132,7 @@ class SandboxHandle:
     root: Path
     env: dict[str, str]
     claude_config_dir: Path
-    auth_source: str  # "credentials-file" | "keychain-or-inherited"
+    auth_source: str  # "harness-dir" | "credentials-file" | "unauthenticated"
     guard_roots: list[Path] = field(default_factory=list)
 
     @property
@@ -673,30 +677,52 @@ def _run_live_check(
     return msg
 
 
+_HARNESS_AUTHED_MARKER = ".harness-authed"
+
+
+def _harness_config_dir() -> Path:
+    """The stable, harness-owned ``CLAUDE_CONFIG_DIR`` a developer logs into ONCE (#236).
+
+    An explicit ``CLAUDE_CONFIG_DIR`` never falls back to the default Keychain entry — the CLI keys a
+    per-dir credential off a hash of the dir PATH — so a fresh tempdir is always "Not logged in" and
+    no file copy can fix that on a Mac (the credential is not a file there). A stable path keeps its
+    Keychain entry across runs. It lives under a SIBLING app name, deliberately OUTSIDE every
+    leak-guarded root, because CLI session files accumulate here across runs. Set up with
+    ``scripts/setup_harness_claude_login.sh``, which writes ``.harness-authed`` only after
+    ``claude auth status`` verifies. Overridable via ``CE_HARNESS_CLAUDE_CONFIG_DIR``.
+    """
+    override = os.environ.get("CE_HARNESS_CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override)
+    from platformdirs import PlatformDirs
+
+    return Path(PlatformDirs(f"{_APP}-harness").user_data_path) / "claude-config"
+
+
 def _seed_auth(claude_config_dir: Path) -> str:
     """Auth-only seed: copy ONLY ~/.claude/.credentials.json. Return the auth source.
 
-    On Mac the credential can live in the Keychain rather than a file — a fresh
-    ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so we record the branch instead of
-    hard-failing. NEVER copy CLAUDE.md / settings* / skills / plugins.
+    Only reached when no authed harness dir exists (see :func:`_harness_config_dir`). NEVER copy
+    CLAUDE.md / settings* / skills / plugins.
     """
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
     cred = Path.home() / ".claude" / ".credentials.json"
-    if cred.is_file():
-        claude_config_dir.mkdir(parents=True, exist_ok=True)
+    # On macOS the real credential is a per-dir Keychain entry; any ~/.claude/.credentials.json is a
+    # stale leftover that does NOT authenticate a fresh dir (#236). Only the authed harness dir counts.
+    if cred.is_file() and sys.platform != "darwin":
         shutil.copy2(cred, claude_config_dir / ".credentials.json")
         return "credentials-file"
-    claude_config_dir.mkdir(parents=True, exist_ok=True)
     # No cred file. On a Mac the credential may be in the Keychain (a fresh CLAUDE_CONFIG_DIR still
     # auths via Keychain) — plausible only on Darwin. Elsewhere this is genuinely unauthenticated,
     # which would fail deep in a live bridge run; record it clearly + warn now (A2) rather than let
     # it surface as an opaque provider failure. (Unit tests seed a fake cred, so never hit this.)
-    import sys
-
-    if sys.platform == "darwin":
-        return "keychain-or-inherited"
+    # #236: there is NO Keychain fallback for an explicit CLAUDE_CONFIG_DIR (the CLI keys the
+    # credential per dir path), so with no file this is unauthenticated on every platform.
     warnings.warn(
-        "sandbox: no ~/.claude/.credentials.json found and not on macOS — a live run "
-        "will be UNAUTHENTICATED and fail at the provider. Authenticate the claude CLI first.",
+        "sandbox: no usable claude login for the sandbox config dir (no authed harness dir; a "
+        "~/.claude/.credentials.json is only usable off macOS) — a live run will be UNAUTHENTICATED "
+        "and fail at the provider with provider_failed. Run "
+        "`bash scripts/setup_harness_claude_login.sh` once to give the harness its own login.",
         RuntimeWarning,
         stacklevel=2,
     )
@@ -782,7 +808,11 @@ def sandbox(
     :class:`EditablePathRefused` (before yielding) if an ``editable_paths`` entry is unsafe.
     """
     root = Path(tempfile.mkdtemp(prefix="ce-harness-"))
-    claude_config_dir = root / "claude-config"
+    # #236: prefer the stable harness-owned config dir the developer logged into once; a tempdir
+    # config can only authenticate from a copied ~/.claude/.credentials.json (non-Mac hosts).
+    authed_dir = _harness_config_dir()
+    use_authed = (authed_dir / _HARNESS_AUTHED_MARKER).is_file()
+    claude_config_dir = authed_dir if use_authed else root / "claude-config"
     claude_config_dir.mkdir(parents=True, exist_ok=True)
 
     # Save prior env so we can restore it exactly (including "was unset"). USER/LOGNAME are here so
@@ -858,7 +888,7 @@ def sandbox(
                 stacklevel=3,
             )
 
-        auth_source = _seed_auth(claude_config_dir)
+        auth_source = "harness-dir" if use_authed else _seed_auth(claude_config_dir)
         # Stored-channel de-id carrier B: pre-seed a SYNTHETIC oauthAccount into the CLI's config so it
         # injects a de-identified account identity, not the real displayName/email/org. (TTL-bounded —
         # see _seed_scrubbed_config.) Done AFTER _seed_auth (which creates the dir + copies the real
