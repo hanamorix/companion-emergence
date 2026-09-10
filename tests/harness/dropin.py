@@ -288,7 +288,9 @@ def ingest_version(
     if dest.exists():
         _handle_existing(dest, on_existing)
 
-    shutil.copytree(source, dest, ignore=_IGNORE)
+    # symlinks=True: copy links as links. A dangling link left by a dev tool (#235: untracked
+    # .claude/skills/* → missing target) must not abort the ingest; following it would.
+    shutil.copytree(source, dest, ignore=_IGNORE, symlinks=True)
 
     venv_python = _build_venv(dest, deps)
     if install_guard:
