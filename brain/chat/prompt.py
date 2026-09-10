@@ -875,11 +875,24 @@ def _recall_snippet(mem, *, full: bool) -> str:
     return body
 
 
-def _render_semantic_recall_block(
+def _render_semantic_active_lines(
     store: MemoryStore, result: SemanticRecallResult, *, persona_dir: Path
-) -> str:
-    """Render a CONCLUSIVE semantic-primary recall result and apply its
-    recall-counter ticks (spec decision 5's "Counter" bullet).
+) -> list[str]:
+    """Render the "  active:" section lines for a CONCLUSIVE semantic recall
+    result and apply its recall-counter ticks (spec decision 5's "Counter"
+    bullet).
+
+    Stage-3 Defect-3 fix (Roy's Option-1 ruling): this used to build and
+    return the ENTIRE recall block (header + active section) and
+    `_build_recall_block` returned it directly, short-circuiting the
+    fading/lost partition, the "not recognised" signal, and the grief-touch
+    breadcrumb below it. Those three pieces must run on EVERY recall turn
+    regardless of semantic conclusiveness — semantic conclusiveness only
+    decides which ACTIVE memories are selected/surfaced. So this function
+    now renders ONLY the "  active:" section's lines (no "recall" header, no
+    snippet invitation — `_build_recall_block` owns those once, for
+    whichever branch fires) and the caller always combines them with the
+    fading/lost/not-recognised sections, which now always run alongside it.
 
     Presentation reuses the EXACT bullet format the lexical path's
     "active:" section already uses (`- <id>: "<snippet>"`) so the model
@@ -901,24 +914,31 @@ def _render_semantic_recall_block(
     in this module (which are deliberately EXCLUDED from any bump, "already
     maximally salient" — see the CHANGE-1 comment in `_build_recall_block`
     below). The spec is explicit that semantic full-injects ARE bumped, at
-    full strength. Snippet-tier gets the SAME rank-weighted fractional bump
-    (0.8 top -> 0.1 bottom, linear; a lone snippet -> 0.8) the lexical
-    path's own bump loop already uses — same mechanic, reused, fed this
-    candidate set in PRESENTATION order.
+    full strength, UNCONDITIONALLY — that bump is NOT gated on
+    SNIPPET_MODE_ENABLED (the gate below only covers the snippet-tier bump,
+    Stage-3 Defect-4 fix).
 
-    Also enqueues the same pending-reappraisal request
+    Snippet-tier gets the SAME rank-weighted fractional bump (0.8 top -> 0.1
+    bottom, linear; a lone snippet -> 0.8) the lexical path's own bump loop
+    already uses — same mechanic, reused, fed this candidate set in
+    PRESENTATION order. Also enqueues the same pending-reappraisal request
     (`PendingQueue.enqueue_reappraisals`, CHANGE 3 / P3 retention rework)
     the lexical path issues for every surfaced memory id — that mechanic is
     keyed on "was surfaced this turn," not on which retrieval mechanism did
     the surfacing.
+
+    Stage-3 Defect-4 fix: the snippet-tier bump AND the reappraisal enqueue
+    are now gated under `SNIPPET_MODE_ENABLED`, exactly like the lexical
+    path's own CHANGE-1/CHANGE-3 gating (`_build_recall_block` below) — when
+    snippet mode is off, `_recall_snippet` renders full untruncated bodies,
+    so a "snippet" isn't actually a snippet and must not receive the
+    fractional reinforcement bump or the reappraisal enqueue. Previously
+    this ran unconditionally, inconsistent with the lexical path.
     """
     full_ids = {m.id for m in result.full}
     snippet_ordered = sorted(result.snippet, key=_recall_sort_key)
 
-    lines = ["recall"]
-    if SNIPPET_MODE_ENABLED:
-        lines.insert(0, _RECALL_SNIPPET_INVITATION)
-    lines.append("  active:")
+    lines = ["  active:"]
     for mem in result.full:
         snippet = _recall_snippet(mem, full=True)
         lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
@@ -928,17 +948,19 @@ def _render_semantic_recall_block(
 
     for mem in result.full:
         store.bump_recall(mem.id, 1.0)
-    n_snip = len(snippet_ordered)
-    for i, mem in enumerate(snippet_ordered):
-        amount = 0.8 if n_snip == 1 else 0.8 - 0.7 * (i / (n_snip - 1))
-        store.bump_recall(mem.id, amount)
 
-    from brain.memory.pending import PendingQueue
+    if SNIPPET_MODE_ENABLED:
+        n_snip = len(snippet_ordered)
+        for i, mem in enumerate(snippet_ordered):
+            amount = 0.8 if n_snip == 1 else 0.8 - 0.7 * (i / (n_snip - 1))
+            store.bump_recall(mem.id, amount)
 
-    reappraise_ids = full_ids | {m.id for m in snippet_ordered}
-    PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+        from brain.memory.pending import PendingQueue
 
-    return "\n".join(lines)
+        reappraise_ids = full_ids | {m.id for m in snippet_ordered}
+        PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+
+    return lines
 
 
 def _build_recall_block(
@@ -969,6 +991,19 @@ def _build_recall_block(
 
     Falls back to ranked retrieval with no graveyard/hebbian when persona_dir
     is None (e.g. called directly in tests without a dir).
+
+    Stage-3 Defect-3 fix (Roy's Option-1 ruling): semantic-PRIMARY recall
+    (below, when persona_dir is not None) decides ONLY the "active:"
+    section's SOURCE — a CONCLUSIVE result surfaces via
+    `_render_semantic_active_lines` (option-4 tiers), an
+    INCONCLUSIVE/None result falls through to the lexical active selection,
+    exactly as before this fix. The fading/lost partition, the "not
+    recognised" signal, and the grief-touch breadcrumb (`handle_recall_touch`
+    on graveyard hits) are NOT part of that fork — they run on EVERY recall
+    turn regardless of semantic conclusiveness, so a semantically-conclusive
+    turn can no longer silently pre-empt a graveyard/fading surfacing (the
+    bug: one unrelated-but-closer ACTIVE candidate could make a turn
+    "conclusive" and skip this machinery entirely).
 
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
@@ -1027,13 +1062,19 @@ def _build_recall_block(
 
     # Semantic-PRIMARY attempt (Stage 3, local semantic-retrieval build,
     # decisions 3-5: semantic cosine is PRIMARY, the lexical/blend path
-    # below is the FALLBACK/backstop). Runs BEFORE the lexical path: when it
-    # returns a CONCLUSIVE result (clear standouts), render it and return
-    # immediately for this turn — the lexical path below never runs. An
-    # INCONCLUSIVE result (None: bunched clump, empty/sparse candidate pool
-    # — graceful warm-up — or any embedding-infra failure) falls through
-    # UNCHANGED to the existing lexical/importance/hebbian/recency blend
-    # below, exactly as it behaved before this stage.
+    # below is the FALLBACK/backstop for the ACTIVE selection only).
+    #
+    # Stage-3 Defect-3 fix (Roy's Option-1 ruling): semantic conclusiveness
+    # used to return here immediately, skipping the fading/lost partition,
+    # the "not recognised" signal, and the grief-touch breadcrumb below —
+    # ALL THREE ALWAYS RUN NOW, regardless of this result. A CONCLUSIVE
+    # result (clear standouts) only decides the "active:" section's SOURCE
+    # (rendered further down, forked on `semantic_result`); it no longer
+    # short-circuits this function. An INCONCLUSIVE result (None: bunched
+    # clump, empty/sparse candidate pool — graceful warm-up — or any
+    # embedding-infra failure) means the "active:" section instead comes
+    # from the lexical/importance/hebbian/recency blend below, exactly as
+    # it behaved before Stage 3.
     try:
         semantic_result = run_semantic_recall(store, persona_dir, user_input)
     except Exception:  # noqa: BLE001
@@ -1046,11 +1087,13 @@ def _build_recall_block(
         # as an inconclusive (None) semantic result would.
         log.exception("_build_recall_block: run_semantic_recall raised — falling back to lexical")
         semantic_result = None
-    if semantic_result is not None:
-        return _render_semantic_recall_block(store, semantic_result, persona_dir=persona_dir)
 
-    # Forgetting-aware LEXICAL FALLBACK path (unchanged from pre-Stage-3) —
-    # partitions into active / fading / lost.
+    # Forgetting-aware partition — ALWAYS RUNS NOW (Stage-3 Defect-3 fix):
+    # partitions into active / fading / lost. `active_hits`/`full_ids`
+    # computed below are only actually SURFACED in the "active:" section
+    # when `semantic_result` is None (inconclusive) — see the
+    # active-selection fork further down — but fading/lost/"not
+    # recognised"/grief-touch always use what's computed here.
     from brain.forgetting.recall import search_with_loss
     from brain.memory.hebbian import HebbianMatrix
 
@@ -1138,10 +1181,29 @@ def _build_recall_block(
         }
         unfamiliar = [t for t in unfamiliar if t.lower() in capitalised]
 
-    if not active_hits and not fading_hits and not lost_hits and not unfamiliar:
+    # Stage-3 Defect-3 fix: a CONCLUSIVE semantic result always carries at
+    # least one surfaced candidate (`run_semantic_recall` returns `None` for
+    # every inconclusive/empty case — see its docstring), so this must not
+    # return "" out from under a semantic-conclusive turn just because the
+    # (unused-for-render) lexical active_hits happens to be empty.
+    has_semantic_active = semantic_result is not None and bool(
+        semantic_result.full or semantic_result.snippet
+    )
+    if (
+        not has_semantic_active
+        and not active_hits
+        and not fading_hits
+        and not lost_hits
+        and not unfamiliar
+    ):
         return ""
 
-    # Fire recall-touch grief breadcrumbs for any graveyard hits.
+    # Fire recall-touch grief breadcrumbs for any graveyard hits — ALWAYS
+    # (Stage-3 Defect-3 fix), regardless of the active-selection fork below.
+    # This is the ONLY call site of handle_recall_touch in this function, so
+    # it fires exactly once per turn: once iff there's a graveyard hit,
+    # never otherwise — on both the semantic-conclusive and inconclusive
+    # branches alike.
     # handle_recall_touch is internally fault-isolated; this outer try
     # guards only against import-time failures on brain.grief / brain.felt_time.
     if seen_lost:
@@ -1178,15 +1240,29 @@ def _build_recall_block(
     lost_top = lost_hits[:limit]
     full_ids = _full_inject_ids(active_top)
 
+    # ACTIVE-selection fork (Stage-3 Defect-3 fix) — the ONLY thing semantic
+    # conclusiveness decides. Conclusive → option-4 semantic surfacing
+    # (`_render_semantic_active_lines`: its own bump/enqueue, Defect-4
+    # gated). Inconclusive → today's lexical active selection, rendered and
+    # bumped exactly as before this fix (the CHANGE-1 block further down,
+    # now explicitly scoped to `semantic_result is None`).
+    if semantic_result is not None:
+        active_lines = _render_semantic_active_lines(store, semantic_result, persona_dir=persona_dir)
+        has_active = has_semantic_active
+    else:
+        has_active = bool(active_top)
+        active_lines = []
+        if active_top:
+            active_lines.append("  active:")
+            for mem in active_top:
+                snippet = _recall_snippet(mem, full=mem.id in full_ids)
+                active_lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
+
     lines = ["recall"]
-    if SNIPPET_MODE_ENABLED and active_top:
+    if SNIPPET_MODE_ENABLED and has_active:
         lines.insert(0, _RECALL_SNIPPET_INVITATION)
 
-    if active_top:
-        lines.append("  active:")
-        for mem in active_top:
-            snippet = _recall_snippet(mem, full=mem.id in full_ids)
-            lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
+    lines.extend(active_lines)
 
     if fading_top:
         lines.append("  softened (fading; original detail gone):")
@@ -1221,7 +1297,25 @@ def _build_recall_block(
     # is False, _recall_snippet renders full bodies instead of snippets, so these
     # rows were not "surfaced as a snippet" and must not be reinforced. Skip the
     # whole loop in that mode; snippet rendering itself is unchanged.
-    if SNIPPET_MODE_ENABLED:
+    #
+    # Stage-3 Defect-3 fix: this block is UNCHANGED from pre-Stage-3 and now
+    # explicitly scoped to `semantic_result is None` — it stays the
+    # INCONCLUSIVE (lexical active selection) branch's own bump/enqueue
+    # only. `active_top` is only ever rendered under "active:" when
+    # `semantic_result` is None (see the fork above); on a CONCLUSIVE turn
+    # `active_top` may still be non-empty (the lexical search ran too, per
+    # the always-run partition) but was NEVER surfaced to the model this
+    # turn, so it must not be bumped/enqueued here — that would reinforce
+    # memories the user never actually saw. The CONCLUSIVE branch's own
+    # bump/enqueue already happened inside `_render_semantic_active_lines`
+    # above (Defect-4 gated separately, same SNIPPET_MODE_ENABLED
+    # condition). `fading_top`/`lost_top` are surfaced on EVERY turn now,
+    # but this fix deliberately does not extend the recall_count bump
+    # mechanic to them on a conclusive turn — bump/enqueue was never part of
+    # the "always-run machinery" the defect report named (fading/lost
+    # partition+surfacing, "not recognised", grief-touch); only those three
+    # are unconditional now.
+    if semantic_result is None and SNIPPET_MODE_ENABLED:
         bump_targets: list = []
         seen_bump: set = set()
         for mem in active_top:
