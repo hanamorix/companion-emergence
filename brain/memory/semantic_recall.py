@@ -186,7 +186,7 @@ def build_semantic_candidate_pool(
     "softened (fading)" section, double-bumping it. Filtering here makes the
     semantic candidate pool structurally disjoint from the fading partition
     `_build_recall_block` computes separately — no downstream dedup needed
-    (see the corrected comment at that call site, fold-in fix (a)).
+    (see the corrected comment at that call site, fold-in fix (b)).
 
     Uses `store.list_active()` rather than a per-id `store.get()` loop:
     `list_active()` is a plain SELECT with no bump parameter at all, so this

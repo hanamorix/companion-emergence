@@ -413,7 +413,15 @@ def run_folded(
                 # — fault-isolated so a backfill error never takes down the
                 # session-cleanup tick.
                 try:
-                    _embedding_backfill_run_tick(persona_dir, store, embeddings)
+                    backfill_result = _embedding_backfill_run_tick(persona_dir, store, embeddings)
+                    logger.info(
+                        "embedding backfill tick: scanned=%d embedded=%d already_cached=%d skipped_short=%d errors=%d",
+                        backfill_result.scanned,
+                        backfill_result.embedded,
+                        backfill_result.already_cached,
+                        backfill_result.skipped_short,
+                        backfill_result.errors,
+                    )
                 except Exception:
                     logger.exception("supervisor embedding backfill tick raised")
 

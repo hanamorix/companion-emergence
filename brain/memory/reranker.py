@@ -270,6 +270,11 @@ def _warm_per_doc_latency(provider: RerankerProvider) -> float:
     caching) on first use or once `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` has
     elapsed since the last measurement.
 
+    The first semantic recall of each process pays this calibration cost
+    in-band (the warmup plus measured reranks above run synchronously before
+    that recall's width is known). It is cached after that first call, so
+    every later recall in the process reads the cached value instead.
+
     Fail-soft: a measurement failure (e.g. the real model errors on the
     calibration call) logs and returns 0.0 — `get_rerank_width` treats 0.0
     as "no latency signal, don't throttle by it," capping width by pool size
