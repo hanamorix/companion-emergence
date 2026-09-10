@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from brain.health.attempt_heal import (
     attempt_heal,
     save_with_backup,
@@ -244,3 +246,58 @@ def test_quarantine_filename_has_no_colons(tmp_path: Path) -> None:
     quarantines = list(tmp_path.glob("x.json.corrupt-*"))
     assert len(quarantines) == 1
     assert ":" not in quarantines[0].name
+
+
+# ---- #200: Windows WinError 32 — rename while another handle reads the file ----
+
+
+def test_save_with_backup_text_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Windows refuses os.replace on a file another handle has open (WinError 32).
+
+    The supervisor reads persona_config.json inside its ticks in the same
+    process, so a settings write can collide with a read. A transient
+    PermissionError on the rotate/replace must be retried, not surfaced.
+    """
+    import os
+
+    import brain.health.attempt_heal as heal
+
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, "v1")
+    real_replace = os.replace
+    failures = {"left": 2}
+
+    def flaky_replace(src, dst):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(heal.os, "replace", flaky_replace)
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+
+    save_with_backup_text(p, "v2")
+    assert p.read_text(encoding="utf-8") == "v2"
+    assert (tmp_path / "x.json.bak1").read_text(encoding="utf-8") == "v1"
+    assert failures["left"] == 0
+
+
+def test_save_with_backup_text_reraises_persistent_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A real permission problem must still fail loud after the retry budget."""
+    import brain.health.attempt_heal as heal
+
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, "v1")
+
+    def always_denied(src, dst):
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(heal.os, "replace", always_denied)
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+
+    with pytest.raises(PermissionError):
+        save_with_backup_text(p, "v2")
