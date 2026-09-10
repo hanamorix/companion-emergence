@@ -47,7 +47,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
-from brain import tunables
+from brain import prompt_strings, tunables
 from brain.bridge import events
 from brain.bridge.chat import (
     ChatMessage,
@@ -79,6 +79,11 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [bridge.server] (issue #129 stage 2b).
+_HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "bridge.server.heartbeat_close_system_prompt_segments"
+)
 
 # Browser/WebView origins that are allowed to call the localhost bridge.
 # HTTP routes are still bearer-token protected; CORS is only the browser's
@@ -633,7 +638,10 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
             / "engines"
             / "default_interests.json",
             persona_name=persona_dir.name,
-            persona_system_prompt=f"You are {persona_dir.name}.",
+            persona_system_prompt=(
+                _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[0] + persona_dir.name
+                + _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
         )
         engine.run_tick(trigger="close", dry_run=False)
 

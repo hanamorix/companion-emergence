@@ -401,7 +401,7 @@ def test_pidfile_arm_is_load_bearing_executed_negative_control(
     _seed_fake_cred(monkeypatch, tmp_path)
     engine_home = tmp_path / "engine-home"
     _seed_bridge(monkeypatch, engine_home, pid=os.getpid())
-    monkeypatch.setattr(sandbox_mod, "_live_bridges", lambda: [])
+    monkeypatch.setattr(sandbox_mod, "_live_bridges", lambda *_a, **_k: [])
     with sandbox() as sb:  # must NOT raise now
         assert sb.root.exists()
 
@@ -561,3 +561,29 @@ def tempfile_gettempdir() -> str:
     import tempfile
 
     return tempfile.gettempdir()
+
+
+# ─────────────────────── #241 — detection must scan the REAL home, not the sandbox ───────────────────────
+
+
+def test_live_bridge_detected_with_real_dynamic_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#241: `sandbox()` swaps KINDLED_HOME to the tempdir BEFORE the live check ran, so
+    `get_home()` resolved to the (empty) sandbox and a running bridge was never seen — the run then
+    died at teardown with a misleading SandboxLeak. Unlike P1, this test does NOT patch `get_home`
+    to a constant: it sets KINDLED_HOME like a real machine and lets the resolver be dynamic."""
+    _seed_fake_cred(monkeypatch, tmp_path)
+    engine_home = tmp_path / "engine-home"
+    persona_dir = engine_home / "personas" / "Canary"
+    persona_dir.mkdir(parents=True)
+    (persona_dir / "bridge.json").write_text(
+        json.dumps({"persona": "Canary", "pid": os.getpid(), "port": 8931})
+    )
+    monkeypatch.setenv("KINDLED_HOME", str(engine_home))
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+
+    with pytest.raises(LiveServiceDetected) as ei:
+        with sandbox():
+            pass  # pragma: no cover - must NOT be reached
+    assert str(os.getpid()) in str(ei.value) and "Canary" in str(ei.value)

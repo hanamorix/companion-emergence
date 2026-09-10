@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from brain import prompt_strings
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,22 +138,8 @@ def read_recent_calibration_rows(
     yield from rows[:limit]
 
 
-_CALIBRATION_BLOCK_TEMPLATE = """\
-=== Your recent editorial track record ===
-Last 20 closed decisions:
-
-  PROMOTED:
-    • {n_replied} reached replied_explicit  ← {user_name} engaged
-    • {n_acknowledged} reached acknowledged_unclear
-    • {n_dismissed} reached dismissed       ← {user_name} ↩'d
-    • {n_pending} still pending
-
-  FILTERED:
-    • {n_stayed_silent} stayed silent in draft (not re-emitted)
-    • {n_recurred} re-emitted within 48h (you may have been too cautious)
-
-Use this only as light context. It is who you've been, not who you must be.
-"""
+# Text externalized to prompt_strings.toml [initiate.adaptive] (issue #129 stage 1).
+_CALIBRATION_BLOCK_TEMPLATE = prompt_strings.register("initiate.adaptive.calibration_block_template")
 
 
 def build_calibration_block(persona_dir: Path, *, user_name: str) -> str:

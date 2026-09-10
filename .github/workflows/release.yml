@@ -125,7 +125,10 @@ jobs:
   validate:
     name: validate (tests + lint + frontend + cargo)
     needs: verify-version
-    runs-on: ubuntu-22.04
+    # Same image as test.yml's python matrix. A pinned 22.04 here let a
+    # READY-mtime test fail deterministically on the release gate while
+    # main CI (ubuntu-latest) stayed green (v0.0.42, #232).
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6

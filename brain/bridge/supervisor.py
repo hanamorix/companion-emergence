@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
 
+from brain import prompt_strings
 from brain.attunement.backfill import (
     run_backfill as _attunement_run_backfill,
 )
@@ -120,6 +121,11 @@ from brain.self_model.resolve import (
 from brain.soul import cadence as soul_cadence
 
 logger = logging.getLogger(__name__)
+
+# Text externalized to prompt_strings.toml [bridge.supervisor] (issue #129 stage 2b).
+_HEARTBEAT_TICK_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
+    "bridge.supervisor.heartbeat_tick_system_prompt_segments"
+)
 
 # Backlog-aware soul-review drain: when candidates have piled up (e.g. after a
 # model-call outage), clear up to this many per tick instead of the default 5,
@@ -1253,7 +1259,10 @@ def _run_heartbeat_tick(
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=default_interests_path,
             persona_name=persona_dir.name,
-            persona_system_prompt=f"You are {persona_dir.name}.",
+            persona_system_prompt=(
+                _HEARTBEAT_TICK_SYSTEM_PROMPT_SEGMENTS[0] + persona_dir.name
+                + _HEARTBEAT_TICK_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
         )
         result = engine.run_tick(trigger="background", dry_run=False)
 

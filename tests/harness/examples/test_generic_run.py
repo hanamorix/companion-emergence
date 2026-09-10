@@ -77,6 +77,7 @@ def test_generic_live_run(tmp_path) -> None:
 
     # 2. Run inside the sandbox: seed Canary, stand up the real bridge, drive a few turns.
     with sandbox() as sb:
+        _skip_unless_authed(sb)
         spec = PersonaSpec(memories=[
             MemorySeed(content="Bob is teaching himself to bake sourdough."),
             MemorySeed(content="Bob's weekend plan is a hike if the weather holds."),
@@ -109,9 +110,17 @@ def test_generic_live_run(tmp_path) -> None:
             server.stop()
 
 
-def _new_session(server: BridgeServer) -> str:  # pragma: no cover - needs live bridge
-    import httpx
+def _skip_unless_authed(sb) -> None:
+    """A sandbox with no usable CLI login can only fail at the first turn (#236) — skip, loudly."""
+    if sb.auth_source == "unauthenticated":
+        pytest.skip(
+            "sandbox has no claude login: run `bash scripts/setup_harness_claude_login.sh` once "
+            "(gives the harness its own CLAUDE_CONFIG_DIR + Keychain entry)"
+        )
 
-    r = httpx.post(f"http://{server.host}:{server.port}/session/new", timeout=30)
-    r.raise_for_status()
-    return r.json()["session_id"]
+
+def _new_session(server: BridgeServer) -> str:
+    # Reuse the harness client: /session/new takes a required JSON body (#234 — a bare POST is 422).
+    from tests.harness.agent_send import new_session
+
+    return new_session(server.port, None)

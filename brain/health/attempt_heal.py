@@ -216,6 +216,29 @@ def _heal_text_from_baks(
     )
 
 
+_REPLACE_RETRIES = 8
+_REPLACE_RETRY_SLEEP_S = 0.05
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """os.replace with a short bounded retry on transient PermissionError.
+
+    Windows refuses to rename a file another handle has open (WinError 32).
+    The supervisor reads persona_config.json inside its ticks in the same
+    process as the settings writer, so a save can collide with a read (#200).
+    Mirrors brain.ingest.buffer._unlink_with_retry: never triggers on POSIX,
+    re-raises after the budget so a real permission problem still fails loud.
+    """
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_SLEEP_S * (attempt + 1))
+
+
 def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
     """Atomic raw-text save with .bak rotation.
 
@@ -241,11 +264,11 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
         src = path.with_name(f"{path.name}.bak{i}")
         dst = path.with_name(f"{path.name}.bak{i + 1}")
         if src.exists():
-            os.replace(src, dst)
+            _replace_with_retry(src, dst)
     if path.exists():
-        os.replace(path, path.with_name(f"{path.name}.bak1"))
+        _replace_with_retry(path, path.with_name(f"{path.name}.bak1"))
 
-    os.replace(new_path, path)
+    _replace_with_retry(new_path, path)
 
     # M-9: fsync the parent directory so the rename is durable, not just
     # atomic. POSIX guarantees os.replace's atomicity but not that the

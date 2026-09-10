@@ -12,10 +12,13 @@ What it does (see the module ``README.md`` for the guarantees):
    ``brain/paths.py:58-82`` routes all persona state to ``KINDLED_HOME``; the provider respects an
    upstream ``CLAUDE_CONFIG_DIR`` (``brain/bridge/provider.py:174``) so the CLI subprocess reads our
    seeded config, not the user's real ``~/.claude``.
-3. Auth-only seed — copy ONLY ``~/.claude/.credentials.json`` into the sandbox config dir. Never
-   ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. On Mac the credential may live in the
-   Keychain; a fresh ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so the branch is
-   recorded, not hard-failed.
+3. Auth. Preferred (#236): a STABLE harness-owned config dir the developer logged into once
+   (``scripts/setup_harness_claude_login.sh`` → ``.harness-authed`` marker) is used as
+   ``CLAUDE_CONFIG_DIR`` instead of the tempdir — an explicit config dir keys its own per-path
+   Keychain credential and never falls back to the default entry, so a fresh tempdir is always
+   "Not logged in" on a Mac. Fallback: copy ONLY ``~/.claude/.credentials.json`` into the tempdir
+   config (non-Mac). Never ``CLAUDE.md`` / ``settings*`` / ``skills`` / ``plugins``. Neither ⇒
+   ``auth_source == "unauthenticated"`` + a RuntimeWarning naming the setup script.
 3b. STORED-CHANNEL DE-ID (the next increment after the F1/F2 input-side ``$USER``/``$LOGNAME`` de-id):
    seal the three RUNTIME carriers by which the ``claude`` CLI's auto-injected context leaks the REAL
    owner name / project into the companion's STORED channels (``memories.db``, ``works/*.md``,
@@ -48,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sys
 import tempfile
 import warnings
 from collections.abc import Iterable, Iterator
@@ -128,7 +132,7 @@ class SandboxHandle:
     root: Path
     env: dict[str, str]
     claude_config_dir: Path
-    auth_source: str  # "credentials-file" | "keychain-or-inherited"
+    auth_source: str  # "harness-dir" | "credentials-file" | "unauthenticated"
     guard_roots: list[Path] = field(default_factory=list)
 
     @property
@@ -561,7 +565,7 @@ def _validate_editable_paths(paths: Iterable[Path] | None) -> list[Path]:
     return out
 
 
-def _live_bridges() -> list[tuple[int, str]]:
+def _live_bridges(home: Path | None = None) -> list[tuple[int, str]]:
     """Scan for RUNNING companion bridges (the load-bearing live-service detector, Phase 2).
 
     A live bridge writes ``bridge.json`` into its ``persona_dir`` carrying its ``pid``
@@ -576,6 +580,10 @@ def _live_bridges() -> list[tuple[int, str]]:
     accepted gap: a live bridge whose primary ``bridge.json`` is corrupt-but-``.bak``-recoverable is
     NOT detected here (backstopped by the post-run :class:`SandboxLeak`).
 
+    ``home`` is the REAL engine home, captured by ``sandbox()`` BEFORE it swaps ``KINDLED_HOME`` to
+    the tempdir (#241: scanning after the swap resolved to the empty sandbox and missed every
+    running bridge, so the run died at teardown with a misleading SandboxLeak). ``None`` ⇒ resolve now.
+
     Returns a list of ``(pid, persona_name)`` for each live bridge found (empty = none live).
     Tolerant: a missing home, a missing/corrupt/unreadable ``bridge.json`` is skipped, never raised.
     """
@@ -586,7 +594,7 @@ def _live_bridges() -> list[tuple[int, str]]:
 
     live: list[tuple[int, str]] = []
     try:
-        personas = get_home() / "personas"
+        personas = (home if home is not None else get_home()) / "personas"
         candidates = list(personas.glob("*/bridge.json"))
     except OSError:
         return live
@@ -629,7 +637,7 @@ def _probe_external_writer(snapshot_fn, wait_s: float) -> bool:
 
 
 def _run_live_check(
-    policy: str, snapshot_fn, *, probe: bool, probe_wait: float
+    policy: str, snapshot_fn, *, probe: bool, probe_wait: float, engine_home: Path | None = None
 ) -> str | None:
     """Run the live-service pre-check and dispatch by ``policy`` (stage-3 M1/L4).
 
@@ -648,7 +656,7 @@ def _run_live_check(
         return None
 
     parts: list[str] = []
-    bridges = _live_bridges()
+    bridges = _live_bridges(engine_home)
     if bridges:
         listed = ", ".join(f"pid {pid} (persona {name})" for pid, name in bridges)
         parts.append(
@@ -673,30 +681,57 @@ def _run_live_check(
     return msg
 
 
+_HARNESS_AUTHED_MARKER = ".harness-authed"
+
+
+def _is_darwin() -> bool:
+    """Seam for tests (patching ``sys.platform`` globally breaks unrelated stdlib paths on Windows)."""
+    return sys.platform == "darwin"
+
+
+def _harness_config_dir() -> Path:
+    """The stable, harness-owned ``CLAUDE_CONFIG_DIR`` a developer logs into ONCE (#236).
+
+    An explicit ``CLAUDE_CONFIG_DIR`` never falls back to the default Keychain entry — the CLI keys a
+    per-dir credential off a hash of the dir PATH — so a fresh tempdir is always "Not logged in" and
+    no file copy can fix that on a Mac (the credential is not a file there). A stable path keeps its
+    Keychain entry across runs. It lives under a SIBLING app name, deliberately OUTSIDE every
+    leak-guarded root, because CLI session files accumulate here across runs. Set up with
+    ``scripts/setup_harness_claude_login.sh``, which writes ``.harness-authed`` only after
+    ``claude auth status`` verifies. Overridable via ``CE_HARNESS_CLAUDE_CONFIG_DIR``.
+    """
+    override = os.environ.get("CE_HARNESS_CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override)
+    from platformdirs import PlatformDirs
+
+    return Path(PlatformDirs(f"{_APP}-harness").user_data_path) / "claude-config"
+
+
 def _seed_auth(claude_config_dir: Path) -> str:
     """Auth-only seed: copy ONLY ~/.claude/.credentials.json. Return the auth source.
 
-    On Mac the credential can live in the Keychain rather than a file — a fresh
-    ``CLAUDE_CONFIG_DIR`` still authenticates via Keychain, so we record the branch instead of
-    hard-failing. NEVER copy CLAUDE.md / settings* / skills / plugins.
+    Only reached when no authed harness dir exists (see :func:`_harness_config_dir`). NEVER copy
+    CLAUDE.md / settings* / skills / plugins.
     """
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
     cred = Path.home() / ".claude" / ".credentials.json"
-    if cred.is_file():
-        claude_config_dir.mkdir(parents=True, exist_ok=True)
+    # On macOS the real credential is a per-dir Keychain entry; any ~/.claude/.credentials.json is a
+    # stale leftover that does NOT authenticate a fresh dir (#236). Only the authed harness dir counts.
+    if cred.is_file() and not _is_darwin():
         shutil.copy2(cred, claude_config_dir / ".credentials.json")
         return "credentials-file"
-    claude_config_dir.mkdir(parents=True, exist_ok=True)
     # No cred file. On a Mac the credential may be in the Keychain (a fresh CLAUDE_CONFIG_DIR still
     # auths via Keychain) — plausible only on Darwin. Elsewhere this is genuinely unauthenticated,
     # which would fail deep in a live bridge run; record it clearly + warn now (A2) rather than let
     # it surface as an opaque provider failure. (Unit tests seed a fake cred, so never hit this.)
-    import sys
-
-    if sys.platform == "darwin":
-        return "keychain-or-inherited"
+    # #236: there is NO Keychain fallback for an explicit CLAUDE_CONFIG_DIR (the CLI keys the
+    # credential per dir path), so with no file this is unauthenticated on every platform.
     warnings.warn(
-        "sandbox: no ~/.claude/.credentials.json found and not on macOS — a live run "
-        "will be UNAUTHENTICATED and fail at the provider. Authenticate the claude CLI first.",
+        "sandbox: no usable claude login for the sandbox config dir (no authed harness dir; a "
+        "~/.claude/.credentials.json is only usable off macOS) — a live run will be UNAUTHENTICATED "
+        "and fail at the provider with provider_failed. Run "
+        "`bash scripts/setup_harness_claude_login.sh` once to give the harness its own login.",
         RuntimeWarning,
         stacklevel=2,
     )
@@ -782,7 +817,11 @@ def sandbox(
     :class:`EditablePathRefused` (before yielding) if an ``editable_paths`` entry is unsafe.
     """
     root = Path(tempfile.mkdtemp(prefix="ce-harness-"))
-    claude_config_dir = root / "claude-config"
+    # #236: prefer the stable harness-owned config dir the developer logged into once; a tempdir
+    # config can only authenticate from a copied ~/.claude/.credentials.json (non-Mac hosts).
+    authed_dir = _harness_config_dir()
+    use_authed = (authed_dir / _HARNESS_AUTHED_MARKER).is_file()
+    claude_config_dir = authed_dir if use_authed else root / "claude-config"
     claude_config_dir.mkdir(parents=True, exist_ok=True)
 
     # Save prior env so we can restore it exactly (including "was unset"). USER/LOGNAME are here so
@@ -829,6 +868,14 @@ def sandbox(
         _agg._warned_unregistered.update(_saved_warned)
 
     try:
+        # #241: resolve the REAL engine home BEFORE the swap below — the live-service pre-check must
+        # scan where a running bridge actually writes its bridge.json, not the empty sandbox.
+        from brain.paths import get_home as _real_get_home
+
+        try:
+            real_engine_home: Path | None = _real_get_home()
+        except Exception:  # noqa: BLE001 — a broken resolver must not break the sandbox
+            real_engine_home = None
         os.environ["KINDLED_HOME"] = str(root)
         os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
         os.environ.pop("NELLBRAIN_HOME", None)  # a stray value would win the fallback (paths.py:60)
@@ -858,7 +905,7 @@ def sandbox(
                 stacklevel=3,
             )
 
-        auth_source = _seed_auth(claude_config_dir)
+        auth_source = "harness-dir" if use_authed else _seed_auth(claude_config_dir)
         # Stored-channel de-id carrier B: pre-seed a SYNTHETIC oauthAccount into the CLI's config so it
         # injects a de-identified account identity, not the real displayName/email/org. (TTL-bounded —
         # see _seed_scrubbed_config.) Done AFTER _seed_auth (which creates the dir + copies the real
@@ -927,7 +974,7 @@ def sandbox(
         # + rmtree in the finally still run — no stale KINDLED_HOME leaks; P14). "warn" returns a
         # message we use to annotate a later SandboxLeak (P5); "off" is a no-op.
         live_note = _run_live_check(
-            live_check, _snapshot, probe=probe, probe_wait=probe_wait
+            live_check, _snapshot, probe=probe, probe_wait=probe_wait, engine_home=real_engine_home
         )
 
         before = _snapshot()
@@ -945,10 +992,19 @@ def sandbox(
         work_dir = root / "work"
         work_dir.mkdir(parents=True, exist_ok=True)
         # Carrier C — synthetic HOME: an empty ~/.claude (no CLAUDE.md) so the CLI's global user-memory
-        # resolves to nothing real whichever way it keys (HOME vs CLAUDE_CONFIG_DIR). Auth is unaffected:
-        # the credentials live under CLAUDE_CONFIG_DIR (seeded), not HOME.
+        # resolves to nothing real whichever way it keys (HOME vs CLAUDE_CONFIG_DIR). Auth lives under
+        # CLAUDE_CONFIG_DIR (or, on macOS, in the Keychain — see the symlink below), not HOME.
         syn_home = root / "home"
         (syn_home / ".claude").mkdir(parents=True, exist_ok=True)
+        # #236: on macOS the CLI's per-dir credential is a Keychain entry, and the Keychain is found
+        # via $HOME/Library/Keychains — so a bare synthetic HOME hides it and every live turn fails
+        # with "Not logged in". Link the REAL Keychains dir into the synthetic HOME (read via
+        # `security`; the login keychain itself stays where it is). Nothing else from ~/Library.
+        if _is_darwin():
+            real_keychains = Path.home() / "Library" / "Keychains"  # HOME is still REAL here
+            if real_keychains.is_dir():
+                (syn_home / "Library").mkdir(parents=True, exist_ok=True)
+                (syn_home / "Library" / "Keychains").symlink_to(real_keychains, target_is_directory=True)
         if saved_cwd is not None:
             os.chdir(work_dir)
         os.environ["HOME"] = str(syn_home)
@@ -974,9 +1030,20 @@ def sandbox(
             after = _snapshot()
             changed = [g for g in before if before[g] != after.get(g)]
             if changed:
+                # #241: name WHICH entries moved (first few per root) — a bare root name forced a
+                # manual fingerprint diff to learn the culprit was one live-bridge persona file.
+                _detail: list[str] = []
+                for g in changed:
+                    b_, a_ = before[g], after.get(g) or {}
+                    if isinstance(b_, dict) and isinstance(a_, dict):
+                        keys = sorted(k for k in set(b_) | set(a_) if b_.get(k) != a_.get(k))
+                        shown = ", ".join(str(k) for k in keys[:5])
+                        more = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+                        _detail.append(f"{g}: {shown}{more}")
                 msg = (
                     "guarded real-home root(s) mutated during a sandboxed run: "
                     + ", ".join(changed)
+                    + (" — changed entries: " + "; ".join(_detail) if _detail else "")
                 )
                 if live_note is not None:
                     # warn-mode pre-check saw a live service — attribute the leak correctly (P5).

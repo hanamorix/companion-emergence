@@ -544,3 +544,68 @@ def test_boot_and_verify_error_does_not_leak_forwarded_token(
         fg.boot_and_verify(spec, boot_cmd=["false"], env={"CE_DROPIN_REPO": "x"})
 
     assert _SENTINEL not in str(excinfo.value)
+
+
+# --- #192: READY freshness must tolerate filesystem/clock granularity -----------------------------
+
+
+def test_boot_and_verify_boot_cmd_accepts_ready_within_mtime_slack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a just-written READY can carry an mtime slightly EARLIER than the
+    boot's ``time.time()`` start (filesystem timestamp granularity / clock source
+    skew). A READY within the slack window is this boot's own — accept it."""
+    import os
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        _write_ready(run_dir, {"brain_repo": "x"})
+        early = time.time() - 1.0  # inside the 2 s slack, but < boot_start
+        os.utime(run_dir / "READY", (early, early))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(fg.subprocess, "run", _fake_run)
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    fg.boot_and_verify(spec, boot_cmd=["true"])  # must not raise "missing or stale"
+
+
+def test_boot_and_verify_boot_cmd_still_rejects_ready_older_than_slack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slack is small: a leftover READY from a previous run is still rejected."""
+    import os
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_ready(run_dir, {"brain_repo": "leftover"})
+    old = time.time() - 60.0
+    os.utime(run_dir / "READY", (old, old))
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(fg.subprocess, "run", _fake_run)
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    with pytest.raises(fg.ForegroundBootError, match="missing or stale"):
+        fg.boot_and_verify(spec, boot_cmd=["true"])
+
+
+def test_boot_and_verify_poll_mode_accepts_ready_within_mtime_slack(tmp_path: Path) -> None:
+    """Poll-branch counterpart: same slack applies to ``_poll_for_ready_or_error``."""
+    import os
+    import threading
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def _write_slightly_early() -> None:
+        time.sleep(0.05)
+        _write_ready(run_dir, {"brain_repo": "x"})
+        early = time.time() - 1.0
+        os.utime(run_dir / "READY", (early, early))
+
+    threading.Thread(target=_write_slightly_early, daemon=True).start()
+    spec = fg.ArmBootSpec(arm="C", port=8933, run_dir=run_dir, ready_timeout=5.0)
+    fg.boot_and_verify(spec, boot_cmd=None)  # must not time out waiting

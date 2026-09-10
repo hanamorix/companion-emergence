@@ -265,6 +265,14 @@ def boot_and_verify(
     )
 
 
+# READY freshness slack. Both branches compare READY's st_mtime against a
+# time.time() start; on Windows a just-written file can read slightly EARLIER
+# than that start (filesystem timestamp granularity, clock-source skew), so a
+# genuinely fresh READY was rejected as stale (#192). 2 s covers FAT/NTFS
+# worst-case granularity while still rejecting any leftover from a prior run.
+_READY_MTIME_SLACK_S = 2.0
+
+
 def _poll_for_ready_or_error(
     run_dir: Path, ready_timeout: float, error_markers: Sequence[str]
 ) -> None:
@@ -276,7 +284,7 @@ def _poll_for_ready_or_error(
         for marker in error_markers:
             if (run_dir / marker).exists():
                 return
-        if ready_path.exists() and ready_path.stat().st_mtime >= start:
+        if ready_path.exists() and ready_path.stat().st_mtime >= start - _READY_MTIME_SLACK_S:
             return
         time.sleep(_POLL_INTERVAL)
     raise ForegroundBootError(
@@ -290,10 +298,11 @@ def _require_fresh_ready(run_dir: Path, start: float) -> None:
 
     A successful (exit-0) ``boot_cmd`` is not itself proof the run booted -- a leftover
     ``READY`` file from a reused ``run_dir`` would otherwise be misread as this boot's own
-    confirmation. Require ``<run_dir>/READY`` to exist AND have an mtime ``>= start``.
+    confirmation. Require ``<run_dir>/READY`` to exist AND have an mtime ``>= start``
+    (minus :data:`_READY_MTIME_SLACK_S`).
     """
     ready_path = run_dir / _READY_NAME
-    if not ready_path.exists() or ready_path.stat().st_mtime < start:
+    if not ready_path.exists() or ready_path.stat().st_mtime < start - _READY_MTIME_SLACK_S:
         raise ForegroundBootError(
             f"boot_cmd exited 0 but {ready_path} is missing or stale (its mtime predates the "
             "boot's own start) -- refusing to treat a leftover READY in a reused run_dir as a "

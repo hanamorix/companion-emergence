@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from brain import __version__
+from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion.persona_loader import load_persona_vocabulary
@@ -43,6 +43,12 @@ from brain.setup import (
     write_persona_config,
 )
 from brain.utils.time import iso_utc
+
+# Text externalized to prompt_strings.toml [cli] (issue #129 stage 2b).
+_DREAM_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.dream_system_prompt_segments")
+_HEARTBEAT_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.heartbeat_system_prompt_segments")
+_REFLEX_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.reflex_system_prompt_segments")
+_RESEARCH_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments("cli.research_system_prompt_segments")
 
 
 def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
@@ -693,9 +699,8 @@ def _dream_handler(args: argparse.Namespace) -> int:
                 persona_dir=persona_dir,
                 persona_name=args.persona,
                 persona_system_prompt=(
-                    f"You are {args.persona}. You just woke from a dream about "
-                    "interconnected memories. Reflect in first person, 2-3 sentences, "
-                    "starting with 'DREAM: '. Be honest and specific, not abstract."
+                    _DREAM_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                    + _DREAM_SYSTEM_PROMPT_SEGMENTS[1]
                 ),
                 soul_store=soul_store,
             )
@@ -762,7 +767,10 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
                 research_log_path=persona_dir / "research_log.json",
                 default_interests_path=_default_interests_path(),
                 persona_name=args.persona,
-                persona_system_prompt=f"You are {args.persona}.",
+                persona_system_prompt=(
+                    _HEARTBEAT_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                    + _HEARTBEAT_SYSTEM_PROMPT_SEGMENTS[1]
+                ),
             )
             result = engine.run_tick(trigger=args.trigger, dry_run=args.dry_run)
         finally:
@@ -867,7 +875,10 @@ def _reflex_handler(args: argparse.Namespace) -> int:
             store=store,
             provider=provider,
             persona_name=args.persona,
-            persona_system_prompt=f"You are {args.persona}.",
+            persona_system_prompt=(
+                _REFLEX_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                + _REFLEX_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
             arcs_path=persona_dir / "reflex_arcs.json",
             log_path=persona_dir / "reflex_log.json",
             default_arcs_path=default_arcs_path,
@@ -922,7 +933,10 @@ def _research_handler(args: argparse.Namespace) -> int:
             provider=provider,
             searcher=searcher,
             persona_name=args.persona,
-            persona_system_prompt=f"You are {args.persona}.",
+            persona_system_prompt=(
+                _RESEARCH_SYSTEM_PROMPT_SEGMENTS[0] + args.persona
+                + _RESEARCH_SYSTEM_PROMPT_SEGMENTS[1]
+            ),
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=_default_interests_path(),

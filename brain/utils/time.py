@@ -38,7 +38,7 @@ own edit:
     date, "%Y-%m-%d" only (no time-of-day)
 
 To switch to a fully-localized presentation later (e.g. locale-aware /
-human-phrase instead of an ISO offset string): change ``format_local()``
+human-phrase instead of a naive-local ISO string): change ``format_local()``
 (and/or ``local_display()``, which calls it) here in this file, and every
 site in the first list follows automatically. Then separately edit each
 exception site named above, since those do not route through either helper.
@@ -100,10 +100,17 @@ def to_local(dt: datetime) -> datetime:
 
 
 def format_local(dt: datetime) -> str:
-    """Render a datetime as local-zone ISO-8601 (seconds precision, explicit
-    UTC offset instead of a 'Z' suffix — 'Z' means UTC, and a converted local
-    time still labeled 'Z' would misstate its own zone)."""
-    return to_local(dt).isoformat(timespec="seconds")
+    """Render a datetime as local-zone ISO-8601, seconds precision, with NO
+    offset suffix (tz-local-display, issue #218): the wall-clock value is
+    still the OS-local time (e.g. 21:21:30, not UTC), but the trailing
+    '-04:00'/'+00:00' is dropped before rendering. A 'Z' suffix is also
+    wrong here — 'Z' means UTC, and a converted local time still labeled
+    'Z' would misstate its own zone — so the fix is to go naive, not to
+    relabel. This is display-only: strip tzinfo on the local-converted
+    value right before isoformat(), never on a stored/ordering timestamp.
+    An explicit offset was tried first and dropped: the substrate echoed
+    the offset token back verbatim, which naive-local avoids."""
+    return to_local(dt).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def local_display(ts: str) -> str:

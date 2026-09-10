@@ -76,9 +76,12 @@ def test_buffer_timestamps_appear_in_context_block(tmp_path: Path, monkeypatch):
 
     # The preamble carries the "Current time" anchor in local wall-clock
     # time too (injected `now` above is trusted as already-local, per
-    # brain.utils.time.to_local's guard - deterministic regardless of TZ).
-    assert "Current time: 2026-05-20T07:30:00-07:00." in block
+    # brain.utils.time.to_local's guard - deterministic regardless of TZ),
+    # rendered with no offset suffix (issue #218 - the offset token was
+    # itself what the substrate was echoing back).
+    assert "Current time: 2026-05-20T07:30:00." in block
     assert "Current time: 2026-05-20T07:30:00Z." not in block
+    assert "Current time: 2026-05-20T07:30:00-07:00." not in block
 
 
 def test_old_buffer_without_ts_loads_cleanly(tmp_path: Path, monkeypatch):
