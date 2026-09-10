@@ -273,24 +273,13 @@ def maybe_weekly_rollover(
         store=store, hebbian=hebbian, embeddings=embeddings, config=config,
     )
 
-    # Stage 4 of the local-semantic-retrieval build (spec decision 5,
-    # "Calibration"): the weekly rollover is the ONE place the per-persona
-    # semantic floor/gap recalibration runs — once, right here, only when
-    # the swap actually fired (new_sid is not None; a deferred/busy/nothing-
-    # to-seed rollover is a no-op and must not trigger it either). This is
-    # OFF the message hot path by construction: this function only ever
-    # runs from the supervisor's background compaction/rollover tick (see
-    # brain/bridge/supervisor.py's weekly-rollover call site), never from a
-    # live turn. `embeddings` may be None in callers that don't pass a
-    # cache (e.g. some tests) — recalibration needs the persona's embedded
-    # vectors, so it's skipped rather than constructing one here.
-    if new_sid is not None and embeddings is not None:
-        try:
-            from brain.memory.semantic_calibration import recalibrate_persona
-
-            recalibrate_persona(persona_dir, embeddings, now=now)
-        except Exception:
-            logger.exception("weekly rollover: semantic recalibration raised (ignored)")
+    # #231 RERANKER RE-ARCHITECTURE (2026-09-10): the Stage-4 per-persona
+    # semantic floor/gap recalibration pass that used to run here (spec
+    # decision 5's "Calibration" bullet, brain/memory/semantic_calibration.py)
+    # is REMOVED — the cold red-team proved deriving a cosine floor/gap from
+    # the corpus's own inter-memory spread doesn't generalize. Replaced by a
+    # cross-encoder reranker + a FIXED floor (brain/memory/semantic_recall.
+    # RERANK_FLOOR), which needs no per-persona recalibration pass at all.
 
     return new_sid
 

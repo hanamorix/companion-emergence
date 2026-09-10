@@ -1,11 +1,12 @@
 """Tests for brain.memory.semantic_recall — Stage 3 (semantic-PRIMARY
-retrieval + option-4 surfacing) of the local semantic-retrieval build.
+retrieval) + #231 RERANKER RE-ARCHITECTURE (floor-gated standout selection,
+replacing the cosine-era per-persona calibration/shape classifier).
 
-Covers the pure shape-classification/surfacing-tier logic directly (cheap,
-exact boundary control at 5/6/9/10 candidates) and the candidate-pool
-builder's warm-up/scoring-safety contract. The end-to-end #88 case, the
-three surfacing tiers wired through the real recall block, and the
-recall-counter tick semantics are covered as integration tests through
+Covers the pure floor-gating/surfacing-tier logic directly (cheap, exact
+boundary control at 5/6/9/10 candidates) and the candidate-pool builder's
+warm-up/scoring-safety/state-filter contract. The end-to-end #88 case, the
+surfacing tiers wired through the real recall block, and the recall-counter
+tick semantics are covered as integration tests through
 `brain.chat.prompt._build_recall_block` in
 `tests/unit/brain/chat/test_semantic_primary_recall.py` — this file is the
 unit layer underneath that.
@@ -22,23 +23,19 @@ import pytest
 
 import brain.memory.semantic_recall as semantic_recall_mod
 from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.reranker import FakeRerankerProvider
 from brain.memory.semantic_recall import (
-    SEMANTIC_FLOOR_BOOTSTRAP,
-    SEMANTIC_GAP_BOOTSTRAP,
-    SemanticCalibration,
+    FULL_INJECT_STANDOUT_MAX,
+    MAX_STANDOUT_COUNT,
+    RERANK_FLOOR,
     build_semantic_candidate_pool,
-    classify_semantic_shape,
     run_semantic_recall,
-    surfacing_tiers,
+    select_standouts,
 )
 from brain.memory.store import Memory, MemoryStore
 
 
-def _cal() -> SemanticCalibration:
-    return SemanticCalibration.bootstrap()
-
-
-def _mem(store: MemoryStore, content: str) -> Memory:
+def _mem(store: MemoryStore, content: str, *, state: str = "active") -> Memory:
     m = Memory(
         id=str(uuid.uuid4()),
         content=content,
@@ -46,151 +43,100 @@ def _mem(store: MemoryStore, content: str) -> Memory:
         domain="d",
         created_at=datetime.now(UTC),
         importance=1.0,
+        state=state,
     )
     store.create(m)
     return m
 
 
 # ---------------------------------------------------------------------------
-# SemanticCalibration
+# select_standouts — floor filtering
 # ---------------------------------------------------------------------------
 
 
-def test_bootstrap_calibration_matches_module_constants() -> None:
-    cal = SemanticCalibration.bootstrap()
-    assert cal.floor == SEMANTIC_FLOOR_BOOTSTRAP
-    assert cal.gap == SEMANTIC_GAP_BOOTSTRAP
+def test_nothing_clears_the_floor_returns_none() -> None:
+    scored = [("a", RERANK_FLOOR - 5.0), ("b", RERANK_FLOOR - 1.0)]
+    assert select_standouts(scored) is None
 
 
-def test_calibration_is_pluggable_not_hardcoded() -> None:
-    """Stage 4's plug-in seam: classify_semantic_shape takes a calibration
-    parameter rather than reading the module constants directly — a
-    different SemanticCalibration instance changes classification."""
-    scored = [("a", 0.9), ("b", 0.5)]
-    loose = SemanticCalibration(floor=0.0, gap=1.0)  # gap too big to ever cliff
-    tight = SemanticCalibration(floor=0.0, gap=0.1)  # 0.4 gap clears this easily
-    assert classify_semantic_shape(scored, calibration=loose).kind == "clump"
-    assert classify_semantic_shape(scored, calibration=tight).kind == "standouts"
-
-
-# ---------------------------------------------------------------------------
-# classify_semantic_shape — floor filtering
-# ---------------------------------------------------------------------------
-
-
-def test_no_candidate_passes_floor_is_shape_none() -> None:
-    scored = [("a", 0.1), ("b", 0.2)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "none"
-    assert shape.standout_count == 0
-
-
-def test_single_floor_passing_candidate_is_a_trivial_standout() -> None:
-    scored = [("a", 0.9), ("b", 0.1)]  # only "a" passes the 0.45 floor
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "standouts"
-    assert shape.standout_count == 1
-
-
-def test_below_floor_candidates_never_enter_the_window() -> None:
-    """A candidate below the floor cannot extend the standout cluster even
-    if it happens to sit close in score to the last real standout."""
-    scored = [("a", 0.9), ("b", 0.46), ("c", 0.44)]  # c fails the 0.45 floor
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    # a->b gap = 0.44 (cliff at 0), b never compared against c (c excluded).
-    assert shape.kind == "standouts"
-    assert shape.standout_count == 1
-
-
-# ---------------------------------------------------------------------------
-# classify_semantic_shape — boundary counts (5 / 6 / 9 / 10)
-# ---------------------------------------------------------------------------
-
-
-def _stepped_scores(n: int, *, top: float = 0.90, step: float = 0.05, floor: float = 0.30) -> list[float]:
-    """n scores each `step` apart (below the bootstrap gap of 0.08, so no
-    internal cliff), followed by one score far below `floor` (a clean cliff
-    right after the nth item)."""
-    scores = [top - i * step for i in range(n)]
-    scores.append(min(scores) - 1.0)  # far below any floor
-    return scores
-
-
-@pytest.mark.parametrize("n", [1, 5])
-def test_le_5_standouts_shape(n: int) -> None:
-    scores = _stepped_scores(n)
-    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "standouts"
-    assert shape.standout_count == n
-
-
-@pytest.mark.parametrize("n", [6, 9])
-def test_6_to_9_standouts_shape(n: int) -> None:
-    scores = _stepped_scores(n)
-    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "standouts"
-    assert shape.standout_count == n
-
-
-def test_10_bunched_candidates_with_no_cliff_in_scan_window_is_a_clump() -> None:
-    """10 candidates, each only `step` apart all the way down — no cliff
-    anywhere in the top-9 scan window, so the shape is INCONCLUSIVE (a
-    clump), matching the spec's 'bunched, ~>=10' bucket."""
-    scores = [0.90 - i * 0.05 for i in range(10)]
-    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "clump"
-    assert shape.standout_count == 0
-
-
-# ---------------------------------------------------------------------------
-# surfacing_tiers
-# ---------------------------------------------------------------------------
-
-
-def test_surfacing_tiers_none_for_inconclusive_shape() -> None:
-    scored = [("a", 0.5), ("b", 0.49)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    assert shape.kind == "clump"
-    assert surfacing_tiers(scored, shape) is None
-
-
-def test_surfacing_tiers_all_full_for_le_5() -> None:
-    scores = _stepped_scores(5)
-    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    tiers = surfacing_tiers(scored, shape)
+def test_a_below_floor_candidate_never_enters_the_standout_set() -> None:
+    scored = [("a", RERANK_FLOOR + 1.0), ("b", RERANK_FLOOR - 0.01)]
+    tiers = select_standouts(scored)
     assert tiers is not None
-    assert tiers.full_ids == [f"m{i}" for i in range(5)]
+    assert tiers.full_ids == ["a"]
     assert tiers.snippet_ids == []
 
 
-def test_surfacing_tiers_top5_full_rest_snippet_for_6_to_9() -> None:
-    scores = _stepped_scores(9)
-    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    tiers = surfacing_tiers(scored, shape)
+def test_a_score_exactly_at_the_floor_clears_it() -> None:
+    """The floor comparison is >=, not > — a candidate scoring exactly
+    RERANK_FLOOR counts as a standout, matching the pre-#231 classifier's
+    own `< calibration.floor` (strict) exclusion rule."""
+    scored = [("a", RERANK_FLOOR)]
+    tiers = select_standouts(scored)
     assert tiers is not None
-    assert tiers.full_ids == [f"m{i}" for i in range(5)]
-    assert tiers.snippet_ids == [f"m{i}" for i in range(5, 9)]
+    assert tiers.full_ids == ["a"]
 
 
-def test_surfacing_tier_ids_are_in_cosine_selection_order() -> None:
-    """full/snippet ids come out highest-cosine-first — presentation
-    re-ordering is the CALLER's job (prompt.py), not this function's."""
-    scores = _stepped_scores(6)
+# ---------------------------------------------------------------------------
+# select_standouts — boundary counts (5 / 6 / 9 / 10+)
+# ---------------------------------------------------------------------------
+
+
+def _above_floor_scores(n: int, *, top: float = 5.0, step: float = 0.5) -> list[float]:
+    """n scores, each clearing RERANK_FLOOR (the floor no longer cares about
+    the GAP between them — every above-floor candidate is a standout)."""
+    return [top - i * step for i in range(n)]
+
+
+@pytest.mark.parametrize("n", [1, 5])
+def test_le_5_standouts_all_full(n: int) -> None:
+    scores = _above_floor_scores(n)
     scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    shape = classify_semantic_shape(scored, calibration=_cal())
-    tiers = surfacing_tiers(scored, shape)
+    tiers = select_standouts(scored)
+    assert tiers is not None
+    assert tiers.full_ids == [f"m{i}" for i in range(n)]
+    assert tiers.snippet_ids == []
+
+
+@pytest.mark.parametrize("n", [6, 9])
+def test_6_to_9_standouts_top5_full_rest_snippet(n: int) -> None:
+    scores = _above_floor_scores(n)
+    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
+    tiers = select_standouts(scored)
+    assert tiers is not None
+    assert tiers.full_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX)]
+    assert tiers.snippet_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX, n)]
+
+
+def test_10_or_more_above_floor_caps_at_max_standout_count_not_lexical() -> None:
+    """#231 correction: the old cosine-era '10+ = clump -> lexical' bucket
+    is DROPPED. A trustworthy per-candidate reranker floor means 10+
+    above-floor candidates are 10+ genuinely relevant results -- capped at
+    MAX_STANDOUT_COUNT (top 5 full + 4 snippet), never demoted to the
+    lexical fallback."""
+    scores = _above_floor_scores(12)
+    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
+    tiers = select_standouts(scored)
+    assert tiers is not None
+    assert tiers.full_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX)]
+    assert tiers.snippet_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX, MAX_STANDOUT_COUNT)]
+    assert len(tiers.full_ids) + len(tiers.snippet_ids) == MAX_STANDOUT_COUNT
+
+
+def test_surfacing_tier_ids_are_in_reranker_selection_order() -> None:
+    """full/snippet ids come out highest-reranker-score-first — presentation
+    re-ordering is the CALLER's job (prompt.py), not this function's."""
+    scores = _above_floor_scores(6)
+    scored = [(f"m{i}", s) for i, s in enumerate(scores)]
+    tiers = select_standouts(scored)
     assert tiers is not None
     assert tiers.full_ids == sorted(tiers.full_ids, key=lambda mid: -dict(scored)[mid])
     assert tiers.snippet_ids == sorted(tiers.snippet_ids, key=lambda mid: -dict(scored)[mid])
 
 
 # ---------------------------------------------------------------------------
-# build_semantic_candidate_pool — warm-up + bump-free scoring
+# build_semantic_candidate_pool — warm-up + bump-free scoring + #231
+# fold-in fix (b): state=='active' filter.
 # ---------------------------------------------------------------------------
 
 
@@ -237,6 +183,43 @@ def test_pool_only_includes_memories_with_a_cached_vector(tmp_path: Path) -> Non
         cache.close()
 
 
+def test_pool_excludes_fading_state_memories_even_if_cached(tmp_path: Path) -> None:
+    """#231 fold-in fix (b): a memory in state='fading' is still active=1
+    (list_active() filters only the deactivation flag), so without this
+    filter it could enter the semantic pool and double-render/double-bump
+    alongside the separately-computed fading partition. The pool must
+    filter to state=='active'.
+
+    NOTE: ``store.create()`` does not persist an arbitrary ``Memory.state``
+    passed to it (schema column ``state`` isn't in its INSERT column list;
+    every row lands ``state='active'`` regardless of the dataclass value) —
+    the only real way a memory transitions to ``state='fading'`` is the
+    production path, ``store.fade(id, summary=...)``, which is what every
+    other fading-memory test in this suite uses (see e.g.
+    tests/unit/brain/memory/test_store.py, tests/unit/brain/chat/
+    test_prompt.py). Mirror that here rather than constructing a Memory with
+    state='fading' directly, which would silently exercise a state create()
+    can never actually produce."""
+    store = MemoryStore(":memory:")
+    active_mem = _mem(store, "an active memory")
+    fading_mem = _mem(store, "the original content before it faded")
+    fading_summary = "a softened fading memory"
+    store.fade(fading_mem.id, summary=fading_summary)
+
+    provider = FakeEmbeddingProvider(dim=8)
+    cache = EmbeddingCache(tmp_path / "embeddings.db", provider)
+    try:
+        cache.get_or_compute(active_mem.content)
+        cache.get_or_compute(fading_summary)
+
+        pool = build_semantic_candidate_pool(store, cache)
+
+        assert active_mem.id in pool
+        assert fading_mem.id not in pool, "a state='fading' memory must never enter the semantic pool"
+    finally:
+        cache.close()
+
+
 def test_pool_build_never_bumps_recall_count(tmp_path: Path) -> None:
     store = MemoryStore(":memory:")
     m = _mem(store, "scored but maybe not surfaced")
@@ -262,10 +245,10 @@ def test_pool_build_never_bumps_recall_count(tmp_path: Path) -> None:
 # run_semantic_recall — fail-soft contract (module docstring: "ANY failure
 # ... must never break recall"). Regression coverage for the defect where
 # only the cache-open and query-embed steps were individually wrapped in
-# try/except; everything after (pool build, cosine scoring, shape
-# classification, surfacing) sat inside a bare try/finally with NO except,
-# so an exception there propagated straight out of run_semantic_recall
-# instead of demoting the turn to the lexical fallback.
+# try/except; everything after (pool build, cosine scoring, reranking,
+# floor-gating) sat inside a bare try/finally with NO except, so an
+# exception there propagated straight out of run_semantic_recall instead of
+# demoting the turn to the lexical fallback.
 # ---------------------------------------------------------------------------
 
 
@@ -323,12 +306,49 @@ def test_run_semantic_recall_is_fail_soft_when_scoring_raises(
     assert result is None, "a scoring failure must demote this turn to the lexical fallback, not raise"
 
 
+def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#231: a reranker failure must demote to the LEXICAL fallback, never
+    raise and never fall back to raw cosine ranking (the unreliable signal
+    the reranker replaces)."""
+
+    class _BoomReranker(FakeRerankerProvider):
+        def rerank(self, query: str, documents: list[str]):
+            raise RuntimeError("simulated reranker failure")
+
+    # semantic_recall.py calls `reranker_mod.build_reranker_provider()` — a
+    # dynamic attribute lookup on the imported `reranker` MODULE at call
+    # time (`from brain.memory import reranker as reranker_mod`), not a
+    # name bound directly into semantic_recall's own namespace. Patch the
+    # attribute on the reranker module itself (mirrors how conftest.py's
+    # own `_fake_reranker_provider_by_default` fixture patches it).
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider", lambda: _BoomReranker()
+    )
+
+    store = MemoryStore(":memory:")
+    mem = _mem(store, "a memory that DOES have a cached vector")
+
+    from brain.memory.embeddings import build_embedding_cache
+
+    cache = build_embedding_cache(tmp_path)
+    try:
+        cache.get_or_compute(mem.content)
+    finally:
+        cache.close()
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is None, "a reranker failure must demote this turn to the lexical fallback, not raise"
+
+
 def test_run_semantic_recall_is_fail_soft_when_close_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """#231 Fix 4: the `finally: embeddings_cache.close()` sat OUTSIDE the
     inner `except Exception` clause (only the two earlier steps and the
-    pool-build/scoring/classification block were guarded), so a
+    pool-build/scoring/reranking/floor-gating block were guarded), so a
     pathological `close()` error could escape this function's own
     documented "never raises" contract — even on an otherwise-SUCCESSFUL
     turn, since the return value is built before `finally` runs but a

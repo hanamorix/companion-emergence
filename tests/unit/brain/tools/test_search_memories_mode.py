@@ -19,6 +19,8 @@ import pytest
 
 from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
 
@@ -81,6 +83,20 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     )
 
 
+def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
+    """#231: `_semantic_top_k` floor-gates on the RERANKER score, not cosine
+    — conftest.py's autouse fixture already forces `build_reranker_provider`
+    to a `FakeRerankerProvider()` with no scripted scores (every unscripted
+    document defaults far below `RERANK_FLOOR`), so a test that wants a
+    CONCLUSIVE (floor-clearing) semantic result must script the specific
+    memory contents it expects to surface, same pattern as `_patch_provider`
+    above for the embedding side."""
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda: FakeRerankerProvider(scores=scores),
+    )
+
+
 def _rc(store: MemoryStore, mid: str) -> int:
     return store._conn.execute(  # noqa: SLF001
         "SELECT recall_count FROM memories WHERE id = ?", (mid,)
@@ -107,6 +123,7 @@ def test_default_mode_is_semantic(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _patch_reranker(monkeypatch, scores={target: RERANK_FLOOR + 5.0})
 
     res = dispatch("search_memories", {"query": query}, **ctx)
 
@@ -183,6 +200,14 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
 
     _seed_vectors(tmp_path, vectors, dim=dim, contents=[target, decoy])
     _patch_provider(monkeypatch, vectors, dim=dim)
+    # Both clear RERANK_FLOOR (so the assertion actually exercises the
+    # reranker's ORDERING, not just floor-based exclusion of the decoy) —
+    # target scored clearly higher, matching the cosine-era hand-chosen
+    # relationship (0.95 vs 0.10) this test's docstring describes.
+    _patch_reranker(
+        monkeypatch,
+        scores={target: RERANK_FLOOR + 5.0, decoy: RERANK_FLOOR + 0.5},
+    )
 
     semantic_res = dispatch("search_memories", {"query": query, "mode": "semantic"}, **ctx)
     assert semantic_res["mode"] == "semantic"

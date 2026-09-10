@@ -80,6 +80,14 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 MODEL_EMBEDDING = "BAAI/bge-small-en-v1.5"  # 384-dim int8, via fastembed (ONNX, no torch)
 MODEL_EMBEDDING_DIM = 384  # output dim of MODEL_EMBEDDING; change together if the model changes
 
+# MODEL_RERANKER is also not a Claude model — it's a local ONNX cross-encoder
+# reranker id (fastembed's TextCrossEncoder), the #231 reranker re-architecture
+# (same standing convention as MODEL_EMBEDDING above): a cross-encoder reads
+# (query, memory) TOGETHER and scores true relevance, replacing the old
+# cosine-floor/gap auto-calibration that didn't generalize across corpus
+# shapes. See brain/memory/reranker.py.
+MODEL_RERANKER = "Xenova/ms-marco-MiniLM-L-6-v2"  # ONNX cross-encoder, ~80MB, via fastembed
+
 # attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
 # (not the bare "haiku" alias) — this predates #154 and substituting the alias
 # could silently repoint it to a different snapshot over time. Moved here from
@@ -104,6 +112,11 @@ TIER_DEV_CLI = "dev-cli"
 # actual provider via build_embedding_provider() in brain/memory/embeddings.py,
 # which reads model_for_tier(TIER_EMBEDDING) rather than hardcoding the id.
 TIER_EMBEDDING = "embedding"
+# Same non-Claude-tier treatment as TIER_EMBEDDING above — registered here so
+# the model id lives in ONE place; construct the actual provider via
+# build_reranker_provider() in brain/memory/reranker.py, which reads
+# model_for_tier(TIER_RERANKER) rather than hardcoding the id.
+TIER_RERANKER = "reranker"
 
 TIER_MODEL: dict[str, str] = {
     # NOMINAL/DEFAULT ONLY — decorative for this one tier (future "biggest"
@@ -122,6 +135,7 @@ TIER_MODEL: dict[str, str] = {
     TIER_BACKGROUND_HOUSEKEEPING: MODEL_LITTLE,
     TIER_DEV_CLI: MODEL_MEDIUM,
     TIER_EMBEDDING: MODEL_EMBEDDING,
+    TIER_RERANKER: MODEL_RERANKER,
 }
 
 

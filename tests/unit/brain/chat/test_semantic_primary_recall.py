@@ -1,25 +1,31 @@
-"""Integration tests for Stage 3 (semantic-PRIMARY recall + option-4
-surfacing) driven through the REAL `_build_recall_block` — not just the raw
-`brain.memory.semantic_recall` functions (those are covered directly in
+"""Integration tests for Stage 3 (semantic-PRIMARY recall) + #231 RERANKER
+RE-ARCHITECTURE (floor-gated reranker surfacing) driven through the REAL
+`_build_recall_block` — not just the raw `brain.memory.semantic_recall`
+functions (those are covered directly in
 `tests/unit/brain/memory/test_semantic_recall.py`).
 
 Uses a small scripted `EmbeddingProvider` (deterministic, hand-chosen cosine
-relationships) rather than the suite-wide `FakeEmbeddingProvider` — Fake's
-hash-seeded vectors are ~orthogonal for any two distinct strings, which is
-fine for mechanical plumbing but cannot exercise a SPECIFIC semantic
-relationship like "paraphrase beats keyword-overlap decoy", which is exactly
-what the #88 acceptance case needs.
+relationships) so the semantic candidate POOL is populated and coarse-cut
+predictably, and a scripted `FakeRerankerProvider` (deterministic,
+per-content-text scores) to control which candidates clear `RERANK_FLOOR`
+and in what order — since #231 the reranker score, not cosine, decides
+surfacing. Fake's hash-seeded default embedding vectors are ~orthogonal for
+any two distinct strings (fine for mechanical plumbing) and
+FakeRerankerProvider's default score for an unscripted document sits far
+below any floor (see that class's docstring) — neither can exercise a
+SPECIFIC semantic relationship like "paraphrase beats keyword-overlap
+decoy" on its own, which is exactly what the #88 acceptance case needs.
 
 Vectors are seeded into `<persona_dir>/embeddings.db` directly (mirroring
 "the idle backfill already ran"), and
-`brain.memory.embeddings.build_embedding_provider` is monkeypatched to the
-same scripted provider so the query embed issued at recall time shares its
-model_id/vectors with the seeded pool.
+`brain.memory.embeddings.build_embedding_provider` /
+`brain.memory.semantic_recall.build_reranker_provider` are monkeypatched to
+scripted providers so the query embed / rerank call issued at recall time
+share the seeded pool.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import uuid
@@ -32,6 +38,8 @@ import pytest
 from brain.chat.prompt import _build_recall_block
 from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider
 from brain.memory.relevance import SNIPPET_COUNT
+from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -97,6 +105,17 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     )
 
 
+def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
+    """Script the RERANKER score per memory-content text (#231: reranker
+    score, not cosine, decides surfacing). Any content NOT listed here falls
+    back to FakeRerankerProvider's default — far below any plausible floor,
+    so it never accidentally clears it."""
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda: FakeRerankerProvider(scores=scores),
+    )
+
+
 def _rc(store: MemoryStore, mid: str) -> float:
     return store._conn.execute(  # noqa: SLF001
         "SELECT recall_count FROM memories WHERE id = ?", (mid,)
@@ -118,7 +137,7 @@ def _display_ids(block: str) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # #88 case: paraphrase (no shared keyword) beats a keyword-overlap decoy —
-# semantic surfaces the meaning-matching memory, full-inject tier (1 standout).
+# the reranker floor-gates the decoy out, full-inject tier (1 standout).
 # ---------------------------------------------------------------------------
 
 
@@ -130,8 +149,8 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
     dim = 2
     vectors = {
         query: np.array([1.0, 0.0], dtype=np.float32),
-        target: _unit_vec_with_cosine(0.95),  # clear standout
-        decoy: _unit_vec_with_cosine(0.60),  # passes the floor but well below the cliff
+        target: _unit_vec_with_cosine(0.95),
+        decoy: _unit_vec_with_cosine(0.60),
     }
 
     store = _store()
@@ -140,6 +159,10 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
 
     _seed_vectors(tmp_path, vectors, dim=dim, contents=[target, decoy])
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _patch_reranker(
+        monkeypatch,
+        {target: RERANK_FLOOR + 5.0, decoy: RERANK_FLOOR - 2.0},  # decoy scored but below floor
+    )
 
     before_target, before_decoy = _rc(store, m_target.id), _rc(store, m_decoy.id)
     block = _build_recall_block(store, query, persona_dir=tmp_path)
@@ -153,8 +176,10 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 # Exact-name / proper-noun recall NOT regressed: semantic infra is live and
 # non-empty (a real, populated candidate pool) but INCONCLUSIVE for this
-# query — the lexical fallback still catches a proper noun that was never
-# even a semantic candidate (no cached vector for it at all).
+# query — nothing scripted for the reranker to prefer, so every candidate
+# falls back to FakeRerankerProvider's below-floor default — the lexical
+# fallback still catches a proper noun that was never even a semantic
+# candidate (no cached vector for it at all).
 # ---------------------------------------------------------------------------
 
 
@@ -169,8 +194,10 @@ def test_exact_name_recall_not_regressed_when_semantic_is_inconclusive(
         unrelated_b: np.array([0.0, 1.0], dtype=np.float32),
         # "Zoraida" (the query below) is deliberately NOT scripted here, so
         # it embeds to an all-zero vector at recall time — cosine 0.0
-        # against everything, guaranteeing an INCONCLUSIVE semantic shape
-        # ("none") even though the candidate pool itself is non-empty.
+        # against everything. No reranker score is scripted for either
+        # candidate either, so both fall to FakeRerankerProvider's
+        # below-floor default — guaranteeing an INCONCLUSIVE result even
+        # though the candidate pool itself is non-empty.
     }
 
     store = _store()
@@ -212,56 +239,8 @@ def test_warmup_empty_vector_store_falls_back_to_lexical(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 wiring: `_build_recall_block` must load THIS persona's persisted
-# semantic_calibration.json (brain.memory.semantic_calibration) rather than
-# always using SemanticCalibration.bootstrap() — proven by a candidate whose
-# cosine clears a persisted (looser) floor but NOT the Stage-3 bootstrap
-# floor, with no shared keyword either (so a bootstrap-default run can't
-# accidentally pass via the lexical fallback and mask the wiring gap).
-# ---------------------------------------------------------------------------
-
-
-def test_recall_block_uses_persisted_per_persona_calibration_not_bootstrap(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    query = "typhoon relief efforts continue"
-    target = "the community rebuilds together slowly"  # no shared keyword with the query
-
-    dim = 2
-    vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
-        target: _unit_vec_with_cosine(0.35),  # below the 0.45 bootstrap floor
-    }
-
-    store = _store()
-    m_target = _mem(store, target)
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
-    _patch_provider(monkeypatch, vectors, dim=dim)
-
-    # 1. WITHOUT a persisted calibration file, the bootstrap default (floor
-    #    0.45) excludes the 0.35-cosine candidate, and there's no lexical
-    #    overlap either -> it must not surface at all.
-    before = _rc(store, m_target.id)
-    bootstrap_block = _build_recall_block(store, query, persona_dir=tmp_path)
-    assert target not in bootstrap_block, "0.35 cosine must NOT clear the bootstrap floor (0.45)"
-    assert _rc(store, m_target.id) == before
-
-    # 2. WITH a persisted per-persona calibration (a looser floor derived —
-    #    in production — from THIS persona's own recalibration pass), the
-    #    same 0.35-cosine candidate clears it and surfaces as a full-inject
-    #    semantic standout.
-    (tmp_path / "semantic_calibration.json").write_text(
-        json.dumps({"floor": 0.2, "gap": 0.05, "sample_count": 60, "updated_at": "2026-01-01T00:00:00+00:00"}),
-        encoding="utf-8",
-    )
-    calibrated_block = _build_recall_block(store, query, persona_dir=tmp_path)
-    assert target in calibrated_block, "the persisted (looser) calibration must be the one actually used"
-    assert _rc(store, m_target.id) - before == pytest.approx(1.0), "sole standout gets a FULL tick"
-
-
-# ---------------------------------------------------------------------------
 # 6-9 standout tier: top 5 full (full tick) + trailing snippet (fractional
-# tick); a below-floor candidate that was SCORED but never surfaced stays
+# tick); a below-floor candidate that was RERANKED but never surfaced stays
 # unbumped (scoring must not tick the counter).
 # ---------------------------------------------------------------------------
 
@@ -271,14 +250,16 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
 ) -> None:
     query = "target query"
     dim = 2
-    standout_scores = [0.90, 0.85, 0.80, 0.75, 0.70, 0.65]  # 6 standouts, 0.05 apart (< 0.08 gap)
     contents = [f"standout memory number {i}" for i in range(6)]
     noise_content = "noise memory scored but never surfaced"
 
+    # Cosine vectors just need to be nonzero and distinct enough to populate
+    # + coarse-cut the pool — the reranker score (below) is what actually
+    # decides tiers under #231.
     vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
-    for content, score in zip(contents, standout_scores, strict=True):
-        vectors[content] = _unit_vec_with_cosine(score)
-    vectors[noise_content] = _unit_vec_with_cosine(0.10)  # below the 0.45 floor
+    for i, content in enumerate(contents):
+        vectors[content] = _unit_vec_with_cosine(0.9 - 0.02 * i)
+    vectors[noise_content] = _unit_vec_with_cosine(0.5)
 
     store = _store()
     mems = [_mem(store, c) for c in contents]
@@ -288,6 +269,13 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
 
     _seed_vectors(tmp_path, vectors, dim=dim, contents=[*contents, noise_content])
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _patch_reranker(
+        monkeypatch,
+        {
+            **{content: RERANK_FLOOR + 6.0 - i for i, content in enumerate(contents)},  # 6 standouts, strictly descending
+            noise_content: RERANK_FLOOR - 1.0,  # scored but below floor
+        },
+    )
 
     block = _build_recall_block(store, query, persona_dir=tmp_path)
 
@@ -295,66 +283,87 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     assert len(ids) == 6, "5 full + 1 snippet == 6 rendered bullets"
     assert noise_mem.id not in ids, "the below-floor candidate never surfaces"
 
-    # Ranks 0-4 (scores 0.90..0.70) are the full tier -> +1.0 each.
+    # Ranks 0-4 (the 5 highest-scored contents) are the full tier -> +1.0 each.
     top5 = [m for m in mems if _rc(store, m.id) - before[m.id] == pytest.approx(1.0)]
     assert len(top5) == 5, "exactly 5 memories get the full (+1.0) tick"
 
-    # Rank 5 (score 0.65) is the lone snippet -> +0.8 (n_snip == 1 -> top amount).
+    # Rank 5 is the lone snippet -> +0.8 (n_snip == 1 -> top amount).
     snippet_mem = [m for m in mems if m not in top5][0]
     assert _rc(store, snippet_mem.id) - before[snippet_mem.id] == pytest.approx(0.8)
 
-    # The noise candidate was scored (cosine computed, part of the pool) but
-    # never selected — must not be bumped at all.
+    # The noise candidate was reranked (part of the pool) but never
+    # selected — must not be bumped at all.
     assert _rc(store, noise_mem.id) == before_noise
 
 
 # ---------------------------------------------------------------------------
-# Clump (bunched, no clear standouts): the lexical FALLBACK engages and
-# surfaces its OWN top-8 in blended-relevance order — NOT a re-rank of the
-# semantic clump. Proven the same way test_c22 proves the existing blend
-# orders by relevance, not raw cosine: a short, keyword-dense memory with a
-# LOW cosine score outranks a long, keyword-sparse memory with a HIGH cosine
-# score. A cosine re-rank would have put them in the opposite order.
+# #231 correction: 10+ candidates ALL clearing the floor is capped at
+# MAX_STANDOUT_COUNT (top 5 full + 4 snippet) — NOT demoted to the lexical
+# fallback. The old cosine-era "bunched clump" bucket is gone: a
+# trustworthy per-candidate reranker floor means 10+ above-floor candidates
+# are 10+ genuinely relevant results.
 # ---------------------------------------------------------------------------
 
 
-def test_clump_engages_fresh_lexical_fallback_not_a_semantic_rerank(
+def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    query = "capped query"
+    dim = 2
+    contents = [f"clearly relevant memory number {i}" for i in range(12)]
+
+    vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
+    for i, content in enumerate(contents):
+        vectors[content] = _unit_vec_with_cosine(0.9 - 0.01 * i)
+
+    store = _store()
+    mems = [_mem(store, c) for c in contents]
+
+    _seed_vectors(tmp_path, vectors, dim=dim, contents=contents)
+    _patch_provider(monkeypatch, vectors, dim=dim)
+    _patch_reranker(
+        monkeypatch,
+        {content: RERANK_FLOOR + 12.0 - i for i, content in enumerate(contents)},  # all 12 clear the floor
+    )
+
+    block = _build_recall_block(store, query, persona_dir=tmp_path)
+
+    ids = _display_ids(block)
+    assert len(ids) == 9, "capped at MAX_STANDOUT_COUNT (5 full + 4 snippet), not the lexical fallback's top-8"
+    # The 9 surfaced are the 9 HIGHEST-reranked (ranks 0-8), not an
+    # arbitrary/lexical selection.
+    expected_top9_ids = {m.id for m in mems[:9]}
+    assert set(ids) == expected_top9_ids
+
+
+# ---------------------------------------------------------------------------
+# Nothing clears the floor: the (already-running, per Stage-3 Defect-3)
+# lexical retrieval's own blended-relevance order governs — NOT reranker
+# order. Proven the same way the old "clump" test proved the blend orders
+# by relevance, not raw cosine: a short, keyword-dense memory with a LOW
+# cosine/reranker score outranks a long, keyword-sparse memory with a HIGH
+# cosine/reranker score.
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_clears_floor_engages_lexical_fallback_ordered_by_blend(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     query = "harbor query"
     dim = 2
 
-    # Strong lexical match (many mentions, short body) but the WORST cosine
-    # of the clump.
+    # Strong lexical match (many mentions, short body).
     lexical_strong = "harbor harbor harbor harbor harbor"
-    # Weak lexical match (one mention buried in filler) but the BEST cosine
-    # of the clump.
+    # Weak lexical match (one mention buried in filler).
     lexical_weak = (
         "harbor mentioned once among a great many other filler words "
         "padding here around it and further padding text besides"
     )
-
-    # Exactly SNIPPET_COUNT (8) candidates total — strong + weak + 6 filler —
-    # so ALL of them fit within the fallback's own top-8 cutoff with no
-    # ranked-9th-or-10th casualty; the discriminating assertion is about
-    # ORDER (blend vs cosine), not about which subset survives a cutoff.
     contents = [lexical_strong, lexical_weak] + [f"harbor filler memory {i}" for i in range(6)]
-    # 8 candidates, stepped 0.03 apart from 0.90 down to 0.69 — all
-    # comfortably clear of the 0.45 floor (a step landing exactly ON the
-    # floor is fragile: the float32 round-trip through a constructed unit
-    # vector and back through cosine_similarity can land a hair under it)
-    # and with gaps well under the 0.08 cliff threshold, so there is no
-    # cliff anywhere in the scan window == a clump.
-    scores = [0.90 - 0.03 * i for i in range(8)]
-    # lexical_weak gets the TOP cosine score; lexical_strong gets the WORST.
-    # The 6 filler memories take the scores left over in between.
-    score_by_content = dict(zip(contents[2:], scores[1:7], strict=True))
-    score_by_content[lexical_weak] = scores[0]
-    score_by_content[lexical_strong] = scores[7]
 
     vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
-    for content, score in score_by_content.items():
-        vectors[content] = _unit_vec_with_cosine(score)
+    for content in contents:
+        vectors[content] = _unit_vec_with_cosine(0.5)  # populates the pool; irrelevant to the outcome
 
     store = _store()
     mem_strong = _mem(store, lexical_strong)
@@ -364,6 +373,9 @@ def test_clump_engages_fresh_lexical_fallback_not_a_semantic_rerank(
 
     _seed_vectors(tmp_path, vectors, dim=dim, contents=contents)
     _patch_provider(monkeypatch, vectors, dim=dim)
+    # No reranker scores scripted at all — every candidate falls to
+    # FakeRerankerProvider's below-floor default, so NOTHING clears
+    # RERANK_FLOOR and run_semantic_recall returns None.
 
     block = _build_recall_block(store, query, persona_dir=tmp_path)
 
@@ -373,5 +385,5 @@ def test_clump_engages_fresh_lexical_fallback_not_a_semantic_rerank(
     assert i_strong != -1 and i_weak != -1, "both the strong- and weak-lexical-match memories surface"
     assert i_strong < i_weak, (
         "blended-relevance order (strong lexical match first) governs presentation — "
-        "a cosine re-rank would have put the higher-cosine (lexical_weak) memory first instead"
+        "the reranker never even ran a conclusive selection here"
     )

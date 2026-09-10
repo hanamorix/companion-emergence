@@ -6,10 +6,11 @@ import logging
 from pathlib import Path
 from typing import Literal
 
+from brain.memory import reranker as reranker_mod
 from brain.memory.embeddings import build_embedding_cache, cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import build_semantic_candidate_pool
+from brain.memory.semantic_recall import RERANK_FLOOR, build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -83,30 +84,44 @@ def _semantic_top_k(
     limit: int,
     exclude: frozenset[str],
 ) -> list[Memory] | None:
-    """Top-K cosine-ranked memories for an ACTIVE search call.
+    """Top-K reranked memories for an ACTIVE search call.
 
-    Embeds ``query`` once via the shared process-cached embedding provider
+    #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10): embeds ``query``
+    once via the shared process-cached embedding provider
     (``build_embedding_cache`` → ``build_embedding_provider``, cached by
     model_id — no per-call model reload), cosines it against every
     actively-cached memory vector (Stage 3's ``build_semantic_candidate_pool``:
     active memories that already have a cached vector under the current
     model_id — never triggers a new embed for an uncached memory, the same
-    warm-up contract passive recall uses), and returns the top ``limit``
-    memories in cosine-descending order.
+    warm-up contract passive recall uses) as a CHEAP COARSE CUT to
+    ``relevance.CANDIDATE_POOL``, then reranks an auto-scaled-width slice of
+    that coarse cut with the cross-encoder (``reranker.build_reranker_
+    provider`` + ``reranker.get_rerank_width``, same auto-scaling
+    ``run_semantic_recall`` uses).
 
-    Deliberately does NOT reuse ``semantic_recall``'s option-4 shape/tier
-    classifier — that machinery decides whether to surface an unsolicited
-    passive-recall block at all. Here the model explicitly asked for a
-    search, so a plain top-k cosine ranking is the natural "semantic search"
-    behavior, mirroring how the lexical path is a plain top-k relevance
-    ranking too.
+    The reranker here improves ORDERING; ``RERANK_FLOOR`` decides
+    semantic-vs-lexical: if NOTHING clears the floor, this returns ``None``
+    (the tool's EXISTING empty-semantic→lexical fallback — never returns
+    nothing, never hands back semantic junk that never cleared the floor).
+    Otherwise returns the top ``limit`` floor-clearing memories in
+    reranker-descending order.
+
+    Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
+    tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
+    surface an unsolicited passive-recall block at all, and how much of it
+    to show in full vs snippet. Here the model explicitly asked for a
+    search, so a plain top-k reranked ranking is the natural "semantic
+    search" behavior, mirroring how the lexical path is a plain top-k
+    relevance ranking too.
 
     Returns ``None`` (never raises) when semantic search cannot run right
-    now — no cached vectors yet, an embedding-model failure, or any other
-    error anywhere in this path — so the caller falls back to the lexical
-    path. Mirrors ``run_semantic_recall``'s fail-soft posture: the whole body
-    is wrapped so a broken/missing local model or a transient store error
-    only demotes this call to lexical, never breaks the tool.
+    now — no cached vectors yet, an embedding/reranker-model failure, or any
+    other error anywhere in this path — so the caller falls back to the
+    lexical path. Mirrors ``run_semantic_recall``'s fail-soft posture: the
+    whole body is wrapped so a broken/missing local model or a transient
+    store error only demotes this call to lexical, never breaks the tool —
+    and a reranker failure demotes to lexical too, never to raw cosine
+    ranking (the unreliable signal the reranker replaces).
     """
     try:
         embeddings_cache = build_embedding_cache(persona_dir)
@@ -128,15 +143,31 @@ def _semantic_top_k(
                 )
                 return None
 
-            scored = [
+            cosine_scored = [
                 (mid, cosine_similarity(query_vec, vec))
                 for mid, (_, vec) in pool.items()
                 if mid not in exclude
             ]
-            if not scored:
+            if not cosine_scored:
                 return None
-            scored.sort(key=lambda pair: -pair[1])
-            return [pool[mid][0] for mid, _ in scored[:limit]]
+            cosine_scored.sort(key=lambda pair: -pair[1])
+            coarse = cosine_scored[:CANDIDATE_POOL]
+
+            reranker_provider = reranker_mod.build_reranker_provider()
+            width = reranker_mod.get_rerank_width(len(coarse), reranker_provider)
+            to_rerank = coarse[:width]
+            rerank_ids = [mid for mid, _ in to_rerank]
+            documents = [pool[mid][0].content for mid in rerank_ids]
+            rerank_scores = list(reranker_provider.rerank(query, documents))
+            reranked = [
+                (mid, score)
+                for mid, score in zip(rerank_ids, rerank_scores, strict=True)
+                if score >= RERANK_FLOOR
+            ]
+            if not reranked:
+                return None
+            reranked.sort(key=lambda pair: -pair[1])
+            return [pool[mid][0] for mid, _ in reranked[:limit]]
         except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
             logger.warning(
                 "search_memories(semantic): semantic path failed after opening the embedding "
@@ -186,9 +217,11 @@ def search_memories(
         whatever order ``mode`` already ranked them.
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
-        CANDIDATE_POOL)``; semantic takes the top-``CANDIDATE_POOL`` by
-        cosine in ``_semantic_top_k`` (no relevance floor pulled in) — THEN
-        sorts that wider matched set by ``created_at`` DESC, THEN slices to
+        CANDIDATE_POOL)``; semantic reranks up to ``CANDIDATE_POOL``
+        floor-clearing candidates in ``_semantic_top_k`` (#231's
+        ``RERANK_FLOOR`` gate still applies — "age" only widens the fetch,
+        it never skips the floor) — THEN sorts that wider matched set by
+        ``created_at`` DESC, THEN slices to
         the caller's real ``limit``. A naive re-sort of an already-``limit``-
         capped set would be subtly broken (it could only ever re-order the
         few candidates ``mode`` happened to already rank highest) — widening

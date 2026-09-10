@@ -29,7 +29,6 @@ from brain.memory.relevance import (
     SNIPPET_MODE_ENABLED,
     snippet_length,
 )
-from brain.memory.semantic_calibration import load_semantic_calibration
 from brain.memory.semantic_recall import SemanticRecallResult, run_semantic_recall
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -901,13 +900,13 @@ def _render_semantic_active_lines(
     mechanism produced it — nothing downstream needs to special-case
     semantic vs lexical recall.
 
-    Full tier renders in cosine-SELECTION order (mirrors how the lexical
+    Full tier renders in reranker-SELECTION order (mirrors how the lexical
     path's importance-based `full_ids` render in their own unsorted
     selection order). Snippet-tier PRESENTATION is re-ordered by
-    `_recall_sort_key` per the spec's explicit requirement ("cosine selects
-    the candidates; the normal sort orders the presentation of what's
-    surfaced, not cosine order") — cosine only decided membership in this
-    tier, not read order.
+    `_recall_sort_key` per the spec's explicit requirement ("the reranker
+    selects the candidates; the normal sort orders the presentation of
+    what's surfaced, not reranker order") — the reranker only decided
+    membership in this tier, not read order.
 
     Counter ticks: full-surfaced memories each get a FULL tick
     (`store.bump_recall(id, 1.0)`) — this is a SEPARATE id population from
@@ -1077,16 +1076,13 @@ def _build_recall_block(
     # from the lexical/importance/hebbian/recency blend below, exactly as
     # it behaved before Stage 3.
     try:
-        # Stage 4 plug-in seam (SemanticCalibration's own docstring): load
-        # this persona's own recalibrated floor/gap (written by
-        # brain.memory.semantic_calibration.recalibrate_persona on the
-        # weekly rollover) instead of letting run_semantic_recall default to
-        # SemanticCalibration.bootstrap(). A cheap single JSON read — safe on
-        # the hot path — that transparently falls back to the bootstrap
-        # default for a persona that hasn't recalibrated yet (or is still
-        # below the cold-start corpus threshold).
-        calibration = load_semantic_calibration(persona_dir)
-        semantic_result = run_semantic_recall(store, persona_dir, user_input, calibration=calibration)
+        # #231 RERANKER RE-ARCHITECTURE: the old Stage-4 plug-in seam
+        # (per-persona cosine floor/gap, loaded here via
+        # load_semantic_calibration) is REMOVED — run_semantic_recall now
+        # floor-gates a cross-encoder RERANKER score against the FIXED
+        # RERANK_FLOOR module constant (brain/memory/semantic_recall.py),
+        # no per-persona calibration file to load.
+        semantic_result = run_semantic_recall(store, persona_dir, user_input)
     except Exception:  # noqa: BLE001
         # Defense-in-depth: run_semantic_recall already wraps its own body in
         # a broad except (its docstring's fail-soft contract: ANY failure ->
@@ -1346,9 +1342,13 @@ def _build_recall_block(
     #
     # On the CONCLUSIVE branch, `_render_semantic_active_lines` already
     # issued its OWN enqueue for its own surfaced ids (semantic full +
-    # snippet tiers) inside the call above. Fading state and the
-    # `list_active()`-sourced semantic candidate pool are mutually
-    # exclusive (a fading memory isn't part of `list_active()`), so
+    # snippet tiers) inside the call above. Fading state and the semantic
+    # candidate pool ARE mutually exclusive here, but NOT because a fading
+    # memory "isn't part of list_active()" — it IS: list_active() filters
+    # only the `active` deactivation flag, not `state`. The actual reason
+    # is #231 fold-in fix (b): `build_semantic_candidate_pool` itself now
+    # filters to `state == "active"` (brain/memory/semantic_recall.py), so
+    # the pool it hands back is disjoint from fading BY THAT FILTER. So
     # `seen_bump` here should never overlap that call's ids in practice —
     # but the overlap is subtracted defensively anyway so this can never
     # double-enqueue an id even if that invariant is ever violated.
