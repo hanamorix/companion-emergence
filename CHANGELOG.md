@@ -7,6 +7,40 @@ signing costs. See [`docs/roadmap.md`](docs/roadmap.md) for what's on
 deck and [`docs/release-checklist.md`](docs/release-checklist.md) for
 what each release has to clear.
 
+## 0.0.42 — 2026-09-10
+
+**Images work again, memory learned to rank and forget on purpose, and the bridge stopped dropping things across a session rollover.**
+
+### Added
+- **Cascade compaction + session rollover.** Long conversations are now summarised in three age-stratified tiers instead of one flat summary, and a session rolls over on an idle gate rather than a hard wall. The old summary could be truncated by budget; the new one survives.
+- **Memory relevance overhaul.** Recall now ranks with FTS5/BM25, reads a snippet before committing to a full memory, and retrieves iteratively — so "search_memories" surfaces what matters rather than what is newest.
+- **Retention rework.** Forgetting is importance-driven: memories re-rate themselves on recall, weak duplicates are swept, and a one-time cleanup pass removes identical rows already accumulated.
+- **Research engine, redesigned.** Research is now a cumulative organ — a notes store, continuation across ticks, chosen topics, interest-spawned threads — and what she has been researching is visible to her in chat.
+- **Live-test harness.** A sandboxed, pluggable `tests/harness` that drives the real engine end to end (contributed groundwork by ThinkerOfThoughts), with de-identification guards and detector-gate certification.
+- **Prompt strings in one editable file.** Model-facing prompt text is externalised so it can be tuned without touching mechanism code (constants deferred to a second pass).
+- **Sidecar reaping.** Aged `.lock.stale-*` and `.corrupt-*` files are cleaned on the maintenance cadence instead of piling up.
+
+### Fixed
+- **Adding images works again (#216).** Attached files — images included — are routed through the `read_file` tool instead of an unreliable base64 transport, so a Claude CLI update can no longer silently break them. PNG/JPEG/WebP/GIF are detected and shown to her as real image blocks.
+- **History and rollover hardening.** `/chat/history` and `/images` follow the rollover pointer, the conversation buffer is preserved when the CLI chat exits, and a rollover can no longer lose the tail of a session.
+- **Timestamps.** She now sees your local system time, not UTC, and persona-facing timestamps render without a dangling offset.
+- **Login gate on the right provider.** The Claude login step in NellFace only appears for personas whose provider is Claude; Ollama and other providers skip it.
+- **CLI error frames are never her reply.** Three paths that could hand a CLI error (or a blank result frame) back as if she had said it are closed.
+- **Idle CPU / lag.** The supervisor no longer hammers the database every tick.
+- **Write idempotency.** Pending notes and monologue records are claimed before they are written and deduplicated by content hash — the duplicate-note and repeated-monologue reports are closed. Replies that *claim* a staged write no tool call backs are now detected and audited.
+- **Emotion hygiene.** Per-turn emotion delta is capped, permutation-duplicate blend names (`grief_love` vs `love_grief`) are deduped, and placeholder vocabulary entries are backfilled.
+- **Self-model.** Emotion mean-cross uses a recency baseline, weather framing corrected, and the reconcile tool is reachable again.
+- **User presence** is computed from event-driven, incremental signals instead of rescanning.
+- **Cadence state files** live under `<persona>/cadence/` and migrate themselves from the old root location on first run.
+- **CI.** The Windows job's leaked-thread cascade, the systemd flake, and the two cascade demo tests are green; the remaining Windows READY-mtime flake is tracked as #232.
+
+### Changed
+- **Her toolset is derived from the registry**, so the tool list in her prompt cannot drift from what is actually callable.
+- **Attunement backfill** respects the global CLI concurrency cap.
+
+### Thanks
+- **[ThinkerOfThoughts](https://github.com/ThinkerOfThoughts)** carried most of this release: the memory diagnosis and rework (cascade compaction, relevance, retention), the image route, the live-test harness, the write-idempotency chain, and the CI greening. 🙏
+
 ## 0.0.41 — 2026-07-07
 
 **Her context is hers alone, ops get real knobs, a new look — and Windows CI is green for the first time in a month.**
