@@ -325,6 +325,61 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     assert m.id in ids
 
 
+def test_semantic_falls_back_to_lexical_when_close_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#231 Fix 5 (mirrors semantic_recall.run_semantic_recall's Fix 4 /
+    ``test_run_semantic_recall_is_fail_soft_when_close_raises`` in
+    tests/unit/brain/memory/test_semantic_recall.py): the
+    `finally: embeddings_cache.close()` in `_semantic_top_k` sat OUTSIDE the
+    inner `except Exception` clause, so a pathological `close()` error could
+    escape this function's own documented "Returns None (never raises) ...
+    falls back to the lexical path" contract and crash `search_memories`
+    instead of demoting the turn to lexical. Wraps a real, working
+    EmbeddingCache in a proxy whose close() blows up; search_memories must
+    still not raise, and must still return a usable (lexical) result."""
+    import brain.tools.impls.search_memories as search_memories_mod
+    from brain.memory.embeddings import build_embedding_cache
+
+    target = "a memory that does have a cached vector"
+    ctx = _ctx(tmp_path)
+    m = _seed(ctx["store"], target)
+
+    real_cache = build_embedding_cache(tmp_path)
+    real_cache.get_or_compute(target)
+
+    class _BoomOnClose:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def close(self) -> None:
+            raise RuntimeError("simulated close() failure")
+
+    monkeypatch.setattr(
+        search_memories_mod,
+        "build_embedding_cache",
+        lambda persona_dir: _BoomOnClose(real_cache),
+    )
+
+    try:
+        # Query shares a token ("cached") with `target` so the lexical
+        # fallback actually has something to find — proving the fallback
+        # returns a real, usable result, not just an empty-but-non-erroring
+        # response.
+        res = dispatch("search_memories", {"query": "cached", "mode": "semantic"}, **ctx)
+    finally:
+        real_cache.close()
+
+    assert res["mode"] == "lexical", (
+        "a close() failure must demote this turn to the lexical fallback, not raise"
+    )
+    ids = {mm["id"] for mm in res["memories"]}
+    assert m.id in ids
+
+
 # ---------------------------------------------------------------------------
 # #231 Fix 3 — resolved_mode must never lie. An invalid `mode` value isn't
 # blocked by `dispatch` (the "enum" in the schema is advisory, not enforced

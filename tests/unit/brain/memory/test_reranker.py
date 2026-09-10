@@ -3,8 +3,11 @@ provider + process-wide caches + auto-scaling rerank width.
 
 All OFFLINE (FakeRerankerProvider / a scripted timing stub) — no real model
 download. A real-model validation test lives in
-tests/unit/brain/memory/test_reranker_real_model.py, marked
-@pytest.mark.requires_network so the default gate skips it.
+tests/unit/brain/memory/test_reranker_real_model.py, marked BOTH
+@pytest.mark.requires_network (opts out of the autouse fake-provider
+fixture) and @pytest.mark.integration (the marker actually deselected by
+the local pre-check gate, -m "not live and not requires_claude_cli and not
+integration" — requires_network alone is not part of that expression).
 """
 
 from __future__ import annotations

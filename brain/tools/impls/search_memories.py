@@ -176,7 +176,17 @@ def _semantic_top_k(
             )
             return None
     finally:
-        embeddings_cache.close()
+        # #231 Fix 5: mirrors semantic_recall.run_semantic_recall's Fix 4 —
+        # this `finally` sat outside the inner `except Exception` above, so a
+        # pathological `close()` error could escape this function's own
+        # documented "never raises" contract. Make cleanup self-contained: a
+        # close error is caught/logged here and never propagates, matching
+        # the "Returns None (never raises) ... falls back to the lexical
+        # path" contract this function's own docstring states.
+        try:
+            embeddings_cache.close()
+        except Exception:  # noqa: BLE001 — fail-soft: close() must never break the contract
+            logger.warning("search_memories(semantic): embeddings_cache.close() failed", exc_info=True)
 
 
 def search_memories(
