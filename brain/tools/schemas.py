@@ -287,9 +287,9 @@ SCHEMAS: dict[str, dict] = {
                     "description": (
                         "Which search to run. semantic (default) compares meaning, so a "
                         "memory worded differently from the query can still surface. "
-                        "lexical matches the actual words in the query, the older keyword "
-                        "search. If semantic search has no memories to compare against "
-                        "yet, it falls back to lexical automatically."
+                        "lexical (keyword) search matches the actual words in the query. "
+                        "If semantic search has no memories to compare against yet, it "
+                        "falls back to lexical automatically."
                     ),
                 },
             },

@@ -298,3 +298,31 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     assert res["mode"] == "lexical"
     ids = {mm["id"] for mm in res["memories"]}
     assert m.id in ids
+
+
+# ---------------------------------------------------------------------------
+# #231 Fix 3 — resolved_mode must never lie. An invalid `mode` value isn't
+# blocked by `dispatch` (the "enum" in the schema is advisory, not enforced
+# at the call boundary — see brain/tools/dispatch.py, which only checks
+# `required`), so it reaches the impl as-is. Pre-fix, that garbage value
+# skipped the `mode == "semantic"` branch entirely (retrieval correctly ran
+# lexical) but `resolved_mode` was seeded from the raw `mode` argument and
+# only ever corrected inside that branch — so the output "mode" field kept
+# reporting "garbage" even though lexical is what actually ran.
+# ---------------------------------------------------------------------------
+
+
+def test_mode_garbage_value_runs_lexical_and_reports_lexical_honestly(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    m = _seed(ctx["store"], "henryk likes long walks")
+
+    res = dispatch("search_memories", {"query": "henryk", "mode": "garbage"}, **ctx)
+
+    # Retrieval actually ran lexical (a keyword hit surfaces with no
+    # embedding infra involved at all).
+    ids = {mm["id"] for mm in res["memories"]}
+    assert m.id in ids
+    # The output "mode" field must report the path that actually ran, never
+    # echo the invalid input back.
+    assert res["mode"] == "lexical"
+    assert res["mode"] != "garbage"

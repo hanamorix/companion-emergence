@@ -321,3 +321,50 @@ def test_run_semantic_recall_is_fail_soft_when_scoring_raises(
     result = run_semantic_recall(store, tmp_path, "any query")
 
     assert result is None, "a scoring failure must demote this turn to the lexical fallback, not raise"
+
+
+def test_run_semantic_recall_is_fail_soft_when_close_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#231 Fix 4: the `finally: embeddings_cache.close()` sat OUTSIDE the
+    inner `except Exception` clause (only the two earlier steps and the
+    pool-build/scoring/classification block were guarded), so a
+    pathological `close()` error could escape this function's own
+    documented "never raises" contract — even on an otherwise-SUCCESSFUL
+    turn, since the return value is built before `finally` runs but a
+    raising `finally` replaces it. Wraps a real, working EmbeddingCache in
+    a proxy whose close() blows up; run_semantic_recall must still not
+    raise."""
+    store = MemoryStore(":memory:")
+    mem = _mem(store, "a memory that DOES have a cached vector")
+
+    from brain.memory.embeddings import build_embedding_cache
+
+    real_cache = build_embedding_cache(tmp_path)
+    real_cache.get_or_compute(mem.content)
+
+    class _BoomOnClose:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def close(self) -> None:
+            raise RuntimeError("simulated close() failure")
+
+    monkeypatch.setattr(
+        semantic_recall_mod,
+        "build_embedding_cache",
+        lambda persona_dir: _BoomOnClose(real_cache),
+    )
+
+    try:
+        result = run_semantic_recall(store, tmp_path, mem.content)
+    finally:
+        real_cache.close()
+
+    # Reaching this line at all proves close()'s own failure did not
+    # propagate. The actual result (None or a SemanticRecallResult) is
+    # incidental to this test.
+    assert result is None or hasattr(result, "full")

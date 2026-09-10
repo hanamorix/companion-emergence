@@ -198,17 +198,26 @@ def search_memories(
     dict with keys:
         query          — the original query string
         mode           — the retrieval path actually used ("semantic" or
-                          "lexical" — differs from the requested mode only
-                          on a semantic fail-soft fallback)
+                          "lexical" — never echoes the raw requested value;
+                          differs from a requested "semantic" only on a
+                          fail-soft fallback, and any non-"semantic" request
+                          — including an invalid/garbage value — is reported
+                          as "lexical", the path that actually ran)
         emotion_filter — the emotion filter (or None)
         count          — number of results returned
         memories       — list of snippet-result dicts (``snippet: true`` + id)
     """
     exclude = frozenset(exclude_ids or ())
 
+    # #231 Fix 3 (owner ruling — resolved_mode must never lie): normalize
+    # the requested mode up front rather than echoing it verbatim. Any value
+    # other than "semantic" (including a garbage/invalid one — the enum is
+    # advisory at the schema level, not enforced at the call boundary) is
+    # treated as "lexical" from the start, so `resolved_mode` always names
+    # the retrieval path that is actually about to run, before it runs.
+    resolved_mode: SearchMode = "semantic" if mode == "semantic" else "lexical"
     candidates: list[Memory] | None = None
-    resolved_mode: SearchMode = mode
-    if mode == "semantic":
+    if resolved_mode == "semantic":
         candidates = _semantic_top_k(store, persona_dir, query, limit=limit, exclude=exclude)
         if candidates is None:
             resolved_mode = "lexical"

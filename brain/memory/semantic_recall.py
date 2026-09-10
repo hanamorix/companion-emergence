@@ -349,4 +349,14 @@ def run_semantic_recall(
             )
             return None
     finally:
-        embeddings_cache.close()
+        # #231 Fix 4: this `finally` sat outside the inner `except Exception`
+        # above, so a pathological `close()` error could escape this
+        # function's documented "never raises" contract (previously caught
+        # only by the caller-side wrap in `_build_recall_block`). Make
+        # cleanup self-contained: a close error is caught/logged here and
+        # never propagates, matching the "ANY failure ... never raises"
+        # contract this function's own docstring states.
+        try:
+            embeddings_cache.close()
+        except Exception:  # noqa: BLE001 — fail-soft: close() must never break the contract
+            log.warning("run_semantic_recall: embeddings_cache.close() failed", exc_info=True)

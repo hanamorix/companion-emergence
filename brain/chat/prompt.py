@@ -1296,44 +1296,46 @@ def _build_recall_block(
             lines.append(f"    - {token}")
 
     # CHANGE 1 — fractional recall_count bump by DISPLAY rank, on passive
-    # surface. Only rows rendered as snippets (full=False) are bumped: the
-    # non-full-inject active rows, then the fading rows (all fading render as
-    # snippets), in the same order they were just rendered above. Full-inject
-    # active rows (already maximally salient) and the lost graveyard bucket
-    # (dicts, no live store row) are excluded. Dedup by id defensively in case
-    # a memory somehow appears in both buckets. Rank 0 (top) -> ~0.8, rank
-    # N-1 (bottom) -> ~0.1, linear between; a single surfaced memory -> 0.8.
-    # The bump is scoped to snippet-rendered rows only. When SNIPPET_MODE_ENABLED
-    # is False, _recall_snippet renders full bodies instead of snippets, so these
-    # rows were not "surfaced as a snippet" and must not be reinforced. Skip the
-    # whole loop in that mode; snippet rendering itself is unchanged.
+    # surface. Only rows rendered as snippets (full=False) are bumped.
+    # Rank 0 (top) -> ~0.8, rank N-1 (bottom) -> ~0.1, linear between; a
+    # single surfaced memory -> 0.8. Gated on SNIPPET_MODE_ENABLED: when it's
+    # False, _recall_snippet renders full bodies instead of snippets, so
+    # these rows were not "surfaced as a snippet" and must not be
+    # reinforced.
     #
-    # Stage-3 Defect-3 fix: this block is UNCHANGED from pre-Stage-3 and now
-    # explicitly scoped to `semantic_result is None` — it stays the
-    # INCONCLUSIVE (lexical active selection) branch's own bump/enqueue
-    # only. `active_top` is only ever rendered under "active:" when
-    # `semantic_result` is None (see the fork above); on a CONCLUSIVE turn
-    # `active_top` may still be non-empty (the lexical search ran too, per
-    # the always-run partition) but was NEVER surfaced to the model this
-    # turn, so it must not be bumped/enqueued here — that would reinforce
-    # memories the user never actually saw. The CONCLUSIVE branch's own
-    # bump/enqueue already happened inside `_render_semantic_active_lines`
-    # above (Defect-4 gated separately, same SNIPPET_MODE_ENABLED
-    # condition). `fading_top`/`lost_top` are surfaced on EVERY turn now,
-    # but this fix deliberately does not extend the recall_count bump
-    # mechanic to them on a conclusive turn — bump/enqueue was never part of
-    # the "always-run machinery" the defect report named (fading/lost
-    # partition+surfacing, "not recognised", grief-touch); only those three
-    # are unconditional now.
+    # #231 Fix 1 (owner ruling, path-independence): "if it surfaces it gets
+    # the full +1 ... doesn't matter how it got surfaced, if it gets fully
+    # opened" — a surfaced/opened memory's bump must not depend on which
+    # retrieval path ran. fading_top renders IDENTICALLY on both the
+    # semantic-conclusive and inconclusive branches — always
+    # `_recall_snippet(mem, full=False)` (see the "softened (fading...)"
+    # render above, which is unconditional on `semantic_result`) — so its
+    # bump is split OUT of the old semantic_result-gated block below and
+    # made unconditional too, at the snippet-fractional level that matches
+    # how it actually renders (never full-inject). `active_top`, in
+    # contrast, is only ever rendered under "active:" when `semantic_result`
+    # is None (the active-selection fork above); on a CONCLUSIVE turn it's
+    # computed (the lexical search still runs, for the always-run
+    # fading/lost/not-recognised machinery) but never shown to the model, so
+    # its bump STAYS gated to the inconclusive branch — bumping an unrendered
+    # row would reinforce a memory the user never actually saw. The
+    # semantic-active section keeps its own separate, pre-existing bump
+    # (`_render_semantic_active_lines`, full -> +1 unconditional, snippet ->
+    # fractional gated on SNIPPET_MODE_ENABLED) — untouched by this split.
+    seen_bump: set = set()
+    if fading_top and SNIPPET_MODE_ENABLED:
+        n_fade = len(fading_top)
+        for i, mem in enumerate(fading_top):
+            if mem.id in seen_bump:
+                continue  # defensive: same id somehow also in active_top
+            seen_bump.add(mem.id)
+            amount = 0.8 if n_fade == 1 else 0.8 - 0.7 * (i / (n_fade - 1))
+            store.bump_recall(mem.id, amount)
+
     if semantic_result is None and SNIPPET_MODE_ENABLED:
         bump_targets: list = []
-        seen_bump: set = set()
         for mem in active_top:
             if mem.id not in full_ids and mem.id not in seen_bump:
-                seen_bump.add(mem.id)
-                bump_targets.append(mem)
-        for mem in fading_top:
-            if mem.id not in seen_bump:
                 seen_bump.add(mem.id)
                 bump_targets.append(mem)
         n_bump = len(bump_targets)
@@ -1347,9 +1349,13 @@ def _build_recall_block(
         # happen on this hot path (C3.3) — the gate re-appraises importance
         # on its own consolidation tick and updates the row in place.
         # STAGE-3 CORRECTION (finding #5): scope is the UNION of full_ids
-        # (full-inject recalls, the most salient) and bump_targets (snippet
-        # recalls, which already include the fading rows) — not narrowed to
-        # snippet-only, since full_ids is reachable at this hook site.
+        # (full-inject recalls, the most salient) and bump_targets/seen_bump
+        # (snippet recalls, which already include the fading rows via the
+        # split-out loop above) — not narrowed to snippet-only, since
+        # full_ids is reachable at this hook site. Still scoped to the
+        # inconclusive branch only, unchanged by the #231 Fix 1 bump split
+        # (that split only concerns the recall_count bump itself, not this
+        # reappraisal enqueue).
         from brain.memory.pending import PendingQueue
 
         reappraise_ids = full_ids | seen_bump

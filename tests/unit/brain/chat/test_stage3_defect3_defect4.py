@@ -69,11 +69,12 @@ def _grief_event_rows(store: MemoryStore) -> list[dict]:
     return [json.loads(r["metadata_json"]) for r in rows]
 
 
-def _seed_fixture(tmp_path: Path) -> tuple[MemoryStore, Memory]:
+def _seed_fixture(tmp_path: Path) -> tuple[MemoryStore, Memory, Memory]:
     """Real fading memory + real graveyard (lost) entry + an unrelated
-    active memory (the semantic standout). Shared by both Defect-3 tests so
-    the only thing that differs between them is whether semantic recall is
-    conclusive.
+    active memory (the semantic standout). Shared by both Defect-3 tests
+    (and the #231 Fix 1 fading-bump-parity tests below) so the only thing
+    that differs between callers is whether semantic recall is conclusive.
+    Returns (store, active_mem, fading_mem).
     """
     persist_felt_time(FeltTimeState(lived_age_hours=48.0), tmp_path)
     store = MemoryStore(":memory:")
@@ -125,7 +126,7 @@ def _seed_fixture(tmp_path: Path) -> tuple[MemoryStore, Memory]:
         reason="test-seed",
     )
 
-    return store, active_mem
+    return store, active_mem, fading_mem
 
 
 def _canned_conclusive_result(active_mem: Memory) -> SemanticRecallResult:
@@ -139,7 +140,7 @@ def _canned_conclusive_result(active_mem: Memory) -> SemanticRecallResult:
 
 
 def test_semantic_conclusive_turn_still_surfaces_fading_lost_and_grief_touch(tmp_path: Path) -> None:
-    store, active_mem = _seed_fixture(tmp_path)
+    store, active_mem, _fading_mem = _seed_fixture(tmp_path)
 
     with (
         patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
@@ -180,7 +181,7 @@ def test_inconclusive_turn_still_fires_grief_touch_exactly_once(tmp_path: Path) 
     (semantic_result=None) turn, must still fire grief-touch exactly once —
     proving the restructure didn't introduce a double-fire (or a skip) on
     the branch that already ran this machinery pre-fix."""
-    store, _active_mem = _seed_fixture(tmp_path)
+    store, _active_mem, _fading_mem = _seed_fixture(tmp_path)
 
     with (
         patch("brain.chat.prompt.run_semantic_recall", return_value=None),
@@ -267,3 +268,116 @@ def test_semantic_snippet_bump_and_enqueue_apply_when_snippet_mode_enabled(tmp_p
 
     assert _rc(store, snippet_mem.id) - before_snip == pytest.approx(0.8)
     mock_enqueue.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# #231 Fix 1 — fading recall-bump is PATH-INDEPENDENT (owner ruling: "if it
+# surfaces it gets the full +1 ... doesn't matter how it got surfaced").
+# fading_top renders identically (always snippet-level, `full=False`) on
+# both the semantic-conclusive and inconclusive branches, so its
+# recall_count bump must fire on both branches too — previously it was
+# gated under `semantic_result is None`, so a conclusive turn's fading rows
+# were rendered but never bumped (fading decaying faster on semantic turns).
+# ---------------------------------------------------------------------------
+
+
+def test_fading_bump_fires_on_conclusive_semantic_turn(tmp_path: Path) -> None:
+    """Pre-fix (path-parity bug): the fading memory renders under "softened
+    (fading...)" on a conclusive-semantic turn but its recall_count is left
+    untouched, because the old CHANGE-1 bump block was gated entirely on
+    `semantic_result is None`. Post-fix: the bump fires here too."""
+    store, active_mem, fading_mem = _seed_fixture(tmp_path)
+    before = _rc(store, fading_mem.id)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        block = _build_recall_block(store, "workshop rooftop Marcus", persona_dir=tmp_path)
+
+    assert "softened (fading" in block
+    # A lone surfaced fading memory gets the top-rank fractional tick (0.8),
+    # matching the same rank-weighted scheme the lexical path already uses.
+    assert _rc(store, fading_mem.id) - before == pytest.approx(0.8)
+
+
+def test_fading_bump_matches_across_conclusive_and_inconclusive_turns(tmp_path: Path) -> None:
+    """The core path-parity assertion: the SAME fading memory, surfaced on a
+    CONCLUSIVE-semantic turn, gets the identical bump amount as on an
+    INCONCLUSIVE turn — proving the bump no longer depends on which
+    retrieval path produced the surfacing."""
+    store_a, active_mem, fading_a = _seed_fixture(tmp_path)
+    before_a = _rc(store_a, fading_a.id)
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        _build_recall_block(store_a, "workshop rooftop Marcus", persona_dir=tmp_path)
+    bump_conclusive = _rc(store_a, fading_a.id) - before_a
+
+    store_b, _active_mem_b, fading_b = _seed_fixture(tmp_path)
+    before_b = _rc(store_b, fading_b.id)
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
+    bump_inconclusive = _rc(store_b, fading_b.id) - before_b
+
+    assert bump_conclusive == pytest.approx(bump_inconclusive)
+    assert bump_conclusive == pytest.approx(0.8)
+
+
+def test_active_top_bump_stays_gated_to_inconclusive_branch(tmp_path: Path) -> None:
+    """Guard against over-correcting Fix 1: `active_top` (the lexical
+    active-selection candidates, computed via the always-run
+    `search_with_loss` call but NOT rendered under "active:" on a
+    conclusive turn — only the semantic result is) must still NOT be
+    bumped on a conclusive turn. Only the semantic-active section's own
+    bump (`_render_semantic_active_lines`) and the now-path-independent
+    fading bump apply there.
+    """
+    store, active_mem, fading_mem = _seed_fixture(tmp_path)
+
+    # A THIRD memory: stays ACTIVE (never faded), lexically matches
+    # "workshop" so search_with_loss's always-run partition puts it in
+    # active_hits/active_top — but it is unrelated to the semantic
+    # standout (`active_mem`), so it is never chosen/rendered on a
+    # conclusive turn.
+    lexical_active_mem = Memory.create_new(
+        content="the workshop schedule pinned by the door", memory_type="event", domain="d"
+    )
+    store.create(lexical_active_mem)
+    before_lexical = _rc(store, lexical_active_mem.id)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=_canned_conclusive_result(active_mem)),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+    ):
+        block = _build_recall_block(store, "workshop rooftop Marcus", persona_dir=tmp_path)
+
+    # The semantic-conclusive standout gets its OWN bump (full-tier, +1,
+    # from _render_semantic_active_lines) — unrelated to the lexical
+    # active_top gating this test is checking.
+    assert _rc(store, active_mem.id) == pytest.approx(1.0)
+    # fading_mem gets its now-path-independent bump.
+    assert _rc(store, fading_mem.id) > 0
+
+    # The lexical active_top candidate is computed (it lexically matches
+    # "workshop") but never rendered under "active:" on this conclusive
+    # turn, so it must NOT be bumped — bumping an unrendered row would
+    # reinforce a memory the user never actually saw.
+    assert lexical_active_mem.id not in block
+    assert _rc(store, lexical_active_mem.id) == before_lexical
