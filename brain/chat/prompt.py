@@ -29,6 +29,7 @@ from brain.memory.relevance import (
     SNIPPET_MODE_ENABLED,
     snippet_length,
 )
+from brain.memory.semantic_calibration import load_semantic_calibration
 from brain.memory.semantic_recall import SemanticRecallResult, run_semantic_recall
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
@@ -1076,7 +1077,16 @@ def _build_recall_block(
     # from the lexical/importance/hebbian/recency blend below, exactly as
     # it behaved before Stage 3.
     try:
-        semantic_result = run_semantic_recall(store, persona_dir, user_input)
+        # Stage 4 plug-in seam (SemanticCalibration's own docstring): load
+        # this persona's own recalibrated floor/gap (written by
+        # brain.memory.semantic_calibration.recalibrate_persona on the
+        # weekly rollover) instead of letting run_semantic_recall default to
+        # SemanticCalibration.bootstrap(). A cheap single JSON read — safe on
+        # the hot path — that transparently falls back to the bootstrap
+        # default for a persona that hasn't recalibrated yet (or is still
+        # below the cold-start corpus threshold).
+        calibration = load_semantic_calibration(persona_dir)
+        semantic_result = run_semantic_recall(store, persona_dir, user_input, calibration=calibration)
     except Exception:  # noqa: BLE001
         # Defense-in-depth: run_semantic_recall already wraps its own body in
         # a broad except (its docstring's fail-soft contract: ANY failure ->

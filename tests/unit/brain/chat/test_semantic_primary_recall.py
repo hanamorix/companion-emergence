@@ -19,6 +19,7 @@ model_id/vectors with the seeded pool.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -208,6 +209,54 @@ def test_warmup_empty_vector_store_falls_back_to_lexical(tmp_path: Path) -> None
 
     assert block.strip() != ""
     assert m.id in _display_ids(block)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 wiring: `_build_recall_block` must load THIS persona's persisted
+# semantic_calibration.json (brain.memory.semantic_calibration) rather than
+# always using SemanticCalibration.bootstrap() — proven by a candidate whose
+# cosine clears a persisted (looser) floor but NOT the Stage-3 bootstrap
+# floor, with no shared keyword either (so a bootstrap-default run can't
+# accidentally pass via the lexical fallback and mask the wiring gap).
+# ---------------------------------------------------------------------------
+
+
+def test_recall_block_uses_persisted_per_persona_calibration_not_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    query = "typhoon relief efforts continue"
+    target = "the community rebuilds together slowly"  # no shared keyword with the query
+
+    dim = 2
+    vectors = {
+        query: np.array([1.0, 0.0], dtype=np.float32),
+        target: _unit_vec_with_cosine(0.35),  # below the 0.45 bootstrap floor
+    }
+
+    store = _store()
+    m_target = _mem(store, target)
+    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
+    _patch_provider(monkeypatch, vectors, dim=dim)
+
+    # 1. WITHOUT a persisted calibration file, the bootstrap default (floor
+    #    0.45) excludes the 0.35-cosine candidate, and there's no lexical
+    #    overlap either -> it must not surface at all.
+    before = _rc(store, m_target.id)
+    bootstrap_block = _build_recall_block(store, query, persona_dir=tmp_path)
+    assert target not in bootstrap_block, "0.35 cosine must NOT clear the bootstrap floor (0.45)"
+    assert _rc(store, m_target.id) == before
+
+    # 2. WITH a persisted per-persona calibration (a looser floor derived —
+    #    in production — from THIS persona's own recalibration pass), the
+    #    same 0.35-cosine candidate clears it and surfaces as a full-inject
+    #    semantic standout.
+    (tmp_path / "semantic_calibration.json").write_text(
+        json.dumps({"floor": 0.2, "gap": 0.05, "sample_count": 60, "updated_at": "2026-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    calibrated_block = _build_recall_block(store, query, persona_dir=tmp_path)
+    assert target in calibrated_block, "the persisted (looser) calibration must be the one actually used"
+    assert _rc(store, m_target.id) - before == pytest.approx(1.0), "sole standout gets a FULL tick"
 
 
 # ---------------------------------------------------------------------------
