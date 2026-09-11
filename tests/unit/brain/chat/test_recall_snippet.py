@@ -135,21 +135,27 @@ def test_g2_single_surfaced_memory_bumped_at_top_amount(tmp_path: Path) -> None:
     assert _rc(store, m.id) - before == pytest.approx(0.8, abs=0.01)
 
 
-def test_full_inject_active_rows_receive_no_passive_bump(tmp_path: Path) -> None:
-    """G1 (full-inject exclusion): a high-importance memory rendered IN FULL
-    (not as a snippet) receives no passive bump — it is already maximally
-    salient by importance. A snippet-rendered sibling in the same block still
-    gets bumped normally."""
+def test_full_inject_active_rows_receive_the_full_bump(tmp_path: Path) -> None:
+    """#231 owner ruling ("if it gets opened, it gets the full bump, doesn't
+    matter how it got opened"): a high-importance memory rendered IN FULL (a
+    full-inject / opened row) now gets the FULL +1.0 recall bump, NOT the
+    fractional snippet rate and not zero. A snippet-rendered sibling in the
+    same block still gets the fractional bump. This REPLACES the old G1
+    "full-inject exclusion" behavior, where the opened row got no bump at
+    all."""
     store = _store()
-    hi = _mem(store, "beacon " + ("H" * 300), importance=9.5)  # full-inject
+    hi = _mem(store, "beacon " + ("H" * 300), importance=9.5)  # full-inject / opened
     lo = _mem(store, "beacon low importance detail", importance=1.0)  # snippet
     before_hi, before_lo = _rc(store, hi.id), _rc(store, lo.id)
 
     block = _build_recall_block(store, "beacon", persona_dir=tmp_path)
     assert ("H" * 300) in block, "hi renders in full (untruncated) — confirms it is full-inject"
 
-    assert _rc(store, hi.id) == before_hi, "full-inject rows get no passive bump"
-    assert _rc(store, lo.id) > before_lo, "snippet-rendered rows are still bumped"
+    # The opened row gets the FULL bump; the snippet row gets a fractional one
+    # strictly below the full tick.
+    assert _rc(store, hi.id) - before_hi == pytest.approx(1.0), "full-inject rows get the full bump"
+    lo_bump = _rc(store, lo.id) - before_lo
+    assert 0 < lo_bump < 1.0, "snippet-rendered rows still get the fractional bump"
 
 
 def test_lost_bucket_entries_are_never_bumped(tmp_path: Path) -> None:

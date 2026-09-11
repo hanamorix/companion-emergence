@@ -467,3 +467,119 @@ def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tm
         _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
     ids_inconclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
     assert fading_b.id in ids_inconclusive
+
+
+# ---------------------------------------------------------------------------
+# #231 Fix 3 — an OPENED / full-rendered memory gets the FULL recall bump on
+# EVERY path (owner ruling: "if it gets opened, it gets the full bump,
+# doesn't matter how it got opened"). On the lexical (inconclusive) path the
+# importance-threshold `full_ids` memories are rendered untruncated, i.e.
+# OPENED, so they get store.bump_recall(id, 1.0) at full strength, NOT the
+# fractional snippet rate, and are no longer EXCLUDED from every bump. That
+# full-open bump is ungated on SNIPPET_MODE_ENABLED, mirroring the semantic
+# full-inject tier. Pre-fix these lexical full_ids memories got NO bump at
+# all (the fractional loop explicitly skipped them, "already maximally
+# salient"), so every "== 1.0" assertion below FAILS against the pre-fix code.
+# ---------------------------------------------------------------------------
+
+
+def _seed_lexical_full_and_snippet(store: MemoryStore) -> tuple[Memory, Memory]:
+    """A high-importance memory (importance >= FULL_INJECT_IMPORTANCE, so it
+    is rendered in FULL and lands in `full_ids`) plus a low-importance one
+    (rendered as a snippet), both lexically matching "lighthouse" so the
+    always-run lexical partition puts both into active_hits/active_top on an
+    inconclusive turn.
+    """
+    full_mem = Memory.create_new(
+        content="the lighthouse keeper's oath, never once broken",
+        memory_type="event",
+        domain="d",
+        importance=9.5,
+    )
+    snippet_mem = Memory.create_new(
+        content="a passing glance at the lighthouse from the far shore",
+        memory_type="event",
+        domain="d",
+        importance=2.0,
+    )
+    store.create(full_mem)
+    store.create(snippet_mem)
+    return full_mem, snippet_mem
+
+
+def test_lexical_full_open_gets_full_bump_not_fractional(tmp_path: Path) -> None:
+    """On an INCONCLUSIVE (lexical) turn, a full-rendered `full_ids` memory
+    gets the FULL +1.0 recall bump, not the fractional snippet rate and not
+    zero. Pre-fix it was EXCLUDED from every bump, so this "+1.0" delta fails
+    against the old code; the low-importance snippet keeps its fractional
+    bump, proving full-open is treated differently from a snippet."""
+    store = MemoryStore(":memory:")
+    full_mem, snippet_mem = _seed_lexical_full_and_snippet(store)
+    before_full = _rc(store, full_mem.id)
+    before_snip = _rc(store, snippet_mem.id)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert full_mem.id in block
+    assert snippet_mem.id in block
+
+    # The opened (full-rendered) memory gets the FULL bump.
+    assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)
+
+    # The non-full snippet memory keeps its fractional bump: strictly less
+    # than the full tick and non-zero (a lone snippet-tier row -> 0.8).
+    snip_bump = _rc(store, snippet_mem.id) - before_snip
+    assert 0 < snip_bump < 1.0
+
+
+def test_lexical_full_open_bump_fires_when_snippet_mode_off(tmp_path: Path) -> None:
+    """The full-open bump is UNGATED on SNIPPET_MODE_ENABLED. With snippet
+    mode OFF, `full_ids` is empty but every active row is rendered in full
+    (opened), so both active memories get the FULL +1.0 bump. Pre-fix the
+    lexical path did NO bumping at all when snippet mode was off (both the
+    fading and the fractional loops are gated on SNIPPET_MODE_ENABLED), so
+    these "+1.0" deltas fail against the old code."""
+    store = MemoryStore(":memory:")
+    full_mem, snippet_mem = _seed_lexical_full_and_snippet(store)
+    before_full = _rc(store, full_mem.id)
+    before_snip = _rc(store, snippet_mem.id)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False),
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert full_mem.id in block
+    assert snippet_mem.id in block
+
+    # Snippet mode off -> every active row is fully opened, so both get the
+    # full +1.0 bump (full-open == full bump, ungated).
+    assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)
+    assert _rc(store, snippet_mem.id) - before_snip == pytest.approx(1.0)
+
+
+def test_lexical_full_open_no_double_bump(tmp_path: Path) -> None:
+    """A memory opened once is bumped exactly once. The full-open loop adds
+    the id to `seen_bump` before the fractional loop runs, so the fractional
+    loop skips it: its recall_count reflects a single +1.0, never +1.0 stacked
+    with a fractional tick (which would read ~1.8)."""
+    store = MemoryStore(":memory:")
+    full_mem, _snippet_mem = _seed_lexical_full_and_snippet(store)
+    before_full = _rc(store, full_mem.id)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+    ):
+        _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    # Exactly one full tick, no fractional tick stacked on top.
+    assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)

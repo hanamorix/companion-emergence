@@ -875,12 +875,14 @@ def _render_semantic_active_lines(
     membership in this tier, not read order.
 
     Counter ticks: full-surfaced memories each get a FULL tick
-    (`store.bump_recall(id, 1.0)`) — this is a SEPARATE id population from
-    the importance-threshold `full_ids` used by the lexical path elsewhere
-    in this module (which are deliberately EXCLUDED from any bump, "already
-    maximally salient" — see the CHANGE-1 comment in `_build_recall_block`
-    below). The spec is explicit that semantic full-injects ARE bumped, at
-    full strength, UNCONDITIONALLY — that bump is NOT gated on
+    (`store.bump_recall(id, 1.0)`). Full-open always means a full bump: any
+    memory rendered in FULL is bumped at full strength on EVERY retrieval
+    path, per the owner ruling ("if it gets opened, it gets the full bump,
+    doesn't matter how it got opened"). The importance-threshold `full_ids`
+    that the lexical path renders in full are bumped the same way now (see
+    the full-open block in `_build_recall_block` below); they are no longer
+    excluded from any bump. The spec is explicit that semantic full-injects
+    ARE bumped, at full strength, UNCONDITIONALLY: that bump is NOT gated on
     SNIPPET_MODE_ENABLED (the gate below only covers the snippet-tier bump,
     Stage-3 Defect-4 fix).
 
@@ -1257,13 +1259,18 @@ def _build_recall_block(
         for token in unfamiliar:
             lines.append(f"    - {token}")
 
-    # CHANGE 1 — fractional recall_count bump by DISPLAY rank, on passive
-    # surface. Only rows rendered as snippets (full=False) are bumped.
+    # CHANGE 1: fractional recall_count bump by DISPLAY rank, on passive
+    # surface. This block bumps ONLY rows rendered as snippets (full=False).
+    # Rows rendered in FULL (the importance-threshold `full_ids`) are OPENED,
+    # so per the owner ruling ("if it gets opened, it gets the full bump,
+    # doesn't matter how it got opened") they get the FULL +1.0 bump instead,
+    # in the dedicated full-open block further below (ungated on
+    # SNIPPET_MODE_ENABLED). They are no longer excluded from every bump.
     # Rank 0 (top) -> ~0.8, rank N-1 (bottom) -> ~0.1, linear between; a
-    # single surfaced memory -> 0.8. Gated on SNIPPET_MODE_ENABLED: when it's
-    # False, _recall_snippet renders full bodies instead of snippets, so
-    # these rows were not "surfaced as a snippet" and must not be
-    # reinforced.
+    # single surfaced memory -> 0.8. This fractional snippet-tier bump stays
+    # gated on SNIPPET_MODE_ENABLED: when it is False, _recall_snippet renders
+    # full bodies instead of snippets, so these rows were not "surfaced as a
+    # snippet" and must not be reinforced.
     #
     # #231 Fix 1 (owner ruling, path-independence): "if it surfaces it gets
     # the full +1 ... doesn't matter how it got surfaced, if it gets fully
@@ -1327,6 +1334,32 @@ def _build_recall_block(
         fading_only_ids = seen_bump - semantic_active_ids
         if fading_only_ids:
             PendingQueue(persona_dir).enqueue_reappraisals(list(fading_only_ids), source="recall")
+
+    # #231 Fix 3 (owner ruling, full-open == full bump): any memory that is
+    # OPENED / rendered in FULL gets the FULL recall bump, regardless of which
+    # retrieval path surfaced it ("if it gets opened, it gets the full bump,
+    # doesn't matter how it got opened"). On the lexical path (semantic_result
+    # is None) an active memory is rendered in FULL exactly when
+    # `_recall_snippet` renders it untruncated, i.e. when it is in the
+    # importance-threshold `full_ids` OR when SNIPPET_MODE_ENABLED is False
+    # (snippet mode off means every active row renders full). Each opened
+    # memory gets store.bump_recall(id, 1.0) at full strength, mirroring the
+    # semantic full-inject tier (_render_semantic_active_lines). This bump is
+    # UNGATED on SNIPPET_MODE_ENABLED (full-open always means a full bump;
+    # only the fractional snippet-tier bump below stays gated), so it fires
+    # even when snippet mode is off, where full_ids is empty but every active
+    # row is nonetheless fully opened. Deduped via seen_bump so a memory
+    # opened once is bumped once across every loop, and it runs BEFORE the
+    # fractional loop so those ids are already in seen_bump. Scoped to the
+    # inconclusive branch because on a conclusive turn active_top/full_ids are
+    # computed but never rendered to the model (the semantic branch issues its
+    # own full bumps in _render_semantic_active_lines).
+    if semantic_result is None:
+        for mem in active_top:
+            opened = mem.id in full_ids or not SNIPPET_MODE_ENABLED
+            if opened and mem.id not in seen_bump:
+                seen_bump.add(mem.id)
+                store.bump_recall(mem.id, 1.0)
 
     if semantic_result is None and SNIPPET_MODE_ENABLED:
         bump_targets: list = []
