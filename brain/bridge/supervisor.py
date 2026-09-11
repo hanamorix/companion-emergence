@@ -1998,22 +1998,21 @@ def _run_voice_reflection_tick(
 ) -> None:
     """Gather inputs and invoke run_voice_reflection_tick.
 
-    Reads the last 7 days of crystallizations (from SoulStore), dreams
-    (from ``dreams.log.jsonl``), and recent message tones (placeholder
-    for v0.0.9 — empty list until the chat-turn tone schema lands).
+    Reads the last 7 days of crystallizations (from SoulStore) and dream
+    memories (from memories.db), each with a short text excerpt so the
+    reflection can ground its evidence (#202). The message-tone stream that
+    used to sit alongside them was a permanent ``[]`` placeholder; retired.
     Publishes a ``voice_reflection_tick`` event on success.
     """
     from brain.initiate.voice_reflection import run_voice_reflection_tick
 
     crystallizations = _read_recent_crystallizations(persona_dir, days=7)
     dreams = _read_recent_dreams(persona_dir, days=7)
-    recent_tones = _read_recent_message_tones(persona_dir, days=7)
     run_voice_reflection_tick(
         persona_dir,
         provider=provider,
         crystallizations=crystallizations,
         dreams=dreams,
-        recent_tones=recent_tones,
         companion_name=persona_dir.name,
     )
     event_bus.publish(
@@ -2024,12 +2023,14 @@ def _run_voice_reflection_tick(
     )
 
 
-def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent crystallization summaries from SoulStore.
+_VOICE_EVIDENCE_CHARS = 160
 
-    Returns a list of ``{"id": ..., "ts": iso8601}`` dicts for
-    crystallizations created within the last ``days`` days. Failures
-    swallowed — reflection still fires with whatever evidence exists.
+
+def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
+    """Recent crystallizations as ``{"id", "ts", "text"}`` (#202: text, not just ids).
+
+    ``text`` is the moment plus why it matters, capped. Failures swallowed —
+    reflection still fires with whatever evidence exists.
     """
     from brain.soul.store import SoulStore
 
@@ -2041,7 +2042,8 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
             for c in store.list_active():
                 ts = c.crystallized_at.isoformat()
                 if ts >= cutoff:
-                    out.append({"id": c.id, "ts": ts})
+                    text = f"{c.moment} — {c.why_it_matters}".strip(" —")
+                    out.append({"id": c.id, "ts": ts, "text": text[:_VOICE_EVIDENCE_CHARS]})
             return out
         finally:
             store.close()
@@ -2050,36 +2052,36 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
 
 
 def _read_recent_dreams(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent dream entries from ``dreams.log.jsonl``."""
-    from brain.health.jsonl_reader import iter_jsonl_streaming
+    """Recent dream memories as ``{"id", "ts", "text"}`` (#202).
 
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    out: list[dict] = []
+    Reads ``memory_type="dream"`` rows from memories.db rather than
+    ``dreams.log.jsonl``: the log carries ids only (no text) and its
+    ``timestamp`` field never matched the ``at``/``ts`` keys the old reader
+    looked for, so dreams were silently absent from the evidence.
+    """
+    from brain.memory.store import MemoryStore
+
+    cutoff = datetime.now(UTC) - timedelta(days=days)
     try:
-        for raw in iter_jsonl_streaming(persona_dir / "dreams.log.jsonl"):
-            ts = raw.get("at") or raw.get("ts")
-            if ts and ts >= cutoff:
-                out.append({"id": raw.get("dream_id") or raw.get("id"), "ts": ts})
+        store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+        try:
+            out: list[dict] = []
+            for mem in store.list_by_type("dream", limit=50):
+                if mem.created_at >= cutoff:
+                    out.append(
+                        {
+                            "id": mem.id,
+                            "ts": mem.created_at.isoformat(),
+                            "text": mem.content[:_VOICE_EVIDENCE_CHARS],
+                        }
+                    )
+            return out
+        finally:
+            store.close()
     except Exception:
         return []
-    return out
 
 
-def _read_recent_message_tones(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent Nell-authored chat turn tones — placeholder for v0.0.9.
-
-    Real implementation requires schema on the chat-turn log we don't
-    currently have. For v0.0.9, return an empty list; voice reflection
-    still fires but with less material. Revisit when chat-turn tone
-    tracking is added.
-    """
-    return []
-
-
-# Per-log retention policies. Bake the cadence-tick policies here so the
-# supervisor doesn't need a config file; defaults reflect Hana's 2026-05-11
-# decisions (5 MB rolling cap; 3 archives for heartbeats, 5 for dreams +
-# emotion_growth; yearly archive for soul_audit kept forever).
 _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("heartbeats.log.jsonl", 3),
     ("dreams.log.jsonl", 5),
@@ -2104,6 +2106,7 @@ _YEARLY_ARCHIVE_LOGS: tuple[tuple[str, str], ...] = (
     ("initiate_audit.jsonl", "ts"),
 )
 _DEFAULT_ROLLING_BYTES = 5 * 1024 * 1024  # 5 MB
+
 
 
 def _run_log_rotation_tick(

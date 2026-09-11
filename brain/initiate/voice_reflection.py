@@ -25,13 +25,18 @@ logger = logging.getLogger(__name__)
 _TICK_PROMPT_SEGMENTS = prompt_strings.register_segments("initiate.voice_reflection.tick_prompt_segments")
 
 
+def _evidence_line(item: dict) -> str:
+    ts = str(item.get("ts") or "")[:10]
+    text = str(item.get("text") or "").replace("\n", " ").strip()
+    return f"- {item.get('id')} ({ts}): {text}" if text else f"- {item.get('id')} ({ts})"
+
+
 def run_voice_reflection_tick(
     persona_dir: Path,
     *,
     provider: Any,
     crystallizations: list[dict],
     dreams: list[dict],
-    recent_tones: list[dict],
     companion_name: str = "Nell",
 ) -> None:
     """Reflect over the last week of internal life; maybe emit a voice-edit candidate.
@@ -42,16 +47,15 @@ def run_voice_reflection_tick(
     voice_path = persona_dir / "voice.md"
     voice_template = voice_path.read_text(encoding="utf-8") if voice_path.exists() else ""
 
+    # #202: each line carries a short excerpt so the >=3-evidence gate can be
+    # met honestly — ids and timestamps alone gave the model nothing to cite.
     evidence_block = "\n".join(
         [
             "Recent crystallizations:",
-            *[f"- {c.get('id')}: {c.get('ts')}" for c in crystallizations[:10]],
+            *[_evidence_line(c) for c in crystallizations[:10]],
             "",
             "Recent dreams:",
-            *[f"- {d.get('id')}: {d.get('ts')}" for d in dreams[:10]],
-            "",
-            "Recent message tones (your own outputs):",
-            *[f"- {t.get('id')}: {t.get('ts')}" for t in recent_tones[:10]],
+            *[_evidence_line(d) for d in dreams[:10]],
         ]
     )
 
