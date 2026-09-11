@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.utils.llm_output import extract_json_object
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
@@ -131,14 +132,6 @@ def run_vocab_repair(
     prior_complete = existing is not None and existing.get("status") == "complete"
     prior_repaired = int(existing.get("repaired", 0)) if prior_complete else 0
     prior_described = int(existing.get("described", 0)) if prior_complete else 0
-    if prior_complete and provider is None:
-        # Step 1 already done and Step 2 needs a provider: nothing to do.
-        return RepairReport(
-            repaired=prior_repaired,
-            described=prior_described,
-            status="complete",
-            completed_at=existing.get("completed_at", ""),
-        )
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
     if not vocab_path.exists():
@@ -149,6 +142,25 @@ def run_vocab_repair(
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("vocab_repair: cannot read vocab: %s — skipping", exc)
         return _write_and_return(persona_dir, repaired=0, described=0)
+
+    # ------------------------------------------------------------------
+    # Step 0 (#174, provider-free, every run): collapse spelling-variant twins
+    # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
+    # into one canonical entry. A twin with a real description beats a placeholder.
+    # ------------------------------------------------------------------
+    merged = _merge_variant_entries(data)
+    if merged:
+        _atomic_write_vocab(vocab_path, data)
+        logger.info("vocab_repair: merged %d variant twin(s): %s", len(merged), merged)
+
+    if prior_complete and provider is None:
+        # Step 1 already done and Step 2 needs a provider: nothing more to do.
+        return RepairReport(
+            repaired=prior_repaired,
+            described=prior_described,
+            status="complete",
+            completed_at=existing.get("completed_at", ""),
+        )
 
     emotions = data.get("emotions", [])
 
@@ -224,6 +236,46 @@ def _write_and_return(persona_dir: Path, *, repaired: int, described: int) -> Re
         status="complete",
         completed_at=completed_at,
     )
+
+
+def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
+    """Collapse entries whose names canonicalise to the same key (#174).
+
+    Mutates ``data["emotions"]`` in place. Returns ``(dropped_name, kept_name)``
+    pairs; empty when nothing changed. Survivor: the first entry with a real
+    description, else the first seen. The survivor is renamed to the canonical key.
+    """
+    from brain.emotion.vocabulary import canonical_name
+    from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
+
+    emotions = data.get("emotions", [])
+    survivors: dict[str, dict] = {}
+    order: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    for entry in emotions:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        key = canonical_name(entry["name"])
+        current = survivors.get(key)
+        if current is None:
+            survivors[key] = entry
+            order.append(key)
+            continue
+        current_is_stub = current.get("description") == PLACEHOLDER_DESCRIPTION
+        entry_is_stub = entry.get("description") == PLACEHOLDER_DESCRIPTION
+        if current_is_stub and not entry_is_stub:
+            dropped.append((current["name"], entry["name"]))
+            survivors[key] = entry
+        else:
+            dropped.append((entry["name"], current["name"]))
+
+    renamed = [(survivors[k]["name"], k) for k in order if survivors[k]["name"] != k]
+    if not dropped and not renamed:
+        return []
+    for key in order:
+        survivors[key]["name"] = key
+    data["emotions"] = [survivors[k] for k in order]
+    return dropped + renamed
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
@@ -312,7 +364,8 @@ def _describe_stubs(
                     )
                 except TypeError:
                     raw = provider.generate(user_prompt, system=_DESCRIBE_SYSTEM)
-                mapping: dict = json.loads(raw)
+                # #173: Haiku may fence its reply; use the shared tolerant extractor.
+                mapping: dict = json.loads(extract_json_object(raw))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "vocab_repair: provider call or parse failed for batch %r: %s — "
@@ -338,6 +391,13 @@ def _describe_stubs(
                     entry["description"] = desc.strip()
                     patched += 1
 
+            if patched == 0:
+                logger.warning(
+                    "vocab_repair: provider reply parsed but matched no stub name "
+                    "(reply keys=%s, batch=%s) — keeping placeholders for this batch",
+                    sorted(mapping)[:10],
+                    batch,
+                )
             if patched > 0:
                 _atomic_write_vocab(vocab_path, data)
                 described += patched

@@ -390,3 +390,69 @@ def test_repair_describes_new_placeholders_after_state_complete(tmp_path: Path) 
     assert by_name["quiet_dread"]["description"] == "a low hum of unease"
     assert by_name["quiet_dread"]["decay_half_life_days"] == 14.0
     assert by_name["love"]["description"] == "a real description"
+
+
+# ---------------------------------------------------------------------------
+# #174 retroactive merge + #173 parse hardening
+# ---------------------------------------------------------------------------
+
+
+def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path) -> None:
+    """#174 reopen: permutation and hyphen/case twins collapse to one canonical entry.
+    The entry with a real description wins; a placeholder twin is dropped."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [
+        _stub_entry("love_grief_blend"),
+        _proper_entry("grief_love_blend", "braided"),
+        _proper_entry("anticipatory-grief", "dread ahead"),
+        _stub_entry("Anticipatory_Grief"),
+        _proper_entry("love"),
+    ])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert set(by_name) == {"grief_love_blend", "anticipatory_grief", "love"}
+    assert by_name["grief_love_blend"]["description"] == "braided"
+    assert by_name["anticipatory_grief"]["description"] == "dread ahead"
+
+
+def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:
+    """#173: a ```json-fenced reply must still describe the stubs (shared extract_json_object)."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    provider = _FakeProvider(response='```json\n{"body_grief": "the weight of it"}\n```')
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+
+    assert report.described == 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    assert data["emotions"][0]["description"] == "the weight of it"
+
+
+def test_repair_warns_when_provider_json_matches_no_stub(tmp_path: Path, caplog) -> None:
+    """#173: a parseable reply whose keys match nothing must not fail silently."""
+    import logging
+
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    provider = _FakeProvider(response=json.dumps({"descriptions": {"body_grief": "x"}}))
+    store = _make_store(tmp_path)
+    try:
+        with caplog.at_level(logging.WARNING, logger="brain.health.vocab_repair"):
+            report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+
+    assert report.described == 0
+    assert any("matched no stub" in r.getMessage() for r in caplog.records)

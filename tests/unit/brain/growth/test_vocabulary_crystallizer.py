@@ -44,7 +44,7 @@ def test_crystallizer_proposes_recurring_unnamed_emotional_configuration() -> No
 
         assert len(result) == 1
         proposal = result[0]
-        assert proposal.name == "love_grief_blend"
+        assert proposal.name == "grief_love_blend"  # #174: canonical sorted spelling
         assert "love" in proposal.description
         assert "grief" in proposal.description
         assert proposal.evidence_memory_ids == (first.id, second.id, third.id)
@@ -82,6 +82,38 @@ def test_crystallizer_treats_reversed_blend_name_as_existing() -> None:
 
         result = crystallize_vocabulary(
             store, current_vocabulary_names={"love", "grief", "grief_love_blend"}
+        )
+
+        assert result == []
+    finally:
+        store.close()
+
+
+def test_crystallizer_mints_blend_name_in_canonical_sorted_order() -> None:
+    """#174: never mint love_grief_blend — the canonical spelling sorts its parts."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(_mem("love and grief braided", {"love": 9, "grief": 8}))
+        store.create(_mem("another love-grief evening", {"love": 8, "grief": 7}))
+        store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
+
+        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief"})
+
+        assert [p.name for p in result] == ["grief_love_blend"]
+    finally:
+        store.close()
+
+
+def test_crystallizer_treats_hyphen_and_case_variants_as_existing() -> None:
+    """#174 reopen: Grief-Love_blend already names this configuration."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(_mem("love and grief braided", {"love": 9, "grief": 8}))
+        store.create(_mem("another love-grief evening", {"love": 8, "grief": 7}))
+        store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
+
+        result = crystallize_vocabulary(
+            store, current_vocabulary_names={"love", "grief", "Love-Grief_blend"}
         )
 
         assert result == []

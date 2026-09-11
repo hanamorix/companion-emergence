@@ -215,7 +215,10 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     seen: set[str] = set()
     new_entries: list[dict] = []
     for mem in store.list_active(limit=None):
-        for name in mem.emotions:
+        for raw_name in mem.emotions:
+            # #174: heal under the canonical spelling so a variant memory key
+            # (present-ness, Love_Grief_blend) never mints a twin entry.
+            name = vocabulary.canonical_name(raw_name)
             if name in seen or vocabulary.get(name) is not None:
                 continue
             seen.add(name)

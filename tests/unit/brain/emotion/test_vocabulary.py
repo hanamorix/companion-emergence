@@ -228,3 +228,60 @@ def test_body_emotions_loadable_via_state_set():
     for name in ("climax", "touch_hunger", "comfort_seeking", "rest_need"):
         s.set(name, 5.0)
         assert s.emotions[name] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# #174: name normalisation
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_name_lowercases_and_underscores() -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name("Anticipatory-Grief") == "anticipatory_grief"
+    assert canonical_name(" present-ness ") == "present_ness"
+
+
+def test_canonical_name_sorts_blend_parts() -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name("love_grief_blend") == "grief_love_blend"
+    assert canonical_name("grief_love_blend") == "grief_love_blend"
+    assert canonical_name("Love-Grief_blend") == "grief_love_blend"
+
+
+def test_get_resolves_variant_spellings_to_registered_entry() -> None:
+    from brain.emotion import vocabulary
+
+    e = vocabulary.Emotion(
+        name="anticipatory_grief",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        assert vocabulary.get("anticipatory-grief") is e
+        assert vocabulary.get("Anticipatory_Grief") is e
+    finally:
+        vocabulary._unregister("anticipatory_grief")
+
+
+def test_register_stores_under_canonical_name() -> None:
+    from brain.emotion import vocabulary
+
+    e = vocabulary.Emotion(
+        name="love_grief_blend",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        stored = vocabulary.get("grief_love_blend")
+        assert stored is not None
+        assert stored.name == "grief_love_blend"
+    finally:
+        vocabulary._unregister("grief_love_blend")
