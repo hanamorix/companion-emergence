@@ -284,13 +284,25 @@ def _poll_for_ready_or_error(
         for marker in error_markers:
             if (run_dir / marker).exists():
                 return
-        if ready_path.exists() and ready_path.stat().st_mtime >= start - _READY_MTIME_SLACK_S:
+        if (
+            ready_path.exists()
+            and ready_path.stat().st_mtime >= start - _READY_MTIME_SLACK_S
+            and _ready_parses(ready_path)
+        ):
             return
         time.sleep(_POLL_INTERVAL)
     raise ForegroundBootError(
         f"no READY (or error marker) appeared under {run_dir} within {ready_timeout}s "
         "(bounded poll timed out, did not hang)."
     )
+
+
+def _ready_parses(ready_path: Path) -> bool:
+    """#215: a READY observed mid-write (empty / partial JSON) is not ready yet -- keep polling."""
+    try:
+        return isinstance(json.loads(ready_path.read_text(encoding="utf-8")), dict)
+    except (OSError, ValueError):
+        return False
 
 
 def _require_fresh_ready(run_dir: Path, start: float) -> None:
