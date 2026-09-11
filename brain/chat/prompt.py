@@ -23,6 +23,7 @@ from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
+from brain.memory.recall_open import open_memory
 from brain.memory.relevance import (
     FULL_INJECT_IMPORTANCE,
     FULL_INJECT_MAX,
@@ -841,8 +842,22 @@ def _recall_snippet(mem, *, full: bool) -> str:
     return body
 
 
+def _snippet_bump_amount(rank: int, group_size: int) -> float:
+    """Rank-weighted fractional recall bump for a genuine-snippet surface.
+
+    ``rank`` is the zero-based display rank (0 = top) within a snippet group of
+    ``group_size``. Top rank -> 0.8, bottom -> 0.1 (linear between); a lone
+    snippet -> 0.8. The SINGLE source of the passive snippet-bump curve that was
+    previously inlined identically at the semantic, fading, and lexical tiers
+    (#231 consolidation, reconciliation D).
+    """
+    if group_size == 1:
+        return 0.8
+    return 0.8 - 0.7 * (rank / (group_size - 1))
+
+
 def _render_semantic_active_lines(
-    store: MemoryStore, result: SemanticRecallResult, *, persona_dir: Path
+    store: MemoryStore, result: SemanticRecallResult, *, persona_dir: Path, seen: set[str]
 ) -> list[str]:
     """Render the "  active:" section lines for a CONCLUSIVE semantic recall
     result and apply its recall-counter ticks (spec decision 5's "Counter"
@@ -874,36 +889,25 @@ def _render_semantic_active_lines(
     what's surfaced, not reranker order") — the reranker only decided
     membership in this tier, not read order.
 
-    Counter ticks: full-surfaced memories each get a FULL tick
-    (`store.bump_recall(id, 1.0)`). Full-open always means a full bump: any
-    memory rendered in FULL is bumped at full strength on EVERY retrieval
-    path, per the owner ruling ("if it gets opened, it gets the full bump,
-    doesn't matter how it got opened"). The importance-threshold `full_ids`
-    that the lexical path renders in full are bumped the same way now (see
-    the full-open block in `_build_recall_block` below); they are no longer
-    excluded from any bump. The spec is explicit that semantic full-injects
-    ARE bumped, at full strength, UNCONDITIONALLY: that bump is NOT gated on
-    SNIPPET_MODE_ENABLED (the gate below only covers the snippet-tier bump,
-    Stage-3 Defect-4 fix).
+    Counter ticks (#231 consolidation — the render-loop rule): the bump
+    follows the ACTUAL render. `result.full` rows render full, so each goes
+    through the one `open_memory` door (+1.0, deliberate=False, per-id enqueue
+    when persona_dir is set) — "if it gets opened, it gets the full bump,
+    doesn't matter how it got opened". `snippet_ordered` rows render full ONLY
+    when `SNIPPET_MODE_ENABLED` is off (then `_recall_snippet` returns the
+    untruncated body), in which case they too go through the door; otherwise
+    they are genuine snippets and take the shared rank-weighted fractional bump
+    (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom, linear; a lone snippet ->
+    0.8) plus one batched `enqueue_reappraisals` for the snippet ids.
 
-    Snippet-tier gets the SAME rank-weighted fractional bump (0.8 top -> 0.1
-    bottom, linear; a lone snippet -> 0.8) the lexical path's own bump loop
-    already uses — same mechanic, reused, fed this candidate set in
-    PRESENTATION order. Also enqueues the same pending-reappraisal request
-    (`PendingQueue.enqueue_reappraisals`, CHANGE 3 / P3 retention rework)
-    the lexical path issues for every surfaced memory id — that mechanic is
-    keyed on "was surfaced this turn," not on which retrieval mechanism did
-    the surfacing.
-
-    Stage-3 Defect-4 fix: the snippet-tier bump AND the reappraisal enqueue
-    are now gated under `SNIPPET_MODE_ENABLED`, exactly like the lexical
-    path's own CHANGE-1/CHANGE-3 gating (`_build_recall_block` below) — when
-    snippet mode is off, `_recall_snippet` renders full untruncated bodies,
-    so a "snippet" isn't actually a snippet and must not receive the
-    fractional reinforcement bump or the reappraisal enqueue. Previously
-    this ran unconditionally, inconsistent with the lexical path.
+    `seen` (threaded from the caller) is the ONE per-turn dedup set spanning
+    every tier, so this function no longer keeps its own internal full/snippet
+    dedup. With the flag ON, production behaviour is byte-identical to before
+    the consolidation (full -> +1.0, snippet -> fractional-by-rank, every
+    surfaced id enqueued once); the only delta is on the flag-OFF path, which
+    is now correct by construction (a full-rendered "snippet" is bumped and
+    enqueued through the door instead of being silently skipped).
     """
-    full_ids = {m.id for m in result.full}
     snippet_ordered = sorted(result.snippet, key=_recall_sort_key)
 
     lines = ["  active:"]
@@ -914,19 +918,33 @@ def _render_semantic_active_lines(
         snippet = _recall_snippet(mem, full=False)
         lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
+    # Render-loop rule (#231 consolidation): the bump follows the ACTUAL render,
+    # not a per-tier flag check. ``result.full`` rows render full (full=True) ->
+    # the +1.0 open through the one door. ``snippet_ordered`` rows render full
+    # ONLY when SNIPPET_MODE_ENABLED is off (then ``_recall_snippet`` returns the
+    # untruncated body) -> the door too; otherwise they are genuine snippets and
+    # take the rank-weighted fractional bump + a batched enqueue, exactly as
+    # before. ``seen`` (threaded from the caller) dedups across every tier this
+    # turn — subsuming this tier's old internal full/snippet dedup.
     for mem in result.full:
-        store.bump_recall(mem.id, 1.0)
+        open_memory(mem, store=store, persona_dir=persona_dir, deliberate=False, seen=seen)
 
-    if SNIPPET_MODE_ENABLED:
+    if not SNIPPET_MODE_ENABLED:
+        for mem in snippet_ordered:
+            open_memory(mem, store=store, persona_dir=persona_dir, deliberate=False, seen=seen)
+    else:
         n_snip = len(snippet_ordered)
+        snippet_ids: list[str] = []
         for i, mem in enumerate(snippet_ordered):
-            amount = 0.8 if n_snip == 1 else 0.8 - 0.7 * (i / (n_snip - 1))
-            store.bump_recall(mem.id, amount)
+            if mem.id in seen:
+                continue
+            seen.add(mem.id)
+            store.bump_recall(mem.id, _snippet_bump_amount(i, n_snip))
+            snippet_ids.append(mem.id)
+        if snippet_ids:
+            from brain.memory.pending import PendingQueue
 
-        from brain.memory.pending import PendingQueue
-
-        reappraise_ids = full_ids | {m.id for m in snippet_ordered}
-        PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+            PendingQueue(persona_dir).enqueue_reappraisals(snippet_ids, source="recall")
 
     return lines
 
@@ -1025,6 +1043,16 @@ def _build_recall_block(
                 prefix += f" · {domain}"
             prefix += "]"
             lines.append(f'- {prefix} {mem.id}: "{_peer_attributed(mem, snippet)}"')
+
+        # Reconciliation E (#231): the legacy/no-persona_dir path now routes its
+        # FULL renders through the one door too — recall_count bumps (+1.0,
+        # deliberate=False so last_accessed_at is untouched) and the enqueue
+        # auto-skips because persona_dir is None. Full iff the row rendered
+        # untruncated: in full_ids, or every row when snippet mode is off.
+        # Snippet rows stay bump-free here (unchanged).
+        for mem in top:
+            if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
+                open_memory(mem, store=store, persona_dir=None, deliberate=False, seen=None)
 
         return "\n".join(lines)
 
@@ -1214,6 +1242,13 @@ def _build_recall_block(
     lost_top = lost_hits[:limit]
     full_ids = _full_inject_ids(active_top)
 
+    # ONE per-turn dedup set threaded through EVERY passive tier (#231
+    # consolidation, reconciliation D): the semantic tier, the fading tier, and
+    # the lexical active tier all consult/extend it, so a memory opened once is
+    # bumped/enqueued once across the whole turn. Created before the
+    # active-selection fork so the semantic branch shares it.
+    seen: set[str] = set()
+
     # ACTIVE-selection fork (Stage-3 Defect-3 fix) — the ONLY thing semantic
     # conclusiveness decides. Conclusive → option-4 semantic surfacing
     # (`_render_semantic_active_lines`: its own bump/enqueue, Defect-4
@@ -1221,7 +1256,9 @@ def _build_recall_block(
     # bumped exactly as before this fix (the CHANGE-1 block further down,
     # now explicitly scoped to `semantic_result is None`).
     if semantic_result is not None:
-        active_lines = _render_semantic_active_lines(store, semantic_result, persona_dir=persona_dir)
+        active_lines = _render_semantic_active_lines(
+            store, semantic_result, persona_dir=persona_dir, seen=seen
+        )
         has_active = has_semantic_active
     else:
         has_active = bool(active_top)
@@ -1259,136 +1296,74 @@ def _build_recall_block(
         for token in unfamiliar:
             lines.append(f"    - {token}")
 
-    # CHANGE 1: fractional recall_count bump by DISPLAY rank, on passive
-    # surface. This block bumps ONLY rows rendered as snippets (full=False).
-    # Rows rendered in FULL (the importance-threshold `full_ids`) are OPENED,
-    # so per the owner ruling ("if it gets opened, it gets the full bump,
-    # doesn't matter how it got opened") they get the FULL +1.0 bump instead,
-    # in the dedicated full-open block further below (ungated on
-    # SNIPPET_MODE_ENABLED). They are no longer excluded from every bump.
-    # Rank 0 (top) -> ~0.8, rank N-1 (bottom) -> ~0.1, linear between; a
-    # single surfaced memory -> 0.8. This fractional snippet-tier bump stays
-    # gated on SNIPPET_MODE_ENABLED: when it is False, _recall_snippet renders
-    # full bodies instead of snippets, so these rows were not "surfaced as a
-    # snippet" and must not be reinforced.
+    # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
+    # The render-loop rule replaces the old scattered per-tier gating: a row
+    # rendered in FULL goes through the one door (`open_memory`: +1.0,
+    # deliberate=False, per-id enqueue when persona_dir is set), a genuine
+    # snippet takes the rank-weighted fractional bump and is folded into one
+    # batched enqueue. `seen` (created before the active-selection fork and
+    # already threaded through the semantic tier) dedups every id across every
+    # tier this turn, so a memory opened once is bumped/enqueued once.
     #
-    # #231 Fix 1 (owner ruling, path-independence): "if it surfaces it gets
-    # the full +1 ... doesn't matter how it got surfaced, if it gets fully
-    # opened" — a surfaced/opened memory's bump must not depend on which
-    # retrieval path ran. fading_top renders IDENTICALLY on both the
-    # semantic-conclusive and inconclusive branches — always
-    # `_recall_snippet(mem, full=False)` (see the "softened (fading...)"
-    # render above, which is unconditional on `semantic_result`) — so its
-    # bump is split OUT of the old semantic_result-gated block below and
-    # made unconditional too, at the snippet-fractional level that matches
-    # how it actually renders (never full-inject). `active_top`, in
-    # contrast, is only ever rendered under "active:" when `semantic_result`
-    # is None (the active-selection fork above); on a CONCLUSIVE turn it's
-    # computed (the lexical search still runs, for the always-run
-    # fading/lost/not-recognised machinery) but never shown to the model, so
-    # its bump STAYS gated to the inconclusive branch — bumping an unrendered
-    # row would reinforce a memory the user never actually saw. The
-    # semantic-active section keeps its own separate, pre-existing bump
-    # (`_render_semantic_active_lines`, full -> +1 unconditional, snippet ->
-    # fractional gated on SNIPPET_MODE_ENABLED) — untouched by this split.
-    seen_bump: set = set()
-    if fading_top and SNIPPET_MODE_ENABLED:
-        n_fade = len(fading_top)
-        for i, mem in enumerate(fading_top):
-            if mem.id in seen_bump:
-                continue  # defensive: same id somehow also in active_top
-            seen_bump.add(mem.id)
-            amount = 0.8 if n_fade == 1 else 0.8 - 0.7 * (i / (n_fade - 1))
-            store.bump_recall(mem.id, amount)
+    # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open
+    # ids -> +1.0, snippet/fading ids -> the identical fractional-by-rank amount,
+    # and the enqueue SET is unchanged (every surfaced id once). The only
+    # intended deltas are on the flag-OFF path, which now becomes correct by
+    # construction: a fading/semantic-snippet row rendered full (because snippet
+    # mode is off) is bumped and enqueued through the door instead of being
+    # silently skipped.
+    snippet_enqueue_ids: list[str] = []
 
-    # #231 Fix 2 (owner ruling, reappraisal-enqueue path-independence):
-    # "if a memory gets opened, it doesn't matter how it surfaced ... it
-    # goes back into the reappraisal queue." The fading bump above is
-    # already path-independent (runs regardless of `semantic_result`); the
-    # reappraisal ENQUEUE for those same surfaced fading ids must now match
-    # that, instead of staying gated to the inconclusive branch below.
-    #
-    # On the INCONCLUSIVE branch, the block below still folds these
-    # `seen_bump` fading ids into its own single enqueue call unchanged
-    # (`full_ids | seen_bump`) — untouched by this fix. So this block only
-    # needs to cover the CONCLUSIVE branch, where that block never runs.
-    #
-    # On the CONCLUSIVE branch, `_render_semantic_active_lines` already
-    # issued its OWN enqueue for its own surfaced ids (semantic full +
-    # snippet tiers) inside the call above. Fading state and the semantic
-    # candidate pool ARE mutually exclusive here, but NOT because a fading
-    # memory "isn't part of list_active()" — it IS: list_active() filters
-    # only the `active` deactivation flag, not `state`. The actual reason
-    # is #231 fold-in fix (b): `build_semantic_candidate_pool` itself now
-    # filters to `state == "active"` (brain/memory/semantic_recall.py), so
-    # the pool it hands back is disjoint from fading BY THAT FILTER. So
-    # `seen_bump` here should never overlap that call's ids in practice —
-    # but the overlap is subtracted defensively anyway so this can never
-    # double-enqueue an id even if that invariant is ever violated.
-    if semantic_result is not None and seen_bump:
-        from brain.memory.pending import PendingQueue
+    # FADING tier renders on EVERY branch, always `_recall_snippet(mem,
+    # full=False)`, so `rendered_full` here is exactly `not SNIPPET_MODE_ENABLED`.
+    # The rank index advances per fading_top position even when an id is skipped
+    # (dedup), so a skip never renumbers later ranks — preserved from the
+    # pre-consolidation loop.
+    n_fade = len(fading_top)
+    for i, mem in enumerate(fading_top):
+        if mem.id in seen:
+            continue  # defensive: already opened this turn (e.g. a semantic id)
+        if SNIPPET_MODE_ENABLED:
+            seen.add(mem.id)
+            store.bump_recall(mem.id, _snippet_bump_amount(i, n_fade))
+            snippet_enqueue_ids.append(mem.id)
+        else:
+            open_memory(mem, store=store, persona_dir=persona_dir, deliberate=False, seen=seen)
 
-        semantic_active_ids = {m.id for m in semantic_result.full} | {
-            m.id for m in semantic_result.snippet
-        }
-        fading_only_ids = seen_bump - semantic_active_ids
-        if fading_only_ids:
-            PendingQueue(persona_dir).enqueue_reappraisals(list(fading_only_ids), source="recall")
-
-    # #231 Fix 3 (owner ruling, full-open == full bump): any memory that is
-    # OPENED / rendered in FULL gets the FULL recall bump, regardless of which
-    # retrieval path surfaced it ("if it gets opened, it gets the full bump,
-    # doesn't matter how it got opened"). On the lexical path (semantic_result
-    # is None) an active memory is rendered in FULL exactly when
-    # `_recall_snippet` renders it untruncated, i.e. when it is in the
-    # importance-threshold `full_ids` OR when SNIPPET_MODE_ENABLED is False
-    # (snippet mode off means every active row renders full). Each opened
-    # memory gets store.bump_recall(id, 1.0) at full strength, mirroring the
-    # semantic full-inject tier (_render_semantic_active_lines). This bump is
-    # UNGATED on SNIPPET_MODE_ENABLED (full-open always means a full bump;
-    # only the fractional snippet-tier bump below stays gated), so it fires
-    # even when snippet mode is off, where full_ids is empty but every active
-    # row is nonetheless fully opened. Deduped via seen_bump so a memory
-    # opened once is bumped once across every loop, and it runs BEFORE the
-    # fractional loop so those ids are already in seen_bump. Scoped to the
-    # inconclusive branch because on a conclusive turn active_top/full_ids are
-    # computed but never rendered to the model (the semantic branch issues its
-    # own full bumps in _render_semantic_active_lines).
+    # LEXICAL active tier is surfaced under "active:" ONLY on the inconclusive
+    # branch (on a conclusive turn active_top is computed for the always-run
+    # fading/lost machinery but never rendered, so it must not be bumped — the
+    # semantic branch issues its own opens inside `_render_semantic_active_lines`).
     if semantic_result is None:
+        # Full-open rows (importance `full_ids`, or every active row when
+        # snippet mode is off) -> the one door. Runs BEFORE the fractional loop
+        # so those ids are already in `seen`.
         for mem in active_top:
-            opened = mem.id in full_ids or not SNIPPET_MODE_ENABLED
-            if opened and mem.id not in seen_bump:
-                seen_bump.add(mem.id)
-                store.bump_recall(mem.id, 1.0)
+            if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
+                open_memory(mem, store=store, persona_dir=persona_dir, deliberate=False, seen=seen)
+        # Genuine snippet rows -> rank-weighted fractional bump. Rank is over the
+        # snippet-only subset in active_top order (the ids not opened above),
+        # exactly as the pre-consolidation `bump_targets` loop computed it.
+        if SNIPPET_MODE_ENABLED:
+            bump_targets = [
+                mem for mem in active_top if mem.id not in full_ids and mem.id not in seen
+            ]
+            n_bump = len(bump_targets)
+            for i, mem in enumerate(bump_targets):
+                seen.add(mem.id)
+                store.bump_recall(mem.id, _snippet_bump_amount(i, n_bump))
+                snippet_enqueue_ids.append(mem.id)
 
-    if semantic_result is None and SNIPPET_MODE_ENABLED:
-        bump_targets: list = []
-        for mem in active_top:
-            if mem.id not in full_ids and mem.id not in seen_bump:
-                seen_bump.add(mem.id)
-                bump_targets.append(mem)
-        n_bump = len(bump_targets)
-        for i, mem in enumerate(bump_targets):
-            amount = 0.8 if n_bump == 1 else 0.8 - 0.7 * (i / (n_bump - 1))
-            store.bump_recall(mem.id, amount)
-
-        # CHANGE 3 (P3 retention rework) — re-enqueue every surfaced recalled
-        # memory id as an "existing memory" re-appraise request. Enqueue-only:
-        # a cheap file append under lock, no appraisal and no provider call
-        # happen on this hot path (C3.3) — the gate re-appraises importance
-        # on its own consolidation tick and updates the row in place.
-        # STAGE-3 CORRECTION (finding #5): scope is the UNION of full_ids
-        # (full-inject recalls, the most salient) and bump_targets/seen_bump
-        # (snippet recalls, which already include the fading rows via the
-        # split-out loop above) — not narrowed to snippet-only, since
-        # full_ids is reachable at this hook site. Still scoped to the
-        # inconclusive branch only, unchanged by the #231 Fix 1 bump split
-        # (that split only concerns the recall_count bump itself, not this
-        # reappraisal enqueue).
+    # One batched reappraisal enqueue for the genuine-snippet ids surfaced this
+    # turn (fading on either branch + lexical active snippets on the inconclusive
+    # branch). Full-open ids were already enqueued per-id through `open_memory`,
+    # and the semantic tier enqueued its own snippet ids inside
+    # `_render_semantic_active_lines` — so together every surfaced id is enqueued
+    # exactly once, matching the pre-consolidation outcome.
+    if snippet_enqueue_ids:
         from brain.memory.pending import PendingQueue
 
-        reappraise_ids = full_ids | seen_bump
-        PendingQueue(persona_dir).enqueue_reappraisals(list(reappraise_ids), source="recall")
+        PendingQueue(persona_dir).enqueue_reappraisals(snippet_enqueue_ids, source="recall")
 
     return "\n".join(lines)
 

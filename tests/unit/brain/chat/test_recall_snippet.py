@@ -396,3 +396,27 @@ def test_c22_assembled_orders_by_blended_relevance(tmp_path: Path) -> None:
     # weak-match/high-importance one. Under a (-importance,-ts) merge, "beta"
     # (importance 9) would rank first — this is the discriminating assertion.
     assert 0 <= i_strong < i_weak
+
+
+def test_recon_e_no_persona_dir_branch_bumps_full_renders(tmp_path: Path) -> None:
+    """#231 reconciliation E: the legacy/no-persona_dir branch now routes its
+    FULL renders through the one door. A high-importance (full-inject) memory
+    surfaced with persona_dir omitted gets the +1.0 recall bump (enqueue
+    auto-skips because there is no persona_dir), while a snippet-rendered row on
+    that branch stays bump-free (unchanged). Pre-fix this branch bumped NOTHING,
+    so the "+1.0" delta fails against the old code."""
+    store = _store()
+    hi = _mem(store, "beacon " + ("H" * 300), importance=9.5)  # full-inject / opened
+    lo = _mem(store, "beacon low importance detail", importance=1.0)  # snippet
+    before_hi, before_lo = _rc(store, hi.id), _rc(store, lo.id)
+
+    # No persona_dir -> the legacy fallback branch.
+    block = _build_recall_block(store, "beacon")
+
+    assert ("H" * 300) in block, "hi renders in full on the legacy branch too"
+    # Full render -> the full open bump, even with no persona_dir.
+    assert _rc(store, hi.id) - before_hi == pytest.approx(1.0)
+    # Snippet render on this branch stays bump-free (recon E touches only full renders).
+    assert _rc(store, lo.id) == before_lo
+    # No queue is (or can be) written without a persona_dir.
+    assert not (tmp_path / "pending_candidates.jsonl").exists()

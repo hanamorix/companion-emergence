@@ -224,51 +224,70 @@ def _semantic_full_plus_snippet(store: MemoryStore) -> tuple[SemanticRecallResul
     return result, full_mem, snippet_mem
 
 
-def test_semantic_snippet_bump_and_enqueue_gated_off_when_snippet_mode_disabled(tmp_path: Path) -> None:
+def test_semantic_full_render_bumps_and_enqueues_when_snippet_mode_disabled(tmp_path: Path) -> None:
+    """#231 flag-off correctness (FLIPPED from the old Defect-4 gated-off test).
+
+    Pre-consolidation this test PINNED the flag-off ZERO-bump: the semantic
+    snippet tier's bump + enqueue were gated behind `SNIPPET_MODE_ENABLED`, so
+    with the flag off a "snippet"-tier row was rendered in FULL (because
+    `_recall_snippet` returns the untruncated body) yet got NO bump and NO
+    enqueue — the exact defect the `open_memory` consolidation closes. Post-fix,
+    a row rendered in full is OPENED through the one door regardless of the flag:
+    full +1.0 recall bump AND a reappraisal enqueue, on both tiers."""
     store = MemoryStore(":memory:")
     result, full_mem, snippet_mem = _semantic_full_plus_snippet(store)
+    before_full = _rc(store, full_mem.id)
     before_snip = _rc(store, snippet_mem.id)
+    PendingQueue(tmp_path).drain()
 
     with (
         patch("brain.chat.prompt.run_semantic_recall", return_value=result),
         patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False),
-        patch("brain.memory.pending.PendingQueue.enqueue_reappraisals") as mock_enqueue,
     ):
         block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
 
     assert full_mem.id in block
     assert snippet_mem.id in block
 
-    # Full-tier bump is UNCONDITIONAL (spec-mandated, unaffected by Defect
-    # 4) — still fires even with snippet mode off.
-    assert _rc(store, full_mem.id) == pytest.approx(1.0)
+    # Both rows render FULL when snippet mode is off, so BOTH get the full +1.0
+    # open bump — the snippet tier is no longer silently skipped.
+    assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)
+    assert _rc(store, snippet_mem.id) - before_snip == pytest.approx(1.0)
 
-    # Defect 4: the snippet-tier bump must NOT apply when snippet mode is off.
-    assert _rc(store, snippet_mem.id) == before_snip
-
-    # Defect 4: no reappraisal enqueue at all when snippet mode is off.
-    mock_enqueue.assert_not_called()
+    # Both are now enqueued for reappraisal (pre-fix: enqueue entirely skipped).
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids.count(full_mem.id) == 1
+    assert ids.count(snippet_mem.id) == 1
 
 
 def test_semantic_snippet_bump_and_enqueue_apply_when_snippet_mode_enabled(tmp_path: Path) -> None:
-    """Contrast case: with snippet mode ON (today's default), the snippet
-    tier DOES get bumped and enqueued — proves the Defect-4 gate only
-    changes behaviour when the flag is off, not a blanket removal."""
+    """Contrast case (prod path, flag ON): the snippet tier still gets the
+    rank-weighted fractional bump and the full tier still gets +1.0, and every
+    surfaced id is enqueued exactly once. This is a byte-identical parity guard
+    for the consolidation — outcomes here are unchanged from pre-fix; only the
+    enqueue call GROUPING changed (full ids now enqueue per-id through the door,
+    snippet ids in one batch), so this asserts the OUTCOME, not the call count."""
     store = MemoryStore(":memory:")
-    result, _full_mem, snippet_mem = _semantic_full_plus_snippet(store)
+    result, full_mem, snippet_mem = _semantic_full_plus_snippet(store)
     before_snip = _rc(store, snippet_mem.id)
+    PendingQueue(tmp_path).drain()
 
     with (
         patch("brain.chat.prompt.run_semantic_recall", return_value=result),
         patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
-        patch("brain.memory.pending.PendingQueue.enqueue_reappraisals") as mock_enqueue,
     ):
         _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
 
+    # Snippet tier: rank-weighted fractional bump (a lone snippet -> 0.8).
     assert _rc(store, snippet_mem.id) - before_snip == pytest.approx(0.8)
-    mock_enqueue.assert_called_once()
+    # Full tier: +1.0.
+    assert _rc(store, full_mem.id) == pytest.approx(1.0)
+    # Both enqueued exactly once (full via the door, snippet via the batch).
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids.count(full_mem.id) == 1
+    assert ids.count(snippet_mem.id) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -583,3 +602,38 @@ def test_lexical_full_open_no_double_bump(tmp_path: Path) -> None:
 
     # Exactly one full tick, no fractional tick stacked on top.
     assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# #231 consolidation — the FADING tier's flag-off correctness. The fading tier
+# always renders `_recall_snippet(mem, full=False)`, so when SNIPPET_MODE_ENABLED
+# is off it renders the untruncated body (a full open). Pre-consolidation its
+# bump AND enqueue were both gated behind SNIPPET_MODE_ENABLED, so a fading row
+# rendered in full got NEITHER — the exact flag-off gap the one door closes.
+# ---------------------------------------------------------------------------
+
+
+def test_fading_full_render_bumps_and_enqueues_when_snippet_mode_off(tmp_path: Path) -> None:
+    """With snippet mode OFF, a surfaced fading memory is rendered in full, so
+    it is OPENED through the one door: full +1.0 bump (not the fractional 0.8
+    rate) AND a reappraisal enqueue. Pre-fix it got zero bump and no enqueue."""
+    store, _active_mem, fading_mem = _seed_fixture(tmp_path)
+    before = _rc(store, fading_mem.id)
+    PendingQueue(tmp_path).drain()
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch(
+            "brain.chat.prompt._extract_recall_tokens",
+            return_value=["workshop", "rooftop", "Marcus"],
+        ),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False),
+    ):
+        block = _build_recall_block(store, "workshop rooftop Marcus", persona_dir=tmp_path)
+
+    assert "softened (fading" in block
+    # Full render (flag off) -> the FULL +1.0 open bump, not the fractional rate.
+    assert _rc(store, fading_mem.id) - before == pytest.approx(1.0)
+    # And enqueued for reappraisal (was skipped entirely pre-fix).
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids.count(fading_mem.id) == 1
