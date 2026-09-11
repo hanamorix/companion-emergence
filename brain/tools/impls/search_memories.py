@@ -154,7 +154,15 @@ def _semantic_top_k(
             coarse = cosine_scored[:CANDIDATE_POOL]
 
             reranker_provider = reranker_mod.build_reranker_provider()
-            width = reranker_mod.get_rerank_width(len(coarse), reranker_provider)
+            # #231-fix: calibrate on REAL candidate-pool documents (a small
+            # sample off the front of the already cosine-sorted `coarse`
+            # list) rather than a synthetic placeholder — see
+            # reranker.get_rerank_width's docstring.
+            calibration_sample = [
+                pool[mid][0].content
+                for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
+            ]
+            width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
             to_rerank = coarse[:width]
             rerank_ids = [mid for mid, _ in to_rerank]
             documents = [pool[mid][0].content for mid in rerank_ids]

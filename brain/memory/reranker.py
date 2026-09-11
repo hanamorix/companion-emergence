@@ -232,10 +232,38 @@ _MEASURE_RERANKS = 3
 _LATENCY_RECOMPUTE_INTERVAL_SECONDS = 3600.0
 
 _MEASURE_QUERY = "warm-up latency calibration query"
+
+# FALLBACK-ONLY synthetic calibration document, used only when no real
+# candidate-pool documents are available to calibrate against (see
+# CALIBRATION_SAMPLE_SIZE below for the preferred path). #231-fix: the
+# ORIGINAL version of this string was a 17-word stub ("a short
+# representative memory sentence used only to measure warm per-doc
+# cross-encoder rerank latency on this host") — a live no-AVX2 run found
+# that stub measures ~7-8ms/doc, while REAL corpus documents reranked in
+# production cost ~128ms/doc: the auto-scale throttle this feeds
+# (`get_rerank_width`) was a structural no-op because the calibration input
+# was not representative of what actually gets reranked. Sized instead to
+# match aggregate content-length stats pulled from a live production memory
+# corpus (mean ~300 chars / ~45 words, median ~175 chars / ~25 words per
+# memory) — this fallback targets the MEAN (the longer of the two), so a
+# measurement that has to fall back to it errs toward under-throttling (a
+# wider width) rather than over-throttling.
 _MEASURE_DOCUMENT = (
-    "a short representative memory sentence used only to measure warm "
-    "per-doc cross-encoder rerank latency on this host"
+    "a longer representative memory passage, sized to match a typical "
+    "corpus document rather than a short placeholder, used only to measure "
+    "warm per-document cross-encoder rerank latency realistically on this "
+    "host so the auto-scaling width calculation reflects real production "
+    "cost instead of an artificially cheap calibration figure"
 )
+
+# How many REAL candidate-pool documents callers should sample for
+# calibration when they can supply them (the preferred path — see
+# `get_rerank_width`'s `sample_documents` parameter). Small on purpose:
+# calibration runs synchronously in-band on the first recall of the process
+# (see `_warm_per_doc_latency`), and `_WARMUP_RERANKS + _MEASURE_RERANKS`
+# single-document rerank() calls already happen per measurement — sampling
+# more documents than that adds calibration latency without adding signal.
+CALIBRATION_SAMPLE_SIZE = 3
 
 # model_id -> (per_doc_seconds, measured_at_monotonic). Process-wide, mirrors
 # the provider cache above — one measurement per model_id, shared across
@@ -244,7 +272,9 @@ _latency_cache: dict[str, tuple[float, float]] = {}
 _latency_cache_lock = threading.Lock()
 
 
-def _measure_warm_per_doc_latency(provider: RerankerProvider) -> float:
+def _measure_warm_per_doc_latency(
+    provider: RerankerProvider, sample_docs: list[str] | None = None
+) -> float:
     """Time `_MEASURE_RERANKS` single-document rerank() calls AFTER
     discarding `_WARMUP_RERANKS` cold ones; return the mean seconds/doc.
 
@@ -252,20 +282,35 @@ def _measure_warm_per_doc_latency(provider: RerankerProvider) -> float:
     the width calculation multiplies this back out linearly
     (`floor(budget / per_doc)`), matching how `get_rerank_width` actually
     uses the figure.
+
+    #231-fix: `sample_docs`, when non-empty, is REAL candidate-pool document
+    content supplied by the caller (the preferred calibration input — see
+    `get_rerank_width`) and is cycled through across the warmup + measured
+    calls, one document per call, so the mean reflects real corpus document
+    length rather than always the same document. Falls back to the fixed
+    synthetic `_MEASURE_DOCUMENT` (see its own comment) only when no real
+    docs are available — e.g. a caller that hasn't threaded them through, or
+    an empty candidate pool.
     """
-    docs = [_MEASURE_DOCUMENT]
-    for _ in range(_WARMUP_RERANKS):
-        list(provider.rerank(_MEASURE_QUERY, docs))
+    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
+
+    def _doc_for(i: int) -> list[str]:
+        return [docs[i % len(docs)]]
+
+    for i in range(_WARMUP_RERANKS):
+        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
 
     samples: list[float] = []
-    for _ in range(_MEASURE_RERANKS):
+    for i in range(_MEASURE_RERANKS):
         start = time.monotonic()
-        list(provider.rerank(_MEASURE_QUERY, docs))
+        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
         samples.append(time.monotonic() - start)
     return sum(samples) / len(samples)
 
 
-def _warm_per_doc_latency(provider: RerankerProvider) -> float:
+def _warm_per_doc_latency(
+    provider: RerankerProvider, sample_docs: list[str] | None = None
+) -> float:
     """Cached warm per-doc latency for `provider`'s model_id, measuring (and
     caching) on first use or once `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` has
     elapsed since the last measurement.
@@ -273,7 +318,11 @@ def _warm_per_doc_latency(provider: RerankerProvider) -> float:
     The first semantic recall of each process pays this calibration cost
     in-band (the warmup plus measured reranks above run synchronously before
     that recall's width is known). It is cached after that first call, so
-    every later recall in the process reads the cached value instead.
+    every later recall in the process reads the cached value instead —
+    `sample_docs` passed on a later (cache-hit) call is simply ignored, same
+    as it would be if the whole function signature hadn't changed; only the
+    FIRST caller within `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` actually
+    supplies the docs a measurement uses.
 
     Fail-soft: a measurement failure (e.g. the real model errors on the
     calibration call) logs and returns 0.0 — `get_rerank_width` treats 0.0
@@ -291,7 +340,7 @@ def _warm_per_doc_latency(provider: RerankerProvider) -> float:
     # (seconds), and holding the lock across it would serialize every
     # concurrent recall behind this one measurement.
     try:
-        measured = _measure_warm_per_doc_latency(provider)
+        measured = _measure_warm_per_doc_latency(provider, sample_docs)
     except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
         log.exception("reranker: warm-latency measurement failed — width will not be latency-throttled")
         measured = 0.0
@@ -307,7 +356,11 @@ def _reset_latency_cache() -> None:
         _latency_cache.clear()
 
 
-def get_rerank_width(pool_size: int, provider: RerankerProvider) -> int:
+def get_rerank_width(
+    pool_size: int,
+    provider: RerankerProvider,
+    sample_documents: list[str] | None = None,
+) -> int:
     """How many of the (cosine-coarse-cut) candidate pool to actually rerank.
 
     `= max(1, min(pool_size, CANDIDATE_POOL, floor(LATENCY_BUDGET_SECONDS /
@@ -318,13 +371,23 @@ def get_rerank_width(pool_size: int, provider: RerankerProvider) -> int:
     is intended (not a violation) — the whole point is that the count
     adapts to the host, not to a fixed target.
 
+    `sample_documents` (#231-fix): a small sample of REAL candidate-pool
+    document content (see `CALIBRATION_SAMPLE_SIZE`), used to calibrate
+    `warm_per_doc` against actual corpus documents instead of a synthetic
+    placeholder — a fixed short stub massively under-measures real
+    cross-encoder cost, which made this auto-scaler a structural no-op (it
+    always computed a budget far in excess of `CANDIDATE_POOL`, so the min()
+    always picked `CANDIDATE_POOL` regardless of true per-doc cost). Optional
+    and purely additive: omitting it (or an empty list) falls back to the
+    original fixed-placeholder calibration, unchanged.
+
     `pool_size <= 0` returns 0 (nothing to rerank — the caller's empty-pool
     case never reaches here in practice, but this stays well-defined).
     """
     if pool_size <= 0:
         return 0
     budget = tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS)
-    per_doc = _warm_per_doc_latency(provider)
+    per_doc = _warm_per_doc_latency(provider, sample_documents)
     if per_doc <= 0.0:
         width = pool_size
     else:
