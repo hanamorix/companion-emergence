@@ -598,7 +598,8 @@ SCHEMAS: dict[str, dict] = {
         "name": "read_file",
         "description": (
             "Read a file from the user's computer. Text files return their contents; an image file "
-            "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see. When the user "
+            "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see; a PDF returns "
+            "its text, page-marked. When the user "
             "shares a file with you this turn, its path appears in their message as "
             "'[the user shared a file: <path>]' — you can read that path to see or read what they "
             "handed you. Otherwise, use this ONLY when the user explicitly asks you to read, open, or "
