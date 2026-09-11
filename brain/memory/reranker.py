@@ -220,9 +220,12 @@ def _reset_reranker_provider_cache() -> None:
 _WARMUP_RERANKS = 2
 
 # Average over this many WARM calls (post-discard) rather than trusting a
-# single sample — a lone reading can still jitter (scheduler noise, a
-# concurrent backfill tick).
-_MEASURE_RERANKS = 3
+# single sample, a lone reading can still jitter (scheduler noise, a
+# concurrent backfill tick). Must stay >= CALIBRATION_SAMPLE_SIZE below,
+# since `_doc_for`'s index restarts at 0 in each loop (warmup and measured
+# are counted separately), a measured-call count smaller than the sample
+# size would leave the tail of a wider sample never actually measured.
+_MEASURE_RERANKS = 5
 
 # Recompute the cached per-doc figure this often (startup + periodic, spec
 # point 3) rather than trusting a single boot-time measurement forever — a
@@ -257,13 +260,15 @@ _MEASURE_DOCUMENT = (
 )
 
 # How many REAL candidate-pool documents callers should sample for
-# calibration when they can supply them (the preferred path — see
-# `get_rerank_width`'s `sample_documents` parameter). Small on purpose:
-# calibration runs synchronously in-band on the first recall of the process
-# (see `_warm_per_doc_latency`), and `_WARMUP_RERANKS + _MEASURE_RERANKS`
-# single-document rerank() calls already happen per measurement — sampling
-# more documents than that adds calibration latency without adding signal.
-CALIBRATION_SAMPLE_SIZE = 3
+# calibration when they can supply them (the preferred path, see
+# `get_rerank_width`'s `sample_documents` parameter). Calibration runs
+# synchronously in-band on the first recall of the process (see
+# `_warm_per_doc_latency`), so this is a tradeoff, not a free knob: a wider
+# sample makes the measured per-doc figure more representative of the real
+# corpus, but each extra sampled document is roughly one extra rerank() call
+# added to that one-time first-recall calibration cost (kept in lockstep
+# with `_MEASURE_RERANKS` above, see its comment).
+CALIBRATION_SAMPLE_SIZE = 5
 
 # model_id -> (per_doc_seconds, measured_at_monotonic). Process-wide, mirrors
 # the provider cache above — one measurement per model_id, shared across

@@ -356,10 +356,50 @@ def test_measure_warm_per_doc_latency_cycles_through_sample_docs(
     sample_docs = ["doc-a", "doc-b"]
     _measure_warm_per_doc_latency(_RecordingProvider(), sample_docs)
 
+    total_calls = reranker_mod._WARMUP_RERANKS + reranker_mod._MEASURE_RERANKS
+    expected = [sample_docs[i % len(sample_docs)] for i in range(reranker_mod._WARMUP_RERANKS)]
+    expected += [sample_docs[i % len(sample_docs)] for i in range(reranker_mod._MEASURE_RERANKS)]
+
     assert set(calls) == {"doc-a", "doc-b"}, "both sample docs must be exercised, not just the first"
-    assert calls == ["doc-a", "doc-b", "doc-a", "doc-b", "doc-a"], (
-        "5 total calls (2 warmup + 3 measured), cycling through the 2 sample docs in order"
+    assert calls == expected, (
+        f"{total_calls} total calls ({reranker_mod._WARMUP_RERANKS} warmup + "
+        f"{reranker_mod._MEASURE_RERANKS} measured), cycling through the 2 sample docs in order"
     )
+
+
+def test_measured_calls_cover_a_full_calibration_sample_size_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 widen-to-5 regression: real callers build their sample as
+    `coarse[:CALIBRATION_SAMPLE_SIZE]`, so a sample sized exactly at
+    CALIBRATION_SAMPLE_SIZE must have EVERY one of its documents appear
+    among the MEASURED (post-warmup) rerank() calls that determine
+    warm_per_doc, not merely among the discarded warmup calls. A measured
+    count smaller than the sample size would silently leave the tail of a
+    widened sample never actually averaged over."""
+    from brain.memory.reranker import _measure_warm_per_doc_latency
+
+    measured_calls: list[str] = []
+    call_index = {"n": 0}
+
+    class _PhaseRecordingProvider(RerankerProvider):
+        def rerank(self, query: str, documents: list[str]):
+            call_index["n"] += 1
+            if call_index["n"] > reranker_mod._WARMUP_RERANKS:
+                measured_calls.extend(documents)
+            return [0.0 for _ in documents]
+
+        def model_id(self) -> str:
+            return "phase-recording-test-provider"
+
+    sample_docs = [f"doc-{i}" for i in range(reranker_mod.CALIBRATION_SAMPLE_SIZE)]
+    _measure_warm_per_doc_latency(_PhaseRecordingProvider(), sample_docs)
+
+    assert set(measured_calls) == set(sample_docs), (
+        "every document in a CALIBRATION_SAMPLE_SIZE-sized sample must be "
+        "exercised by a MEASURED call, not just by warmup"
+    )
+    assert len(measured_calls) == reranker_mod._MEASURE_RERANKS
 
 
 def test_width_with_sample_docs_is_cached_not_remeasured_every_call(
