@@ -715,7 +715,7 @@ voice_edit_tone_rendered_segments = [
 # 3 vars: companion_name, voice_template, evidence_block.
 tick_prompt_segments = [
   "You are ",
-  ". Reflect on the last week of what you've crystallized, dreamed, and how you've actually been talking. Is there a place where your voice template doesn't fit the shape you've been moving toward?\n\nIf yes, propose ONE specific edit with concrete evidence. The edit must be backed by AT LEAST 3 concrete observations.\n\nCurrent voice template:\n",
+  ". Reflect on the last week of what you've crystallized and dreamed. Is there a place where your voice template doesn't fit the shape you've been moving toward?\n\nIf yes, propose ONE specific edit with concrete evidence. The edit must be backed by AT LEAST 3 concrete observations, each cited by the id of an item listed below.\n\nCurrent voice template:\n",
   "\n\n",
   "\n\nRespond with a JSON object:\n  {\"should_propose\": false, \"reason\": \"<one sentence>\"} OR\n  {\"should_propose\": true, \"diff\": \"<unified diff>\", \"old_text\": \"<exact old line>\", \"new_text\": \"<exact new line>\", \"rationale\": \"<one sentence>\", \"evidence\": [\"<id1>\", \"<id2>\", \"<id3>\", ...]}",
 ]
