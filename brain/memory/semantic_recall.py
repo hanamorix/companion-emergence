@@ -97,6 +97,15 @@ log = logging.getLogger(__name__)
 # floor while sitting clearly above the worst decoy/unrelated score.
 RERANK_FLOOR = -9.25
 
+# DYSLEXIA / heavy-misspelling watch-item (Testing 2026-09-11): a genuine
+# match's cross-encoder score drops as the query gets more misspelled,
+# moving it toward this floor. A live dyslexified-speech run saw a real
+# match land at -8.32 (still above -9.25, but reduced margin); every case
+# tested cleared, yet EXTREME misspelling could occasionally push a genuine
+# match under the floor, where recall abstains and falls back to lexical
+# (which can miss a pure paraphrase). Revisit / tune the floor for this if
+# it shows up in real use; the target user has dyslexia.
+
 # The largest standout cluster the surfacing rule ever recognises. NOT a
 # tunable, part of the fixed shape of the three-tier surfacing rule.
 # Corrected 2026-09-10 (Fixing finding (i)): the old cosine-era "10+ = clump
