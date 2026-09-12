@@ -193,7 +193,7 @@ def test_voice_reflection_deferral_is_quiet(tmp_path: Path, caplog) -> None:
     from brain.initiate.voice_reflection import run_voice_reflection_tick
 
     with caplog.at_level(logging.INFO, logger="brain.initiate.voice_reflection"):
-        run_voice_reflection_tick(tmp_path, provider=_DeferringProvider(), crystallizations=[], dreams=[], recent_tones=[])
+        run_voice_reflection_tick(tmp_path, provider=_DeferringProvider(), crystallizations=[], dreams=[])
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
