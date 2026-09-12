@@ -23,6 +23,7 @@ once a real machine validates it.
 |---|---|---|---|
 | Windows bridge shutdown (pythonw / schtasks / `--force`) | Windows | test-verified on macOS; a Windows user confirms post-ship | 39 |
 | True Windows SCM host (vs Task Scheduler) | Windows | deferred | 38 |
+| Updater `scripts/update.sh` (#179) — bash; the bundled Windows runtime ships no bash | Windows | gap, documented; PowerShell twin tracked in #255 | — |
 | Linux x86_64 real-machine click-through (systemd `--user` install, install-shape) | Linux (Kubuntu 26.04 validator) | code shipped v0.0.15-alpha.3; awaiting manual pass | 7 |
 | systemd install test `LoadState=loaded` + `UnitFileState=enabled` assertions (#160 / #164) | Linux with a live `systemd --user` | reasoned, not executed: self-skips on macOS and on GitHub ubuntu runners; first executes on the Kubuntu validator's run | 164 |
 | Kindled-link cross-machine (peer-to-peer over a real relay) | any 2 machines | EXPERIMENTAL, unvalidated cross-machine | 51 |
