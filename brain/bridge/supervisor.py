@@ -151,6 +151,7 @@ def run_folded(
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+    vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
@@ -236,6 +237,11 @@ def run_folded(
         if compaction_interval_s is not None
         else None
     )
+    vocab_repair_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "vocab_repair_cadence.json")
+        if vocab_repair_interval_s is not None
+        else None
+    )
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
@@ -290,19 +296,7 @@ def run_folded(
     # Haiku (fail-soft — placeholders kept if provider unavailable/fails).
     # Runs adjacent to emotion backfill; independent of it (separate try/except).
     try:
-        if _vocab_repair_should_run(persona_dir):
-            from brain.memory.store import MemoryStore as _MemoryStore
-
-            db_path = persona_dir / "memories.db"
-            _store = _MemoryStore(str(db_path), integrity_check=False)
-            try:
-                _vocab_repair_run(
-                    persona_dir,
-                    store=_store,
-                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
-                )
-            finally:
-                _store.close()
+        _run_vocab_repair_tick(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("vocab repair failed during startup: %s", exc)
 
@@ -619,6 +613,26 @@ def run_folded(
                         persona_dir, "log_rotation_cadence.json", log_rotation_cadence_state
                     )
 
+            # Vocab-repair cadence (#173) — 6h default. The startup pass above
+            # only fires once per bridge start and can be throttle-deferred;
+            # this retries the placeholder-describer (and the #174 variant
+            # merge) on a persisted wall-clock cadence. Cheap when nothing is
+            # pending: should_run is a file scan, no provider is built.
+            if vocab_repair_cadence_state is not None and persisted_cadence.is_due(
+                vocab_repair_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_vocab_repair_tick(persona_dir)
+                except Exception:
+                    logger.exception("supervisor vocab-repair tick raised")
+                finally:
+                    vocab_repair_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=vocab_repair_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "vocab_repair_cadence.json", vocab_repair_cadence_state
+                    )
+
             # Initiate review cadence — mirrors soul_review. Per-pass cost cap
             # (3 candidates max). Fault-isolated.
             if initiate_review_cadence_state is not None and persisted_cadence.is_due(
@@ -780,6 +794,27 @@ def run_folded(
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _run_vocab_repair_tick(persona_dir: Path) -> None:
+    """Repair emotion_vocabulary.json if it has placeholder or variant-twin entries (#173/#174).
+
+    Shared by the startup one-shot and the 6h cadence. Builds the Haiku-tier
+    provider only when there is something to describe.
+    """
+    if not _vocab_repair_should_run(persona_dir):
+        return
+    from brain.memory.store import MemoryStore as _MemoryStore
+
+    _store = _MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        _vocab_repair_run(
+            persona_dir,
+            store=_store,
+            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
+        )
+    finally:
+        _store.close()
 
 
 def _run_maker_tick(persona_dir, *, store, provider):

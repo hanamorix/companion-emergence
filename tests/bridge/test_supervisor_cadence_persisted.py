@@ -378,3 +378,43 @@ def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
     assert calls[0] >= 1, "persisted past-due log rotation must fire on a fresh process"
     saved = json.loads((_cadence_dir(persona_dir) / "log_rotation_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
+
+
+def test_vocab_repair_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#173: the placeholder-describer runs on a persisted cadence, not only at startup."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / "vocab_repair_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        if calls[0] >= 2:  # 1st = startup one-shot; 2nd = the persisted cadence
+            stop.set()
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_vocab_repair_tick", _counter)
+
+    watchdog = threading.Timer(10.0, stop.set)  # failure-path ceiling only (#210)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        vocab_repair_interval_s=6 * 3600.0,
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 2, "persisted past-due vocab repair must fire beyond the startup pass"
+    saved = json.loads((_cadence_dir(persona_dir) / "vocab_repair_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)

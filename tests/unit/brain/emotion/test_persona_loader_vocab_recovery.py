@@ -83,3 +83,49 @@ def test_existing_file_heals_referenced_unregistered_emotion(tmp_path: Path):
     finally:
         store.close()
         _cleanup_emotion("warmth")
+
+
+def test_heal_mints_canonical_name_for_variant_memory_key(tmp_path: Path):
+    """#174: a memory keyed 'present-ness' heals as 'present_ness', not a hyphen twin."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"present-ness": 8.0},
+            )
+        )
+        _cleanup_emotion("present_ness")
+
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        names = {e["name"] for e in json.loads(vocab_path.read_text())["emotions"]}
+        assert names == {"present_ness"}
+        assert vocabulary.get("present-ness") is not None
+    finally:
+        store.close()
+        _cleanup_emotion("present_ness")
+
+
+def test_reconstruct_mints_canonical_names(tmp_path: Path):
+    """#174: reconstruct_vocabulary_from_memories collapses variant keys to one entry."""
+    from brain.health.reconstruct import reconstruct_vocabulary_from_memories
+
+    store = MemoryStore(":memory:")
+    try:
+        for key in ("love_grief_blend", "grief-love_blend"):
+            store.create(
+                Memory.create_new(
+                    content="x", memory_type="conversation", domain="us", emotions={key: 8.0}
+                )
+            )
+        data = reconstruct_vocabulary_from_memories(store)
+        ext = [e["name"] for e in data["emotions"] if e["category"] == "persona_extension"]
+        assert ext == ["grief_love_blend"]
+    finally:
+        store.close()
