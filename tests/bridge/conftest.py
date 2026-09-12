@@ -25,6 +25,22 @@ def persona_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _claude_workdir_in_tmp(tmp_path: Path, monkeypatch):
+    """#122: build_app's lifespan resolves the claude spawn cwd; keep it under tmp_path."""
+    from brain.bridge import provider as _provider
+
+    t = tmp_path / "claude-tmp"
+    t.mkdir(exist_ok=True)
+    monkeypatch.setattr(_provider.tempfile, "gettempdir", lambda: str(t))
+    # The second candidate is <KINDLED_HOME>/claude-work: keep it under tmp_path as well so
+    # no bridge test can create a directory in the developer's/CI's real data dir.
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "kindled-home"))
+    _provider._claude_work_dir_reset_for_tests()
+    yield
+    _provider._claude_work_dir_reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _reset_session_registry():
     """Clear the in-memory session registry between bridge tests."""
     from brain.chat.session import reset_registry

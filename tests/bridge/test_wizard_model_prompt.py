@@ -11,7 +11,7 @@ from brain import cli
 
 
 def _run_init(monkeypatch, tmp_path: Path, argv: list[str], inputs: list[str] | None = None) -> int:
-    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))  # #122: KINDLED_HOME is the current key; the bridge conftest sets it too
     if inputs is not None:
         it = iter(inputs)
         monkeypatch.setattr("builtins.input", lambda *a, **kw: next(it))
