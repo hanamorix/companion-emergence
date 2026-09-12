@@ -28,14 +28,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.body.session_hours import (
+    compute_active_session_hours as _active_session_hours,  # noqa: F401
+)
+
 # Re-export the canonical helper so existing call sites in this module
 # (and any external imports of the private name) keep working. The
 # function moved to brain.body.session_hours so brain.tools.dispatch can
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
-from brain.body.session_hours import (
-    compute_active_session_hours as _active_session_hours,  # noqa: F401
-)
+from brain.bridge import provider_auth
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "connection": _build_connection(persona_dir),
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
+        # #246: True while the brain's CLI login is expired (bridge-process state).
+        "provider_auth_expired": provider_auth.state()["status"] == "expired",
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
     }

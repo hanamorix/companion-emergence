@@ -144,6 +144,10 @@ export interface PersonaState {
    *  Cleared on the next supervisor tick — banner is naturally short-lived.
    *  Optional so older bridge builds without the field degrade gracefully. */
   felt_time_recovered?: boolean;
+  /** #246: True while the brain's Claude CLI login is expired (bridge-process
+   *  state). The app shows the re-authorise offer while this is true.
+   *  Optional so older bridge builds without the field degrade gracefully. */
+  provider_auth_expired?: boolean;
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the

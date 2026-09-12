@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from brain import tunables
+from brain.bridge import provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -494,13 +495,19 @@ def _cli_error_detail(payload: dict) -> str | None:
     graceful path at each call site.
     """
     if not payload.get("is_error"):
+        provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
         return None
     if payload.get("subtype") == "error_max_budget_usd" or any(
         "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
     ):
         return None
     detail = str(payload.get("result") or "").strip()
-    return detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+    detail = detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+    # #246: every is_error frame on every path passes through here — the one place
+    # an auth-expired text can be classified without enumerating raise sites.
+    # ponytail: side-effect in a formatter, chosen so no site can be missed (#119 lesson).
+    provider_auth.note_cli_failure(detail)
+    return detail
 
 
 def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
@@ -513,6 +520,12 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     ``exit 1:`` lines. Prefer the structured result when present, then fall
     back to stderr/stdout snippets.
     """
+    detail = _claude_failure_detail_text(result)
+    provider_auth.note_cli_failure(detail)  # #246: every exit!=0 text passes through here
+    return detail
+
+
+def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str:
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
     if stdout:
@@ -589,6 +602,11 @@ class ClaudeCliProvider(LLMProvider):
         system: str | None = None,
         persona_dir: Path | None = None,
     ) -> str:
+        # #246: every background LLM call funnels through generate() (engines call it;
+        # initiate's complete() delegates to it). While the login is expired, defer all
+        # but one probe per interval so the autonomic layer stops spawning failing CLIs.
+        if provider_auth.should_skip_background():
+            raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
         # Prompt piped via stdin; system prompt via --system-prompt-file.
         # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
         # limit — WinError 206). See _system_prompt_tempfile for context.
@@ -1118,6 +1136,8 @@ class ClaudeCliProvider(LLMProvider):
                     rc = proc.wait()
                     if rc != 0:
                         stderr_text = proc.stderr.read() if proc.stderr else ""
+                        # #246: the one exit!=0 site that bypasses _claude_failure_detail.
+                        provider_auth.note_cli_failure(stderr_text)
                         yield StreamError(
                             stage="claude_cli_exit",
                             detail=f"exit {rc}: {stderr_text[:200]}",

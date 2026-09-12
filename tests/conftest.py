@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge import cli_throttle
+from brain.bridge import cli_throttle, provider_auth
 from brain.chat import pass2_queue
 
 
@@ -21,8 +21,10 @@ def _reset_cli_throttle() -> Iterator[None]:
     to be gated when the test expects them to fire.
     """
     cli_throttle.reset()
+    provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
     yield
     cli_throttle.reset()
+    provider_auth.reset()
 
 
 @pytest.fixture(autouse=True)
