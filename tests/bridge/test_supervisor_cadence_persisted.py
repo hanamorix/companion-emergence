@@ -16,6 +16,10 @@ import pytest
 
 from brain.bridge.supervisor import run_folded
 
+# #210: every test below stops the loop from inside its counted callback, so this is only a
+# ceiling for the failure path. 2 s was too tight for the windows-latest runner under load.
+_WATCHDOG_S = 10.0
+
 
 def _cadence_dir(persona_dir: Path) -> Path:
     """#178: cadence state lives under <persona>/cadence/."""
@@ -72,7 +76,7 @@ def test_finalize_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_finalize_tick", _counter)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -120,7 +124,7 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _counter)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -157,7 +161,7 @@ def test_voice_reflection_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_voice_reflection_tick", _counter)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -200,7 +204,7 @@ def test_cadence_advances_even_when_tick_raises(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_finalize_tick", _raiser)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -246,7 +250,7 @@ def test_maintenance_advances_even_when_forgetting_raises(
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _raiser)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -281,7 +285,7 @@ def test_disabled_cadence_writes_no_state_file(
         lambda *a, **k: stop.set(),
     )
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -318,7 +322,7 @@ def test_initiate_review_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_initiate_review_tick", _counter)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -356,7 +360,7 @@ def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_log_rotation_tick", _counter)
 
-    watchdog = threading.Timer(2.0, stop.set)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
     watchdog.start()
     run_folded(
         stop,
@@ -374,3 +378,43 @@ def test_log_rotation_fires_from_persisted_due_time_on_fresh_process(
     assert calls[0] >= 1, "persisted past-due log rotation must fire on a fresh process"
     saved = json.loads((_cadence_dir(persona_dir) / "log_rotation_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
+
+
+def test_vocab_repair_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#173: the placeholder-describer runs on a persisted cadence, not only at startup."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / "vocab_repair_cadence.json").write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    calls = [0]
+    stop = threading.Event()
+
+    def _counter(*a, **k):
+        calls[0] += 1
+        if calls[0] >= 2:  # 1st = startup one-shot; 2nd = the persisted cadence
+            stop.set()
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_vocab_repair_tick", _counter)
+
+    watchdog = threading.Timer(10.0, stop.set)  # failure-path ceiling only (#210)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        vocab_repair_interval_s=6 * 3600.0,
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 2, "persisted past-due vocab repair must fire beyond the startup pass"
+    saved = json.loads((_cadence_dir(persona_dir) / "vocab_repair_cadence.json").read_text())
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)

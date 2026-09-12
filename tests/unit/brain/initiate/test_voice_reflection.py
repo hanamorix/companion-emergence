@@ -40,7 +40,6 @@ def test_voice_reflection_emits_candidate_when_evidence_strong(
         provider=_evidence_provider(emit=True),
         crystallizations=[{"id": "c1", "ts": "2026-05-08T00:00:00+00:00"}],
         dreams=[{"id": "d1", "ts": "2026-05-09T00:00:00+00:00"}],
-        recent_tones=[{"id": "t1", "ts": "2026-05-10T00:00:00+00:00"}],
     )
     candidates = read_candidates(persona_dir)
     assert len(candidates) == 1
@@ -59,7 +58,6 @@ def test_voice_reflection_skips_when_evidence_thin(tmp_path: Path) -> None:
         provider=_evidence_provider(emit=False),
         crystallizations=[],
         dreams=[],
-        recent_tones=[],
     )
     assert read_candidates(persona_dir) == []
 
@@ -87,7 +85,6 @@ def test_voice_reflection_requires_at_least_3_evidence_pieces(
         provider=provider,
         crystallizations=[],
         dreams=[],
-        recent_tones=[],
     )
     assert read_candidates(persona_dir) == []
 
@@ -108,10 +105,38 @@ def test_run_voice_reflection_tick_uses_companion_name_not_nell(tmp_path: Path) 
         provider=provider,
         crystallizations=[],
         dreams=[],
-        recent_tones=[],
         companion_name="Mira",
     )
 
     assert captured, "provider.complete was not called"
     assert "Mira" in captured[0]
     assert "Nell" not in captured[0]
+
+
+def test_voice_reflection_prompt_carries_evidence_text(tmp_path: Path) -> None:
+    """#202: the model must see what was crystallized / dreamed, not only ids and timestamps."""
+    persona_dir = tmp_path / "p"
+    persona_dir.mkdir()
+    provider = _evidence_provider(emit=False)
+    run_voice_reflection_tick(
+        persona_dir,
+        provider=provider,
+        crystallizations=[
+            {"id": "c1", "ts": "2026-09-01T00:00:00+00:00", "text": "the kitchen light left on"}
+        ],
+        dreams=[{"id": "d1", "ts": "2026-09-02T00:00:00+00:00", "text": "the sailor kept the boat"}],
+    )
+    prompt = provider.complete.call_args.args[0]
+    assert "the kitchen light left on" in prompt
+    assert "the sailor kept the boat" in prompt
+    assert "message tones" not in prompt.lower()
+
+
+def test_voice_reflection_no_longer_accepts_recent_tones(tmp_path: Path) -> None:
+    import pytest
+
+    with pytest.raises(TypeError):
+        run_voice_reflection_tick(
+            tmp_path, provider=_evidence_provider(emit=False),
+            crystallizations=[], dreams=[], recent_tones=[],
+        )

@@ -1034,8 +1034,10 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     persona_dir = _persona_dir(tmp_path)
     bus = EventBus()
     stop = threading.Event()
+    fired = threading.Event()
 
     def fake_sweep(**kwargs):
+        fired.set()
         raise RuntimeError("boom")
 
     def runner():
@@ -1056,7 +1058,8 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-    time.sleep(0.3)
+    # #210: wait for the tick itself rather than a fixed 0.3 s window (flaked on windows-latest).
+    assert fired.wait(timeout=5.0), "interest sweep tick never ran"
     stop.set()
     t.join(timeout=5.0)
     assert not t.is_alive(), "supervisor loop must not die from a tick exception"

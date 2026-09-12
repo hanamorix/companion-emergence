@@ -235,10 +235,15 @@ def test_startup_repair_sites_unchanged(tmp_path):
     anchor = "while not stop_event.is_set():"
     assert anchor in source
     prefix = source.split(anchor, 1)[0]
-    assert prefix.count("integrity_check=False") == 2
-    assert "_vocab_repair_should_run(persona_dir)" in prefix
+    # #173: the vocab-repair open moved into _run_vocab_repair_tick (shared by the
+    # startup pass and the 6h cadence); the soul-candidate open is still inline.
+    assert prefix.count("integrity_check=False") == 1
+    assert "_run_vocab_repair_tick(persona_dir)" in prefix
     assert "_soul_candidate_repair_should_run(persona_dir)" in prefix
     assert 'MemoryStore(str(db_path), integrity_check=False)' in prefix
+    tick_src = source.split("def _run_vocab_repair_tick", 1)[1].split("\ndef ", 1)[0]
+    assert "_vocab_repair_should_run(persona_dir)" in tick_src
+    assert "integrity_check=False" in tick_src
 
 
 # ---------------------------------------------------------------------------

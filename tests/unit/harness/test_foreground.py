@@ -76,6 +76,32 @@ def test_boot_and_verify_poll_mode_picks_up_fresh_ready(tmp_path: Path) -> None:
     assert session.ready_payload == {"brain_repo": "y"}
 
 
+def test_boot_and_verify_poll_mode_tolerates_partial_ready_write(tmp_path: Path) -> None:
+    """#215: a READY seen mid-write (empty / not yet valid JSON) must be re-polled, not decode-failed.
+
+    Under full-suite load the poll can observe the file after create but before the JSON body
+    lands. The poll should keep waiting (within its timeout) until the file parses.
+    """
+    import threading
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ready_path = run_dir / "READY"
+
+    def _two_step_write() -> None:
+        time.sleep(0.1)
+        ready_path.write_text("", encoding="utf-8")  # created, body not yet written
+        time.sleep(0.3)
+        _write_ready(run_dir, {"brain_repo": "z"})
+
+    threading.Thread(target=_two_step_write, daemon=True).start()
+    spec = fg.ArmBootSpec(arm="B", port=8933, run_dir=run_dir, ready_timeout=5.0)
+
+    session = fg.boot_and_verify(spec, boot_cmd=None)
+
+    assert session.ready_payload == {"brain_repo": "z"}
+
+
 def test_boot_and_verify_poll_mode_ignores_stale_ready(tmp_path: Path) -> None:
     """N3: a READY predating the poll start must be ignored, not read as a false confirmation."""
     run_dir = tmp_path / "run"

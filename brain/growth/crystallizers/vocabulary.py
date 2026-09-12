@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from brain.emotion.vocabulary import canonical_name
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import Memory, MemoryStore
 
@@ -39,16 +40,16 @@ def crystallize_vocabulary(
     returns at most one proposal per tick, matching the growth rate limit.
     """
     clusters = _cluster_active_memories(store.list_active())
-    current_names = {name.lower() for name in current_vocabulary_names}
+    current_names = {canonical_name(name) for name in current_vocabulary_names}
 
     proposals: list[EmotionProposal] = []
     for cluster in sorted(clusters.values(), key=_cluster_rank, reverse=True):
         if len(cluster.memories) < _MIN_EVIDENCE_MEMORIES:
             continue
         first, second = cluster.display_order
-        name = f"{first}_{second}_blend"
-        # #174: the reversed spelling names the same configuration.
-        if name in current_names or f"{second}_{first}_blend" in current_names:
+        # #174: mint the canonical spelling so a reversed pair can never be a new name.
+        name = canonical_name(f"{first}_{second}_blend")
+        if name in current_names:
             continue
         evidence = tuple(mem.id for mem in sorted(cluster.memories, key=lambda m: m.created_at))[
             :_MAX_EVIDENCE_MEMORIES

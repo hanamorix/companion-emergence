@@ -452,7 +452,6 @@ def test_voice_reflection_defers_when_chat_active(tmp_path):
         provider=provider,
         crystallizations=[],
         dreams=[],
-        recent_tones=[],
         companion_name="Nell",
     )
 

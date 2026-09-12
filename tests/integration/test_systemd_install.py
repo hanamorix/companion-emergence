@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,27 @@ def _systemd_user_available() -> bool:
         return False
 
 
+def _poll_unit_property(
+    prop: str, want: str, *, budget_s: float = 5.0
+) -> subprocess.CompletedProcess[str]:
+    """Poll ``systemctl --user show -p <prop>`` until it equals ``want`` or the budget lapses.
+
+    Returns the last CompletedProcess either way so the caller's assert carries stderr.
+    """
+    deadline = time.monotonic() + budget_s
+    while True:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", prop, "--value", "companion-emergence-ci_test"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.stdout.strip() == want or time.monotonic() >= deadline:
+            return result
+        time.sleep(0.2)
+
+
+@pytest.mark.integration
 def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
     """Round-trip: install → assert unit file + systemd loaded it → uninstall."""
     if not _systemd_user_available():
@@ -128,20 +150,9 @@ def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
         #    reports "failed", a slow one is still "activating" — which is the
         #    intermittent failure in #160. Bridge boot-success is a different
         #    subject with different preconditions; it is not this test's claim.
-        load_state = subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "show",
-                "-p",
-                "LoadState",
-                "--value",
-                "companion-emergence-ci_test",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        #    (#220) Under full-suite load the manager can still be absorbing the
+        #    daemon-reload when we first ask, so poll briefly instead of asserting once.
+        load_state = _poll_unit_property("LoadState", "loaded")
         assert load_state.stdout.strip() == "loaded", (
             "systemd did not load the installed unit; "
             f"LoadState={load_state.stdout.strip()!r} stderr={load_state.stderr!r}"

@@ -16,7 +16,7 @@ Decay half-lives per spec Section 10.1:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
@@ -125,9 +125,26 @@ _BASELINE: tuple[Emotion, ...] = (
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 
 
+_BLEND_SUFFIX = "_blend"
+
+
+def canonical_name(name: str) -> str:
+    """Collapse spelling variants of one emotion channel to a single key (#174).
+
+    Lowercase, hyphens to underscores, surrounding whitespace dropped. A
+    two-part ``<a>_<b>_blend`` name has its parts sorted so ``love_grief_blend``
+    and ``grief_love_blend`` are the same channel.
+    """
+    key = name.strip().lower().replace("-", "_")
+    if key.endswith(_BLEND_SUFFIX):
+        parts = key[: -len(_BLEND_SUFFIX)].split("_")
+        key = "_".join(sorted(parts)) + _BLEND_SUFFIX
+    return key
+
+
 def get(name: str) -> Emotion | None:
-    """Return the Emotion with the given name, or None if unknown."""
-    return _REGISTRY.get(name)
+    """Return the Emotion with the given name (any spelling variant), or None."""
+    return _REGISTRY.get(canonical_name(name))
 
 
 def list_all() -> list[Emotion]:
@@ -145,9 +162,12 @@ def register(emotion: Emotion) -> None:
 
     Raises ValueError if an emotion with the same name is already registered.
     """
-    if emotion.name in _REGISTRY:
+    key = canonical_name(emotion.name)
+    if key in _REGISTRY:
         raise ValueError(f"Emotion {emotion.name!r} already registered")
-    _REGISTRY[emotion.name] = emotion
+    if key != emotion.name:
+        emotion = replace(emotion, name=key)
+    _REGISTRY[key] = emotion
 
 
 def _unregister(name: str) -> None:
@@ -155,4 +175,4 @@ def _unregister(name: str) -> None:
 
     The framework does not support runtime removal of vocabulary entries.
     """
-    _REGISTRY.pop(name, None)
+    _REGISTRY.pop(canonical_name(name), None)

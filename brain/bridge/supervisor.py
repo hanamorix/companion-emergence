@@ -155,6 +155,7 @@ def run_folded(
     compaction_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
+    vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
@@ -262,6 +263,11 @@ def run_folded(
         if clustering_interval_s is not None
         else None
     )
+    vocab_repair_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "vocab_repair_cadence.json")
+        if vocab_repair_interval_s is not None
+        else None
+    )
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
@@ -316,19 +322,7 @@ def run_folded(
     # Haiku (fail-soft — placeholders kept if provider unavailable/fails).
     # Runs adjacent to emotion backfill; independent of it (separate try/except).
     try:
-        if _vocab_repair_should_run(persona_dir):
-            from brain.memory.store import MemoryStore as _MemoryStore
-
-            db_path = persona_dir / "memories.db"
-            _store = _MemoryStore(str(db_path), integrity_check=False)
-            try:
-                _vocab_repair_run(
-                    persona_dir,
-                    store=_store,
-                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
-                )
-            finally:
-                _store.close()
+        _run_vocab_repair_tick(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("vocab repair failed during startup: %s", exc)
 
@@ -690,6 +684,26 @@ def run_folded(
                         persona_dir, "clustering_cadence.json", clustering_cadence_state
                     )
 
+            # Vocab-repair cadence (#173) — 6h default. The startup pass above
+            # only fires once per bridge start and can be throttle-deferred;
+            # this retries the placeholder-describer (and the #174 variant
+            # merge) on a persisted wall-clock cadence. Cheap when nothing is
+            # pending: should_run is a file scan, no provider is built.
+            if vocab_repair_cadence_state is not None and persisted_cadence.is_due(
+                vocab_repair_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_vocab_repair_tick(persona_dir)
+                except Exception:
+                    logger.exception("supervisor vocab-repair tick raised")
+                finally:
+                    vocab_repair_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=vocab_repair_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "vocab_repair_cadence.json", vocab_repair_cadence_state
+                    )
+
             # Initiate review cadence — mirrors soul_review. Per-pass cost cap
             # (3 candidates max). Fault-isolated.
             if initiate_review_cadence_state is not None and persisted_cadence.is_due(
@@ -851,6 +865,27 @@ def run_folded(
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _run_vocab_repair_tick(persona_dir: Path) -> None:
+    """Repair emotion_vocabulary.json if it has placeholder or variant-twin entries (#173/#174).
+
+    Shared by the startup one-shot and the 6h cadence. Builds the Haiku-tier
+    provider only when there is something to describe.
+    """
+    if not _vocab_repair_should_run(persona_dir):
+        return
+    from brain.memory.store import MemoryStore as _MemoryStore
+
+    _store = _MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        _vocab_repair_run(
+            persona_dir,
+            store=_store,
+            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
+        )
+    finally:
+        _store.close()
 
 
 def _run_maker_tick(persona_dir, *, store, provider):
@@ -2060,22 +2095,21 @@ def _run_voice_reflection_tick(
 ) -> None:
     """Gather inputs and invoke run_voice_reflection_tick.
 
-    Reads the last 7 days of crystallizations (from SoulStore), dreams
-    (from ``dreams.log.jsonl``), and recent message tones (placeholder
-    for v0.0.9 — empty list until the chat-turn tone schema lands).
+    Reads the last 7 days of crystallizations (from SoulStore) and dream
+    memories (from memories.db), each with a short text excerpt so the
+    reflection can ground its evidence (#202). The message-tone stream that
+    used to sit alongside them was a permanent ``[]`` placeholder; retired.
     Publishes a ``voice_reflection_tick`` event on success.
     """
     from brain.initiate.voice_reflection import run_voice_reflection_tick
 
     crystallizations = _read_recent_crystallizations(persona_dir, days=7)
     dreams = _read_recent_dreams(persona_dir, days=7)
-    recent_tones = _read_recent_message_tones(persona_dir, days=7)
     run_voice_reflection_tick(
         persona_dir,
         provider=provider,
         crystallizations=crystallizations,
         dreams=dreams,
-        recent_tones=recent_tones,
         companion_name=persona_dir.name,
     )
     event_bus.publish(
@@ -2086,12 +2120,14 @@ def _run_voice_reflection_tick(
     )
 
 
-def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent crystallization summaries from SoulStore.
+_VOICE_EVIDENCE_CHARS = 160
 
-    Returns a list of ``{"id": ..., "ts": iso8601}`` dicts for
-    crystallizations created within the last ``days`` days. Failures
-    swallowed — reflection still fires with whatever evidence exists.
+
+def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
+    """Recent crystallizations as ``{"id", "ts", "text"}`` (#202: text, not just ids).
+
+    ``text`` is the moment plus why it matters, capped. Failures swallowed —
+    reflection still fires with whatever evidence exists.
     """
     from brain.soul.store import SoulStore
 
@@ -2103,7 +2139,8 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
             for c in store.list_active():
                 ts = c.crystallized_at.isoformat()
                 if ts >= cutoff:
-                    out.append({"id": c.id, "ts": ts})
+                    text = f"{c.moment} — {c.why_it_matters}".strip(" —")
+                    out.append({"id": c.id, "ts": ts, "text": text[:_VOICE_EVIDENCE_CHARS]})
             return out
         finally:
             store.close()
@@ -2112,36 +2149,36 @@ def _read_recent_crystallizations(persona_dir: Path, days: int) -> list[dict]:
 
 
 def _read_recent_dreams(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent dream entries from ``dreams.log.jsonl``."""
-    from brain.health.jsonl_reader import iter_jsonl_streaming
+    """Recent dream memories as ``{"id", "ts", "text"}`` (#202).
 
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    out: list[dict] = []
+    Reads ``memory_type="dream"`` rows from memories.db rather than
+    ``dreams.log.jsonl``: the log carries ids only (no text) and its
+    ``timestamp`` field never matched the ``at``/``ts`` keys the old reader
+    looked for, so dreams were silently absent from the evidence.
+    """
+    from brain.memory.store import MemoryStore
+
+    cutoff = datetime.now(UTC) - timedelta(days=days)
     try:
-        for raw in iter_jsonl_streaming(persona_dir / "dreams.log.jsonl"):
-            ts = raw.get("at") or raw.get("ts")
-            if ts and ts >= cutoff:
-                out.append({"id": raw.get("dream_id") or raw.get("id"), "ts": ts})
+        store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+        try:
+            out: list[dict] = []
+            for mem in store.list_by_type("dream", limit=50):
+                if mem.created_at >= cutoff:
+                    out.append(
+                        {
+                            "id": mem.id,
+                            "ts": mem.created_at.isoformat(),
+                            "text": mem.content[:_VOICE_EVIDENCE_CHARS],
+                        }
+                    )
+            return out
+        finally:
+            store.close()
     except Exception:
         return []
-    return out
 
 
-def _read_recent_message_tones(persona_dir: Path, days: int) -> list[dict]:
-    """Read recent Nell-authored chat turn tones — placeholder for v0.0.9.
-
-    Real implementation requires schema on the chat-turn log we don't
-    currently have. For v0.0.9, return an empty list; voice reflection
-    still fires but with less material. Revisit when chat-turn tone
-    tracking is added.
-    """
-    return []
-
-
-# Per-log retention policies. Bake the cadence-tick policies here so the
-# supervisor doesn't need a config file; defaults reflect Hana's 2026-05-11
-# decisions (5 MB rolling cap; 3 archives for heartbeats, 5 for dreams +
-# emotion_growth; yearly archive for soul_audit kept forever).
 _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("heartbeats.log.jsonl", 3),
     ("dreams.log.jsonl", 5),
@@ -2166,6 +2203,7 @@ _YEARLY_ARCHIVE_LOGS: tuple[tuple[str, str], ...] = (
     ("initiate_audit.jsonl", "ts"),
 )
 _DEFAULT_ROLLING_BYTES = 5 * 1024 * 1024  # 5 MB
+
 
 
 def _run_log_rotation_tick(

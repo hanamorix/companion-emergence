@@ -25,7 +25,7 @@ def reconstruct_vocabulary_from_memories(store: MemoryStore) -> dict:
     seen_names: set[str] = set()
     for mem in store.list_active(limit=None):
         for name in mem.emotions:
-            seen_names.add(name)
+            seen_names.add(_vocabulary.canonical_name(name))  # #174
 
     entries: list[dict] = []
     # Framework baseline always — these are immutable identity.
