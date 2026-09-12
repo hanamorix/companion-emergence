@@ -320,4 +320,80 @@ describe("App brain-login banner", () => {
     await waitFor(() => expect(screen.getByText("● bridge down")).toBeInTheDocument());
     expect(screen.queryByText("● live")).not.toBeInTheDocument();
   });
+
+  // ── #246: bridge-reported auth expiry ────────────────────────────────────────
+  const expiredState = (expired: boolean) => ({
+    persona: "nell",
+    emotions: {},
+    body: null,
+    interior: { dream: null, research: null, heartbeat: null, reflex: null },
+    soul_highlight: null,
+    connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+    mode: "live" as const,
+    recovering: false,
+    felt_time_recovered: false,
+    provider_auth_expired: expired,
+  });
+
+  it("C8: cold open into an expired bridge shows the offer even when the login probe later says authorized", async () => {
+    let resolveProbe: (v: { authorized: boolean }) => void = () => undefined;
+    brainLoginStatus.mockReturnValue(
+      new Promise<{ authorized: boolean }>((res) => {
+        resolveProbe = res;
+      }),
+    );
+    fetchPersonaState.mockResolvedValue(expiredState(true));
+
+    render(<App />);
+
+    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    await waitFor(() => expect(brainLoginStatus).toHaveBeenCalled());
+    // the Rust probe resolves AFTER the first poll — must not hide the bridge's flag
+    resolveProbe({ authorized: true });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /authorize/i })).toBeInTheDocument(),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("button", { name: /authorize/i })).toBeInTheDocument();
+  });
+
+  it("C14: the bridge flag alone re-arms a dismissed offer on false→true and hides it on true→false", async () => {
+    const { fireEvent } = await import("@testing-library/react");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      brainLoginStatus.mockResolvedValue({ authorized: true }); // the Rust probe is happy throughout
+      fetchPersonaState
+        .mockResolvedValueOnce(expiredState(true)) // poll 1: expired → offer
+        .mockResolvedValueOnce(expiredState(true)) // poll 2: still expired → stays dismissed, no remount
+        .mockResolvedValueOnce(expiredState(false)) // poll 3: recovered
+        .mockResolvedValueOnce(expiredState(true)) // poll 4: expired again → re-armed
+        .mockResolvedValue(expiredState(false)); // poll 5+: recovered → hides without a click
+
+      render(<App />);
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: /not now/i })).toBeInTheDocument(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /not now/i }));
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: /authorize/i })).not.toBeInTheDocument(),
+      );
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 2
+      await new Promise((r) => setTimeout(r, 20));
+      expect(screen.queryByRole("button", { name: /authorize/i })).not.toBeInTheDocument();
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 3 (false)
+      await vi.advanceTimersByTimeAsync(5000); // poll 4 (true) → re-armed
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: /authorize/i })).toBeInTheDocument(),
+      );
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 5 (false) → hidden by derivation
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: /authorize/i })).not.toBeInTheDocument(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

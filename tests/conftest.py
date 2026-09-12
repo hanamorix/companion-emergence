@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge import cli_throttle
+from brain.bridge import cli_throttle, provider_auth
 from brain.chat import pass2_queue
 
 
@@ -21,8 +21,10 @@ def _reset_cli_throttle() -> Iterator[None]:
     to be gated when the test expects them to fire.
     """
     cli_throttle.reset()
+    provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
     yield
     cli_throttle.reset()
+    provider_auth.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +60,119 @@ def _reset_pass2_queue() -> Iterator[None]:
     pass2_queue.reset()
     yield
     pass2_queue.reset()
+
+
+@pytest.fixture(autouse=True)
+def _fake_embedding_provider_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force brain.memory.embeddings.build_embedding_provider() to the
+    deterministic, offline FakeEmbeddingProvider for the whole suite by
+    default.
+
+    build_embedding_provider() is the PRODUCTION default (FastEmbedProvider —
+    a real local ONNX model, downloaded once over the network into a shared
+    cache dir). Every brain/bridge/{server,supervisor,daemon}.py call site
+    that used to hardcode FakeEmbeddingProvider(dim=256) directly now goes
+    through build_embedding_cache()/build_embedding_provider() (Stage 1 of
+    the local semantic-retrieval build), so ANY test that exercises those
+    code paths — even indirectly, via a background thread the test itself
+    never awaits — would otherwise attempt a real model download: slow,
+    network-dependent, and (seen while landing this fixture) capable of
+    retrying for minutes past the test's own teardown in a now-deleted tmp
+    dir. A test that genuinely needs the real provider opts out with
+    `@pytest.mark.requires_network`.
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import embeddings
+
+    monkeypatch.setattr(
+        embeddings, "build_embedding_provider", lambda: embeddings.FakeEmbeddingProvider(dim=256)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_provider_cache() -> Iterator[None]:
+    """Reset embeddings.build_embedding_provider()'s process-level provider
+    cache before and after each test.
+
+    Most tests never touch this cache at all — the fake-provider override
+    above replaces build_embedding_provider() wholesale (cache included), so
+    the fake path never reads or writes it. But a couple of tests in
+    test_embeddings.py import `build_embedding_provider` by NAME and call the
+    real function directly to exercise its own model_tier wiring, which
+    bypasses that monkeypatch entirely (the import binds the original
+    function object before any fixture runs). Without this reset, whichever
+    such test ran first would cache a provider that a later one — expecting
+    to build its own, under its own patched tmp_path / stubbed TextEmbedding
+    — would get served back instead.
+    """
+    from brain.memory import embeddings
+
+    embeddings._reset_embedding_provider_cache()
+    yield
+    embeddings._reset_embedding_provider_cache()
+
+
+@pytest.fixture(autouse=True)
+def _fake_reranker_provider_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force brain.memory.reranker.build_reranker_provider() to the
+    deterministic, offline FakeRerankerProvider for the whole suite by
+    default (#231 offline-test discipline, mirrors
+    `_fake_embedding_provider_by_default` above).
+
+    build_reranker_provider() is the PRODUCTION default (CrossEncoderProvider
+    — a real local ONNX cross-encoder model, downloaded once over the
+    network into a shared cache dir). Any test that exercises
+    run_semantic_recall / search_memories(mode="semantic") — even
+    indirectly — would otherwise attempt a real model download. A test that
+    genuinely needs the real provider opts out with
+    `@pytest.mark.requires_network`.
+
+    FakeRerankerProvider defaults every UNSCRIPTED document to a score far
+    below any plausible RERANK_FLOOR (see that class's docstring) — so a
+    test that never scripts reranker scores gets the same "semantic
+    inconclusive -> lexical fallback" behavior it would have gotten from an
+    empty/orthogonal cosine result pre-#231, rather than an arbitrary
+    reranker score accidentally clearing the floor. Tests that need a
+    CONCLUSIVE reranked result construct their own
+    `FakeRerankerProvider(scores={...})` and monkeypatch this function
+    directly, mirroring how `_ScriptedProvider` overrides the embedding
+    fixture above for the same reason.
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import reranker
+
+    # Both consuming call sites (brain.memory.semantic_recall,
+    # brain.tools.impls.search_memories) import the module itself
+    # (`from brain.memory import reranker as reranker_mod`) and call
+    # `reranker_mod.build_reranker_provider()` — a dynamic attribute lookup
+    # at call time, exactly like embeddings.build_embedding_cache's
+    # same-module call to build_embedding_provider() — so patching this ONE
+    # module attribute is sufficient to intercept every call site.
+    monkeypatch.setattr(
+        reranker, "build_reranker_provider", lambda: reranker.FakeRerankerProvider()
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_reranker_provider_cache() -> Iterator[None]:
+    """Reset reranker.build_reranker_provider()'s process-level provider
+    cache before and after each test — mirrors
+    `_reset_embedding_provider_cache` above for the same reason (a test that
+    calls the REAL `build_reranker_provider()` directly must not read or
+    leak a provider a prior/later test's call happened to cache)."""
+    from brain.memory import reranker
+
+    reranker._reset_reranker_provider_cache()
+    reranker._reset_latency_cache()
+    yield
+    reranker._reset_reranker_provider_cache()
+    reranker._reset_latency_cache()
 
 
 @pytest.fixture(scope="session")

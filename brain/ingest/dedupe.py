@@ -58,9 +58,13 @@ def is_duplicate(
     try:
         # Snapshot existing rows BEFORE computing the candidate embedding so we
         # don't accidentally compare the text against itself if get_or_compute
-        # adds it to the cache during this call.
+        # adds it to the cache during this call. Scoped to THIS cache's own
+        # model_id — a row left over from a prior provider (e.g. a stale
+        # 256-dim FakeEmbeddingProvider vector under a real 384-dim model) is
+        # a different vector space and must never enter a cosine comparison.
         existing_rows = embeddings._conn.execute(  # noqa: SLF001
-            "SELECT vector, dim FROM embedding_cache"
+            "SELECT vector, dim FROM embedding_cache WHERE model_id = ?",
+            (embeddings.model_id,),
         ).fetchall()
 
         if not existing_rows:

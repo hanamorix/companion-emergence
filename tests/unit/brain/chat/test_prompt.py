@@ -1162,6 +1162,42 @@ def test_build_recall_block_no_not_recognised_when_all_found(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# _build_recall_block — semantic recall fail-soft defense-in-depth
+# ---------------------------------------------------------------------------
+
+
+def test_build_recall_block_falls_back_to_lexical_when_semantic_recall_raises(tmp_path: Path):
+    """Regression test: run_semantic_recall's own body already wraps itself
+    fail-soft (see tests/unit/brain/memory/test_semantic_recall.py), but
+    _build_recall_block must NOT depend solely on that callee's internal
+    safety net — this proves the CALLER-side try/except around the
+    run_semantic_recall call also does its job. Simulates the callee raising
+    despite its own guard (bypassing it entirely via a patched replacement)
+    and asserts the block still comes back as the normal lexical/blend
+    recall output, exactly as if semantic recall had returned an
+    inconclusive None -- chat composition must never break."""
+    from unittest.mock import patch
+
+    from brain.chat.prompt import _build_recall_block
+    from brain.memory.store import Memory, MemoryStore
+
+    store = MemoryStore(":memory:")
+    seeded = Memory.create_new("some memory about marcus", "event", "d")
+    store.create(seeded)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", side_effect=RuntimeError("simulated semantic failure")),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["Marcus"]),
+    ):
+        block = _build_recall_block(store, "Who is Marcus?", persona_dir=tmp_path)
+    store.close()
+
+    assert block.strip() != "", "a semantic-recall exception must not break recall entirely"
+    assert seeded.id in block, "the lexical fallback must still surface the real hit"
+    assert "not recognised" not in block
+
+
+# ---------------------------------------------------------------------------
 # Epistemic instruction injection
 # ---------------------------------------------------------------------------
 

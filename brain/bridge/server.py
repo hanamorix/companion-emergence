@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import prompt_strings, tunables
-from brain.bridge import events
+from brain.bridge import events, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -73,7 +73,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
@@ -488,10 +488,7 @@ def _close_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return close_session(
             persona_dir,
@@ -523,10 +520,7 @@ def _snapshot_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return extract_session_snapshot(
             persona_dir,
@@ -570,6 +564,12 @@ _STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds",
 
 def _stream_keepalive_seconds() -> float:
     return tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS)
+
+
+def _chat_error_code(exc: BaseException) -> str:
+    """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
+    failing call's own text is an auth failure, else the generic ``provider_failed``."""
+    return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
 
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
@@ -677,10 +677,7 @@ def _drain_sessions_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
         return snapshot_stale_sessions(
             persona_dir,
@@ -1260,6 +1257,9 @@ def build_app(
             "health_error": health_error,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
+            # #246: the brain's CLI login state — "expired" means background LLM
+            # calls are backed off and the app should offer re-authorisation.
+            "provider_auth": provider_auth.state(),
         }
 
     @app.post(
@@ -1349,9 +1349,7 @@ def build_app(
                     stack.callback(store.close)
                     hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
                     stack.callback(hebbian.close)
-                    embeddings = EmbeddingCache(
-                        s.persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256)
-                    )
+                    embeddings = build_embedding_cache(s.persona_dir)
                     stack.callback(embeddings.close)
                     new_sid = perform_rollover(
                         s.persona_dir, stale_sid, s.persona,
@@ -2581,7 +2579,8 @@ def build_app(
                 # Audit 2026-05-07 P3-2: keep detailed exception text in
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
-                raise HTTPException(status_code=502, detail="provider_failed") from exc
+                # #246: classified from THIS call's text, never from global state.
+                raise HTTPException(status_code=502, detail=_chat_error_code(exc)) from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -2772,11 +2771,11 @@ def build_app(
 
             try:
                 result = await respond_task
-            except Exception:
+            except Exception as exc:
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
                 # full exception text stays in the log only.
-                await ws.send_json({"type": "error", "code": "provider_failed", "done": True})
+                await ws.send_json({"type": "error", "code": _chat_error_code(exc), "done": True})
                 await ws.close()
                 return
 

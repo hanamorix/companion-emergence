@@ -83,3 +83,29 @@ def test_is_duplicate_returns_false_when_similarity_below_threshold(
     # With deterministic hash-based vectors for completely different texts,
     # similarity should be well below 0.88.
     assert result is False
+
+
+def test_is_duplicate_ignores_rows_from_a_different_model_id(
+    store: MemoryStore, tmp_path
+) -> None:
+    """The model_id swap-staleness guard reaches dedupe's raw scan too: a
+    vector cached under a DIFFERENT provider/model_id (e.g. left over from a
+    prior FakeEmbeddingProvider dim, or a stale non-production model) must
+    never enter the cosine comparison, even though it shares a content_hash-
+    scoped table with the current provider's rows."""
+    db_path = tmp_path / "embeddings.db"
+    text = "Nell loves writing and spending time with Hana"
+
+    # Seed a row under an OLD provider/model_id for this exact text.
+    old_cache = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=64))
+    old_cache.get_or_compute(text)
+    old_cache.close()
+
+    # A cache opened with a DIFFERENT provider (different model_id) must not
+    # see that row as a match, even for the identical text — same as
+    # get_or_compute's own guard, but exercised through is_duplicate's raw
+    # SELECT ... WHERE model_id = ? scan.
+    new_cache = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=128))
+    result = is_duplicate(text, store=store, threshold=DEFAULT_DEDUP_THRESHOLD, embeddings=new_cache)
+    new_cache.close()
+    assert result is False

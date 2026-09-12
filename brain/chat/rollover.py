@@ -267,11 +267,21 @@ def maybe_weekly_rollover(
     if is_session_busy is not None and is_session_busy(session_id):
         return None
 
-    return perform_rollover(
+    new_sid = perform_rollover(
         persona_dir, session_id, persona_name,
         seed_mode="tiers_plus_tail", now=now, provider=provider,
         store=store, hebbian=hebbian, embeddings=embeddings, config=config,
     )
+
+    # #231 RERANKER RE-ARCHITECTURE (2026-09-10): the Stage-4 per-persona
+    # semantic floor/gap recalibration pass that used to run here (spec
+    # decision 5's "Calibration" bullet, brain/memory/semantic_calibration.py)
+    # is REMOVED — the cold red-team proved deriving a cosine floor/gap from
+    # the corpus's own inter-memory spread doesn't generalize. Replaced by a
+    # cross-encoder reranker + a FIXED floor (brain/memory/semantic_recall.
+    # RERANK_FLOOR), which needs no per-persona recalibration pass at all.
+
+    return new_sid
 
 
 def _ts_span(raw: list[dict]) -> tuple[datetime | None, datetime | None]:

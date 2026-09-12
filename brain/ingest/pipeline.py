@@ -237,8 +237,28 @@ def close_session(
         # Back-fill the committed memory's vector into the dedupe cache so that
         # a held-buffer retry (and any future pass) recognises it as a duplicate
         # and skips it — closes the retry-double-commit gap (A1).
+        #
+        # FAIL SOFT (Stage 2 hardening): now that `embeddings` is backed by a
+        # real local model (FastEmbedProvider), a no-network / retries-
+        # exhausted / corrupt-model-cache box can raise here. This call is
+        # off the message hot path (this function runs via asyncio.to_thread),
+        # but a raise here would still crash the whole ingest pipeline mid-
+        # commit — the memory is already durably written by commit_item()
+        # above, only its vector would be missing. The embedding backfill
+        # (brain/memory/embedding_backfill.py) picks up any row left without
+        # a current-model vector on its next idle tick, so a swallowed error
+        # here is a deferred retry, not a lost embedding. Mirrors is_duplicate's
+        # own fail-soft posture (brain/ingest/dedupe.py).
         if embeddings is not None:
-            embeddings.get_or_compute(item.text)
+            try:
+                embeddings.get_or_compute(item.text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embeddings.get_or_compute failed for committed memory %s "
+                    "(embedding backfill will retry): %s",
+                    mem_id,
+                    exc,
+                )
 
         # SOUL
         if item.importance >= crystallize_threshold:
@@ -422,8 +442,28 @@ def extract_session_snapshot(
         # Back-fill the committed memory's vector into the dedupe cache so that
         # a held-buffer retry (and any future pass) recognises it as a duplicate
         # and skips it — closes the retry-double-commit gap (A1).
+        #
+        # FAIL SOFT (Stage 2 hardening): now that `embeddings` is backed by a
+        # real local model (FastEmbedProvider), a no-network / retries-
+        # exhausted / corrupt-model-cache box can raise here. This call is
+        # off the message hot path (this function runs via asyncio.to_thread),
+        # but a raise here would still crash the whole ingest pipeline mid-
+        # commit — the memory is already durably written by commit_item()
+        # above, only its vector would be missing. The embedding backfill
+        # (brain/memory/embedding_backfill.py) picks up any row left without
+        # a current-model vector on its next idle tick, so a swallowed error
+        # here is a deferred retry, not a lost embedding. Mirrors is_duplicate's
+        # own fail-soft posture (brain/ingest/dedupe.py).
         if embeddings is not None:
-            embeddings.get_or_compute(item.text)
+            try:
+                embeddings.get_or_compute(item.text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embeddings.get_or_compute failed for committed memory %s "
+                    "(embedding backfill will retry): %s",
+                    mem_id,
+                    exc,
+                )
 
         if item.importance >= crystallize_threshold:
             queued = queue_soul_candidate(
