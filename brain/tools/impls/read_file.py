@@ -22,6 +22,9 @@ _FILE_IMAGE_TYPES = tunables.register(
     "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"]
 )
 _FILE_IMAGE_MAX_BYTES = tunables.register("files.image_max_bytes", 20 * 1024 * 1024)
+# #126: PDFs are read as extracted text (pypdf, pure-Python). Cap matches /upload.
+_FILE_PDF_MAX_BYTES = tunables.register("files.pdf_max_bytes", 20 * 1024 * 1024)
+_PDF_MAGIC = b"%PDF-"
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
 
@@ -36,6 +39,94 @@ def _image_types() -> list:
 
 def _image_max_bytes() -> int:
     return tunables.get_tunable("files.image_max_bytes", _FILE_IMAGE_MAX_BYTES)
+
+
+def _pdf_max_bytes() -> int:
+    return tunables.get_tunable("files.pdf_max_bytes", _FILE_PDF_MAX_BYTES)
+
+
+def _window_lines(
+    lines: list[str], *, max_lines: int | None, offset: int
+) -> tuple[str, int, int, bool]:
+    """Apply the ranged-read / head-cap policy shared by text and PDF reads.
+
+    Returns (sliced_text, start, window_len, truncated).
+    """
+    total = len(lines)
+    start = max(0, int(offset or 0))
+    if max_lines is not None:
+        window = lines[start : start + max(0, int(max_lines))]
+        truncated = (start + len(window)) < total or start > 0
+    elif total > _DEFAULT_HEAD_LINES:
+        window = lines[:_DEFAULT_HEAD_LINES]
+        truncated = True
+    else:
+        window = lines[start:] if start else lines
+        truncated = start > 0
+    return "".join(window), start, len(window), truncated
+
+
+def _read_pdf(
+    p: Path, *, raw: str, persona_dir: Path, max_lines: int | None, offset: int
+) -> dict:
+    """#126: return a PDF's text layer, page-marked and windowed like a text file.
+
+    No text layer (scan / image-only) -> an honest note with the page count.
+    Any pypdf failure -> fail-soft error dict. Page rendering is out of scope.
+    """
+    size = p.stat().st_size
+    cap = _pdf_max_bytes()
+    if size > cap:
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=False, error="too large")
+        return {"error": f"PDF too large ({size} bytes > {cap} cap) — not shown"}
+
+    _dedup_key = os.path.normcase(os.path.realpath(str(p)))
+    if _read_cache.seen_recently(_dedup_key):
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
+        return {
+            "path": str(p),
+            "deduped": True,
+            "note": "you already read this file moments ago this turn — its content is above.",
+        }
+    _read_cache.mark(_dedup_key)
+
+    try:
+        from pypdf import PdfReader  # noqa: PLC0415 — only imported on the PDF path
+
+        reader = PdfReader(str(p))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")  # owner-password-only PDFs open with the empty user password
+            except Exception:  # noqa: BLE001
+                pass
+        page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:  # noqa: BLE001
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=False, error=f"pdf: {exc}")
+        return {"error": f"could not read PDF: {exc}"}
+
+    pages = len(page_texts)
+    if not any(page_texts):
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True, error="pdf: no text layer")
+        return {
+            "path": str(p),
+            "pages": pages,
+            "note": f"PDF has no extractable text ({pages} page(s) — scanned or image-only); not shown",
+        }
+
+    joined = "".join(
+        (f"--- page {i} ---\n" if i > 1 else "") + text + "\n" for i, text in enumerate(page_texts, 1)
+    )
+    lines = joined.splitlines(keepends=True)
+    sliced, start, window_len, truncated = _window_lines(lines, max_lines=max_lines, offset=offset)
+    _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
+    out: dict = {"path": str(p), "content": sliced, "pages": pages, "total_lines": len(lines)}
+    if truncated:
+        out["truncated"] = True
+        out["note"] = (
+            f"showing lines {start}-{start + window_len} of {len(lines)} across {pages} page(s); "
+            "pass offset/max_lines to read more"
+        )
+    return out
 
 
 def _suggest(target: Path) -> list[str]:
@@ -199,6 +290,11 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             result["stored_image"] = stored_image
         return result
 
+    # PDF branch (#126) — also BEFORE the text cap: a PDF is binary-large but
+    # text-small, same cap-ordering reasoning as the image branch above.
+    if _prefix.startswith(_PDF_MAGIC):
+        return _read_pdf(p, raw=raw, persona_dir=persona_dir, max_lines=max_lines, offset=offset)
+
     cap = _file_read_max_bytes()
     size = p.stat().st_size
     if size > cap:
@@ -246,23 +342,15 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
 
         lines = content.splitlines(keepends=True)
         total = len(lines)
-        start = max(0, int(offset or 0))
-        if max_lines is not None:
-            window = lines[start:start + max(0, int(max_lines))]
-            truncated = (start + len(window)) < total or start > 0
-        elif total > _DEFAULT_HEAD_LINES:
-            window = lines[:_DEFAULT_HEAD_LINES]
-            truncated = True
-        else:
-            window = lines[start:] if start else lines
-            truncated = start > 0
-        sliced = "".join(window)
+        sliced, start, window_len, truncated = _window_lines(
+            lines, max_lines=max_lines, offset=offset
+        )
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
         out: dict = {"path": str(p), "content": sliced, "total_lines": total}
         if truncated:
             out["truncated"] = True
             out["note"] = (
-                f"showing lines {start}-{start + len(window)} of {total}; "
+                f"showing lines {start}-{start + window_len} of {total}; "
                 "pass offset/max_lines to read more"
             )
         return out

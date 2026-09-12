@@ -18,6 +18,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "tzdata>=2024.1",
+    "pypdf>=6",
 ]
 
 [project.optional-dependencies]
