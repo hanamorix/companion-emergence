@@ -963,6 +963,10 @@ def _heartbeat_and_felt_time(
     heartbeat_result = None
     try:
         heartbeat_result = _run_heartbeat_tick(persona_dir, provider, event_bus)
+    except cli_throttle.ThrottleDeferred as exc:
+        # #246 belt: every deferral should be caught inside the engine; one that
+        # escapes is a wiring bug worth a WARNING (no traceback), never silence.
+        logger.warning("supervisor heartbeat tick deferred at the belt: %s", exc)
     except Exception:
         logger.exception("supervisor heartbeat tick raised")
     try:

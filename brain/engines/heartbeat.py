@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
     TIER_BACKGROUND_GENERATIVE,
@@ -577,9 +578,13 @@ class HeartbeatEngine:
         if not dry_run and self._should_emit_memory(
             config, dream_id, edges_pruned, memories_decayed
         ):
-            heartbeat_memory_id = self._emit_heartbeat_memory(
-                elapsed_seconds, memories_decayed, edges_pruned, dream_id, persona_dir
-            )
+            try:
+                heartbeat_memory_id = self._emit_heartbeat_memory(
+                    elapsed_seconds, memories_decayed, edges_pruned, dream_id, persona_dir
+                )
+            except ThrottleDeferred as exc:
+                # #246: the memory is optional; the state save below is not.
+                logger.info("heartbeat memory deferred this tick: %s", exc)
 
         # Compute pending alarms (always, before writing audit log).
         pending_alarms_count = len(compute_pending_alarms(persona_dir))
@@ -747,6 +752,18 @@ class HeartbeatEngine:
             dream_result = dream_engine.run_cycle()
         except NoSeedAvailable:
             return None
+        except ThrottleDeferred as exc:
+            # #246: provider login expired (or slot denied) — the dream is skipped
+            # quietly and, crucially, the tick still reaches state.save below.
+            logger.info("dream deferred this tick: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            # #248: a failed dream must not abort the tick — an overdue dream is
+            # retried every tick, and each abort skipped state.save so emotion
+            # decay was re-applied over the whole growing window next tick.
+            logger.warning("dream failed this tick; tick continues: %.200s", exc)
+            logger.debug("dream failure traceback", exc_info=True)
+            return None
         finally:
             soul_store.close()
         return dream_result.memory.id if dream_result.memory is not None else None
@@ -777,6 +794,11 @@ class HeartbeatEngine:
         )
         try:
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        except ThrottleDeferred as exc:
+            # #246: a deferred provider is not an engine crash — no reflex_error,
+            # no WARNING; the success shape so the audit row reads "nothing fired".
+            logger.info("reflex tick deferred: %s", exc)
+            return ((), 0, None)
         except Exception as exc:
             # Fault-isolate reflex failures from the heartbeat tick per spec §7:
             # a misbehaving arc/provider must not abort decay, dream-gate, or
@@ -929,6 +951,9 @@ class HeartbeatEngine:
                 cooldown_hours=config.research_cooldown_hours_per_interest,
             )
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
+        except ThrottleDeferred as exc:
+            logger.info("research tick deferred: %s", exc)  # #246
+            return (None, "auth_deferred")
         except Exception as exc:
             logger.warning("research tick raised; isolating: %.200s", exc)
             return (None, "research_raised")

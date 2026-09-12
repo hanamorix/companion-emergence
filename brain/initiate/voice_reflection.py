@@ -73,6 +73,9 @@ def run_voice_reflection_tick(
         try:
             raw = provider.complete(prompt).strip()
             parsed = json.loads(raw)
+        except cli_throttle.ThrottleDeferred as exc:
+            logger.info("voice reflection deferred: %s", exc)  # #246: not a failure
+            return
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning("voice reflection LLM output unparseable: %s", exc)
             return

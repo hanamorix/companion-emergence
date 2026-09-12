@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   brainLoginStatus,
@@ -343,6 +343,22 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [brainPromptDismissed, setBrainPromptDismissed] = useState(false);
   const restartBridge = useRestartBridge(persona, state?.mode ?? "live");
 
+  // #246: the bridge reports an expired CLI login via /persona/state. The offer
+  // is DERIVED from that flag OR the Rust probe — never written into
+  // brainAuthorized, so a probe that resolves "authorized" after the first poll
+  // cannot hide it (cold-open race). The only write here is re-arming a
+  // dismissed offer when the flag transitions false→true.
+  const providerAuthExpired = state?.provider_auth_expired === true;
+  const prevAuthExpiredRef = useRef(false);
+  useEffect(() => {
+    if (providerAuthExpired && !prevAuthExpiredRef.current) {
+      setBrainPromptDismissed(false);
+    }
+    prevAuthExpiredRef.current = providerAuthExpired;
+  }, [providerAuthExpired]);
+  const showLoginPrompt =
+    (brainAuthorized === false || providerAuthExpired) && !brainPromptDismissed;
+
   // #172: the login step is claude-code specific. Probe only once the
   // persona's state reports provider === "claude-cli", or when the state
   // poll has failed (bridge unreachable — keep the offer reachable rather
@@ -514,7 +530,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
             ))}
           </div>
         )}
-        {brainAuthorized === false && !brainPromptDismissed && (
+        {showLoginPrompt && (
           <div
             data-testid="brain-login-banner"
             style={{

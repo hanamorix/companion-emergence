@@ -7,6 +7,13 @@
  * act on; pass everything else through unchanged.
  */
 export function friendlyChatError(raw: string): string {
+  if (/auth_expired/i.test(raw)) {
+    // #246: the brain's own Claude login lapsed — a re-login, not a reinstall.
+    return (
+      "Your companion's Claude login has expired. Re-authorise from the " +
+      "connection panel (the bridge restarts itself afterwards)."
+    );
+  }
   if (/provider_failed/i.test(raw)) {
     return (
       "Your companion couldn't reach Claude. Make sure Claude Code is installed " +
