@@ -112,3 +112,36 @@ def test_paths_all_iterates_multiple_personas(tmp_path):
     # Both persona names should appear in the output
     assert "alpha" in result.stdout
     assert "beta" in result.stdout
+
+
+def test_paths_reports_install_location(tmp_path):
+    """#179: an updater needs the CODE location, not just persona data."""
+    _setup_persona(tmp_path)
+    result = _nell(tmp_path, "paths", "--json")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["install_root"]["path"]).is_dir()
+    assert Path(payload["brain_package"]["path"]).name == "brain"
+    # Running from the source tree (uv run), so the kind is "source".
+    assert payload["install_kind"]["path"] == "source"
+
+
+def test_paths_single_key_install_kind(tmp_path):
+    _setup_persona(tmp_path)
+    result = _nell(tmp_path, "paths", "install_kind")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "source"
+
+
+def test_install_kind_detects_bundled(monkeypatch, tmp_path):
+    """Unit: no pyproject.toml next to the package → bundled."""
+    import brain
+    from brain.cli import _install_kind
+
+    pkg = tmp_path / "site-packages" / "brain"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(pkg / "__init__.py"))
+    assert _install_kind() == "bundled"
+    (tmp_path / "site-packages" / "pyproject.toml").write_text("", encoding="utf-8")
+    assert _install_kind() == "source"
