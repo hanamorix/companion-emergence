@@ -685,3 +685,51 @@ def test_fading_full_render_bumps_and_enqueues_when_snippet_mode_off(tmp_path: P
     # And enqueued for reappraisal (was skipped entirely pre-fix).
     ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
     assert ids.count(fading_mem.id) == 1
+
+
+# ---------------------------------------------------------------------------
+# #231 crash-safety (Roy's ruling 2026-09-12): the batched reappraisal flush now
+# lives in a `finally`, so full-open ids collected before a mid-pass exception
+# are STILL enqueued (>= the pre-consolidation per-id-immediate crash safety),
+# and the exception still propagates unchanged. Pre-fix (1e2edee5) the flush ran
+# AFTER the collection, not in a finally, so a mid-pass raise dropped the
+# collected ids -- the assertion below fails against that code.
+# ---------------------------------------------------------------------------
+
+
+def test_finally_flushes_collected_full_open_ids_on_mid_pass_exception(tmp_path: Path) -> None:
+    """Inject an exception mid-pass AFTER a full-open id is collected (the
+    lexical full-open loop has already appended it to `full_open_ids`) but
+    BEFORE the normal flush point, by making the downstream fractional-bump
+    call raise. The `finally` must still enqueue the collected full-open id,
+    and the original exception must propagate unchanged. Against the pre-fix
+    code (flush after collection, no finally) the id is lost and this fails."""
+    store = MemoryStore(":memory:")
+    full_mem, snippet_mem = _seed_lexical_full_and_snippet(store)
+    PendingQueue(tmp_path).drain()
+
+    boom = RuntimeError("mid-pass failure after full-open collection")
+
+    # `_snippet_bump_amount` is only reached in the bump loops, and the lexical
+    # full-open loop (which appends full_mem.id to `full_open_ids`) runs BEFORE
+    # the fractional snippet loop that first calls it -- so raising here lands
+    # after the id is collected, before the flush.
+    def _raise(*_a, **_k):
+        raise boom
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+        patch("brain.chat.prompt._snippet_bump_amount", side_effect=_raise),
+    ):
+        with pytest.raises(RuntimeError) as excinfo:
+            _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    # The mid-pass exception propagated unchanged (finally did not swallow it).
+    assert excinfo.value is boom
+
+    # The full-open id collected before the raise was STILL enqueued by the
+    # finally. Pre-fix this drain is empty (flush was skipped by the raise).
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert full_mem.id in ids

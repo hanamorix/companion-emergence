@@ -1281,109 +1281,97 @@ def _build_recall_block(
     # function, restoring the pre-consolidation (4c916b24) batched write
     # instead of one file-lock/open/append per full-open id (#231 follow-up).
     full_open_ids: list[str] = []
-
-    # ACTIVE-selection fork (Stage-3 Defect-3 fix) — the ONLY thing semantic
-    # conclusiveness decides. Conclusive → option-4 semantic surfacing
-    # (`_render_semantic_active_lines`: its own bump/enqueue, Defect-4
-    # gated). Inconclusive → today's lexical active selection, rendered and
-    # bumped exactly as before this fix (the CHANGE-1 block further down,
-    # now explicitly scoped to `semantic_result is None`).
-    if semantic_result is not None:
-        active_lines = _render_semantic_active_lines(
-            store,
-            semantic_result,
-            persona_dir=persona_dir,
-            seen=seen,
-            pending_ids=full_open_ids,
-        )
-        has_active = has_semantic_active
-    else:
-        has_active = bool(active_top)
-        active_lines = []
-        if active_top:
-            active_lines.append("  active:")
-            for mem in active_top:
-                snippet = _recall_snippet(mem, full=mem.id in full_ids)
-                active_lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
-
-    lines = ["recall"]
-    if SNIPPET_MODE_ENABLED and has_active:
-        lines.insert(0, _RECALL_SNIPPET_INVITATION)
-
-    lines.extend(active_lines)
-
-    if fading_top:
-        lines.append("  softened (fading; original detail gone):")
-        for mem in fading_top:
-            snippet = _recall_snippet(mem, full=False)
-            lines.append(f'    - "{_peer_attributed(mem, snippet)}"  [state: fading]')
-
-    if lost_top:
-        lines.append("  lost (no longer in active memory):")
-        for entry in lost_top:
-            summary = (entry.get("summary") or "").strip()
-            lost_max_chars = snippet_length(len(summary))
-            if len(summary) > lost_max_chars:
-                summary = summary[: lost_max_chars - 1].rstrip() + "…"
-            reason = entry.get("graveyard_reason", "forgotten")
-            lines.append(f'    - "{_peer_attributed(entry, summary)}"  [forgotten — {reason}]')
-
-    if unfamiliar:
-        lines.append("  not recognised (searched; no memory found):")
-        for token in unfamiliar:
-            lines.append(f"    - {token}")
-
-    # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
-    # The render-loop rule replaces the old scattered per-tier gating: a row
-    # rendered in FULL goes through the one door (`open_memory`: +1.0,
-    # deliberate=False, per-id enqueue when persona_dir is set), a genuine
-    # snippet takes the rank-weighted fractional bump and is folded into one
-    # batched enqueue. `seen` (created before the active-selection fork and
-    # already threaded through the semantic tier) dedups every id across every
-    # tier this turn, so a memory opened once is bumped/enqueued once.
-    #
-    # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open
-    # ids -> +1.0, snippet/fading ids -> the identical fractional-by-rank amount,
-    # and the enqueue SET is unchanged (every surfaced id once). The only
-    # intended deltas are on the flag-OFF path, which now becomes correct by
-    # construction: a fading/semantic-snippet row rendered full (because snippet
-    # mode is off) is bumped and enqueued through the door instead of being
-    # silently skipped.
     snippet_enqueue_ids: list[str] = []
 
-    # FADING tier renders on EVERY branch, always `_recall_snippet(mem,
-    # full=False)`, so `rendered_full` here is exactly `not SNIPPET_MODE_ENABLED`.
-    # The rank index advances per fading_top position even when an id is skipped
-    # (dedup), so a skip never renumbers later ranks — preserved from the
-    # pre-consolidation loop.
-    n_fade = len(fading_top)
-    for i, mem in enumerate(fading_top):
-        if mem.id in seen:
-            continue  # defensive: already opened this turn (e.g. a semantic id)
-        if SNIPPET_MODE_ENABLED:
-            seen.add(mem.id)
-            store.bump_recall(mem.id, _snippet_bump_amount(i, n_fade))
-            snippet_enqueue_ids.append(mem.id)
-        else:
-            open_memory(
-                mem,
-                store=store,
+    # Crash-safety (#231): the batched reappraisal flushes for this pass live
+    # in a `finally` so ids collected before a mid-pass exception are still
+    # enqueued. The pre-consolidation code enqueued each id immediately as it
+    # surfaced, so it was crash-safe; batching the writes (4c916b24 follow-up)
+    # reopened a drop-on-exception window that this closes. The finally only
+    # guarantees the flush: it never swallows or alters a propagating exception.
+    try:
+        # ACTIVE-selection fork (Stage-3 Defect-3 fix) — the ONLY thing semantic
+        # conclusiveness decides. Conclusive → option-4 semantic surfacing
+        # (`_render_semantic_active_lines`: its own bump/enqueue, Defect-4
+        # gated). Inconclusive → today's lexical active selection, rendered and
+        # bumped exactly as before this fix (the CHANGE-1 block further down,
+        # now explicitly scoped to `semantic_result is None`).
+        if semantic_result is not None:
+            active_lines = _render_semantic_active_lines(
+                store,
+                semantic_result,
                 persona_dir=persona_dir,
-                deliberate=False,
                 seen=seen,
                 pending_ids=full_open_ids,
             )
+            has_active = has_semantic_active
+        else:
+            has_active = bool(active_top)
+            active_lines = []
+            if active_top:
+                active_lines.append("  active:")
+                for mem in active_top:
+                    snippet = _recall_snippet(mem, full=mem.id in full_ids)
+                    active_lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
-    # LEXICAL active tier is surfaced under "active:" ONLY on the inconclusive
-    # branch (on a conclusive turn active_top is computed for the always-run
-    # fading/lost machinery but never rendered, so it must not be bumped — the
-    # semantic branch issues its own opens inside `_render_semantic_active_lines`).
-    if semantic_result is None:
-        # Full-open rows (importance `full_ids`, or every active row when
-        # snippet mode is off) -> the one door. Runs BEFORE the fractional loop
-        # so those ids are already in `seen`.
-        for mem in active_top:
-            if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
+        lines = ["recall"]
+        if SNIPPET_MODE_ENABLED and has_active:
+            lines.insert(0, _RECALL_SNIPPET_INVITATION)
+
+        lines.extend(active_lines)
+
+        if fading_top:
+            lines.append("  softened (fading; original detail gone):")
+            for mem in fading_top:
+                snippet = _recall_snippet(mem, full=False)
+                lines.append(f'    - "{_peer_attributed(mem, snippet)}"  [state: fading]')
+
+        if lost_top:
+            lines.append("  lost (no longer in active memory):")
+            for entry in lost_top:
+                summary = (entry.get("summary") or "").strip()
+                lost_max_chars = snippet_length(len(summary))
+                if len(summary) > lost_max_chars:
+                    summary = summary[: lost_max_chars - 1].rstrip() + "…"
+                reason = entry.get("graveyard_reason", "forgotten")
+                lines.append(f'    - "{_peer_attributed(entry, summary)}"  [forgotten — {reason}]')
+
+        if unfamiliar:
+            lines.append("  not recognised (searched; no memory found):")
+            for token in unfamiliar:
+                lines.append(f"    - {token}")
+
+        # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
+        # The render-loop rule replaces the old scattered per-tier gating: a row
+        # rendered in FULL goes through the one door (`open_memory`: +1.0,
+        # deliberate=False, per-id enqueue when persona_dir is set), a genuine
+        # snippet takes the rank-weighted fractional bump and is folded into one
+        # batched enqueue. `seen` (created before the active-selection fork and
+        # already threaded through the semantic tier) dedups every id across every
+        # tier this turn, so a memory opened once is bumped/enqueued once.
+        #
+        # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open
+        # ids -> +1.0, snippet/fading ids -> the identical fractional-by-rank amount,
+        # and the enqueue SET is unchanged (every surfaced id once). The only
+        # intended deltas are on the flag-OFF path, which now becomes correct by
+        # construction: a fading/semantic-snippet row rendered full (because snippet
+        # mode is off) is bumped and enqueued through the door instead of being
+        # silently skipped.
+
+        # FADING tier renders on EVERY branch, always `_recall_snippet(mem,
+        # full=False)`, so `rendered_full` here is exactly `not SNIPPET_MODE_ENABLED`.
+        # The rank index advances per fading_top position even when an id is skipped
+        # (dedup), so a skip never renumbers later ranks — preserved from the
+        # pre-consolidation loop.
+        n_fade = len(fading_top)
+        for i, mem in enumerate(fading_top):
+            if mem.id in seen:
+                continue  # defensive: already opened this turn (e.g. a semantic id)
+            if SNIPPET_MODE_ENABLED:
+                seen.add(mem.id)
+                store.bump_recall(mem.id, _snippet_bump_amount(i, n_fade))
+                snippet_enqueue_ids.append(mem.id)
+            else:
                 open_memory(
                     mem,
                     store=store,
@@ -1392,43 +1380,67 @@ def _build_recall_block(
                     seen=seen,
                     pending_ids=full_open_ids,
                 )
-        # Genuine snippet rows -> rank-weighted fractional bump. Rank is over the
-        # snippet-only subset in active_top order (the ids not opened above),
-        # exactly as the pre-consolidation `bump_targets` loop computed it.
-        if SNIPPET_MODE_ENABLED:
-            bump_targets = [
-                mem for mem in active_top if mem.id not in full_ids and mem.id not in seen
-            ]
-            n_bump = len(bump_targets)
-            for i, mem in enumerate(bump_targets):
-                seen.add(mem.id)
-                store.bump_recall(mem.id, _snippet_bump_amount(i, n_bump))
-                snippet_enqueue_ids.append(mem.id)
 
-    # Two batched reappraisal enqueues cover every surfaced id exactly once
-    # (restored batching, #231 follow-up — matches 4c916b24's single combined
-    # write per pass instead of the per-id `enqueue_reappraisal` calls the
-    # open_memory consolidation temporarily introduced):
-    #   - `full_open_ids`: every full-open id from every tier this turn
-    #     (semantic full-inject, fading-rendered-full, lexical-active
-    #     full_ids) — collected via `open_memory`'s `pending_ids` sink instead
-    #     of enqueuing immediately per id.
-    #   - `snippet_enqueue_ids`: the genuine-snippet ids (fading on either
-    #     branch + lexical active snippets on the inconclusive branch) —
-    #     unchanged, already batched.
-    # The semantic tier's own snippet ids are enqueued inside
-    # `_render_semantic_active_lines` (its existing single batched call) — so
-    # together every surfaced id is enqueued exactly once, matching the
-    # pre-consolidation outcome; only the call GROUPING changed, not the id set.
-    if full_open_ids:
-        from brain.memory.pending import PendingQueue
+        # LEXICAL active tier is surfaced under "active:" ONLY on the inconclusive
+        # branch (on a conclusive turn active_top is computed for the always-run
+        # fading/lost machinery but never rendered, so it must not be bumped — the
+        # semantic branch issues its own opens inside `_render_semantic_active_lines`).
+        if semantic_result is None:
+            # Full-open rows (importance `full_ids`, or every active row when
+            # snippet mode is off) -> the one door. Runs BEFORE the fractional loop
+            # so those ids are already in `seen`.
+            for mem in active_top:
+                if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
+                    open_memory(
+                        mem,
+                        store=store,
+                        persona_dir=persona_dir,
+                        deliberate=False,
+                        seen=seen,
+                        pending_ids=full_open_ids,
+                    )
+            # Genuine snippet rows -> rank-weighted fractional bump. Rank is over the
+            # snippet-only subset in active_top order (the ids not opened above),
+            # exactly as the pre-consolidation `bump_targets` loop computed it.
+            if SNIPPET_MODE_ENABLED:
+                bump_targets = [
+                    mem for mem in active_top if mem.id not in full_ids and mem.id not in seen
+                ]
+                n_bump = len(bump_targets)
+                for i, mem in enumerate(bump_targets):
+                    seen.add(mem.id)
+                    store.bump_recall(mem.id, _snippet_bump_amount(i, n_bump))
+                    snippet_enqueue_ids.append(mem.id)
+    finally:
+        # Two batched reappraisal enqueues cover every surfaced id exactly once
+        # (restored batching, #231 follow-up matching 4c916b24's single combined
+        # write per pass), and now fire even on a mid-pass exception:
+        #   - `full_open_ids`: every full-open id from every tier this turn
+        #     (semantic full-inject, fading-rendered-full, lexical-active full_ids),
+        #     collected via `open_memory`'s `pending_ids` sink.
+        #   - `snippet_enqueue_ids`: the genuine-snippet ids (fading on either branch
+        #     + lexical active snippets on the inconclusive branch).
+        # The semantic tier's own snippet ids are enqueued inside
+        # `_render_semantic_active_lines`, so together every surfaced id is enqueued
+        # exactly once; only the call GROUPING changed, not the id set. Order is
+        # preserved (full-open ids first, then snippet ids) to match the happy path.
+        # Each flush is guarded so a failure here cannot mask the original
+        # exception or crash (fail-soft, matching this module's convention).
+        if full_open_ids:
+            from brain.memory.pending import PendingQueue
 
-        PendingQueue(persona_dir).enqueue_reappraisals(full_open_ids, source="recall")
+            try:
+                PendingQueue(persona_dir).enqueue_reappraisals(full_open_ids, source="recall")
+            except Exception:  # noqa: BLE001
+                log.exception("_build_recall_block: full-open reappraisal flush failed")
 
-    if snippet_enqueue_ids:
-        from brain.memory.pending import PendingQueue
+        if snippet_enqueue_ids:
+            from brain.memory.pending import PendingQueue
 
-        PendingQueue(persona_dir).enqueue_reappraisals(snippet_enqueue_ids, source="recall")
+            try:
+                PendingQueue(persona_dir).enqueue_reappraisals(snippet_enqueue_ids, source="recall")
+            except Exception:  # noqa: BLE001
+                log.exception("_build_recall_block: snippet reappraisal flush failed")
 
     return "\n".join(lines)
 
