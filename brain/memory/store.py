@@ -471,7 +471,26 @@ class MemoryStore:
         return self._db_path.parent
 
     def create(self, memory: Memory) -> str:
-        """Insert a memory. Returns the id. Raises on duplicate id."""
+        """Insert a memory. Returns the id. Raises on duplicate id.
+
+        Deliberately does NOT touch embeddings/EmbeddingCache — MemoryStore
+        has no dependency on the embeddings subsystem (~11 call sites use
+        `create()` directly: brain/tools/impls/add_memory.py,
+        crystallize_soul.py, brain/memory/pending.py, etc.). Embedding a
+        memory on write, everywhere, would mean either threading an
+        EmbeddingCache dependency through every one of those call sites, or
+        this method spawning off-thread work itself (its own new sqlite
+        connection per call, on a hot synchronous path some of those sites
+        sit on) — both more invasive and riskier than the alternative that
+        was chosen instead: the idle-chipped embedding backfill
+        (brain/memory/embedding_backfill.py), which scans `memories` every
+        supervisor tick and catches whatever `create()` didn't embed,
+        regardless of which call site wrote it. New memories are lexically
+        recallable immediately either way; they become semantically
+        recallable within one backfill tick. See that module's docstring
+        and hunts/semantic-retrieval/plan.md Part A #7 for the full
+        reasoning (Stage 2 of the local semantic-retrieval build).
+        """
         try:
             metadata_json = json.dumps(memory.metadata)
         except TypeError as exc:
@@ -869,6 +888,50 @@ class MemoryStore:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def list_active_since(
+        self, cursor: tuple[str, str] | None, *, limit: int
+    ) -> list[Memory]:
+        """Return up to `limit` active memories strictly after `cursor`,
+        ordered ASCENDING by (created_at, id) (oldest-of-the-remainder
+        first).
+
+        `cursor` is `(created_at_iso, id)` of the last row already
+        processed, or `None` to start from the beginning of history. Uses a
+        composite keyset comparison — `created_at > ts OR (created_at = ts
+        AND id > id)` — rather than filtering on `created_at` alone, so that
+        multiple rows sharing an IDENTICAL `created_at` (common after a bulk
+        migrator import — see `brain/migrator/emergence_kit.py` — since
+        `brain/migrator/transform.py` derives `created_at` from the source
+        export's own timestamp string) are still individually reachable: a
+        strict `created_at > ts` filter would make every row but the last
+        one at a shared timestamp permanently invisible to a caller that
+        pins its cursor at that timestamp (the embedding backfill did
+        exactly this — see brain/memory/embedding_backfill.py). `id` is a
+        UUID4 string (TEXT PRIMARY KEY); the comparison is a plain
+        lexicographic tiebreak, not creation order — it only needs to be a
+        stable TOTAL order so no row at a shared timestamp is skipped or
+        revisited, not a meaningful one. A bounded, cursor-paged sibling of
+        `list_active()` for callers (the embedding backfill) that walk the
+        WHOLE corpus a little at a time across many calls rather than
+        loading it all at once — same `active = 1` filter as `list_active()`.
+        """
+        if cursor is None:
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params: list[Any] = [limit]
+        else:
+            cursor_ts, cursor_id = cursor
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 AND "
+                "(created_at > ? OR (created_at = ? AND id > ?)) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params = [cursor_ts, cursor_ts, cursor_id, limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 

@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from brain.bridge.model_tier import (
+    MODEL_EMBEDDING,
+    MODEL_EMBEDDING_DIM,
     MODEL_LITTLE,
     MODEL_MEDIUM,
     TIER_ATTUNEMENT_DETECTOR,
@@ -25,6 +27,7 @@ from brain.bridge.model_tier import (
     TIER_BACKGROUND_HOUSEKEEPING,
     TIER_COMPACTION,
     TIER_DEV_CLI,
+    TIER_EMBEDDING,
     TIER_INTERACTIVE_CHAT,
     TIER_MODEL,
     TIER_SELF_MODEL_ARTICULATE,
@@ -67,8 +70,37 @@ def test_model_for_tier_resolves_every_declared_tier():
         TIER_BACKGROUND_GENERATIVE,
         TIER_BACKGROUND_HOUSEKEEPING,
         TIER_DEV_CLI,
+        TIER_EMBEDDING,
     ):
         assert isinstance(model_for_tier(tier), str)
+
+
+# ---------------------------------------------------------------------------
+# TIER_EMBEDDING — registered alongside the Claude tiers (local semantic-
+# retrieval spec, Stage 1): a local ONNX embedding model id, NOT a Claude
+# model, resolved the same way (one constant + TIER_MODEL entry) but WITHOUT
+# routing through build_tier_provider/get_provider (those are Claude-scoped).
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_tier_resolves_to_the_pinned_local_model():
+    assert model_for_tier(TIER_EMBEDDING) == MODEL_EMBEDDING == "BAAI/bge-small-en-v1.5"
+
+
+def test_embedding_model_dim_matches_the_pinned_model():
+    """bge-small-en-v1.5 is a 384-dim model — this constant is what the real
+    provider (FastEmbedProvider) and the swap-staleness guard both rely on."""
+    assert MODEL_EMBEDDING_DIM == 384
+
+
+def test_embedding_tier_is_n_model_extensible_like_every_other_tier(monkeypatch):
+    """Repointing TIER_MODEL[TIER_EMBEDDING] is a model_tier.py-only edit —
+    no call site elsewhere hand-rolls the model id (mirrors
+    test_n_model_extensible_new_size_needs_no_call_site_changes above)."""
+    monkeypatch.setitem(TIER_MODEL, TIER_EMBEDDING, "some/other-embedding-model")
+    assert model_for_tier(TIER_EMBEDDING) == "some/other-embedding-model"
+    # Every other tier is untouched.
+    assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
 def test_model_for_tier_unknown_tier_raises_keyerror():

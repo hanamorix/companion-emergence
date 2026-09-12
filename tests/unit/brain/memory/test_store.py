@@ -448,6 +448,99 @@ def test_store_list_active_is_explicit_list_all_path(store: MemoryStore) -> None
     assert [m.id for m in results] == [active.id]
 
 
+def test_store_list_active_since_none_cursor_returns_from_beginning(
+    store: MemoryStore,
+) -> None:
+    """cursor_iso=None starts from the oldest active memory, ascending."""
+    older = _mem("older")
+    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    newer = _mem("newer")
+    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(older)
+    store.create(newer)
+
+    results = store.list_active_since(None, limit=10)
+
+    assert [m.id for m in results] == [older.id, newer.id]
+
+
+def test_store_list_active_since_excludes_at_or_before_cursor(
+    store: MemoryStore,
+) -> None:
+    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
+    a = _mem("a")
+    a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    b = _mem("b")
+    b.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    c = _mem("c")
+    c.created_at = datetime(2020, 1, 3, tzinfo=UTC)
+    store.create(a)
+    store.create(b)
+    store.create(c)
+
+    results = store.list_active_since((b.created_at.isoformat(), b.id), limit=10)
+
+    assert [m.id for m in results] == [c.id]
+
+
+def test_store_list_active_since_tie_inclusive_on_shared_created_at(
+    store: MemoryStore,
+) -> None:
+    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
+    sharing that EXACT created_at, provided its id sorts after the cursor's.
+
+    Regression for the keyset-pagination fix: the old cursor was a bare
+    `created_at > ?` filter, so pinning it at the created_at of a row that
+    shared its timestamp with siblings made every sibling but the pinned one
+    permanently invisible to every future call — exactly the shape produced
+    by a bulk migrator import (brain/migrator/emergence_kit.py) where many
+    rows commonly share a second-granularity created_at.
+    """
+    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    first = _mem("first")
+    first.created_at = shared_ts
+    second = _mem("second")
+    second.created_at = shared_ts
+    # Force a deterministic id ordering regardless of uuid4 randomness, so
+    # the test asserts the intended tie-break rather than depending on luck.
+    first.id = "aaaa0000-0000-0000-0000-000000000000"
+    second.id = "bbbb0000-0000-0000-0000-000000000000"
+    store.create(first)
+    store.create(second)
+
+    # Pin the cursor exactly at `first`'s (created_at, id) — as
+    # embedding_backfill does after processing `first`.
+    results = store.list_active_since((shared_ts.isoformat(), first.id), limit=10)
+
+    assert [m.id for m in results] == [second.id]
+
+
+def test_store_list_active_since_respects_limit(store: MemoryStore) -> None:
+    """Bounded per call — never returns more than `limit` rows."""
+    for i in range(5):
+        m = _mem(f"item-{i}")
+        m.created_at = datetime(2020, 1, i + 1, tzinfo=UTC)
+        store.create(m)
+
+    results = store.list_active_since(None, limit=2)
+
+    assert len(results) == 2
+    assert [m.content for m in results] == ["item-0", "item-1"]
+
+
+def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
+    """Same active=1 filter as list_active() — deactivated rows never appear."""
+    active = _mem("active")
+    inactive = _mem("inactive")
+    store.create(active)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+
+    results = store.list_active_since(None, limit=10)
+
+    assert [m.id for m in results] == [active.id]
+
+
 def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     """Substring matching ignores case."""
     store.create(_mem("The Moment"))

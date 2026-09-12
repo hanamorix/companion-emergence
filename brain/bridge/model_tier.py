@@ -71,6 +71,23 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 # No call-site changes are required for that tier (or any tier EXCEPT
 # TIER_INTERACTIVE_CHAT — see that constant's own TIER_MODEL comment below).
 
+# MODEL_EMBEDDING is NOT a Claude model — it's a local ONNX embedding model id
+# (fastembed/HuggingFace naming), the standing convention (per the local
+# semantic-retrieval spec) for embeddings AND any future minimodel (#228):
+# minimodel selection lives here alongside the Claude tiers, one constant to
+# repoint every embedding call site. See TIER_EMBEDDING below for why it
+# resolves via a dedicated accessor rather than build_tier_provider.
+MODEL_EMBEDDING = "BAAI/bge-small-en-v1.5"  # 384-dim int8, via fastembed (ONNX, no torch)
+MODEL_EMBEDDING_DIM = 384  # output dim of MODEL_EMBEDDING; change together if the model changes
+
+# MODEL_RERANKER is also not a Claude model — it's a local ONNX cross-encoder
+# reranker id (fastembed's TextCrossEncoder), the #231 reranker re-architecture
+# (same standing convention as MODEL_EMBEDDING above): a cross-encoder reads
+# (query, memory) TOGETHER and scores true relevance, replacing the old
+# cosine-floor/gap auto-calibration that didn't generalize across corpus
+# shapes. See brain/memory/reranker.py.
+MODEL_RERANKER = "Xenova/ms-marco-MiniLM-L-6-v2"  # ONNX cross-encoder, ~80MB, via fastembed
+
 # attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
 # (not the bare "haiku" alias) — this predates #154 and substituting the alias
 # could silently repoint it to a different snapshot over time. Moved here from
@@ -88,6 +105,18 @@ TIER_BACKGROUND_CLASSIFIER = "background-classifier"
 TIER_BACKGROUND_GENERATIVE = "background-generative"
 TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
 TIER_DEV_CLI = "dev-cli"
+# Embedding is not a Claude-LLM tier — it never goes through get_provider/
+# build_tier_provider (those are Claude-scoped: claude-cli/ollama/fake
+# provider *kinds*, Claude model aliases). It's registered here anyway so the
+# model id lives in ONE place with every other model selection; construct the
+# actual provider via build_embedding_provider() in brain/memory/embeddings.py,
+# which reads model_for_tier(TIER_EMBEDDING) rather than hardcoding the id.
+TIER_EMBEDDING = "embedding"
+# Same non-Claude-tier treatment as TIER_EMBEDDING above — registered here so
+# the model id lives in ONE place; construct the actual provider via
+# build_reranker_provider() in brain/memory/reranker.py, which reads
+# model_for_tier(TIER_RERANKER) rather than hardcoding the id.
+TIER_RERANKER = "reranker"
 
 TIER_MODEL: dict[str, str] = {
     # NOMINAL/DEFAULT ONLY — decorative for this one tier (future "biggest"
@@ -105,6 +134,8 @@ TIER_MODEL: dict[str, str] = {
     TIER_BACKGROUND_GENERATIVE: MODEL_MEDIUM,
     TIER_BACKGROUND_HOUSEKEEPING: MODEL_LITTLE,
     TIER_DEV_CLI: MODEL_MEDIUM,
+    TIER_EMBEDDING: MODEL_EMBEDDING,
+    TIER_RERANKER: MODEL_RERANKER,
 }
 
 

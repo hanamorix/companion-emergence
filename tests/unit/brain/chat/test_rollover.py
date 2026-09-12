@@ -822,3 +822,5 @@ def test_persist_during_summary_only_rollover_window_not_orphaned(
     assert "so-raced-user" in texts and "so-raced-asst" in texts, (
         "racing persist orphaned instead of threading into the successor"
     )
+
+

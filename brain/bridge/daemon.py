@@ -33,7 +33,7 @@ import httpx
 from brain.bridge import state_file
 from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
 from brain.ingest.pipeline import snapshot_stale_sessions
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
@@ -100,7 +100,7 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
     )
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
+    embeddings = build_embedding_cache(persona_dir)
     provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
     try:
         reports = snapshot_stale_sessions(

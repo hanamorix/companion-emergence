@@ -1293,3 +1293,92 @@ def test_finalize_stale_sessions_deletes_backoff(
     assert read_backoff(tmp_path, sid) is None
     backoff_file = tmp_path / "active_conversations" / f"{sid}.backoff"
     assert not backoff_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 (semantic-retrieval build) — embed-on-write fail-soft hardening.
+# The post-commit `embeddings.get_or_compute(item.text)` back-fill call used
+# to have no try/except; a raising provider (no network, corrupt model cache,
+# retries exhausted) would crash the whole pipeline mid-commit even though
+# the memory itself was already durably written. Verifies close_session AND
+# extract_session_snapshot both fail soft and leave the commit intact.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingEmbeddingProvider:
+    """EmbeddingProvider stand-in whose embed() always raises.
+
+    Duck-typed to the three methods EmbeddingCache actually calls — no need
+    to subclass the ABC for a test double.
+    """
+
+    def embed(self, text: str):  # noqa: ANN001
+        raise RuntimeError("embedding provider unavailable (simulated)")
+
+    def embedding_dim(self) -> int:
+        return 8
+
+    def model_id(self) -> str:
+        return "raising-test-provider"
+
+
+@pytest.fixture
+def raising_embeddings():
+    from brain.memory.embeddings import EmbeddingCache
+
+    return EmbeddingCache(db_path=":memory:", provider=_RaisingEmbeddingProvider())
+
+
+def test_close_session_survives_embed_on_write_failure(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+    raising_embeddings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising embeddings provider must not crash close_session — the
+    memory commit succeeds and the failure is logged, not propagated."""
+    ingest_turn(tmp_path, {"session_id": "sess_embed_fail", "speaker": "Hana", "text": "hi"})
+
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.pipeline"):
+        report = close_session(
+            tmp_path,
+            "sess_embed_fail",
+            store=store,
+            hebbian=hebbian,
+            provider=canned_provider,
+            embeddings=raising_embeddings,
+        )
+
+    # The commit itself is unaffected — only the vector back-fill failed.
+    assert report.errors == 0
+    assert len(report.memory_ids) == 2
+    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
+    for mid in report.memory_ids:
+        assert store.get(mid) is not None
+    assert any("get_or_compute failed" in r.message for r in caplog.records)
+
+
+def test_snapshot_survives_embed_on_write_failure(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+    raising_embeddings,
+) -> None:
+    """Same fail-soft guarantee for extract_session_snapshot's identical
+    back-fill call site."""
+    ingest_turn(tmp_path, {"session_id": "sess_snap_embed_fail", "speaker": "Hana", "text": "hi"})
+
+    report = extract_session_snapshot(
+        tmp_path,
+        "sess_snap_embed_fail",
+        store=store,
+        hebbian=hebbian,
+        provider=canned_provider,
+        embeddings=raising_embeddings,
+    )
+
+    assert report.errors == 0
+    assert len(report.memory_ids) == 2

@@ -99,7 +99,10 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embedding_backfill import (
+    run_embedding_backfill_tick as _embedding_backfill_run_tick,
+)
+from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
@@ -151,6 +154,7 @@ def run_folded(
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+    clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
 ) -> None:
@@ -176,6 +180,20 @@ def run_folded(
     sweep cadence is non-destructive (Task 3); finalize is the only path
     that deletes buffers + cursors and evicts from _SESSIONS, so it
     paces hourly because the threshold is days, not minutes.
+
+    ``clustering_interval_s=None`` disables the autonomous memory-vector
+    clustering cadence (Stage 5, #157, local semantic-retrieval build).
+    Default 6h — same value as ``soul_review_interval_s``/the maintenance
+    cadence, but its OWN persisted state file (mirrors the log-rotation/
+    finalize/maintenance decoupling pattern: a slow, independent, idle-cadence
+    batch pass, not chained to any other cadence's pacing). 6h is a
+    documented default, not spec-pinned — the spec/plan intentionally leave
+    cadence choice to the build (see ``hunts/semantic-retrieval/plan.md``
+    Stage 5); chosen to match the other "whole-corpus batch pass" cadences in
+    this file rather than the much tighter embedding-backfill tick (which
+    chips a small per-row batch every base tick — clustering instead
+    recomputes over the WHOLE cached vector set each firing, so it doesn't
+    need or want that tight a cadence).
     """
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
@@ -235,6 +253,14 @@ def run_folded(
     compaction_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "compaction_cadence.json")
         if compaction_interval_s is not None
+        else None
+    )
+    # Memory-vector clustering (Stage 5, #157) — own persisted wall-clock
+    # cadence, decoupled from every other cadence (see clustering_interval_s
+    # docstring above).
+    clustering_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "clustering_cadence.json")
+        if clustering_interval_s is not None
         else None
     )
     vocab_repair_cadence_state = (
@@ -350,10 +376,7 @@ def run_folded(
             with ExitStack() as stack:
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
-                embeddings = EmbeddingCache(
-                    persona_dir / "embeddings.db",
-                    FakeEmbeddingProvider(dim=256),
-                )
+                embeddings = build_embedding_cache(persona_dir)
                 stack.callback(embeddings.close)
 
                 reports = snapshot_stale_sessions(
@@ -371,6 +394,30 @@ def run_folded(
                     older_than_seconds=silence_minutes * 60.0,
                     persona_name=persona_dir.name,
                 )
+
+                # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
+                # build) — reuses the `store`/`embeddings` handles already open
+                # for the snapshot above, so no extra connections. Runs every
+                # base tick (default 60s): internally bounded (batch_size +
+                # scan_cap), so it is cheap when caught up and never spikes
+                # CPU on a cold-start backlog. This is the primary embed-on-
+                # write mechanism for the ~11 write sites that call
+                # MemoryStore's create method directly and never touch EmbeddingCache
+                # (see brain/memory/embedding_backfill.py's module docstring)
+                # — fault-isolated so a backfill error never takes down the
+                # session-cleanup tick.
+                try:
+                    backfill_result = _embedding_backfill_run_tick(persona_dir, store, embeddings)
+                    logger.info(
+                        "embedding backfill tick: scanned=%d embedded=%d already_cached=%d skipped_short=%d errors=%d",
+                        backfill_result.scanned,
+                        backfill_result.embedded,
+                        backfill_result.already_cached,
+                        backfill_result.skipped_short,
+                        backfill_result.errors,
+                    )
+                except Exception:
+                    logger.exception("supervisor embedding backfill tick raised")
 
             # Publish events outside the with-block — events don't need stores.
             for r in reports:
@@ -611,6 +658,30 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "log_rotation_cadence.json", log_rotation_cadence_state
+                    )
+
+            # Memory-vector clustering cadence (Stage 5, #157) — own
+            # persisted wall-clock cadence, default 6h (see
+            # clustering_interval_s docstring). A full numpy k-means pass
+            # over the persona's currently-embedded vectors; off the message
+            # hot path by construction (only ever called from here). Own
+            # ExitStack ownership inside _run_clustering_tick (mirrors
+            # _run_log_rotation_tick/_run_narrative_memory_pass) since the
+            # per-tick `embeddings` handle opened earlier in this loop is
+            # already closed by the time this block runs.
+            if clustering_cadence_state is not None and persisted_cadence.is_due(
+                clustering_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_clustering_tick(persona_dir)
+                except Exception:
+                    logger.exception("supervisor clustering tick raised")
+                finally:
+                    clustering_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=clustering_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "clustering_cadence.json", clustering_cadence_state
                     )
 
             # Vocab-repair cadence (#173) — 6h default. The startup pass above
@@ -1761,10 +1832,7 @@ def _run_narrative_memory_pass(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings_cache = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings_cache = build_embedding_cache(persona_dir)
         stack.callback(embeddings_cache.close)
 
         # FeltTime read — get_state() is cheap, doesn't tick.
@@ -1868,10 +1936,7 @@ def _run_compaction_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
 
         for session_id in list_active_sessions(persona_dir):
@@ -1921,10 +1986,7 @@ def _run_finalize_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = EmbeddingCache(
-            persona_dir / "embeddings.db",
-            FakeEmbeddingProvider(dim=256),
-        )
+        embeddings = build_embedding_cache(persona_dir)
         stack.callback(embeddings.close)
 
         reports = finalize_stale_sessions(
@@ -2222,6 +2284,37 @@ def _run_log_rotation_tick(
                     "at": _now_iso(),
                 }
             )
+
+
+def _run_clustering_tick(persona_dir: Path) -> None:
+    """Stage 5 (#157) — one full numpy k-means pass over the persona's
+    currently-embedded vectors, off the message hot path (own persisted
+    cadence — see ``clustering_interval_s`` on ``run_folded``, default 6h).
+
+    Opens its own ``EmbeddingCache`` + ``MemoryClusterStore`` (ExitStack —
+    mirrors ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s
+    per-call ownership pattern) since the per-tick handles opened earlier in
+    ``run_folded``'s loop are already closed by the time this cadence block
+    runs. Local import keeps the module-load surface light — clustering is
+    only exercised on its own slow cadence, same rationale as narrative
+    memory's local imports above.
+    """
+    from brain.memory.clustering import MemoryClusterStore, run_clustering_pass
+
+    with ExitStack() as stack:
+        embeddings = build_embedding_cache(persona_dir)
+        stack.callback(embeddings.close)
+        cluster_store = MemoryClusterStore(persona_dir / "embeddings.db")
+        stack.callback(cluster_store.close)
+
+        result = run_clustering_pass(embeddings, cluster_store)
+        logger.info(
+            "clustering tick: ran=%s n_vectors=%d k=%d reason=%s",
+            result.ran,
+            result.n_vectors,
+            result.k,
+            result.reason,
+        )
 
 
 def _now_iso() -> str:
