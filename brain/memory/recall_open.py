@@ -23,6 +23,7 @@ def open_memory(
     persona_dir: Path | None,
     deliberate: bool,
     seen: set[str] | None = None,
+    pending_ids: list[str] | None = None,
 ) -> None:
     """Register that ``mem`` was opened in full. One open event does:
 
@@ -38,6 +39,17 @@ def open_memory(
       otherwise the id is added, so one open per memory per pass. Pass
       ``seen=None`` for a standalone open (each deliberate tool call is its own
       event, with per-call behaviour unchanged).
+
+    ``pending_ids`` (restored batching, #231 follow-up): when given (and
+    ``persona_dir`` is not None), the enqueue is NOT issued immediately —
+    ``mem.id`` is appended to this collector instead, and the caller is
+    responsible for flushing it with ONE ``PendingQueue.enqueue_reappraisals``
+    call after the whole passive render pass finishes (matching the
+    pre-consolidation batched write at 4c916b24 — one file-lock/open/append
+    for every full-open id, instead of one per id). Leave ``pending_ids=None``
+    for a standalone/deliberate open (e.g. ``read_full_memory``) — that path
+    opens exactly one memory per call, so there is nothing to batch, and it
+    keeps enqueuing immediately as before.
     """
     if seen is not None:
         if mem.id in seen:
@@ -54,6 +66,9 @@ def open_memory(
         store.bump_recall(mem.id, 1.0)
 
     if persona_dir is not None:
-        from brain.memory.pending import PendingQueue
+        if pending_ids is not None:
+            pending_ids.append(mem.id)
+        else:
+            from brain.memory.pending import PendingQueue
 
-        PendingQueue(persona_dir).enqueue_reappraisal(mem.id, source="recall")
+            PendingQueue(persona_dir).enqueue_reappraisal(mem.id, source="recall")

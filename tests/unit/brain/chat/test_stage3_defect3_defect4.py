@@ -604,6 +604,54 @@ def test_lexical_full_open_no_double_bump(tmp_path: Path) -> None:
     assert _rc(store, full_mem.id) - before_full == pytest.approx(1.0)
 
 
+def test_lexical_full_open_batches_multiple_ids_into_one_enqueue_call(tmp_path: Path) -> None:
+    """#231 follow-up (restored batching): when a single turn full-opens
+    MULTIPLE memories (both importance >= FULL_INJECT_IMPORTANCE, so both land
+    in `full_ids`), the passive pass issues exactly ONE `enqueue_reappraisals`
+    file-lock/write for all of them — not one per id. Pre-follow-up, each
+    full-open enqueued through `open_memory` individually, so this lock-count
+    assertion would fail (2 acquisitions instead of 1) against that code.
+    The enqueued id-SET stays exactly the two full-open ids either way."""
+    from brain.utils.file_lock import file_lock as real_file_lock
+
+    store = MemoryStore(":memory:")
+    full_mem_a = Memory.create_new(
+        content="the lighthouse keeper's first oath, never once broken",
+        memory_type="event",
+        domain="d",
+        importance=9.5,
+    )
+    full_mem_b = Memory.create_new(
+        content="the lighthouse keeper's second oath, kept just as well",
+        memory_type="event",
+        domain="d",
+        importance=9.2,
+    )
+    store.create(full_mem_a)
+    store.create(full_mem_b)
+    PendingQueue(tmp_path).drain()
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+        patch("brain.memory.pending.file_lock", wraps=real_file_lock) as mock_lock,
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert full_mem_a.id in block
+    assert full_mem_b.id in block
+
+    # Both full-opened -> ONE lock acquisition covers both (no snippet-tier
+    # ids this turn, so this is the full-open flush's lock count in isolation).
+    assert mock_lock.call_count == 1
+
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids.count(full_mem_a.id) == 1
+    assert ids.count(full_mem_b.id) == 1
+    assert len(ids) == 2  # exactly these two ids, nothing extra, nothing dropped
+
+
 # ---------------------------------------------------------------------------
 # #231 consolidation — the FADING tier's flag-off correctness. The fading tier
 # always renders `_recall_snippet(mem, full=False)`, so when SNIPPET_MODE_ENABLED

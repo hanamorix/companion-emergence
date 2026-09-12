@@ -110,3 +110,69 @@ def test_no_seen_opens_each_call(tmp_path: Path) -> None:
 
     assert _rc(store, m.id) == pytest.approx(2.0)
     assert _reappraisal_ids(PendingQueue(tmp_path).drain()).count(m.id) == 2
+
+
+# ---------------------------------------------------------------------------
+# `pending_ids` collector (restored batching, #231 follow-up): a passive
+# render pass can defer the enqueue to a caller-owned list instead of writing
+# the queue file immediately, so N full-opens in one turn cost one flush
+# instead of N file-lock/open/append syscalls.
+# ---------------------------------------------------------------------------
+
+
+def test_pending_ids_collector_defers_enqueue_instead_of_writing_immediately(
+    tmp_path: Path,
+) -> None:
+    """With a `pending_ids` collector supplied, `open_memory` still bumps
+    recall_count immediately, but APPENDS the id to the collector instead of
+    writing the pending-candidates queue file — nothing is enqueued until the
+    caller flushes the collector itself."""
+    store = MemoryStore(":memory:")
+    m = _seed(store)
+    pending_ids: list[str] = []
+
+    open_memory(
+        m, store=store, persona_dir=tmp_path, deliberate=False, seen=None, pending_ids=pending_ids
+    )
+
+    assert _rc(store, m.id) == pytest.approx(1.0)  # bump still happens immediately
+    assert pending_ids == [m.id]  # id landed in the collector...
+    assert not (tmp_path / "pending_candidates.jsonl").exists()  # ...not the queue file
+
+    # The caller's own flush is what actually enqueues it.
+    written = PendingQueue(tmp_path).enqueue_reappraisals(pending_ids, source="recall")
+    assert written == 1
+    assert _reappraisal_ids(PendingQueue(tmp_path).drain()) == [m.id]
+
+
+def test_pending_ids_collector_batches_multiple_opens_into_one_list(tmp_path: Path) -> None:
+    """Several full-opens sharing one `pending_ids` collector across one
+    passive pass all land in the SAME list, ready for one combined
+    `enqueue_reappraisals` flush — the shape the restored batching depends on."""
+    store = MemoryStore(":memory:")
+    m1 = _seed(store)
+    m2 = _seed(store)
+    pending_ids: list[str] = []
+    seen: set[str] = set()
+
+    open_memory(
+        m1, store=store, persona_dir=tmp_path, deliberate=False, seen=seen, pending_ids=pending_ids
+    )
+    open_memory(
+        m2, store=store, persona_dir=tmp_path, deliberate=False, seen=seen, pending_ids=pending_ids
+    )
+
+    assert pending_ids == [m1.id, m2.id]
+    assert not (tmp_path / "pending_candidates.jsonl").exists()
+
+
+def test_deliberate_open_without_collector_still_enqueues_immediately(tmp_path: Path) -> None:
+    """The deliberate `read_full_memory` path never passes `pending_ids` (it
+    opens exactly one memory per call), so it must keep enqueuing immediately,
+    unaffected by the new collector parameter."""
+    store = MemoryStore(":memory:")
+    m = _seed(store)
+
+    open_memory(m, store=store, persona_dir=tmp_path, deliberate=True, seen=None)
+
+    assert _reappraisal_ids(PendingQueue(tmp_path).drain()) == [m.id]
