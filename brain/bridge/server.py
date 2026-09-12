@@ -62,7 +62,7 @@ from brain.bridge.model_tier import (
     build_interactive_chat_provider,
     build_tier_provider,
 )
-from brain.bridge.provider import LLMProvider, ProviderError
+from brain.bridge.provider import LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
@@ -911,6 +911,11 @@ def build_app(
             shutdown_controller=shutdown_controller,
         )
         logger.info("bridge started persona=%s pid=%d", persona_dir.name, os.getpid())
+        # #122: resolve the claude spawn cwd once at start so a missing memory-free
+        # directory is WARNED here (the helper logs it), not at the first spawn.
+        _work_dir = _claude_work_dir()
+        if _work_dir is not None:
+            logger.info("claude working directory: %s", _work_dir)
 
         # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
         # write_defaults_section swallows its own errors; belt-and-braces here so

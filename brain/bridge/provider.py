@@ -127,13 +127,18 @@ def _brain_claude_config_dir() -> str | None:
 
     Why: the ``claude`` CLI injects the user's global config into every ``-p``
     invocation as context (the superpowers ``using-superpowers`` block, the
-    agent-types list, the enabled-skills catalogue, and the whole
-    ``~/.claude/CLAUDE.md``). None of that is Nell's persona or her
+    agent-types list, the enabled-skills catalogue, and the *user* memory
+    ``<config>/CLAUDE.md``). None of that is Nell's persona or her
     conversation, but she receives it every turn and sometimes narrates it. It
     can't be flag-stripped without breaking her MCP tools or auth. A dedicated
-    ``CLAUDE_CONFIG_DIR`` with its own one-time ``claude auth login`` and no
-    plugins/hooks/CLAUDE.md is the one clean escape (``--mcp-config`` is
-    unaffected by the config dir, so tool-calling is preserved).
+    ``CLAUDE_CONFIG_DIR`` with its own one-time ``claude auth login`` is the one
+    clean escape for that leg (``--mcp-config`` is unaffected by the config dir,
+    so tool-calling is preserved). It does NOT strip cwd-keyed *project* memory
+    (``<cwd>/.claude/CLAUDE.md`` and every ancestor's ``CLAUDE.md`` — which for a
+    cwd under ``$HOME`` is the owner's global file again), cwd-keyed auto-memory,
+    or project-scoped plugins; :func:`_claude_work_dir` handles that leg (#122).
+    ``HOME`` is not a lever and redirecting it hides the macOS Keychain. See the
+    dated row in ``docs/cli-provider-capabilities.md``.
 
     **Safety spine:** used ONLY when ``<KINDLED_HOME>/claude-config`` exists AND
     carries the ``.brain-authed`` marker (written by the setup helper after it
@@ -153,6 +158,83 @@ def _brain_claude_config_dir() -> str | None:
     return None
 
 
+# #122: the claude CLI loads ``<cwd>/.claude/CLAUDE.md`` and every ancestor's ``CLAUDE.md`` as
+# *project* memory, so a spawn whose cwd sits under ``$HOME`` (launchd/systemd run the bridge from
+# there) receives the owner's global ``~/.claude/CLAUDE.md`` even with the dedicated config dir.
+# Spawn from a directory whose resolved ancestor chain carries none of these markers instead.
+_CWD_MEMORY_MARKERS = (".claude", "CLAUDE.md", "CLAUDE.local.md", ".git")
+_CLAUDE_WORK_DIRNAME = "companion-emergence-claude-work"
+_claude_work_dir_warned = False
+
+
+def _has_memory_ancestor(d: Path) -> bool:
+    for anc in (d, *d.parents):
+        for m in _CWD_MEMORY_MARKERS:
+            if (anc / m).exists():
+                return True
+    return False
+
+
+def _claude_work_dir_candidates() -> list[Path]:
+    from brain.paths import get_home
+
+    out = [Path(tempfile.gettempdir()) / _CLAUDE_WORK_DIRNAME]
+    try:
+        out.append(get_home() / "claude-work")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _claude_work_dir() -> str | None:
+    """A memory-free working directory for ``claude`` spawns, or ``None`` (status quo).
+
+    Candidates, in order: ``<tempdir>/companion-emergence-claude-work`` (outside ``$HOME`` on
+    macOS/Linux), then ``<KINDLED_HOME>/claude-work`` — a formality on any machine with Claude
+    Code installed (``~/.claude`` is its ancestor), kept for tempdir-unwritable hosts. A candidate
+    wins if its resolved ancestor chain has no ``.claude``/``CLAUDE.md``/``CLAUDE.local.md``/
+    ``.git``, it can be created, and (POSIX) it is owned by this uid (shared ``/tmp``). No
+    candidate → one WARNING per process and ``None``. Windows: both candidates sit under the
+    profile, so a profile-level ``.claude\\CLAUDE.md`` keeps the status quo — see #252.
+    Fail-soft: never raises.
+    """
+    global _claude_work_dir_warned
+    tried: list[str] = []
+    try:
+        for cand in _claude_work_dir_candidates():
+            try:
+                try:
+                    d = cand.resolve()
+                except OSError:
+                    d = cand
+                tried.append(str(d))
+                if _has_memory_ancestor(d):  # may raise PermissionError on a hardened parent
+                    continue
+                d.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if os.name == "posix" and hasattr(os, "getuid") and d.stat().st_uid != os.getuid():
+                    continue  # foreign-owned dir in a shared /tmp
+                return str(d)
+            except OSError:
+                continue  # this candidate is unusable; try the next
+    except Exception:  # noqa: BLE001 — never let cwd selection break a spawn
+        logger.debug("claude work dir selection raised", exc_info=True)
+    if not _claude_work_dir_warned:
+        _claude_work_dir_warned = True
+        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if sys.platform == "win32" else ""
+        logger.warning(
+            "no memory-free working directory for claude spawns; tried %s — the owner's global "
+            "CLAUDE.md may reach the companion%s",
+            tried,
+            extra,
+        )
+    return None
+
+
+def _claude_work_dir_reset_for_tests() -> None:
+    global _claude_work_dir_warned
+    _claude_work_dir_warned = False
+
+
 def _subprocess_env() -> dict[str, str]:
     """Environment for every ``claude`` CLI spawn.
 
@@ -166,8 +248,9 @@ def _subprocess_env() -> dict[str, str]:
 
     Also points ``CLAUDE_CONFIG_DIR`` at a dedicated brain-owned config dir when
     one has been set up + authed (see :func:`_brain_claude_config_dir`), to keep
-    the user's global plugins/skills/CLAUDE.md out of Nell's context. If an
-    explicit ``CLAUDE_CONFIG_DIR`` is already set upstream, it is respected.
+    the user's global plugins/skills and *user* memory out of Nell's context
+    (cwd-keyed project memory is handled by :func:`_claude_work_dir`, #122). If
+    an explicit ``CLAUDE_CONFIG_DIR`` is already set upstream, it is respected.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("CAVEMAN_")}
     env["CAVEMAN_DEFAULT_MODE"] = "off"
@@ -282,9 +365,10 @@ def brain_tools_mcp_entry(
     dir), never ``site-packages``, so the venv/editable ``brain`` still resolves. requires-python
     >= 3.12 guarantees ``-P`` (added 3.11).
 
-    A safe explicit ``cwd=`` is not used because there is no fixed cwd guaranteed free of a foreign
-    top-level ``brain/`` (the drop-in copy root itself contains one); ``-P`` drops the cwd entry
-    unconditionally, matching the cwd-independence the fix wants.
+    The child inherits the parent ``claude`` process's cwd, which since #122 is the memory-free
+    directory from :func:`_claude_work_dir` (or the bridge cwd when none qualifies); either way
+    ``-P`` drops the cwd entry from ``sys.path`` unconditionally, so a foreign top-level ``brain/``
+    in any cwd can never shadow the installed package.
 
     Keeping this the ONE definition lets the harness roster preflight
     (``tests.harness.roster_preflight``) reproduce the child argv/config by construction.
@@ -633,6 +717,7 @@ class ClaudeCliProvider(LLMProvider):
                     errors="replace",
                     timeout=self._timeout,
                     env=_subprocess_env(),
+                    cwd=_claude_work_dir(),  # #122: memory-free working directory
                     check=False,
                     creationflags=_NO_WINDOW,
                 )
@@ -767,6 +852,7 @@ class ClaudeCliProvider(LLMProvider):
                     errors="replace",
                     timeout=self._timeout,
                     env=_subprocess_env(),
+                    cwd=_claude_work_dir(),  # #122: memory-free working directory
                     check=False,
                     creationflags=_NO_WINDOW,
                 )
@@ -974,6 +1060,7 @@ class ClaudeCliProvider(LLMProvider):
                     encoding="utf-8",
                     errors="replace",
                     env=_subprocess_env(),
+                    cwd=_claude_work_dir(),  # #122: memory-free working directory
                     creationflags=_NO_WINDOW,
                 )
             except OSError as exc:
@@ -1258,6 +1345,7 @@ class ClaudeCliProvider(LLMProvider):
                         input=flat_prompt,
                         capture_output=True,
                         env=_subprocess_env(),
+                        cwd=_claude_work_dir(),  # #122: memory-free working directory
                         text=True,
                         encoding="utf-8",
                         errors="replace",
