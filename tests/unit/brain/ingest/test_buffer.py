@@ -425,3 +425,58 @@ def test_delete_backoff_is_idempotent(tmp_path: Path) -> None:
 def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         write_backoff(tmp_path, "sess_abc", failures=1, first_failure_at="garbage")
+
+
+# ── #198: rewrite_session_atomic survives a transient os.replace refusal ─────
+# Windows refuses os.replace over a file another handle holds open (a GET
+# /chat/history streaming the buffer). Mirror _unlink_with_retry: bounded
+# retry, and never leave the .jsonl.tmp behind.
+
+
+def _seed_session(persona_dir: Path, sid: str) -> Path:
+    from brain.ingest.buffer import _session_path, ingest_turn
+
+    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user", "text": "hi"})
+    return _session_path(persona_dir, sid)
+
+
+def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, monkeypatch):
+    import os as _os
+
+    from brain.ingest import buffer as buf
+
+    sid = "11111111-1111-4111-8111-111111111111"
+    path = _seed_session(tmp_path, sid)
+    real_replace = _os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(32, "in use")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(buf.os, "replace", flaky)
+    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "rewritten"}])
+    assert calls["n"] == 3
+    assert path.read_text(encoding="utf-8").strip() == '{"speaker": "assistant", "text": "rewritten"}'
+    assert not path.with_suffix(".jsonl.tmp").exists()
+
+
+def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
+    from brain.ingest import buffer as buf
+
+    sid = "22222222-2222-4222-8222-222222222222"
+    path = _seed_session(tmp_path, sid)
+    before = path.read_text(encoding="utf-8")
+
+    def always(src, dst):
+        raise PermissionError(32, "in use")
+
+    monkeypatch.setattr(buf.os, "replace", always)
+    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    with pytest.raises(PermissionError):
+        buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
+    assert path.read_text(encoding="utf-8") == before  # old buffer untouched
+    assert not path.with_suffix(".jsonl.tmp").exists()  # no litter

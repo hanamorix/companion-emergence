@@ -995,7 +995,18 @@ def build_app(
             session so it never mutates/deletes a buffer mid-request (owner ruling
             2026-08-13). Reads the async ``in_flight_locks`` from the supervisor
             thread — ``asyncio.Lock.locked()`` is a plain bool read, safe enough for
-            a best-effort belt; the worst case is deferring one idle tick."""
+            a best-effort belt; the worst case is deferring one idle tick.
+
+            Only ``POST /chat`` (and the snapshot/WS turn paths) populate the
+            locks; GET readers (``/chat/history``, ``/images``, ``/sessions/active``)
+            are deliberately invisible here (#198 decision, 2026-09-13): the belt
+            is a UX guard against swapping under an active *turn*, not the
+            race-safety mechanism (that is ``registry_lock`` + the compaction lock
+            + the ``rolled_to`` pointer + atomic ``os.replace``). A GET holding
+            this lock would queue chat turns behind history hydration; a separate
+            read counter would defer rollovers for millisecond reads that on POSIX
+            keep the old inode anyway. The one Windows consequence — ``os.replace``
+            refused under an open reader — is retried in ``rewrite_session_atomic``."""
             lk = app.state.bridge.in_flight_locks.get(sid)
             return lk is not None and lk.locked()
 
