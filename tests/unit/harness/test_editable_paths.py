@@ -316,7 +316,7 @@ def test_c11_nested_editable_notes_folder_does_not_trip(
 
 
 def test_c11_symlinked_documents_editable_still_excluded(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requires_symlinks
 ) -> None:
     """C11 (MINOR-4): when Documents is reached through a symlink, an editable notes folder is STILL
     correctly excluded (parent match resolves both sides). Skipped where symlinks are unavailable."""
@@ -325,10 +325,7 @@ def test_c11_symlinked_documents_editable_still_excluded(
     editable = _mark(real_docs / "Canary Notes")
     # Point the notes-scan Documents dir at a SYMLINK to the real Documents.
     link = tmp_path / "docs-link"
-    try:
-        link.symlink_to(real_docs, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable on this platform")
+    link.symlink_to(real_docs, target_is_directory=True)
     monkeypatch.setattr(sandbox_mod, "_documents_dir", lambda: link)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

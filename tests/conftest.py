@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import functools
+import os
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -9,6 +12,32 @@ import pytest
 
 from brain.bridge import cli_throttle, provider_auth
 from brain.chat import pass2_queue
+
+pytest_plugins = ["pytester"]
+
+
+@functools.cache
+def _symlinks_available() -> bool:
+    """Probe once per session whether this host lets us create a symlink (#262).
+
+    Non-elevated Windows without Developer Mode raises ``OSError: [WinError 1314]``; GitHub's
+    ``windows-latest`` runner is elevated, so CI never sees it — a contributor's stock checkout does.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.mkdir()
+        try:
+            os.symlink(target, Path(tmp) / "link", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+@pytest.fixture
+def requires_symlinks() -> None:
+    """Skip (not fail) a test whose setup creates a symlink, where the host denies it (#262)."""
+    if not _symlinks_available():
+        pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
 
 
 @pytest.fixture(autouse=True)

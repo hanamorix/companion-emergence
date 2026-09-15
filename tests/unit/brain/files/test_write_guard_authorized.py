@@ -22,7 +22,7 @@ def test_dotdot_escape_refused(tmp_path):
     assert is_within_authorized(sneaky, folder) is False
 
 
-def test_symlink_escape_refused(tmp_path):
+def test_symlink_escape_refused(tmp_path, requires_symlinks):
     folder = tmp_path / "notes"
     folder.mkdir()
     outside = tmp_path / "outside"

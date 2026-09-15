@@ -376,7 +376,7 @@ def test_c5_fires_on_known_bad_inputs(tmp_path: Path) -> None:
 # --- #235: dangling symlinks in the source tree must not abort the copy -------------------------
 
 
-def test_ingest_survives_dangling_symlink_in_source(tmp_path: Path) -> None:
+def test_ingest_survives_dangling_symlink_in_source(tmp_path: Path, requires_symlinks) -> None:
     """A tool-left dangling symlink (e.g. an untracked ``.claude/skills/x``) is not part of the
     version under test and must not abort ``ingest_version`` (#235)."""
     src = _source_repo(tmp_path)

@@ -118,7 +118,7 @@ def test_non_darwin_still_seeds_the_credentials_file(
 
 
 def test_synthetic_home_exposes_the_real_keychain_on_darwin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requires_symlinks
 ) -> None:
     """Carrier C swaps HOME for an empty synthetic one; on macOS the CLI's Keychain lives under
     ``$HOME/Library/Keychains``, so the swap alone hides the per-dir credential and every live turn

@@ -54,7 +54,7 @@ def test_dotdot_escape_into_ssh_refused(tmp_path, monkeypatch):
     assert not r.ok  # resolves into ~/.ssh
 
 
-def test_symlink_escape_into_ssh_refused(tmp_path, monkeypatch):
+def test_symlink_escape_into_ssh_refused(tmp_path, monkeypatch, requires_symlinks):
     h = _home(tmp_path)
     monkeypatch.setattr(Path, "home", lambda: h)
     (h / ".ssh").mkdir(parents=True, exist_ok=True)

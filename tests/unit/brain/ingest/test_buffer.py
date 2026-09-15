@@ -158,8 +158,6 @@ def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
     the whole pytest session at ~42% on windows-latest). The probe must
     delegate to state_file.pid_is_alive, which carries the Windows-safe
     branch — and brain/ingest must contain no direct os.kill at all."""
-    import subprocess
-
     from brain.bridge import state_file
     from brain.ingest import buffer as buffer_mod
 
@@ -174,15 +172,16 @@ def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
     assert buffer_mod._pid_alive(0) is False
     assert sentinel_calls == [4242]
 
-    # Grep-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
-    # class). Doc mentions (backtick-quoted) are allowed; .pyc excluded.
-    result = subprocess.run(
-        ["grep", "-rn", "--include=*.py", r"os\.kill(", "brain/ingest/"],
-        capture_output=True,
-        text=True,
-        cwd=str(Path(__file__).resolve().parents[4]),
-    )
-    code_hits = [ln for ln in result.stdout.splitlines() if "``" not in ln]
+    # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
+    # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
+    # shelling out to ``grep`` failed on stock Windows (#262).
+    ingest_dir = Path(__file__).resolve().parents[4] / "brain" / "ingest"
+    code_hits = [
+        f"{py.relative_to(ingest_dir.parent.parent).as_posix()}:{lineno}:{line}"
+        for py in sorted(ingest_dir.rglob("*.py"))
+        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1)
+        if "os.kill(" in line and "``" not in line
+    ]
     assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
 
 
