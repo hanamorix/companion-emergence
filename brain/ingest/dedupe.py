@@ -1,29 +1,36 @@
-"""SP-4 DEDUPE stage — cosine-similarity check against existing embeddings.
+"""SP-4 DEDUPE stage — cosine-similarity check against existing memories.
 
-Design decision: dedupe is opt-in. When embeddings is None (the default in
-the pipeline signature), this function returns False unconditionally and the
-item passes through. This keeps SP-4 self-contained — the pipeline runs even
-without embedding infrastructure.
+F1 (#259) increment 5: sources vectors off the memories row / warm matrix
+instead of the old `embeddings.db` content-hash cache.
 
-When embeddings IS provided, we compute the candidate's embedding and compare
-it against every cached vector. If any similarity >= threshold, the item is a
-duplicate and should be skipped.
+  - EXISTING vectors: every active, currently-embedded row in `store`'s
+    memories.db, via the process-wide warm matrix
+    (`build_embedding_matrix(store.db_path).snapshot()`). Pre-migration /
+    pre-backfill most rows have `embedding IS NULL`, so this set can be
+    sparse — dedup then simply finds fewer semantic near-dups, the same
+    graceful degradation semantic recall has while the backfill catches up.
+    We deliberately do NOT embed-on-read to fill gaps here.
+  - CANDIDATE vector: the transient, not-yet-committed `text` is embedded
+    DIRECTLY via `build_embedding_provider().embed(text)` — there is no
+    cache row to write (and therefore nothing to undo if the item's commit
+    later fails).
 
-The EmbeddingCache API exposes:
-  get_or_compute(content) -> np.ndarray   — compute + cache the vector
-  count() -> int                          — number of cached vectors
+Both the matrix and the provider key off the SAME current model id
+(`model_tier.model_for_tier(TIER_EMBEDDING)`), so a row left over from a
+prior/different embedding model is never loaded into the comparison — the
+matrix's own build query already filters to the current model id.
 
-Iterating all vectors requires querying the underlying SQLite table directly
-via the cache's internal connection. We do this defensively — if anything
-fails, we return False (let the item through) rather than crashing the pipeline.
+Any exception during the process (matrix build, provider embed, etc.) is
+caught and logged; we return False on failure (safe default — at worst we
+commit a near-duplicate) rather than crashing the pipeline.
 """
 
 from __future__ import annotations
 
 import logging
 
-import numpy as np
-
+from brain.memory import embeddings as embeddings_mod
+from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import EmbeddingCache, cosine_similarity
 from brain.memory.store import MemoryStore
 
@@ -39,42 +46,35 @@ def is_duplicate(
     threshold: float = DEFAULT_DEDUP_THRESHOLD,
     embeddings: EmbeddingCache | None = None,
 ) -> bool:
-    """Cosine-similarity check against the persona's existing embeddings.
+    """Cosine-similarity check against the persona's existing row-embedded memories.
 
-    If ``embeddings`` is None or has no cached entries: return False —
-    dedupe is impossible, let the item through.
-
-    Otherwise:
-      1. Compute (or retrieve from cache) the embedding for ``text``.
-      2. Iterate all stored (content_hash, vector) pairs.
-      3. Return True if max cosine similarity >= threshold.
+    1. Snapshot the warm matrix's currently-embedded vectors for this store.
+       If none exist yet (cold-start / pre-backfill), return False.
+    2. Embed ``text`` directly through the production provider (no cache
+       row written).
+    3. Return True if max cosine similarity against the snapshot >= threshold.
 
     Any exception during the process is caught and logged; we return False
     on failure (safe default — at worst we commit a near-duplicate).
+
+    ``embeddings`` is UNUSED as of F1 (#259) increment 5 — kept only for
+    call-site backward compatibility (e.g. tests/unit/brain/chat/test_rollover.py
+    execs a pre-increment-5 pipeline.py snapshot that still passes it
+    positionally-as-kwarg). Removed along with embeddings.db itself in the F1
+    teardown increment.
     """
-    if embeddings is None:
-        return False
-
     try:
-        # Snapshot existing rows BEFORE computing the candidate embedding so we
-        # don't accidentally compare the text against itself if get_or_compute
-        # adds it to the cache during this call. Scoped to THIS cache's own
-        # model_id — a row left over from a prior provider (e.g. a stale
-        # 256-dim FakeEmbeddingProvider vector under a real 384-dim model) is
-        # a different vector space and must never enter a cosine comparison.
-        existing_rows = embeddings._conn.execute(  # noqa: SLF001
-            "SELECT vector, dim FROM embedding_cache WHERE model_id = ?",
-            (embeddings.model_id,),
-        ).fetchall()
-
-        if not existing_rows:
+        existing = build_embedding_matrix(store.db_path).snapshot()
+        if not existing:
             return False
 
-        candidate = embeddings.get_or_compute(text)
+        # Looked up via the MODULE (not a bare imported name) so a test's
+        # monkeypatch on `embeddings.build_embedding_provider` is honored —
+        # mirrors `MemoryStore.embed_row`'s identical dynamic lookup.
+        candidate = embeddings_mod.build_embedding_provider().embed(text).astype("float32")
 
         max_sim = 0.0
-        for vec_bytes, dim in existing_rows:
-            stored_vec = np.frombuffer(vec_bytes, dtype=np.float32).copy().reshape(dim)
+        for stored_vec in existing.values():
             sim = cosine_similarity(candidate, stored_vec)
             if sim > max_sim:
                 max_sim = sim

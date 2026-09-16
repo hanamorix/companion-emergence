@@ -4,8 +4,10 @@ When store.create raises (e.g. sqlite3.OperationalError: database is locked),
 commit_item returns None. The pipeline must treat that as a non-clean ingest
 and HOLD the buffer / cursor for retry, not delete it.
 
-Dedupe (is_duplicate → True) is NOT a failure — retry is idempotent, already-
-committed items hit is_duplicate on the next pass and cursor still advances.
+Dedupe (is_duplicate → True) is NOT a failure — retry is idempotent, cursor
+still advances. That idempotency covers already-embedded `memories` rows;
+gated (pending-queue) candidates are a narrower case — see the A1 test below
+for what changed there in F1 (#259) increment 5.
 """
 from __future__ import annotations
 
@@ -22,7 +24,6 @@ from brain.ingest.pipeline import (
     finalize_stale_sessions,
 )
 from brain.ingest.types import ExtractedItem
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import PendingQueue
 from brain.memory.store import MemoryStore
@@ -233,23 +234,25 @@ def test_finalize_holds_buffer_when_commit_fails(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Finding #3 — embeddings-ON retry must not self-dedup after commit failure
+# Finding #3 — retry must not self-dedup after a commit failure.
+#
+# F1 (#259) increment 5 update: the original failure mode was is_duplicate's
+# own get_or_compute call persisting the failed candidate's vector into
+# embeddings.db BEFORE the commit was even attempted, so a naive retry would
+# self-match at cosine 1.0 and be silently discarded — fixed at the time by
+# an evict-on-failed-commit call. That failure mode is now structurally
+# impossible: dedupe embeds the candidate directly through the provider and
+# never writes a cache row anywhere (brain/ingest/dedupe.py), so there is
+# nothing for a retry to self-match against, and the evict call is gone
+# (brain/ingest/pipeline.py). This test now verifies that direct consequence:
+# a retried item is never deduped away.
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
-    """Pass 1: store.create raises → commit_failures >= 1, cursor held, AND the
-    candidate's vector is evicted from the embedding cache so pass 2 doesn't
-    self-match at cosine 1.0 and silently discard the memory.
-
-    Pass 2: store.create succeeds → memory committed, found in store.
-
-    The bug only triggers when the cache has at least one existing entry before
-    pass 1 — if the cache is empty, is_duplicate returns False early without
-    ever calling get_or_compute, so the vector is never cached and no evict is
-    needed. We seed the cache with one unrelated entry so existing_rows is
-    non-empty, which forces is_duplicate to call get_or_compute(item_text) and
-    persist its vector before the commit fails.
+def test_snapshot_retry_after_commit_failure_is_not_self_deduped(tmp_path: Path):
+    """Pass 1: enqueue raises → commit_failures >= 1, cursor held.
+    Pass 2: enqueue succeeds → the SAME item must actually be re-attempted
+    (enqueued), not silently discarded as a self-duplicate.
     """
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
@@ -259,15 +262,8 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
 
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
 
     try:
-        # Seed cache with one unrelated entry so existing_rows is non-empty in
-        # pass 1 — this forces is_duplicate to reach the get_or_compute call
-        # and persist item_text's vector before the commit fails.
-        embeddings.get_or_compute("unrelated prior memory")
-        assert embeddings.count() == 1
-
         # ── Pass 1: commit (enqueue) raises ────────────────────────────────
         with patch(
             "brain.ingest.pipeline.extract_items_with_status",
@@ -279,14 +275,9 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
                 store=store,
                 hebbian=hebbian,
                 provider=_NoopProvider(),
-                embeddings=embeddings,
             )
 
         assert report1.commit_failures >= 1, "pass 1 must record a commit failure"
-        # After eviction the candidate's vector must be gone; the unrelated seed stays.
-        assert embeddings.count() == 1, (
-            "evict() must remove item_text's vector (count back to 1 — only seed remains)"
-        )
 
         # ── Pass 2: commit succeeds ────────────────────────────────────────
         with patch(
@@ -299,9 +290,9 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
                 store=store,
                 hebbian=hebbian,
                 provider=_NoopProvider(),
-                embeddings=embeddings,
             )
 
+        assert report2.deduped == 0, "the retried item must NOT be self-deduped"
         assert report2.committed == 0, "gated label never durably commits (#167)"
         assert report2.enqueued >= 1, "pass 2 must enqueue the memory (not dedup it away)"
         # A "fact" label is gated (#167: enqueued, not committed); the memory must be
@@ -313,7 +304,6 @@ def test_snapshot_embeddings_on_retry_not_self_deduped(tmp_path: Path):
     finally:
         store.close()
         hebbian.close()
-        embeddings.close()
 
 
 # ---------------------------------------------------------------------------
@@ -379,23 +369,40 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# A1 — held-buffer retry must be idempotent: no double-commit for items that
-#      succeeded in pass 1 but whose vectors were never back-filled.
+# A1 — held-buffer retry idempotency for GATED candidates.
+#
+# F1 (#259) increment 5 update: pre-F1, a retry after a partial commit
+# failure was protected against re-enqueuing already-enqueued items by a
+# side channel — is_duplicate back-filled each committed item's vector into
+# embeddings.db immediately, independent of the memories-table/pending-queue
+# lifecycle. F1 removed that side channel: dedupe now reads ONLY row-embedded
+# `memories` (the warm matrix, brain/memory/embedding_matrix.py), and a GATED
+# candidate (label "fact", not in GATE_BYPASS_TYPES) is never a `memories`
+# row — it sits in pending_candidates.jsonl until Pass-2 consolidation
+# promotes it (brain/engines/consolidation.py), and promotion is the ONLY
+# point a row (and therefore a vector) starts to exist. So ingest-time cosine
+# dedup structurally cannot see a same-session pending duplicate anymore, and
+# a retry now legitimately RE-enqueues already-enqueued items too.
+#
+# This is a known, accepted trade-off of moving vectors onto the memories
+# row (surfaced during increment 5's build, not silently dropped): a
+# duplicate PENDING candidate is still caught before it becomes a durable
+# memory by consolidation's own Pass-2 "duplicate" verdict, which reviews
+# every pending candidate at promotion time — this test documents and locks
+# in the new ingest-time behavior, it does not claim promotion-time dedup is
+# gone.
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
-    """Partial-commit + retry round-trip with embeddings ON.
+def test_snapshot_retry_after_partial_failure_reenqueues_gated_candidates(tmp_path: Path):
+    """Partial-commit + retry round-trip, gated ("fact") candidates.
 
-    Pass 1: item 1 (index 1) raises on store.create; items 0 and 2 commit OK.
-    Pass 2: all store.create calls succeed.
+    Pass 1: item 1 (index 1) raises on enqueue; items 0 and 2 enqueue OK.
+    Pass 2: all enqueue calls succeed.
 
-    Expected final state: exactly 3 distinct memories in the store — items 0
-    and 2 are recognised as duplicates (via their back-filled vectors) and
-    skipped; item 1 commits fresh. No text appears twice.
-
-    Without the back-fill fix, pass 2 re-commits items 0 and 2 because the
-    embedding cache is cold for their texts → 5 memories total, 2 duplicated.
+    Expected final state: 5 pending candidates — items 0 and 2 are
+    RE-enqueued (ingest-time dedup cannot see them, per the module note
+    above) alongside item 1's fresh, first-time enqueue.
     """
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
@@ -406,7 +413,6 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
 
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    embeddings = EmbeddingCache(persona_dir / "embeddings.db", FakeEmbeddingProvider(dim=256))
 
     pass1_call: list[int] = [0]
 
@@ -428,7 +434,6 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
                 store=store,
                 hebbian=hebbian,
                 provider=_NoopProvider(),
-                embeddings=embeddings,
             )
 
         assert report1.commit_failures >= 1, "pass 1 must record a commit failure"
@@ -453,24 +458,24 @@ def test_snapshot_retry_no_double_commit_with_embeddings(tmp_path: Path):
                 store=store,
                 hebbian=hebbian,
                 provider=_NoopProvider(),
-                embeddings=embeddings,
             )
 
         assert report2.committed == 0, "gated label never durably commits (#167)"
-        assert report2.enqueued >= 1, "pass 2 must enqueue at least item 1"
+        assert report2.enqueued == 3, "pass 2 re-attempts ALL 3 items (dedup can't see pending candidates)"
         assert report2.commit_failures == 0, "pass 2 must have no commit failures"
+        assert report2.deduped == 0, "ingest-time cosine dedup cannot see not-yet-promoted candidates"
 
-        # Final assertion: exactly 3 distinct candidates in the queue, no dups.
+        # Final assertion: 5 pending candidates — items 0 and 2 duplicated.
         all_queued = PendingQueue(persona_dir).read_recent("fact", limit=20)
         final_texts = [m.content for m in all_queued if m.content in texts]
-        assert len(final_texts) == 3, (
-            f"expected exactly 3 distinct memories, got {len(final_texts)}: {final_texts}"
+        assert len(final_texts) == 5, (
+            f"expected 5 pending entries (items 0/2 re-enqueued, item 1 fresh) — "
+            f"got {len(final_texts)}: {final_texts}"
         )
-        for t in texts:
-            count = final_texts.count(t)
-            assert count == 1, f"text {t!r} appears {count} times — double-commit detected"
+        assert final_texts.count(texts[0]) == 2
+        assert final_texts.count(texts[1]) == 1
+        assert final_texts.count(texts[2]) == 2
 
     finally:
         store.close()
         hebbian.close()
-        embeddings.close()

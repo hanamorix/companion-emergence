@@ -1296,89 +1296,85 @@ def test_finalize_stale_sessions_deletes_backoff(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 (semantic-retrieval build) — embed-on-write fail-soft hardening.
-# The post-commit `embeddings.get_or_compute(item.text)` back-fill call used
-# to have no try/except; a raising provider (no network, corrupt model cache,
-# retries exhausted) would crash the whole pipeline mid-commit even though
-# the memory itself was already durably written. Verifies close_session AND
-# extract_session_snapshot both fail soft and leave the commit intact.
+# F1 (#259) increment 5 — the evict-on-failed-commit dance is gone. Dedupe no
+# longer writes a candidate vector into embeddings.db (it embeds the
+# candidate directly, with nothing to write or evict), so a failed commit has
+# nothing to roll back: `embeddings.evict(...)` must never be called anymore.
+# The `embeddings` kwarg itself is still accepted (unused) for
+# brain/bridge/supervisor.py call-site compatibility until the F1 teardown
+# increment removes it — these tests pass a tracking stub to prove pipeline.py
+# genuinely never touches it, not just that no error surfaces from a fake.
 # ---------------------------------------------------------------------------
 
 
-class _RaisingEmbeddingProvider:
-    """EmbeddingProvider stand-in whose embed() always raises.
+class _EvictTrackingEmbeddings:
+    """Stand-in for the (dedupe-unused) `embeddings` kwarg. Records whether
+    `.evict()` is ever called — pipeline.py no longer calls anything else on
+    this object post-increment-5."""
 
-    Duck-typed to the three methods EmbeddingCache actually calls — no need
-    to subclass the ABC for a test double.
-    """
+    def __init__(self) -> None:
+        self.evict_calls: list[str] = []
 
-    def embed(self, text: str):  # noqa: ANN001
-        raise RuntimeError("embedding provider unavailable (simulated)")
-
-    def embedding_dim(self) -> int:
-        return 8
-
-    def model_id(self) -> str:
-        return "raising-test-provider"
+    def evict(self, content: str) -> None:
+        self.evict_calls.append(content)
 
 
-@pytest.fixture
-def raising_embeddings():
-    from brain.memory.embeddings import EmbeddingCache
-
-    return EmbeddingCache(db_path=":memory:", provider=_RaisingEmbeddingProvider())
-
-
-def test_close_session_survives_embed_on_write_failure(
+def test_close_session_commit_failure_does_not_evict(
     tmp_path: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     canned_provider: _CannedProvider,
-    raising_embeddings,
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A raising embeddings provider must not crash close_session — the
-    memory commit succeeds and the failure is logged, not propagated."""
-    ingest_turn(tmp_path, {"session_id": "sess_embed_fail", "speaker": "Hana", "text": "hi"})
+    """A failed commit_item() must still be counted as an error/commit_failure,
+    but must NOT reach into `embeddings.evict()` — there's no candidate cache
+    row left to roll back."""
+    import brain.ingest.pipeline as pipeline_mod
 
-    with caplog.at_level(logging.WARNING, logger="brain.ingest.pipeline"):
-        report = close_session(
-            tmp_path,
-            "sess_embed_fail",
-            store=store,
-            hebbian=hebbian,
-            provider=canned_provider,
-            embeddings=raising_embeddings,
-        )
+    ingest_turn(tmp_path, {"session_id": "sess_commit_fail", "speaker": "Hana", "text": "hi"})
+    monkeypatch.setattr(pipeline_mod, "commit_item", lambda *args, **kwargs: None)
 
-    # The commit itself is unaffected — only the vector back-fill failed.
-    assert report.errors == 0
-    assert len(report.memory_ids) == 2
-    run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
-    for mid in report.memory_ids:
-        assert store.get(mid) is not None
-    assert any("get_or_compute failed" in r.message for r in caplog.records)
-
-
-def test_snapshot_survives_embed_on_write_failure(
-    tmp_path: Path,
-    store: MemoryStore,
-    hebbian: HebbianMatrix,
-    canned_provider: _CannedProvider,
-    raising_embeddings,
-) -> None:
-    """Same fail-soft guarantee for extract_session_snapshot's identical
-    back-fill call site."""
-    ingest_turn(tmp_path, {"session_id": "sess_snap_embed_fail", "speaker": "Hana", "text": "hi"})
-
-    report = extract_session_snapshot(
+    tracking_embeddings = _EvictTrackingEmbeddings()
+    report = close_session(
         tmp_path,
-        "sess_snap_embed_fail",
+        "sess_commit_fail",
         store=store,
         hebbian=hebbian,
         provider=canned_provider,
-        embeddings=raising_embeddings,
+        embeddings=tracking_embeddings,
     )
 
-    assert report.errors == 0
-    assert len(report.memory_ids) == 2
+    assert report.errors == 2
+    assert report.commit_failures == 2
+    assert report.memory_ids == []
+    assert tracking_embeddings.evict_calls == []
+
+
+def test_snapshot_commit_failure_does_not_evict(
+    tmp_path: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    canned_provider: _CannedProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guarantee for extract_session_snapshot's identical DEDUPE+COMMIT
+    loop."""
+    import brain.ingest.pipeline as pipeline_mod
+
+    ingest_turn(tmp_path, {"session_id": "sess_snap_commit_fail", "speaker": "Hana", "text": "hi"})
+    monkeypatch.setattr(pipeline_mod, "commit_item", lambda *args, **kwargs: None)
+
+    tracking_embeddings = _EvictTrackingEmbeddings()
+    report = extract_session_snapshot(
+        tmp_path,
+        "sess_snap_commit_fail",
+        store=store,
+        hebbian=hebbian,
+        provider=canned_provider,
+        embeddings=tracking_embeddings,
+    )
+
+    assert report.errors == 2
+    assert report.commit_failures == 2
+    assert report.memory_ids == []
+    assert tracking_embeddings.evict_calls == []
