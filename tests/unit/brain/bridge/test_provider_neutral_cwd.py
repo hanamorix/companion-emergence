@@ -66,6 +66,7 @@ def test_no_clean_candidate_returns_none_and_warns_once(tmp_path: Path, monkeypa
     (home / ".claude").mkdir()
     monkeypatch.setattr(provider_mod.tempfile, "gettempdir", lambda: str(t))
     monkeypatch.setenv("KINDLED_HOME", str(home))
+    monkeypatch.setattr(sys, "platform", "linux")  # pin the non-Windows arm; real win32 hosts get the #252 text
     with caplog.at_level(logging.WARNING, logger="brain.bridge.provider"):
         assert provider_mod._claude_work_dir() is None
         assert provider_mod._claude_work_dir() is None
