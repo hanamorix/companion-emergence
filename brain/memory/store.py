@@ -585,13 +585,23 @@ class MemoryStore:
         build_embedding_matrix(self.db_path)`) so it is immediately
         recall-visible in this process without waiting for a lazy rebuild.
 
-        Raises on any failure (provider/model error, sqlite error) —
-        deliberately NOT fail-soft here. The caller decides how to handle a
-        failed embed; e.g. `brain.engines.consolidation._dispatch` wraps its
-        call in a local try/except and leaves the row's embedding NULL for
-        the later idle backfill to pick up, rather than aborting the whole
-        drain tick over one bad embed. `MemoryStore._reembed_or_clear` below
-        is the other caller, with its own failure handling (clear + evict).
+        Raises on any failure computing/persisting the embedding itself
+        (provider/model error, sqlite error) — deliberately NOT fail-soft
+        there. The caller decides how to handle a failed embed; e.g.
+        `brain.engines.consolidation._dispatch` wraps its call in a local
+        try/except and leaves the row's embedding NULL for the later idle
+        backfill to pick up, rather than aborting the whole drain tick over
+        one bad embed. `MemoryStore._reembed_or_clear` below is the other
+        caller, with its own failure handling (clear + evict).
+
+        The warm-matrix `put` AFTER the row commit is different: by that
+        point the row is already durably embedded (the DB is the source of
+        truth; the matrix is a cache that self-heals on rebuild — see
+        `build_embedding_matrix`), so a `put` failure must NOT be reported
+        as an embed failure (F1 #259 increment-3 red-team fix, F3) — it is
+        logged and swallowed, never raised out of this method, so a caller
+        counting embed successes/failures (the backfill's `errors` field)
+        doesn't misclassify an already-committed row as failed.
         """
         from brain.memory import embeddings as embeddings_mod
         from brain.memory.embedding_matrix import build_embedding_matrix
@@ -603,7 +613,17 @@ class MemoryStore:
             (vec.tobytes(), provider.model_id(), memory_id),
         )
         self._conn.commit()
-        build_embedding_matrix(self.db_path).put(memory_id, vec)
+        try:
+            build_embedding_matrix(self.db_path).put(memory_id, vec)
+        except Exception:  # noqa: BLE001 — row is already committed-embedded; a
+            # matrix-cache write failure must not surface as an embed failure.
+            logger.warning(
+                "MemoryStore.embed_row: warm-matrix put failed for id=%s after "
+                "the row's embedding was already committed — the matrix "
+                "self-heals on rebuild, so this is logged, not raised",
+                memory_id,
+                exc_info=True,
+            )
 
     def _reembed_or_clear(self, memory_id: str, content: str) -> None:
         """Keep a row's embedding coherent with its content after ANY
@@ -1145,8 +1165,8 @@ class MemoryStore:
         `list_active()` for a caller that walks the WHOLE corpus a little at
         a time across many calls rather than loading it all at once — same
         `active = 1` filter as `list_active()`. See `list_unembedded_since`
-        below for the sibling scoped to `embedding IS NULL` (the embedding
-        backfill's own backlog query, F1 #259 increment 3).
+        below for the sibling scoped to the embedding backlog predicate (the
+        embedding backfill's own backlog query, F1 #259 increment 3).
         """
         if cursor is None:
             sql = (
@@ -1166,46 +1186,81 @@ class MemoryStore:
         return [_row_to_memory(row) for row in rows]
 
     def list_unembedded_since(
-        self, cursor: tuple[str, str] | None, *, limit: int
+        self,
+        cursor: tuple[str, str] | None,
+        *,
+        limit: int,
+        current_model_id: str,
+        min_chars: int,
     ) -> list[Memory]:
-        """Return up to `limit` ACTIVE memories with `embedding IS NULL`,
-        strictly after `cursor`, ordered ASCENDING by (created_at, id) — the
-        embedding backfill's own backlog query (F1 #259 increment 3).
+        """Return up to `limit` ACTIVE memories that are backlog for the
+        embedding backfill, strictly after `cursor`, ordered ASCENDING by
+        (created_at, id) — the embedding backfill's own backlog query (F1
+        #259 increment 3; model-mismatch clause + SQL-level short-row
+        exclusion folded in on Fixing's inc3 spec-gap, Planning-ruled
+        2026-09-16).
 
-        Backlog membership is determined directly by the row's OWN
-        `embedding` column, not a content-hash side-table lookup: unlike the
-        old `embeddings.db` cache, a row's presence here is purely a
-        function of its current `embedding` value, so a row that gets
-        embedded (by this backfill, by embed-on-write at promotion, or by a
-        synchronous re-embed in `fade`/`update`/`unfade`) simply stops
-        appearing in this query's results — no separate bookkeeping needed.
+        Backlog membership is `embedding IS NULL OR embedding_model_id !=
+        current_model_id` — determined directly off the row's OWN columns,
+        not a content-hash side-table lookup: unlike the old `embeddings.db`
+        cache, a row's presence here is purely a function of its current
+        `embedding`/`embedding_model_id` values, so a row that gets (re-)
+        embedded under the current model (by this backfill, by embed-on-
+        write at promotion, or by a synchronous re-embed in
+        `fade`/`update`/`unfade`) simply stops appearing in this query's
+        results — no separate bookkeeping needed.
+
+        The `embedding_model_id != current_model_id` half restores the
+        model-scoped self-healing the old content-hash cache had: after a
+        `MODEL_EMBEDDING` swap, old-model rows stay non-NULL (so an
+        IS-NULL-only backlog would never re-embed them) but the warm matrix
+        filters them out by model_id, so without this clause they'd fall to
+        lexical recall forever with no re-embed path. It's a no-op in
+        steady state (every row already matches `current_model_id`) and
+        only fires on a swap.
+
+        `min_chars` excludes rows too short to ever be embed-worthy
+        (`MIN_CHARS_TO_EMBED` — the caller's constant, passed through rather
+        than duplicated here) directly in SQL rather than filtering them out
+        Python-side after the fact: this is what keeps the cursor-reset
+        no-op cheap in steady state (see `run_embedding_backfill_tick`) —
+        once every EMBEDDABLE row is embedded, this query returns empty
+        without ever re-scanning the permanently-short rows on every tick.
+        `length()` on a SQLite TEXT column counts characters, matching
+        Python's `len()`; `content` is `NOT NULL` per schema so no NULL
+        handling is needed here.
 
         Same composite keyset cursor semantics as `list_active_since` (see
         that method's docstring for the tied-created_at rationale) — this is
-        its sibling scoped to `embedding IS NULL`. The caller (embedding
-        backfill) is responsible for NOT persisting a forward cursor once a
-        tick has seen the whole currently-null backlog (i.e. got back fewer
-        than `limit` rows): `embedding IS NULL` is not append-only per id —
-        a row can go null a SECOND time (a later content edit whose
-        synchronous re-embed attempt fails — see `_reembed_or_clear`) at a
-        `created_at` position the cursor may have already passed — so a
-        persisted forward position is only a safe optimization while the
-        backlog is larger than one scan, never a correctness mechanism.
+        its sibling scoped to the backlog predicate above. The caller
+        (embedding backfill) is responsible for NOT persisting a forward
+        cursor once a tick has seen the whole currently-backlogged set (i.e.
+        got back fewer than `limit` rows): backlog membership is not
+        append-only per id — a row can re-enter it a SECOND time (a later
+        content edit whose synchronous re-embed attempt fails — see
+        `_reembed_or_clear` — or a model swap) at a `created_at` position
+        the cursor may have already passed — so a persisted forward position
+        is only a safe optimization while the backlog is larger than one
+        scan, never a correctness mechanism.
         """
         if cursor is None:
             sql = (
-                "SELECT * FROM memories WHERE active = 1 AND embedding IS NULL "
+                "SELECT * FROM memories WHERE active = 1 "
+                "AND (embedding IS NULL OR embedding_model_id != ?) "
+                "AND length(content) >= ? "
                 "ORDER BY created_at ASC, id ASC LIMIT ?"
             )
-            params: list[Any] = [limit]
+            params: list[Any] = [current_model_id, min_chars, limit]
         else:
             cursor_ts, cursor_id = cursor
             sql = (
-                "SELECT * FROM memories WHERE active = 1 AND embedding IS NULL AND "
+                "SELECT * FROM memories WHERE active = 1 "
+                "AND (embedding IS NULL OR embedding_model_id != ?) "
+                "AND length(content) >= ? AND "
                 "(created_at > ? OR (created_at = ? AND id > ?)) "
                 "ORDER BY created_at ASC, id ASC LIMIT ?"
             )
-            params = [cursor_ts, cursor_ts, cursor_id, limit]
+            params = [current_model_id, min_chars, cursor_ts, cursor_ts, cursor_id, limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 

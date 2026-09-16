@@ -114,7 +114,12 @@ def test_tick_is_a_near_no_op_once_caught_up(tmp_path: Path) -> None:
 
 
 def test_skips_rows_under_min_chars(tmp_path: Path) -> None:
-    """Very short content is never embedded — noise-vector guard."""
+    """Very short content is never embedded — noise-vector guard. As of the
+    FIX B (SQL-level short-row exclusion), the short row is excluded by
+    `list_unembedded_since`'s own query — it never becomes a `candidate`,
+    so it is not `scanned` and does not count as `skipped_short` either
+    (that Python-side counter is now only a defense-in-depth backstop that
+    should never actually trigger against this method's own query)."""
     store = _open_store(tmp_path)
     short = "x" * (MIN_CHARS_TO_EMBED - 1)
     long_enough = "y" * MIN_CHARS_TO_EMBED
@@ -130,8 +135,37 @@ def test_skips_rows_under_min_chars(tmp_path: Path) -> None:
     assert _is_embedded(store, long_m.id) is True
     store.close()
 
-    assert result.skipped_short == 1
+    assert result.scanned == 1  # the short row was excluded at the SQL level
+    assert result.skipped_short == 0
     assert result.embedded == 1
+
+
+def test_steady_state_short_row_backlog_query_is_a_cheap_no_op(tmp_path: Path) -> None:
+    """FIX B (F1 #259 increment-3 red-team, quiescence): once every
+    EMBEDDABLE row is embedded, a permanently-short row must never
+    resurface in the backlog query — `list_unembedded_since` excludes it in
+    SQL — so the tick's cursor-reset-on-drain (see the module docstring's
+    "Resumable/idempotent" section) is a genuinely cheap no-op: it re-scans
+    nothing, not even the short row, on every subsequent tick."""
+    store = _open_store(tmp_path)
+    short = "x" * (MIN_CHARS_TO_EMBED - 1)
+    long_enough = "y" * MIN_CHARS_TO_EMBED
+    short_m = _mem(short, created_at=datetime(2020, 1, 1, tzinfo=UTC))
+    long_m = _mem(long_enough, created_at=datetime(2020, 1, 2, tzinfo=UTC))
+    store.create(short_m)
+    store.create(long_m)
+
+    # First tick: embeds the long row, the short row is never a candidate.
+    result1 = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
+    assert result1.embedded == 1
+    assert result1.scanned == 1
+
+    # Steady state: the short row alone must not make later ticks re-scan.
+    result2 = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
+    store.close()
+    assert result2.scanned == 0
+    assert result2.embedded == 0
+    assert result2.skipped_short == 0
 
 
 def test_already_embedded_rows_are_not_in_the_backlog(tmp_path: Path) -> None:
@@ -218,7 +252,10 @@ def test_derived_batch_size_reflects_measured_per_embed_time(
 ) -> None:
     """The batch size a tick actually uses (when not explicitly overridden)
     is `floor(batch_budget_seconds / measured_per_embed_seconds)` — a
-    derived figure, never the old literal 25."""
+    derived figure, never the old literal 25. `scan_cap` is deliberately
+    large here (well above the expected derived batch) so the FIX C
+    scan_cap upper-clamp (see `test_derived_batch_size_is_clamped_to_scan_cap`
+    below) does not interfere with what this test is isolating."""
     _seed(tmp_path, 1)
     store = _open_store(tmp_path)
 
@@ -226,7 +263,7 @@ def test_derived_batch_size_reflects_measured_per_embed_time(
         embedding_backfill, "_measure_per_embed_seconds", lambda provider: 0.5  # noqa: ARG005
     )
     try:
-        result = run_embedding_backfill_tick(tmp_path, store, scan_cap=10)
+        result = run_embedding_backfill_tick(tmp_path, store, scan_cap=1000)
     finally:
         store.close()
 
@@ -280,6 +317,59 @@ def test_derived_batch_size_clamps_to_at_least_one(
 
     assert result.batch_size == 1
     assert result.embedded == 1
+
+
+def test_derived_batch_size_is_clamped_to_scan_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX C (F1 #259 increment-3 red-team, F2): a fluke-fast per-embed
+    measurement must not derive a batch size larger than `scan_cap` — a
+    tick can never usefully embed more rows than it even scans
+    (`candidates` is itself `LIMIT scan_cap`), so the derived batch is
+    clamped to it. Measuring at exactly the floor still derives an
+    enormous RAW batch (budget / a-millisecond is tens of thousands); the
+    scan_cap clamp is what keeps the reported/cached `batch_size` sane."""
+    _seed(tmp_path, 3)
+    store = _open_store(tmp_path)
+
+    monkeypatch.setattr(
+        embedding_backfill,
+        "_measure_per_embed_seconds",
+        lambda provider: embedding_backfill._MIN_PLAUSIBLE_PER_EMBED_SECONDS,  # noqa: ARG005
+    )
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, scan_cap=3)
+    finally:
+        store.close()
+
+    assert result.batch_size == 3
+    assert result.embedded == 3
+
+
+def test_measured_per_embed_seconds_is_floored_against_near_zero() -> None:
+    """FIX C (F1 #259 increment-3 red-team, F2): a provider that returns
+    (near-)instantly — a measurement artifact, e.g. a trivial fake or
+    clock-resolution noise — must not drive the measured mean per-embed
+    time below `_MIN_PLAUSIBLE_PER_EMBED_SECONDS`. This is the floor that
+    keeps a fluke-fast measurement from deriving an absurd batch size in
+    the first place (the scan_cap clamp above is the second line of
+    defense on top of it)."""
+    import numpy as np
+
+    from brain.memory.embeddings import EmbeddingProvider
+
+    class _InstantProvider(EmbeddingProvider):
+        def embed(self, text: str):  # noqa: ANN201, ARG002
+            return np.ones(8, dtype="float32")
+
+        def embedding_dim(self) -> int:
+            return 8
+
+        def model_id(self) -> str:
+            return "instant-test"
+
+    measured = embedding_backfill._measure_per_embed_seconds(_InstantProvider())
+    assert measured >= embedding_backfill._MIN_PLAUSIBLE_PER_EMBED_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -628,3 +718,132 @@ def test_backfill_writes_land_in_the_warm_matrix(
     vec = matrix.get(made[0].id)
     assert vec is not None
     np.testing.assert_array_equal(vec, provider.embed(made[0].content).astype(np.float32))
+
+
+def test_warm_matrix_put_failure_is_not_counted_as_a_backfill_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX D (F1 #259 increment-3 red-team, F3): once `store.embed_row`'s
+    row UPDATE has committed, the row IS durably embedded — a subsequent
+    `EmbeddingMatrix.put` failure must not propagate out of `embed_row`,
+    and must therefore not be counted in the tick's `errors` field. Before
+    the fix, a put failure here would have been indistinguishable from a
+    genuine embed failure, under-reporting a row that is actually fine."""
+    from brain.bridge import model_tier
+    from brain.memory import embedding_matrix as embedding_matrix_mod
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    def _boom_put(self, memory_id: str, vector) -> None:  # noqa: ANN001, ARG001
+        raise RuntimeError("simulated warm-matrix put failure")
+
+    monkeypatch.setattr(embedding_matrix_mod.EmbeddingMatrix, "put", _boom_put)
+
+    made = _seed(tmp_path, 1)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
+    finally:
+        store.close()
+
+    assert result.embedded == 1
+    assert result.errors == 0
+
+    store2 = _open_store(tmp_path)
+    try:
+        assert _is_embedded(store2, made[0].id) is True
+    finally:
+        store2.close()
+
+
+# ---------------------------------------------------------------------------
+# Model-mismatch backlog clause (FIX A, Planning-ruled 2026-09-16, F1 #259
+# increment-3 spec-gap): after a MODEL_EMBEDDING swap, old-model rows stay
+# non-NULL but are stale — the backlog must re-open them, not just rows
+# whose embedding is outright NULL.
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_reembeds_stale_model_rows_after_a_model_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row embedded under an OLD model_id (embedding non-NULL, but
+    `embedding_model_id` != the current model) IS in the backlog and gets
+    re-embedded under the CURRENT model. A row already embedded under the
+    CURRENT model is left alone (not re-embedded, not counted again)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    # FakeEmbeddingProvider.model_id() is dim-qualified ("fake-<dim>"), not
+    # per-instance-unique — two DIFFERENT dims is how this test gets two
+    # genuinely different model_ids to simulate a swap (the warm matrix
+    # isn't exercised by this test, so the dim mismatch doesn't matter here).
+    old_provider = embeddings_mod.FakeEmbeddingProvider(dim=256)
+
+    made = _seed(tmp_path, 2)
+    stale_row, current_row = made[0], made[1]
+
+    store = _open_store(tmp_path)
+    # Embed both rows under the "old" model first.
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: old_provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, old_provider.model_id())
+    store.embed_row(stale_row.id, stale_row.content)
+    store.embed_row(current_row.id, current_row.content)
+
+    # Now swap to a NEW model (different model_id) and re-embed only the
+    # "current_row" under it directly (simulating it was written fresh
+    # after the swap), leaving "stale_row" behind under the old model_id.
+    new_provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    assert new_provider.model_id() != old_provider.model_id()
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: new_provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, new_provider.model_id())
+    store.embed_row(current_row.id, current_row.content)
+
+    result = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
+    store.close()
+
+    # Only the stale-model row was backlog for this tick.
+    assert result.scanned == 1
+    assert result.embedded == 1
+
+    store2 = _open_store(tmp_path)
+    try:
+        stale_after = store2._conn.execute(
+            "SELECT embedding_model_id FROM memories WHERE id = ?", (stale_row.id,)
+        ).fetchone()
+        current_after = store2._conn.execute(
+            "SELECT embedding_model_id FROM memories WHERE id = ?", (current_row.id,)
+        ).fetchone()
+    finally:
+        store2.close()
+
+    assert stale_after["embedding_model_id"] == new_provider.model_id()
+    assert current_after["embedding_model_id"] == new_provider.model_id()
+
+
+def test_backfill_is_a_no_op_when_all_rows_match_the_current_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Steady state (no model swap): every row already carries the current
+    model's id, so the model-mismatch clause contributes nothing — the
+    backlog query returns empty, matching the pre-FIX-A no-op behavior."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    made = _seed(tmp_path, 3)
+    store = _open_store(tmp_path)
+    for m in made:
+        store.embed_row(m.id, m.content)
+
+    result = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
+    store.close()
+
+    assert result.scanned == 0
+    assert result.embedded == 0

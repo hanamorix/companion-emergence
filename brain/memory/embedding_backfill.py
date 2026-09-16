@@ -14,16 +14,25 @@ source of truth for everything else: it scans ``memories`` on every eligible
 supervisor tick and embeds whatever hasn't been covered yet, ingest-path or
 not.
 
-BACKLOG DEFINITION (F1 #259 increment 3): a memory row with `embedding IS
-NULL` (active, >= `MIN_CHARS_TO_EMBED` chars) — read straight off the row via
-``MemoryStore.list_unembedded_since``, not a content-hash side cache. This
-replaced the old ``embeddings.db`` / ``EmbeddingCache.has()`` check: identity
-is now the memory's own id, not its content hash, so "already embedded"
-literally means "this row already carries a vector." A row that goes NULL
-again after a content mutation (`fade`/`update(content=...)`/`unfade`'s
-synchronous re-embed failing — see ``MemoryStore._reembed_or_clear``) simply
-reappears in the backlog query on its own; no separate invalidation
-bookkeeping is needed the way the content-hash cache required.
+BACKLOG DEFINITION (F1 #259 increment 3; model-mismatch clause folded in on
+Fixing's inc3 spec-gap, Planning-ruled 2026-09-16): an active memory row with
+`embedding IS NULL` OR `embedding_model_id != <current model_id>`, and
+`length(content) >= MIN_CHARS_TO_EMBED` — all three filters applied straight
+in SQL via ``MemoryStore.list_unembedded_since``, not a content-hash side
+cache. This replaced the old ``embeddings.db`` / ``EmbeddingCache.has()``
+check: identity is now the memory's own id, not its content hash, so
+"already embedded" literally means "this row already carries a vector under
+the CURRENT model." A row that goes NULL again after a content mutation
+(`fade`/`update(content=...)`/`unfade`'s synchronous re-embed failing — see
+``MemoryStore._reembed_or_clear``) simply reappears in the backlog query on
+its own; no separate invalidation bookkeeping is needed the way the
+content-hash cache required. Likewise, the `embedding_model_id !=` clause
+means a `MODEL_EMBEDDING` swap reopens every old-model row for this same
+backlog query automatically — no separate re-embed path needed — restoring
+the model-scoped self-healing the old content-hash cache had (without this
+clause, old-model rows stay non-NULL and the warm matrix filters them out by
+model_id, so they'd fall to lexical recall forever). It's a no-op in steady
+state (every row already matches the current model).
 
 Each embedded row is written via ``MemoryStore.embed_row``, which persists
 `embedding` + `embedding_model_id` on the row AND pushes the vector into the
@@ -50,7 +59,8 @@ every base tick unconditionally, unlike every other background maintenance
 cadence — a regression from intent this closes.
 
 Resumable/idempotent by construction: because backlog membership is the
-row's own `embedding IS NULL`, a row embedded by a prior (possibly
+row's own `embedding`/`embedding_model_id` columns (see BACKLOG DEFINITION
+above), a row (re-)embedded under the current model by a prior (possibly
 interrupted) tick is simply absent from the next tick's candidates — killing
 the process mid-batch loses nothing (`embed_row` commits per row). A
 persisted cursor (this persona's ``cadence/embedding_backfill_cursor.json``)
@@ -176,6 +186,16 @@ _MEASURE_TEXT = (
 _FALLBACK_BATCH_SIZE = 25
 _MIN_BATCH_SIZE = 1
 
+# Floor for the MEASURED mean per-embed time (F1 #259 increment-3 red-team
+# fix, F2): a fluke-fast measurement (near-zero — a clock-resolution
+# artifact, or an unrealistically fast provider) would otherwise divide
+# `budget` by a near-zero number and derive an absurd batch size. A real
+# warm ONNX embed call takes on the order of single-digit milliseconds at
+# the very fastest on real hardware, so anything measured below this floor
+# is treated as a measurement artifact, not a genuine host capability, and
+# clamped up to it before deriving the batch.
+_MIN_PLAUSIBLE_PER_EMBED_SECONDS = 0.001
+
 # model_id -> derived batch size. Process-wide, mirrors
 # build_embedding_provider's own per-model_id cache — one measurement per
 # model_id, shared across every tick in the process.
@@ -186,9 +206,12 @@ _warned_no_headroom = False
 
 def _measure_per_embed_seconds(provider) -> float:  # noqa: ANN001
     """Mean WARM per-embed seconds for `provider`, after discarding
-    `_WARMUP_EMBEDS` cold calls. Isolated as its own function (rather than
-    inlined into `_get_batch_size`) so a test can monkeypatch/measure it
-    directly without needing a real or artificially-timed provider."""
+    `_WARMUP_EMBEDS` cold calls, floored at `_MIN_PLAUSIBLE_PER_EMBED_SECONDS`
+    so a fluke-fast (near-zero) measurement can't drive an absurd derived
+    batch size (F1 #259 increment-3 red-team fix, F2). Isolated as its own
+    function (rather than inlined into `_get_batch_size`) so a test can
+    monkeypatch/measure it directly without needing a real or artificially-
+    timed provider."""
     for _ in range(_WARMUP_EMBEDS):
         provider.embed(_MEASURE_TEXT)
     samples: list[float] = []
@@ -196,11 +219,19 @@ def _measure_per_embed_seconds(provider) -> float:  # noqa: ANN001
         start = time.monotonic()
         provider.embed(_MEASURE_TEXT)
         samples.append(time.monotonic() - start)
-    return sum(samples) / len(samples)
+    mean = sum(samples) / len(samples)
+    return max(mean, _MIN_PLAUSIBLE_PER_EMBED_SECONDS)
 
 
-def _derive_batch_size(per_embed_seconds: float) -> int:
-    """`floor(batch_budget_seconds / per_embed_seconds)`, clamped to >= 1.
+def _derive_batch_size(per_embed_seconds: float, scan_cap: int) -> int:
+    """`floor(batch_budget_seconds / per_embed_seconds)`, clamped to >= 1
+    and to <= `scan_cap` (F1 #259 increment-3 red-team fix, F2): a derived
+    batch can never usefully exceed the number of rows one tick even scans
+    (`candidates` is itself `LIMIT scan_cap`), so an upper clamp keeps the
+    reported/cached figure sane even before the per-embed-time floor in
+    `_measure_per_embed_seconds` above is considered — belt-and-braces
+    against a fluke-fast measurement, while a fluke-SLOW measurement is
+    already kept reasonable (>= 1) by the existing low clamp below.
 
     Logs once (per process) if the configured budget leaves no headroom
     inside the assumed tick interval — a configuration smell, not a fatal
@@ -219,11 +250,12 @@ def _derive_batch_size(per_embed_seconds: float) -> int:
             tick,
         )
     if per_embed_seconds <= 0.0:
-        return _FALLBACK_BATCH_SIZE
-    return max(_MIN_BATCH_SIZE, math.floor(budget / per_embed_seconds))
+        return max(_MIN_BATCH_SIZE, min(_FALLBACK_BATCH_SIZE, scan_cap))
+    derived = math.floor(budget / per_embed_seconds)
+    return max(_MIN_BATCH_SIZE, min(derived, scan_cap))
 
 
-def _get_batch_size(provider) -> int:  # noqa: ANN001
+def _get_batch_size(provider, scan_cap: int) -> int:  # noqa: ANN001
     """Cached-once-per-process derived batch size for `provider`'s
     model_id. Measures OFF-lock (a real embed call can take real time —
     must not serialize concurrent callers behind it) and caches with
@@ -232,6 +264,14 @@ def _get_batch_size(provider) -> int:  # noqa: ANN001
     measurement overwrite an already-cached figure. Mirrors
     reranker.py's `_warm_per_doc_latency`, minus its periodic-recompute
     machinery — see module docstring for why this measures only once.
+
+    `scan_cap` is folded into the cached figure via `_derive_batch_size`'s
+    upper clamp: in production `run_embedding_backfill_tick` is always
+    called with the same (default) `scan_cap`, so this is a stable bound;
+    a caller that varied `scan_cap` across calls under the same model_id
+    would get the clamp from whichever call populated the cache first —
+    the same "measured/derived once per process" policy the per-embed
+    timing itself already follows.
     """
     model_id = provider.model_id()
     with _batch_size_cache_lock:
@@ -240,7 +280,7 @@ def _get_batch_size(provider) -> int:  # noqa: ANN001
             return cached
 
     per_embed = _measure_per_embed_seconds(provider)
-    batch = _derive_batch_size(per_embed)
+    batch = _derive_batch_size(per_embed, scan_cap)
 
     with _batch_size_cache_lock:
         _batch_size_cache.setdefault(model_id, batch)
@@ -280,7 +320,7 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
     blind spot this format exists to close); it is treated exactly like any
     other unparseable cursor and reset to ``None``, which just rescans from
     the top. Safe and cheap: a rescan only re-confirms rows already embedded
-    (they no longer satisfy `embedding IS NULL`).
+    under the current model (they no longer satisfy the backlog predicate).
     """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
     try:
@@ -291,18 +331,16 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
         return None
     if raw.get("model_id") != current_model_id:
         # A model swap (or first run under this model) invalidates any prior
-        # cursor position, so the next tick rescans from the top of the
-        # (still-NULL) backlog rather than trusting a position recorded
-        # under a different model_id. NOTE — scope boundary (F1 #259
-        # increment 3): unlike the old content-hash cache, backlog
-        # membership here is plain `embedding IS NULL`, not scoped to
-        # model_id, so a model swap does NOT by itself reopen rows this
-        # backfill already embedded under the PRIOR model (they are not
-        # NULL, so they are simply not in scope for this tick regardless of
-        # cursor position) — this reset only avoids trusting a stale
-        # position, it does not force a full re-embed. Re-embedding under a
-        # new model_id is a later increment's / a dedicated migration's job
-        # (see F1 spec §2's matrix rebuild-on-swap, and §5's migration).
+        # cursor position, so the next tick rescans from the top rather than
+        # trusting a position recorded under a different model_id. As of the
+        # model-mismatch backlog clause (F1 #259 increment 3, folded in
+        # 2026-09-16), this reset is now doubly correct: a model swap DOES
+        # reopen every row embedded under the PRIOR model for this same
+        # backlog query (`embedding_model_id != current_model_id`), so
+        # trusting a cursor position recorded before the swap could skip
+        # straight past exactly the rows the swap just put back in scope.
+        # Resetting to None makes the very next tick a full rescan of the
+        # now-larger (model-mismatched + still-NULL) backlog.
         return None
     cursor = raw.get("cursor")
     if not isinstance(cursor, dict):
@@ -361,8 +399,10 @@ def run_embedding_backfill_tick(
     even read from `memories` this call.
 
     Backlog is exactly `MemoryStore.list_unembedded_since`'s definition:
-    active rows with `embedding IS NULL`. A row is fault-isolated on
-    failure — logged and the tick CONTINUES to the next candidate, never
+    active, long-enough rows with `embedding IS NULL` OR
+    `embedding_model_id` stale under the current model (see module docstring
+    BACKLOG DEFINITION). A row is fault-isolated on failure — logged and the
+    tick CONTINUES to the next candidate, never
     starving later rows — and the persisted cursor is allowed to advance
     PAST a failing row (skip-and-log, F1 #259 increment 3's cursor-freeze
     fix), so one permanently-bad row can never stall the backlog the way it
@@ -372,10 +412,14 @@ def run_embedding_backfill_tick(
 
     provider = embeddings_mod.build_embedding_provider()
     model_id = provider.model_id()
-    effective_batch_size = batch_size if batch_size is not None else _get_batch_size(provider)
+    effective_batch_size = (
+        batch_size if batch_size is not None else _get_batch_size(provider, scan_cap)
+    )
 
     cursor = _load_cursor(persona_dir, model_id)
-    candidates = store.list_unembedded_since(cursor, limit=scan_cap)
+    candidates = store.list_unembedded_since(
+        cursor, limit=scan_cap, current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
+    )
 
     scanned = 0
     embedded = 0
@@ -388,6 +432,12 @@ def run_embedding_backfill_tick(
         row_cursor = (memory.created_at.isoformat(), memory.id)
 
         if len(memory.content) < MIN_CHARS_TO_EMBED:
+            # Defensive/redundant as of F1 #259 increment-3 red-team fix
+            # (F1): `list_unembedded_since` now excludes short rows in SQL
+            # (`length(content) >= min_chars`), which is the load-bearing
+            # exclusion — a short row is no longer even a `candidate` here.
+            # This branch is kept as a defense-in-depth backstop only; it
+            # should never actually trigger against this method's own query.
             skipped_short += 1
             resolved_up_to = row_cursor
             continue

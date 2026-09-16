@@ -551,8 +551,11 @@ def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
 def test_store_list_unembedded_since_excludes_already_embedded_rows(
     store: MemoryStore,
 ) -> None:
-    """A row with a non-NULL embedding never appears in the backlog query —
-    backlog membership is the row's own column, not a side-table lookup."""
+    """A row embedded under the CURRENT model never appears in the backlog
+    query — backlog membership is the row's own columns, not a side-table
+    lookup. (The row is embedded under "some-model", and the query is asked
+    about "some-model" too, so this is the steady-state / no-swap case —
+    see the model-mismatch tests below for the swap case.)"""
     embedded = _mem("already embedded")
     embedded.created_at = datetime(2020, 1, 1, tzinfo=UTC)
     unembedded = _mem("still needs an embedding")
@@ -565,9 +568,64 @@ def test_store_list_unembedded_since_excludes_already_embedded_rows(
     )
     store._conn.commit()
 
-    results = store.list_unembedded_since(None, limit=10)
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
 
     assert [m.id for m in results] == [unembedded.id]
+
+
+def test_store_list_unembedded_since_includes_stale_model_rows(
+    store: MemoryStore,
+) -> None:
+    """FIX A (Planning-ruled 2026-09-16, F1 #259 increment-3 spec-gap): a row
+    embedded under a model_id that no longer matches `current_model_id` (a
+    model swap happened) IS backlog — `embedding_model_id != current` — even
+    though its `embedding` column is non-NULL. Restores the model-scoped
+    self-healing the old content-hash cache had; without this, a post-swap
+    row would fall to lexical recall forever with no re-embed path."""
+    stale = _mem("embedded under the old model")
+    stale.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    current = _mem("embedded under the current model")
+    current.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(stale)
+    store.create(current)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "old-model", stale.id),
+    )
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "new-model", current.id),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="new-model", min_chars=0
+    )
+
+    # The stale-model row IS in the backlog; the current-model row is not.
+    assert [m.id for m in results] == [stale.id]
+
+
+def test_store_list_unembedded_since_excludes_short_rows(
+    store: MemoryStore,
+) -> None:
+    """FIX B (F1 #259 increment-3 red-team): a row under `min_chars` is
+    excluded at the SQL level, not merely skipped Python-side — it never
+    even appears in the returned candidates."""
+    short = _mem("x" * 5)
+    short.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    long_enough = _mem("y" * 25)
+    long_enough.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(short)
+    store.create(long_enough)
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=20
+    )
+
+    assert [m.id for m in results] == [long_enough.id]
 
 
 def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
@@ -581,7 +639,9 @@ def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
     store.create(older)
     store.create(newer)
 
-    results = store.list_unembedded_since(None, limit=10)
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
 
     assert [m.id for m in results] == [older.id, newer.id]
 
@@ -600,7 +660,9 @@ def test_store_list_unembedded_since_excludes_at_or_before_cursor(
     store.create(b)
     store.create(c)
 
-    results = store.list_unembedded_since((b.created_at.isoformat(), b.id), limit=10)
+    results = store.list_unembedded_since(
+        (b.created_at.isoformat(), b.id), limit=10, current_model_id="some-model", min_chars=0
+    )
 
     assert [m.id for m in results] == [c.id]
 
@@ -621,7 +683,9 @@ def test_store_list_unembedded_since_tie_inclusive_on_shared_created_at(
     store.create(first)
     store.create(second)
 
-    results = store.list_unembedded_since((shared_ts.isoformat(), first.id), limit=10)
+    results = store.list_unembedded_since(
+        (shared_ts.isoformat(), first.id), limit=10, current_model_id="some-model", min_chars=0
+    )
 
     assert [m.id for m in results] == [second.id]
 
@@ -633,7 +697,9 @@ def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
         m.created_at = datetime(2020, 1, i + 1, tzinfo=UTC)
         store.create(m)
 
-    results = store.list_unembedded_since(None, limit=2)
+    results = store.list_unembedded_since(
+        None, limit=2, current_model_id="some-model", min_chars=0
+    )
 
     assert len(results) == 2
     assert [m.content for m in results] == ["item-0", "item-1"]
@@ -648,7 +714,9 @@ def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> No
     store.create(inactive)
     store.deactivate(inactive.id)
 
-    results = store.list_unembedded_since(None, limit=10)
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
 
     assert [m.id for m in results] == [active.id]
 
@@ -670,7 +738,12 @@ def test_store_list_unembedded_since_row_reappears_after_going_null_again(
         (b"\x00" * 4, "some-model", m.id),
     )
     store._conn.commit()
-    assert store.list_unembedded_since(None, limit=10) == []
+    assert (
+        store.list_unembedded_since(
+            None, limit=10, current_model_id="some-model", min_chars=0
+        )
+        == []
+    )
 
     store._conn.execute(
         "UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?",
@@ -678,7 +751,9 @@ def test_store_list_unembedded_since_row_reappears_after_going_null_again(
     )
     store._conn.commit()
 
-    results = store.list_unembedded_since(None, limit=10)
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
     assert [row.id for row in results] == [m.id]
 
 
@@ -1159,6 +1234,38 @@ def test_hard_delete_evicts_matrix_entry(tmp_path, monkeypatch: pytest.MonkeyPat
     store.hard_delete(m.id)
 
     assert matrix.get(m.id) is None, "hard_delete must evict the warm-matrix entry"
+    store.close()
+
+
+def test_embed_row_succeeds_even_if_warm_matrix_put_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX D (F1 #259 increment-3 red-team, F3): once the row's own UPDATE
+    has committed, the row IS durably embedded — the DB is the source of
+    truth, the matrix is a cache that self-heals on rebuild. A `put`
+    failure AFTER that commit must be logged, never raised out of
+    `embed_row`, and must never look like the embed itself failed."""
+    from brain.memory import embedding_matrix as embedding_matrix_mod
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="content that gets embedded", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+
+    def _boom_put(self, memory_id: str, vector) -> None:  # noqa: ANN001, ARG001
+        raise RuntimeError("simulated warm-matrix put failure")
+
+    monkeypatch.setattr(embedding_matrix_mod.EmbeddingMatrix, "put", _boom_put)
+
+    store.embed_row(m.id, m.content)  # must NOT raise
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is not None
+    assert row["embedding_model_id"] == provider.model_id()
     store.close()
 
 
