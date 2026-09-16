@@ -57,6 +57,18 @@ def seeded_db(tmp_path) -> Path:
     return db_path
 
 
+@pytest.fixture
+def coherence_db(tmp_path) -> Path:
+    """A memories.db with 12 active, embedded rows (mem-co-0 .. mem-co-11),
+    every one durably holding _vec(1.0) under fake-model-v1. Used by the
+    concurrency-coherence tests, which put/evict against ids that REALLY
+    exist in the DB so a rebuild's reload is a genuine adversary: a lost put
+    reverts to the DB's _vec(1.0), a resurrected row reappears from disk."""
+    db_path = tmp_path / "memories.db"
+    _seed_db(db_path, [(f"mem-co-{i}", _vec(1.0), True) for i in range(12)])
+    return db_path
+
+
 # ---------------------------------------------------------------------------
 # Lazy build
 # ---------------------------------------------------------------------------
@@ -81,9 +93,9 @@ def test_lazy_build_runs_exactly_once_across_repeated_calls(seeded_db, monkeypat
     calls = []
     original = matrix._load_from_db
 
-    def counting_load():
+    def counting_load(*args, **kwargs):
         calls.append(1)
-        return original()
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(matrix, "_load_from_db", counting_load)
     matrix.get("mem-active-1")
@@ -230,10 +242,10 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
     started = threading.Event()
     release = threading.Event()
 
-    def slow_load():
+    def slow_load(*args, **kwargs):
         started.set()
         release.wait(timeout=5)
-        return real_load()
+        return real_load(*args, **kwargs)
 
     monkeypatch.setattr(matrix, "_load_from_db", slow_load)
 
@@ -255,21 +267,84 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
 
 
 # ---------------------------------------------------------------------------
-# Acceptance criterion 3: concurrent reader vs writer (put-storm + rebuild)
+# Acceptance criterion 3: warm-matrix stays COHERENT under concurrent
+# rebuild + put/evict — no lost update, no resurrected row, no stale vector.
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_reads_survive_writer_puts_and_rebuild(seeded_db) -> None:
-    """A recall-style reader thread hammers get()/snapshot() while a
-    supervisor-style writer thread does many per-item puts interleaved with
-    full rebuilds. Assert: no exception, and no torn read — every vector
-    handed back (from either snapshot() or get()) is a full, correctly
-    shaped/typed float32 array, never a partial/short buffer or a
-    half-built matrix, for the whole duration of the concurrent run."""
-    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch) -> None:
+    """DETERMINISTIC coherence proof (fails on the pre-fix wholesale-swap).
+
+    A rebuild's slow DB scan is pinned mid-flight (its off-lock window held
+    open by an event). While it is blocked, three mutations land against ids
+    that DO exist in the DB:
+
+      * put("mem-co-0", 2.0)   — the DB still holds 1.0 for this id
+      * put("mem-co-new", 3.0) — a brand-new id with no DB row at all
+      * evict("mem-co-1")      — the DB still holds a row for this id
+
+    A wholesale `self._vectors = loaded` at swap time (the pre-fix code)
+    discards all three: mem-co-0 reverts to the DB's 1.0 (lost update),
+    mem-co-new vanishes (lost update), mem-co-1 comes back from disk
+    (resurrection). The pending-overlay reconcile re-applies them on top of
+    the freshly-loaded dict, so every mutation survives the rebuild."""
+    matrix = EmbeddingMatrix(coherence_db, model_id="fake-model-v1")
+    matrix.ensure_built()
+    # Baseline: every id currently reads its DB value.
+    np.testing.assert_array_equal(matrix.get("mem-co-0"), _vec(1.0))
+
+    real_load = matrix._load_from_db
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(matrix, "_load_from_db", slow_load)
+
+    rebuild_thread = threading.Thread(target=matrix.rebuild)
+    rebuild_thread.start()
+    # The rebuild has entered its off-lock scan; the pending overlay is now
+    # recording. Land the mutations INSIDE this window.
+    assert started.wait(timeout=5)
+
+    matrix.put("mem-co-0", _vec(2.0))
+    matrix.put("mem-co-new", _vec(3.0))
+    matrix.evict("mem-co-1")
+
+    release.set()
+    rebuild_thread.join(timeout=5)
+    assert not rebuild_thread.is_alive()
+
+    # Lost-update guard: the concurrent put must WIN over the stale reload.
+    np.testing.assert_array_equal(matrix.get("mem-co-0"), _vec(2.0))
+    # Lost-update guard for an id with no DB backing yet: must not vanish.
+    got_new = matrix.get("mem-co-new")
+    assert got_new is not None
+    np.testing.assert_array_equal(got_new, _vec(3.0))
+    # Resurrection guard: the concurrent evict must hold, not be undone.
+    assert "mem-co-1" not in matrix
+    assert matrix.get("mem-co-1") is None
+    # Untouched ids load their correct DB value — not stale, not torn.
+    np.testing.assert_array_equal(matrix.get("mem-co-2"), _vec(1.0))
+
+
+def test_concurrent_reads_survive_writer_puts_and_rebuild(coherence_db) -> None:
+    """Stress/robustness arm: a recall-style reader thread hammers
+    get()/snapshot() while a supervisor-style writer thread does many
+    per-item puts/evicts interleaved with full rebuilds, all against ids
+    that REALLY exist in the DB. Assert: no exception, no torn read (every
+    vector handed back is a full, correctly shaped/typed float32 array), and
+    — after the storm settles on a deterministic final state written AFTER
+    the last rebuild — membership/value coherence: every keeper holds its
+    final value, every deleted id is absent."""
+    matrix = EmbeddingMatrix(coherence_db, model_id="fake-model-v1")
     matrix.ensure_built()
 
-    ids = [f"mem-writer-{i}" for i in range(20)]
+    keeper_ids = [f"mem-co-{i}" for i in range(6)]
+    delete_ids = [f"mem-co-{i}" for i in range(6, 12)]
     stop = threading.Event()
     errors: list[BaseException] = []
 
@@ -281,7 +356,7 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(seeded_db) -> None:
                 for vec in snap.values():
                     assert vec.dtype == np.float32
                     assert vec.shape == (DIM,)
-                for mem_id in ids:
+                for mem_id in keeper_ids:
                     got = matrix.get(mem_id)
                     if got is not None:
                         assert got.dtype == np.float32
@@ -292,11 +367,20 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(seeded_db) -> None:
     def writer() -> None:
         try:
             for round_ in range(50):
-                for i, mem_id in enumerate(ids):
+                for i, mem_id in enumerate(keeper_ids):
                     matrix.put(mem_id, _vec(float(i) + round_ * 0.01))
+                for mem_id in delete_ids:
+                    matrix.evict(mem_id)
                 if round_ % 10 == 0:
+                    # A rebuild here would revert the in-memory puts to the
+                    # DB's _vec(1.0) and resurrect the evicted rows if the
+                    # overlay reconcile were absent.
                     matrix.rebuild()
-            for mem_id in ids:
+            # Deterministic final state, written AFTER the last rebuild so the
+            # post-storm assertions are race-free.
+            for i, mem_id in enumerate(keeper_ids):
+                matrix.put(mem_id, _vec(100.0 + i))
+            for mem_id in delete_ids:
                 matrix.evict(mem_id)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
@@ -315,3 +399,87 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(seeded_db) -> None:
     assert not writer_thread.is_alive()
     assert not any(t.is_alive() for t in reader_threads)
     assert errors == []
+
+    for i, mem_id in enumerate(keeper_ids):
+        np.testing.assert_array_equal(matrix.get(mem_id), _vec(100.0 + i))
+    for mem_id in delete_ids:
+        assert mem_id not in matrix
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: per-row embedding_model_id filter (no stale-model vectors)
+# ---------------------------------------------------------------------------
+
+
+def _insert_row(
+    db_path: Path,
+    mem_id: str,
+    blob: bytes | None,
+    model_id: str | None,
+    *,
+    active: bool = True,
+) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "INSERT INTO memories (id, content, memory_type, domain, emotions_json,"
+            " tags_json, created_at, active, embedding, embedding_model_id)"
+            " VALUES (?, 'body', 'conversation', 'us', '{}', '[]',"
+            " '2026-01-01T00:00:00+00:00', ?, ?, ?)",
+            (mem_id, int(active), blob, model_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_build_loads_only_the_target_model_id(seeded_db) -> None:
+    """A row stamped with a DIFFERENT embedding_model_id must NOT be loaded
+    under the current model's label — otherwise a rebuild during a model
+    swap serves stale-model vectors under the new model_id."""
+    _insert_row(seeded_db, "mem-other-model", _vec(0.5).tobytes(), "fake-model-v2")
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    snap = matrix.snapshot()
+    assert "mem-other-model" not in snap
+    assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
+
+
+def test_rebuild_onto_new_model_id_loads_only_that_models_rows(seeded_db) -> None:
+    """After a model swap, rebuild(model_id=v2) loads ONLY the v2 rows — the
+    old v1 vectors are dropped, not re-served under the v2 label."""
+    _insert_row(seeded_db, "mem-v2-a", _vec(0.7).tobytes(), "fake-model-v2")
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    matrix.ensure_built()
+    assert set(matrix.snapshot().keys()) == {"mem-active-1", "mem-active-2"}
+
+    matrix.rebuild(model_id="fake-model-v2")
+    assert matrix.model_id == "fake-model-v2"
+    assert set(matrix.snapshot().keys()) == {"mem-v2-a"}
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: per-row decode guard (one bad blob must not kill the build)
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_embedding_blob_is_skipped_not_fatal(seeded_db) -> None:
+    """A short/corrupt embedding blob on one row must be skipped-and-logged,
+    not throw and take down the whole build (which would propagate into
+    recall via the request-thread lazy build)."""
+    _insert_row(seeded_db, "mem-corrupt", b"\x00\x01\x02", "fake-model-v1")
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    snap = matrix.snapshot()  # must not raise
+    assert "mem-corrupt" not in snap
+    # The good rows still loaded.
+    assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
+
+
+def test_wrong_dim_embedding_blob_is_skipped(seeded_db) -> None:
+    """A blob whose byte length is a clean float32 multiple but the wrong
+    dimension (not 384) is skipped, not served as a malformed vector."""
+    wrong = np.full(128, 0.5, dtype=np.float32).tobytes()  # 128-dim, not 384
+    _insert_row(seeded_db, "mem-wrong-dim", wrong, "fake-model-v1")
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    snap = matrix.snapshot()
+    assert "mem-wrong-dim" not in snap
+    assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
