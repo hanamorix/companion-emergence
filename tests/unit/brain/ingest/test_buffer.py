@@ -158,8 +158,6 @@ def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
     the whole pytest session at ~42% on windows-latest). The probe must
     delegate to state_file.pid_is_alive, which carries the Windows-safe
     branch — and brain/ingest must contain no direct os.kill at all."""
-    import subprocess
-
     from brain.bridge import state_file
     from brain.ingest import buffer as buffer_mod
 
@@ -174,15 +172,16 @@ def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
     assert buffer_mod._pid_alive(0) is False
     assert sentinel_calls == [4242]
 
-    # Grep-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
-    # class). Doc mentions (backtick-quoted) are allowed; .pyc excluded.
-    result = subprocess.run(
-        ["grep", "-rn", "--include=*.py", r"os\.kill(", "brain/ingest/"],
-        capture_output=True,
-        text=True,
-        cwd=str(Path(__file__).resolve().parents[4]),
-    )
-    code_hits = [ln for ln in result.stdout.splitlines() if "``" not in ln]
+    # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
+    # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
+    # shelling out to ``grep`` failed on stock Windows (#262).
+    ingest_dir = Path(__file__).resolve().parents[4] / "brain" / "ingest"
+    code_hits = [
+        f"{py.relative_to(ingest_dir.parent.parent).as_posix()}:{lineno}:{line}"
+        for py in sorted(ingest_dir.rglob("*.py"))
+        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1)
+        if "os.kill(" in line and "``" not in line
+    ]
     assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
 
 
@@ -425,3 +424,58 @@ def test_delete_backoff_is_idempotent(tmp_path: Path) -> None:
 def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         write_backoff(tmp_path, "sess_abc", failures=1, first_failure_at="garbage")
+
+
+# ── #198: rewrite_session_atomic survives a transient os.replace refusal ─────
+# Windows refuses os.replace over a file another handle holds open (a GET
+# /chat/history streaming the buffer). Mirror _unlink_with_retry: bounded
+# retry, and never leave the .jsonl.tmp behind.
+
+
+def _seed_session(persona_dir: Path, sid: str) -> Path:
+    from brain.ingest.buffer import _session_path, ingest_turn
+
+    ingest_turn(persona_dir, {"session_id": sid, "speaker": "user", "text": "hi"})
+    return _session_path(persona_dir, sid)
+
+
+def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, monkeypatch):
+    import os as _os
+
+    from brain.ingest import buffer as buf
+
+    sid = "11111111-1111-4111-8111-111111111111"
+    path = _seed_session(tmp_path, sid)
+    real_replace = _os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(32, "in use")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(buf.os, "replace", flaky)
+    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "rewritten"}])
+    assert calls["n"] == 3
+    assert path.read_text(encoding="utf-8").strip() == '{"speaker": "assistant", "text": "rewritten"}'
+    assert not path.with_suffix(".jsonl.tmp").exists()
+
+
+def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
+    from brain.ingest import buffer as buf
+
+    sid = "22222222-2222-4222-8222-222222222222"
+    path = _seed_session(tmp_path, sid)
+    before = path.read_text(encoding="utf-8")
+
+    def always(src, dst):
+        raise PermissionError(32, "in use")
+
+    monkeypatch.setattr(buf.os, "replace", always)
+    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    with pytest.raises(PermissionError):
+        buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
+    assert path.read_text(encoding="utf-8") == before  # old buffer untouched
+    assert not path.with_suffix(".jsonl.tmp").exists()  # no litter

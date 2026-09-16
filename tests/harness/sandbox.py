@@ -985,10 +985,11 @@ def sandbox(
         # derived guard computation above ever sees the synthetic HOME. Same serial-use assumption as the
         # existing $USER/$LOGNAME de-id (sandbox() is documented not-thread-safe / not-nestable).
         #
-        # Carrier A — neutral cwd: brain/bridge/provider.py spawns `claude -p` with NO cwd=, so the CLI
-        # inherits the process cwd. Point it at a de-identified scratch dir (a bare child of the tempdir
-        # root — not a git repo, no ancestor CLAUDE.md) so the CLI's working-dir/git block and the
-        # .claude.json `projects` key name nothing real. (Verified: no brain/ code depends on cwd==repo.)
+        # Carrier A — neutral cwd for the BRIDGE PROCESS. Since #122 brain/bridge/provider.py passes an
+        # explicit cwd= (its own memory-free dir under the REAL tempdir — the sandbox sets no TMPDIR —
+        # an empty dir not fingerprinted by _guarded_roots and carrying no identity) to every
+        # `claude -p`, so this chdir no longer reaches the CLI; it still de-identifies anything the
+        # bridge process itself derives from os.getcwd(). (Verified: no brain/ code depends on cwd==repo.)
         work_dir = root / "work"
         work_dir.mkdir(parents=True, exist_ok=True)
         # Carrier C — synthetic HOME: an empty ~/.claude (no CLAUDE.md) so the CLI's global user-memory

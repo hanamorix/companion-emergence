@@ -307,6 +307,13 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     ``compaction`` provenance object) and exact byte content survive. Used by
     compaction to install ``[summary, *retained_tail]``. Temp file + os.replace
     mirrors ``write_cursor`` so a reader never sees a torn buffer.
+
+    The replace gets the same bounded retry as ``_unlink_with_retry`` (#198):
+    Windows refuses ``os.replace`` over a file another handle holds open — a
+    ``GET /chat/history`` streaming this buffer is the realistic case, and it
+    finishes in milliseconds. On POSIX the retry never triggers. After the
+    budget the error re-raises (the old buffer is intact) and the temp file is
+    removed so a repeated collision cannot litter ``active_conversations``.
     """
     path = _session_path(persona_dir, session_id)
     tmp = path.with_suffix(".jsonl.tmp")
@@ -315,7 +322,15 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    for attempt in range(_UNLINK_RETRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _UNLINK_RETRIES - 1:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
 
 
 # Archive rotation (1d). A single unbounded ``<sid>.jsonl`` grows without limit on

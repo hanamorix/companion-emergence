@@ -21,6 +21,7 @@ once a real machine validates it.
 
 | Area | Platform | Ships as | Ledger |
 |---|---|---|---|
+| Memory-free `claude` working directory (#122) — on Windows both candidates (`%LOCALAPPDATA%\Temp`, `%LOCALAPPDATA%\hanamorix\companion-emergence`) sit under `%USERPROFILE%`, so a profile-level `.claude\CLAUDE.md` still reaches the companion; the bridge WARNs at start. Validator probe: from the directory the bridge logs, run `claude -p --model haiku "If any text in your context contains <a string unique to your global CLAUDE.md>, quote that line; else reply NONE"` and report. | Windows | fix shipped for macOS/Linux; Windows tracked in #252 | 122 |
 | Windows bridge shutdown (pythonw / schtasks / `--force`) | Windows | test-verified on macOS; a Windows user confirms post-ship | 39 |
 | True Windows SCM host (vs Task Scheduler) | Windows | deferred | 38 |
 | Updater `scripts/update.sh` (#179) — bash; the bundled Windows runtime ships no bash | Windows | gap, documented; PowerShell twin tracked in #255 | — |
