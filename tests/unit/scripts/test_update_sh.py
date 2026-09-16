@@ -120,7 +120,7 @@ def test_bundled_without_source_clones_ref(tmp_path):
     )
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anything")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() == 0, reason="root can write anything")
 def test_unwritable_root_plans_sudo(tmp_path):
     root = _bundled_root(tmp_path / "python-runtime")
     src = _src(tmp_path)
