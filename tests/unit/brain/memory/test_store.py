@@ -858,6 +858,202 @@ def test_hard_delete_raises_on_unknown_id() -> None:
     store.close()
 
 
+# ---------------------------------------------------------------------------
+# F1 #259 step 5: content-mutation invalidation. fade() / update(content=) /
+# unfade() must synchronously re-embed (row + warm matrix); hard_delete()
+# must evict the matrix entry. A failed re-embed clears the row's stale
+# vector rather than leaving it describing old content.
+#
+# These use a REAL tmp_path db FILE, never MemoryStore(":memory:") — the
+# warm matrix's lazy build opens its OWN separate sqlite3 connection to
+# `store.db_path` and reloads straight from disk; an in-memory-only store's
+# writes are invisible to that connection (two independent `:memory:`
+# databases), so a `put()` would look like it landed but silently vanish on
+# the next `ensure_built()`.
+# ---------------------------------------------------------------------------
+
+
+def _use_384_fake_provider(monkeypatch: pytest.MonkeyPatch):
+    """Override the process-cached embedding provider to a 384-dim
+    `FakeEmbeddingProvider` and align `model_tier`'s embedding tier to its
+    model id.
+
+    Two separate reasons this alignment is needed, both load-bearing for
+    every test below:
+      (1) DIMENSION — the suite-wide autouse fixture fakes the provider to
+          `FakeEmbeddingProvider(dim=256)`, but `EmbeddingMatrix` hardcodes
+          an expected blob width of 384 (matching production's real
+          `MODEL_EMBEDDING_DIM`) and silently SKIPS any other-width row — a
+          256-dim embed would never appear in the matrix no matter what.
+      (2) MODEL ID — `embed_row` embeds via the process-cached provider, but
+          the matrix's lazy-build filter is sourced from
+          `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a
+          SEPARATE lookup that must be aligned or the matrix's first read
+          reloads from disk filtered to the wrong model id and finds
+          nothing.
+    """
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    return provider
+
+
+def test_fade_reembeds_row_and_matrix_with_new_content(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: without `_reembed_or_clear` wired into `fade()`, the
+    row's embedding would stay the ORIGINAL content's vector (embed_row was
+    only ever called once, at simulated embed-on-write time) instead of the
+    faded summary's — a stale vector under new content."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)  # simulate embed-on-write already having run
+
+    store.fade(m.id, summary="short summary")
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is not None
+    expected = provider.embed("short summary").astype(np.float32).tobytes()
+    assert row["embedding"] == expected, "the row vector must reflect the NEW (faded) content, not the original"
+    assert row["embedding_model_id"] == provider.model_id()
+
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(matrix.get(m.id), provider.embed("short summary").astype(np.float32))
+    store.close()
+
+
+def test_update_content_reembeds_row_and_matrix(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: `update(memory_id, content=...)` never re-embedded, so
+    the row kept the OLD content's vector after a content mutation."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    store.update(m.id, content="brand new content")
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = provider.embed("brand new content").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(matrix.get(m.id), provider.embed("brand new content").astype(np.float32))
+    store.close()
+
+
+def test_update_without_content_does_not_reembed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-content field update must NOT trigger a re-embed — only a
+    `content` change invalidates the vector."""
+    _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="stable content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    before = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+
+    store.update(m.id, importance=7.0)
+
+    after = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert after == before, "a non-content update must never touch the row's embedding"
+    store.close()
+
+
+def test_unfade_reembeds_row_and_matrix_with_restored_content(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails pre-fix: `unfade()` never re-embedded, so the row kept the
+    fade-summary's vector after content was restored to the full body."""
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="the full original body", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    store.fade(m.id, summary="short summary")  # row now embeds "short summary"
+
+    store.unfade(m.id)
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = provider.embed("the full original body").astype("float32").tobytes()
+    assert row["embedding"] == expected, (
+        "unfade must re-embed the RESTORED content, not leave the fade-summary's vector"
+    )
+    store.close()
+
+
+def test_hard_delete_evicts_matrix_entry(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: hard_delete dropped the row but never evicted the
+    matrix entry, leaving a deleted memory's vector resurrectable in the
+    warm cache."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="to be deleted", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    matrix = build_embedding_matrix(store.db_path)
+    assert matrix.get(m.id) is not None  # sanity: present before delete
+
+    store.hard_delete(m.id)
+
+    assert matrix.get(m.id) is None, "hard_delete must evict the warm-matrix entry"
+    store.close()
+
+
+def test_reembed_or_clear_clears_row_and_evicts_matrix_on_embed_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the re-embed itself fails (provider/model error), the row's stale
+    vector must be CLEARED (never left describing the OLD content) and the
+    matrix entry evicted — a NULL row (picked up by the later idle backfill)
+    is always safer than a vector silently describing stale content."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    def _boom_embed(text: str):
+        raise RuntimeError("simulated embed failure")
+
+    monkeypatch.setattr(provider, "embed", _boom_embed)
+
+    store.update(m.id, content="new content that cannot be embedded")
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is None
+    assert row["embedding_model_id"] is None
+
+    matrix = build_embedding_matrix(store.db_path)
+    assert matrix.get(m.id) is None
+    store.close()
+
+
 def test_get_bumps_last_accessed_at_and_recall_count() -> None:
     store = MemoryStore(":memory:")
     m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})

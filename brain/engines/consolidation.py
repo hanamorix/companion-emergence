@@ -406,6 +406,20 @@ def _dispatch(
     if verdict == "correction" and decision.target_id:
         cand.metadata = {**cand.metadata, "correction_of": decision.target_id}
     store.create(cand)
+    # F1 #259 step 4: embed-on-write at the pending-queue -> committed-memory
+    # promotion — the steady-state embedding path (the idle backfill only
+    # mops up rows this misses). Local try/except: a failed embed must never
+    # abort the drain tick or lose the just-promoted candidate — leave the
+    # row's embedding NULL and let the later idle backfill pick it up.
+    try:
+        store.embed_row(cand.id, cand.content)
+    except Exception:  # noqa: BLE001 — degrade to backfill, never abort the drain
+        logger.warning(
+            "consolidation._dispatch: embed_row failed for promoted id=%s — "
+            "leaving embedding NULL for the idle backfill",
+            cand.id,
+            exc_info=True,
+        )
     if verdict in ("correction", "continuation") and decision.target_id and hebbian is not None:
         hebbian.set_edge_weight(cand.id, decision.target_id, ASSOC_WEIGHT)
 

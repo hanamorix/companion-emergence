@@ -16,12 +16,13 @@ below any floor (see that class's docstring) — neither can exercise a
 SPECIFIC semantic relationship like "paraphrase beats keyword-overlap
 decoy" on its own, which is exactly what the #88 acceptance case needs.
 
-Vectors are seeded into `<persona_dir>/embeddings.db` directly (mirroring
-"the idle backfill already ran"), and
-`brain.memory.embeddings.build_embedding_provider` /
-`brain.memory.semantic_recall.build_reranker_provider` are monkeypatched to
-scripted providers so the query embed / rerank call issued at recall time
-share the seeded pool.
+Vectors are seeded directly onto each memory row's `embedding` /
+`embedding_model_id` columns (F1 #259: the warm matrix reads these row
+columns, not the old content-hash `embeddings.db` cache), mirroring "the
+embed-on-write / idle backfill already ran". `brain.memory.embeddings.
+build_embedding_provider` / `brain.memory.semantic_recall.
+build_reranker_provider` are monkeypatched to scripted providers so the
+query embed / rerank call issued at recall time share the seeded pool.
 """
 
 from __future__ import annotations
@@ -35,12 +36,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from brain.bridge import model_tier
 from brain.chat.prompt import _build_recall_block
-from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider
+from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.relevance import SNIPPET_COUNT
 from brain.memory.reranker import FakeRerankerProvider
 from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
+
+_SCRIPTED_MODEL_ID = "scripted-test"
+# Row vectors now flow through EmbeddingMatrix, which enforces a FIXED
+# 384-dim blob width (`brain.memory.embedding_matrix._EXPECTED_DIM`) and
+# silently skips any row whose blob is a different length — a 2-dim test
+# vector would simply never appear in a `matrix.snapshot()`. All scripted
+# vectors here are padded to this width (see `_unit_vec_with_cosine` /
+# `_query_unit_vec`) so they survive the matrix read path.
+_EMBED_DIM = 384
 
 
 class _ScriptedProvider(EmbeddingProvider):
@@ -61,17 +72,38 @@ class _ScriptedProvider(EmbeddingProvider):
         return self._dim
 
     def model_id(self) -> str:
-        return "scripted-test"
+        return _SCRIPTED_MODEL_ID
 
 
 def _unit_vec_with_cosine(score: float) -> np.ndarray:
-    """A 2-D unit vector whose cosine similarity against [1.0, 0.0] is
-    exactly `score` (for |score| <= 1)."""
-    return np.array([score, math.sqrt(max(0.0, 1.0 - score * score))], dtype=np.float32)
+    """A `_EMBED_DIM`-wide vector whose cosine similarity against
+    `_query_unit_vec()` is exactly `score` (for |score| <= 1) — only the
+    first two components are non-zero; the zero padding contributes nothing
+    to either the dot product or the norm, so it never perturbs the
+    hand-chosen cosine relationship."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = score
+    vec[1] = math.sqrt(max(0.0, 1.0 - score * score))
+    return vec
 
 
-def _store() -> MemoryStore:
-    return MemoryStore(":memory:")
+def _query_unit_vec() -> np.ndarray:
+    """The `_EMBED_DIM`-wide vector `_unit_vec_with_cosine`'s cosine scores
+    are measured against — the scripted "query" vector."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = 1.0
+    return vec
+
+
+def _store(tmp_path: Path) -> MemoryStore:
+    """A REAL memories.db file under `persona_dir` — NOT `:memory:`. The
+    warm matrix `run_semantic_recall` builds reads from `store.db_path`
+    directly (its own separate sqlite3 connection); an in-memory store's
+    writes would be invisible to it (two independent `:memory:` databases).
+    `persona_dir` IS `tmp_path` throughout this file (every
+    `_build_recall_block` call below passes `persona_dir=tmp_path`), so the
+    store's backing file lives at the same path the matrix reads."""
+    return MemoryStore(tmp_path / "memories.db")
 
 
 def _mem(store: MemoryStore, content: str, *, importance: float = 1.0) -> Memory:
@@ -87,15 +119,18 @@ def _mem(store: MemoryStore, content: str, *, importance: float = 1.0) -> Memory
     return m
 
 
-def _seed_vectors(persona_dir: Path, vectors: dict[str, np.ndarray], *, dim: int, contents: list[str]) -> None:
-    """Pre-populate embeddings.db as if the idle backfill already embedded
-    `contents` (memory bodies only — never the query text itself)."""
-    cache = EmbeddingCache(persona_dir / "embeddings.db", _ScriptedProvider(vectors, dim=dim))
-    try:
-        for content in contents:
-            cache.get_or_compute(content)
-    finally:
-        cache.close()
+def _seed_vectors(store: MemoryStore, vectors: dict[str, np.ndarray], *, contents_by_id: dict[str, str]) -> None:
+    """Write a vector directly onto each memory row's `embedding` /
+    `embedding_model_id` columns. `contents_by_id` maps memory id -> its
+    content, used to look the right vector up in `vectors` (keyed by
+    content, matching `_patch_provider`'s scripting)."""
+    for memory_id, content in contents_by_id.items():
+        vec = vectors[content]
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (np.asarray(vec, dtype=np.float32).tobytes(), _SCRIPTED_MODEL_ID, memory_id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarray], *, dim: int) -> None:
@@ -103,6 +138,15 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
         "brain.memory.embeddings.build_embedding_provider",
         lambda: _ScriptedProvider(vectors, dim=dim),
     )
+    # `run_semantic_recall` sources its candidate pool via
+    # `build_embedding_matrix`, which derives the matrix's filter model id
+    # from `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) —
+    # NOT from whichever provider `build_embedding_provider` is patched to
+    # above. Align the two so the matrix's lazy-build filter matches what
+    # `_seed_vectors` stamped on the rows; otherwise the first matrix read
+    # reloads from disk filtered to the real production model id, finds
+    # nothing, and silently discards the seeded vectors.
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -146,18 +190,18 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
     target = "deep breathing helps when you are feeling anxious"
     decoy = "too much of a flood of party invitations this week"
 
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         target: _unit_vec_with_cosine(0.95),
         decoy: _unit_vec_with_cosine(0.60),
     }
 
-    store = _store()
+    store = _store(tmp_path)
     m_target = _mem(store, target)
     m_decoy = _mem(store, decoy)
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target, decoy])
+    _seed_vectors(store, vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
     _patch_provider(monkeypatch, vectors, dim=dim)
     _patch_reranker(
         monkeypatch,
@@ -186,12 +230,14 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
 def test_exact_name_recall_not_regressed_when_semantic_is_inconclusive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    dim = 2
+    dim = _EMBED_DIM
     unrelated_a = "the weather was pleasant that afternoon"
     unrelated_b = "a quiet evening with nothing much happening"
+    _vec_up = np.zeros(_EMBED_DIM, dtype=np.float32)
+    _vec_up[1] = 1.0
     vectors = {
-        unrelated_a: np.array([0.0, 1.0], dtype=np.float32),
-        unrelated_b: np.array([0.0, 1.0], dtype=np.float32),
+        unrelated_a: _vec_up,
+        unrelated_b: _vec_up,
         # "Zoraida" (the query below) is deliberately NOT scripted here, so
         # it embeds to an all-zero vector at recall time — cosine 0.0
         # against everything. No reranker score is scripted for either
@@ -200,12 +246,14 @@ def test_exact_name_recall_not_regressed_when_semantic_is_inconclusive(
         # though the candidate pool itself is non-empty.
     }
 
-    store = _store()
-    _mem(store, unrelated_a)
-    _mem(store, unrelated_b)
+    store = _store(tmp_path)
+    m_unrelated_a = _mem(store, unrelated_a)
+    m_unrelated_b = _mem(store, unrelated_b)
     proper_noun_mem = _mem(store, "Zoraida visited the old lighthouse last spring")
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[unrelated_a, unrelated_b])
+    _seed_vectors(
+        store, vectors, contents_by_id={m_unrelated_a.id: unrelated_a, m_unrelated_b.id: unrelated_b}
+    )
     _patch_provider(monkeypatch, vectors, dim=dim)
 
     # A bare "Zoraida" (rather than "tell me about Zoraida") keeps every
@@ -228,7 +276,7 @@ def test_exact_name_recall_not_regressed_when_semantic_is_inconclusive(
 
 
 def test_warmup_empty_vector_store_falls_back_to_lexical(tmp_path: Path) -> None:
-    store = _store()
+    store = _store(tmp_path)
     m = _mem(store, "jordan was here that summer")
 
     # No embeddings.db seeded at all — cold-start / backfill hasn't run yet.
@@ -249,25 +297,27 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     query = "target query"
-    dim = 2
+    dim = _EMBED_DIM
     contents = [f"standout memory number {i}" for i in range(6)]
     noise_content = "noise memory scored but never surfaced"
 
     # Cosine vectors just need to be nonzero and distinct enough to populate
     # + coarse-cut the pool — the reranker score (below) is what actually
     # decides tiers under #231.
-    vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
+    vectors = {query: _query_unit_vec()}
     for i, content in enumerate(contents):
         vectors[content] = _unit_vec_with_cosine(0.9 - 0.02 * i)
     vectors[noise_content] = _unit_vec_with_cosine(0.5)
 
-    store = _store()
+    store = _store(tmp_path)
     mems = [_mem(store, c) for c in contents]
     noise_mem = _mem(store, noise_content)
     before = {m.id: _rc(store, m.id) for m in mems}
     before_noise = _rc(store, noise_mem.id)
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[*contents, noise_content])
+    contents_by_id = {m.id: c for m, c in zip(mems, contents, strict=True)}
+    contents_by_id[noise_mem.id] = noise_content
+    _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _patch_reranker(
         monkeypatch,
@@ -309,17 +359,17 @@ def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     query = "capped query"
-    dim = 2
+    dim = _EMBED_DIM
     contents = [f"clearly relevant memory number {i}" for i in range(12)]
 
-    vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
+    vectors = {query: _query_unit_vec()}
     for i, content in enumerate(contents):
         vectors[content] = _unit_vec_with_cosine(0.9 - 0.01 * i)
 
-    store = _store()
+    store = _store(tmp_path)
     mems = [_mem(store, c) for c in contents]
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=contents)
+    _seed_vectors(store, vectors, contents_by_id={m.id: c for m, c in zip(mems, contents, strict=True)})
     _patch_provider(monkeypatch, vectors, dim=dim)
     _patch_reranker(
         monkeypatch,
@@ -350,7 +400,7 @@ def test_nothing_clears_floor_engages_lexical_fallback_ordered_by_blend(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     query = "harbor query"
-    dim = 2
+    dim = _EMBED_DIM
 
     # Strong lexical match (many mentions, short body).
     lexical_strong = "harbor harbor harbor harbor harbor"
@@ -361,17 +411,18 @@ def test_nothing_clears_floor_engages_lexical_fallback_ordered_by_blend(
     )
     contents = [lexical_strong, lexical_weak] + [f"harbor filler memory {i}" for i in range(6)]
 
-    vectors = {query: np.array([1.0, 0.0], dtype=np.float32)}
+    vectors = {query: _query_unit_vec()}
     for content in contents:
         vectors[content] = _unit_vec_with_cosine(0.5)  # populates the pool; irrelevant to the outcome
 
-    store = _store()
+    store = _store(tmp_path)
     mem_strong = _mem(store, lexical_strong)
     mem_weak = _mem(store, lexical_weak)
-    for content in contents[2:]:
-        _mem(store, content)
+    other_mems = [_mem(store, content) for content in contents[2:]]
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=contents)
+    contents_by_id = {mem_strong.id: lexical_strong, mem_weak.id: lexical_weak}
+    contents_by_id.update({m.id: c for m, c in zip(other_mems, contents[2:], strict=True)})
+    _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
     # No reranker scores scripted at all — every candidate falls to
     # FakeRerankerProvider's below-floor default, so NOTHING clears

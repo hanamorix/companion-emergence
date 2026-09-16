@@ -61,7 +61,8 @@ from pathlib import Path
 import numpy as np
 
 from brain.memory import reranker as reranker_mod
-from brain.memory.embeddings import build_embedding_cache, cosine_similarity, hash_content
+from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
+from brain.memory.embeddings import build_embedding_cache, cosine_similarity
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.store import Memory, MemoryStore
 
@@ -173,19 +174,25 @@ def select_standouts(reranked_desc: list[tuple[str, float]]) -> SemanticSurfacin
 
 
 def build_semantic_candidate_pool(
-    store: MemoryStore, embeddings_cache
+    store: MemoryStore, matrix: EmbeddingMatrix
 ) -> dict[str, tuple[Memory, np.ndarray]]:
-    """Active-STATE memories that already have a cached vector under THIS
-    cache's model_id, paired with that vector.
+    """Active-STATE memories that already have a vector on their row under
+    the warm matrix's model_id, paired with that vector.
 
-    Deliberately NEVER computes a new embedding for an uncached memory —
+    Deliberately NEVER computes a new embedding for an unembedded memory —
     that would be exactly the forbidden hot-path bulk embed. An active
-    memory with no cached vector yet (the idle backfill hasn't reached it)
-    simply isn't a semantic candidate this turn. This IS the "graceful
-    warm-up" contract from the spec: semantic coverage grows as the corpus
-    embeds; a cold/sparse persona degrades to the lexical fallback (empty
-    pool here -> `run_semantic_recall` returns None) until backfill catches
-    up.
+    memory with no row vector yet (embed-on-write hasn't reached it, or the
+    later idle backfill hasn't caught it up) simply isn't a semantic
+    candidate this turn. This IS the "graceful warm-up" contract from the
+    spec: semantic coverage grows as the corpus embeds; a cold/sparse
+    persona degrades to the lexical fallback (empty pool here ->
+    `run_semantic_recall` returns None) until backfill catches up.
+
+    Sources vectors from `matrix.snapshot()` (F1 increment 2) — a
+    `{memory_id: vector}` map keyed identically to the row's own id, so
+    joining against `store.list_active()` is a direct id lookup, no
+    content-hash join needed (the old `embeddings_cache.all_hashes_and_
+    vectors()` + `hash_content(mem.content)` join this replaces).
 
     Fold-in fix (b), #231 (2026-09-10): filters to ``mem.state == "active"``.
     ``store.list_active()`` filters only the ``active`` deactivation flag,
@@ -203,14 +210,14 @@ def build_semantic_candidate_pool(
     scoring must never tick the counter (only actual surfacing does, via the
     caller's `bump_recall` calls on the final selected set).
     """
-    hash_to_vector = dict(embeddings_cache.all_hashes_and_vectors())
-    if not hash_to_vector:
+    vectors = matrix.snapshot()
+    if not vectors:
         return {}
     pool: dict[str, tuple[Memory, np.ndarray]] = {}
     for mem in store.list_active():
         if mem.state != "active":
             continue
-        vec = hash_to_vector.get(hash_content(mem.content))
+        vec = vectors.get(mem.id)
         if vec is not None:
             pool[mem.id] = (mem, vec)
     return pool
@@ -281,7 +288,8 @@ def run_semantic_recall(
         return None
     try:
         try:
-            pool = build_semantic_candidate_pool(store, embeddings_cache)
+            matrix = build_embedding_matrix(store.db_path)
+            pool = build_semantic_candidate_pool(store, matrix)
             if not pool:
                 return None
             try:

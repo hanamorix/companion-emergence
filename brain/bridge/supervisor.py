@@ -102,6 +102,7 @@ from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
 )
+from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -1719,8 +1720,6 @@ def _run_narrative_memory_pass(
     """
     # Local imports keep the module-load surface light — narrative_memory
     # is only exercised on the (slow) soul-review cadence.
-    import numpy as np
-
     from brain.felt_time import FeltTime
     from brain.felt_time.anchors import scan_since as anchors_scan_since
     from brain.forgetting import _load_soul_linked_ids
@@ -1832,8 +1831,7 @@ def _run_narrative_memory_pass(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings_cache = build_embedding_cache(persona_dir)
-        stack.callback(embeddings_cache.close)
+        matrix = build_embedding_matrix(store.db_path)
 
         # FeltTime read — get_state() is cheap, doesn't tick.
         felt_time_state = FeltTime(persona_dir=persona_dir).get_state()
@@ -1845,18 +1843,19 @@ def _run_narrative_memory_pass(
         class _EmbeddingsByMemoryId:
             """Adapter exposing the narrative_memory EmbeddingsView protocol.
 
-            Maps memory_id -> content -> cached vector via store + embedding
-            cache. Returns None when the memory is missing or the embedding
-            provider raises (defensive — the membership path falls back).
+            F1 increment 2: pure read off the warm matrix, keyed by
+            memory_id directly — no more store.get() (which would bump
+            recall_count) + embeddings_cache.get_or_compute() compute-on-miss
+            (approved flag-3 read-only behavior: an unembedded memory simply
+            has no membership vector this pass, it is never embedded as a
+            side effect of a membership check). Returns None on a miss (id
+            unknown to the matrix, or not yet embedded) or if the matrix
+            itself raises (defensive — the membership path falls back).
             """
 
             def get(self, memory_id: str):
                 try:
-                    mem = store.get(memory_id)
-                    if mem is None:
-                        return None
-                    vec = embeddings_cache.get_or_compute(mem.content)
-                    return np.asarray(vec)
+                    return matrix.get(memory_id)
                 except Exception:
                     return None
 

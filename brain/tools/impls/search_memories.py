@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain.memory import reranker as reranker_mod
+from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import build_embedding_cache, cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
@@ -132,7 +133,8 @@ def _semantic_top_k(
         return None
     try:
         try:
-            pool = build_semantic_candidate_pool(store, embeddings_cache)
+            matrix = build_embedding_matrix(store.db_path)
+            pool = build_semantic_candidate_pool(store, matrix)
             if not pool:
                 return None
             try:

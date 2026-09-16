@@ -143,6 +143,63 @@ def test_c5_promote_creates_row_and_round_trips_fields(persona):
     assert got.metadata.get("k") == "v"
 
 
+# --------------------------------------------------------------------------- F1 #259 step 4
+def test_embed_on_write_promoted_memory_has_row_embedding_and_matrix_entry(
+    persona, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 #259 step 4 (embed-on-write): a candidate promoted via
+    `consolidation._dispatch` (the ``store.create(cand)`` call at the
+    promote branch) must have its row `embedding` populated and its warm
+    matrix entry set IMMEDIATELY — the steady-state path, not waiting for
+    the next idle backfill tick. Fails pre-fix: without the
+    `store.embed_row(cand.id, cand.content)` call right after
+    `store.create(cand)`, the row's `embedding` column stays NULL and the
+    matrix never sees the id."""
+    tmp, store, hebbian, queue = persona
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    # Two separate alignments needed for this test's `matrix.get(...)` check
+    # to actually find what `embed_row` wrote:
+    #  (1) DIMENSION — the suite-wide autouse fixture fakes the provider to
+    #      FakeEmbeddingProvider(dim=256), but EmbeddingMatrix hardcodes an
+    #      expected blob width of 384 (matching production's real
+    #      MODEL_EMBEDDING_DIM) and silently SKIPS any other-width row (see
+    #      `_load_from_db`'s per-row decode guard) — a 256-dim embed would
+    #      never appear in the matrix no matter what. Override locally to a
+    #      384-dim fake provider.
+    #  (2) MODEL ID — `embed_row` embeds via the process-cached provider,
+    #      but the matrix's lazy-build filter is sourced from
+    #      `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a
+    #      SEPARATE lookup (see tests/unit/brain/memory/test_semantic_recall.py's
+    #      `_align_embedding_tier` for the identical need). Align the two.
+    fake_provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: fake_provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, fake_provider.model_id())
+
+    content = "a memory that should be embedded immediately at promotion"
+    m = _mem(content, "dream")
+    queue.enqueue(m, source="x")
+    run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=_stub({content: Decision("new")}),
+    )
+
+    hits = store.search_text("embedded immediately at promotion")
+    assert len(hits) == 1
+    promoted = hits[0]
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (promoted.id,)
+    ).fetchone()
+    assert row["embedding"] is not None, "row embedding must be populated at promotion time, not NULL"
+    assert row["embedding_model_id"] == fake_provider.model_id()
+
+    matrix = build_embedding_matrix(store.db_path)
+    assert matrix.get(promoted.id) is not None, "the warm matrix must reflect the embed immediately"
+
+
 # --------------------------------------------------------------------------- C6
 def test_c6_pass1_exact_dup_only_never_non_identical(persona):
     tmp, store, hebbian, queue = persona

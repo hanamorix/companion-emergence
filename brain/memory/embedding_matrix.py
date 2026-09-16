@@ -1,12 +1,17 @@
-"""Warm in-process vector matrix over `memories.embedding` (F1, #259 step 2).
+"""Warm in-process vector matrix over `memories.embedding` (F1, #259 step 2+).
 
 A process-level `{memory_id -> np.ndarray(float32, 384-dim)}` map, sourced
 from the `embedding` column F1 added to the `memories` table (see
-`brain/memory/store.py`'s `_SCHEMA`). This is the read-side cache a recall
-consumer will eventually query directly instead of the old content-hash
-`embeddings.db` join — but THIS module is additive only: nothing in this
-increment wires it into recall, backfill, dedupe, or clustering. It exists
-so the next increment has a warm-matrix primitive ready to consume.
+`brain/memory/store.py`'s `_SCHEMA`). This is the read-side cache
+`semantic_recall.py`, `search_memories.py`, and the narrative-memory
+adapter in `brain/bridge/supervisor.py` query directly instead of the old
+content-hash `embeddings.db` join (F1 increment 2). `build_embedding_matrix`
+below is the process-wide singleton accessor every consumer should go
+through — constructing `EmbeddingMatrix` directly is still valid (existing
+tests do this for exact control) but bypasses the shared-instance guarantee
+production callers need. Backfill, dedupe, and clustering are NOT wired to
+this module yet — they still read/write the old `embeddings.db` — that
+migration is later increments' job.
 
 Build cost: the matrix is built LAZILY, on first access, never at import or
 construction time — building at startup would pay a cost on every process
@@ -313,3 +318,82 @@ class EmbeddingMatrix:
             self._vectors.pop(memory_id, None)
             if self._build_depth > 0:
                 self._pending[memory_id] = _TOMBSTONE
+
+
+# ---------------------------------------------------------------------------
+# Process-wide singleton (F1 #259 step 3+) — mirrors embeddings.py's
+# `build_embedding_provider` double-checked-locking cache exactly, but keyed
+# by the memories.db PATH rather than by model_id.
+#
+# Keyed by `str(db_path)`, NOT persona_dir: several tests open
+# `MemoryStore(":memory:")` while passing a DIFFERENT tmp_path as
+# `persona_dir` (the two are independent args to plenty of call sites) — a
+# matrix keyed by persona_dir could silently point at a directory whose
+# memories.db is not the file the store is actually reading/writing. Keying
+# by the store's own `db_path` guarantees the matrix always reads the exact
+# file a caller's MemoryStore reads and writes.
+_matrix_cache: dict[str, EmbeddingMatrix] = {}
+_matrix_cache_lock = threading.Lock()
+
+
+def build_embedding_matrix(db_path: str | Path) -> EmbeddingMatrix:
+    """The process-wide EmbeddingMatrix for one memories.db file.
+
+    PROCESS-WIDE CACHING, keyed by `str(db_path)`: constructing an
+    EmbeddingMatrix is cheap (no DB touch — the lazy build happens on first
+    `get`/`snapshot`), but callers must all share ONE matrix instance per
+    file so a `put()`/`evict()` from one caller (e.g. embed-on-write in
+    `MemoryStore.embed_row`) is visible to every other caller reading that
+    same file (e.g. a recall-path `matrix.get(...)`). A fresh EmbeddingMatrix
+    per call site would mean each held its own independent, unsynchronized
+    copy of the warm cache — exactly the staleness this primitive exists to
+    prevent.
+
+    Model id comes from `model_tier.py` (`model_for_tier(TIER_EMBEDDING)`),
+    never hardcoded here — same convention as every other tier lookup (see
+    `build_embedding_provider`'s own docstring). Looked up via the `model_tier`
+    MODULE (not a bare imported name) so a test that monkeypatches
+    `brain.bridge.model_tier.model_for_tier` (or the `TIER_MODEL` dict it
+    reads) intercepts this call too, mirroring `build_embedding_provider`'s
+    own `model_for_tier` lookup.
+
+    THREAD SAFETY: double-checked locking, identical shape to
+    `build_embedding_provider` — an unlocked fast-path read handles the
+    (overwhelmingly common) already-cached case with no lock at all; the
+    lock is acquired — then re-checked, in case another thread won the race
+      while this one was waiting — only the first time a given db_path
+    actually needs a matrix constructed.
+    """
+    from brain.bridge import model_tier
+
+    key = str(db_path)
+
+    matrix = _matrix_cache.get(key)
+    if matrix is not None:
+        return matrix
+
+    with _matrix_cache_lock:
+        matrix = _matrix_cache.get(key)  # re-check: lost the race?
+        if matrix is not None:
+            return matrix
+        model_id = model_tier.model_for_tier(model_tier.TIER_EMBEDDING)
+        matrix = EmbeddingMatrix(db_path, model_id=model_id)
+        _matrix_cache[key] = matrix
+        return matrix
+
+
+def _reset_embedding_matrix_cache() -> None:
+    """Test-only: clear the process-level matrix cache
+    `build_embedding_matrix()` builds up.
+
+    Wired into `tests/conftest.py`'s autouse `_reset_embedding_matrix_cache`
+    fixture (before AND after every test), mirroring
+    `embeddings._reset_embedding_provider_cache` — needed because this dict
+    is process-global and `tmp_path` is unique per test, so without a reset a
+    LATER test using the (astronomically unlikely but not impossible)
+    reused/short path, or a test that constructs `build_embedding_matrix`
+    against a shared fixture path, could read back a stale matrix left by an
+    earlier test.
+    """
+    with _matrix_cache_lock:
+        _matrix_cache.clear()

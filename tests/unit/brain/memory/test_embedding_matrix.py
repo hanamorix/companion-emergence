@@ -483,3 +483,106 @@ def test_wrong_dim_embedding_blob_is_skipped(seeded_db) -> None:
     snap = matrix.snapshot()
     assert "mem-wrong-dim" not in snap
     assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
+
+
+# ---------------------------------------------------------------------------
+# build_embedding_matrix — process-wide singleton (F1 #259 step 0)
+# ---------------------------------------------------------------------------
+
+
+def test_build_embedding_matrix_returns_the_same_instance_for_the_same_path(seeded_db) -> None:
+    """Two callers asking for the matrix over the SAME db file must get the
+    SAME object — a `put()` from one caller (e.g. embed-on-write) must be
+    visible to every other caller reading that file (e.g. a recall-path
+    `matrix.get(...)`), which only holds if they share one instance."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    m1 = build_embedding_matrix(seeded_db)
+    m2 = build_embedding_matrix(seeded_db)
+    assert m1 is m2
+
+
+def test_build_embedding_matrix_returns_different_instances_for_different_paths(
+    tmp_path: Path,
+) -> None:
+    """Keyed by `str(db_path)`, not persona_dir or a bare singleton — two
+    different memories.db files must never share a matrix instance."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    db_a = tmp_path / "a" / "memories.db"
+    db_b = tmp_path / "b" / "memories.db"
+    db_a.parent.mkdir()
+    db_b.parent.mkdir()
+    _seed_db(db_a, [("mem-a", _vec(0.1), True)])
+    _seed_db(db_b, [("mem-b", _vec(0.2), True)])
+
+    m_a = build_embedding_matrix(db_a)
+    m_b = build_embedding_matrix(db_b)
+    assert m_a is not m_b
+
+
+def test_build_embedding_matrix_model_id_comes_from_model_tier(
+    seeded_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Model id is sourced from `model_tier.model_for_tier(TIER_EMBEDDING)`
+    (I7 — model ids live in model_tier.py, never hardcoded) — looked up
+    through the `model_tier` MODULE so a test monkeypatching
+    `model_tier.TIER_MODEL` is honored, mirroring
+    `build_embedding_provider`'s own dynamic `model_for_tier` lookup."""
+    from brain.bridge import model_tier
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "a-test-model-id")
+    matrix = build_embedding_matrix(seeded_db)
+    assert matrix.model_id == "a-test-model-id"
+
+
+def test_reset_embedding_matrix_cache_clears_the_singleton(seeded_db) -> None:
+    """The test-only reset hook (wired into `tests/conftest.py`'s autouse
+    fixture) must make the NEXT `build_embedding_matrix()` call for a given
+    path construct a fresh instance rather than returning the old one — the
+    same contract `embeddings._reset_embedding_provider_cache` gives its own
+    cache."""
+    from brain.memory.embedding_matrix import _reset_embedding_matrix_cache, build_embedding_matrix
+
+    m1 = build_embedding_matrix(seeded_db)
+    _reset_embedding_matrix_cache()
+    m2 = build_embedding_matrix(seeded_db)
+    assert m1 is not m2
+
+
+def test_build_embedding_matrix_double_checked_locking_constructs_once(
+    seeded_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent first-time callers for the SAME path must all converge on
+    ONE constructed EmbeddingMatrix instance — mirrors
+    `build_embedding_provider`'s own race-to-construct coverage."""
+    import brain.memory.embedding_matrix as embedding_matrix_mod
+
+    real_init = embedding_matrix_mod.EmbeddingMatrix.__init__
+    construct_count = {"n": 0}
+
+    def counting_init(self, *args, **kwargs):
+        construct_count["n"] += 1
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(embedding_matrix_mod.EmbeddingMatrix, "__init__", counting_init)
+
+    results: list[embedding_matrix_mod.EmbeddingMatrix] = []
+    errors: list[BaseException] = []
+
+    def _build() -> None:
+        try:
+            results.append(embedding_matrix_mod.build_embedding_matrix(seeded_db))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_build) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert len({id(r) for r in results}) == 1, "every thread must get the SAME matrix instance"
+    assert construct_count["n"] == 1, "EmbeddingMatrix must be constructed exactly once"

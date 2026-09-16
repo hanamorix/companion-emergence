@@ -145,6 +145,22 @@ def _reset_embedding_provider_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_embedding_matrix_cache() -> Iterator[None]:
+    """Reset embedding_matrix.build_embedding_matrix()'s process-level matrix
+    cache before and after each test — mirrors `_reset_embedding_provider_cache`
+    above for the same reason: the cache is process-global and keyed by
+    `str(db_path)`, so without a reset a matrix built (and possibly warmed)
+    by one test against a given path could leak into a later test that
+    happens to reuse that path, or hold a stale reference across tests that
+    each expect a fresh singleton for their own tmp_path db."""
+    from brain.memory import embedding_matrix
+
+    embedding_matrix._reset_embedding_matrix_cache()
+    yield
+    embedding_matrix._reset_embedding_matrix_cache()
+
+
+@pytest.fixture(autouse=True)
 def _fake_reranker_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
