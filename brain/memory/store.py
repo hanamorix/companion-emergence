@@ -1340,6 +1340,29 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def count_unembedded(self, *, current_model_id: str, min_chars: int) -> int:
+        """Return a plain, cursor-free COUNT of `list_unembedded_since`'s own
+        backlog predicate (F1 #259 increment 6): active, long-enough rows
+        with `embedding IS NULL OR embedding_model_id != current_model_id`.
+
+        Unlike `list_unembedded_since`, this ignores any persisted backfill
+        cursor entirely — it is a full-table count from the top, used by the
+        one-go backfill CLI (`nell embed backfill`) to size its progress
+        ticker's denominator before the drain starts, and by
+        `run_embedding_backfill_to_completion` to report the TRUE remaining
+        backlog after the drain stops (a scattered permanently-failing row
+        can sit BEHIND a persisted forward cursor and so never reappear in a
+        cursor-bounded `list_unembedded_since` call again within the same
+        run, even though it is still un-embedded — this method still counts
+        it, because it does not consult the cursor at all).
+        """
+        sql = (
+            "SELECT COUNT(*) FROM memories WHERE active = 1 "
+            "AND (embedding IS NULL OR embedding_model_id != ?) "
+            "AND length(content) >= ?"
+        )
+        return int(self._conn.execute(sql, (current_model_id, min_chars)).fetchone()[0])
+
     def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
         """Return True if a grief_event memory with grief_referent_id == referent_id
         exists in the memories table created within the last `hours`.

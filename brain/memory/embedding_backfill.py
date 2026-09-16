@@ -98,6 +98,16 @@ never reached). One bad memory can no longer stall the backlog.
 Stays off the message hot path: ``run_embedding_backfill_tick`` is only ever
 called from the supervisor's own per-tick maintenance block, never from a
 chat-turn code path.
+
+ONE-GO DRAIN (F1 #259 increment 6, spec §5b / S12): ``run_embedding_
+backfill_to_completion`` (below) is the separate operator escape hatch
+behind the ``nell embed backfill`` CLI command (``brain/cli.py``). It loops
+this module's own ``run_embedding_backfill_tick`` back-to-back with no
+inter-tick sleep and no idle gate (operator-initiated, not the supervisor
+cadence), and adds only the loop's own termination condition on top — see
+that function's docstring for why a naive "loop until empty" would spin
+forever on a small permanently-failing backlog, and how skip-and-log's
+cursor-reset behavior is what the termination check keys off of.
 """
 
 from __future__ import annotations
@@ -107,6 +117,7 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from brain import tunables
@@ -484,4 +495,150 @@ def run_embedding_backfill_tick(
         skipped_short=skipped_short,
         errors=errors,
         batch_size=effective_batch_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drain-to-completion (F1 #259 increment 6 — the `nell embed backfill` CLI's
+# operator escape hatch, spec §5b / S12).
+# ---------------------------------------------------------------------------
+
+# `(embedded_so_far, failed_so_far, scanned_so_far)` — cumulative running
+# totals across the whole drain, invoked once after EVERY tick (including
+# the final one) so a caller (the CLI) can render a live ticker without
+# polling the store itself.
+ProgressCallback = Callable[[int, int, int], None]
+
+
+@dataclass(frozen=True)
+class BackfillDrainResult:
+    """What a full `run_embedding_backfill_to_completion` call accomplished."""
+
+    embedded: int  # rows newly embedded across the whole drain
+    failed: int  # rows STILL un-embedded/backlog when the drain stopped —
+    # a fresh `MemoryStore.count_unembedded` count taken after the last
+    # tick, NOT a sum of per-tick `errors` (see docstring below for why a
+    # per-tick sum can double-count a row attempted more than once).
+    scanned: int  # cumulative candidate rows examined across all ticks
+    ticks: int  # number of `run_embedding_backfill_tick` calls performed
+    stopped_reason: str  # "no_more_candidates" | "stalled_no_progress"
+
+
+def run_embedding_backfill_to_completion(
+    persona_dir,  # noqa: ANN001 — Path, kept untyped to mirror run_embedding_backfill_tick
+    store: MemoryStore,
+    *,
+    batch_size: int | None = None,
+    scan_cap: int = DEFAULT_SCAN_CAP,
+    progress_cb: ProgressCallback | None = None,
+) -> BackfillDrainResult:
+    """Drain the embedding backlog to completion in ONE call, for the
+    operator-initiated `nell embed backfill` CLI command (F1 #259 increment
+    6, spec §5b / S12) — NOT for the idle-gated supervisor cadence, which
+    stays on `run_embedding_backfill_tick` directly (one bounded tick per
+    ELIGIBLE supervisor tick, gated by the caller).
+
+    Loops `run_embedding_backfill_tick` back-to-back with NO inter-tick
+    sleep and NO idle gate — flat-out, exactly as the operator asked for by
+    running this command at all. `batch_size`/`scan_cap` are passed straight
+    through to every tick (same runtime-derived-batch-size + cursor-freeze-
+    skip-and-log machinery as the idle path — see module docstring); this
+    function adds only the LOOP and its termination condition on top.
+
+    TERMINATION (the part this function adds on top of one tick): a tick's
+    own cursor-freeze fix already lets ONE tick skip past a failing row and
+    keep going — but a naive `while backlog not empty: tick()` loop can
+    still spin forever on a SMALL backlog that is entirely (or down to its
+    last row) permanently-failing. Why: `run_embedding_backfill_tick`
+    intentionally resets its persisted cursor to `None` whenever a tick sees
+    FEWER than `scan_cap` candidates (i.e. the whole remaining backlog fit
+    in one scan — see that function's closing comment) — a still-NULL
+    permanently-failing row stays in that same small backlog forever, so the
+    VERY NEXT tick would rescan from the top, hit the identical row(s),
+    fail identically, and reset the cursor to `None` again: infinite,
+    byte-for-byte-identical repetition, burning real provider calls for no
+    progress. Detect this directly rather than counting on a wall-clock
+    timeout: if a tick embeds ZERO rows AND saw fewer than `scan_cap`
+    candidates (`result.scanned < scan_cap` — the exact condition under
+    which the tick just reset its cursor to `None`), stop — the next tick is
+    guaranteed to reproduce the same result, so there is nothing to gain by
+    calling it. (A tick that scans a FULL `scan_cap` window of entirely
+    failing rows is NOT a stall: its cursor advances PAST that window
+    regardless of success/failure — see the tick's own skip-and-log cursor
+    logic — so the NEXT tick genuinely examines different, not-yet-seen
+    rows; looping continues in that case.) A tick that saw zero candidates
+    at all (`scanned == 0`) means there is nothing left reachable from the
+    current cursor position — also stop.
+
+    Both stop conditions are reached in a BOUNDED number of ticks: the
+    keyset cursor only ever moves forward (or resets to re-scan a
+    provably-exhausted-of-successes remainder), so the total rows examined
+    across the whole drain is bounded by a small constant multiple of the
+    backlog size, never unbounded.
+
+    `failed` on the returned result is deliberately NOT a running sum of
+    each tick's `errors` field — a row that resets the cursor (small
+    backlog, see above) and is retried on a LATER tick before the stall is
+    detected would be double-counted by a naive sum. Instead it is a fresh
+    `store.count_unembedded()` call taken once after the loop stops: the
+    true number of rows still `embedding IS NULL` (or model-stale) in the
+    table at that moment, independent of how many times any one of them was
+    attempted. Note this can be > 0 even when the loop stopped via
+    `"no_more_candidates"`, not only `"stalled_no_progress"`: a large
+    backlog with failing rows SCATTERED through it can have those rows sit
+    behind an already-advanced forward cursor (see the tick's own docstring)
+    and so never reappear as `candidates` again within this run, even though
+    they are still genuinely un-embedded — `count_unembedded` catches them
+    because it does not consult the cursor at all. This is expected, not a
+    bug: those rows permanently fail to embed; the drain's job is to make
+    forward progress and terminate, not to guarantee an empty backlog when
+    permanent failures exist.
+
+    `progress_cb`, when given, is invoked after EVERY tick (including the
+    one that triggers a stop) with cumulative
+    `(embedded_so_far, failed_so_far_this_run, scanned_so_far)` — the
+    "failed_so_far" arg IS a running sum of `errors` (may over-count a
+    retried row by the same small margin described above), since it is only
+    ever used for a live progress ticker, not the authoritative final count;
+    the authoritative count is this function's own returned `.failed`.
+    """
+    from brain.memory import embeddings as embeddings_mod
+
+    total_embedded = 0
+    total_failed_attempts = 0
+    total_scanned = 0
+    ticks = 0
+    stopped_reason = "no_more_candidates"
+
+    while True:
+        result = run_embedding_backfill_tick(
+            persona_dir, store, batch_size=batch_size, scan_cap=scan_cap
+        )
+        ticks += 1
+        total_embedded += result.embedded
+        total_failed_attempts += result.errors
+        total_scanned += result.scanned
+
+        if progress_cb is not None:
+            progress_cb(total_embedded, total_failed_attempts, total_scanned)
+
+        if result.scanned == 0:
+            stopped_reason = "no_more_candidates"
+            break
+
+        if result.embedded == 0 and result.scanned < scan_cap:
+            stopped_reason = "stalled_no_progress"
+            break
+
+    provider = embeddings_mod.build_embedding_provider()
+    final_failed = store.count_unembedded(
+        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+    )
+
+    return BackfillDrainResult(
+        embedded=total_embedded,
+        failed=final_failed,
+        scanned=total_scanned,
+        ticks=ticks,
+        stopped_reason=stopped_reason,
     )

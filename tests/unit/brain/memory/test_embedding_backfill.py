@@ -28,6 +28,7 @@ from brain.memory.embedding_backfill import (
     MIN_CHARS_TO_EMBED,
     _load_cursor,
     run_embedding_backfill_tick,
+    run_embedding_backfill_to_completion,
 )
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.store import Memory, MemoryStore
@@ -847,3 +848,234 @@ def test_backfill_is_a_no_op_when_all_rows_match_the_current_model(
 
     assert result.scanned == 0
     assert result.embedded == 0
+
+
+# ---------------------------------------------------------------------------
+# Drain-to-completion (F1 #259 increment 6 — the `nell embed backfill` CLI's
+# operator escape hatch). Reuses this file's `_mem`/`_open_store`/`_seed`/
+# `_is_embedded` helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_drain_embeds_every_row_and_terminates_with_empty_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common case: no failures. The drain embeds the WHOLE backlog in
+    one call and reports an empty backlog afterward (acceptance criterion 8
+    / the increment-6 spec: "drains all un-embedded rows to completion")."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    made = _seed(tmp_path, 11)
+    store = _open_store(tmp_path)
+    try:
+        # Small batch/scan bounds force several ticks so this also proves
+        # the LOOP (not just a single generous tick) does the draining.
+        result = run_embedding_backfill_to_completion(
+            tmp_path, store, batch_size=3, scan_cap=3
+        )
+    finally:
+        store.close()
+
+    assert result.embedded == 11
+    assert result.failed == 0
+    assert result.stopped_reason == "no_more_candidates"
+    assert result.ticks > 1  # genuinely looped, not a one-shot generous tick
+
+    store2 = _open_store(tmp_path)
+    try:
+        for m in made:
+            assert _is_embedded(store2, m.id) is True
+        assert store2.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 0
+    finally:
+        store2.close()
+
+
+def test_drain_terminates_when_a_row_permanently_fails_without_looping_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that fails on EVERY attempt must not spin the drain loop
+    forever — this is the exact bug this function exists to close: a small
+    backlog that is entirely (or down to its last row) permanently-failing
+    resets its tick-level cursor to `None` on every tick (see
+    `run_embedding_backfill_tick`'s closing comment), so a naive
+    `while backlog: tick()` loop would repeat the identical failing tick
+    without end. Proven here by: the call RETURNS (pytest itself is the
+    forever-loop timeout backstop), a bounded `ticks` count, the failing row
+    left un-embedded, every other row embedded, and `result.failed == 1` —
+    NOT 2, proving the failed count is a deduped final backlog count, not a
+    naive sum of the two separate tick-level attempts this scenario
+    produces (see the function's own docstring)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    made = _seed(tmp_path, 5)  # "... number 0" .. "... number 4"
+
+    class _AlwaysFailsOnTwo(embeddings_mod.EmbeddingProvider):
+        def embed(self, text: str):  # noqa: ANN201
+            if text.endswith("number 2"):
+                raise RuntimeError("simulated PERMANENT provider failure")
+            import numpy as np
+
+            return np.ones(8, dtype="float32")
+
+        def embedding_dim(self) -> int:
+            return 8
+
+        def model_id(self) -> str:
+            return "always-fails-on-two-test"
+
+    provider = _AlwaysFailsOnTwo()
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(
+            tmp_path, store, batch_size=2, scan_cap=2
+        )
+    finally:
+        store.close()
+
+    assert result.embedded == 4
+    assert result.failed == 1  # deduped final count, not a raw attempt sum
+    assert result.stopped_reason == "stalled_no_progress"
+    # Bounded: nowhere near an infinite loop. Generous upper bound so this
+    # isn't brittle to the exact tick-accounting shape, while still failing
+    # hard if the termination guard regresses into spinning.
+    assert result.ticks < 20
+
+    store2 = _open_store(tmp_path)
+    try:
+        failing = made[2]
+        assert _is_embedded(store2, failing.id) is False
+        for m in (made[0], made[1], made[3], made[4]):
+            assert _is_embedded(store2, m.id) is True
+        assert store2.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 1
+    finally:
+        store2.close()
+
+
+def test_drain_scattered_failure_in_a_large_backlog_still_terminates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanently-failing row BURIED inside a backlog larger than
+    `scan_cap` must not stall the drain either — its containing tick's
+    cursor advances PAST the full scan_cap window regardless of the failure
+    (see run_embedding_backfill_tick's skip-and-log cursor logic), so later
+    ticks keep making genuine progress on rows further along. The drain
+    still terminates, and the one failing row is still reflected in the
+    final `.failed` count even though the loop's own stop condition here is
+    "no_more_candidates", not "stalled_no_progress" (see the function's
+    docstring on why a scattered failure can sit behind an already-advanced
+    cursor)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    made = _seed(tmp_path, 20)
+    failing = made[10]
+
+    class _FailsOnOneBuried(embeddings_mod.EmbeddingProvider):
+        def embed(self, text: str):  # noqa: ANN201
+            if text.endswith("number 10"):
+                raise RuntimeError("simulated PERMANENT provider failure")
+            import numpy as np
+
+            return np.ones(8, dtype="float32")
+
+        def embedding_dim(self) -> int:
+            return 8
+
+        def model_id(self) -> str:
+            return "fails-on-one-buried-test"
+
+    provider = _FailsOnOneBuried()
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(
+            tmp_path, store, batch_size=5, scan_cap=5
+        )
+    finally:
+        store.close()
+
+    assert result.embedded == 19
+    assert result.failed == 1
+    assert result.ticks < 20
+
+    store2 = _open_store(tmp_path)
+    try:
+        assert _is_embedded(store2, failing.id) is False
+        for m in made:
+            if m.id != failing.id:
+                assert _is_embedded(store2, m.id) is True
+    finally:
+        store2.close()
+
+
+def test_drain_progress_cb_reports_cumulative_running_totals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`progress_cb` is invoked after every tick with CUMULATIVE
+    `(embedded, failed, scanned)` — the CLI ticker's contract (F1 #259
+    increment 6). Cumulative embedded must be monotonically non-decreasing
+    and the LAST call must match the function's own returned totals."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    _seed(tmp_path, 7)
+    store = _open_store(tmp_path)
+
+    calls: list[tuple[int, int, int]] = []
+
+    def _cb(embedded: int, failed: int, scanned: int) -> None:
+        calls.append((embedded, failed, scanned))
+
+    try:
+        result = run_embedding_backfill_to_completion(
+            tmp_path, store, batch_size=2, scan_cap=2, progress_cb=_cb
+        )
+    finally:
+        store.close()
+
+    assert len(calls) == result.ticks
+    assert len(calls) > 1
+    embedded_series = [c[0] for c in calls]
+    assert embedded_series == sorted(embedded_series)  # monotonically non-decreasing
+    assert calls[-1][0] == result.embedded
+    assert calls[-1][2] == result.scanned
+
+
+def test_drain_empty_backlog_returns_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to embed — the drain must not loop at all, just confirm
+    there is nothing left."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+
+    store = _open_store(tmp_path)  # no memories seeded at all
+    try:
+        result = run_embedding_backfill_to_completion(tmp_path, store, batch_size=10, scan_cap=10)
+    finally:
+        store.close()
+
+    assert result.embedded == 0
+    assert result.failed == 0
+    assert result.scanned == 0
+    assert result.ticks == 1
+    assert result.stopped_reason == "no_more_candidates"

@@ -758,6 +758,106 @@ def test_store_list_unembedded_since_row_reappears_after_going_null_again(
     assert [row.id for row in results] == [m.id]
 
 
+# ---------------------------------------------------------------------------
+# count_unembedded — same backlog predicate as list_unembedded_since, but a
+# cursor-free full-table COUNT (F1 #259 increment 6, for the `nell embed
+# backfill` CLI's progress-ticker denominator + the drain-to-completion
+# helper's final failure count).
+# ---------------------------------------------------------------------------
+
+
+def test_count_unembedded_matches_list_unembedded_since_predicate(
+    store: MemoryStore,
+) -> None:
+    """Same backlog membership as list_unembedded_since: NULL embedding OR
+    stale model, active, long enough."""
+    embedded_current = _mem("embedded under the current model" + "x" * 20)
+    embedded_stale = _mem("embedded under a stale model" + "x" * 20)
+    unembedded = _mem("never embedded" + "x" * 20)
+    too_short = _mem("short")
+    inactive = _mem("inactive but otherwise eligible" + "x" * 20)
+    store.create(embedded_current)
+    store.create(embedded_stale)
+    store.create(unembedded)
+    store.create(too_short)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "current-model", embedded_current.id),
+    )
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "old-model", embedded_stale.id),
+    )
+    store._conn.commit()
+
+    count = store.count_unembedded(current_model_id="current-model", min_chars=20)
+
+    # Backlog: `unembedded` (NULL) + `embedded_stale` (model mismatch).
+    # NOT `embedded_current` (matches), `too_short` (< min_chars), or
+    # `inactive` (deactivated).
+    assert count == 2
+    matching_ids = {
+        m.id
+        for m in store.list_unembedded_since(
+            None, limit=10, current_model_id="current-model", min_chars=20
+        )
+    }
+    assert matching_ids == {unembedded.id, embedded_stale.id}
+
+
+def test_count_unembedded_zero_on_empty_store(store: MemoryStore) -> None:
+    """No rows at all -> 0, not an error."""
+    assert store.count_unembedded(current_model_id="any-model", min_chars=0) == 0
+
+
+def test_count_unembedded_zero_once_everything_matches_current_model(
+    store: MemoryStore,
+) -> None:
+    """Steady state: every row already embedded under the queried model ->
+    0, matching list_unembedded_since's own no-op steady state."""
+    m = _mem("embedded and current" + "x" * 20)
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "current-model", m.id),
+    )
+    store._conn.commit()
+
+    assert store.count_unembedded(current_model_id="current-model", min_chars=0) == 0
+
+
+def test_count_unembedded_ignores_any_persisted_backfill_cursor(
+    store: MemoryStore,
+) -> None:
+    """count_unembedded takes NO cursor argument at all — it always counts
+    from the top of the table, unlike list_unembedded_since which a caller
+    can (and the backfill does) page through with a persisted cursor. This
+    is the property `run_embedding_backfill_to_completion` relies on to
+    report the TRUE remaining backlog even when a scattered permanently-
+    failing row sits behind an already-advanced forward cursor position."""
+    older = _mem("older, still unembedded" + "x" * 20)
+    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    newer = _mem("newer, still unembedded" + "x" * 20)
+    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(older)
+    store.create(newer)
+
+    # A caller that had already paged PAST `older` via list_unembedded_since
+    # would no longer see it — count_unembedded is unaffected by any such
+    # cursor because it never takes one.
+    paged = store.list_unembedded_since(
+        (older.created_at.isoformat(), older.id),
+        limit=10,
+        current_model_id="some-model",
+        min_chars=0,
+    )
+    assert [row.id for row in paged] == [newer.id]
+
+    assert store.count_unembedded(current_model_id="some-model", min_chars=0) == 2
+
+
 def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     """Substring matching ignores case."""
     store.create(_mem("The Moment"))
