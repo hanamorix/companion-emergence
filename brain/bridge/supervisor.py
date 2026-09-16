@@ -397,26 +397,36 @@ def run_folded(
                 )
 
                 # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
-                # build) — reuses the `store`/`embeddings` handles already open
-                # for the snapshot above, so no extra connections. Runs every
-                # base tick (default 60s): internally bounded (batch_size +
-                # scan_cap), so it is cheap when caught up and never spikes
-                # CPU on a cold-start backlog. This is the primary embed-on-
-                # write mechanism for the ~11 write sites that call
-                # MemoryStore's create method directly and never touch EmbeddingCache
-                # (see brain/memory/embedding_backfill.py's module docstring)
-                # — fault-isolated so a backfill error never takes down the
-                # session-cleanup tick.
+                # build; F1 #259 increment 3 rewires backlog + rate) — reuses
+                # the `store` handle already open for the snapshot above, so
+                # no extra connection. Idle-gated behind
+                # cli_throttle.background_slot() (mirrors maintenance /
+                # interest-sweep below): before increment 3 this ran on
+                # EVERY base tick unconditionally, unlike every other
+                # background maintenance cadence in this file — a denied
+                # slot now just defers this firing to the next tick rather
+                # than skipping the idle check other cadences get. Batch
+                # size is internally runtime-derived and scan_cap-bounded
+                # (see brain/memory/embedding_backfill.py), so it is cheap
+                # when caught up and never spikes CPU on a cold-start
+                # backlog. This is the primary embed-on-write mechanism for
+                # the ~11 write sites that call MemoryStore's create method
+                # directly and never write a row embedding themselves (see
+                # that module's docstring) — fault-isolated so a backfill
+                # error never takes down the session-cleanup tick.
                 try:
-                    backfill_result = _embedding_backfill_run_tick(persona_dir, store, embeddings)
-                    logger.info(
-                        "embedding backfill tick: scanned=%d embedded=%d already_cached=%d skipped_short=%d errors=%d",
-                        backfill_result.scanned,
-                        backfill_result.embedded,
-                        backfill_result.already_cached,
-                        backfill_result.skipped_short,
-                        backfill_result.errors,
-                    )
+                    with cli_throttle.background_slot() as _backfill_slot:
+                        if _backfill_slot:
+                            backfill_result = _embedding_backfill_run_tick(persona_dir, store)
+                            logger.info(
+                                "embedding backfill tick: scanned=%d embedded=%d "
+                                "skipped_short=%d errors=%d batch_size=%d",
+                                backfill_result.scanned,
+                                backfill_result.embedded,
+                                backfill_result.skipped_short,
+                                backfill_result.errors,
+                                backfill_result.batch_size,
+                            )
                 except Exception:
                     logger.exception("supervisor embedding backfill tick raised")
 

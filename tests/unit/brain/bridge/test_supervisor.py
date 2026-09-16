@@ -314,12 +314,15 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
 
 
 def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
-    """Live-path proof for the Stage 2 embedding backfill wiring: a memory
+    """Live-path proof for the embedding backfill wiring (F1 #259 increment
+    3: writes land on the ROW, not the old embeddings.db cache): a memory
     committed straight via MemoryStore.create() (bypassing the ingest
     pipeline's own embed-on-write, like ~11 real write sites do) gets
-    embedded by the supervisor's own per-tick block — not a mock-call
-    assertion, an actual vector landing in embeddings.db."""
-    from brain.memory.embeddings import build_embedding_cache
+    embedded by the supervisor's own idle-gated per-tick block — not a
+    mock-call assertion, an actual vector landing in the row's `embedding`
+    column. Chat is idle throughout (the suite-wide cli_throttle reset
+    leaves it idle by default — see the busy-defers test below for the
+    other half of the idle gate)."""
     from brain.memory.store import Memory, MemoryStore
 
     persona_dir = _persona_dir(tmp_path)
@@ -353,11 +356,75 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
     stop.set()
     t.join(timeout=30.0)
 
-    cache = build_embedding_cache(persona_dir)
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
-        assert cache.has(memory.content) is True
+        row = store2._conn.execute(
+            "SELECT embedding FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+        assert row is not None
+        assert row["embedding"] is not None
     finally:
-        cache.close()
+        store2.close()
+
+
+def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) -> None:
+    """Idle-gate proof (F1 #259 increment 3): before this increment the
+    backfill ran on EVERY base tick unconditionally, unlike every other
+    background maintenance cadence in this file. With chat marked
+    interactive-active throughout, `cli_throttle.background_slot()` must
+    deny the backfill's slot on every tick, so a backlogged memory stays
+    un-embedded across several ticks — mirrors
+    tests/unit/brain/bridge/test_background_yields.py's
+    mark_interactive_active() pattern for the other idle-gated engines."""
+    from brain.bridge import cli_throttle
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)
+    store.close()
+
+    cli_throttle.mark_interactive_active()
+
+    bus = _CapturingBus()
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "silence_minutes": 5.0,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    _wait_until(
+        lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
+    )
+    stop.set()
+    t.join(timeout=30.0)
+
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        row = store2._conn.execute(
+            "SELECT embedding FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+        assert row is not None
+        assert row["embedding"] is None, (
+            "backfill must be idle-gated: deferred on every tick while chat is active"
+        )
+    finally:
+        store2.close()
 
 
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:

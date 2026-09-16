@@ -161,6 +161,21 @@ def _reset_embedding_matrix_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_embedding_backfill_batch_cache() -> Iterator[None]:
+    """Reset embedding_backfill's measured/derived batch-size cache before
+    and after each test — mirrors `_reset_embedding_provider_cache` above:
+    the cache is process-global and keyed by model_id, measured once per
+    process (F1 #259 increment 3), so without a reset a batch size measured
+    (and possibly deliberately controlled/monkeypatched) by one test could
+    leak into a later test expecting its own fresh measurement."""
+    from brain.memory import embedding_backfill
+
+    embedding_backfill._reset_batch_size_cache()
+    yield
+    embedding_backfill._reset_batch_size_cache()
+
+
+@pytest.fixture(autouse=True)
 def _fake_reranker_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

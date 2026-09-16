@@ -541,6 +541,147 @@ def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
     assert [m.id for m in results] == [active.id]
 
 
+# ---------------------------------------------------------------------------
+# list_unembedded_since — the embedding backfill's own backlog query (F1
+# #259 increment 3). Same keyset-cursor shape as list_active_since above,
+# scoped to `embedding IS NULL`.
+# ---------------------------------------------------------------------------
+
+
+def test_store_list_unembedded_since_excludes_already_embedded_rows(
+    store: MemoryStore,
+) -> None:
+    """A row with a non-NULL embedding never appears in the backlog query —
+    backlog membership is the row's own column, not a side-table lookup."""
+    embedded = _mem("already embedded")
+    embedded.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    unembedded = _mem("still needs an embedding")
+    unembedded.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(embedded)
+    store.create(unembedded)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "some-model", embedded.id),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(None, limit=10)
+
+    assert [m.id for m in results] == [unembedded.id]
+
+
+def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
+    store: MemoryStore,
+) -> None:
+    """cursor=None starts from the oldest still-unembedded memory, ascending."""
+    older = _mem("older")
+    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    newer = _mem("newer")
+    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(older)
+    store.create(newer)
+
+    results = store.list_unembedded_since(None, limit=10)
+
+    assert [m.id for m in results] == [older.id, newer.id]
+
+
+def test_store_list_unembedded_since_excludes_at_or_before_cursor(
+    store: MemoryStore,
+) -> None:
+    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
+    a = _mem("a")
+    a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    b = _mem("b")
+    b.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    c = _mem("c")
+    c.created_at = datetime(2020, 1, 3, tzinfo=UTC)
+    store.create(a)
+    store.create(b)
+    store.create(c)
+
+    results = store.list_unembedded_since((b.created_at.isoformat(), b.id), limit=10)
+
+    assert [m.id for m in results] == [c.id]
+
+
+def test_store_list_unembedded_since_tie_inclusive_on_shared_created_at(
+    store: MemoryStore,
+) -> None:
+    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
+    sharing that EXACT created_at, provided its id sorts after the cursor's
+    — same tied-timestamp regression coverage as list_active_since."""
+    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    first = _mem("first")
+    first.created_at = shared_ts
+    second = _mem("second")
+    second.created_at = shared_ts
+    first.id = "aaaa0000-0000-0000-0000-000000000000"
+    second.id = "bbbb0000-0000-0000-0000-000000000000"
+    store.create(first)
+    store.create(second)
+
+    results = store.list_unembedded_since((shared_ts.isoformat(), first.id), limit=10)
+
+    assert [m.id for m in results] == [second.id]
+
+
+def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
+    """Bounded per call — never returns more than `limit` rows."""
+    for i in range(5):
+        m = _mem(f"item-{i}")
+        m.created_at = datetime(2020, 1, i + 1, tzinfo=UTC)
+        store.create(m)
+
+    results = store.list_unembedded_since(None, limit=2)
+
+    assert len(results) == 2
+    assert [m.content for m in results] == ["item-0", "item-1"]
+
+
+def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> None:
+    """Same active=1 filter as list_active()/list_active_since() —
+    deactivated rows never appear even if unembedded."""
+    active = _mem("active")
+    inactive = _mem("inactive")
+    store.create(active)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+
+    results = store.list_unembedded_since(None, limit=10)
+
+    assert [m.id for m in results] == [active.id]
+
+
+def test_store_list_unembedded_since_row_reappears_after_going_null_again(
+    store: MemoryStore,
+) -> None:
+    """A row that was embedded and then goes NULL again (e.g. a content
+    edit whose synchronous re-embed failed — see
+    `MemoryStore._reembed_or_clear`) must reappear in the backlog query
+    regardless of its `created_at` position relative to any OTHER row —
+    membership is purely `embedding IS NULL`, not a forward-only cursor
+    position."""
+    m = _mem("will be embedded, then re-nulled")
+    m.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "some-model", m.id),
+    )
+    store._conn.commit()
+    assert store.list_unembedded_since(None, limit=10) == []
+
+    store._conn.execute(
+        "UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?",
+        (m.id,),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(None, limit=10)
+    assert [row.id for row in results] == [m.id]
+
+
 def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     """Substring matching ignores case."""
     store.create(_mem("The Moment"))

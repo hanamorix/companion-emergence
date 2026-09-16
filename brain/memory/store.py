@@ -1142,9 +1142,11 @@ class MemoryStore:
         lexicographic tiebreak, not creation order — it only needs to be a
         stable TOTAL order so no row at a shared timestamp is skipped or
         revisited, not a meaningful one. A bounded, cursor-paged sibling of
-        `list_active()` for callers (the embedding backfill) that walk the
-        WHOLE corpus a little at a time across many calls rather than
-        loading it all at once — same `active = 1` filter as `list_active()`.
+        `list_active()` for a caller that walks the WHOLE corpus a little at
+        a time across many calls rather than loading it all at once — same
+        `active = 1` filter as `list_active()`. See `list_unembedded_since`
+        below for the sibling scoped to `embedding IS NULL` (the embedding
+        backfill's own backlog query, F1 #259 increment 3).
         """
         if cursor is None:
             sql = (
@@ -1156,6 +1158,50 @@ class MemoryStore:
             cursor_ts, cursor_id = cursor
             sql = (
                 "SELECT * FROM memories WHERE active = 1 AND "
+                "(created_at > ? OR (created_at = ? AND id > ?)) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params = [cursor_ts, cursor_ts, cursor_id, limit]
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def list_unembedded_since(
+        self, cursor: tuple[str, str] | None, *, limit: int
+    ) -> list[Memory]:
+        """Return up to `limit` ACTIVE memories with `embedding IS NULL`,
+        strictly after `cursor`, ordered ASCENDING by (created_at, id) — the
+        embedding backfill's own backlog query (F1 #259 increment 3).
+
+        Backlog membership is determined directly by the row's OWN
+        `embedding` column, not a content-hash side-table lookup: unlike the
+        old `embeddings.db` cache, a row's presence here is purely a
+        function of its current `embedding` value, so a row that gets
+        embedded (by this backfill, by embed-on-write at promotion, or by a
+        synchronous re-embed in `fade`/`update`/`unfade`) simply stops
+        appearing in this query's results — no separate bookkeeping needed.
+
+        Same composite keyset cursor semantics as `list_active_since` (see
+        that method's docstring for the tied-created_at rationale) — this is
+        its sibling scoped to `embedding IS NULL`. The caller (embedding
+        backfill) is responsible for NOT persisting a forward cursor once a
+        tick has seen the whole currently-null backlog (i.e. got back fewer
+        than `limit` rows): `embedding IS NULL` is not append-only per id —
+        a row can go null a SECOND time (a later content edit whose
+        synchronous re-embed attempt fails — see `_reembed_or_clear`) at a
+        `created_at` position the cursor may have already passed — so a
+        persisted forward position is only a safe optimization while the
+        backlog is larger than one scan, never a correctness mechanism.
+        """
+        if cursor is None:
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 AND embedding IS NULL "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params: list[Any] = [limit]
+        else:
+            cursor_ts, cursor_id = cursor
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 AND embedding IS NULL AND "
                 "(created_at > ? OR (created_at = ? AND id > ?)) "
                 "ORDER BY created_at ASC, id ASC LIMIT ?"
             )

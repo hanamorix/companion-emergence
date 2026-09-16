@@ -1,64 +1,105 @@
-"""Idle-chipped embedding backfill.
+"""Idle-chipped embedding backfill (F1 #259 increment 3 rewrite).
 
-Stage 2 of the local semantic-retrieval build (companion-emergence). Most
-memories are committed via ``MemoryStore``'s ``create`` method at ~11 call sites
-(``brain/tools/impls/add_memory.py``, ``crystallize_soul.py``,
+Most memories are committed via ``MemoryStore``'s ``create`` method at ~11
+call sites (``brain/tools/impls/add_memory.py``, ``crystallize_soul.py``,
 ``add_journal.py``, ``brain/recovery/engine.py``,
 ``brain/kindled_link/relationship.py``, ``brain/migrator/cli.py``,
 ``brain/body/events.py``, ``brain/soul/review.py``,
 ``brain/engines/consolidation.py``, ``brain/migrator/emergence_kit.py``,
-``brain/grief/breadcrumb.py``, ``brain/memory/pending.py``) that never touch
-``EmbeddingCache`` at all — see ``hunts/semantic-retrieval/plan.md`` Part A
-#7. Only the ingest pipeline (``brain/ingest/pipeline.py``, via dedupe's
-``get_or_compute`` side effect) embeds a memory as a side effect of writing
-it. Rather than instrumenting all ~11 sites (invasive, easy to miss a 12th
-later — see this module's sibling decision in the Stage 2 report), this
-backfill is the single source of truth: it scans ``memories`` on every
+``brain/grief/breadcrumb.py``, ``brain/memory/pending.py``) that never write
+an embedding as a side effect. Only ``brain.engines.consolidation``'s
+promote branch does (F1 step 4, embed-on-write at pending-queue -> committed
+promotion — see ``MemoryStore.embed_row``). This backfill is the single
+source of truth for everything else: it scans ``memories`` on every eligible
 supervisor tick and embeds whatever hasn't been covered yet, ingest-path or
 not.
 
-Resumable/idempotent by construction: "backlog" is defined directly against
-the ``(content_hash, model_id)`` cache (``EmbeddingCache.has``), never a
-row's mere presence in a cursor window — a row embedded by a prior (possibly
-interrupted) tick is simply absent from the next tick's work. Killing the
-process mid-batch loses nothing: everything embedded before the kill is
-already committed to ``embeddings.db`` (``get_or_compute`` commits per row);
-the next tick's scan just resumes. A persisted cursor (this persona's
-``cadence/embedding_backfill_cursor.json``) is a pure scan-cost optimization
-— it lets a large corpus avoid re-walking its already-resolved prefix every
-tick — NOT the source of correctness; a missing/corrupt/stale cursor file
-just means the next tick rescans more than strictly necessary, never that a
-row is skipped. The cursor resets automatically on a model swap (its
-``model_id`` no longer matches the cache's), so a new model reopens the
-whole backlog rather than silently under-covering it.
+BACKLOG DEFINITION (F1 #259 increment 3): a memory row with `embedding IS
+NULL` (active, >= `MIN_CHARS_TO_EMBED` chars) — read straight off the row via
+``MemoryStore.list_unembedded_since``, not a content-hash side cache. This
+replaced the old ``embeddings.db`` / ``EmbeddingCache.has()`` check: identity
+is now the memory's own id, not its content hash, so "already embedded"
+literally means "this row already carries a vector." A row that goes NULL
+again after a content mutation (`fade`/`update(content=...)`/`unfade`'s
+synchronous re-embed failing — see ``MemoryStore._reembed_or_clear``) simply
+reappears in the backlog query on its own; no separate invalidation
+bookkeeping is needed the way the content-hash cache required.
+
+Each embedded row is written via ``MemoryStore.embed_row``, which persists
+`embedding` + `embedding_model_id` on the row AND pushes the vector into the
+process's warm ``EmbeddingMatrix`` (``brain.memory.embedding_matrix.
+build_embedding_matrix(store.db_path)``) so it is immediately recall-visible
+without waiting for a lazy matrix rebuild.
+
+RUNTIME-DERIVED BATCH SIZE (replaces the old hardcoded `DEFAULT_BATCH_SIZE =
+25`): the number of real embed computations one tick performs self-derives
+from a measured WARM per-embed time on the actual host vs a time budget
+(`floor(batch_budget_seconds / per_embed_seconds)`) — see `_get_batch_size`
+below, which mirrors ``brain/memory/reranker.py``'s auto-scaling rerank
+width. Measured ONCE per process (per model_id) and cached for the process
+lifetime — no periodic recompute (approved F1 spec §3/S10): unlike rerank
+width, hardware doesn't meaningfully drift mid-process here, and this tick
+runs unattended on the supervisor thread where a recompute would just be
+extra embed-provider calls for no real gain.
+
+IDLE-GATED: this module's own ``run_embedding_backfill_tick`` does NOT gate
+itself — the supervisor call site (``brain/bridge/supervisor.py``) wraps the
+call in ``cli_throttle.background_slot()``, mirroring the maintenance +
+interest-sweep cadences in that file. Before increment 3 the backfill ran on
+every base tick unconditionally, unlike every other background maintenance
+cadence — a regression from intent this closes.
+
+Resumable/idempotent by construction: because backlog membership is the
+row's own `embedding IS NULL`, a row embedded by a prior (possibly
+interrupted) tick is simply absent from the next tick's candidates — killing
+the process mid-batch loses nothing (`embed_row` commits per row). A
+persisted cursor (this persona's ``cadence/embedding_backfill_cursor.json``)
+is a scan-cost optimization for a LARGE backlog — it lets a tick skip
+straight past a prefix already known not to be backlog, rather than
+re-querying the same window from the top every time — but it is deliberately
+NOT trusted once a tick's query returns fewer rows than `scan_cap` (i.e. the
+whole currently-null backlog fit in one scan): see the comment at the bottom
+of `run_embedding_backfill_tick` for why a forward cursor is only safe while
+the backlog is larger than one scan window. A missing/corrupt/stale cursor
+file just means the next tick rescans more than strictly necessary, never
+that a row is skipped. The cursor resets automatically on a model swap (its
+persisted `model_id` no longer matches the current provider's), so a new
+model reopens the whole backlog rather than silently under-covering it.
 
 The cursor is a COMPOSITE ``(created_at, id)`` keyset position, not a bare
-timestamp — see ``MemoryStore.list_active_since``. A bare-timestamp cursor
-made any row sharing its exact ``created_at`` with the pinned row permanently
-unreachable (bulk migrator imports routinely produce duplicate/second-
-granularity timestamps — ``brain/migrator/emergence_kit.py`` via
-``brain/migrator/transform.py``'s ``_coerce_utc``); pairing the timestamp
-with the row's own ``id`` gives every row a distinct position in the scan
-order, so a shared timestamp can never hide a row from the backfill. A
-cursor file written before this change is timestamp-only and is treated as
-unparseable — see ``_load_cursor`` — which resets to the top of history
-rather than guessing; safe and cheap, since a rescan only re-confirms rows
-already in ``embeddings.db`` via ``EmbeddingCache.has()``.
+timestamp — see ``MemoryStore.list_active_since``/``list_unembedded_since``.
+A bare-timestamp cursor made any row sharing its exact ``created_at`` with
+the pinned row permanently unreachable (bulk migrator imports routinely
+produce duplicate/second-granularity timestamps —
+``brain/migrator/emergence_kit.py`` via ``brain/migrator/transform.py``'s
+``_coerce_utc``); pairing the timestamp with the row's own ``id`` gives
+every row a distinct position in the scan order. A cursor file written
+before this pairing existed is timestamp-only and is treated as unparseable
+— see ``_load_cursor`` — which resets to the top of history rather than
+guessing; safe and cheap, since a rescan only re-confirms rows already
+embedded (they no longer satisfy `embedding IS NULL`).
 
-Stays off the message hot path: ``run_embedding_backfill_tick`` is only
-ever called from the supervisor's own per-tick maintenance block
-(``brain/bridge/supervisor.py``), never from a chat-turn code path — no
-different from the ``embeddings = build_embedding_cache(persona_dir)``
-handle that block already opens for ``snapshot_stale_sessions``.
+CURSOR-FREEZE FIX (folded into increment 3): a row that fails to embed is
+logged and the cursor is allowed to advance PAST it (skip-and-log), instead
+of the old behavior where a permanently-failing row froze the cursor and
+later ticks re-scanned the same `scan_cap` window forever (rows beyond it
+never reached). One bad memory can no longer stall the backlog.
+
+Stays off the message hot path: ``run_embedding_backfill_tick`` is only ever
+called from the supervisor's own per-tick maintenance block, never from a
+chat-turn code path.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+import threading
+import time
 from dataclasses import dataclass
 
-from brain.memory.embeddings import EmbeddingCache
+from brain import tunables
 from brain.memory.store import MemoryStore
 from brain.paths import cadence_state_path
 
@@ -72,18 +113,146 @@ logger = logging.getLogger(__name__)
 # the two thresholds can diverge independently later).
 MIN_CHARS_TO_EMBED = 20
 
-# Bounded batch per tick so even a large cold-start backlog only chips away
-# a little bit per tick rather than spiking CPU. Two independent caps:
-# BATCH_SIZE bounds actual embed *compute* (the expensive part — ~34ms/call
-# per the spec's own empirical measurement on this class of hardware);
-# SCAN_CAP bounds how many candidate rows are even *examined* this tick
-# (cheap: an indexed cache lookup per row), so a corpus with a long run of
-# skip-worthy short rows can't spin CPU scanning without also embedding
-# anything.
-DEFAULT_BATCH_SIZE = 25
+# Bounds how many candidate rows are even *examined* (read from `memories`)
+# in one tick — cheap (an indexed WHERE-clause row), independent of
+# `batch_size` which bounds actual embed *compute* (the expensive part).
+# Keeps a corpus with a long run of skip-worthy short/failing rows from
+# spinning CPU scanning without also embedding anything.
 DEFAULT_SCAN_CAP = 500
 
 _CURSOR_FILE = "embedding_backfill_cursor.json"
+
+# ---------------------------------------------------------------------------
+# Runtime-derived batch size (F1 #259 increment 3) — see module docstring.
+# ---------------------------------------------------------------------------
+
+# I7: the tick's own time budget and the assumed supervisor tick cadence are
+# ops tunables, not inline literals — registered like the existing
+# `throttle.*` keys (see brain/bridge/cli_throttle.py). `batch_budget_seconds`
+# leaves ~half of `tick_interval_seconds` as headroom so a slow entry (or a
+# tick that ran a little long already) still fits inside one supervisor tick.
+_BATCH_BUDGET_SECONDS_DEFAULT = tunables.register(
+    "embedding_backfill.batch_budget_seconds", 30.0
+)
+_TICK_INTERVAL_SECONDS_DEFAULT = tunables.register(
+    "embedding_backfill.tick_interval_seconds", 60.0
+)
+
+
+def _batch_budget_seconds() -> float:
+    return tunables.get_tunable(
+        "embedding_backfill.batch_budget_seconds", _BATCH_BUDGET_SECONDS_DEFAULT
+    )
+
+
+def _tick_interval_seconds() -> float:
+    return tunables.get_tunable(
+        "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
+    )
+
+
+# Cold-cache timing trap ([[single-shot-timing-cold-cache-trap]]): the first
+# embed() call on a freshly-constructed provider pays model/ONNX-session
+# warm-up cost far above steady-state — discard this many calls before
+# starting to time (mirrors reranker.py's _WARMUP_RERANKS).
+_WARMUP_EMBEDS = 2
+# Average over this many WARM calls (post-discard) rather than trusting a
+# single noisy sample (mirrors reranker.py's _MEASURE_RERANKS).
+_MEASURE_EMBEDS = 5
+
+# Fixed calibration text, sized like a typical memory rather than a token
+# stub, so the measured per-embed figure reflects real embedding cost
+# (mirrors reranker.py's _MEASURE_DOCUMENT rationale).
+_MEASURE_TEXT = (
+    "a representative memory passage, sized similarly to a typical corpus "
+    "entry, used only to measure warm per-embed compute time on this host "
+    "so the derived backfill batch size reflects real embedding cost rather "
+    "than a short placeholder"
+)
+
+# Fallback ONLY if a measured per-embed time is degenerate (<= 0s — a
+# clock/measurement anomaly, never the normal path). Small and conservative
+# rather than an unbounded guess.
+_FALLBACK_BATCH_SIZE = 25
+_MIN_BATCH_SIZE = 1
+
+# model_id -> derived batch size. Process-wide, mirrors
+# build_embedding_provider's own per-model_id cache — one measurement per
+# model_id, shared across every tick in the process.
+_batch_size_cache: dict[str, int] = {}
+_batch_size_cache_lock = threading.Lock()
+_warned_no_headroom = False
+
+
+def _measure_per_embed_seconds(provider) -> float:  # noqa: ANN001
+    """Mean WARM per-embed seconds for `provider`, after discarding
+    `_WARMUP_EMBEDS` cold calls. Isolated as its own function (rather than
+    inlined into `_get_batch_size`) so a test can monkeypatch/measure it
+    directly without needing a real or artificially-timed provider."""
+    for _ in range(_WARMUP_EMBEDS):
+        provider.embed(_MEASURE_TEXT)
+    samples: list[float] = []
+    for _ in range(_MEASURE_EMBEDS):
+        start = time.monotonic()
+        provider.embed(_MEASURE_TEXT)
+        samples.append(time.monotonic() - start)
+    return sum(samples) / len(samples)
+
+
+def _derive_batch_size(per_embed_seconds: float) -> int:
+    """`floor(batch_budget_seconds / per_embed_seconds)`, clamped to >= 1.
+
+    Logs once (per process) if the configured budget leaves no headroom
+    inside the assumed tick interval — a configuration smell, not a fatal
+    error, so this never raises.
+    """
+    global _warned_no_headroom
+    budget = _batch_budget_seconds()
+    tick = _tick_interval_seconds()
+    if budget >= tick and not _warned_no_headroom:
+        _warned_no_headroom = True
+        logger.warning(
+            "embedding_backfill: batch_budget_seconds (%.1f) >= "
+            "tick_interval_seconds (%.1f) — the derived batch leaves no "
+            "headroom inside the tick",
+            budget,
+            tick,
+        )
+    if per_embed_seconds <= 0.0:
+        return _FALLBACK_BATCH_SIZE
+    return max(_MIN_BATCH_SIZE, math.floor(budget / per_embed_seconds))
+
+
+def _get_batch_size(provider) -> int:  # noqa: ANN001
+    """Cached-once-per-process derived batch size for `provider`'s
+    model_id. Measures OFF-lock (a real embed call can take real time —
+    must not serialize concurrent callers behind it) and caches with
+    first-writer-wins (`setdefault`) so a measurement race between two
+    threads on the very first call never lets a later, possibly-noisier
+    measurement overwrite an already-cached figure. Mirrors
+    reranker.py's `_warm_per_doc_latency`, minus its periodic-recompute
+    machinery — see module docstring for why this measures only once.
+    """
+    model_id = provider.model_id()
+    with _batch_size_cache_lock:
+        cached = _batch_size_cache.get(model_id)
+        if cached is not None:
+            return cached
+
+    per_embed = _measure_per_embed_seconds(provider)
+    batch = _derive_batch_size(per_embed)
+
+    with _batch_size_cache_lock:
+        _batch_size_cache.setdefault(model_id, batch)
+        return _batch_size_cache[model_id]
+
+
+def _reset_batch_size_cache() -> None:
+    """Test-only: clear the measured/derived batch-size cache."""
+    global _warned_no_headroom
+    with _batch_size_cache_lock:
+        _batch_size_cache.clear()
+    _warned_no_headroom = False
 
 
 @dataclass(frozen=True)
@@ -91,10 +260,10 @@ class BackfillTickResult:
     """What one tick of the backfill accomplished — for logging/tests."""
 
     scanned: int  # candidate rows examined this tick
-    embedded: int  # rows newly embedded (real compute, not a cache hit)
-    already_cached: int  # candidates that turned out already embedded
+    embedded: int  # rows newly embedded (real compute)
     skipped_short: int  # rows skipped for being under MIN_CHARS_TO_EMBED
-    errors: int  # embed attempts that raised (left in the backlog for retry)
+    errors: int  # embed attempts that raised (logged, cursor skips past them)
+    batch_size: int  # the derived (or caller-overridden) batch size used
 
 
 def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None:  # noqa: ANN001
@@ -104,14 +273,14 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
     optimization, not the correctness mechanism.
 
     The persisted cursor is the COMPOSITE ``{"created_at": ..., "id": ...}``
-    form (see ``MemoryStore.list_active_since``). A cursor file written by a
-    pre-keyset build of this module is timestamp-only (a bare string) — that
-    old format is deliberately NOT half-interpreted (e.g. paired with an
-    empty/sentinel id, which would silently reintroduce the same-timestamp
+    form (see ``MemoryStore.list_unembedded_since``). A cursor file written
+    by a pre-keyset build of this module is timestamp-only (a bare string)
+    — that old format is deliberately NOT half-interpreted (e.g. paired with
+    an empty/sentinel id, which would silently reintroduce the same-timestamp
     blind spot this format exists to close); it is treated exactly like any
     other unparseable cursor and reset to ``None``, which just rescans from
-    the top. Safe and cheap: ``EmbeddingCache.has()``/``get_or_compute`` are
-    idempotent, so re-scanning only re-confirms rows already embedded.
+    the top. Safe and cheap: a rescan only re-confirms rows already embedded
+    (they no longer satisfy `embedding IS NULL`).
     """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
     try:
@@ -122,8 +291,18 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
         return None
     if raw.get("model_id") != current_model_id:
         # A model swap (or first run under this model) invalidates any prior
-        # cursor position — the whole backlog needs re-examining under the
-        # new model_id, since embedding_cache rows are scoped to model_id.
+        # cursor position, so the next tick rescans from the top of the
+        # (still-NULL) backlog rather than trusting a position recorded
+        # under a different model_id. NOTE — scope boundary (F1 #259
+        # increment 3): unlike the old content-hash cache, backlog
+        # membership here is plain `embedding IS NULL`, not scoped to
+        # model_id, so a model swap does NOT by itself reopen rows this
+        # backfill already embedded under the PRIOR model (they are not
+        # NULL, so they are simply not in scope for this tick regardless of
+        # cursor position) — this reset only avoids trusting a stale
+        # position, it does not force a full re-embed. Re-embedding under a
+        # new model_id is a later increment's / a dedicated migration's job
+        # (see F1 spec §2's matrix rebuild-on-swap, and §5's migration).
         return None
     cursor = raw.get("cursor")
     if not isinstance(cursor, dict):
@@ -164,55 +343,45 @@ def _save_cursor(
 def run_embedding_backfill_tick(
     persona_dir,  # noqa: ANN001 — Path, kept untyped to avoid importing pathlib just for the hint here
     store: MemoryStore,
-    embeddings: EmbeddingCache,
     *,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_size: int | None = None,
     scan_cap: int = DEFAULT_SCAN_CAP,
 ) -> BackfillTickResult:
     """Embed up to `batch_size` un-embedded active memories, off the hot path.
 
-    Intended to be called once per supervisor tick (see module docstring).
-    Never performs more than `batch_size` real embed computations, so even a
-    large cold-start backlog only chips away a little bit per call rather
-    than spiking CPU; `scan_cap` separately bounds how many rows are even
-    read from `memories` this call.
+    Intended to be called once per ELIGIBLE supervisor tick — the caller
+    (``brain/bridge/supervisor.py``) is responsible for idle-gating this
+    call (see module docstring); this function itself does not check
+    ``cli_throttle``.
 
-    Resumable/idempotent: a row counts as backlog iff it is missing from
-    `embeddings` under the cache's OWN model_id (`EmbeddingCache.has`) — the
-    exact key `get_or_compute` reads/writes — so a row embedded by a prior
-    (possibly killed) tick, or by the ingest pipeline's own embed-on-write
-    side effect, is simply skipped here, never re-embedded or duplicated.
+    `batch_size`, when omitted, is the runtime-derived figure from
+    `_get_batch_size` (measured once per process per model_id — see module
+    docstring); pass an explicit value to override (tests do this for
+    deterministic bounds). `scan_cap` separately bounds how many rows are
+    even read from `memories` this call.
 
-    Fault-isolated WITHOUT starving later rows: a per-row failure (cache
-    lookup or embed compute — e.g. a transient provider error, or a row that
-    permanently trips a real embedding-runtime limit) is logged and the tick
-    CONTINUES to the next candidate rather than stopping there. The
-    persisted cursor still only advances up to the position just BEFORE the
-    EARLIEST failed row this tick — even if later rows in the same batch
-    embed successfully — so that row is retried first on the next tick
-    (transient failures get their retry). But because scanning does not stop
-    at the first failure, a row that fails on EVERY attempt (a permanent
-    failure) never blocks the rows after it from being embedded — it simply
-    never lets the cursor advance past itself, and is re-examined (and
-    re-skipped-with-a-warning) every tick indefinitely. Rows already
-    resolved earlier in the same tick (embedded or found already-cached)
-    keep their progress either way, since `has()` reflects them regardless
-    of where the cursor sits.
+    Backlog is exactly `MemoryStore.list_unembedded_since`'s definition:
+    active rows with `embedding IS NULL`. A row is fault-isolated on
+    failure — logged and the tick CONTINUES to the next candidate, never
+    starving later rows — and the persisted cursor is allowed to advance
+    PAST a failing row (skip-and-log, F1 #259 increment 3's cursor-freeze
+    fix), so one permanently-bad row can never stall the backlog the way it
+    used to.
     """
-    model_id = embeddings.model_id
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.build_embedding_provider()
+    model_id = provider.model_id()
+    effective_batch_size = batch_size if batch_size is not None else _get_batch_size(provider)
+
     cursor = _load_cursor(persona_dir, model_id)
-    candidates = store.list_active_since(cursor, limit=scan_cap)
+    candidates = store.list_unembedded_since(cursor, limit=scan_cap)
 
     scanned = 0
     embedded = 0
-    already_cached = 0
     skipped_short = 0
     errors = 0
-    resolved_up_to = cursor  # last row the cursor can safely advance past
-    # Once a row fails, resolved_up_to must never advance again THIS tick —
-    # a later success at a higher position must not skip the persisted
-    # cursor past the earlier, still-unresolved failure.
-    failed_this_tick = False
+    resolved_up_to = cursor
 
     for memory in candidates:
         scanned += 1
@@ -220,52 +389,49 @@ def run_embedding_backfill_tick(
 
         if len(memory.content) < MIN_CHARS_TO_EMBED:
             skipped_short += 1
-            if not failed_this_tick:
-                resolved_up_to = row_cursor
+            resolved_up_to = row_cursor
             continue
 
-        try:
-            cached = embeddings.has(memory.content)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "embedding_backfill: cache lookup failed for memory %s: %s", memory.id, exc
-            )
-            errors += 1
-            failed_this_tick = True
-            continue  # keep scanning — a later row must not be starved
-
-        if cached:
-            already_cached += 1
-            if not failed_this_tick:
-                resolved_up_to = row_cursor
-            continue
-
-        if embedded >= batch_size:
+        if embedded >= effective_batch_size:
             # Batch budget spent — leave this (and anything after it) for
-            # next tick. This is ordinary pacing, not a failure, so it's a
-            # clean stop rather than a continue.
+            # next tick. Ordinary pacing, not a failure: the cursor must NOT
+            # advance past a row that was never even attempted.
             break
 
         try:
-            embeddings.get_or_compute(memory.content)
+            store.embed_row(memory.id, memory.content)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "embedding_backfill: embed failed for memory %s: %s", memory.id, exc
+                "embedding_backfill: embed failed for memory %s — skipping "
+                "and advancing past it (skip-and-log): %s",
+                memory.id,
+                exc,
             )
             errors += 1
-            failed_this_tick = True
-            continue  # keep scanning — a later row must not be starved
+            resolved_up_to = row_cursor  # cursor-freeze fix: advance past it
+            continue
 
         embedded += 1
-        if not failed_this_tick:
-            resolved_up_to = row_cursor
+        resolved_up_to = row_cursor
 
-    _save_cursor(persona_dir, model_id, resolved_up_to)
+    # If the DB-side query returned fewer rows than scan_cap, this tick has
+    # seen the WHOLE currently-null backlog — persist NO forward cursor
+    # (reset to None) rather than `resolved_up_to`. Unlike the old
+    # content-hash cache, `embedding IS NULL` is not append-only per id: a
+    # row can go null a SECOND time (a later content edit whose synchronous
+    # re-embed fails — see MemoryStore._reembed_or_clear) at a `created_at`
+    # position the cursor may already have passed. A persisted forward
+    # cursor is only a safe scan-cost optimization while the backlog is
+    # LARGER than one scan window (the case it exists to make cheap); once
+    # it fits in one window, resetting is nearly free and makes the NEXT
+    # tick a full, self-healing rescan instead of trusting a stale position.
+    cursor_to_persist = None if len(candidates) < scan_cap else resolved_up_to
+    _save_cursor(persona_dir, model_id, cursor_to_persist)
 
     return BackfillTickResult(
         scanned=scanned,
         embedded=embedded,
-        already_cached=already_cached,
         skipped_short=skipped_short,
         errors=errors,
+        batch_size=effective_batch_size,
     )
