@@ -1054,6 +1054,178 @@ def test_reembed_or_clear_clears_row_and_evicts_matrix_on_embed_failure(
     store.close()
 
 
+# ---------------------------------------------------------------------------
+# Increment-2 cold red-team FIX 1 (crash-window data integrity): the
+# embedding/embedding_model_id columns must be NULLed in the SAME
+# UPDATE/commit as the content change on update(content=...)/fade()/
+# unfade() — not in the later, separate re-embed commit. Otherwise a crash
+# between "content committed" and "re-embed committed" durably leaves
+# {new content, OLD embedding}: a stale vector with no `embedding IS NULL`
+# signal for the idle backfill to catch, so recall could keep surfacing the
+# memory on its pre-mutation content indefinitely.
+#
+# Each test below patches the embedding provider's `embed()` so that, when
+# it is called (necessarily AFTER the content UPDATE has already committed —
+# `embed_row`/`_reembed_or_clear` run as a separate step following the
+# content write), it FIRST captures the row's current embedding columns
+# in-flight before letting the real embed proceed. This directly observes
+# the durable intermediate state a crash at that instant would leave behind,
+# while the happy path (no failure injected) still completes normally so the
+# same test also proves the final row/matrix state is correct.
+# ---------------------------------------------------------------------------
+
+
+def _capture_embedding_mid_reembed(provider, store, memory_id: str, captured: dict):
+    """Wrap `provider.embed` to snapshot memory_id's `embedding` /
+    `embedding_model_id` columns into `captured` the instant it is called,
+    then delegate to the original embed. Returns the original (unwrapped)
+    embed callable so a test can independently recompute an "expected"
+    vector without re-triggering the capture.
+    """
+    original_embed = provider.embed
+
+    def _embed(text: str):
+        row = store._conn.execute(
+            "SELECT embedding, embedding_model_id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        captured["embedding"] = row["embedding"]
+        captured["embedding_model_id"] = row["embedding_model_id"]
+        return original_embed(text)
+
+    provider.embed = _embed
+    return original_embed
+
+
+def test_update_content_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails pre-fix: pre-fix, the content UPDATE and the embedding-NULLing
+    happened in two separate commits (content first, embedding cleared only
+    on re-embed failure) — at the instant re-embed's `provider.embed` runs,
+    the row still held the OLD content's vector, not NULL. Post-fix, the
+    embedding/embedding_model_id columns are NULLed in the SAME commit as
+    the content change, so the row is already NULL/backfill-eligible by
+    the time re-embed even starts.
+    """
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.update(m.id, content="brand new content")
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale OLD vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    # Happy path (no failure injected): the row ends up byte-equal to the
+    # new content's embedding, and the matrix reflects it too.
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("brand new content").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("brand new content").astype(np.float32)
+    )
+    store.close()
+
+
+def test_fade_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same crash-window proof as above, for `fade()`."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.fade(m.id, summary="short summary")
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale pre-fade vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("short summary").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("short summary").astype(np.float32)
+    )
+    store.close()
+
+
+def test_unfade_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same crash-window proof as above, for `unfade()`."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_384_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="the full original body", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    store.fade(m.id, summary="short summary")  # row now embeds "short summary"
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.unfade(m.id)
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale fade-summary vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("the full original body").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("the full original body").astype(np.float32)
+    )
+    store.close()
+
+
 def test_get_bumps_last_accessed_at_and_recall_count() -> None:
     store = MemoryStore(":memory:")
     m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})

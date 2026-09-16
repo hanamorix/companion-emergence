@@ -780,6 +780,20 @@ class MemoryStore:
             else:
                 raise ValueError(f"Unknown update field: {key!r}")
 
+        # F1 #259 increment-2 red-team fix (crash-window data integrity): NULL
+        # the embedding/embedding_model_id columns IN THE SAME UPDATE/commit
+        # as the content change, not in the separate re-embed commit below.
+        # A crash between "content committed" and "re-embed committed" used
+        # to leave the row durably {new content, OLD embedding} — a stale
+        # vector with no `embedding IS NULL` signal for the idle backfill to
+        # catch, so recall could keep surfacing the memory on its
+        # pre-mutation content indefinitely. Folding the NULL into this same
+        # UPDATE makes the durable intermediate state {new content, NULL
+        # embedding}: backfill-eligible and crash-safe.
+        if "content" in fields:
+            column_map["embedding"] = ("embedding", None)
+            column_map["embedding_model_id"] = ("embedding_model_id", None)
+
         # Empty `fields` kwargs — existence already verified above, nothing to write.
         if not column_map and not extra_clauses:
             return
@@ -791,12 +805,29 @@ class MemoryStore:
         self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
         self._conn.commit()
 
-        # F1 #259 step 5: a content mutation invalidates the row's embedding
-        # — row-id keying has no `embedding IS NULL` signal for the backfill
-        # to catch new content under the SAME id, so re-embed synchronously
-        # (or clear on failure) right here, only when `content` was actually
-        # one of the updated fields.
+        # F1 #259 step 5 (increment-2 red-team fix): a content mutation
+        # invalidates the row's embedding — row-id keying has no
+        # `embedding IS NULL` signal for the backfill to catch new content
+        # under the SAME id, so re-embed synchronously (or clear on
+        # failure) right here, only when `content` was actually one of the
+        # updated fields.
         if "content" in fields:
+            # Evict the in-memory matrix entry at the same point the row's
+            # embedding went NULL (above), so a concurrent recall in the
+            # brief re-embed window below degrades to lexical rather than
+            # serving the stale in-memory vector.
+            try:
+                from brain.memory.embedding_matrix import build_embedding_matrix
+
+                build_embedding_matrix(self.db_path).evict(memory_id)
+            except Exception:  # noqa: BLE001 — best-effort, must not block the write
+                logger.warning(
+                    "MemoryStore.update: matrix evict failed for id=%s", memory_id, exc_info=True
+                )
+            # Happy-path synchronous re-embed repopulates embedding + matrix;
+            # on failure the row is already NULL (self-healing) — the
+            # clear-on-failure branch in `_reembed_or_clear` is now
+            # belt-and-suspenders, since the row is already NULL going in.
             self._reembed_or_clear(memory_id, fields["content"])
 
     def deactivate(self, memory_id: str) -> None:
@@ -819,15 +850,35 @@ class MemoryStore:
                 memory_id,
             )
             return
+        # F1 #259 increment-2 red-team fix: embedding/embedding_model_id are
+        # NULLed IN THE SAME UPDATE/commit as the content change, so the
+        # durable intermediate state after a crash right here is {summary
+        # content, NULL embedding} — backfill-eligible, never a stale vector
+        # against the pre-fade content. See `update()`'s matching comment.
         self._conn.execute(
-            "UPDATE memories SET content_snapshot = content, content = ?, state = 'fading' WHERE id = ?",
+            "UPDATE memories SET content_snapshot = content, content = ?, "
+            "state = 'fading', embedding = NULL, embedding_model_id = NULL "
+            "WHERE id = ?",
             (summary, memory_id),
         )
         self._conn.commit()
+        # Evict the in-memory matrix entry at the same point, so a
+        # concurrent recall in the brief re-embed window below degrades to
+        # lexical rather than serving the stale in-memory vector.
+        try:
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort, must not block fade()
+            logger.warning(
+                "MemoryStore.fade: matrix evict failed for id=%s", memory_id, exc_info=True
+            )
         # F1 #259 step 5: content changed (full body -> summary) — re-embed
         # synchronously so the row's vector reflects the faded summary, not
         # the pre-fade content (or clear on failure; see
-        # `_reembed_or_clear`'s docstring).
+        # `_reembed_or_clear`'s docstring). On failure the row is already
+        # NULL (self-healing) — that clear-on-failure branch is now
+        # belt-and-suspenders.
         self._reembed_or_clear(memory_id, summary)
 
     def unfade(self, memory_id: str) -> None:
@@ -847,15 +898,35 @@ class MemoryStore:
             )
             return
         restored_content = row["content_snapshot"]
+        # F1 #259 increment-2 red-team fix: embedding/embedding_model_id are
+        # NULLed IN THE SAME UPDATE/commit as the content change, so the
+        # durable intermediate state after a crash right here is {restored
+        # content, NULL embedding} — backfill-eligible, never a stale vector
+        # against the pre-unfade (summary) content. See `update()`'s
+        # matching comment.
         self._conn.execute(
-            "UPDATE memories SET content = content_snapshot, content_snapshot = NULL, state = 'active' WHERE id = ?",
+            "UPDATE memories SET content = content_snapshot, content_snapshot = NULL, "
+            "state = 'active', embedding = NULL, embedding_model_id = NULL "
+            "WHERE id = ?",
             (memory_id,),
         )
         self._conn.commit()
+        # Evict the in-memory matrix entry at the same point, so a
+        # concurrent recall in the brief re-embed window below degrades to
+        # lexical rather than serving the stale in-memory vector.
+        try:
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort, must not block unfade()
+            logger.warning(
+                "MemoryStore.unfade: matrix evict failed for id=%s", memory_id, exc_info=True
+            )
         # F1 #259 step 5: content changed back (summary -> restored full
         # body) — re-embed synchronously so the row's vector reflects the
         # restored content (or clear on failure; see `_reembed_or_clear`'s
-        # docstring).
+        # docstring). On failure the row is already NULL (self-healing) —
+        # that clear-on-failure branch is now belt-and-suspenders.
         self._reembed_or_clear(memory_id, restored_content)
 
     def hard_delete(self, memory_id: str) -> None:

@@ -502,6 +502,26 @@ def test_build_embedding_matrix_returns_the_same_instance_for_the_same_path(seed
     assert m1 is m2
 
 
+def test_build_embedding_matrix_normalizes_path_before_keying(seeded_db: Path) -> None:
+    """FIX 2 (increment-2 cold red-team, LOW): two differently-SPELLED paths
+    to the SAME underlying file must resolve to the SAME cache key. Keying
+    by raw `str(db_path)` alone would split them into two independent
+    matrices over one physical memories.db — a `put()`/`evict()` from a
+    caller that arrived via one spelling would be silently invisible to a
+    reader that arrived via the other. `str(Path(db_path).resolve())`
+    collapses the `..` traversal here, so both spellings land on one
+    instance."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    aliased_path = seeded_db.parent / "nonexistent_subdir" / ".." / seeded_db.name
+    assert str(aliased_path) != str(seeded_db)  # genuinely different spelling ...
+    assert aliased_path.resolve() == seeded_db.resolve()  # ... of the same physical file
+
+    m1 = build_embedding_matrix(seeded_db)
+    m2 = build_embedding_matrix(aliased_path)
+    assert m1 is m2
+
+
 def test_build_embedding_matrix_returns_different_instances_for_different_paths(
     tmp_path: Path,
 ) -> None:

@@ -366,7 +366,17 @@ def build_embedding_matrix(db_path: str | Path) -> EmbeddingMatrix:
     """
     from brain.bridge import model_tier
 
-    key = str(db_path)
+    # Normalize before keying (increment-2 red-team fix): two differently
+    # spelled paths to the SAME file (relative vs absolute, a symlink hop,
+    # a trailing `..`) must land on the same cache entry, or callers split
+    # into two independent matrices over one physical memories.db — a
+    # `put()`/`evict()` from one caller would silently be invisible to a
+    # reader that arrived via the other spelling. `str(db_path)` alone did
+    # not do this. `Path.resolve()` is a no-op on an already-canonical path
+    # (e.g. every real caller here, which passes `store.db_path`), so this
+    # changes nothing for the common case and only collapses the aliasing
+    # case.
+    key = str(Path(db_path).resolve())
 
     matrix = _matrix_cache.get(key)
     if matrix is not None:
