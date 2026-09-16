@@ -1310,3 +1310,118 @@ def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
     assert cols["peak_emotion_intensity"] == "REAL"
     mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 2.0})
     assert isinstance(mem.peak_emotion_intensity, float)
+
+
+# ---------------------------------------------------------------------------
+# F1 (#259) step 1: embedding/cluster columns + cluster_centroids table
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_embedding_and_cluster_columns() -> None:
+    """A brand-new store's `memories` table carries the 4 F1 columns,
+    all nullable/no-default — existing rows land NULL."""
+    store = MemoryStore(":memory:")
+    cols = {row[1]: row for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for name in ("embedding", "embedding_model_id", "cluster_id", "cluster_model_id"):
+        assert name in cols, f"missing column: {name}"
+        col = cols[name]
+        # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk)
+        assert col[3] == 0, f"{name} must be nullable (notnull=0), got {col[3]}"
+        assert col[4] is None, f"{name} must have no default, got {col[4]!r}"
+    store.close()
+
+
+def test_fresh_store_has_cluster_centroids_table() -> None:
+    """A brand-new store also creates the relocated `cluster_centroids`
+    table (F1 moves it from the old MemoryClusterStore side file into
+    memories.db) with the shape mirrored from
+    `MemoryClusterStore.memory_cluster_centroids`."""
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "cluster_centroids" in tables
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(cluster_centroids)").fetchall()}
+    assert cols == {"model_id", "cluster_id", "centroid", "dim", "updated_at"}
+    store.close()
+
+
+def test_new_memory_row_has_null_embedding_and_cluster_fields(store: MemoryStore) -> None:
+    """A freshly-created memory lands with the F1 columns NULL — nothing in
+    this step writes them."""
+    mem = Memory.create_new("plain content", "conversation", "us")
+    store.create(mem)
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id, cluster_id, cluster_model_id"
+        " FROM memories WHERE id = ?",
+        (mem.id,),
+    ).fetchone()
+    assert row["embedding"] is None
+    assert row["embedding_model_id"] is None
+    assert row["cluster_id"] is None
+    assert row["cluster_model_id"] is None
+
+
+def test_existing_store_migrates_in_embedding_and_cluster_columns(tmp_path) -> None:
+    """Simulate a pre-F1 persona — manually create the OLD (pre-#259)
+    schema (no embedding/cluster columns, no cluster_centroids table), then
+    open MemoryStore: the 4 columns + the table must be added without
+    error, and a pre-existing row must survive with NULL in all 4."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        emotions_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.0,
+        score REAL NOT NULL DEFAULT 0.0,
+        created_at TEXT NOT NULL,
+        last_accessed_at TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        protected INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL DEFAULT 'active',
+        content_snapshot TEXT,
+        recall_count REAL NOT NULL DEFAULT 0,
+        peak_emotion_intensity REAL NOT NULL DEFAULT 0.0
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO memories (id, content, memory_type, domain, emotions_json, tags_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("mem_pre_f1", "old body", "episodic", "chat", "{}", "[]", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for name in ("embedding", "embedding_model_id", "cluster_id", "cluster_model_id"):
+        assert name in cols
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "cluster_centroids" in tables
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id, cluster_id, cluster_model_id"
+        " FROM memories WHERE id = ?",
+        ("mem_pre_f1",),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None)
+    store.close()
+
+    # Re-open again (already-migrated DB) — the ALTER-guard must be a no-op,
+    # not raise "duplicate column name".
+    store2 = MemoryStore(db_path)
+    store2.close()

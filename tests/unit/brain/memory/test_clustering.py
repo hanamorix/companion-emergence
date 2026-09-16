@@ -141,11 +141,17 @@ def test_kmeans_k_equals_1_puts_everything_in_one_cluster() -> None:
 
 
 def test_store_schema_never_touches_memories_table(tmp_path: Path) -> None:
-    """Hard constraint guard: opening a MemoryClusterStore (even against the
-    SAME file a MemoryStore could use) never creates/touches a `memories`
-    table or a `cluster_id` column anywhere. The store lives in its own
-    file/table pair; this also documents that its schema is fully disjoint
-    from MemoryStore's."""
+    """Hard constraint guard, UPDATED for F1 (#259): opening a
+    MemoryClusterStore (even against the SAME file a MemoryStore could use)
+    never creates/touches a `memories` table anywhere — it lives in its own
+    file/table pair, fully disjoint from MemoryStore's schema. This is a
+    coexistence-era test: F1 relocates the per-memory `cluster_id` tag AND
+    the centroids table onto/into memories.db (see
+    `brain/memory/store.py`'s `_SCHEMA`), but does not yet remove
+    `MemoryClusterStore`/`embeddings.db` itself — that removal is a later
+    F1 increment (spec `f1-embedding-storage-spec.md` §1, §6). Until then
+    both the old side table and the new `memories.cluster_id` column
+    legitimately exist at once; nothing reads/writes the new column yet."""
     db_path = tmp_path / "embeddings.db"
     cluster_store = MemoryClusterStore(db_path)
     try:
@@ -168,16 +174,18 @@ def test_store_schema_never_touches_memories_table(tmp_path: Path) -> None:
     finally:
         cluster_store.close()
 
-    # And a real MemoryStore's own `memories` table schema is untouched by
-    # any of this (same assertion the plan's Stage 5 verification calls for,
-    # run against the actual memories.db this persona would use).
+    # A real MemoryStore's own `memories` table is untouched by opening a
+    # MemoryClusterStore against a neighboring file — but it DOES (as of
+    # F1 step 1) carry its own `cluster_id` column, relocated there by
+    # design; it is NULL/unpopulated until a later increment's clustering
+    # pass writes it.
     store = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     try:
         cols = {
             row[1]
             for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()  # noqa: SLF001
         }
-        assert "cluster_id" not in cols
+        assert "cluster_id" in cols
     finally:
         store.close()
 

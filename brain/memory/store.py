@@ -214,13 +214,34 @@ CREATE TABLE IF NOT EXISTS memories (
     state TEXT NOT NULL DEFAULT 'active',
     content_snapshot TEXT,
     recall_count REAL NOT NULL DEFAULT 0,
-    peak_emotion_intensity REAL NOT NULL DEFAULT 0.0
+    peak_emotion_intensity REAL NOT NULL DEFAULT 0.0,
+    embedding BLOB,
+    embedding_model_id TEXT,
+    cluster_id INTEGER,
+    cluster_model_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+-- F1 (#259): per-cluster centroid vectors, relocated into memories.db so
+-- every per-persona vector artifact lives in the one DB (I1) instead of the
+-- old content-hash-keyed side file (embeddings.db's MemoryClusterStore).
+-- Keyed by (model_id, cluster_id) — centroids are per-cluster, not
+-- per-memory, so they have no row on `memories` to live on. Shape mirrors
+-- `MemoryClusterStore.memory_cluster_centroids`
+-- (brain/memory/clustering.py) column-for-column so the later read/write
+-- swap-over is a straight port, not a reshape.
+CREATE TABLE IF NOT EXISTS cluster_centroids (
+    model_id TEXT NOT NULL,
+    cluster_id INTEGER NOT NULL,
+    centroid BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (model_id, cluster_id)
+);
 
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
@@ -396,6 +417,17 @@ class MemoryStore:
                             )
                 except sqlite3.OperationalError as exc:
                     logger.warning("peak seeding skipped: %s", exc)
+        # F1 (#259): embedding/cluster columns. Nullable, no default — existing
+        # rows land NULL and are picked up by the embedding backfill (a later
+        # increment); this migration step only guarantees the columns exist.
+        if "embedding" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
+        if "embedding_model_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedding_model_id TEXT")
+        if "cluster_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
+        if "cluster_model_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_model_id TEXT")
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
