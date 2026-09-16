@@ -7,30 +7,39 @@ the persona's cached embedding vectors and expose cluster membership as a
 MACHINE-USABLE retrieval tag (an integer cluster id, not a human-readable
 topic label).
 
-HARD CONSTRAINT (spec decision 2, re-confirmed in
-``hunts/semantic-retrieval/plan.md`` Stage 5): cluster data lives in its OWN
-content-hash-keyed side table (``MemoryClusterStore`` below), co-located in
-``embeddings.db`` alongside ``embedding_cache`` (both are content-hash-keyed,
-vector-derived data — the plan's own recommendation) but as separate tables.
-Cluster data is NEVER a column on the `memories` table in `memories.db` — that
-bolt-on is the one design that would collide with a future emotions
-row-migration; the side-table design keeps this work disjoint from `memories`,
-`hebbian.db`, and any emotions cleanup.
+STORAGE (F1 #259 increment 4 — supersedes the OLD side-table design below):
+the per-memory cluster tag lives as `cluster_id`/`cluster_model_id` columns
+directly on the `memories` row, keyed by memory id, and per-cluster centroids
+live in the `cluster_centroids` table — both inside `memories.db` (see
+`brain/memory/store.py`'s `_SCHEMA`). This reverses the module's original
+"NEVER a column on `memories`" hard constraint: that constraint turned out to
+be an assistant-minted coordination heuristic that Roy never actually ruled
+on (struck per the semantic-retrieval ledger's Q5 / the 2026-09-15
+postmortem), and the invariant it was blocking — per-memory attributes live
+on the memory row keyed by id (I2) — applies here same as anywhere else.
+`run_clustering_pass` now sources its vectors from the warm `EmbeddingMatrix`
+(`brain.memory.embedding_matrix.build_embedding_matrix(store.db_path)
+.snapshot()`, itself backed by `memories.embedding`/`embedding_model_id`)
+instead of `EmbeddingCache.all_hashes_and_vectors()`, and writes memberships
++ centroids via `MemoryStore.set_cluster_memberships` instead of
+`MemoryClusterStore.replace_pass`. Identity key changes from content-hash to
+memory-id as a result: two byte-identical memories no longer share one
+cluster tag, each gets its own (intended, mirrors the same change embed-on-
+write already made for the embedding column itself).
 
-Scoping: every row carries the `model_id` that produced the clustered vectors
-(mirrors `embedding_cache`'s own `(content_hash, model_id)` scoping — see that
-module's docstring). `cluster_for`/`cluster_tag_for_content` only ever return
-a row whose `model_id` matches the caller's current embedding provider, so a
-stale row is never served as if valid. Two ways staleness is avoided, mirroring
-`EmbeddingCache.get_or_compute`'s own INSERT-OR-REPLACE behavior exactly:
-content NOT YET reclustered under a new model has no row scoped to that
-model_id at all (invisible until the next pass computes one); content THAT HAS
-been reclustered has its row's `model_id`/`cluster_id` overwritten in place
-(`content_hash` is the row's natural key — the same text hashes identically
-regardless of which model embedded it, so there is only ever one row per
-content_hash, pointing at whichever model most recently clustered it) — a
-lookup still scoped to the OLD model_id on that content_hash then correctly
-returns nothing, not a mix of old and new.
+`MemoryClusterStore` below — the OLD content-hash-keyed side table,
+co-located in `embeddings.db` alongside `embedding_cache` — is now UNUSED by
+`run_clustering_pass`/`cluster_tag_for_memory`. It is kept in place, dead but
+present, only because `embeddings.db`'s deletion is a later F1 increment's
+job (spec §7); nothing in this module reads or writes it anymore.
+
+Scoping: still per-`model_id`, just implemented on the new storage.
+`MemoryStore.set_cluster_memberships` wholesale-replaces every row tagged
+with the target `model_id` each pass (mirroring `replace_pass`'s own
+delete-then-reinsert symmetry — see that method's docstring), and
+`cluster_tag_for_memory` only ever returns a `cluster_id` whose row-level
+`cluster_model_id` matches the caller's current embedding model_id, so a
+stale tag from a prior model is never served as if valid.
 
 Runs as a periodic BATCH pass (own persisted supervisor cadence — see
 `_run_clustering_tick` in `brain/bridge/supervisor.py`), never on the message
@@ -46,13 +55,13 @@ are bounded in size, so a full recompute every pass is affordable.
 Graceful with sparse data: below `MIN_VECTORS_TO_CLUSTER` cached vectors, a
 pass is a clean no-op (`ClusteringPassResult.ran=False`) — no crash, no
 degenerate single-cluster write. Idempotent/resumable: `run_clustering_pass`
-is a pure recompute-and-upsert against the current `embedding_cache` snapshot;
+is a pure recompute-and-upsert against the current warm-matrix snapshot;
 re-running it (including after a kill mid-write) always converges to a
 membership consistent with the last COMPLETED pass, never a mix of two passes
-— `MemoryClusterStore.replace_pass` writes memberships + centroids inside one
-transaction, committed once, so a kill mid-write leaves the table at its
-PREVIOUS consistent state (SQLite rolls back an uncommitted transaction on
-next open), not a half-applied one.
+— `MemoryStore.set_cluster_memberships` writes memberships + centroids inside
+one transaction, committed once, so a kill mid-write leaves the row/table at
+their PREVIOUS consistent state (SQLite rolls back an uncommitted transaction
+on next open), not a half-applied one.
 """
 
 from __future__ import annotations
@@ -65,7 +74,7 @@ from pathlib import Path
 
 import numpy as np
 
-from brain.memory.embeddings import EmbeddingCache, hash_content
+from brain.memory.embeddings import hash_content
 
 logger = logging.getLogger(__name__)
 
@@ -202,20 +211,31 @@ def kmeans(
 
 
 class MemoryClusterStore:
-    """Content-hash-keyed side table for memory cluster membership.
+    """UNUSED as of F1 #259 increment 4 — the OLD content-hash-keyed side
+    table for memory cluster membership. `run_clustering_pass` and
+    `cluster_tag_for_memory` below no longer read or write it; cluster data
+    now lives as `cluster_id`/`cluster_model_id` columns on the `memories`
+    row plus the `cluster_centroids` table, both inside `memories.db` (see
+    `MemoryStore.set_cluster_memberships`/`get_cluster_id` in
+    `brain/memory/store.py`). Kept dead-but-present only because
+    `embeddings.db`'s own deletion is a later F1 increment's job (spec §7) —
+    this class is NOT the storage this module's public functions use
+    anymore.
 
-    OWN table (`memory_clusters` + `memory_cluster_centroids`), never a
-    column on `memories` — see module docstring's hard constraint. Mirrors
-    `EmbeddingCache`'s schema/pragma/ALTER-guard shape so the two side tables
-    read as one family, but is its own class with its own connection (a
-    genuinely separate side table, not a method bolted onto EmbeddingCache).
+    OWN table (`memory_clusters` + `memory_cluster_centroids`) in
+    `embeddings.db`, content_hash-keyed rather than memory-id-keyed (the
+    "never a column on `memories`" constraint this design originally
+    honored was an assistant-minted heuristic, never a Roy ruling — struck
+    per the semantic-retrieval ledger's Q5 / the 2026-09-15 postmortem; see
+    module docstring). Mirrors `EmbeddingCache`'s schema/pragma/ALTER-guard
+    shape so the two side tables read as one family, but is its own class
+    with its own connection (a genuinely separate side table, not a method
+    bolted onto EmbeddingCache).
 
     `memory_clusters` holds one row per `content_hash`: the cluster id that
     content currently belongs to, and the `model_id` of the embedding that
     produced it. `memory_cluster_centroids` holds each cluster's centroid
-    vector, keyed by `(model_id, cluster_id)` — kept for future retrieval use
-    (e.g. "nearest cluster to a query vector") though Stage 5 itself only
-    needs to expose membership.
+    vector, keyed by `(model_id, cluster_id)`.
     """
 
     _SCHEMA = """
@@ -367,15 +387,27 @@ class ClusteringPassResult:
 
 
 def run_clustering_pass(
-    embeddings: EmbeddingCache,
-    cluster_store: MemoryClusterStore,
+    store,  # brain.memory.store.MemoryStore — untyped to avoid a hard import here
     *,
     seed: int = DEFAULT_SEED,
     min_vectors: int = MIN_VECTORS_TO_CLUSTER,
 ) -> ClusteringPassResult:
-    """Run one full clustering pass over `embeddings`' currently cached
-    vectors (scoped to `embeddings.model_id`) and upsert the result into
-    `cluster_store`.
+    """Run one full clustering pass over `store`'s currently embedded
+    vectors and upsert the result onto the `memories` row + the
+    `cluster_centroids` table (F1 #259 increment 4).
+
+    Vectors come from the warm `EmbeddingMatrix` for `store.db_path`
+    (`brain.memory.embedding_matrix.build_embedding_matrix(store.db_path)
+    .snapshot()` -> `{memory_id: vector}`), itself backed by the
+    `memories.embedding`/`embedding_model_id` columns — NOT
+    `EmbeddingCache.all_hashes_and_vectors()`/`embeddings.db` anymore. The
+    matrix's own `model_id` (the model its currently-held vectors were
+    embedded under) is what this pass's `cluster_id` writes get tagged
+    with, so a tag always describes the model that actually produced the
+    vectors clustered to produce it.
+
+    The k-means algorithm itself (`choose_k`/`kmeans` above) is unchanged —
+    only the vector source and the write destination moved.
 
     Off the message hot path by construction — callers only ever invoke this
     from a periodic background tick (see `_run_clustering_tick` in
@@ -383,41 +415,48 @@ def run_clustering_pass(
 
     Considers the ENTIRE model-scoped vector set every pass — no row cap.
     An earlier version applied a fixed `LIMIT` (`MAX_VECTORS_PER_PASS`) with
-    no `ORDER BY`, which SQLite serves in insertion order: once a persona's
-    embedding_cache exceeded that cap, the SAME first-N-inserted rows were
-    returned every pass and every later-embedded row was silently and
-    PERMANENTLY excluded from clustering. Removed rather than replaced with a
-    rotating/sampled bound: this is an off-hot-path background job on a ~6h
-    supervisor cadence and companion corpora are bounded in size, so a full
-    recompute every pass is affordable.
+    no `ORDER BY` against `embedding_cache`, which SQLite serves in
+    insertion order: once a persona's cache exceeded that cap, the SAME
+    first-N-inserted rows were returned every pass and every later-embedded
+    row was silently and PERMANENTLY excluded from clustering. Removed
+    rather than replaced with a rotating/sampled bound: this is an
+    off-hot-path background job on a ~6h supervisor cadence and companion
+    corpora are bounded in size, so a full recompute every pass is
+    affordable — the warm-matrix `snapshot()` this pass now reads has no
+    such cap either.
 
-    Sparse-data floor: fewer than `min_vectors` cached vectors -> clean no-op
-    (`ClusteringPassResult(ran=False, reason="sparse-skip")`), no write, no
-    crash. Idempotent: re-running with the same cached vectors + `seed`
-    reproduces the same memberships/centroids and upserts them again (a
-    strict no-op in effect, since `replace_pass` overwrites with identical
-    values) — safe to call every cadence firing indefinitely.
+    Sparse-data floor: fewer than `min_vectors` embedded vectors -> clean
+    no-op (`ClusteringPassResult(ran=False, reason="sparse-skip")`), no
+    write, no crash. Idempotent: re-running with the same embedded vectors +
+    `seed` reproduces the same memberships/centroids and upserts them again
+    (a strict no-op in effect, since `set_cluster_memberships` overwrites
+    with identical values) — safe to call every cadence firing indefinitely.
     """
-    model_id = embeddings.model_id
-    pairs = embeddings.all_hashes_and_vectors()
-    n = len(pairs)
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    matrix = build_embedding_matrix(store.db_path)
+    vectors_by_id = matrix.snapshot()
+    model_id = matrix.model_id
+    n = len(vectors_by_id)
 
     if n < min_vectors:
         logger.info(
-            "clustering: skipping pass (%d cached vectors < floor %d) model_id=%s",
+            "clustering: skipping pass (%d embedded vectors < floor %d) model_id=%s",
             n,
             min_vectors,
             model_id,
         )
         return ClusteringPassResult(ran=False, n_vectors=n, k=0, reason="sparse-skip")
 
-    hashes = [content_hash for content_hash, _ in pairs]
-    vectors = np.stack([vector for _, vector in pairs])
+    memory_ids = list(vectors_by_id.keys())
+    vectors = np.stack([vectors_by_id[mid] for mid in memory_ids])
     k = choose_k(n)
     labels, centroids = kmeans(vectors, k, seed=seed)
 
-    memberships = {h: int(label) for h, label in zip(hashes, labels, strict=True)}
-    cluster_store.replace_pass(memberships, centroids, model_id=model_id)
+    memberships = {
+        mid: int(label) for mid, label in zip(memory_ids, labels, strict=True)
+    }
+    store.set_cluster_memberships(memberships, centroids, model_id=model_id)
 
     logger.info(
         "clustering: pass complete n_vectors=%d k=%d model_id=%s", n, k, model_id
@@ -429,22 +468,29 @@ def cluster_tag_for_memory(
     memory_id: str,
     *,
     store,  # brain.memory.store.MemoryStore — untyped to avoid a hard import here
-    embeddings: EmbeddingCache,
-    cluster_store: MemoryClusterStore,
 ) -> int | None:
     """The query accessor Stage 3+ retrieval can later use: given a memory
-    id, resolve its content (WITHOUT bumping recall — this is a metadata
-    lookup, not a surfacing event, same `bump=False` care as the
-    `_EmbeddingsByMemoryId` precedent in `brain/bridge/supervisor.py`), hash
-    it, and look up its cluster tag scoped to `embeddings`' current
-    model_id.
+    id, read its `cluster_id`/`cluster_model_id` straight off the `memories`
+    row (`MemoryStore.get_cluster_id` — a raw row read, no recall bump, same
+    `bump=False` care as the `_EmbeddingsByMemoryId` precedent in
+    `brain/bridge/supervisor.py`) and return the tag only if it was written
+    under the caller's CURRENT embedding model_id
+    (`model_tier.model_for_tier(TIER_EMBEDDING)`, looked up via the module
+    so a test's monkeypatch on `model_for_tier` is honored, mirroring every
+    other dynamic model_id lookup in this codebase).
 
-    Returns `None` when the memory doesn't exist, hasn't been embedded yet,
-    hasn't been clustered yet, or was only clustered under a prior model_id
-    (never serves a stale tag). NOT wired into the retrieval path itself —
-    that is a separate, later stage; this only makes the tag queryable.
+    Returns `None` when the memory doesn't exist, hasn't been clustered yet,
+    or was only clustered under a prior model_id (never serves a stale tag).
+    NOT wired into the retrieval path itself — that is a separate, later
+    stage; this only makes the tag queryable.
     """
-    memory = store.get(memory_id, bump=False)
-    if memory is None:
+    from brain.bridge import model_tier
+
+    row = store.get_cluster_id(memory_id)
+    if row is None:
         return None
-    return cluster_store.cluster_for_content(memory.content, model_id=embeddings.model_id)
+    cluster_id, cluster_model_id = row
+    current_model_id = model_tier.model_for_tier(model_tier.TIER_EMBEDDING)
+    if cluster_model_id != current_model_id:
+        return None
+    return cluster_id

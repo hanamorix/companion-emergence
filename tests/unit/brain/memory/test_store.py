@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
+import numpy as np
 import pytest
 
 from brain.memory.store import _SCHEMA, Memory, MemoryStore
@@ -2041,3 +2042,125 @@ def test_existing_store_migrates_in_embedding_and_cluster_columns(tmp_path) -> N
     # not raise "duplicate column name".
     store2 = MemoryStore(db_path)
     store2.close()
+
+
+# ---------------------------------------------------------------------------
+# F1 (#259) increment 4: MemoryStore.set_cluster_memberships / get_cluster_id
+# — the row/table-based successor to MemoryClusterStore.replace_pass
+# (brain/memory/clustering.py), unit-tested directly here against small
+# hand-built memberships/centroids (brain/memory/clustering.py's own tests
+# cover the real k-means-driven end-to-end path).
+# ---------------------------------------------------------------------------
+
+
+def test_get_cluster_id_returns_none_for_unclustered_or_unknown_row(
+    store: MemoryStore,
+) -> None:
+    m = _mem()
+    store.create(m)
+    assert store.get_cluster_id(m.id) is None  # exists, never clustered
+    assert store.get_cluster_id("nonexistent-id") is None  # no such row
+
+
+def test_set_cluster_memberships_writes_row_and_centroids(store: MemoryStore) -> None:
+    m1, m2 = _mem(), _mem()
+    store.create(m1)
+    store.create(m2)
+    centroids = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+    store.set_cluster_memberships({m1.id: 0, m2.id: 1}, centroids, model_id="model-a")
+
+    assert store.get_cluster_id(m1.id) == (0, "model-a")
+    assert store.get_cluster_id(m2.id) == (1, "model-a")
+    rows = store._conn.execute(
+        "SELECT cluster_id, dim FROM cluster_centroids WHERE model_id = ? ORDER BY cluster_id",
+        ("model-a",),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [(0, 2), (1, 2)]
+
+
+def test_set_cluster_memberships_is_scoped_to_model_id(store: MemoryStore) -> None:
+    """A row tagged under one model_id must be invisible to a lookup that
+    compares against a different model_id — mirrors the old
+    MemoryClusterStore's own model-scoping invariant, ported onto the row."""
+    m = _mem()
+    store.create(m)
+    store.set_cluster_memberships({m.id: 3}, np.zeros((4, 2)), model_id="model-old")
+
+    cluster_id, cluster_model_id = store.get_cluster_id(m.id)
+    assert cluster_id == 3
+    assert cluster_model_id == "model-old"
+    assert cluster_model_id != "model-new"  # the caller's own scoping check
+
+
+def test_set_cluster_memberships_clears_rows_that_drop_out_of_the_pool(
+    store: MemoryStore,
+) -> None:
+    """Wholesale-replace semantics: a memory id clustered by a PRIOR pass
+    but absent from a LATER pass's memberships (same model_id) must end up
+    with cluster_id NULL, never a stale tag pointing at a centroid the later
+    pass may have deleted — the row-storage mirror of
+    MemoryClusterStore.replace_pass's delete-then-reinsert symmetry."""
+    m1, m2 = _mem(), _mem()
+    store.create(m1)
+    store.create(m2)
+    store.set_cluster_memberships(
+        {m1.id: 0, m2.id: 1}, np.array([[1.0, 0.0], [0.0, 1.0]]), model_id="m"
+    )
+    assert store.get_cluster_id(m1.id) == (0, "m")
+    assert store.get_cluster_id(m2.id) == (1, "m")
+
+    # Second pass: m2 has fallen out of the pool (e.g. its embedding was
+    # evicted); only m1 remains, now the sole member of the sole cluster.
+    store.set_cluster_memberships({m1.id: 0}, np.array([[1.0, 0.0]]), model_id="m")
+
+    assert store.get_cluster_id(m1.id) == (0, "m")
+    assert store.get_cluster_id(m2.id) is None  # dropped, not dangling
+    n_centroids = store._conn.execute(
+        "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", ("m",)
+    ).fetchone()[0]
+    assert n_centroids == 1
+
+
+def test_set_cluster_memberships_only_clears_the_target_model_id(
+    store: MemoryStore,
+) -> None:
+    """A pass for model_id "new" must not touch rows/centroids that belong
+    to a DIFFERENT model_id "old" — the clear-before-reinsert step is scoped
+    by model_id, not a blanket wipe."""
+    m_old, m_new = _mem(), _mem()
+    store.create(m_old)
+    store.create(m_new)
+    store.set_cluster_memberships({m_old.id: 0}, np.array([[1.0, 0.0]]), model_id="old")
+
+    store.set_cluster_memberships({m_new.id: 0}, np.array([[0.0, 1.0]]), model_id="new")
+
+    assert store.get_cluster_id(m_old.id) == (0, "old")  # untouched
+    assert store.get_cluster_id(m_new.id) == (0, "new")
+    n_old_centroids = store._conn.execute(
+        "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", ("old",)
+    ).fetchone()[0]
+    assert n_old_centroids == 1
+
+
+def test_set_cluster_memberships_is_atomic_a_failed_write_leaves_prior_state_intact(
+    store: MemoryStore,
+) -> None:
+    """Simulates a crash mid-write: a bad centroid blows up AFTER the
+    membership UPDATEs already ran, but every write shares ONE uncommitted
+    transaction — rolling back after the failure must undo the membership
+    writes too, leaving exactly the last successfully COMMITTED pass's
+    state (mirrors MemoryClusterStore.replace_pass's own atomicity test)."""
+    m = _mem()
+    store.create(m)
+    store.set_cluster_memberships({m.id: 0}, np.array([[1.0, 0.0]]), model_id="m")
+    assert store.get_cluster_id(m.id) == (0, "m")
+
+    bad_centroids = [None]  # blows up inside the centroid-write loop
+    with pytest.raises(AttributeError):
+        store.set_cluster_memberships({m.id: 1}, bad_centroids, model_id="m")
+    store._conn.rollback()
+
+    # The prior committed pass survives untouched — the failed pass never
+    # landed (not even the membership half, despite it running first).
+    assert store.get_cluster_id(m.id) == (0, "m")

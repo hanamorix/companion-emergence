@@ -22,6 +22,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -672,6 +674,80 @@ class MemoryStore:
                 memory_id,
                 exc_info=True,
             )
+
+    def set_cluster_memberships(
+        self,
+        memberships: dict[str, int],
+        centroids: np.ndarray,
+        *,
+        model_id: str,
+    ) -> None:
+        """Atomically replace `model_id`'s cluster memberships (on the
+        `memories` row's `cluster_id`/`cluster_model_id` columns) + its
+        centroids (`cluster_centroids` table) with the result of one
+        clustering pass (F1 #259 increment 4).
+
+        This is the row/table-based successor to the old
+        `MemoryClusterStore.replace_pass` (`brain/memory/clustering.py`) —
+        it ports that method's two load-bearing properties onto the new
+        storage rather than reinventing them:
+
+        WHOLESALE-REPLACE, scoped to `model_id`: every row currently
+        tagged `cluster_model_id = model_id` is cleared FIRST (`cluster_id`
+        / `cluster_model_id` -> NULL), then every memory id present in
+        `memberships` gets its `cluster_id`/`cluster_model_id` (re)stamped.
+        A memory id clustered by a PRIOR pass but absent from THIS pass's
+        `memberships` (its embedding was evicted/faded/dropped out of the
+        warm-matrix snapshot since) ends up NULL, not a stale `cluster_id`
+        pointing at a centroid this pass may have deleted — mirroring
+        `replace_pass`'s own delete-then-reinsert symmetry, just keyed by
+        memory id instead of content_hash (I2: two byte-identical memories
+        no longer share one tag, each gets its own — the intended identity
+        change per spec §1).
+
+        ONE transaction, ONE commit: the membership clear, the membership
+        (re)stamps, AND the centroid replace below all share one
+        uncommitted SQLite transaction, committed once at the end — a
+        crash mid-write leaves this at exactly the LAST successfully
+        committed pass's state (never a mix of old/new memberships, and
+        never memberships without their matching centroids). This is what
+        makes `run_clustering_pass` idempotent/resumable, same guarantee
+        `replace_pass` provided for the old side table.
+        """
+        self._conn.execute(
+            "UPDATE memories SET cluster_id = NULL, cluster_model_id = NULL "
+            "WHERE cluster_model_id = ?",
+            (model_id,),
+        )
+        self._conn.executemany(
+            "UPDATE memories SET cluster_id = ?, cluster_model_id = ? WHERE id = ?",
+            [(cluster_id, model_id, mem_id) for mem_id, cluster_id in memberships.items()],
+        )
+        self._conn.execute("DELETE FROM cluster_centroids WHERE model_id = ?", (model_id,))
+        self._conn.executemany(
+            "INSERT INTO cluster_centroids (model_id, cluster_id, centroid, dim) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (model_id, i, centroid.astype(np.float32).tobytes(), centroid.shape[0])
+                for i, centroid in enumerate(centroids)
+            ],
+        )
+        self._conn.commit()
+
+    def get_cluster_id(self, memory_id: str) -> tuple[int, str] | None:
+        """`(cluster_id, cluster_model_id)` for `memory_id`'s row, or
+        `None` when the row doesn't exist or hasn't been clustered
+        (`cluster_id IS NULL`) — the raw row read `cluster_tag_for_memory`
+        (`brain/memory/clustering.py`) layers its model_id-scoping check on
+        top of (never bumps recall — this is a metadata read, not a
+        surfacing event)."""
+        row = self._conn.execute(
+            "SELECT cluster_id, cluster_model_id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None or row["cluster_id"] is None:
+            return None
+        return int(row["cluster_id"]), row["cluster_model_id"]
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

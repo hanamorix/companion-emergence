@@ -2300,23 +2300,28 @@ def _run_clustering_tick(persona_dir: Path) -> None:
     currently-embedded vectors, off the message hot path (own persisted
     cadence — see ``clustering_interval_s`` on ``run_folded``, default 6h).
 
-    Opens its own ``EmbeddingCache`` + ``MemoryClusterStore`` (ExitStack —
-    mirrors ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s
-    per-call ownership pattern) since the per-tick handles opened earlier in
+    F1 #259 increment 4: sources vectors from the warm ``EmbeddingMatrix``
+    over ``memories.db`` (via ``run_clustering_pass(store)``) and writes
+    ``cluster_id``/``cluster_model_id`` onto the ``memories`` row plus the
+    ``cluster_centroids`` table — this tick no longer opens
+    ``EmbeddingCache``/``MemoryClusterStore`` against ``embeddings.db`` and
+    does not touch that file at all anymore.
+
+    Opens its own ``MemoryStore`` (ExitStack — mirrors
+    ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s per-call
+    ownership pattern) since the per-tick handles opened earlier in
     ``run_folded``'s loop are already closed by the time this cadence block
     runs. Local import keeps the module-load surface light — clustering is
     only exercised on its own slow cadence, same rationale as narrative
     memory's local imports above.
     """
-    from brain.memory.clustering import MemoryClusterStore, run_clustering_pass
+    from brain.memory.clustering import run_clustering_pass
 
     with ExitStack() as stack:
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
-        cluster_store = MemoryClusterStore(persona_dir / "embeddings.db")
-        stack.callback(cluster_store.close)
+        store = MemoryStore(persona_dir / "memories.db")
+        stack.callback(store.close)
 
-        result = run_clustering_pass(embeddings, cluster_store)
+        result = run_clustering_pass(store)
         logger.info(
             "clustering tick: ran=%s n_vectors=%d k=%d reason=%s",
             result.ran,

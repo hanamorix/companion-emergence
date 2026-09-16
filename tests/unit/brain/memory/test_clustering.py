@@ -1,12 +1,20 @@
 """Tests for brain.memory.clustering — Stage 5 (#157) of the local
-semantic-retrieval build: numpy-only k-means over cached embedding vectors,
-exposed as a machine-usable retrieval tag via a content-hash-keyed side
-table.
+semantic-retrieval build: numpy-only k-means over embedded memory vectors,
+exposed as a machine-usable retrieval tag.
 
 Covers the build task's acceptance bar: stable membership on a seeded
-fixture, content-hash+model_id-keyed side table, model_id swap recomputes
-rather than serving stale tags, sparse-data skip, idempotent re-run, and the
-hard "never a `memories`-table column" guard.
+fixture, model_id-scoped tags, a model_id swap recomputes rather than
+serving stale tags, sparse-data skip, idempotent re-run.
+
+F1 (#259) increment 4: `run_clustering_pass`/`cluster_tag_for_memory` now
+source vectors from the warm `EmbeddingMatrix` over `memories.db` and write
+`cluster_id`/`cluster_model_id` onto the `memories` row + the
+`cluster_centroids` table — NOT the old content-hash-keyed
+`MemoryClusterStore`/`embeddings.db` side table. `MemoryClusterStore` itself
+is retained UNUSED (dead but present — its own deletion, alongside
+`embeddings.db`, is a later F1 increment's job) and is still exercised
+directly below purely as a regression suite for that (now-dead) class's own
+SQL correctness.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from brain.bridge import model_tier
 from brain.memory.clustering import (
     K_MAX,
     K_MIN,
@@ -26,7 +35,7 @@ from brain.memory.clustering import (
     kmeans,
     run_clustering_pass,
 )
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
+from brain.memory.embedding_matrix import _reset_embedding_matrix_cache, build_embedding_matrix
 from brain.memory.store import Memory, MemoryStore
 
 # ---------------------------------------------------------------------------
@@ -136,22 +145,22 @@ def test_kmeans_k_equals_1_puts_everything_in_one_cluster() -> None:
 
 
 # ---------------------------------------------------------------------------
-# MemoryClusterStore — content-hash + model_id keyed side table
+# MemoryClusterStore — UNUSED as of F1 #259 increment 4 (see module
+# docstring). Exercised here purely as a regression suite for the class's
+# own SQL correctness, in case it is ever needed again before embeddings.db
+# is deleted; nothing below reflects the LIVE clustering path anymore (see
+# the run_clustering_pass / cluster_tag_for_memory sections below for that).
 # ---------------------------------------------------------------------------
 
 
 def test_store_schema_never_touches_memories_table(tmp_path: Path) -> None:
-    """Hard constraint guard, UPDATED for F1 (#259): opening a
-    MemoryClusterStore (even against the SAME file a MemoryStore could use)
-    never creates/touches a `memories` table anywhere — it lives in its own
-    file/table pair, fully disjoint from MemoryStore's schema. This is a
-    coexistence-era test: F1 relocates the per-memory `cluster_id` tag AND
-    the centroids table onto/into memories.db (see
-    `brain/memory/store.py`'s `_SCHEMA`), but does not yet remove
-    `MemoryClusterStore`/`embeddings.db` itself — that removal is a later
-    F1 increment (spec `f1-embedding-storage-spec.md` §1, §6). Until then
-    both the old side table and the new `memories.cluster_id` column
-    legitimately exist at once; nothing reads/writes the new column yet."""
+    """Guard, UPDATED for F1 increment 4: opening a (now-unused)
+    MemoryClusterStore never creates/touches a `memories` table — it lives
+    in its own file/table pair, fully disjoint from MemoryStore's schema.
+    The real `memories.cluster_id`/`cluster_model_id` columns are, as of
+    this increment, the LIVE storage `run_clustering_pass` writes — this
+    test only confirms MemoryClusterStore's own schema stays disjoint from
+    them, not that the columns are unpopulated."""
     db_path = tmp_path / "embeddings.db"
     cluster_store = MemoryClusterStore(db_path)
     try:
@@ -175,10 +184,8 @@ def test_store_schema_never_touches_memories_table(tmp_path: Path) -> None:
         cluster_store.close()
 
     # A real MemoryStore's own `memories` table is untouched by opening a
-    # MemoryClusterStore against a neighboring file — but it DOES (as of
-    # F1 step 1) carry its own `cluster_id` column, relocated there by
-    # design; it is NULL/unpopulated until a later increment's clustering
-    # pass writes it.
+    # MemoryClusterStore against a neighboring file — and it carries the
+    # LIVE `cluster_id` column `run_clustering_pass` now writes.
     store = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     try:
         cols = {
@@ -229,54 +236,6 @@ def test_model_id_scoping_a_different_model_never_sees_the_others_rows(tmp_path:
         assert store.cluster_for("hash-a", model_id="model-new") is None
     finally:
         store.close()
-
-
-def test_model_swap_recomputes_rather_than_serving_stale_tags(tmp_path: Path) -> None:
-    """A model swap must not silently serve a cluster tag computed under a
-    stale model's vector space — it must recompute (or stay absent) under the
-    new model_id."""
-    cache_old = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=16))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        texts = [f"memory content number {i} long enough to embed" for i in range(10)]
-        for t in texts:
-            cache_old.get_or_compute(t)
-        result_old = run_clustering_pass(cache_old, cluster_store, seed=1)
-        assert result_old.ran is True
-        old_model_id = cache_old.model_id
-        for t in texts:
-            assert cluster_store.cluster_for_content(t, model_id=old_model_id) is not None
-
-        # Swap to a different model (different dim -> different model_id,
-        # same as the real FastEmbedProvider dim-migration story).
-        cache_new = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=32))
-        new_model_id = cache_new.model_id
-        assert new_model_id != old_model_id
-
-        # Before the new model has embedded/clustered anything, old tags must
-        # NEVER be served under the new model_id.
-        for t in texts:
-            assert cluster_store.cluster_for_content(t, model_id=new_model_id) is None
-
-        for t in texts:
-            cache_new.get_or_compute(t)
-        result_new = run_clustering_pass(cache_new, cluster_store, seed=1)
-        assert result_new.ran is True
-        for t in texts:
-            assert cluster_store.cluster_for_content(t, model_id=new_model_id) is not None
-        # The row for each content_hash is now overwritten to point at the
-        # NEW model (content_hash is the row's natural key — the same text
-        # hashes identically regardless of which model embedded it, exactly
-        # mirroring EmbeddingCache.get_or_compute's own INSERT-OR-REPLACE
-        # behavior on a model swap). A query still scoped to the OLD
-        # model_id now correctly returns None — the targeted invalidation
-        # the hard invariant calls for: never serve a stale tag.
-        for t in texts:
-            assert cluster_store.cluster_for_content(t, model_id=old_model_id) is None
-        cache_new.close()
-    finally:
-        cache_old.close()
-        cluster_store.close()
 
 
 def test_replace_pass_is_atomic_a_failed_write_leaves_prior_state_intact(
@@ -361,200 +320,348 @@ def test_replace_pass_deletes_stale_membership_when_pool_composition_changes(
         store.close()
 
 
-def test_run_clustering_pass_drops_stale_membership_for_evicted_content(
-    tmp_path: Path,
+# ---------------------------------------------------------------------------
+# run_clustering_pass / cluster_tag_for_memory — F1 #259 increment 4: sourced
+# from the warm EmbeddingMatrix over memories.db, written onto the memories
+# row (`cluster_id`/`cluster_model_id`) + the `cluster_centroids` table.
+# ---------------------------------------------------------------------------
+
+_TEST_MODEL_ID = "fake-clustering-test-model"
+
+
+def _align_embedding_tier(monkeypatch: pytest.MonkeyPatch, model_id: str = _TEST_MODEL_ID) -> None:
+    """`run_clustering_pass` (via the warm `EmbeddingMatrix`) and
+    `cluster_tag_for_memory` both derive their model_id from
+    `model_tier.model_for_tier(TIER_EMBEDDING)` — NOT from any embedding
+    provider a test might otherwise construct. Align the two so the
+    matrix's lazy-build filter (and `cluster_tag_for_memory`'s model_id
+    comparison) actually match rows seeded under `model_id` — same
+    convention as `test_semantic_recall.py`'s `_align_embedding_tier`."""
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, model_id)
+
+
+def _seed_embedded_rows(
+    store: MemoryStore,
+    n: int,
+    *,
+    model_id: str = _TEST_MODEL_ID,
+    label: str = "row",
+) -> list[str]:
+    """Create `n` active memory rows, each with a deterministic 384-dim
+    vector written directly onto `embedding`/`embedding_model_id` — the warm
+    matrix requires exactly 384 dims (`embedding_matrix._EXPECTED_DIM`);
+    anything else is silently skipped-and-logged, not an error, so a test
+    seeding the wrong width would look like a sparse-skip rather than fail
+    loud. Bypasses a real embedding provider entirely, same convention as
+    `test_semantic_recall.py`'s `_seed_row_vector`. Returns the created ids
+    in insertion order."""
+    ids: list[str] = []
+    for i in range(n):
+        m = Memory.create_new(
+            content=f"{label} memory content number {i}",
+            memory_type="conversation",
+            domain="us",
+        )
+        store.create(m)
+        vec = np.full(384, float(i), dtype=np.float32)
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (vec.tobytes(), model_id, m.id),
+        )
+        ids.append(m.id)
+    store._conn.commit()  # noqa: SLF001
+    return ids
+
+
+def _bulk_seed_embedded_rows(
+    store: MemoryStore, n: int, *, model_id: str = _TEST_MODEL_ID, label: str = "bulk"
+) -> list[str]:
+    """Bulk-insert `n` embedded memory rows via a single `executemany` + one
+    commit — bypasses `Memory.create_new`/`store.create()`'s per-row commit,
+    used only for corpora too large to seed one row at a time within a
+    reasonable test runtime (mirrors this module's pre-F1
+    `_bulk_seed_cache_directly` helper, ported onto the row schema)."""
+    import uuid as _uuid
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    now = _datetime.now(_UTC).isoformat()
+    ids: list[str] = []
+    rows = []
+    for i in range(n):
+        mem_id = str(_uuid.uuid4())
+        ids.append(mem_id)
+        vec = np.full(384, float(i), dtype=np.float32)
+        rows.append(
+            (
+                mem_id,
+                f"{label} bulk-seeded memory number {i}",
+                "conversation",
+                "us",
+                "{}",
+                "[]",
+                now,
+                1,
+                vec.tobytes(),
+                model_id,
+            )
+        )
+    store._conn.executemany(  # noqa: SLF001
+        "INSERT INTO memories (id, content, memory_type, domain, emotions_json,"
+        " tags_json, created_at, active, embedding, embedding_model_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    store._conn.commit()  # noqa: SLF001
+    return ids
+
+
+def test_sparse_data_skips_cleanly_no_crash_no_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End-to-end version of the same regression via the real
-    embedding-cache -> clustering-pass path: content evicted from
-    `EmbeddingCache` between two passes under the same model_id must lose its
-    cluster membership entirely, never keep a stale cluster_id."""
-    db_path = tmp_path / "embeddings.db"
-    cache = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(db_path)
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        # Seed one more than the sparse-data floor so eviction still leaves
-        # enough vectors for pass 2 to actually run (not sparse-skip).
-        texts = _seed_embedding_cache(cache, MIN_VECTORS_TO_CLUSTER + 1)
-        result1 = run_clustering_pass(cache, cluster_store, seed=3)
-        assert result1.ran is True
-
-        evicted_text = texts[0]
-        assert cluster_store.cluster_for_content(evicted_text, model_id=cache.model_id) is not None
-        cache.evict(evicted_text)
-
-        result2 = run_clustering_pass(cache, cluster_store, seed=3)
-        assert result2.ran is True
-        assert result2.n_vectors == MIN_VECTORS_TO_CLUSTER
-
-        # The evicted content's membership must be gone, not stale.
-        assert cluster_store.cluster_for_content(evicted_text, model_id=cache.model_id) is None
-
-        # Every remaining membership under this model_id has a live centroid.
-        live_centroids = cluster_store.centroids(model_id=cache.model_id)
-        for t in texts[1:]:
-            cid = cluster_store.cluster_for_content(t, model_id=cache.model_id)
-            assert cid is not None
-            assert cid in live_centroids
-    finally:
-        cache.close()
-        cluster_store.close()
-
-
-# ---------------------------------------------------------------------------
-# run_clustering_pass — sparse-data skip + idempotency
-# ---------------------------------------------------------------------------
-
-
-def _seed_embedding_cache(cache: EmbeddingCache, n: int) -> list[str]:
-    texts = [f"memory content number {i} long enough to embed cleanly" for i in range(n)]
-    for t in texts:
-        cache.get_or_compute(t)
-    return texts
-
-
-def test_sparse_data_skips_cleanly_no_crash_no_write(tmp_path: Path) -> None:
-    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        _seed_embedding_cache(cache, MIN_VECTORS_TO_CLUSTER - 1)
-        result = run_clustering_pass(cache, cluster_store)
+        ids = _seed_embedded_rows(store, MIN_VECTORS_TO_CLUSTER - 1)
+        result = run_clustering_pass(store)
         assert result.ran is False
         assert result.reason == "sparse-skip"
-        assert cluster_store.count() == 0
+        for mid in ids:
+            assert store.get_cluster_id(mid) is None
+        n_centroids = store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM cluster_centroids"
+        ).fetchone()[0]
+        assert n_centroids == 0
     finally:
-        cache.close()
-        cluster_store.close()
+        store.close()
 
 
-def test_at_the_floor_clustering_runs(tmp_path: Path) -> None:
-    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
+def test_at_the_floor_clustering_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        _seed_embedding_cache(cache, MIN_VECTORS_TO_CLUSTER)
-        result = run_clustering_pass(cache, cluster_store)
+        ids = _seed_embedded_rows(store, MIN_VECTORS_TO_CLUSTER)
+        result = run_clustering_pass(store)
         assert result.ran is True
         assert result.reason == "ok"
         assert result.n_vectors == MIN_VECTORS_TO_CLUSTER
-        assert cluster_store.count(model_id=cache.model_id) == MIN_VECTORS_TO_CLUSTER
+        for mid in ids:
+            row = store.get_cluster_id(mid)
+            assert row is not None
+            cluster_id, cluster_model_id = row
+            assert cluster_model_id == _TEST_MODEL_ID
+            assert isinstance(cluster_id, int)
     finally:
-        cache.close()
-        cluster_store.close()
+        store.close()
 
 
-def test_empty_cache_skips_cleanly(tmp_path: Path) -> None:
-    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
+def test_empty_matrix_skips_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        result = run_clustering_pass(cache, cluster_store)
+        result = run_clustering_pass(store)
         assert result.ran is False
         assert result.n_vectors == 0
     finally:
-        cache.close()
-        cluster_store.close()
+        store.close()
 
 
-def test_idempotent_rerun_same_corpus_same_seed_converges(tmp_path: Path) -> None:
-    """Re-running the pass against an unchanged cache (default seed) leaves
-    every content's cluster tag unchanged, and the row count doesn't grow."""
-    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
+def test_idempotent_rerun_same_corpus_same_seed_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running the pass against an unchanged corpus (default seed) leaves
+    every memory's cluster tag unchanged, and no centroid-row growth."""
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        texts = _seed_embedding_cache(cache, 20)
-        result1 = run_clustering_pass(cache, cluster_store)
-        tags_after_1 = {t: cluster_store.cluster_for_content(t, model_id=cache.model_id) for t in texts}
+        ids = _seed_embedded_rows(store, 20)
+        result1 = run_clustering_pass(store)
+        tags_after_1 = {mid: store.get_cluster_id(mid) for mid in ids}
 
-        result2 = run_clustering_pass(cache, cluster_store)
-        tags_after_2 = {t: cluster_store.cluster_for_content(t, model_id=cache.model_id) for t in texts}
+        result2 = run_clustering_pass(store)
+        tags_after_2 = {mid: store.get_cluster_id(mid) for mid in ids}
 
         assert result1.ran and result2.ran
         assert tags_after_1 == tags_after_2
-        assert cluster_store.count(model_id=cache.model_id) == 20  # no growth, no dupes
+        n_centroids = store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?",
+            (_TEST_MODEL_ID,),
+        ).fetchone()[0]
+        assert n_centroids == result1.k  # no growth, no dupes
     finally:
-        cache.close()
-        cluster_store.close()
+        store.close()
 
 
-def test_kill_mid_pass_then_rerun_leaves_consistent_state(tmp_path: Path) -> None:
-    """Simulates a process kill between two ticks: a fresh
-    EmbeddingCache/MemoryClusterStore pair opened against the same on-disk
-    files after an interrupted-looking prior pass still converges to a
+def test_kill_mid_pass_then_rerun_leaves_consistent_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates a process kill between two ticks: a fresh MemoryStore (and
+    a fresh warm matrix — the process-wide singleton cache is explicitly
+    reset mid-test to simulate a genuinely new process, since a real restart
+    would never carry the old matrix over) opened against the same on-disk
+    file after an interrupted-looking prior pass still converges to a
     consistent, fully-clustered state on the next call — same resumability
     posture as the Stage 2 embedding backfill, even though this module
     recomputes wholesale rather than chipping incrementally."""
-    db_path = tmp_path / "embeddings.db"
-    cache_a = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=8))
-    texts = _seed_embedding_cache(cache_a, 15)
-    cluster_store_a = MemoryClusterStore(db_path)
-    run_clustering_pass(cache_a, cluster_store_a)
-    cache_a.close()
-    cluster_store_a.close()  # simulates the process dying right after commit
+    _align_embedding_tier(monkeypatch)
+    db_path = tmp_path / "memories.db"
+    store_a = MemoryStore(db_path, integrity_check=False)
+    ids = _seed_embedded_rows(store_a, 15)
+    run_clustering_pass(store_a)
+    store_a.close()  # simulates the process dying right after commit
 
-    # Fresh "process" reopens the same files and runs again.
-    cache_b = EmbeddingCache(db_path, FakeEmbeddingProvider(dim=8))
-    cluster_store_b = MemoryClusterStore(db_path)
+    _reset_embedding_matrix_cache()  # simulate a fresh process: no warm matrix carried over
+
+    store_b = MemoryStore(db_path, integrity_check=False)
     try:
-        result = run_clustering_pass(cache_b, cluster_store_b)
+        result = run_clustering_pass(store_b)
         assert result.ran is True
-        for t in texts:
-            assert cluster_store_b.cluster_for_content(t, model_id=cache_b.model_id) is not None
-        assert cluster_store_b.count(model_id=cache_b.model_id) == 15
+        for mid in ids:
+            assert store_b.get_cluster_id(mid) is not None
+        n_centroids = store_b._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?",
+            (_TEST_MODEL_ID,),
+        ).fetchone()[0]
+        assert n_centroids == result.k
     finally:
-        cache_b.close()
-        cluster_store_b.close()
+        store_b.close()
 
 
-def _bulk_seed_cache_directly(cache: EmbeddingCache, n: int, *, label: str) -> list[str]:
-    """Insert `n` embedding_cache rows for `cache`'s model_id via a single
-    bulk executemany, bypassing `get_or_compute`'s per-call commit — used
-    only to seed corpora too large to build one text at a time within a
-    reasonable test runtime. Vectors/hashes are computed exactly the way
-    `get_or_compute` computes them, just written in one batch."""
-    texts = [f"{label} bulk-seeded vector number {i}" for i in range(n)]
-    rows = []
-    for t in texts:
-        vec = cache._provider.embed(t).astype(np.float32)  # noqa: SLF001 — test-only bulk seed
-        rows.append((EmbeddingCache._hash(t), vec.tobytes(), vec.shape[0], cache.model_id))  # noqa: SLF001
-    cache._conn.executemany(  # noqa: SLF001
-        "INSERT OR REPLACE INTO embedding_cache (content_hash, vector, dim, model_id) "
-        "VALUES (?, ?, ?, ?)",
-        rows,
-    )
-    cache._conn.commit()  # noqa: SLF001
-    return texts
+def test_run_clustering_pass_drops_stale_membership_for_evicted_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end regression for the dangling/stale cluster_id bug: a memory
+    whose embedding is evicted between two passes under the same model_id
+    (fade/hard_delete/a failed re-embed all clear the row + evict the
+    warm-matrix entry the same way) must lose its cluster membership
+    entirely (cluster_id -> NULL), never keep a stale cluster_id pointing at
+    a centroid this pass deleted."""
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    try:
+        # Seed one more than the sparse-data floor so eviction still leaves
+        # enough vectors for pass 2 to actually run (not sparse-skip).
+        ids = _seed_embedded_rows(store, MIN_VECTORS_TO_CLUSTER + 1)
+        result1 = run_clustering_pass(store)
+        assert result1.ran is True
+
+        evicted_id = ids[0]
+        assert store.get_cluster_id(evicted_id) is not None
+
+        # Simulate the row's embedding being evicted — clear the row column
+        # AND the warm-matrix entry directly, exactly what
+        # MemoryStore.fade()/hard_delete() do in production.
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?",
+            (evicted_id,),
+        )
+        store._conn.commit()  # noqa: SLF001
+        build_embedding_matrix(store.db_path).evict(evicted_id)
+
+        result2 = run_clustering_pass(store)
+        assert result2.ran is True
+        assert result2.n_vectors == MIN_VECTORS_TO_CLUSTER
+
+        # The evicted memory's membership must be gone, not stale.
+        assert store.get_cluster_id(evicted_id) is None
+
+        # Every remaining membership under this model_id has a live centroid.
+        for mid in ids[1:]:
+            row = store.get_cluster_id(mid)
+            assert row is not None
+            cluster_id, _cluster_model_id = row
+            live = store._conn.execute(  # noqa: SLF001
+                "SELECT 1 FROM cluster_centroids WHERE model_id = ? AND cluster_id = ?",
+                (_TEST_MODEL_ID, cluster_id),
+            ).fetchone()
+            assert live is not None
+    finally:
+        store.close()
 
 
-def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(tmp_path: Path) -> None:
-    """Regression for the fixed-window-LIMIT-with-no-ORDER-BY starvation bug:
-    the old `run_clustering_pass` ran `all_hashes_and_vectors(limit=5000)`
-    (`MAX_VECTORS_PER_PASS`) against a query with NO `ORDER BY`. SQLite serves
-    that in insertion order, so once embedding_cache exceeded 5000 rows, the
-    SAME first-5000-inserted rows were returned every single pass and every
-    LATER-embedded row was silently and PERMANENTLY excluded from clustering
-    — forever, not just until the next pass.
+def test_model_swap_recomputes_rather_than_serving_stale_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model swap must not silently serve a cluster tag computed under a
+    stale model's vector space — it must recompute (or stay absent) under
+    the new model_id."""
+    old_model_id = "fake-clustering-model-old"
+    new_model_id = "fake-clustering-model-new"
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    try:
+        _align_embedding_tier(monkeypatch, old_model_id)
+        old_ids = _seed_embedded_rows(store, 10, model_id=old_model_id, label="row-v1")
+        result_old = run_clustering_pass(store)
+        assert result_old.ran is True
+        for mid in old_ids:
+            row = store.get_cluster_id(mid)
+            assert row is not None
+            assert row[1] == old_model_id
+            assert cluster_tag_for_memory(mid, store=store) is not None
 
-    Seeds well past that old 5000-row boundary and confirms clustering now
-    covers the FULL model-scoped vector set: every seeded row, including ones
-    inserted long after the old cap would have been reached, ends up with a
-    cluster membership."""
-    cache = EmbeddingCache(tmp_path / "embeddings.db", FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(tmp_path / "embeddings.db")
+        # Swap the active embedding tier to a new model — a genuinely new
+        # process would build a fresh matrix filtered to the new model_id;
+        # reset the singleton to simulate that rather than relying on this
+        # process's already-built (old-model) matrix.
+        _reset_embedding_matrix_cache()
+        _align_embedding_tier(monkeypatch, new_model_id)
+
+        # Before the new model has embedded/clustered anything, old tags
+        # must NEVER be served under the new model_id.
+        for mid in old_ids:
+            assert cluster_tag_for_memory(mid, store=store) is None
+
+        new_ids = _seed_embedded_rows(store, 10, model_id=new_model_id, label="row-v2")
+        result_new = run_clustering_pass(store)
+        assert result_new.ran is True
+        for mid in new_ids:
+            assert cluster_tag_for_memory(mid, store=store) is not None
+
+        # The OLD rows are untouched by the new-model pass (their
+        # cluster_model_id is still old_model_id) — a lookup still scoped to
+        # the CURRENT (new) model correctly returns None for them, the
+        # targeted invalidation the hard invariant calls for: never serve a
+        # stale tag.
+        for mid in old_ids:
+            row = store.get_cluster_id(mid)
+            assert row is not None
+            assert row[1] == old_model_id  # untouched, not overwritten
+            assert cluster_tag_for_memory(mid, store=store) is None
+    finally:
+        store.close()
+
+
+def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the fixed-window-LIMIT-with-no-ORDER-BY starvation bug
+    (see module history): an earlier version's vector source applied a fixed
+    `LIMIT` with no `ORDER BY`, so once the corpus exceeded that cap, only
+    the same first-N rows were ever clustered and every later row was
+    silently and PERMANENTLY excluded. The warm-matrix snapshot this pass
+    now reads has no LIMIT at all — confirm the full corpus, including rows
+    well past the old cap, is included."""
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
         old_cap = 5000
         total = old_cap + 50
-        texts = _bulk_seed_cache_directly(cache, total, label="starvation-regression")
+        ids = _bulk_seed_embedded_rows(store, total, label="starvation-regression")
 
-        result = run_clustering_pass(cache, cluster_store)
+        result = run_clustering_pass(store)
 
         assert result.ran is True
         assert result.n_vectors == total  # not silently capped at the old 5000
-        assert cluster_store.count(model_id=cache.model_id) == total
 
         # Rows inserted well past the old fixed window must be clustered too.
-        for late_text in texts[-10:]:
-            assert cluster_store.cluster_for_content(late_text, model_id=cache.model_id) is not None
+        for mid in ids[-10:]:
+            assert store.get_cluster_id(mid) is not None
     finally:
-        cache.close()
-        cluster_store.close()
+        store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -562,87 +669,75 @@ def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-def test_cluster_tag_for_memory_end_to_end(tmp_path: Path) -> None:
-    memories_db = tmp_path / "memories.db"
-    embeddings_db = tmp_path / "embeddings.db"
-
-    store = MemoryStore(str(memories_db), integrity_check=False)
-    cache = EmbeddingCache(embeddings_db, FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(embeddings_db)
+def test_cluster_tag_for_memory_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        made_ids = []
-        for i in range(MIN_VECTORS_TO_CLUSTER):
-            m = Memory.create_new(
-                content=f"memory content number {i} long enough to embed",
-                memory_type="conversation",
-                domain="us",
-            )
-            store.create(m)
-            made_ids.append(m.id)
-            cache.get_or_compute(m.content)
-
-        result = run_clustering_pass(cache, cluster_store)
+        ids = _seed_embedded_rows(store, MIN_VECTORS_TO_CLUSTER)
+        result = run_clustering_pass(store)
         assert result.ran is True
 
-        for mid in made_ids:
-            tag = cluster_tag_for_memory(
-                mid, store=store, embeddings=cache, cluster_store=cluster_store
-            )
+        for mid in ids:
+            tag = cluster_tag_for_memory(mid, store=store)
             assert tag is not None
             assert isinstance(tag, int)
     finally:
         store.close()
-        cache.close()
-        cluster_store.close()
 
 
-def test_cluster_tag_for_memory_returns_none_for_unknown_memory(tmp_path: Path) -> None:
-    memories_db = tmp_path / "memories.db"
-    embeddings_db = tmp_path / "embeddings.db"
-    store = MemoryStore(str(memories_db), integrity_check=False)
-    cache = EmbeddingCache(embeddings_db, FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(embeddings_db)
+def test_cluster_tag_for_memory_returns_none_for_unknown_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        tag = cluster_tag_for_memory(
-            "nonexistent-id", store=store, embeddings=cache, cluster_store=cluster_store
-        )
+        tag = cluster_tag_for_memory("nonexistent-id", store=store)
         assert tag is None
     finally:
         store.close()
-        cache.close()
-        cluster_store.close()
 
 
-def test_cluster_tag_for_memory_does_not_bump_recall(tmp_path: Path) -> None:
+def test_cluster_tag_for_memory_returns_none_for_unclustered_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A memory that exists and is even embedded, but hasn't been through a
+    clustering pass yet, has no `cluster_id` -> `None`, not an error."""
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    try:
+        ids = _seed_embedded_rows(store, 1)
+        assert cluster_tag_for_memory(ids[0], store=store) is None
+    finally:
+        store.close()
+
+
+def test_cluster_tag_for_memory_does_not_bump_recall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Mirrors the `_EmbeddingsByMemoryId` precedent's own trap (Part A of
     the build plan): a candidate-pool/metadata lookup must never inflate
-    recall_count just from being consulted."""
-    memories_db = tmp_path / "memories.db"
-    embeddings_db = tmp_path / "embeddings.db"
-    store = MemoryStore(str(memories_db), integrity_check=False)
-    cache = EmbeddingCache(embeddings_db, FakeEmbeddingProvider(dim=8))
-    cluster_store = MemoryClusterStore(embeddings_db)
+    recall_count just from being consulted. `cluster_tag_for_memory` reads
+    via `MemoryStore.get_cluster_id` — a raw row SELECT, not `store.get()` —
+    so this asserts that stays true end to end."""
+    _align_embedding_tier(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
-        m = Memory.create_new(
-            content="a memory whose recall count must not move",
-            memory_type="conversation",
-            domain="us",
-        )
-        store.create(m)
-        cache.get_or_compute(m.content)
-        before = store.get(m.id, bump=False)
+        ids = _seed_embedded_rows(store, MIN_VECTORS_TO_CLUSTER)
+        run_clustering_pass(store)
+        mid = ids[0]
+        before = store.get(mid, bump=False)
         assert before is not None
         recall_before = before.recall_count
 
-        cluster_tag_for_memory(m.id, store=store, embeddings=cache, cluster_store=cluster_store)
+        cluster_tag_for_memory(mid, store=store)
 
-        after = store.get(m.id, bump=False)
+        after = store.get(mid, bump=False)
         assert after is not None
         assert after.recall_count == recall_before
     finally:
         store.close()
-        cache.close()
-        cluster_store.close()
 
 
 # ---------------------------------------------------------------------------

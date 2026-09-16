@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from brain.bridge import persisted_cadence
@@ -16,6 +17,7 @@ from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
     _ROLLING_LOG_POLICIES,
+    _run_clustering_tick,
     _run_heartbeat_tick,
     _run_initiate_review_tick,  # noqa: F401 — imported to assert symbol exists
     _run_log_rotation_tick,
@@ -425,6 +427,68 @@ def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) 
         )
     finally:
         store2.close()
+
+
+def test_supervisor_clustering_tick_writes_row_and_centroids_not_embeddings_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-path proof for F1 #259 increment 4's clustering rewire:
+    `_run_clustering_tick` sources vectors from the warm matrix over
+    `memories.db` (via `run_clustering_pass`) and writes `cluster_id`/
+    `cluster_model_id` onto the row plus the `cluster_centroids` table —
+    not the old `MemoryClusterStore`/`embeddings.db` side file this tick
+    used to open unconditionally on every firing. Seeds rows directly
+    (bypassing the real embed provider, same convention as
+    `brain/memory/clustering.py`'s own tests) and aligns the active
+    embedding tier to the seeded model_id so the matrix's lazy build
+    actually finds them."""
+    from brain.bridge import model_tier
+    from brain.memory.clustering import MIN_VECTORS_TO_CLUSTER
+    from brain.memory.store import Memory, MemoryStore
+
+    test_model_id = "fake-clustering-tick-model"
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, test_model_id)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    ids: list[str] = []
+    for i in range(MIN_VECTORS_TO_CLUSTER):
+        m = Memory.create_new(
+            content=f"clustering tick memory number {i}",
+            memory_type="conversation",
+            domain="us",
+        )
+        store.create(m)
+        vec = np.full(384, float(i), dtype=np.float32)
+        store._conn.execute(
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (vec.tobytes(), test_model_id, m.id),
+        )
+        ids.append(m.id)
+    store._conn.commit()
+    store.close()
+
+    _run_clustering_tick(persona_dir)
+
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        for mid in ids:
+            row = store2._conn.execute(
+                "SELECT cluster_id, cluster_model_id FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+            assert row is not None
+            assert row["cluster_id"] is not None
+            assert row["cluster_model_id"] == test_model_id
+        n_centroids = store2._conn.execute(
+            "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", (test_model_id,)
+        ).fetchone()[0]
+        assert n_centroids > 0
+    finally:
+        store2.close()
+
+    # The old side file must never have been created — this tick no longer
+    # opens embeddings.db at all.
+    assert not (persona_dir / "embeddings.db").exists()
 
 
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:

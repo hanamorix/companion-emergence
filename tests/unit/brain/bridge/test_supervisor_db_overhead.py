@@ -64,6 +64,7 @@ def _isolating_kwargs(**overrides):
         "soul_review_interval_s": None,
         "finalize_interval_s": None,
         "log_rotation_interval_s": None,
+        "clustering_interval_s": None,
         "initiate_review_interval_s": None,
         "voice_reflection_interval_s": None,
         "self_model_interval_s": None,
