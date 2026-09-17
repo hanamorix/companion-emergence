@@ -120,7 +120,23 @@ MODEL_EMBEDDING_DIM = 1024
 # (query, memory) TOGETHER and scores true relevance, replacing the old
 # cosine-floor/gap auto-calibration that didn't generalize across corpus
 # shapes. See brain/memory/reranker.py.
-MODEL_RERANKER = "Xenova/ms-marco-MiniLM-L-6-v2"  # ONNX cross-encoder, ~80MB, via fastembed
+# #250 F2a inc1 model-swap (2026-09-17, Roy): swapped from the English-only
+# Xenova/ms-marco-MiniLM-L-6-v2 to this multilingual model per the F4
+# forward-compat item (see semantic-retrieval-LEDGER.md, agent a2feb8f5) —
+# fastembed-native (TextCrossEncoder registry), a SINGLE self-contained
+# fp32 .onnx file (additional_files: []), ~1.11GB, so it needs NO
+# materialize-files workaround (unlike F1's multilingual-e5-large, which
+# hits the onnxruntime external-data-path bug because it ships sharded
+# external weights). fp16 export (~2x faster) is a LATER increment, gated
+# on a build-time fp16-vs-fp32 accuracy check — this fp32 default is
+# increment 1 only. Score type: raw, unbounded logit (same shape as the
+# outgoing ms-marco score, but a DIFFERENT SCALE) — semantic_recall.py's
+# RERANK_FLOOR is still calibrated against the OLD MiniLM scale as of this
+# commit; a scale mismatch against jina's scores is EXPECTED here and gets
+# resolved by the floor's daily self-calibration (F2a §7), not by this
+# swap. License: CC-BY-NC-4.0 (non-commercial), accepted for this
+# free/open-source, non-commercial project.
+MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encoder, ~1.11GB fp32, via fastembed
 
 # attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
 # (not the bare "haiku" alias) — this predates #154 and substituting the alias
