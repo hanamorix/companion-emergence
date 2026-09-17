@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from brain import __version__, prompt_strings
@@ -600,6 +601,120 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_backfill_eta(seconds: float | None) -> str:
+    """Format a remaining-time estimate for the backfill ticker. `None`
+    means "not yet estimable" (no completed embeds to derive a rate from
+    yet)."""
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _embed_backfill_handler(args: argparse.Namespace) -> int:
+    """Drain the embedding backlog to completion in one pass — `nell embed
+    backfill` (F1 #259 increment 6, spec §5b / S12). The operator escape
+    hatch for the idle-gated embedding backfill
+    (`brain/memory/embedding_backfill.py`): reuses that module's own tick
+    machinery (row-NULL/model-mismatch backlog, `embed_row` writes, cursor
+    skip-and-log on a permanently-failing row) but loops it flat-out with no
+    idle gate and no inter-tick sleep, since this command is
+    operator-initiated, not the background supervisor cadence.
+
+    Cross-process note (flag-4 resolution — documented here, not signalled):
+    this CLI runs in a SEPARATE process from the bridge.
+      - Cleanest: run it with the bridge STOPPED first
+        (`nell supervisor stop --persona <name>`). The bridge rebuilds its
+        warm vector matrix lazily, straight from the finished `memories`
+        columns, on its next start — no cross-process staleness, no IPC
+        needed.
+      - Also supported: running it while the bridge is LIVE. The rows this
+        command embeds only become recall-visible after the NEXT bridge
+        restart — there is no live matrix-rebuild signal in this build. A
+        live IPC rebuild signal is explicitly OUT of F1 scope (new
+        bridge-lifecycle plumbing, adjacent to #177's crash-recovery work);
+        it is not built here.
+    """
+    from brain.memory.embedding_backfill import (
+        MIN_CHARS_TO_EMBED,
+        run_embedding_backfill_to_completion,
+    )
+    from brain.memory.embeddings import build_embedding_provider
+
+    # `_open_memory_store_for_cli` is documented as opening for "read-only
+    # CLI inspection" (its other 3 call sites only ever read) — `MemoryStore`
+    # itself has no separate read-only mode, so the SAME open is reused here
+    # even though this command intentionally writes (`embed_row` persists
+    # the row's embedding column), rather than duplicating its existence
+    # checks in a second near-identical helper.
+    store, rc = _open_memory_store_for_cli(args.persona)
+    if store is None:
+        return rc
+
+    persona_dir = get_persona_dir(args.persona)
+    try:
+        provider = build_embedding_provider()
+        total_backlog = store.count_unembedded(
+            current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+        )
+
+        if total_backlog == 0:
+            print(f"embedding backlog for '{args.persona}' is already empty — nothing to do.")
+            return 0
+
+        print(
+            f"embedding backfill for '{args.persona}': {total_backlog} row(s) to "
+            f"embed (model={provider.model_id()!r})"
+        )
+
+        start = time.monotonic()
+        quiet = args.quiet
+
+        def _progress(embedded: int, failed: int, _scanned: int) -> None:
+            if quiet:
+                return
+            elapsed = time.monotonic() - start
+            rate = embedded / elapsed if elapsed > 0 else 0.0
+            # `failed` here is a live running total (may slightly over-count
+            # a row retried across ticks before a stall is detected — see
+            # run_embedding_backfill_to_completion's docstring); clamped so
+            # a transient over-count never drives "remaining" negative.
+            remaining = max(total_backlog - embedded - failed, 0)
+            eta = _format_backfill_eta(remaining / rate) if rate > 0 else _format_backfill_eta(None)
+            print(
+                f"\rembedded {embedded}/{total_backlog}  failed {failed}  "
+                f"({rate:.2f}/s, ETA {eta})",
+                end="",
+                flush=True,
+            )
+
+        result = run_embedding_backfill_to_completion(persona_dir, store, progress_cb=_progress)
+        if not quiet:
+            print()  # close out the in-place ticker line
+
+        elapsed = time.monotonic() - start
+        print(
+            f"done: embedded={result.embedded} failed={result.failed} "
+            f"scanned={result.scanned} ticks={result.ticks} "
+            f"stopped={result.stopped_reason} elapsed={elapsed:.1f}s"
+        )
+        if result.failed:
+            print(
+                f"note: {result.failed} row(s) could not be embedded (permanently "
+                "failing on this content — see the persona log for per-row "
+                "errors) and will keep falling back to lexical recall.",
+                file=sys.stderr,
+            )
+        return 0 if result.failed == 0 else 1
+    finally:
+        store.close()
+
+
 def _works_list_handler(args: argparse.Namespace) -> int:
     """List recent brain-authored creative artifacts."""
     from brain.paths import get_persona_dir
@@ -693,7 +808,6 @@ def _dream_handler(args: argparse.Namespace) -> int:
             engine = DreamEngine(
                 store=store,
                 hebbian=hebbian,
-                embeddings=None,
                 provider=provider,
                 log_path=persona_dir / "dreams.log.jsonl",
                 persona_dir=persona_dir,
@@ -1680,7 +1794,6 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "bridge_json": pd / "bridge.json",
         "memories_db": pd / "memories.db",
         "hebbian_db": pd / "hebbian.db",
-        "embeddings_db": pd / "embeddings.db",
         "crystallizations_db": pd / "crystallizations.db",
         "soul_candidates": pd / "soul_candidates.jsonl",
         "active_conversations": pd / "active_conversations",
@@ -2383,6 +2496,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Persona name. If omitted and exactly one is installed, that one is used.",
     )
     memory_show.set_defaults(func=_memory_show_handler)
+
+    # nell embed backfill — F1 #259 increment 6: the manual one-go backfill
+    # CLI (spec §5b / S12), the operator escape hatch for the idle-gated
+    # embedding backfill. See _embed_backfill_handler's docstring for the
+    # bridge-stopped-vs-live flag-4 resolution.
+    embed_sub = subparsers.add_parser(
+        "embed",
+        help="Embedding-backfill commands (F1 #259).",
+    )
+    embed_actions = embed_sub.add_subparsers(dest="action", required=True)
+
+    embed_backfill = embed_actions.add_parser(
+        "backfill",
+        help=(
+            "Drain the embedding backfill to completion in one pass, with a "
+            "live progress ticker. Operator-initiated escape hatch — runs "
+            "flat-out (no idle gate). Cleanest run is with the bridge "
+            "STOPPED first (`nell supervisor stop --persona <name>`); it "
+            "rebuilds its warm vector matrix lazily on next start. Running "
+            "it while the bridge is LIVE also works, but the newly-written "
+            "vectors only become recall-visible after the next bridge "
+            "restart (no live matrix-rebuild signal in this build)."
+        ),
+    )
+    embed_backfill.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
+    embed_backfill.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the live progress ticker; print only the final summary.",
+    )
+    embed_backfill.set_defaults(func=_embed_backfill_handler)
 
     _build_migrate_parser(subparsers)
     from brain.recovery.cli import build_parser as _build_recover_parser

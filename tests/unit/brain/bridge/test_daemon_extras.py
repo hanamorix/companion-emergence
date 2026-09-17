@@ -664,7 +664,6 @@ def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
         store,
         hebbian,
         provider,
-        embeddings,
     ):
         captured["persona_dir"] = persona_dir_arg
         captured["silence_minutes"] = silence_minutes

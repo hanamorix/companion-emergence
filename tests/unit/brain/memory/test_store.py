@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
+import numpy as np
 import pytest
 
 from brain.memory.store import _SCHEMA, Memory, MemoryStore
@@ -541,6 +542,322 @@ def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
     assert [m.id for m in results] == [active.id]
 
 
+# ---------------------------------------------------------------------------
+# list_unembedded_since — the embedding backfill's own backlog query (F1
+# #259 increment 3). Same keyset-cursor shape as list_active_since above,
+# scoped to `embedding IS NULL`.
+# ---------------------------------------------------------------------------
+
+
+def test_store_list_unembedded_since_excludes_already_embedded_rows(
+    store: MemoryStore,
+) -> None:
+    """A row embedded under the CURRENT model never appears in the backlog
+    query — backlog membership is the row's own columns, not a side-table
+    lookup. (The row is embedded under "some-model", and the query is asked
+    about "some-model" too, so this is the steady-state / no-swap case —
+    see the model-mismatch tests below for the swap case.)"""
+    embedded = _mem("already embedded")
+    embedded.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    unembedded = _mem("still needs an embedding")
+    unembedded.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(embedded)
+    store.create(unembedded)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "some-model", embedded.id),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
+
+    assert [m.id for m in results] == [unembedded.id]
+
+
+def test_store_list_unembedded_since_includes_stale_model_rows(
+    store: MemoryStore,
+) -> None:
+    """FIX A (Planning-ruled 2026-09-16, F1 #259 increment-3 spec-gap): a row
+    embedded under a model_id that no longer matches `current_model_id` (a
+    model swap happened) IS backlog — `embedding_model_id != current` — even
+    though its `embedding` column is non-NULL. Restores the model-scoped
+    self-healing the old content-hash cache had; without this, a post-swap
+    row would fall to lexical recall forever with no re-embed path."""
+    stale = _mem("embedded under the old model")
+    stale.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    current = _mem("embedded under the current model")
+    current.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(stale)
+    store.create(current)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "old-model", stale.id),
+    )
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "new-model", current.id),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="new-model", min_chars=0
+    )
+
+    # The stale-model row IS in the backlog; the current-model row is not.
+    assert [m.id for m in results] == [stale.id]
+
+
+def test_store_list_unembedded_since_excludes_short_rows(
+    store: MemoryStore,
+) -> None:
+    """FIX B (F1 #259 increment-3 red-team): a row under `min_chars` is
+    excluded at the SQL level, not merely skipped Python-side — it never
+    even appears in the returned candidates."""
+    short = _mem("x" * 5)
+    short.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    long_enough = _mem("y" * 25)
+    long_enough.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(short)
+    store.create(long_enough)
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=20
+    )
+
+    assert [m.id for m in results] == [long_enough.id]
+
+
+def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
+    store: MemoryStore,
+) -> None:
+    """cursor=None starts from the oldest still-unembedded memory, ascending."""
+    older = _mem("older")
+    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    newer = _mem("newer")
+    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(older)
+    store.create(newer)
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
+
+    assert [m.id for m in results] == [older.id, newer.id]
+
+
+def test_store_list_unembedded_since_excludes_at_or_before_cursor(
+    store: MemoryStore,
+) -> None:
+    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
+    a = _mem("a")
+    a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    b = _mem("b")
+    b.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    c = _mem("c")
+    c.created_at = datetime(2020, 1, 3, tzinfo=UTC)
+    store.create(a)
+    store.create(b)
+    store.create(c)
+
+    results = store.list_unembedded_since(
+        (b.created_at.isoformat(), b.id), limit=10, current_model_id="some-model", min_chars=0
+    )
+
+    assert [m.id for m in results] == [c.id]
+
+
+def test_store_list_unembedded_since_tie_inclusive_on_shared_created_at(
+    store: MemoryStore,
+) -> None:
+    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
+    sharing that EXACT created_at, provided its id sorts after the cursor's
+    — same tied-timestamp regression coverage as list_active_since."""
+    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    first = _mem("first")
+    first.created_at = shared_ts
+    second = _mem("second")
+    second.created_at = shared_ts
+    first.id = "aaaa0000-0000-0000-0000-000000000000"
+    second.id = "bbbb0000-0000-0000-0000-000000000000"
+    store.create(first)
+    store.create(second)
+
+    results = store.list_unembedded_since(
+        (shared_ts.isoformat(), first.id), limit=10, current_model_id="some-model", min_chars=0
+    )
+
+    assert [m.id for m in results] == [second.id]
+
+
+def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
+    """Bounded per call — never returns more than `limit` rows."""
+    for i in range(5):
+        m = _mem(f"item-{i}")
+        m.created_at = datetime(2020, 1, i + 1, tzinfo=UTC)
+        store.create(m)
+
+    results = store.list_unembedded_since(
+        None, limit=2, current_model_id="some-model", min_chars=0
+    )
+
+    assert len(results) == 2
+    assert [m.content for m in results] == ["item-0", "item-1"]
+
+
+def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> None:
+    """Same active=1 filter as list_active()/list_active_since() —
+    deactivated rows never appear even if unembedded."""
+    active = _mem("active")
+    inactive = _mem("inactive")
+    store.create(active)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
+
+    assert [m.id for m in results] == [active.id]
+
+
+def test_store_list_unembedded_since_row_reappears_after_going_null_again(
+    store: MemoryStore,
+) -> None:
+    """A row that was embedded and then goes NULL again (e.g. a content
+    edit whose synchronous re-embed failed — see
+    `MemoryStore._reembed_or_clear`) must reappear in the backlog query
+    regardless of its `created_at` position relative to any OTHER row —
+    membership is purely `embedding IS NULL`, not a forward-only cursor
+    position."""
+    m = _mem("will be embedded, then re-nulled")
+    m.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "some-model", m.id),
+    )
+    store._conn.commit()
+    assert (
+        store.list_unembedded_since(
+            None, limit=10, current_model_id="some-model", min_chars=0
+        )
+        == []
+    )
+
+    store._conn.execute(
+        "UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?",
+        (m.id,),
+    )
+    store._conn.commit()
+
+    results = store.list_unembedded_since(
+        None, limit=10, current_model_id="some-model", min_chars=0
+    )
+    assert [row.id for row in results] == [m.id]
+
+
+# ---------------------------------------------------------------------------
+# count_unembedded — same backlog predicate as list_unembedded_since, but a
+# cursor-free full-table COUNT (F1 #259 increment 6, for the `nell embed
+# backfill` CLI's progress-ticker denominator + the drain-to-completion
+# helper's final failure count).
+# ---------------------------------------------------------------------------
+
+
+def test_count_unembedded_matches_list_unembedded_since_predicate(
+    store: MemoryStore,
+) -> None:
+    """Same backlog membership as list_unembedded_since: NULL embedding OR
+    stale model, active, long enough."""
+    embedded_current = _mem("embedded under the current model" + "x" * 20)
+    embedded_stale = _mem("embedded under a stale model" + "x" * 20)
+    unembedded = _mem("never embedded" + "x" * 20)
+    too_short = _mem("short")
+    inactive = _mem("inactive but otherwise eligible" + "x" * 20)
+    store.create(embedded_current)
+    store.create(embedded_stale)
+    store.create(unembedded)
+    store.create(too_short)
+    store.create(inactive)
+    store.deactivate(inactive.id)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "current-model", embedded_current.id),
+    )
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "old-model", embedded_stale.id),
+    )
+    store._conn.commit()
+
+    count = store.count_unembedded(current_model_id="current-model", min_chars=20)
+
+    # Backlog: `unembedded` (NULL) + `embedded_stale` (model mismatch).
+    # NOT `embedded_current` (matches), `too_short` (< min_chars), or
+    # `inactive` (deactivated).
+    assert count == 2
+    matching_ids = {
+        m.id
+        for m in store.list_unembedded_since(
+            None, limit=10, current_model_id="current-model", min_chars=20
+        )
+    }
+    assert matching_ids == {unembedded.id, embedded_stale.id}
+
+
+def test_count_unembedded_zero_on_empty_store(store: MemoryStore) -> None:
+    """No rows at all -> 0, not an error."""
+    assert store.count_unembedded(current_model_id="any-model", min_chars=0) == 0
+
+
+def test_count_unembedded_zero_once_everything_matches_current_model(
+    store: MemoryStore,
+) -> None:
+    """Steady state: every row already embedded under the queried model ->
+    0, matching list_unembedded_since's own no-op steady state."""
+    m = _mem("embedded and current" + "x" * 20)
+    store.create(m)
+    store._conn.execute(
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (b"\x00" * 4, "current-model", m.id),
+    )
+    store._conn.commit()
+
+    assert store.count_unembedded(current_model_id="current-model", min_chars=0) == 0
+
+
+def test_count_unembedded_ignores_any_persisted_backfill_cursor(
+    store: MemoryStore,
+) -> None:
+    """count_unembedded takes NO cursor argument at all — it always counts
+    from the top of the table, unlike list_unembedded_since which a caller
+    can (and the backfill does) page through with a persisted cursor. This
+    is the property `run_embedding_backfill_to_completion` relies on to
+    report the TRUE remaining backlog even when a scattered permanently-
+    failing row sits behind an already-advanced forward cursor position."""
+    older = _mem("older, still unembedded" + "x" * 20)
+    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    newer = _mem("newer, still unembedded" + "x" * 20)
+    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
+    store.create(older)
+    store.create(newer)
+
+    # A caller that had already paged PAST `older` via list_unembedded_since
+    # would no longer see it — count_unembedded is unaffected by any such
+    # cursor because it never takes one.
+    paged = store.list_unembedded_since(
+        (older.created_at.isoformat(), older.id),
+        limit=10,
+        current_model_id="some-model",
+        min_chars=0,
+    )
+    assert [row.id for row in paged] == [newer.id]
+
+    assert store.count_unembedded(current_model_id="some-model", min_chars=0) == 2
+
+
 def test_store_search_text_is_case_insensitive(store: MemoryStore) -> None:
     """Substring matching ignores case."""
     store.create(_mem("The Moment"))
@@ -855,6 +1172,409 @@ def test_hard_delete_raises_on_unknown_id() -> None:
     store = MemoryStore(":memory:")
     with pytest.raises(KeyError):
         store.hard_delete("mem_nonexistent")
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# F1 #259 step 5: content-mutation invalidation. fade() / update(content=) /
+# unfade() must synchronously re-embed (row + warm matrix); hard_delete()
+# must evict the matrix entry. A failed re-embed clears the row's stale
+# vector rather than leaving it describing old content.
+#
+# These use a REAL tmp_path db FILE, never MemoryStore(":memory:") — the
+# warm matrix's lazy build opens its OWN separate sqlite3 connection to
+# `store.db_path` and reloads straight from disk; an in-memory-only store's
+# writes are invisible to that connection (two independent `:memory:`
+# databases), so a `put()` would look like it landed but silently vanish on
+# the next `ensure_built()`.
+# ---------------------------------------------------------------------------
+
+
+def _use_matrix_dim_fake_provider(monkeypatch: pytest.MonkeyPatch):
+    """Override the process-cached embedding provider to a
+    `FakeEmbeddingProvider` sized to `model_tier.MODEL_EMBEDDING_DIM` and
+    align `model_tier`'s embedding tier to its model id.
+
+    One load-bearing reason, plus one now-cosmetic-but-still-useful one:
+      (1) MODEL ID (load-bearing) — `embed_row` embeds via the process-cached
+          provider, but the matrix's lazy-build filter is sourced from
+          `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a
+          SEPARATE lookup that must be aligned or the matrix's first read
+          reloads from disk filtered to the wrong model id and finds
+          nothing.
+      (2) DIMENSION (no longer load-bearing as of #259 inc7 red-team F1) —
+          `EmbeddingMatrix` now decodes each row to its OWN stored
+          byte-length and does NOT skip a row for merely mismatching
+          `model_tier.MODEL_EMBEDDING_DIM` (that constant is a documented
+          sanity value checked only inside `FastEmbedProvider`, never a gate
+          in `EmbeddingMatrix._load_from_db`). Sizing this fixture off the
+          same constant is kept anyway purely so the fixture's vectors read
+          as a realistic production-shaped dim in test output, not because
+          a mismatched dim would be silently dropped.
+    """
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=model_tier.MODEL_EMBEDDING_DIM)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    return provider
+
+
+def test_fade_reembeds_row_and_matrix_with_new_content(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: without `_reembed_or_clear` wired into `fade()`, the
+    row's embedding would stay the ORIGINAL content's vector (embed_row was
+    only ever called once, at simulated embed-on-write time) instead of the
+    faded summary's — a stale vector under new content."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)  # simulate embed-on-write already having run
+
+    store.fade(m.id, summary="short summary")
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is not None
+    expected = provider.embed("short summary").astype(np.float32).tobytes()
+    assert row["embedding"] == expected, "the row vector must reflect the NEW (faded) content, not the original"
+    assert row["embedding_model_id"] == provider.model_id()
+
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(matrix.get(m.id), provider.embed("short summary").astype(np.float32))
+    store.close()
+
+
+def test_update_content_reembeds_row_and_matrix(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: `update(memory_id, content=...)` never re-embedded, so
+    the row kept the OLD content's vector after a content mutation."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    store.update(m.id, content="brand new content")
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = provider.embed("brand new content").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(matrix.get(m.id), provider.embed("brand new content").astype(np.float32))
+    store.close()
+
+
+def test_update_without_content_does_not_reembed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-content field update must NOT trigger a re-embed — only a
+    `content` change invalidates the vector."""
+    _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="stable content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    before = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+
+    store.update(m.id, importance=7.0)
+
+    after = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert after == before, "a non-content update must never touch the row's embedding"
+    store.close()
+
+
+def test_unfade_reembeds_row_and_matrix_with_restored_content(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails pre-fix: `unfade()` never re-embedded, so the row kept the
+    fade-summary's vector after content was restored to the full body."""
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="the full original body", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    store.fade(m.id, summary="short summary")  # row now embeds "short summary"
+
+    store.unfade(m.id)
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = provider.embed("the full original body").astype("float32").tobytes()
+    assert row["embedding"] == expected, (
+        "unfade must re-embed the RESTORED content, not leave the fade-summary's vector"
+    )
+    store.close()
+
+
+def test_hard_delete_evicts_matrix_entry(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails pre-fix: hard_delete dropped the row but never evicted the
+    matrix entry, leaving a deleted memory's vector resurrectable in the
+    warm cache."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="to be deleted", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    matrix = build_embedding_matrix(store.db_path)
+    assert matrix.get(m.id) is not None  # sanity: present before delete
+
+    store.hard_delete(m.id)
+
+    assert matrix.get(m.id) is None, "hard_delete must evict the warm-matrix entry"
+    store.close()
+
+
+def test_embed_row_succeeds_even_if_warm_matrix_put_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX D (F1 #259 increment-3 red-team, F3): once the row's own UPDATE
+    has committed, the row IS durably embedded — the DB is the source of
+    truth, the matrix is a cache that self-heals on rebuild. A `put`
+    failure AFTER that commit must be logged, never raised out of
+    `embed_row`, and must never look like the embed itself failed."""
+    from brain.memory import embedding_matrix as embedding_matrix_mod
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="content that gets embedded", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+
+    def _boom_put(self, memory_id: str, vector) -> None:  # noqa: ANN001, ARG001
+        raise RuntimeError("simulated warm-matrix put failure")
+
+    monkeypatch.setattr(embedding_matrix_mod.EmbeddingMatrix, "put", _boom_put)
+
+    store.embed_row(m.id, m.content)  # must NOT raise
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is not None
+    assert row["embedding_model_id"] == provider.model_id()
+    store.close()
+
+
+def test_reembed_or_clear_clears_row_and_evicts_matrix_on_embed_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the re-embed itself fails (provider/model error), the row's stale
+    vector must be CLEARED (never left describing the OLD content) and the
+    matrix entry evicted — a NULL row (picked up by the later idle backfill)
+    is always safer than a vector silently describing stale content."""
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+
+    def _boom_embed(text: str):
+        raise RuntimeError("simulated embed failure")
+
+    monkeypatch.setattr(provider, "embed", _boom_embed)
+
+    store.update(m.id, content="new content that cannot be embedded")
+
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()
+    assert row["embedding"] is None
+    assert row["embedding_model_id"] is None
+
+    matrix = build_embedding_matrix(store.db_path)
+    assert matrix.get(m.id) is None
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Increment-2 cold red-team FIX 1 (crash-window data integrity): the
+# embedding/embedding_model_id columns must be NULLed in the SAME
+# UPDATE/commit as the content change on update(content=...)/fade()/
+# unfade() — not in the later, separate re-embed commit. Otherwise a crash
+# between "content committed" and "re-embed committed" durably leaves
+# {new content, OLD embedding}: a stale vector with no `embedding IS NULL`
+# signal for the idle backfill to catch, so recall could keep surfacing the
+# memory on its pre-mutation content indefinitely.
+#
+# Each test below patches the embedding provider's `embed()` so that, when
+# it is called (necessarily AFTER the content UPDATE has already committed —
+# `embed_row`/`_reembed_or_clear` run as a separate step following the
+# content write), it FIRST captures the row's current embedding columns
+# in-flight before letting the real embed proceed. This directly observes
+# the durable intermediate state a crash at that instant would leave behind,
+# while the happy path (no failure injected) still completes normally so the
+# same test also proves the final row/matrix state is correct.
+# ---------------------------------------------------------------------------
+
+
+def _capture_embedding_mid_reembed(provider, store, memory_id: str, captured: dict):
+    """Wrap `provider.embed` to snapshot memory_id's `embedding` /
+    `embedding_model_id` columns into `captured` the instant it is called,
+    then delegate to the original embed. Returns the original (unwrapped)
+    embed callable so a test can independently recompute an "expected"
+    vector without re-triggering the capture.
+    """
+    original_embed = provider.embed
+
+    def _embed(text: str):
+        row = store._conn.execute(
+            "SELECT embedding, embedding_model_id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        captured["embedding"] = row["embedding"]
+        captured["embedding_model_id"] = row["embedding_model_id"]
+        return original_embed(text)
+
+    provider.embed = _embed
+    return original_embed
+
+
+def test_update_content_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails pre-fix: pre-fix, the content UPDATE and the embedding-NULLing
+    happened in two separate commits (content first, embedding cleared only
+    on re-embed failure) — at the instant re-embed's `provider.embed` runs,
+    the row still held the OLD content's vector, not NULL. Post-fix, the
+    embedding/embedding_model_id columns are NULLed in the SAME commit as
+    the content change, so the row is already NULL/backfill-eligible by
+    the time re-embed even starts.
+    """
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.update(m.id, content="brand new content")
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale OLD vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    # Happy path (no failure injected): the row ends up byte-equal to the
+    # new content's embedding, and the matrix reflects it too.
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("brand new content").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("brand new content").astype(np.float32)
+    )
+    store.close()
+
+
+def test_fade_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same crash-window proof as above, for `fade()`."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.fade(m.id, summary="short summary")
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale pre-fade vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("short summary").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("short summary").astype(np.float32)
+    )
+    store.close()
+
+
+def test_unfade_nulls_embedding_in_same_commit_before_reembed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same crash-window proof as above, for `unfade()`."""
+    import numpy as np
+
+    from brain.memory.embedding_matrix import build_embedding_matrix
+
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
+    store = MemoryStore(tmp_path / "memories.db")
+    m = Memory.create_new(
+        content="the full original body", memory_type="episodic", domain="chat", emotions={}
+    )
+    store.create(m)
+    store.embed_row(m.id, m.content)
+    store.fade(m.id, summary="short summary")  # row now embeds "short summary"
+    old_embedding = store._conn.execute(
+        "SELECT embedding FROM memories WHERE id = ?", (m.id,)
+    ).fetchone()["embedding"]
+    assert old_embedding is not None
+
+    captured: dict = {}
+    original_embed = _capture_embedding_mid_reembed(provider, store, m.id, captured)
+
+    store.unfade(m.id)
+
+    assert captured["embedding"] is None, (
+        "the row's embedding must already be NULL by the time re-embed runs, "
+        "not the stale fade-summary vector"
+    )
+    assert captured["embedding_model_id"] is None
+
+    row = store._conn.execute("SELECT embedding FROM memories WHERE id = ?", (m.id,)).fetchone()
+    expected = original_embed("the full original body").astype(np.float32).tobytes()
+    assert row["embedding"] == expected
+    matrix = build_embedding_matrix(store.db_path)
+    np.testing.assert_array_equal(
+        matrix.get(m.id), original_embed("the full original body").astype(np.float32)
+    )
     store.close()
 
 
@@ -1310,3 +2030,240 @@ def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
     assert cols["peak_emotion_intensity"] == "REAL"
     mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 2.0})
     assert isinstance(mem.peak_emotion_intensity, float)
+
+
+# ---------------------------------------------------------------------------
+# F1 (#259) step 1: embedding/cluster columns + cluster_centroids table
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_embedding_and_cluster_columns() -> None:
+    """A brand-new store's `memories` table carries the 4 F1 columns,
+    all nullable/no-default — existing rows land NULL."""
+    store = MemoryStore(":memory:")
+    cols = {row[1]: row for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for name in ("embedding", "embedding_model_id", "cluster_id", "cluster_model_id"):
+        assert name in cols, f"missing column: {name}"
+        col = cols[name]
+        # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk)
+        assert col[3] == 0, f"{name} must be nullable (notnull=0), got {col[3]}"
+        assert col[4] is None, f"{name} must have no default, got {col[4]!r}"
+    store.close()
+
+
+def test_fresh_store_has_cluster_centroids_table() -> None:
+    """A brand-new store also creates the relocated `cluster_centroids`
+    table (F1 moves it from the old MemoryClusterStore side file into
+    memories.db) with the shape mirrored from
+    `MemoryClusterStore.memory_cluster_centroids`."""
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "cluster_centroids" in tables
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(cluster_centroids)").fetchall()}
+    assert cols == {"model_id", "cluster_id", "centroid", "dim", "updated_at"}
+    store.close()
+
+
+def test_new_memory_row_has_null_embedding_and_cluster_fields(store: MemoryStore) -> None:
+    """A freshly-created memory lands with the F1 columns NULL — nothing in
+    this step writes them."""
+    mem = Memory.create_new("plain content", "conversation", "us")
+    store.create(mem)
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id, cluster_id, cluster_model_id"
+        " FROM memories WHERE id = ?",
+        (mem.id,),
+    ).fetchone()
+    assert row["embedding"] is None
+    assert row["embedding_model_id"] is None
+    assert row["cluster_id"] is None
+    assert row["cluster_model_id"] is None
+
+
+def test_existing_store_migrates_in_embedding_and_cluster_columns(tmp_path) -> None:
+    """Simulate a pre-F1 persona — manually create the OLD (pre-#259)
+    schema (no embedding/cluster columns, no cluster_centroids table), then
+    open MemoryStore: the 4 columns + the table must be added without
+    error, and a pre-existing row must survive with NULL in all 4."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        emotions_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.0,
+        score REAL NOT NULL DEFAULT 0.0,
+        created_at TEXT NOT NULL,
+        last_accessed_at TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        protected INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL DEFAULT 'active',
+        content_snapshot TEXT,
+        recall_count REAL NOT NULL DEFAULT 0,
+        peak_emotion_intensity REAL NOT NULL DEFAULT 0.0
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO memories (id, content, memory_type, domain, emotions_json, tags_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("mem_pre_f1", "old body", "episodic", "chat", "{}", "[]", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for name in ("embedding", "embedding_model_id", "cluster_id", "cluster_model_id"):
+        assert name in cols
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "cluster_centroids" in tables
+    row = store._conn.execute(
+        "SELECT embedding, embedding_model_id, cluster_id, cluster_model_id"
+        " FROM memories WHERE id = ?",
+        ("mem_pre_f1",),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None)
+    store.close()
+
+    # Re-open again (already-migrated DB) — the ALTER-guard must be a no-op,
+    # not raise "duplicate column name".
+    store2 = MemoryStore(db_path)
+    store2.close()
+
+
+# ---------------------------------------------------------------------------
+# F1 (#259) increment 4: MemoryStore.set_cluster_memberships / get_cluster_id
+# — the row/table-based successor to MemoryClusterStore.replace_pass
+# (brain/memory/clustering.py), unit-tested directly here against small
+# hand-built memberships/centroids (brain/memory/clustering.py's own tests
+# cover the real k-means-driven end-to-end path).
+# ---------------------------------------------------------------------------
+
+
+def test_get_cluster_id_returns_none_for_unclustered_or_unknown_row(
+    store: MemoryStore,
+) -> None:
+    m = _mem()
+    store.create(m)
+    assert store.get_cluster_id(m.id) is None  # exists, never clustered
+    assert store.get_cluster_id("nonexistent-id") is None  # no such row
+
+
+def test_set_cluster_memberships_writes_row_and_centroids(store: MemoryStore) -> None:
+    m1, m2 = _mem(), _mem()
+    store.create(m1)
+    store.create(m2)
+    centroids = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+    store.set_cluster_memberships({m1.id: 0, m2.id: 1}, centroids, model_id="model-a")
+
+    assert store.get_cluster_id(m1.id) == (0, "model-a")
+    assert store.get_cluster_id(m2.id) == (1, "model-a")
+    rows = store._conn.execute(
+        "SELECT cluster_id, dim FROM cluster_centroids WHERE model_id = ? ORDER BY cluster_id",
+        ("model-a",),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [(0, 2), (1, 2)]
+
+
+def test_set_cluster_memberships_is_scoped_to_model_id(store: MemoryStore) -> None:
+    """A row tagged under one model_id must be invisible to a lookup that
+    compares against a different model_id — mirrors the old
+    MemoryClusterStore's own model-scoping invariant, ported onto the row."""
+    m = _mem()
+    store.create(m)
+    store.set_cluster_memberships({m.id: 3}, np.zeros((4, 2)), model_id="model-old")
+
+    cluster_id, cluster_model_id = store.get_cluster_id(m.id)
+    assert cluster_id == 3
+    assert cluster_model_id == "model-old"
+    assert cluster_model_id != "model-new"  # the caller's own scoping check
+
+
+def test_set_cluster_memberships_clears_rows_that_drop_out_of_the_pool(
+    store: MemoryStore,
+) -> None:
+    """Wholesale-replace semantics: a memory id clustered by a PRIOR pass
+    but absent from a LATER pass's memberships (same model_id) must end up
+    with cluster_id NULL, never a stale tag pointing at a centroid the later
+    pass may have deleted — the row-storage mirror of
+    MemoryClusterStore.replace_pass's delete-then-reinsert symmetry."""
+    m1, m2 = _mem(), _mem()
+    store.create(m1)
+    store.create(m2)
+    store.set_cluster_memberships(
+        {m1.id: 0, m2.id: 1}, np.array([[1.0, 0.0], [0.0, 1.0]]), model_id="m"
+    )
+    assert store.get_cluster_id(m1.id) == (0, "m")
+    assert store.get_cluster_id(m2.id) == (1, "m")
+
+    # Second pass: m2 has fallen out of the pool (e.g. its embedding was
+    # evicted); only m1 remains, now the sole member of the sole cluster.
+    store.set_cluster_memberships({m1.id: 0}, np.array([[1.0, 0.0]]), model_id="m")
+
+    assert store.get_cluster_id(m1.id) == (0, "m")
+    assert store.get_cluster_id(m2.id) is None  # dropped, not dangling
+    n_centroids = store._conn.execute(
+        "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", ("m",)
+    ).fetchone()[0]
+    assert n_centroids == 1
+
+
+def test_set_cluster_memberships_only_clears_the_target_model_id(
+    store: MemoryStore,
+) -> None:
+    """A pass for model_id "new" must not touch rows/centroids that belong
+    to a DIFFERENT model_id "old" — the clear-before-reinsert step is scoped
+    by model_id, not a blanket wipe."""
+    m_old, m_new = _mem(), _mem()
+    store.create(m_old)
+    store.create(m_new)
+    store.set_cluster_memberships({m_old.id: 0}, np.array([[1.0, 0.0]]), model_id="old")
+
+    store.set_cluster_memberships({m_new.id: 0}, np.array([[0.0, 1.0]]), model_id="new")
+
+    assert store.get_cluster_id(m_old.id) == (0, "old")  # untouched
+    assert store.get_cluster_id(m_new.id) == (0, "new")
+    n_old_centroids = store._conn.execute(
+        "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", ("old",)
+    ).fetchone()[0]
+    assert n_old_centroids == 1
+
+
+def test_set_cluster_memberships_is_atomic_a_failed_write_leaves_prior_state_intact(
+    store: MemoryStore,
+) -> None:
+    """Simulates a crash mid-write: a bad centroid blows up AFTER the
+    membership UPDATEs already ran, but every write shares ONE uncommitted
+    transaction — rolling back after the failure must undo the membership
+    writes too, leaving exactly the last successfully COMMITTED pass's
+    state (mirrors MemoryClusterStore.replace_pass's own atomicity test)."""
+    m = _mem()
+    store.create(m)
+    store.set_cluster_memberships({m.id: 0}, np.array([[1.0, 0.0]]), model_id="m")
+    assert store.get_cluster_id(m.id) == (0, "m")
+
+    bad_centroids = [None]  # blows up inside the centroid-write loop
+    with pytest.raises(AttributeError):
+        store.set_cluster_memberships({m.id: 1}, bad_centroids, model_id="m")
+    store._conn.rollback()
+
+    # The prior committed pass survives untouched — the failed pass never
+    # landed (not even the membership half, despite it running first).
+    assert store.get_cluster_id(m.id) == (0, "m")

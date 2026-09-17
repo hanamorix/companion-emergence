@@ -100,9 +100,12 @@ from brain.ingest.pipeline import (
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embedding_backfill import (
+    delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
+)
+from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
 )
-from brain.memory.embeddings import build_embedding_cache
+from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
@@ -361,6 +364,33 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("self-model repair failed during startup: %s", exc)
 
+    # One-shot startup: run-once, fail-safe deletion of the legacy
+    # embeddings.db file once every active row carries a current-model
+    # embedding (F1 #259 increment 9, spec §5 / S9, invariant I9). No code
+    # reads or writes embeddings.db anymore (increment 8's teardown) — on an
+    # already-deployed persona it can only exist as a stale orphan left over
+    # from before this column migration ran. Gated on the file's own
+    # existence BEFORE opening a store — same "should_run" shape as every
+    # other one-shot above, and it means a persona that has already
+    # completed this migration (the overwhelming steady-state case once
+    # this ships) never pays for a MemoryStore open here at all. Opens its
+    # own short-lived MemoryStore handle (mirrors soul-candidate-repair
+    # above) rather than reusing the main loop's per-tick store, since this
+    # runs once before that loop starts. Fault-isolated (recipe item 3): the
+    # function itself already catches delete errors per-file, and this
+    # try/except is the outer safety net (e.g. a provider-load failure) so
+    # a stuck stale file can never crash the bridge — worst case, it is
+    # just re-checked (and left in place, or deleted) on the next startup.
+    try:
+        if (persona_dir / "embeddings.db").exists():
+            _store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+            try:
+                _delete_legacy_embeddings_db(persona_dir, _store)
+            finally:
+                _store.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("legacy embeddings.db deletion check failed during startup: %s", exc)
+
     while not stop_event.is_set():
         # store is opened here (per-tick, this thread only — H-A hardening) and reused by
         # the maker/notes ticks below in this same iteration, instead of each opening its
@@ -376,8 +406,6 @@ def run_folded(
             with ExitStack() as stack:
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
-                embeddings = build_embedding_cache(persona_dir)
-                stack.callback(embeddings.close)
 
                 reports = snapshot_stale_sessions(
                     persona_dir,
@@ -385,7 +413,6 @@ def run_folded(
                     store=store,
                     hebbian=hebbian,
                     provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                    embeddings=embeddings,
                 )
                 # Snapshot is NON-destructive — do NOT call remove_session
                 # here. Session lifecycle is owned by finalize_stale_sessions
@@ -396,26 +423,36 @@ def run_folded(
                 )
 
                 # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
-                # build) — reuses the `store`/`embeddings` handles already open
-                # for the snapshot above, so no extra connections. Runs every
-                # base tick (default 60s): internally bounded (batch_size +
-                # scan_cap), so it is cheap when caught up and never spikes
-                # CPU on a cold-start backlog. This is the primary embed-on-
-                # write mechanism for the ~11 write sites that call
-                # MemoryStore's create method directly and never touch EmbeddingCache
-                # (see brain/memory/embedding_backfill.py's module docstring)
-                # — fault-isolated so a backfill error never takes down the
-                # session-cleanup tick.
+                # build; F1 #259 increment 3 rewires backlog + rate) — reuses
+                # the `store` handle already open for the snapshot above, so
+                # no extra connection. Idle-gated behind
+                # cli_throttle.background_slot() (mirrors maintenance /
+                # interest-sweep below): before increment 3 this ran on
+                # EVERY base tick unconditionally, unlike every other
+                # background maintenance cadence in this file — a denied
+                # slot now just defers this firing to the next tick rather
+                # than skipping the idle check other cadences get. Batch
+                # size is internally runtime-derived and scan_cap-bounded
+                # (see brain/memory/embedding_backfill.py), so it is cheap
+                # when caught up and never spikes CPU on a cold-start
+                # backlog. This is the primary embed-on-write mechanism for
+                # the ~11 write sites that call MemoryStore's create method
+                # directly and never write a row embedding themselves (see
+                # that module's docstring) — fault-isolated so a backfill
+                # error never takes down the session-cleanup tick.
                 try:
-                    backfill_result = _embedding_backfill_run_tick(persona_dir, store, embeddings)
-                    logger.info(
-                        "embedding backfill tick: scanned=%d embedded=%d already_cached=%d skipped_short=%d errors=%d",
-                        backfill_result.scanned,
-                        backfill_result.embedded,
-                        backfill_result.already_cached,
-                        backfill_result.skipped_short,
-                        backfill_result.errors,
-                    )
+                    with cli_throttle.background_slot() as _backfill_slot:
+                        if _backfill_slot:
+                            backfill_result = _embedding_backfill_run_tick(persona_dir, store)
+                            logger.info(
+                                "embedding backfill tick: scanned=%d embedded=%d "
+                                "skipped_short=%d errors=%d batch_size=%d",
+                                backfill_result.scanned,
+                                backfill_result.embedded,
+                                backfill_result.skipped_short,
+                                backfill_result.errors,
+                                backfill_result.batch_size,
+                            )
                 except Exception:
                     logger.exception("supervisor embedding backfill tick raised")
 
@@ -667,7 +704,7 @@ def run_folded(
             # hot path by construction (only ever called from here). Own
             # ExitStack ownership inside _run_clustering_tick (mirrors
             # _run_log_rotation_tick/_run_narrative_memory_pass) since the
-            # per-tick `embeddings` handle opened earlier in this loop is
+            # per-tick `hebbian` handle opened earlier in this loop is
             # already closed by the time this block runs.
             if clustering_cadence_state is not None and persisted_cadence.is_due(
                 clustering_cadence_state, now=datetime.now(UTC)
@@ -1708,8 +1745,8 @@ def _run_narrative_memory_pass(
 ) -> None:
     """Soul-review-cadence wrapper around narrative_memory.run_pass.
 
-    Opens per-call MemoryStore, HebbianMatrix, EmbeddingCache (ExitStack —
-    mirrors `_run_finalize_tick` ownership pattern), reads FeltTimeState,
+    Opens per-call MemoryStore, HebbianMatrix (ExitStack — mirrors
+    `_run_finalize_tick` ownership pattern), reads FeltTimeState,
     and builds the anchor-sweep + candidate-pool + salience + is_exempt
     closures against the real stores. Dispatches to the orchestrator.
 
@@ -1719,8 +1756,6 @@ def _run_narrative_memory_pass(
     """
     # Local imports keep the module-load surface light — narrative_memory
     # is only exercised on the (slow) soul-review cadence.
-    import numpy as np
-
     from brain.felt_time import FeltTime
     from brain.felt_time.anchors import scan_since as anchors_scan_since
     from brain.forgetting import _load_soul_linked_ids
@@ -1832,8 +1867,7 @@ def _run_narrative_memory_pass(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings_cache = build_embedding_cache(persona_dir)
-        stack.callback(embeddings_cache.close)
+        matrix = build_embedding_matrix(store.db_path)
 
         # FeltTime read — get_state() is cheap, doesn't tick.
         felt_time_state = FeltTime(persona_dir=persona_dir).get_state()
@@ -1845,18 +1879,19 @@ def _run_narrative_memory_pass(
         class _EmbeddingsByMemoryId:
             """Adapter exposing the narrative_memory EmbeddingsView protocol.
 
-            Maps memory_id -> content -> cached vector via store + embedding
-            cache. Returns None when the memory is missing or the embedding
-            provider raises (defensive — the membership path falls back).
+            F1 increment 2: pure read off the warm matrix, keyed by
+            memory_id directly — no more store.get() (which would bump
+            recall_count) + embeddings_cache.get_or_compute() compute-on-miss
+            (approved flag-3 read-only behavior: an unembedded memory simply
+            has no membership vector this pass, it is never embedded as a
+            side effect of a membership check). Returns None on a miss (id
+            unknown to the matrix, or not yet embedded) or if the matrix
+            itself raises (defensive — the membership path falls back).
             """
 
             def get(self, memory_id: str):
                 try:
-                    mem = store.get(memory_id)
-                    if mem is None:
-                        return None
-                    vec = embeddings_cache.get_or_compute(mem.content)
-                    return np.asarray(vec)
+                    return matrix.get(memory_id)
                 except Exception:
                     return None
 
@@ -1936,8 +1971,6 @@ def _run_compaction_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
 
         for session_id in list_active_sessions(persona_dir):
             now = datetime.now(UTC)
@@ -1958,7 +1991,7 @@ def _run_compaction_tick(
                     persona_dir, session_id, persona_name,
                     weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
                     now=now, provider=provider,
-                    store=store, hebbian=hebbian, embeddings=embeddings,
+                    store=store, hebbian=hebbian,
                     is_session_busy=is_session_busy,
                 )
             except Exception:
@@ -1976,18 +2009,16 @@ def _run_finalize_tick(
     for every session that was finalized.
 
     Mirrors the per-tick store ownership pattern of `_run_heartbeat_tick`:
-    opens MemoryStore + HebbianMatrix + EmbeddingCache inside this thread,
-    closes them via ExitStack. The supervisor follows up by calling
-    remove_session() for each finalized session — finalize itself doesn't
-    touch the in-memory registry.
+    opens MemoryStore + HebbianMatrix inside this thread, closes them via
+    ExitStack. The supervisor follows up by calling remove_session() for
+    each finalized session — finalize itself doesn't touch the in-memory
+    registry.
     """
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
 
         reports = finalize_stale_sessions(
             persona_dir,
@@ -1995,7 +2026,6 @@ def _run_finalize_tick(
             store=store,
             hebbian=hebbian,
             provider=provider,
-            embeddings=embeddings,
         )
 
     for r in reports:
@@ -2291,23 +2321,32 @@ def _run_clustering_tick(persona_dir: Path) -> None:
     currently-embedded vectors, off the message hot path (own persisted
     cadence — see ``clustering_interval_s`` on ``run_folded``, default 6h).
 
-    Opens its own ``EmbeddingCache`` + ``MemoryClusterStore`` (ExitStack —
-    mirrors ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s
-    per-call ownership pattern) since the per-tick handles opened earlier in
+    F1 #259 increment 4: sources vectors from the warm ``EmbeddingMatrix``
+    over ``memories.db`` (via ``run_clustering_pass(store)``) and writes
+    ``cluster_id``/``cluster_model_id`` onto the ``memories`` row plus the
+    ``cluster_centroids`` table — this tick no longer opens
+    ``EmbeddingCache``/``MemoryClusterStore`` against ``embeddings.db`` and
+    does not touch that file at all anymore.
+
+    Opens its own ``MemoryStore`` (ExitStack — mirrors
+    ``_run_log_rotation_tick``/``_run_narrative_memory_pass``'s per-call
+    ownership pattern) since the per-tick handles opened earlier in
     ``run_folded``'s loop are already closed by the time this cadence block
     runs. Local import keeps the module-load surface light — clustering is
     only exercised on its own slow cadence, same rationale as narrative
     memory's local imports above.
     """
-    from brain.memory.clustering import MemoryClusterStore, run_clustering_pass
+    from brain.memory.clustering import run_clustering_pass
 
     with ExitStack() as stack:
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
-        cluster_store = MemoryClusterStore(persona_dir / "embeddings.db")
-        stack.callback(cluster_store.close)
+        # integrity_check=False mirrors the sweep/maker/notes/vocab-repair
+        # ticks in this file (F1 #259 increment 7) — a full PRAGMA
+        # integrity_check on every construction is unwarranted for a
+        # background cadence tick; deep checks are health.py's job.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
 
-        result = run_clustering_pass(embeddings, cluster_store)
+        result = run_clustering_pass(store)
         logger.info(
             "clustering tick: ran=%s n_vectors=%d k=%d reason=%s",
             result.ran,

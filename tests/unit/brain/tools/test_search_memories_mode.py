@@ -17,12 +17,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider
+from brain.bridge import model_tier
+from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.reranker import FakeRerankerProvider
 from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
+
+_SCRIPTED_MODEL_ID = "scripted-test"
+# Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
+# EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
+# (each row decodes to its own stored byte-length) — a 2-dim test vector
+# WOULD now appear in a `matrix.snapshot()` just fine. This suite still pads
+# every scripted vector to 384 dims (see `_unit_vec_with_cosine` /
+# `_query_unit_vec`) purely to look production-realistic and to keep every
+# row in one matrix sharing a uniform shape (needed elsewhere, e.g.
+# clustering's `np.stack`), not because a shorter vector would be dropped.
+_EMBED_DIM = 384
 
 
 class _ScriptedProvider(EmbeddingProvider):
@@ -42,13 +54,27 @@ class _ScriptedProvider(EmbeddingProvider):
         return self._dim
 
     def model_id(self) -> str:
-        return "scripted-test"
+        return _SCRIPTED_MODEL_ID
 
 
 def _unit_vec_with_cosine(score: float) -> np.ndarray:
-    """A 2-D unit vector whose cosine similarity against [1.0, 0.0] is
-    exactly `score` (for |score| <= 1)."""
-    return np.array([score, math.sqrt(max(0.0, 1.0 - score * score))], dtype=np.float32)
+    """A `_EMBED_DIM`-wide vector whose cosine similarity against
+    `_query_unit_vec()` is exactly `score` (for |score| <= 1) — only the
+    first two components are non-zero; the zero padding contributes nothing
+    to either the dot product or the norm, so it never perturbs the
+    hand-chosen cosine relationship."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = score
+    vec[1] = math.sqrt(max(0.0, 1.0 - score * score))
+    return vec
+
+
+def _query_unit_vec() -> np.ndarray:
+    """The `_EMBED_DIM`-wide vector `_unit_vec_with_cosine`'s cosine scores
+    are measured against — the scripted "query" vector."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = 1.0
+    return vec
 
 
 def _seed(store: MemoryStore, content: str) -> Memory:
@@ -59,21 +85,26 @@ def _seed(store: MemoryStore, content: str) -> Memory:
 
 def _ctx(tmp_path: Path) -> dict:
     return {
-        "store": MemoryStore(":memory:"),
+        "store": MemoryStore(tmp_path / "memories.db"),
         "hebbian": HebbianMatrix(":memory:"),
         "persona_dir": tmp_path,
     }
 
 
-def _seed_vectors(persona_dir: Path, vectors: dict[str, np.ndarray], *, dim: int, contents: list[str]) -> None:
-    """Pre-populate embeddings.db as if the idle backfill already embedded
-    `contents` (memory bodies only, never the query text itself)."""
-    cache = EmbeddingCache(persona_dir / "embeddings.db", _ScriptedProvider(vectors, dim=dim))
-    try:
-        for content in contents:
-            cache.get_or_compute(content)
-    finally:
-        cache.close()
+def _seed_vectors(store: MemoryStore, vectors: dict[str, np.ndarray], *, contents_by_id: dict[str, str]) -> None:
+    """Write a vector directly onto each memory row's `embedding` /
+    `embedding_model_id` columns (F1 #259: `_semantic_top_k` now sources the
+    candidate pool from the warm matrix over these row columns, not the old
+    content-hash `embeddings.db` cache). `contents_by_id` maps memory id ->
+    its content, used to look the right vector up in `vectors` (keyed by
+    content, matching `_patch_provider`'s scripting)."""
+    for memory_id, content in contents_by_id.items():
+        vec = vectors[content]
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (np.asarray(vec, dtype=np.float32).tobytes(), _SCRIPTED_MODEL_ID, memory_id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarray], *, dim: int) -> None:
@@ -81,6 +112,15 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
         "brain.memory.embeddings.build_embedding_provider",
         lambda: _ScriptedProvider(vectors, dim=dim),
     )
+    # `_semantic_top_k` sources its candidate pool via `build_embedding_matrix`,
+    # which derives the matrix's filter model id from
+    # `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — NOT from
+    # whichever provider `build_embedding_provider` is patched to above. Align
+    # the two so the matrix's lazy-build filter matches what `_seed_vectors`
+    # stamped on the rows; otherwise the first matrix read reloads from disk
+    # filtered to the real production model id, finds nothing, and silently
+    # discards the seeded vectors.
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -112,16 +152,16 @@ def test_default_mode_is_semantic(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     query = "how do I calm down when everything feels like too much"
     target = "deep breathing helps when you are feeling anxious"
 
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         target: _unit_vec_with_cosine(0.95),
     }
 
     ctx = _ctx(tmp_path)
     m_target = _seed(ctx["store"], target)
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
+    _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
     _patch_provider(monkeypatch, vectors, dim=dim)
     _patch_reranker(monkeypatch, scores={target: RERANK_FLOOR + 5.0})
 
@@ -187,9 +227,9 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
     target = "slow controlled breathing eases panic and racing thoughts"
     decoy = "too much rain fell down all afternoon"
 
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         target: _unit_vec_with_cosine(0.95),  # clear semantic match
         decoy: _unit_vec_with_cosine(0.10),  # semantically unrelated despite shared words
     }
@@ -198,7 +238,7 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
     m_target = _seed(ctx["store"], target)
     m_decoy = _seed(ctx["store"], decoy)
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target, decoy])
+    _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
     _patch_provider(monkeypatch, vectors, dim=dim)
     # Both clear RERANK_FLOOR (so the assertion actually exercises the
     # reranker's ORDERING, not just floor-based exclusion of the decoy) —
@@ -231,15 +271,15 @@ def test_mode_semantic_result_shape_matches_existing_snippet_format(
     unchanged, only the ranking path differs."""
     query = "quiet evening"
     target = "a quiet evening with nothing much happening"
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         target: _unit_vec_with_cosine(0.9),
     }
 
     ctx = _ctx(tmp_path)
-    _seed(ctx["store"], target)
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
+    m_target = _seed(ctx["store"], target)
+    _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
     _patch_provider(monkeypatch, vectors, dim=dim)
 
     res = dispatch("search_memories", {"query": query, "mode": "semantic"}, **ctx)
@@ -255,15 +295,15 @@ def test_mode_semantic_result_shape_matches_existing_snippet_format(
 def test_mode_semantic_stays_bump_free(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     query = "quiet evening"
     target = "a quiet evening with nothing much happening"
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         target: _unit_vec_with_cosine(0.9),
     }
 
     ctx = _ctx(tmp_path)
     m = _seed(ctx["store"], target)
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
+    _seed_vectors(ctx["store"], vectors, contents_by_id={m.id: target})
     _patch_provider(monkeypatch, vectors, dim=dim)
 
     before = _rc(ctx["store"], m.id)
@@ -299,12 +339,17 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     the query embed itself blows up — must still fall back cleanly rather
     than error out."""
     target = "a memory that does have a cached vector"
-    dim = 2
-    vectors = {target: np.array([1.0, 0.0], dtype=np.float32)}
+    dim = _EMBED_DIM
+    vectors = {target: _query_unit_vec()}
 
     ctx = _ctx(tmp_path)
     m = _seed(ctx["store"], target)
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[target])
+    _seed_vectors(ctx["store"], vectors, contents_by_id={m.id: target})
+    # Align model_tier's embedding tier to the seeded rows' model id — see
+    # `_patch_provider`'s docstring for why (this test scripts its own
+    # provider directly rather than going through `_patch_provider`, so it
+    # must do the alignment itself).
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
     class _BoomProvider(_ScriptedProvider):
         def embed(self, text: str) -> np.ndarray:
@@ -321,61 +366,6 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     res = dispatch("search_memories", {"query": "cached", "mode": "semantic"}, **ctx)
 
     assert res["mode"] == "lexical"
-    ids = {mm["id"] for mm in res["memories"]}
-    assert m.id in ids
-
-
-def test_semantic_falls_back_to_lexical_when_close_raises(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """#231 Fix 5 (mirrors semantic_recall.run_semantic_recall's Fix 4 /
-    ``test_run_semantic_recall_is_fail_soft_when_close_raises`` in
-    tests/unit/brain/memory/test_semantic_recall.py): the
-    `finally: embeddings_cache.close()` in `_semantic_top_k` sat OUTSIDE the
-    inner `except Exception` clause, so a pathological `close()` error could
-    escape this function's own documented "Returns None (never raises) ...
-    falls back to the lexical path" contract and crash `search_memories`
-    instead of demoting the turn to lexical. Wraps a real, working
-    EmbeddingCache in a proxy whose close() blows up; search_memories must
-    still not raise, and must still return a usable (lexical) result."""
-    import brain.tools.impls.search_memories as search_memories_mod
-    from brain.memory.embeddings import build_embedding_cache
-
-    target = "a memory that does have a cached vector"
-    ctx = _ctx(tmp_path)
-    m = _seed(ctx["store"], target)
-
-    real_cache = build_embedding_cache(tmp_path)
-    real_cache.get_or_compute(target)
-
-    class _BoomOnClose:
-        def __init__(self, inner: object) -> None:
-            self._inner = inner
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._inner, name)
-
-        def close(self) -> None:
-            raise RuntimeError("simulated close() failure")
-
-    monkeypatch.setattr(
-        search_memories_mod,
-        "build_embedding_cache",
-        lambda persona_dir: _BoomOnClose(real_cache),
-    )
-
-    try:
-        # Query shares a token ("cached") with `target` so the lexical
-        # fallback actually has something to find — proving the fallback
-        # returns a real, usable result, not just an empty-but-non-erroring
-        # response.
-        res = dispatch("search_memories", {"query": "cached", "mode": "semantic"}, **ctx)
-    finally:
-        real_cache.close()
-
-    assert res["mode"] == "lexical", (
-        "a close() failure must demote this turn to the lexical fallback, not raise"
-    )
     ids = {mm["id"] for mm in res["memories"]}
     assert m.id in ids
 

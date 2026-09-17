@@ -78,7 +78,6 @@ def _make_engine(store: MemoryStore, hebbian: HebbianMatrix, provider: LLMProvid
     return DreamEngine(
         store=store,
         hebbian=hebbian,
-        embeddings=None,
         provider=provider,
         log_path=tmp_path / "dreams.log.jsonl",
         persona_name="Nell",
