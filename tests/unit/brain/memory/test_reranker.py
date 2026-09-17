@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sys
+from unittest.mock import mock_open
 
 import pytest
 
@@ -250,6 +251,96 @@ def test_avx2_detection_error_is_fail_soft_and_conservative(monkeypatch: pytest.
     monkeypatch.setattr("builtins.open", _boom)
 
     assert _detect_avx2() is False  # no raise
+
+
+# ---------------------------------------------------------------------------
+# F2a inc3 test-coverage gap (#250 §3 follow-up): the tests above never
+# exercise the actual /proc/cpuinfo PARSING — they call
+# _default_latency_budget_seconds(bool) directly or only force open() to
+# raise. `_detect_avx2` reads the `flags` line and does a WHOLE-TOKEN match
+# (`"avx2" in line.split(":", 1)[1].split()`), not a substring search — a
+# regression to a naive `"avx2" in text` substring check would leave every
+# test above green. These tests run the REAL `_detect_avx2()` against
+# crafted /proc/cpuinfo content (via mock_open on builtins.open, matching
+# the function's actual `open(...).read()`-by-line-iteration mechanism) to
+# close that gap.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_avx2_true_when_flags_line_has_the_bare_avx2_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A realistic multi-token `flags` line with `avx2` present among many
+    other flags (including the related-but-distinct `avx`) must detect
+    True."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    cpuinfo = (
+        "processor\t: 0\n"
+        "vendor_id\t: GenuineIntel\n"
+        "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca "
+        "cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb "
+        "rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq "
+        "pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave "
+        "avx f16c rdrand avx2 bmi1 bmi2\n"
+        "bogomips\t: 4800.00\n"
+    )
+    monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
+
+    assert _detect_avx2() is True
+
+
+def test_detect_avx2_false_when_flags_line_has_avx_but_not_avx2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guards the avx/avx2 PREFIX confusion: `avx` present, `avx2` absent ->
+    must be False, not True from a loose `avx` prefix match."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse avx f16c rdrand bmi1 bmi2\n"
+    monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
+
+    assert _detect_avx2() is False
+
+
+def test_detect_avx2_false_for_decoy_substring_token_without_bare_avx2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE SUBSTRING-REGRESSION GUARD: the flags line contains a token that
+    CONTAINS "avx2" as a substring (`avx2_vnni`, the real Intel flag name
+    for AVX2-VNNI-INT8 support) but no bare `avx2` token. `_detect_avx2`'s
+    real implementation does a whole-token match
+    (`"avx2" in line.split(":", 1)[1].split()`), so this must be False. If
+    the code were ever regressed to a naive `"avx2" in text` substring
+    check, this test would flip to True and fail — that's the point: it
+    fails under the regression this whole test class exists to catch.
+    Verified by construction: `"avx2" in "avx2_vnni"` is True (substring),
+    but `"avx2" in "avx2_vnni".split()` is False (whole-token: split()
+    produces the single token "avx2_vnni", not "avx2")."""
+    assert "avx2" in "avx2_vnni"  # sanity: the decoy IS a substring match
+    assert "avx2" not in "avx2_vnni".split()  # but NOT a whole-token match
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse avx2_vnni bmi1 bmi2\n"
+    monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
+
+    assert _detect_avx2() is False
+
+
+def test_detect_avx2_false_for_arm_style_cpuinfo_with_no_flags_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ARM-style /proc/cpuinfo has a `Features:` line, not `flags` — the
+    loop never finds a line starting with "flags" and falls through to the
+    trailing `return False`."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    cpuinfo = (
+        "processor\t: 0\n"
+        "model name\t: ARMv8 Processor rev 1 (v8l)\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n"
+        "CPU implementer\t: 0x41\n"
+    )
+    monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
+
+    assert _detect_avx2() is False
 
 
 def test_width_narrows_under_a_tight_latency_budget(monkeypatch: pytest.MonkeyPatch) -> None:
