@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 
@@ -2267,3 +2268,92 @@ def test_set_cluster_memberships_is_atomic_a_failed_write_leaves_prior_state_int
     # The prior committed pass survives untouched — the failed pass never
     # landed (not even the membership half, despite it running first).
     assert store.get_cluster_id(m.id) == (0, "m")
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc4): calibration_log table + log_calibration_sample — the
+# real-query calibration store (spec Section 4).
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_calibration_log_table() -> None:
+    """A brand-new store creates `calibration_log` with the columns the
+    daily calibration tick (spec Section 5/7, not yet built) will need:
+    the query, candidate ids + reranker scores (already-computed, per-turn),
+    the reranker's model_id (so a floor derivation never mixes score scales
+    across a reranker swap), a day_bucket for the daily sampling pass, and
+    nullable tie-break label columns logged from day one (Out-of-scope,
+    F2c)."""
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "calibration_log" in tables
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert cols == {
+        "id",
+        "logged_at",
+        "day_bucket",
+        "query",
+        "candidate_ids",
+        "reranker_scores",
+        "reranker_model_id",
+        "local_judge_label",
+        "haiku_label",
+    }
+    store.close()
+
+
+def test_calibration_log_table_creation_is_idempotent(tmp_path) -> None:
+    """Opening the same on-disk store a second time must not raise — CREATE
+    TABLE IF NOT EXISTS, mirroring the cluster_centroids precedent (F1)."""
+    db_path = tmp_path / "memories.db"
+    store1 = MemoryStore(db_path)
+    store1.close()
+    store2 = MemoryStore(db_path)  # must not raise
+    store2.close()
+
+
+def test_log_calibration_sample_writes_row(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="how do I calm down",
+        candidate_ids=["a", "b"],
+        reranker_scores=[1.5, -2.0],
+        reranker_model_id="jinaai/jina-reranker-v2-base-multilingual",
+    )
+    row = store._conn.execute(
+        "SELECT query, candidate_ids, reranker_scores, reranker_model_id, "
+        "day_bucket, local_judge_label, haiku_label FROM calibration_log"
+    ).fetchone()
+    assert row["query"] == "how do I calm down"
+    assert json.loads(row["candidate_ids"]) == ["a", "b"]
+    assert json.loads(row["reranker_scores"]) == [1.5, -2.0]
+    assert row["reranker_model_id"] == "jinaai/jina-reranker-v2-base-multilingual"
+    assert row["day_bucket"]  # populated, non-empty
+    assert row["local_judge_label"] is None, "tie-break labels default null on day one (Out-of-scope, F2c)"
+    assert row["haiku_label"] is None
+
+
+def test_log_calibration_sample_query_is_byte_identical(store: MemoryStore) -> None:
+    """No normalization/trimming/reconstruction of the logged query — the
+    raw string goes straight into the row (acceptance #5)."""
+    odd_query = "  weird\twhitespace\nand Ünicode  "
+    store.log_calibration_sample(
+        query=odd_query, candidate_ids=[], reranker_scores=[], reranker_model_id="m"
+    )
+    row = store._conn.execute("SELECT query FROM calibration_log").fetchone()
+    assert row["query"] == odd_query
+
+
+def test_log_calibration_sample_writes_multiple_rows_independently(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="first turn", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    store.log_calibration_sample(
+        query="second turn", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="m"
+    )
+    rows = store._conn.execute("SELECT query FROM calibration_log ORDER BY id").fetchall()
+    assert [r["query"] for r in rows] == ["first turn", "second turn"]

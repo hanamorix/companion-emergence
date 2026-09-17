@@ -323,6 +323,28 @@ def run_semantic_recall(
         rerank_ids = [mid for mid, _ in to_rerank]
         documents = [pool[mid][0].content for mid in rerank_ids]
         rerank_scores = list(reranker_provider.rerank(user_input, documents))
+        try:
+            # F2a (#250 inc4): real-query calibration logging (spec Section
+            # 4). `user_input` is logged byte-identical to what was just
+            # embedded/reranked above — no synthetic/reconstructed query.
+            # `rerank_ids`/`rerank_scores` are the already-computed per-turn
+            # rerank output, reused as-is (no recompute). One bounded INSERT,
+            # off the hot path in every sense but this single cheap write
+            # (I6). Wrapped separately from the outer fail-soft `except`
+            # below so a logging failure can NEVER demote a good semantic
+            # result to the lexical fallback — it only loses that one turn's
+            # calibration row.
+            store.log_calibration_sample(
+                query=user_input,
+                candidate_ids=rerank_ids,
+                reranker_scores=rerank_scores,
+                reranker_model_id=reranker_provider.model_id(),
+            )
+        except Exception:  # noqa: BLE001 — fail-soft: logging must never break recall
+            log.warning(
+                "run_semantic_recall: calibration log write failed — continuing",
+                exc_info=True,
+            )
         reranked = list(zip(rerank_ids, rerank_scores, strict=True))
         reranked.sort(key=lambda pair: -pair[1])
 

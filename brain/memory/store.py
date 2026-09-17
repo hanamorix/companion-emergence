@@ -245,6 +245,38 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
     PRIMARY KEY (model_id, cluster_id)
 );
 
+-- F2a (#250 inc4): real-query calibration log — one row per recall turn,
+-- logging the REAL (never synthetic) query, the retrieved candidate ids, and
+-- the reranker scores ALREADY computed that turn, so a later idle-gated
+-- daily tick (spec Section 5/7, not yet built) can judge-label a SAMPLE of
+-- these rows and re-derive RERANK_FLOOR against the actual corpus and the
+-- actual reranker model in use. Lives in memories.db per I1 — same posture
+-- as `cluster_centroids` above (a per-persona artifact, not per-memory; no
+-- separate .db file). `reranker_model_id` is logged per row so a later floor
+-- derivation can filter to one model's score scale and never mixes scores
+-- across a reranker swap (F2a's own jina swap, or any future one).
+-- `day_bucket` mirrors `logged_at`'s date so the daily tick can select one
+-- day's rows cheaply without parsing timestamps. `local_judge_label` /
+-- `haiku_label` are nullable and start empty on day one — populated by the
+-- offline judge pass (Section 6, not yet built) and read by F2c's later
+-- fine-tuning (Out-of-scope) — logged from day one per spec so F2c has data
+-- to start from once it exists.
+--
+-- Retention/pruning is UNSPECIFIED by the F2a spec (open gap, flagged back
+-- to Planning, not invented here) — this table currently grows unbounded.
+CREATE TABLE IF NOT EXISTS calibration_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    day_bucket TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
+    query TEXT NOT NULL,
+    candidate_ids TEXT NOT NULL,
+    reranker_scores TEXT NOT NULL,
+    reranker_model_id TEXT NOT NULL,
+    local_judge_label TEXT,
+    haiku_label TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
+
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
 -- content with content_rowid='rowid' indexes only `content` (no duplication).
@@ -774,6 +806,45 @@ class MemoryStore:
         if row is None or row["cluster_id"] is None:
             return None
         return int(row["cluster_id"]), row["cluster_model_id"]
+
+    def log_calibration_sample(
+        self,
+        query: str,
+        candidate_ids: list[str],
+        reranker_scores: list[float],
+        reranker_model_id: str,
+    ) -> None:
+        """Log one recall turn's (query, candidate ids, reranker scores) row
+        to `calibration_log` (F2a #250 inc4).
+
+        `query` must be the literal raw `user_input` string the caller
+        embedded/reranked this turn — byte-identical, never a synthesized
+        or reconstructed query (spec Section 4 / acceptance #5). `candidate_
+        ids` and `reranker_scores` are the ALREADY-COMPUTED per-turn rerank
+        output (same order, 1:1) — this method does no scoring of its own.
+        `reranker_model_id` is stamped per row so a later floor-derivation
+        pass can filter to one reranker's score scale.
+
+        ONE bounded INSERT — no embedding, no model call, off the hot path
+        in every sense except this single cheap write (I6). Fail-soft is
+        the CALLER's job (`semantic_recall.run_semantic_recall` wraps this
+        call in its own try/except so a logging failure here can never
+        break recall) — this method itself does not swallow errors, so a
+        caller that forgets to guard it fails loudly instead of silently
+        losing calibration data.
+        """
+        self._conn.execute(
+            "INSERT INTO calibration_log "
+            "(query, candidate_ids, reranker_scores, reranker_model_id) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                query,
+                json.dumps(list(candidate_ids)),
+                json.dumps([float(s) for s in reranker_scores]),
+                reranker_model_id,
+            ),
+        )
+        self._conn.commit()
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

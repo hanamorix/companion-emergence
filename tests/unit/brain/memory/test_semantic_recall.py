@@ -14,6 +14,7 @@ unit layer underneath that.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -343,5 +344,83 @@ def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
     result = run_semantic_recall(store, tmp_path, "any query")
 
     assert result is None, "a reranker failure must demote this turn to the lexical fallback, not raise"
+
+
+# ---------------------------------------------------------------------------
+# calibration-log write (F2a #250 inc4, spec Section 4 / acceptance #5) —
+# every conclusive recall turn logs the REAL query + already-computed
+# candidate ids/scores, and a logging failure must never demote a good
+# semantic result to the lexical fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A conclusive recall turn writes exactly one `calibration_log` row:
+    the literal raw query string (byte-identical, never reconstructed —
+    acceptance #5), the turn's candidate ids + reranker scores (the
+    ALREADY-COMPUTED rerank output, reused as-is), and the reranker's
+    model_id. The tie-break label columns (Section 6/F2c) start null."""
+    content = "a memory that clears the floor"
+    query = "  query with odd\twhitespace and Ünicode  "
+
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda: FakeRerankerProvider(scores={content: RERANK_FLOOR + 1.0}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, query)
+
+    assert result is not None
+    rows = store._conn.execute(  # noqa: SLF001
+        "SELECT query, candidate_ids, reranker_scores, reranker_model_id, "
+        "day_bucket, local_judge_label, haiku_label FROM calibration_log"
+    ).fetchall()
+    assert len(rows) == 1, "exactly one calibration row per recall turn"
+    row = rows[0]
+    assert row["query"] == query, "logged query must be byte-identical to the literal recall-call argument"
+    candidate_ids = json.loads(row["candidate_ids"])
+    scores = json.loads(row["reranker_scores"])
+    assert mem.id in candidate_ids
+    assert scores[candidate_ids.index(mem.id)] == pytest.approx(RERANK_FLOOR + 1.0)
+    assert row["reranker_model_id"] == "fake-reranker"  # FakeRerankerProvider.model_id()
+    assert row["day_bucket"]  # populated, non-empty
+    assert row["local_judge_label"] is None
+    assert row["haiku_label"] is None
+
+
+def test_calibration_log_write_failure_does_not_break_recall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A logging failure must never demote a good semantic result to the
+    lexical fallback — it only loses that one turn's calibration row. The
+    write is wrapped in its OWN try/except, separate from the outer
+    fail-soft catch that governs the rest of the recall path."""
+    content = "a memory that clears the floor"
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda: FakeRerankerProvider(scores={content: RERANK_FLOOR + 1.0}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated calibration-log write failure")
+
+    monkeypatch.setattr(MemoryStore, "log_calibration_sample", _boom)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is not None, "a calibration-log write failure must not fall back to lexical"
+    assert mem.id in [m.id for m in result.full]
 
 
