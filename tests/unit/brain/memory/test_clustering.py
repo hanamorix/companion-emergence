@@ -348,11 +348,14 @@ def _seed_embedded_rows(
     label: str = "row",
 ) -> list[str]:
     """Create `n` active memory rows, each with a deterministic 384-dim
-    vector written directly onto `embedding`/`embedding_model_id` — the warm
-    matrix requires exactly 384 dims (`embedding_matrix._EXPECTED_DIM`);
-    anything else is silently skipped-and-logged, not an error, so a test
-    seeding the wrong width would look like a sparse-skip rather than fail
-    loud. Bypasses a real embedding provider entirely, same convention as
+    vector written directly onto `embedding`/`embedding_model_id`. 384 is
+    just this fixture's own consistent choice — the warm matrix no longer
+    requires any particular dim (#259 inc7 red-team F1: `_load_from_db`
+    decodes each row to its own stored byte-length, gated only on the
+    `embedding_model_id` filter, not a dimension constant) — but every row
+    here must still share ONE dim with each other, since `run_clustering_
+    pass`'s `np.stack` over the matrix snapshot requires a uniform shape.
+    Bypasses a real embedding provider entirely, same convention as
     `test_semantic_recall.py`'s `_seed_row_vector`. Returns the created ids
     in insertion order."""
     ids: list[str] = []

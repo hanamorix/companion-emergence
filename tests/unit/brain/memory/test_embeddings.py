@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import threading
@@ -356,6 +357,107 @@ def test_fastembed_provider_embed_returns_the_declared_dim(
     assert isinstance(vec, np.ndarray)
     assert vec.shape == (384,)
     assert vec.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# #259 inc7 red-team F1 — embedding_dim() must derive the REAL model output,
+# never echo the constructor's declared `dim=` (a stale MODEL_EMBEDDING_DIM
+# after an un-updated model swap). This is the decisive unit-level proof for
+# FastEmbedProvider itself; the end-to-end proof (embed_row -> warm matrix ->
+# clustering, with no MODEL_EMBEDDING_DIM edit) lives in
+# test_embedding_dimension_one_touch_swap.py.
+# ---------------------------------------------------------------------------
+
+
+def _make_stub_text_embedding(output_dim: int):
+    """Factory for a fastembed.TextEmbedding stub whose embed() always
+    yields vectors of `output_dim` — used to simulate the model's REAL
+    output being a DIFFERENT dim than whatever `dim=` a caller declares to
+    FastEmbedProvider's constructor."""
+
+    class _Stub:
+        def __init__(self, model_name: str, cache_dir: str, lazy_load: bool = False, **kwargs) -> None:
+            self.model_name = model_name
+            self.cache_dir = cache_dir
+            self.lazy_load = lazy_load
+
+        def embed(self, texts):
+            for _ in texts:
+                yield np.ones(output_dim, dtype=np.float32)
+
+    return _Stub
+
+
+def test_fastembed_provider_embedding_dim_reflects_the_real_model_output_not_the_declared_dim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Construct with a DECLARED `dim=384` (what a stale MODEL_EMBEDDING_DIM
+    would pass after an un-updated model swap), but wire the underlying
+    model to REALLY produce 1024-dim vectors. `embedding_dim()` must report
+    1024 (the real output), never 384 (the declared value). Fails pre-fix:
+    the old `embedding_dim()` just returned the constructor's `dim` — this
+    test would have asserted 384."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _make_stub_text_embedding(1024))
+    provider = FastEmbedProvider(model_id="some/other-model", cache_dir=tmp_path, dim=384)
+    assert provider.embedding_dim() == 1024
+
+
+def test_fastembed_provider_embedding_dim_probes_once_and_caches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`embedding_dim()` works even before any real `embed()` call has
+    happened — it probes the model itself exactly once (never at
+    construction — construction must stay network/inference-free), then
+    reuses the cached real dim on every later call without re-probing."""
+    calls = {"n": 0}
+    base_stub = _make_stub_text_embedding(1024)
+
+    class _CountingStub(base_stub):
+        def embed(self, texts):
+            calls["n"] += 1
+            yield from super().embed(texts)
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _CountingStub)
+    provider = FastEmbedProvider(model_id="some/other-model", cache_dir=tmp_path, dim=384)
+    assert calls["n"] == 0  # construction never embeds
+
+    assert provider.embedding_dim() == 1024
+    assert calls["n"] == 1  # one probe embed
+
+    assert provider.embedding_dim() == 1024
+    assert calls["n"] == 1  # cached — no second probe
+
+
+def test_fastembed_provider_logs_loud_error_on_declared_vs_real_dim_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A mismatch between the DECLARED dim (MODEL_EMBEDDING_DIM in
+    production) and the REAL probed dim must be logged loudly (ERROR) the
+    first time it's discovered — a stale constant is caught rather than
+    silently ignored, even though it is not fatal (the real dim is what
+    actually drives embed/decode/cluster)."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _make_stub_text_embedding(1024))
+    provider = FastEmbedProvider(model_id="some/other-model", cache_dir=tmp_path, dim=384)
+
+    with caplog.at_level(logging.ERROR, logger="brain.memory.embeddings"):
+        provider.embed("hello")
+
+    assert "1024" in caplog.text
+    assert "384" in caplog.text
+
+
+def test_fastembed_provider_no_mismatch_log_when_declared_dim_matches_real_dim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No spurious loud log when the declared dim genuinely matches the
+    real one — the common, correctly-configured case stays quiet."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _make_stub_text_embedding(384))
+    provider = FastEmbedProvider(model_id="some/other-model", cache_dir=tmp_path, dim=384)
+
+    with caplog.at_level(logging.ERROR, logger="brain.memory.embeddings"):
+        provider.embed("hello")
+
+    assert caplog.text == ""
 
 
 def test_build_embedding_provider_resolves_model_id_from_model_tier(

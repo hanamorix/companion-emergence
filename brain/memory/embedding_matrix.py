@@ -2,11 +2,18 @@
 
 A process-level `{memory_id -> np.ndarray(float32, N-dim)}` map, sourced
 from the `embedding` column F1 added to the `memories` table (see
-`brain/memory/store.py`'s `_SCHEMA`). `N` is whatever
-`model_tier.MODEL_EMBEDDING_DIM` currently says (384 for bge-small today;
-a future multilingual swap, e.g. bge-m3 at 1024-dim, changes that one
-constant and this module follows automatically — see `_expected_dim()`
-below). This is the read-side cache `semantic_recall.py`,
+`brain/memory/store.py`'s `_SCHEMA`). `N` is whatever the REAL embedding
+model currently produces (384 for bge-small today; a future multilingual
+swap, e.g. bge-m3 at 1024-dim, needs NO change here — #259 inc7 red-team F1
+made this module genuinely dim-agnostic): each row is decoded to its OWN
+stored byte-length (see `_load_from_db` below), never validated against
+`model_tier.MODEL_EMBEDDING_DIM` (that constant is a documented sanity value
+checked elsewhere — see `FastEmbedProvider.embed()` in `embeddings.py` — not
+a gate on what this module will load). `put()` still enforces ONE dim per
+matrix instance, self-derived from whichever vector it sees first (real
+provider dim or first-seen dim), so a genuinely wrong-dim vector can never
+enter the warm matrix and later crash clustering's `np.stack`. This is the
+read-side cache `semantic_recall.py`,
 `search_memories.py`, and the narrative-memory adapter in
 `brain/bridge/supervisor.py` query directly instead of the old content-hash
 `embeddings.db` join (F1 increment 2). `build_embedding_matrix` below is the
@@ -80,25 +87,22 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Retrieval embeddings are float32, dimension `model_tier.MODEL_EMBEDDING_DIM`
-# (see the backfill/provider) — NOT a hardcoded literal (F1 #259 increment 7:
-# a future multilingual embedding model swap, e.g. bge-m3 at 1024-dim vs
-# bge-small's 384, must not require a code change here). A blob whose byte
-# length isn't `dim * 4` (float32) is a corrupt/short row that must be
-# skipped rather than allowed to crash the whole build.
-def _expected_dim() -> int:
-    """The dimension embedding vectors are expected to have, derived from
-    `model_tier.MODEL_EMBEDDING_DIM` — the single source of truth for the
-    active embedding model's output size. Looked up via the `model_tier`
-    MODULE (not a bare imported name), mirroring `build_embedding_matrix`'s
-    own lookup convention, so a test that monkeypatches
-    `brain.bridge.model_tier.MODEL_EMBEDDING_DIM` is honored here too.
-    Called per-build (not cached at import time) so it always reflects the
-    currently configured model, including across a model swap mid-process.
-    """
-    from brain.bridge import model_tier
-
-    return model_tier.MODEL_EMBEDDING_DIM
+# Retrieval embeddings are float32, of whatever dimension the ACTIVE model
+# actually produces — NOT `model_tier.MODEL_EMBEDDING_DIM` (#259 inc7
+# red-team F1: that constant is a documented sanity value checked elsewhere,
+# never a gate here — see the module docstring above and
+# `FastEmbedProvider.embed()` in `embeddings.py`). `_load_from_db` below
+# decodes each row to ITS OWN stored byte-length, model-agnostic by
+# construction: a future multilingual embedding model swap, e.g. bge-m3 at
+# 1024-dim vs bge-small's 384, needs no code change here. A blob whose byte
+# length isn't a multiple of 4 (float32) is corrupt/truncated and is skipped
+# rather than allowed to crash the whole build; a blob that decodes cleanly
+# but to a dimension no other currently-held row shares is NOT rejected at
+# decode time (the `embedding_model_id` filter is what keeps current-model
+# rows dimensionally consistent in practice) — `EmbeddingMatrix.put()` is
+# where a genuinely wrong-dim vector gets caught and rejected (see that
+# method), since that is the point a bad vector could otherwise reach
+# clustering's `np.stack` over mixed-dim vectors.
 
 # Sentinel recorded in the pending overlay to mean "this id was evicted while
 # a build was in flight" — distinct from an absent key (no mutation) and from
@@ -129,6 +133,16 @@ class EmbeddingMatrix:
         # survives until the LAST one swaps.
         self._pending: dict[str, object] = {}
         self._build_depth = 0
+        # Self-derived expected dim (#259 inc7 red-team F1) — NOT
+        # `model_tier.MODEL_EMBEDDING_DIM`. Set from whichever vector this
+        # matrix sees first (a build/rebuild that actually loads rows, or a
+        # `put()` before any load has happened), and re-derived on every
+        # build/rebuild so a model swap that changes dimension is tracked
+        # automatically. `put()` uses this to reject a genuinely wrong-dim
+        # vector before it can reach `_vectors` and later crash clustering's
+        # `np.stack`. None means "no dimension established yet" — an empty
+        # matrix accepts any dim for its first vector.
+        self._expected_dim: int | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -197,6 +211,17 @@ class EmbeddingMatrix:
             self._built = True
             if model_id is not None:
                 self.model_id = model_id
+            # Re-derive the self-tracked expected dim from whatever this
+            # build/rebuild (plus the reconciled overlay) actually holds
+            # (#259 inc7 red-team F1) — NOT from `model_tier.MODEL_EMBEDDING_
+            # DIM`. Always re-derived (not just set-if-None) so a rebuild onto
+            # a NEW model_id with a different real dim (a genuine multilingual
+            # swap) updates `put()`'s validation target instead of leaving it
+            # pinned to the PRIOR model's dim, which would reject every
+            # legitimate post-swap put. An empty matrix (fresh model, no rows
+            # yet) leaves this unset — the first `put()` establishes it.
+            if self._vectors:
+                self._expected_dim = next(iter(self._vectors.values())).shape[0]
             self._build_depth -= 1
             if self._build_depth == 0:
                 self._pending = {}
@@ -211,14 +236,18 @@ class EmbeddingMatrix:
         need.
 
         Filters to the target `model_id` so a rebuild during a model swap
-        loads only the current model's vectors. Decodes each row
-        defensively: a corrupt or wrong-length blob is skipped-and-logged,
-        never allowed to throw and kill the whole build (which would
-        propagate into recall via the request-thread lazy build).
+        loads only the current model's vectors. Decodes each row to ITS OWN
+        stored byte-length (#259 inc7 red-team F1) — `len(blob) // 4` float32
+        elements — rather than validating against any expected-dim constant:
+        this is what makes a different-dim model swap work with NO code
+        change here. A blob is only skipped-and-logged as corrupt/truncated
+        when its byte length isn't even a clean multiple of 4 (an undecodable
+        float32 array), never merely because it differs from some other
+        row's dimension — the `embedding_model_id` filter is what keeps
+        current-model rows dimensionally consistent in practice, and
+        `EmbeddingMatrix.put()` is the backstop against a genuinely wrong-dim
+        vector reaching `_vectors` (see that method).
         """
-        expected_dim = _expected_dim()
-        expected_bytes = expected_dim * 4
-
         conn = sqlite3.connect(str(self._db_path))
         try:
             # Mirror MemoryStore's 5s busy_timeout (WAL is already on the
@@ -237,12 +266,11 @@ class EmbeddingMatrix:
         result: dict[str, np.ndarray] = {}
         for row in rows:
             mem_id, blob = row[0], row[1]
-            if blob is None or len(blob) != expected_bytes:
+            if blob is None or len(blob) % 4 != 0:
                 logger.warning(
-                    "embedding_matrix: skipping row %s with bad embedding blob"
-                    " (expected %d bytes, got %s)",
+                    "embedding_matrix: skipping row %s with corrupt/truncated"
+                    " embedding blob (byte length %s is not a multiple of 4)",
                     mem_id,
-                    expected_bytes,
                     "None" if blob is None else len(blob),
                 )
                 continue
@@ -253,15 +281,6 @@ class EmbeddingMatrix:
                     "embedding_matrix: skipping row %s, undecodable embedding: %s",
                     mem_id,
                     exc,
-                )
-                continue
-            if vec.shape != (expected_dim,):
-                logger.warning(
-                    "embedding_matrix: skipping row %s with wrong embedding dim"
-                    " (expected %d, got %d)",
-                    mem_id,
-                    expected_dim,
-                    vec.shape[0],
                 )
                 continue
             result[mem_id] = vec
@@ -319,9 +338,36 @@ class EmbeddingMatrix:
         already durable in `memories` by the time a caller puts it here, so
         the eventual lazy/rebuild load picks it up regardless — this is
         purely a same-process warm-cache update, never the sole record.
+
+        DIMENSION VALIDATION (#259 inc7 red-team F1): once this matrix has
+        an established expected dim (self-derived from an earlier load or
+        put — see `_expected_dim`, never `model_tier.MODEL_EMBEDDING_DIM`), a
+        vector of a DIFFERENT length is rejected-and-logged instead of
+        accepted. Letting a wrong-dim vector into `_vectors` would silently
+        corrupt every later `get()`/`snapshot()` (inconsistent shapes) and
+        crash clustering's `np.stack` over the resulting mixed-dim result —
+        this is the backstop that makes that impossible regardless of what
+        called `put()` or why. The memory's OWN `embedding` column is
+        unaffected (callers, e.g. `MemoryStore.embed_row`, persist that
+        BEFORE calling `put()`), so a reject here degrades that one memory
+        to lexical-only recall in THIS process, never data loss or a crash.
+        The first vector this matrix ever sees (empty `_vectors`, no prior
+        load) establishes the expected dim rather than being rejected.
         """
         vec = np.asarray(vector, dtype=np.float32).copy()
         with self._lock:
+            if self._expected_dim is not None and vec.shape[0] != self._expected_dim:
+                logger.error(
+                    "embedding_matrix: rejecting put() for memory %s — vector "
+                    "dim=%d does not match this matrix's expected dim=%d "
+                    "(established by an earlier load/put)",
+                    memory_id,
+                    vec.shape[0],
+                    self._expected_dim,
+                )
+                return
+            if self._expected_dim is None:
+                self._expected_dim = vec.shape[0]
             self._vectors[memory_id] = vec
             if self._build_depth > 0:
                 self._pending[memory_id] = vec

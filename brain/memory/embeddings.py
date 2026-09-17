@@ -26,12 +26,15 @@ model/ONNX-session load happens once per process, not once per call.
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_DIM = 256
 
@@ -103,16 +106,37 @@ class FastEmbedProvider(EmbeddingProvider):
     call happens at embed() time once the file is cached. Construction itself
     does NOT download; the download is deferred to fastembed's own internals
     on first `embed()` call, same as fastembed's default behavior.
+
+    DIMENSION (#259 inc7 red-team F1 — the one-touch-swap fix): `dim` is a
+    DECLARED sanity value (production passes `model_tier.MODEL_EMBEDDING_DIM`)
+    used ONLY for the loud mismatch log below — it is never what
+    `embedding_dim()` returns. The REAL dimension is established by probing
+    the loaded model with one actual `embed()` call (see `embedding_dim()`),
+    so a `MODEL_EMBEDDING` swap to a different-dim model works correctly even
+    if `MODEL_EMBEDDING_DIM` is never updated to match. Before this fix,
+    `embedding_dim()` just echoed `dim` back — a silent no-op check that made
+    a stale constant indistinguishable from a correct one.
     """
 
-    def __init__(self, model_id: str, cache_dir: str | Path, dim: int) -> None:
+    # Short, fixed text used to probe the model's real output dimension on
+    # first use — never persisted, never cached, just measures `len(vector)`.
+    _PROBE_TEXT = "probe"
+
+    def __init__(self, model_id: str, cache_dir: str | Path, dim: int | None = None) -> None:
         # Imported lazily so importing this module never requires fastembed/
         # onnxruntime to be installed unless the real provider is actually
         # constructed (tests exclusively use FakeEmbeddingProvider).
         from fastembed import TextEmbedding
 
         self._model_id = model_id
-        self._dim = dim
+        # DECLARED dim (a sanity value, e.g. MODEL_EMBEDDING_DIM) — compared
+        # against the REAL probed dim on first use, never returned directly.
+        # None is valid (no declared value to check against; the real dim is
+        # still established on first use).
+        self._declared_dim = dim
+        # The REAL dim, established lazily from an actual embed() call (see
+        # `embed`/`embedding_dim`). None until the first embed happens.
+        self._real_dim: int | None = None
         # lazy_load=True: defer the (one-time) model-file load/download to
         # the first embed() call rather than construction time. Every current
         # call site constructs this off the message hot path already, but
@@ -141,10 +165,46 @@ class FastEmbedProvider(EmbeddingProvider):
         # input; we pass exactly one string and take the one result.
         with self._embed_lock:
             (vec,) = self._model.embed([text])
-        return np.asarray(vec, dtype=np.float32)
+            arr = np.asarray(vec, dtype=np.float32)
+            if self._real_dim is None:
+                # First real embed this instance has ever performed — this is
+                # the "first used" moment the real dim is established from,
+                # and the ONE point a stale MODEL_EMBEDDING_DIM gets caught
+                # loudly rather than silently (#259 inc7 red-team F1).
+                self._real_dim = arr.shape[0]
+                if self._declared_dim is not None and self._real_dim != self._declared_dim:
+                    logger.error(
+                        "FastEmbedProvider: model %s produced dim=%d but the "
+                        "declared/sanity dim (model_tier.MODEL_EMBEDDING_DIM) "
+                        "is %d — that constant is stale (likely a model swap "
+                        "that didn't update it together). This is NOT fatal: "
+                        "embed/decode/cluster all follow the REAL dim (%d), "
+                        "not the constant. Update MODEL_EMBEDDING_DIM to %d "
+                        "to clear this warning.",
+                        self._model_id,
+                        self._real_dim,
+                        self._declared_dim,
+                        self._real_dim,
+                        self._real_dim,
+                    )
+        return arr
 
     def embedding_dim(self) -> int:
-        return self._dim
+        """The REAL output dimension of the loaded model.
+
+        Established by an actual `embed()` call — reused from the first one
+        this instance has ever performed, or triggered here via a one-time
+        probe embed if none has happened yet. Never the constructor's `dim`
+        sanity value (#259 inc7 red-team F1): this is what makes the
+        embedding dimension genuinely one-touch-swappable — every consumer
+        that asks this provider for its dim gets the model's ACTUAL output
+        size, so a `MODEL_EMBEDDING` swap to a different-dim model works
+        without also having to edit `MODEL_EMBEDDING_DIM` anywhere else.
+        """
+        if self._real_dim is None:
+            self.embed(self._PROBE_TEXT)
+        assert self._real_dim is not None  # embed() always sets it
+        return self._real_dim
 
     def model_id(self) -> str:
         return self._model_id
@@ -348,8 +408,13 @@ def build_embedding_provider() -> EmbeddingProvider:
     per the build-plan recommendation — the model isn't persona-specific
     data, just a local asset).
 
-    The model id/dim come from `model_tier.py`, never hardcoded here — same
-    convention as every Claude tier in that module.
+    The model id comes from `model_tier.py`, never hardcoded here — same
+    convention as every Claude tier in that module. `MODEL_EMBEDDING_DIM` is
+    passed through too, but ONLY as `FastEmbedProvider`'s declared/sanity dim
+    (#259 inc7 red-team F1) — the provider's own `embedding_dim()` derives
+    the REAL dim from the loaded model, so this constant going stale after a
+    `MODEL_EMBEDDING` swap degrades to a loud log from `FastEmbedProvider`,
+    never a silent or load-bearing failure here.
 
     PROCESS-WIDE CACHING: constructing a FastEmbedProvider builds a real
     fastembed/ONNX inference session — a one-time ~300-450ms cost. Before

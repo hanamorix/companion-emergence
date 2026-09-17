@@ -45,12 +45,14 @@ from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 
 _SCRIPTED_MODEL_ID = "scripted-test"
-# Row vectors now flow through EmbeddingMatrix, which enforces a FIXED
-# 384-dim blob width (`brain.memory.embedding_matrix._EXPECTED_DIM`) and
-# silently skips any row whose blob is a different length — a 2-dim test
-# vector would simply never appear in a `matrix.snapshot()`. All scripted
-# vectors here are padded to this width (see `_unit_vec_with_cosine` /
-# `_query_unit_vec`) so they survive the matrix read path.
+# Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
+# EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
+# (each row decodes to its own stored byte-length) — a 2-dim test vector
+# WOULD now appear in a `matrix.snapshot()` just fine. This suite still pads
+# every scripted vector to 384 dims (see `_unit_vec_with_cosine` /
+# `_query_unit_vec`) purely to look production-realistic and to keep every
+# row in one matrix sharing a uniform shape (needed elsewhere, e.g.
+# clustering's `np.stack`), not because a shorter vector would be dropped.
 _EMBED_DIM = 384
 
 

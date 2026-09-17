@@ -78,7 +78,19 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 # repoint every embedding call site. See TIER_EMBEDDING below for why it
 # resolves via a dedicated accessor rather than build_tier_provider.
 MODEL_EMBEDDING = "BAAI/bge-small-en-v1.5"  # 384-dim int8, via fastembed (ONNX, no torch)
-MODEL_EMBEDDING_DIM = 384  # output dim of MODEL_EMBEDDING; change together if the model changes
+# DOCUMENTED SANITY VALUE ONLY (#259 inc7 red-team F1) — NOT the load-bearing
+# source of the dimension actually used to embed/decode/cluster. That comes
+# from the REAL model's own output (`FastEmbedProvider.embedding_dim()`,
+# probed via a one-time embed call — see brain/memory/embeddings.py), so a
+# MODEL_EMBEDDING swap to a different-dim model (e.g. bge-m3 at 1024-dim) is
+# genuinely one-touch: this constant does NOT need to change together for the
+# system to keep working. It still matters for one thing: a loud startup/
+# first-use health-check log (in FastEmbedProvider.embed(), see that class)
+# compares the real probed dim against this constant and logs an error on a
+# mismatch, so a desync (this constant going stale after a model swap) is
+# caught LOUDLY rather than silently. Update it to match MODEL_EMBEDDING when
+# you change that constant, but nothing breaks if you forget.
+MODEL_EMBEDDING_DIM = 384
 
 # MODEL_RERANKER is also not a Claude model — it's a local ONNX cross-encoder
 # reranker id (fastembed's TextCrossEncoder), the #231 reranker re-architecture

@@ -1195,24 +1195,22 @@ def _use_matrix_dim_fake_provider(monkeypatch: pytest.MonkeyPatch):
     `FakeEmbeddingProvider` sized to `model_tier.MODEL_EMBEDDING_DIM` and
     align `model_tier`'s embedding tier to its model id.
 
-    Two separate reasons this alignment is needed, both load-bearing for
-    every test below:
-      (1) DIMENSION — the suite-wide autouse fixture fakes the provider to
-          `FakeEmbeddingProvider(dim=256)`, but `EmbeddingMatrix` expects a
-          blob width derived from `model_tier.MODEL_EMBEDDING_DIM` (F1 #259
-          increment 7 — no longer a hardcoded literal, but still must MATCH
-          whatever that constant currently is) and silently SKIPS any
-          other-width row — a 256-dim embed would never appear in the
-          matrix no matter what. Sizing this fixture off the same constant
-          (rather than a literal) means it keeps matching automatically if
-          `MODEL_EMBEDDING_DIM` is ever repointed (e.g. a multilingual model
-          swap).
-      (2) MODEL ID — `embed_row` embeds via the process-cached provider, but
-          the matrix's lazy-build filter is sourced from
+    One load-bearing reason, plus one now-cosmetic-but-still-useful one:
+      (1) MODEL ID (load-bearing) — `embed_row` embeds via the process-cached
+          provider, but the matrix's lazy-build filter is sourced from
           `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a
           SEPARATE lookup that must be aligned or the matrix's first read
           reloads from disk filtered to the wrong model id and finds
           nothing.
+      (2) DIMENSION (no longer load-bearing as of #259 inc7 red-team F1) —
+          `EmbeddingMatrix` now decodes each row to its OWN stored
+          byte-length and does NOT skip a row for merely mismatching
+          `model_tier.MODEL_EMBEDDING_DIM` (that constant is a documented
+          sanity value checked only inside `FastEmbedProvider`, never a gate
+          in `EmbeddingMatrix._load_from_db`). Sizing this fixture off the
+          same constant is kept anyway purely so the fixture's vectors read
+          as a realistic production-shaped dim in test output, not because
+          a mismatched dim would be silently dropped.
     """
     from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod

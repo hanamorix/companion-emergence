@@ -1309,15 +1309,26 @@ class MemoryStore:
         Same composite keyset cursor semantics as `list_active_since` (see
         that method's docstring for the tied-created_at rationale) — this is
         its sibling scoped to the backlog predicate above. The caller
-        (embedding backfill) is responsible for NOT persisting a forward
-        cursor once a tick has seen the whole currently-backlogged set (i.e.
-        got back fewer than `limit` rows): backlog membership is not
-        append-only per id — a row can re-enter it a SECOND time (a later
-        content edit whose synchronous re-embed attempt fails — see
-        `_reembed_or_clear` — or a model swap) at a `created_at` position
-        the cursor may have already passed — so a persisted forward position
-        is only a safe optimization while the backlog is larger than one
-        scan, never a correctness mechanism.
+        (embedding backfill) decides whether to persist a forward cursor
+        after a tick, and — as of F1 #259 increment 7 — that decision is
+        `hit_batch_limit`-aware, not simply "got back fewer than `limit`
+        rows": a tick that stops early because it hit its own `batch_size`
+        cap (rows still remain in the fetched window) DOES persist a forward
+        cursor even though it saw fewer than `limit` candidates, so a
+        long-lived persona's no-sleep drain keeps making forward progress
+        instead of re-scanning full history every tick. A cursor is only
+        reset to `None` when a tick both (a) did NOT stop early on its batch
+        cap and (b) fetched fewer than `limit` rows — i.e. it genuinely
+        EXHAUSTED the whole currently-backlogged set in one scan. See
+        `run_embedding_backfill_tick`'s closing comment in
+        `brain/memory/embedding_backfill.py` for the exact condition.
+        Backlog membership is not append-only per id regardless — a row can
+        re-enter it a SECOND time (a later content edit whose synchronous
+        re-embed attempt fails — see `_reembed_or_clear` — or a model swap)
+        at a `created_at` position the cursor may have already passed — so a
+        persisted forward position is only ever a safe scan-cost
+        optimization, never a correctness mechanism (a missing/stale cursor
+        just means more re-scanning, never a skipped row).
         """
         if cursor is None:
             sql = (

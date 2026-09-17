@@ -24,13 +24,15 @@ from brain.memory.store import Memory, MemoryStore
 def _use_384_fake_provider(monkeypatch: pytest.MonkeyPatch) -> embeddings_mod.FakeEmbeddingProvider:
     """Align `build_embedding_provider()` AND `model_tier`'s embedding-tier
     model id to one 384-dim `FakeEmbeddingProvider` — mirrors the identical
-    helper in tests/unit/brain/memory/test_store.py. Both alignments are
-    load-bearing: `is_duplicate` embeds the candidate through
+    helper in tests/unit/brain/memory/test_store.py. The model-id alignment
+    is load-bearing: `is_duplicate` embeds the candidate through
     `build_embedding_provider()`, but the warm matrix's lazy build filters
     EXISTING rows by `model_tier.model_for_tier(TIER_EMBEDDING)` — a SEPARATE
     lookup that must resolve to the same model id, or the matrix loads
-    nothing (and 384 specifically because `EmbeddingMatrix` hardcodes that
-    expected blob width, unlike the suite-wide default of dim=256)."""
+    nothing. 384 specifically is no longer load-bearing (#259 inc7 red-team
+    F1: `EmbeddingMatrix` decodes each row to its own stored byte-length, not
+    a hardcoded expected width) — kept only for consistency with the rest of
+    this suite's production-shaped vectors."""
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
     monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())

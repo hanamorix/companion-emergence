@@ -163,12 +163,13 @@ def test_embed_on_write_promoted_memory_has_row_embedding_and_matrix_entry(
     # Two separate alignments needed for this test's `matrix.get(...)` check
     # to actually find what `embed_row` wrote:
     #  (1) DIMENSION — the suite-wide autouse fixture fakes the provider to
-    #      FakeEmbeddingProvider(dim=256), but EmbeddingMatrix hardcodes an
-    #      expected blob width of 384 (matching production's real
-    #      MODEL_EMBEDDING_DIM) and silently SKIPS any other-width row (see
-    #      `_load_from_db`'s per-row decode guard) — a 256-dim embed would
-    #      never appear in the matrix no matter what. Override locally to a
-    #      384-dim fake provider.
+    #      FakeEmbeddingProvider(dim=256). `EmbeddingMatrix._load_from_db`
+    #      (#259 inc7 red-team F1) decodes each row to its OWN stored
+    #      byte-length and no longer gates on any expected-dim constant, so
+    #      a 256-dim embed WOULD now appear in the matrix — this override to
+    #      a 384-dim fake provider is kept for realism/consistency with the
+    #      rest of this test's production-shaped expectations, not because a
+    #      256-dim row would be silently dropped.
     #  (2) MODEL ID — `embed_row` embeds via the process-cached provider,
     #      but the matrix's lazy-build filter is sourced from
     #      `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a

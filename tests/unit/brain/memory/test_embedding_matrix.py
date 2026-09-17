@@ -192,6 +192,97 @@ def test_put_before_first_lazy_build_does_not_short_circuit_it(seeded_db) -> Non
 
 
 # ---------------------------------------------------------------------------
+# put() dimension validation (#259 inc7 red-team F1) — a wrong-dim vector
+# must never enter the warm matrix, since that would later crash
+# clustering's np.stack over a mixed-dim snapshot. Validated against a
+# SELF-DERIVED expected dim (the first vector this matrix instance ever
+# saw, from a load or a put), never `model_tier.MODEL_EMBEDDING_DIM`.
+# ---------------------------------------------------------------------------
+
+
+def test_put_rejects_a_vector_whose_dim_does_not_match_the_built_matrix(
+    seeded_db, caplog
+) -> None:
+    """Once the matrix has loaded real rows (establishing DIM as the
+    expected dim), a put() with a DIFFERENT-length vector must be rejected
+    (not stored) and logged — never silently accepted into `_vectors`."""
+    import logging
+
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    matrix.ensure_built()  # establishes expected dim = DIM from the 2 seeded rows
+    wrong_dim = 8 if DIM != 8 else 16
+
+    with caplog.at_level(logging.ERROR, logger="brain.memory.embedding_matrix"):
+        matrix.put("mem-bad-dim", np.full(wrong_dim, 1.0, dtype=np.float32))
+
+    assert "mem-bad-dim" not in matrix
+    assert matrix.get("mem-bad-dim") is None
+    assert "rejecting put()" in caplog.text
+    # The good rows are untouched.
+    assert set(matrix.snapshot().keys()) == {"mem-active-1", "mem-active-2"}
+
+
+def test_put_establishes_expected_dim_from_the_first_vector_on_an_empty_matrix(
+    tmp_path,
+) -> None:
+    """An empty matrix (no DB rows yet under this model_id) has no
+    established dim — its FIRST put(), of ANY dim, must be accepted and
+    become the expected dim going forward (this is the "first-seen dim"
+    half of the #259 inc7 red-team F1 fix, exercised independently of any
+    real/fake provider — a genuinely different-dim model, e.g. 1024 instead
+    of 384, works with zero code change here)."""
+    empty_db = tmp_path / "empty_memories.db"
+    MemoryStore(empty_db).close()  # real schema, zero rows
+
+    matrix = EmbeddingMatrix(empty_db, model_id="fake-model-v1")
+    matrix.ensure_built()
+    assert len(matrix) == 0
+
+    matrix.put("mem-first", np.full(1024, 2.0, dtype=np.float32))
+    got = matrix.get("mem-first")
+    assert got is not None
+    assert got.shape == (1024,)
+
+    # A LATER put() of a different dim is now rejected, proving 1024 became
+    # the established expected dim from that first put.
+    matrix.put("mem-second", np.full(384, 3.0, dtype=np.float32))
+    assert "mem-second" not in matrix
+    # And a further 1024-dim put() still succeeds.
+    matrix.put("mem-third", np.full(1024, 4.0, dtype=np.float32))
+    assert "mem-third" in matrix
+
+
+def test_rebuild_onto_a_different_dim_model_updates_the_expected_dim(
+    tmp_path,
+) -> None:
+    """A rebuild onto a NEW model_id whose rows are a DIFFERENT real dim
+    (the multilingual-swap scenario #259 inc7 red-team F1 exists for) must
+    re-derive the matrix's expected dim from what it actually just loaded —
+    not leave it pinned to the PRIOR model's dim, which would incorrectly
+    reject every legitimate post-swap put()."""
+    db_path = tmp_path / "memories.db"
+    _seed_db(db_path, [("mem-v1-a", np.full(384, 0.1, dtype=np.float32), True)])
+    _insert_row(
+        db_path, "mem-v2-a", np.full(1024, 0.5, dtype=np.float32).tobytes(), "fake-model-v2"
+    )
+
+    matrix = EmbeddingMatrix(db_path, model_id="fake-model-v1")
+    matrix.ensure_built()
+    assert matrix.get("mem-v1-a").shape == (384,)
+
+    matrix.rebuild(model_id="fake-model-v2")
+    assert set(matrix.snapshot().keys()) == {"mem-v2-a"}
+
+    # A 1024-dim put() (matching the NEWLY loaded model's real dim) must be
+    # accepted — proving the expected dim followed the swap, not stuck at 384.
+    matrix.put("mem-v2-b", np.full(1024, 0.6, dtype=np.float32))
+    assert "mem-v2-b" in matrix
+    # A stale 384-dim put() (the OLD model's dim) is now rejected.
+    matrix.put("mem-stale-dim", np.full(384, 0.7, dtype=np.float32))
+    assert "mem-stale-dim" not in matrix
+
+
+# ---------------------------------------------------------------------------
 # Full rebuild — atomic swap
 # ---------------------------------------------------------------------------
 
@@ -478,15 +569,40 @@ def test_corrupt_embedding_blob_is_skipped_not_fatal(seeded_db) -> None:
     assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
 
 
-def test_wrong_dim_embedding_blob_is_skipped(seeded_db) -> None:
-    """A blob whose byte length is a clean float32 multiple but the wrong
-    dimension (not DIM) is skipped, not served as a malformed vector."""
+def test_differently_sized_clean_blob_is_decoded_by_its_own_byte_length(seeded_db) -> None:
+    """#259 inc7 red-team F1: `_load_from_db` is model-agnostic — it decodes
+    each blob to ITS OWN stored byte-length, never validating against a
+    constant (`model_tier.MODEL_EMBEDDING_DIM` or any other expected-dim
+    literal). A blob whose byte length is a clean float32 multiple but
+    DIFFERENT from its peers under the same model_id is therefore loaded,
+    not skipped — this is what makes a different-dim model swap (e.g.
+    bge-small's 384 -> bge-m3's 1024) work with no code change here. (Real
+    corpora don't mix dims under one model_id in practice — the
+    `embedding_model_id` filter is what keeps that true — so this is a
+    decode-contract proof, not a claim that mixed dims are a supported
+    steady state; `EmbeddingMatrix.put()` is the backstop against a
+    genuinely wrong-dim vector reaching a live matrix.)"""
     wrong_dim = 128 if DIM != 128 else 64
-    wrong = np.full(wrong_dim, 0.5, dtype=np.float32).tobytes()  # not DIM
-    _insert_row(seeded_db, "mem-wrong-dim", wrong, "fake-model-v1")
+    differently_sized = np.full(wrong_dim, 0.5, dtype=np.float32).tobytes()
+    _insert_row(seeded_db, "mem-different-dim", differently_sized, "fake-model-v1")
     matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
     snap = matrix.snapshot()
-    assert "mem-wrong-dim" not in snap
+    assert "mem-different-dim" in snap
+    assert snap["mem-different-dim"].shape == (wrong_dim,)
+    assert set(snap.keys()) == {"mem-active-1", "mem-active-2", "mem-different-dim"}
+
+
+def test_corrupt_blob_byte_length_not_multiple_of_4_is_skipped(seeded_db) -> None:
+    """#259 inc7 red-team F1: the ONLY decode-time skip left is a blob whose
+    byte length isn't even a multiple of 4 (float32) — genuinely undecodable,
+    not merely a different (but clean) dimension. Distinguishes this from
+    `test_corrupt_embedding_blob_is_skipped_not_fatal` above (which already
+    covers a 3-byte blob) by using a length that is clearly not corrupt-by-
+    truncation-of-a-real-vector, just deliberately unaligned."""
+    _insert_row(seeded_db, "mem-unaligned", b"\x00" * 15, "fake-model-v1")  # 15 % 4 != 0
+    matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
+    snap = matrix.snapshot()
+    assert "mem-unaligned" not in snap
     assert set(snap.keys()) == {"mem-active-1", "mem-active-2"}
 
 

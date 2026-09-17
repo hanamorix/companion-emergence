@@ -516,6 +516,23 @@ def run_embedding_backfill_tick(
     # (no batch cap hit, window smaller than scan_cap) still resets — the
     # "catch rows that went NULL behind the cursor" self-healing property is
     # unchanged for that case.
+    #
+    # ACCEPTED BOUND (#259 inc7 red-team F2b): under SUSTAINED ingestion that
+    # keeps the backlog permanently larger than `batch_size` (every tick hits
+    # `hit_batch_limit`), the cursor may simply never reset for a long time.
+    # A row that goes NULL a SECOND time BEHIND the persisted cursor position
+    # (a failed synchronous re-embed from `fade`/`update(content=...)`/
+    # `unfade` — see `MemoryStore._reembed_or_clear`) is invisible to
+    # `list_unembedded_since` until either the backlog finally drains below
+    # one scan window (letting a tick exhaust it and reset the cursor) or a
+    # `MODEL_EMBEDDING` swap forces a full rescan (`_load_cursor` resets on
+    # model-id mismatch). This is bounded and self-healing, not silent data
+    # loss — the row's content is unchanged, only its (re-)embedding is
+    # delayed — and it is an ACCEPTED tradeoff: a synchronous re-embed
+    # failure is rare (the embed call that just succeeded once already;
+    # `_reembed_or_clear` only hits this path on a second, later failure),
+    # and a companion's ingestion is bursty, not sustained — the backlog
+    # drains at idle, which is exactly when this backfill runs.
     window_exhausted = not hit_batch_limit and len(candidates) < scan_cap
     cursor_to_persist = None if window_exhausted else resolved_up_to
     _save_cursor(persona_dir, model_id, cursor_to_persist)

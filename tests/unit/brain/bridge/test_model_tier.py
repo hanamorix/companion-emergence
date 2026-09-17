@@ -88,8 +88,17 @@ def test_embedding_tier_resolves_to_the_pinned_local_model():
 
 
 def test_embedding_model_dim_matches_the_pinned_model():
-    """bge-small-en-v1.5 is a 384-dim model — this constant is what the real
-    provider (FastEmbedProvider) and the swap-staleness guard both rely on."""
+    """bge-small-en-v1.5 is a 384-dim model — but this constant is a
+    DOCUMENTED SANITY VALUE ONLY (#259 inc7 red-team F1/F3), not something
+    the real provider or a staleness guard load-bearingly rely on.
+    `FastEmbedProvider.embedding_dim()` derives the REAL dimension from a
+    probe embed against the loaded model, checking it against this constant
+    only to log a loud (non-fatal) warning on mismatch — see
+    `FastEmbedProvider.embed()` in `brain/memory/embeddings.py`. The actual
+    swap-staleness guard (re-embedding backlog rows after a `MODEL_EMBEDDING`
+    swap — see `MemoryStore.list_unembedded_since`) keys off model_id STRING
+    equality (`embedding_model_id != current_model_id`), not this dimension
+    constant at all."""
     assert MODEL_EMBEDDING_DIM == 384
 
 
