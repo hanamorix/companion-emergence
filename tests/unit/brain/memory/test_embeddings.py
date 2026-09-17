@@ -117,12 +117,23 @@ def test_fake_provider_model_id_is_dim_qualified() -> None:
 class _StubTextEmbedding:
     """Stand-in for fastembed.TextEmbedding — records constructor args,
     returns a deterministic zero vector so shape/plumbing can be asserted
-    without any model download or ONNX inference."""
+    without any model download or ONNX inference.
+
+    `self.model = self` + `self._model_dir = cache_dir` mimics just enough of
+    the REAL TextEmbedding's internal shape (`.model._model_dir`) for
+    FastEmbedProvider's onnxruntime-symlink-workaround materialize step
+    (`_materialize_fastembed_model_dir`) to find an existing, empty directory
+    (pytest's `tmp_path`) and take its no-symlinks-found fast path silently —
+    without this, every stub-backed construction would log a loud "could not
+    locate model directory" warning (harmless, but noisy, and it broke the
+    two tests below that assert on exact log content)."""
 
     def __init__(self, model_name: str, cache_dir: str, lazy_load: bool = False, **kwargs) -> None:
         self.model_name = model_name
         self.cache_dir = cache_dir
         self.lazy_load = lazy_load
+        self.model = self
+        self._model_dir = cache_dir
 
     def embed(self, texts):
         for _ in texts:
@@ -174,6 +185,11 @@ def _make_stub_text_embedding(output_dim: int):
             self.model_name = model_name
             self.cache_dir = cache_dir
             self.lazy_load = lazy_load
+            # See _StubTextEmbedding's docstring: gives the materialize-
+            # workaround step a `.model._model_dir` to find (an existing,
+            # empty tmp_path) so it silently no-ops instead of logging.
+            self.model = self
+            self._model_dir = cache_dir
 
         def embed(self, texts):
             for _ in texts:
@@ -262,7 +278,12 @@ def test_build_embedding_provider_resolves_model_id_from_model_tier(
     embeddings.py — and cache into the shared get_cache_dir()."""
     from brain.bridge.model_tier import MODEL_EMBEDDING, MODEL_EMBEDDING_DIM
 
-    monkeypatch.setattr("fastembed.TextEmbedding", _StubTextEmbedding)
+    # Stub's real output must match MODEL_EMBEDDING_DIM here (unlike
+    # _StubTextEmbedding's fixed 384, used elsewhere for tests that don't
+    # care) — this test asserts embedding_dim() against the live production
+    # constant, and embedding_dim() always reflects the REAL probed output,
+    # never the declared/sanity dim (#259 inc7 red-team F1).
+    monkeypatch.setattr("fastembed.TextEmbedding", _make_stub_text_embedding(MODEL_EMBEDDING_DIM))
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
 
     provider = build_embedding_provider()
@@ -383,6 +404,12 @@ class _LazyLoadRaceStubTextEmbedding:
         self._loaded = False
         self.concurrent_loads = 0
         self.max_concurrent_loads = 0
+        # See _StubTextEmbedding's docstring: gives the materialize-
+        # workaround step a `.model._model_dir` to find (an existing, empty
+        # tmp_path) so it silently no-ops instead of logging. Unrelated to
+        # this stub's own `_loaded`-flag race simulation below.
+        self.model = self
+        self._model_dir = cache_dir
 
     def embed(self, texts):
         if not self._loaded:

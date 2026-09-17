@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import shutil
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -92,6 +95,88 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         return f"fake-{self._dim}"
 
 
+def _materialize_symlinked_files(directory: Path) -> Path:
+    """Return a directory holding REAL (non-symlinked) files for everything
+    fastembed downloaded into `directory`, materializing them if needed.
+
+    WHY (#259 F1 model-swap, onnxruntime external-data workaround):
+    huggingface_hub's default cache layout (`snapshot_download`) stores the
+    actual file content once under `<cache>/models--org--repo/blobs/<hash>`
+    and creates the SNAPSHOT directory fastembed actually reads from
+    (`directory` here) as a directory of SYMLINKS into that `blobs/` dir. For
+    a model that ships "external data" weights — a `model.onnx` file that
+    references a separate `model.onnx_data` shard, e.g.
+    `intfloat/multilingual-e5-large` — onnxruntime>=1.24.1's security check
+    resolves the external-data reference relative to the model file's
+    directory and rejects it if the resolved (symlink-realpath) location
+    "escapes" that directory. Under the blobs/snapshots layout it always
+    does, because `model.onnx` and `model.onnx_data` are two INDEPENDENT
+    symlinks that can resolve into different blob paths — loading raises
+    "External data path escapes model directory" even though the files are
+    entirely legitimate. Spike-confirmed fix: materialize the snapshot as
+    real, non-symlinked files sitting together in one directory; onnxruntime
+    then loads it cleanly.
+
+    Fast path: if `directory` contains no symlinks (already-real files, e.g.
+    a fresh download under `HF_HUB_DISABLE_SYMLINKS`, or materialized on a
+    prior run), returns `directory` unchanged — this function costs nothing
+    in the common case.
+
+    Writes are hardlink-or-copy into a temp path then `os.replace` (atomic on
+    POSIX) into place, so a second process/instance racing to materialize the
+    same directory concurrently can't observe a half-written file.
+    """
+    entries = [p for p in directory.rglob("*") if p.is_file()]
+    if not any(p.is_symlink() for p in entries):
+        return directory
+
+    materialized = directory.parent / f"{directory.name}.materialized"
+    for entry in entries:
+        rel = entry.relative_to(directory)
+        dest = materialized / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        real_src = entry.resolve()  # follow symlink(s) to the real blob
+        if dest.exists() and not dest.is_symlink() and dest.stat().st_size == real_src.stat().st_size:
+            continue  # already materialized, from this or a prior process run
+        tmp_dest = dest.with_name(dest.name + f".tmp{os.getpid()}")
+        try:
+            if tmp_dest.exists():
+                tmp_dest.unlink()
+            os.link(real_src, tmp_dest)  # same filesystem: instant, no extra disk
+        except OSError:
+            shutil.copy2(real_src, tmp_dest)  # cross-filesystem fallback
+        os.replace(tmp_dest, dest)
+    return materialized
+
+
+def _materialize_fastembed_model_dir(text_embedding: Any) -> None:
+    """After constructing a fastembed `TextEmbedding`, repoint its internal
+    model directory at a REAL-file materialization if the download left
+    symlinks in place (see `_materialize_symlinked_files` for the "why").
+
+    Reaches into fastembed's undocumented internals (`TextEmbedding.model.
+    _model_dir`) because fastembed exposes no public hook for this — defensive
+    by design: if a fastembed upgrade renames/removes either attribute, this
+    logs a loud warning and no-ops rather than crashing provider construction.
+    """
+    inner = getattr(text_embedding, "model", None)
+    model_dir = getattr(inner, "_model_dir", None)
+    if inner is None or model_dir is None:
+        logger.warning(
+            "FastEmbedProvider: could not locate fastembed's internal model "
+            "directory to apply the onnxruntime external-data symlink "
+            "workaround (TextEmbedding.model._model_dir is missing, likely "
+            "renamed by a fastembed upgrade). A model with sharded "
+            "external-data weights (e.g. intfloat/multilingual-e5-large) may "
+            "fail to load with 'External data path escapes model directory' "
+            "if the HuggingFace cache for it is symlinked."
+        )
+        return
+    real_dir = _materialize_symlinked_files(Path(model_dir))
+    if real_dir != Path(model_dir):
+        inner._model_dir = real_dir  # noqa: SLF001 — the documented workaround target
+
+
 class FastEmbedProvider(EmbeddingProvider):
     """Real local embedding provider via `fastembed` (ONNX runtime, no torch).
 
@@ -99,11 +184,30 @@ class FastEmbedProvider(EmbeddingProvider):
     (`model_for_tier(TIER_EMBEDDING)`), never hardcoded here — see that
     module's docstring for why every model selection routes through it.
 
-    The model file is downloaded once (fastembed's own lazy-download-on-first-
-    use behavior) into `cache_dir` and used fully offline after — no network
-    call happens at embed() time once the file is cached. Construction itself
-    does NOT download; the download is deferred to fastembed's own internals
-    on first `embed()` call, same as fastembed's default behavior.
+    The model file is downloaded once (fastembed's own download-on-
+    construction behavior — see below) into `cache_dir` and used fully
+    offline after: no network call happens at embed() time once the file is
+    cached. Construction DOES perform that (one-time) download eagerly —
+    fastembed's `lazy_load` only defers building the ONNX inference session
+    itself to the first `embed()` call, not the file download (confirmed
+    against the installed fastembed's `OnnxTextEmbedding.__init__`, which
+    calls `download_model()` unconditionally before its own `lazy_load`
+    check). Every current call site constructs this provider off the message
+    hot path already, so paying the download cost at construction time (when
+    the file isn't yet cached) is acceptable; only the ONNX session build is
+    deferred, keeping steady-state (already-cached) construction cheap.
+
+    ONNXRUNTIME EXTERNAL-DATA SYMLINK WORKAROUND (#259 F1 model-swap): a
+    model that ships sharded "external data" weights (a `model.onnx` that
+    references a separate `model.onnx_data` shard — e.g.
+    `intfloat/multilingual-e5-large`) fails to load under
+    onnxruntime>=1.24.1's external-data security check via HuggingFace's
+    default symlink cache layout: `model.onnx` and `model.onnx_data` are two
+    INDEPENDENT symlinks that can resolve to different `blobs/` paths, which
+    onnxruntime treats as the data "escaping" the model directory
+    ("External data path escapes model directory"). The fix (spike-verified)
+    is applied around the `TextEmbedding(...)` construction below — see the
+    comments there and `_materialize_symlinked_files`.
 
     DIMENSION (#259 inc7 red-team F1 — the one-touch-swap fix): `dim` is a
     DECLARED sanity value (production passes `model_tier.MODEL_EMBEDDING_DIM`)
@@ -124,7 +228,28 @@ class FastEmbedProvider(EmbeddingProvider):
         # Imported lazily so importing this module never requires fastembed/
         # onnxruntime to be installed unless the real provider is actually
         # constructed (tests exclusively use FakeEmbeddingProvider).
+        #
+        # onnxruntime external-data symlink WORKAROUND (#259 F1 model-swap,
+        # class docstring above has the full "why"): force huggingface_hub to
+        # write REAL files instead of its default blobs+symlinks cache layout
+        # for any download the `TextEmbedding(...)` construction below
+        # triggers. Set BEFORE importing fastembed (which transitively
+        # imports huggingface_hub) so a fresh download never creates the
+        # symlink layout in the first place.
+        os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+        # Belt-and-suspenders: huggingface_hub actually reads this setting
+        # from a MODULE ATTRIBUTE (`huggingface_hub.constants.
+        # HF_HUB_DISABLE_SYMLINKS`), re-read from the module namespace at
+        # every call site (confirmed against the installed huggingface_hub's
+        # `file_download.py`) — NOT a value frozen once at import time — so
+        # patching it directly here is effective regardless of whether
+        # something else in this process already imported huggingface_hub
+        # before the env var above was set (which would otherwise leave that
+        # earlier `os.environ.get(...)` read stale/too-late).
+        import huggingface_hub.constants as _hf_hub_constants
         from fastembed import TextEmbedding
+
+        _hf_hub_constants.HF_HUB_DISABLE_SYMLINKS = True
 
         self._model_id = model_id
         # DECLARED dim (a sanity value, e.g. MODEL_EMBEDDING_DIM) — compared
@@ -135,11 +260,24 @@ class FastEmbedProvider(EmbeddingProvider):
         # The REAL dim, established lazily from an actual embed() call (see
         # `embed`/`embedding_dim`). None until the first embed happens.
         self._real_dim: int | None = None
-        # lazy_load=True: defer the (one-time) model-file load/download to
-        # the first embed() call rather than construction time. Every current
-        # call site constructs this off the message hot path already, but
-        # deferring keeps construction itself cheap and never network-bound.
+        # lazy_load=True: defer building the ONNX inference SESSION to the
+        # first embed() call rather than construction time (the model FILE
+        # download itself still happens eagerly, right here, inside
+        # TextEmbedding's own __init__ — see the class docstring's "The model
+        # file is downloaded once" paragraph). Every current call site
+        # constructs this off the message hot path already, so paying the
+        # download cost at construction (when not yet cached) is acceptable;
+        # deferring the session build keeps steady-state construction cheap.
         self._model = TextEmbedding(model_name=model_id, cache_dir=str(cache_dir), lazy_load=True)
+        # Fallback for a cache directory populated by a PRIOR run (before
+        # this workaround existed) that may still hold the old symlink
+        # layout, or any other path that slips past the disable-symlinks
+        # setting above: realpath-resolve and materialize any symlinks left
+        # in the downloaded model directory into real files, then repoint the
+        # model at that directory. No-op fast path when the directory already
+        # holds only real files (the common case after the fix above, or for
+        # a model with no external-data shards at all).
+        _materialize_fastembed_model_dir(self._model)
         # A shared instance of this provider (see build_embedding_provider's
         # process-wide cache) can have .embed() called concurrently from two
         # threads — the turn thread (recall) and the supervisor's background

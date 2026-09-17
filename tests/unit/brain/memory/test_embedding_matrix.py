@@ -575,8 +575,9 @@ def test_differently_sized_clean_blob_is_decoded_by_its_own_byte_length(seeded_d
     constant (`model_tier.MODEL_EMBEDDING_DIM` or any other expected-dim
     literal). A blob whose byte length is a clean float32 multiple but
     DIFFERENT from its peers under the same model_id is therefore loaded,
-    not skipped — this is what makes a different-dim model swap (e.g.
-    bge-small's 384 -> bge-m3's 1024) work with no code change here. (Real
+    not skipped — this is what makes a different-dim model swap (e.g. the
+    real #259 F1 swap, bge-small's 384 -> multilingual-e5-large's 1024) work
+    with no code change here. (Real
     corpora don't mix dims under one model_id in practice — the
     `embedding_model_id` filter is what keeps that true — so this is a
     decode-contract proof, not a claim that mixed dims are a supported

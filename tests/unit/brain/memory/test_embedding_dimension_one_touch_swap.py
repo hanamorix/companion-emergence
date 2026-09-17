@@ -3,28 +3,30 @@ dimension is genuinely ONE-TOUCH-swappable, derived from the REAL model
 output at every layer — never from the hand-maintained
 `model_tier.MODEL_EMBEDDING_DIM` constant.
 
-Before this fix, swapping to a different-dim embedding model (e.g. a
-1024-dim bge-m3 in place of bge-small's 384) without ALSO updating
-`MODEL_EMBEDDING_DIM` failed SILENTLY: `EmbeddingMatrix._load_from_db`
-skipped every row whose blob didn't match that stale constant, so the warm
-matrix ended up empty and the whole corpus degraded to lexical-only recall
-with no error, no crash, nothing — see `brain/memory/embedding_matrix.py`.
+Before this fix, swapping to a different-dim embedding model (e.g. the real
+#259 F1 swap to 1024-dim multilingual-e5-large, in place of the prior
+384-dim bge-small) without ALSO updating `MODEL_EMBEDDING_DIM` failed
+SILENTLY: `EmbeddingMatrix._load_from_db` skipped every row whose blob
+didn't match that stale constant, so the warm matrix ended up empty and the
+whole corpus degraded to lexical-only recall with no error, no crash,
+nothing — see `brain/memory/embedding_matrix.py`.
 
 This test simulates exactly that swap: it points the embedding provider at
-a 1024-dim `FakeEmbeddingProvider` and DELIBERATELY NEVER TOUCHES
-`model_tier.MODEL_EMBEDDING_DIM` (still 384 throughout). It then proves the
-whole pipeline works anyway: `MemoryStore.embed_row` persists the real
-1024-dim vector, the warm `EmbeddingMatrix` builds/decodes/serves it,
-`EmbeddingMatrix.put()` accepts a matching-dim vector (and rejects a
+a `_SWAPPED_DIM`-dim `FakeEmbeddingProvider` — deliberately chosen to differ
+from whatever `model_tier.MODEL_EMBEDDING_DIM` currently is (asserted below)
+— and DELIBERATELY NEVER TOUCHES that constant. It then proves the whole
+pipeline works anyway: `MemoryStore.embed_row` persists the real
+`_SWAPPED_DIM`-dim vector, the warm `EmbeddingMatrix` builds/decodes/serves
+it, `EmbeddingMatrix.put()` accepts a matching-dim vector (and rejects a
 mismatched one), a brute-force cosine scan over the matrix snapshot (the
 same shape of operation `semantic_recall`'s candidate pool performs) runs
 without error, and `clustering.run_clustering_pass` completes without
 crashing on `np.stack` over the resulting vectors.
 
 Fails pre-fix: `_load_from_db` used to gate on
-`model_tier.MODEL_EMBEDDING_DIM` (unchanged at 384), so every 1024-dim row
-would be silently skipped and the matrix/clustering assertions below would
-fail (empty matrix, clustering sparse-skips instead of running).
+`model_tier.MODEL_EMBEDDING_DIM` (unchanged/stale), so every `_SWAPPED_DIM`
+row would be silently skipped and the matrix/clustering assertions below
+would fail (empty matrix, clustering sparse-skips instead of running).
 """
 
 from __future__ import annotations
@@ -39,18 +41,25 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.store import Memory, MemoryStore
 
-_SWAPPED_DIM = 1024  # deliberately NOT 384 — a stand-in for a real bge-m3-style swap
+# Deliberately NOT model_tier.MODEL_EMBEDDING_DIM — a stand-in for a real
+# further model swap (dim picked to differ from whatever the constant
+# currently is; see the sanity assert in the fixture below).
+_SWAPPED_DIM = model_tier.MODEL_EMBEDDING_DIM + 777
 
 
 @pytest.fixture
 def swapped_provider(monkeypatch: pytest.MonkeyPatch) -> embeddings_mod.FakeEmbeddingProvider:
     """Simulate a `MODEL_EMBEDDING` swap to a different-dim model WITHOUT
-    updating `model_tier.MODEL_EMBEDDING_DIM` (still 384) — the exact
-    "forgot to update the constant" scenario F1 exists to make harmless."""
+    updating `model_tier.MODEL_EMBEDDING_DIM` (stays stale/untouched) — the
+    exact "forgot to update the constant" scenario F1 exists to make
+    harmless."""
     provider = embeddings_mod.FakeEmbeddingProvider(dim=_SWAPPED_DIM)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
     monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
-    assert model_tier.MODEL_EMBEDDING_DIM == 384, "sanity: the constant must stay stale/untouched"
+    assert model_tier.MODEL_EMBEDDING_DIM != _SWAPPED_DIM, (
+        "sanity: the swap dim must differ from the declared constant, or this "
+        "test stops exercising the mismatch it exists to prove is harmless"
+    )
     return provider
 
 
@@ -87,8 +96,8 @@ def test_one_touch_dimension_swap_works_end_to_end_without_editing_model_embeddi
         matrix = build_embedding_matrix(store.db_path)
         snap = matrix.snapshot()
         assert set(snap.keys()) == set(ids), (
-            "pre-fix, every 1024-dim row would be silently skipped by "
-            "_load_from_db's stale-384 gate, leaving this empty"
+            "pre-fix, every _SWAPPED_DIM row would be silently skipped by "
+            "_load_from_db's stale-MODEL_EMBEDDING_DIM gate, leaving this empty"
         )
         for vec in snap.values():
             assert vec.shape == (_SWAPPED_DIM,)
@@ -100,8 +109,9 @@ def test_one_touch_dimension_swap_works_end_to_end_without_editing_model_embeddi
         got = matrix.get("mem-put-ok")
         assert got is not None and got.shape == (_SWAPPED_DIM,)
 
-        # -- put() rejects a mismatched-dim vector (the OLD 384) -----------
-        matrix.put("mem-put-bad", np.full(384, 0.1, dtype=np.float32))
+        # -- put() rejects a mismatched-dim vector (the declared constant's
+        # own dim — guaranteed != _SWAPPED_DIM by the fixture's sanity assert)
+        matrix.put("mem-put-bad", np.full(model_tier.MODEL_EMBEDDING_DIM, 0.1, dtype=np.float32))
         assert "mem-put-bad" not in matrix
 
         # -- recall/candidate-pool: a brute-force cosine scan over the
