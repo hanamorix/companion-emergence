@@ -76,21 +76,29 @@ def test_run_folded_accepts_calibration_interval_s():
 def test_calibration_tick_skips_entirely_when_a_session_is_busy():
     """Unlike compaction's per-session skip, this tick's work (a table-wide
     prune) is corpus-global, so a busy session defers the WHOLE tick rather
-    than partially pruning. Assert the store is never even opened/pruned
-    when is_session_busy reports a busy session."""
+    than partially pruning. Seed one genuinely active session (a real
+    buffer file under active_conversations/, via ingest_turn — the same
+    write path list_active_sessions reads) so is_session_busy is actually
+    consulted and reports busy, then assert the tick defers before ever
+    opening the store: no memories.db is created, so the prune cannot have
+    run. Without a seeded active session `list_active_sessions` returns []
+    and `any(...)` over an empty list is vacuously False regardless of what
+    is_session_busy would say, which is exactly the theater this rewrite
+    closes."""
     from brain.bridge.supervisor import _run_calibration_tick
+    from brain.ingest.buffer import ingest_turn, list_active_sessions
 
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
-        from brain.ingest.buffer import list_active_sessions
 
-        # No active sessions on a fresh persona_dir -> list_active_sessions
-        # returns []; is_session_busy is never actually asked, and the tick
-        # must proceed (no memories.db to prune yet is fine — the store is
-        # created on open).
-        assert list_active_sessions(pd) == []
-        _run_calibration_tick(pd, is_session_busy=lambda sid: True)
-        assert (pd / "memories.db").exists(), "tick should have opened the store and run the prune"
+        sid = ingest_turn(pd, {"session_id": "sess_busy", "speaker": "user", "text": "hi"})
+        assert list_active_sessions(pd) == [sid], "fixture must seed a real active session"
+
+        _run_calibration_tick(pd, is_session_busy=lambda s: True)
+
+        assert not (pd / "memories.db").exists(), (
+            "tick must defer before opening the store when a session is busy"
+        )
 
 
 def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():

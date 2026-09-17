@@ -2392,6 +2392,30 @@ def test_prune_calibration_log_deletes_rows_older_than_window_days(store: Memory
     assert remaining == {"recent"}
 
 
+def test_prune_calibration_log_retains_row_exactly_at_the_cutoff_boundary(
+    store: MemoryStore,
+) -> None:
+    """Boundary case for the prune predicate itself: a row whose day_bucket
+    is EXACTLY the cutoff bucket (`ref - window_days`, same computation as
+    `prune_calibration_log`) must SURVIVE, because the delete is a strict
+    `<` against the cutoff (`DELETE ... WHERE day_bucket < ?`) — the cutoff
+    day itself is still inside the retention window. A regression to `<=`
+    would incorrectly delete this row, and none of the other prune tests
+    seed a row at exactly this boundary to catch that."""
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    window_days = 5.0
+    cutoff_bucket = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
+    _seed_calibration_row(store, cutoff_bucket, "at_cutoff")
+
+    deleted = store.prune_calibration_log(window_days=window_days, now=now)
+
+    assert deleted == 0
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"at_cutoff"}
+
+
 def test_prune_calibration_log_returns_zero_when_nothing_is_due(store: MemoryStore) -> None:
     now = datetime(2026, 6, 29, 12, tzinfo=UTC)
     _seed_calibration_row(store, now.strftime("%Y-%m-%d"), "today")
