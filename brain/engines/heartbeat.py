@@ -733,7 +733,6 @@ class HeartbeatEngine:
         dream_engine = DreamEngine(
             store=self.store,
             hebbian=self.hebbian,
-            embeddings=None,
             provider=build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
             log_path=self.dream_log_path,
             persona_dir=persona_dir,

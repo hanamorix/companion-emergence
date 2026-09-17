@@ -577,10 +577,10 @@ class MemoryStore:
         (F1 #259 step 4: embed-on-write).
 
         Embeds `content` via the process-cached production provider
-        (`brain.memory.embeddings.build_embedding_provider()` — the same
-        provider `EmbeddingCache` wraps, looked up through the module so a
-        test's monkeypatch on the module attribute is honored, mirroring
-        every other dynamic-lookup call site in this codebase), writes
+        (`brain.memory.embeddings.build_embedding_provider()`, looked up
+        through the module so a test's monkeypatch on the module attribute
+        is honored, mirroring every other dynamic-lookup call site in this
+        codebase), writes
         `embedding` + `embedding_model_id` straight onto the row (no
         content-hash side table involved), and pushes the vector into this
         db's warm `EmbeddingMatrix` (`brain.memory.embedding_matrix.

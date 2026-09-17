@@ -808,7 +808,6 @@ def _dream_handler(args: argparse.Namespace) -> int:
             engine = DreamEngine(
                 store=store,
                 hebbian=hebbian,
-                embeddings=None,
                 provider=provider,
                 log_path=persona_dir / "dreams.log.jsonl",
                 persona_dir=persona_dir,
@@ -1781,7 +1780,6 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "bridge_json": pd / "bridge.json",
         "memories_db": pd / "memories.db",
         "hebbian_db": pd / "hebbian.db",
-        "embeddings_db": pd / "embeddings.db",
         "crystallizations_db": pd / "crystallizations.db",
         "soul_candidates": pd / "soul_candidates.jsonl",
         "active_conversations": pd / "active_conversations",

@@ -1,10 +1,11 @@
 """Tests for brain.ingest.dedupe — DEDUPE stage.
 
-F1 (#259) increment 5: `is_duplicate` sources EXISTING vectors from the warm
-matrix over `store`'s memories.db (i.e. already row-embedded memories), and
-embeds the transient, not-yet-committed CANDIDATE text directly via the
-production provider. Neither side of the comparison touches the old
-`embeddings.db` / `EmbeddingCache` content-hash cache at all.
+`is_duplicate` sources EXISTING vectors from the warm matrix over `store`'s
+memories.db (i.e. already row-embedded memories), and embeds the transient,
+not-yet-committed CANDIDATE text directly via the production provider (F1
+#259). Neither side of the comparison touches a content-hash cache — the
+old `embeddings.db` / `EmbeddingCache` cache this dedupe stage used to sit
+on top of is gone entirely (increment 8 code teardown).
 """
 
 from __future__ import annotations
@@ -142,27 +143,6 @@ def test_is_duplicate_ignores_rows_from_a_different_model_id(
 
     result = is_duplicate(text, store=store, threshold=DEFAULT_DEDUP_THRESHOLD)
     assert result is False
-
-
-def test_is_duplicate_never_constructs_an_embeddingcache(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Structural guard: the new dedupe path must never construct an
-    EmbeddingCache (the old embeddings.db content-hash cache) — neither to
-    read existing vectors nor to write/cache the transient candidate's."""
-    _use_384_fake_provider(monkeypatch)
-    text = "Nell loves writing and spending time with Hana"
-    _seed_embedded_memory(store, text)
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("is_duplicate must never construct an EmbeddingCache")
-
-    monkeypatch.setattr(embeddings_mod.EmbeddingCache, "__init__", _boom)
-
-    # Both the duplicate and non-duplicate paths must complete without ever
-    # hitting the patched constructor.
-    assert is_duplicate(text, store=store, threshold=DEFAULT_DEDUP_THRESHOLD) is True
-    assert is_duplicate("something entirely unrelated here", store=store) is False
 
 
 def test_is_duplicate_fails_soft_on_matrix_error(

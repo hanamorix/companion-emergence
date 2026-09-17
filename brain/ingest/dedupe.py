@@ -1,7 +1,6 @@
 """SP-4 DEDUPE stage — cosine-similarity check against existing memories.
 
-F1 (#259) increment 5: sources vectors off the memories row / warm matrix
-instead of the old `embeddings.db` content-hash cache.
+Sources vectors off the memories row / warm matrix (F1 #259).
 
   - EXISTING vectors: every active, currently-embedded row in `store`'s
     memories.db, via the process-wide warm matrix
@@ -31,7 +30,7 @@ import logging
 
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
-from brain.memory.embeddings import EmbeddingCache, cosine_similarity
+from brain.memory.embeddings import cosine_similarity
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -44,7 +43,6 @@ def is_duplicate(
     *,
     store: MemoryStore,
     threshold: float = DEFAULT_DEDUP_THRESHOLD,
-    embeddings: EmbeddingCache | None = None,
 ) -> bool:
     """Cosine-similarity check against the persona's existing row-embedded memories.
 
@@ -56,12 +54,6 @@ def is_duplicate(
 
     Any exception during the process is caught and logged; we return False
     on failure (safe default — at worst we commit a near-duplicate).
-
-    ``embeddings`` is UNUSED as of F1 (#259) increment 5 — kept only for
-    call-site backward compatibility (e.g. tests/unit/brain/chat/test_rollover.py
-    execs a pre-increment-5 pipeline.py snapshot that still passes it
-    positionally-as-kwarg). Removed along with embeddings.db itself in the F1
-    teardown increment.
     """
     try:
         existing = build_embedding_matrix(store.db_path).snapshot()

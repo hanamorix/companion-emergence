@@ -16,7 +16,6 @@ from typing import Any
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
 from brain.engines import dream_seeds
-from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
@@ -55,7 +54,6 @@ class DreamEngine:
 
     store: MemoryStore
     hebbian: HebbianMatrix
-    embeddings: EmbeddingCache | None
     provider: LLMProvider
     log_path: Path | None = None
     persona_dir: Path | None = None

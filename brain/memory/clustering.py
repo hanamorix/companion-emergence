@@ -27,11 +27,12 @@ memory-id as a result: two byte-identical memories no longer share one
 cluster tag, each gets its own (intended, mirrors the same change embed-on-
 write already made for the embedding column itself).
 
-`MemoryClusterStore` below — the OLD content-hash-keyed side table,
-co-located in `embeddings.db` alongside `embedding_cache` — is now UNUSED by
-`run_clustering_pass`/`cluster_tag_for_memory`. It is kept in place, dead but
-present, only because `embeddings.db`'s deletion is a later F1 increment's
-job (spec §7); nothing in this module reads or writes it anymore.
+The OLD content-hash-keyed side table this module used to also define
+(`MemoryClusterStore`, co-located in `embeddings.db` alongside
+`embedding_cache`) has been dead since increment 4 and is REMOVED in the F1
+#259 increment 8 code teardown, along with `embeddings.db`'s other code
+paths — this module now only exposes the row/table-based storage described
+above.
 
 Scoping: still per-`model_id`, just implemented on the new storage.
 `MemoryStore.set_cluster_memberships` wholesale-replaces every row tagged
@@ -68,13 +69,9 @@ from __future__ import annotations
 
 import logging
 import math
-import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-
-from brain.memory.embeddings import hash_content
 
 logger = logging.getLogger(__name__)
 
@@ -208,172 +205,6 @@ def kmeans(
         centroids = new_centroids
 
     return labels, centroids
-
-
-class MemoryClusterStore:
-    """UNUSED as of F1 #259 increment 4 — the OLD content-hash-keyed side
-    table for memory cluster membership. `run_clustering_pass` and
-    `cluster_tag_for_memory` below no longer read or write it; cluster data
-    now lives as `cluster_id`/`cluster_model_id` columns on the `memories`
-    row plus the `cluster_centroids` table, both inside `memories.db` (see
-    `MemoryStore.set_cluster_memberships`/`get_cluster_id` in
-    `brain/memory/store.py`). Kept dead-but-present only because
-    `embeddings.db`'s own deletion is a later F1 increment's job (spec §7) —
-    this class is NOT the storage this module's public functions use
-    anymore.
-
-    OWN table (`memory_clusters` + `memory_cluster_centroids`) in
-    `embeddings.db`, content_hash-keyed rather than memory-id-keyed (the
-    "never a column on `memories`" constraint this design originally
-    honored was an assistant-minted heuristic, never a Roy ruling — struck
-    per the semantic-retrieval ledger's Q5 / the 2026-09-15 postmortem; see
-    module docstring). Mirrors `EmbeddingCache`'s schema/pragma/ALTER-guard
-    shape so the two side tables read as one family, but is its own class
-    with its own connection (a genuinely separate side table, not a method
-    bolted onto EmbeddingCache).
-
-    `memory_clusters` holds one row per `content_hash`: the cluster id that
-    content currently belongs to, and the `model_id` of the embedding that
-    produced it. `memory_cluster_centroids` holds each cluster's centroid
-    vector, keyed by `(model_id, cluster_id)`.
-    """
-
-    _SCHEMA = """
-    CREATE TABLE IF NOT EXISTS memory_clusters (
-        content_hash TEXT PRIMARY KEY,
-        model_id TEXT NOT NULL DEFAULT '',
-        cluster_id INTEGER NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_memory_clusters_model
-        ON memory_clusters(model_id);
-    CREATE TABLE IF NOT EXISTS memory_cluster_centroids (
-        model_id TEXT NOT NULL,
-        cluster_id INTEGER NOT NULL,
-        centroid BLOB NOT NULL,
-        dim INTEGER NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (model_id, cluster_id)
-    );
-    """
-
-    def __init__(self, db_path: str | Path) -> None:
-        self._conn = sqlite3.connect(str(db_path))
-        # WAL + busy_timeout mirrors EmbeddingCache — the supervisor's
-        # periodic clustering tick and any concurrent reader (e.g. a future
-        # retrieval-path query) share this file.
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
-        self._conn.executescript(self._SCHEMA)
-        self._conn.commit()
-
-    def close(self) -> None:
-        self._conn.close()
-
-    def cluster_for(self, content_hash: str, *, model_id: str) -> int | None:
-        """The cluster id for `content_hash`, scoped to `model_id`. `None`
-        when unclustered OR when the only row on file was written under a
-        DIFFERENT model_id (stale — never served)."""
-        row = self._conn.execute(
-            "SELECT cluster_id FROM memory_clusters WHERE content_hash = ? AND model_id = ?",
-            (content_hash, model_id),
-        ).fetchone()
-        return int(row[0]) if row is not None else None
-
-    def cluster_for_content(self, content: str, *, model_id: str) -> int | None:
-        """Convenience wrapper: hash `content` the same way `embedding_cache`
-        does, then look up its cluster tag."""
-        return self.cluster_for(hash_content(content), model_id=model_id)
-
-    def centroids(self, *, model_id: str) -> dict[int, np.ndarray]:
-        """`{cluster_id: centroid_vector}` for `model_id`'s current clusters."""
-        rows = self._conn.execute(
-            "SELECT cluster_id, centroid, dim FROM memory_cluster_centroids WHERE model_id = ?",
-            (model_id,),
-        ).fetchall()
-        return {
-            int(cid): np.frombuffer(blob, dtype=np.float32).copy().reshape(dim)
-            for cid, blob, dim in rows
-        }
-
-    def count(self, *, model_id: str | None = None) -> int:
-        """Number of clustered rows, optionally scoped to `model_id`."""
-        if model_id is None:
-            return int(self._conn.execute("SELECT COUNT(*) FROM memory_clusters").fetchone()[0])
-        return int(
-            self._conn.execute(
-                "SELECT COUNT(*) FROM memory_clusters WHERE model_id = ?", (model_id,)
-            ).fetchone()[0]
-        )
-
-    def replace_pass(
-        self,
-        memberships: dict[str, int],
-        centroids: np.ndarray,
-        *,
-        model_id: str,
-    ) -> None:
-        """Atomically replace `model_id`'s cluster memberships + centroids
-        with the result of one clustering pass.
-
-        ONE transaction, ONE commit — a process kill mid-write leaves this
-        table exactly as it was after the LAST successfully committed pass
-        (SQLite rolls back an uncommitted transaction on next open), never a
-        mix of old and new memberships/centroids. This is what makes
-        `run_clustering_pass` idempotent/resumable: re-running it after a
-        kill just redoes the whole (cheap, local, numpy-only) computation and
-        writes it in one more atomic replace.
-
-        `memory_clusters` is WHOLESALE-REPLACED for `model_id`, exactly
-        mirroring `memory_cluster_centroids` below: every existing row for
-        this `model_id` is deleted, then this pass's `memberships` are
-        (re)inserted. A content_hash present in a PRIOR pass but absent from
-        `memberships` (e.g. its pool composition changed — it fell out of the
-        embedding cache via `EmbeddingCache.evict()`, or simply wasn't part
-        of this pass's candidate pool) ends up with NO row at all, not a
-        dangling one: `cluster_for()`/`cluster_tag_for_memory()` then
-        correctly return `None` for it instead of a stale `cluster_id` that
-        points at a centroid this pass just deleted. (An earlier version
-        upserted memberships without ever deleting — asymmetric against the
-        centroid table's delete-then-reinsert below — so a content_hash that
-        dropped out of the pool kept its old `cluster_id` pointing at a
-        centroid row that no longer existed.) A content_hash present in BOTH
-        the prior and current pass still gets its `model_id`/`cluster_id`
-        overwritten in place via the reinsert (`content_hash` is the PRIMARY
-        KEY — one row per content, always pointing at whichever model most
-        recently clustered it, exactly mirroring
-        `EmbeddingCache.get_or_compute`'s own INSERT-OR-REPLACE-by-
-        content_hash behavior on a model swap): a lookup still scoped to that
-        content's PRIOR model_id then correctly finds nothing, rather than a
-        stale tag.
-        """
-        self._conn.execute(
-            "DELETE FROM memory_clusters WHERE model_id = ?", (model_id,)
-        )
-        self._conn.executemany(
-            "INSERT INTO memory_clusters (content_hash, model_id, cluster_id, updated_at) "
-            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(content_hash) DO UPDATE SET "
-            "model_id = excluded.model_id, "
-            "cluster_id = excluded.cluster_id, "
-            "updated_at = excluded.updated_at",
-            [(content_hash, model_id, cluster_id) for content_hash, cluster_id in memberships.items()],
-        )
-        self._conn.execute(
-            "DELETE FROM memory_cluster_centroids WHERE model_id = ?", (model_id,)
-        )
-        self._conn.executemany(
-            "INSERT INTO memory_cluster_centroids (model_id, cluster_id, centroid, dim) "
-            "VALUES (?, ?, ?, ?)",
-            [
-                (model_id, i, centroid.astype(np.float32).tobytes(), centroid.shape[0])
-                for i, centroid in enumerate(centroids)
-            ],
-        )
-        self._conn.commit()
 
 
 @dataclass(frozen=True)

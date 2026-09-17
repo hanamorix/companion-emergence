@@ -6,15 +6,13 @@ Covers the build task's acceptance bar: stable membership on a seeded
 fixture, model_id-scoped tags, a model_id swap recomputes rather than
 serving stale tags, sparse-data skip, idempotent re-run.
 
-F1 (#259) increment 4: `run_clustering_pass`/`cluster_tag_for_memory` now
-source vectors from the warm `EmbeddingMatrix` over `memories.db` and write
+F1 (#259) increment 4: `run_clustering_pass`/`cluster_tag_for_memory` source
+vectors from the warm `EmbeddingMatrix` over `memories.db` and write
 `cluster_id`/`cluster_model_id` onto the `memories` row + the
 `cluster_centroids` table — NOT the old content-hash-keyed
-`MemoryClusterStore`/`embeddings.db` side table. `MemoryClusterStore` itself
-is retained UNUSED (dead but present — its own deletion, alongside
-`embeddings.db`, is a later F1 increment's job) and is still exercised
-directly below purely as a regression suite for that (now-dead) class's own
-SQL correctness.
+`MemoryClusterStore`/`embeddings.db` side table, which was dead since
+increment 4 and is REMOVED (class + its own tests) in the increment 8 code
+teardown.
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ from brain.memory.clustering import (
     K_MAX,
     K_MIN,
     MIN_VECTORS_TO_CLUSTER,
-    MemoryClusterStore,
     choose_k,
     cluster_tag_for_memory,
     kmeans,
@@ -142,182 +139,6 @@ def test_kmeans_k_equals_1_puts_everything_in_one_cluster() -> None:
     labels, centroids = kmeans(vectors, k=1, seed=0)
     assert set(np.unique(labels).tolist()) == {0}
     assert centroids.shape == (1, 4)
-
-
-# ---------------------------------------------------------------------------
-# MemoryClusterStore — UNUSED as of F1 #259 increment 4 (see module
-# docstring). Exercised here purely as a regression suite for the class's
-# own SQL correctness, in case it is ever needed again before embeddings.db
-# is deleted; nothing below reflects the LIVE clustering path anymore (see
-# the run_clustering_pass / cluster_tag_for_memory sections below for that).
-# ---------------------------------------------------------------------------
-
-
-def test_store_schema_never_touches_memories_table(tmp_path: Path) -> None:
-    """Guard, UPDATED for F1 increment 4: opening a (now-unused)
-    MemoryClusterStore never creates/touches a `memories` table — it lives
-    in its own file/table pair, fully disjoint from MemoryStore's schema.
-    The real `memories.cluster_id`/`cluster_model_id` columns are, as of
-    this increment, the LIVE storage `run_clustering_pass` writes — this
-    test only confirms MemoryClusterStore's own schema stays disjoint from
-    them, not that the columns are unpopulated."""
-    db_path = tmp_path / "embeddings.db"
-    cluster_store = MemoryClusterStore(db_path)
-    try:
-        tables = {
-            row[0]
-            for row in cluster_store._conn.execute(  # noqa: SLF001 — test-only introspection
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        assert "memories" not in tables
-        assert {"memory_clusters", "memory_cluster_centroids"} <= tables
-
-        cols = {
-            row[1]
-            for row in cluster_store._conn.execute(  # noqa: SLF001
-                "PRAGMA table_info(memory_clusters)"
-            ).fetchall()
-        }
-        assert "cluster_id" in cols  # on the SIDE table, exactly as designed
-    finally:
-        cluster_store.close()
-
-    # A real MemoryStore's own `memories` table is untouched by opening a
-    # MemoryClusterStore against a neighboring file — and it carries the
-    # LIVE `cluster_id` column `run_clustering_pass` now writes.
-    store = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
-    try:
-        cols = {
-            row[1]
-            for row in store._conn.execute("PRAGMA table_info(memories)").fetchall()  # noqa: SLF001
-        }
-        assert "cluster_id" in cols
-    finally:
-        store.close()
-
-
-def test_cluster_for_content_queryable_by_content_hash(tmp_path: Path) -> None:
-    store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        store.replace_pass(
-            {"hash-a": 0, "hash-b": 1}, np.zeros((2, 4)), model_id="model-x"
-        )
-        assert store.cluster_for("hash-a", model_id="model-x") == 0
-        assert store.cluster_for("hash-b", model_id="model-x") == 1
-        assert store.cluster_for("hash-c", model_id="model-x") is None  # never written
-    finally:
-        store.close()
-
-
-def test_cluster_for_content_hashes_the_same_way_as_embedding_cache(tmp_path: Path) -> None:
-    """cluster_for_content must key rows identically to how EmbeddingCache
-    hashes content, so a memory's content resolves to the same row either
-    way."""
-    from brain.memory.embeddings import hash_content
-
-    store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        h = hash_content("some memory content")
-        store.replace_pass({h: 5}, np.zeros((1, 4)), model_id="model-x")
-        assert store.cluster_for_content("some memory content", model_id="model-x") == 5
-    finally:
-        store.close()
-
-
-def test_model_id_scoping_a_different_model_never_sees_the_others_rows(tmp_path: Path) -> None:
-    """Hard invariant: cluster tags are model_id-scoped exactly like
-    embedding_cache. A row written under one model_id must be invisible to a
-    lookup scoped to a different model_id."""
-    store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        store.replace_pass({"hash-a": 0}, np.zeros((1, 4)), model_id="model-old")
-        assert store.cluster_for("hash-a", model_id="model-old") == 0
-        assert store.cluster_for("hash-a", model_id="model-new") is None
-    finally:
-        store.close()
-
-
-def test_replace_pass_is_atomic_a_failed_write_leaves_prior_state_intact(
-    tmp_path: Path,
-) -> None:
-    """Simulates a crash mid-write: replace_pass must not leave a partial
-    (memberships-without-centroids) state behind. `None` in place of a
-    centroid ndarray raises a genuine ``AttributeError`` on ``.astype(...)``
-    partway through the SECOND (centroids) write, AFTER the memberships
-    upsert already ran — but both writes share ONE uncommitted SQLite
-    transaction, so rolling back after the failure undoes the memberships
-    write too. The table must end up at exactly whatever the LAST
-    successfully COMMITTED pass left it at — never a mix of old and new."""
-    db_path = tmp_path / "embeddings.db"
-    store = MemoryClusterStore(db_path)
-    store.replace_pass({"hash-a": 0}, np.zeros((1, 4)), model_id="m")
-    assert store.cluster_for("hash-a", model_id="m") == 0
-
-    bad_centroids = [None]  # blows up inside replace_pass's centroid loop
-    with pytest.raises(AttributeError):
-        store.replace_pass({"hash-a": 1, "hash-b": 2}, bad_centroids, model_id="m")
-    store._conn.rollback()  # noqa: SLF001 — undo the uncommitted partial transaction
-    store.close()
-
-    # A fresh connection against the same file confirms durability: the
-    # PRIOR committed pass (hash-a -> 0) is intact; the failed pass never
-    # landed (hash-b was never written; hash-a was never overwritten).
-    reopened = MemoryClusterStore(db_path)
-    try:
-        assert reopened.cluster_for("hash-a", model_id="m") == 0
-        assert reopened.cluster_for("hash-b", model_id="m") is None
-    finally:
-        reopened.close()
-
-
-def test_replace_pass_deletes_stale_membership_when_pool_composition_changes(
-    tmp_path: Path,
-) -> None:
-    """Regression for the dangling/stale cluster_id bug: an earlier version
-    upserted `memory_clusters` rows only for content in the CURRENT pass's
-    memberships and never deleted rows for content that fell OUT of the pool
-    since the previous pass — while wholesale-replacing
-    `memory_cluster_centroids` every pass. A content_hash that dropped out
-    (e.g. evicted from the embedding cache) then kept its OLD cluster_id
-    pointing at a centroid row that no longer existed.
-
-    Runs two passes under the SAME model_id where pool composition changes
-    between them (hash-b present in pass 1, absent from pass 2) and asserts:
-    (a) hash-b's lookup returns None after pass 2, not a dangling cluster_id;
-    (b) every cluster_id returned by any lookup after pass 2 has a matching
-    live centroid row for that model_id.
-    """
-    store = MemoryClusterStore(tmp_path / "embeddings.db")
-    try:
-        # Pass 1: hash-a -> cluster 0, hash-b -> cluster 1, two centroids.
-        store.replace_pass(
-            {"hash-a": 0, "hash-b": 1},
-            np.array([[1.0, 0.0], [0.0, 1.0]]),
-            model_id="m",
-        )
-        assert store.cluster_for("hash-a", model_id="m") == 0
-        assert store.cluster_for("hash-b", model_id="m") == 1
-
-        # Pass 2: hash-b has fallen out of the pool (e.g. evicted); only
-        # hash-a remains, now the sole member of the sole cluster.
-        store.replace_pass(
-            {"hash-a": 0},
-            np.array([[1.0, 0.0]]),
-            model_id="m",
-        )
-
-        # (a) The dropped hash must be genuinely absent, not dangling.
-        assert store.cluster_for("hash-b", model_id="m") is None
-
-        # (b) Every surviving lookup's cluster_id has a live centroid.
-        live_centroids = store.centroids(model_id="m")
-        for content_hash in ("hash-a", "hash-b"):
-            cid = store.cluster_for(content_hash, model_id="m")
-            if cid is not None:
-                assert cid in live_centroids
-    finally:
-        store.close()
 
 
 # ---------------------------------------------------------------------------

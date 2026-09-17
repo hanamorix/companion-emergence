@@ -42,7 +42,6 @@ from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
 from brain.ingest.extract import extract_items_with_status, format_transcript
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
-from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
@@ -111,7 +110,6 @@ def close_session(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> IngestReport:
     """Run the full 8-stage ingest pipeline on one session and delete its buffer.
@@ -128,13 +126,6 @@ def close_session(
         HebbianMatrix to strengthen connections between related memories.
     provider:
         LLMProvider used for EXTRACT stage (generate() surface).
-    embeddings:
-        Unused by DEDUPE as of F1 (#259) increment 5 — dedupe now sources
-        vectors from the memories row / warm matrix (brain/ingest/dedupe.py)
-        instead of this cache. Kept in the signature only so existing
-        callers (brain/bridge/supervisor.py) keep working unchanged; the
-        parameter is removed, along with embeddings.db itself, in the F1
-        teardown increment.
     config:
         Optional dict of pipeline knobs:
           extraction_max_retries: int = 1
@@ -286,7 +277,6 @@ def extract_session_snapshot(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> IngestReport:
     """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
@@ -484,7 +474,6 @@ def snapshot_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
@@ -518,7 +507,6 @@ def snapshot_stale_sessions(
                     store=store,
                     hebbian=hebbian,
                     provider=provider,
-                    embeddings=embeddings,
                     config=config,
                 )
                 reports.append(report)
@@ -538,7 +526,6 @@ def finalize_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; finalize any whose last turn is past
@@ -575,7 +562,6 @@ def finalize_stale_sessions(
                 store=store,
                 hebbian=hebbian,
                 provider=provider,
-                embeddings=embeddings,
                 config=config,
             )
         except Exception:
@@ -629,7 +615,6 @@ def close_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
@@ -663,7 +648,6 @@ def close_stale_sessions(
                 store=store,
                 hebbian=hebbian,
                 provider=provider,
-                embeddings=embeddings,
                 config=config,
             )
             reports.append(report)

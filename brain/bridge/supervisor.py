@@ -103,7 +103,6 @@ from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
 )
 from brain.memory.embedding_matrix import build_embedding_matrix
-from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
@@ -377,8 +376,6 @@ def run_folded(
             with ExitStack() as stack:
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
-                embeddings = build_embedding_cache(persona_dir)
-                stack.callback(embeddings.close)
 
                 reports = snapshot_stale_sessions(
                     persona_dir,
@@ -386,7 +383,6 @@ def run_folded(
                     store=store,
                     hebbian=hebbian,
                     provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                    embeddings=embeddings,
                 )
                 # Snapshot is NON-destructive — do NOT call remove_session
                 # here. Session lifecycle is owned by finalize_stale_sessions
@@ -678,7 +674,7 @@ def run_folded(
             # hot path by construction (only ever called from here). Own
             # ExitStack ownership inside _run_clustering_tick (mirrors
             # _run_log_rotation_tick/_run_narrative_memory_pass) since the
-            # per-tick `embeddings` handle opened earlier in this loop is
+            # per-tick `hebbian` handle opened earlier in this loop is
             # already closed by the time this block runs.
             if clustering_cadence_state is not None and persisted_cadence.is_due(
                 clustering_cadence_state, now=datetime.now(UTC)
@@ -1719,8 +1715,8 @@ def _run_narrative_memory_pass(
 ) -> None:
     """Soul-review-cadence wrapper around narrative_memory.run_pass.
 
-    Opens per-call MemoryStore, HebbianMatrix, EmbeddingCache (ExitStack —
-    mirrors `_run_finalize_tick` ownership pattern), reads FeltTimeState,
+    Opens per-call MemoryStore, HebbianMatrix (ExitStack — mirrors
+    `_run_finalize_tick` ownership pattern), reads FeltTimeState,
     and builds the anchor-sweep + candidate-pool + salience + is_exempt
     closures against the real stores. Dispatches to the orchestrator.
 
@@ -1945,8 +1941,6 @@ def _run_compaction_tick(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
 
         for session_id in list_active_sessions(persona_dir):
             now = datetime.now(UTC)
@@ -1967,7 +1961,7 @@ def _run_compaction_tick(
                     persona_dir, session_id, persona_name,
                     weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
                     now=now, provider=provider,
-                    store=store, hebbian=hebbian, embeddings=embeddings,
+                    store=store, hebbian=hebbian,
                     is_session_busy=is_session_busy,
                 )
             except Exception:
@@ -1985,18 +1979,16 @@ def _run_finalize_tick(
     for every session that was finalized.
 
     Mirrors the per-tick store ownership pattern of `_run_heartbeat_tick`:
-    opens MemoryStore + HebbianMatrix + EmbeddingCache inside this thread,
-    closes them via ExitStack. The supervisor follows up by calling
-    remove_session() for each finalized session — finalize itself doesn't
-    touch the in-memory registry.
+    opens MemoryStore + HebbianMatrix inside this thread, closes them via
+    ExitStack. The supervisor follows up by calling remove_session() for
+    each finalized session — finalize itself doesn't touch the in-memory
+    registry.
     """
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
 
         reports = finalize_stale_sessions(
             persona_dir,
@@ -2004,7 +1996,6 @@ def _run_finalize_tick(
             store=store,
             hebbian=hebbian,
             provider=provider,
-            embeddings=embeddings,
         )
 
     for r in reports:

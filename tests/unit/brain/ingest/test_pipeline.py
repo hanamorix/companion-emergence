@@ -1297,26 +1297,13 @@ def test_finalize_stale_sessions_deletes_backoff(
 
 # ---------------------------------------------------------------------------
 # F1 (#259) increment 5 — the evict-on-failed-commit dance is gone. Dedupe no
-# longer writes a candidate vector into embeddings.db (it embeds the
-# candidate directly, with nothing to write or evict), so a failed commit has
-# nothing to roll back: `embeddings.evict(...)` must never be called anymore.
-# The `embeddings` kwarg itself is still accepted (unused) for
-# brain/bridge/supervisor.py call-site compatibility until the F1 teardown
-# increment removes it — these tests pass a tracking stub to prove pipeline.py
-# genuinely never touches it, not just that no error surfaces from a fake.
+# longer writes a candidate vector anywhere (it embeds the candidate
+# directly, with nothing to write or evict), so a failed commit has nothing
+# to roll back. The dead `embeddings` kwarg itself (accepted-but-unused for
+# call-site compatibility through increment 5-7) is removed in the F1
+# increment 8 code teardown — these tests now just confirm a failed commit
+# is counted correctly, with no cache/evict machinery in the picture at all.
 # ---------------------------------------------------------------------------
-
-
-class _EvictTrackingEmbeddings:
-    """Stand-in for the (dedupe-unused) `embeddings` kwarg. Records whether
-    `.evict()` is ever called — pipeline.py no longer calls anything else on
-    this object post-increment-5."""
-
-    def __init__(self) -> None:
-        self.evict_calls: list[str] = []
-
-    def evict(self, content: str) -> None:
-        self.evict_calls.append(content)
 
 
 def test_close_session_commit_failure_does_not_evict(
@@ -1326,28 +1313,25 @@ def test_close_session_commit_failure_does_not_evict(
     canned_provider: _CannedProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed commit_item() must still be counted as an error/commit_failure,
-    but must NOT reach into `embeddings.evict()` — there's no candidate cache
-    row left to roll back."""
+    """A failed commit_item() must still be counted as an error/commit_failure.
+    There is no candidate cache row to roll back anymore (no `embeddings`
+    kwarg, no evict machinery)."""
     import brain.ingest.pipeline as pipeline_mod
 
     ingest_turn(tmp_path, {"session_id": "sess_commit_fail", "speaker": "Hana", "text": "hi"})
     monkeypatch.setattr(pipeline_mod, "commit_item", lambda *args, **kwargs: None)
 
-    tracking_embeddings = _EvictTrackingEmbeddings()
     report = close_session(
         tmp_path,
         "sess_commit_fail",
         store=store,
         hebbian=hebbian,
         provider=canned_provider,
-        embeddings=tracking_embeddings,
     )
 
     assert report.errors == 2
     assert report.commit_failures == 2
     assert report.memory_ids == []
-    assert tracking_embeddings.evict_calls == []
 
 
 def test_snapshot_commit_failure_does_not_evict(
@@ -1364,17 +1348,14 @@ def test_snapshot_commit_failure_does_not_evict(
     ingest_turn(tmp_path, {"session_id": "sess_snap_commit_fail", "speaker": "Hana", "text": "hi"})
     monkeypatch.setattr(pipeline_mod, "commit_item", lambda *args, **kwargs: None)
 
-    tracking_embeddings = _EvictTrackingEmbeddings()
     report = extract_session_snapshot(
         tmp_path,
         "sess_snap_commit_fail",
         store=store,
         hebbian=hebbian,
         provider=canned_provider,
-        embeddings=tracking_embeddings,
     )
 
     assert report.errors == 2
     assert report.commit_failures == 2
     assert report.memory_ids == []
-    assert tracking_embeddings.evict_calls == []

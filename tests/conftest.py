@@ -101,10 +101,11 @@ def _fake_embedding_provider_by_default(
 
     build_embedding_provider() is the PRODUCTION default (FastEmbedProvider —
     a real local ONNX model, downloaded once over the network into a shared
-    cache dir). Every brain/bridge/{server,supervisor,daemon}.py call site
-    that used to hardcode FakeEmbeddingProvider(dim=256) directly now goes
-    through build_embedding_cache()/build_embedding_provider() (Stage 1 of
-    the local semantic-retrieval build), so ANY test that exercises those
+    cache dir). Every production call site that embeds anything (recall's
+    query embed, dedupe's candidate embed, embed-on-write) goes through this
+    one function (Stage 1 of the local semantic-retrieval build; the old
+    build_embedding_cache()/EmbeddingCache layer in front of it is gone as
+    of F1 #259 increment 8), so ANY test that exercises those
     code paths — even indirectly, via a background thread the test itself
     never awaits — would otherwise attempt a real model download: slow,
     network-dependent, and (seen while landing this fixture) capable of
@@ -211,9 +212,10 @@ def _fake_reranker_provider_by_default(
     # brain.tools.impls.search_memories) import the module itself
     # (`from brain.memory import reranker as reranker_mod`) and call
     # `reranker_mod.build_reranker_provider()` — a dynamic attribute lookup
-    # at call time, exactly like embeddings.build_embedding_cache's
-    # same-module call to build_embedding_provider() — so patching this ONE
-    # module attribute is sufficient to intercept every call site.
+    # at call time, exactly like every embedding-provider call site's
+    # identical dynamic lookup on `embeddings.build_embedding_provider` — so
+    # patching this ONE module attribute is sufficient to intercept every
+    # call site.
     monkeypatch.setattr(
         reranker, "build_reranker_provider", lambda: reranker.FakeRerankerProvider()
     )
