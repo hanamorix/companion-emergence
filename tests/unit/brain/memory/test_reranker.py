@@ -12,6 +12,9 @@ integration" — requires_network alone is not part of that expression).
 
 from __future__ import annotations
 
+import json
+import sys
+
 import pytest
 
 import brain.memory.reranker as reranker_mod
@@ -19,6 +22,8 @@ from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.reranker import (
     FakeRerankerProvider,
     RerankerProvider,
+    _default_latency_budget_seconds,
+    _detect_avx2,
     _reset_latency_cache,
     _reset_reranker_provider_cache,
     build_reranker_provider,
@@ -173,6 +178,78 @@ class _SlowProvider(RerankerProvider):
 
     def model_id(self) -> str:
         return "slow-test-provider"
+
+
+# ---------------------------------------------------------------------------
+# F2a inc3 (#250 §3): startup AVX2 check -> AVX2-aware rerank latency-budget
+# default, with manual-override precedence. Four paths: AVX2-detected -> 2s,
+# no-AVX2 -> 4s, explicit override wins regardless of the detected default,
+# and detection-error -> fail-soft conservative default (no crash).
+# ---------------------------------------------------------------------------
+
+
+def test_default_latency_budget_is_2s_when_avx2_detected() -> None:
+    assert _default_latency_budget_seconds(True) == 2.0
+
+
+def test_default_latency_budget_is_4s_when_avx2_not_detected() -> None:
+    assert _default_latency_budget_seconds(False) == 4.0
+
+
+def test_manual_override_wins_over_avx2_auto_detected_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A manual tunables.json override for reranker.latency_budget_seconds
+    must win over the AVX2-auto-detected default — regardless of what that
+    default resolved to — per #250 §3's "manual override takes precedence"
+    requirement. Simulates an AVX2-detected host (default would be 2.0s,
+    via the module-level LATENCY_BUDGET_SECONDS monkeypatch below) with an
+    override of 0.3s, so the two are clearly distinguishable: only the
+    override value can produce the asserted width."""
+    import brain.tunables as tunables_mod
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    tunables_mod._reset_for_tests()
+    (tmp_path / "tunables.json").write_text(
+        json.dumps({"defaults": {}, "overrides": {"reranker.latency_budget_seconds": 0.3}}),
+        encoding="utf-8",
+    )
+    # The auto-detected default this process would otherwise use (as if
+    # AVX2 were detected) — the override must win over THIS, not just over
+    # some arbitrary fallback.
+    monkeypatch.setattr(reranker_mod, "LATENCY_BUDGET_SECONDS", 2.0)
+
+    _reset_latency_cache()
+    provider = _SlowProvider(seconds_per_call=0.1)
+    clock = {"t": 0.0}
+
+    def fake_monotonic() -> float:
+        clock["t"] += 0.1
+        return clock["t"]
+
+    monkeypatch.setattr(reranker_mod.time, "monotonic", fake_monotonic)
+
+    width = get_rerank_width(50, provider)
+    # override budget 0.3s / 0.1s-per-doc = 3, NOT floor(2.0/0.1)=20 (the
+    # auto-detected-default figure) — proves the override, not the default,
+    # drove the computation.
+    assert width == 3, f"expected the override (0.3s) to win, got width={width}"
+    _reset_latency_cache()
+    tunables_mod._reset_for_tests()
+
+
+def test_avx2_detection_error_is_fail_soft_and_conservative(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AVX2 detection failing outright (e.g. /proc/cpuinfo unreadable) must
+    never raise into startup — it degrades to "no AVX2" (the conservative,
+    larger-budget default), matching #250 §3's fail-soft requirement."""
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated /proc/cpuinfo read failure")
+
+    monkeypatch.setattr("builtins.open", _boom)
+
+    assert _detect_avx2() is False  # no raise
 
 
 def test_width_narrows_under_a_tight_latency_budget(monkeypatch: pytest.MonkeyPatch) -> None:

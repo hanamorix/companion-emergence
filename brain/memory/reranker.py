@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -58,14 +59,68 @@ from brain.memory.relevance import CANDIDATE_POOL
 
 log = logging.getLogger(__name__)
 
-# Latency budget for one rerank call (spec point 3: "~1-2s", MEASURED
-# no-AVX2 numbers put ~50 docs at ~1.1s). The ONLY operator-tunable knob in
-# this module — ops-clean (a latency/throughput knob), unlike RERANK_FLOOR
+
+def _detect_avx2() -> bool:
+    """Best-effort startup AVX2 capability check (F2a inc3, #250 §3).
+
+    Runs at process startup (this module's import time), not install time —
+    a VM's AVX2 exposure depends on the host it boots on and can change
+    between boots ([[dev-vm-avx2-depends-on-host]]), so baking the answer in
+    at build/install time would go stale.
+
+    Only Linux is actually probed, via /proc/cpuinfo's `flags` line — the
+    one place a reliable answer is available with no new dependency (no
+    py-cpuinfo, no numpy CPU-dispatch introspection — that answers "does
+    numpy's own build support AVX2", not "does this CPU"). macOS, Windows,
+    and any read/parse failure on Linux all fall back to "no AVX2": #250 §3
+    pins the 2s/4s split but not a cross-platform detection METHOD, so this
+    is resolved conservatively rather than guessed — an undetectable host is
+    treated exactly like a confirmed no-AVX2 host, getting the larger, safer
+    budget instead of silently assuming a fast one (keeps the potato
+    baseline honest). Fail-soft throughout: this must never raise into
+    startup.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("flags"):
+                    return "avx2" in line.split(":", 1)[1].split()
+        return False
+    except Exception:  # noqa: BLE001 — fail-soft: a capability probe must never break startup
+        log.exception("reranker: AVX2 detection failed — defaulting to the conservative no-AVX2 latency budget")
+        return False
+
+
+def _default_latency_budget_seconds(avx2_present: bool) -> float:
+    """AVX2-aware rerank latency-budget default (#250 §3): 2s when the
+    startup check found AVX2, 4s when it did not (or could not tell — see
+    `_detect_avx2`) — build for the no-AVX2 potato baseline, AVX2 as a
+    bonus, per the spec's design posture. Split out as its own pure
+    function (rather than inlined where `LATENCY_BUDGET_SECONDS` is
+    computed) so tests can exercise both branches directly, without needing
+    to reload this module under a monkeypatched detector."""
+    return 2.0 if avx2_present else 4.0
+
+
+_AVX2_PRESENT = _detect_avx2()
+
+# Latency budget for one rerank call (#250 §3): AVX2-aware default — 2s if
+# this process's startup check found AVX2, 4s if not (see
+# `_default_latency_budget_seconds`). The ONLY operator-tunable knob in this
+# module — ops-clean (a latency/throughput knob), unlike RERANK_FLOOR
 # (physiology, fenced into semantic_recall.py per tunables.py's own
-# "physiology fenced out" rule). Registered here (the owning module), read
-# at call time via tunables.get_tunable so a live override applies with no
-# restart.
-LATENCY_BUDGET_SECONDS: float = tunables.register("reranker.latency_budget_seconds", 1.5)
+# "physiology fenced out" rule). Registered here (the owning module) as the
+# DEFAULT only; a manual override in tunables.json wins over this
+# auto-detected value via tunables.get_tunable's existing override-
+# precedence mechanism (see `get_rerank_width` below) — this AVX2-awareness
+# only changes what the default resolves to, never the override behavior
+# itself. Read at call time via tunables.get_tunable so a live override
+# applies with no restart.
+LATENCY_BUDGET_SECONDS: float = tunables.register(
+    "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT)
+)
 
 
 class RerankerProvider(ABC):
