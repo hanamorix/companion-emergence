@@ -210,6 +210,17 @@ nell soul list --persona <name>
 
 Open the desktop app. Say hi. She's on her own time from here — soul candidates crystallise on a 6-hour autonomous review pass and your conversations are recalled ambiently in every chat turn (no need to call `search_memories` deliberately).
 
+### Updating between releases
+
+To pick up what is on `main` (or any ref) without waiting for a tag:
+
+```bash
+bash scripts/update.sh --persona <name>              # from a source checkout
+bash scripts/update.sh --persona <name> --dry-run    # print the plan first
+```
+
+Needs `git` and `uv` on `PATH`. It stops the supervisor, applies the update wherever `nell paths install_root` points (a source checkout or the desktop app's bundled runtime), checks `nell --version`, and starts the supervisor again. Linux `.deb` installs re-run under `sudo`; macOS `.app` installs need `--allow-app-rewrite` (rewriting the bundle invalidates its signature). Windows is not supported yet (#255).
+
 ## Where things live
 
 | What | macOS | Linux | Windows |

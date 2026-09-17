@@ -71,6 +71,26 @@ a Markdown report. The previous version hardcoded the live Nell
 persona dir + an `/audits/` doc path and overwrote a tracked file
 on every run; the rewrite preserves no such defaults.
 
+### `update.sh` — tier 3
+
+Applies the current git state over an existing install (#179). Reads
+`nell paths install_root` / `install_kind`, stops the supervisor,
+updates a **source** install with `git pull --ff-only` + `uv sync`, or a
+**bundled** desktop-app runtime by building a wheel from the source tree
+and installing it plus locked deps into that runtime (restoring the
+relocatable `bin/nell` wrapper afterwards), checks `nell --version`,
+and starts the supervisor again. A failure after the stop still
+restarts the brain.
+
+```bash
+bash scripts/update.sh --persona <name> --dry-run   # print the plan, run nothing
+bash scripts/update.sh --persona <name>             # main; --ref <ref> for another
+```
+
+Needs `git` + `uv`. Linux `.deb` installs re-run under `sudo`; macOS
+`.app` installs need `--allow-app-rewrite` (rewriting the bundle
+invalidates its signature). Not on Windows (#255).
+
 ### `backfill_soul_for_persona.py` — tier 3 (when not `--dry-run`)
 
 Re-derives soul candidate entries from the active memory store for a
