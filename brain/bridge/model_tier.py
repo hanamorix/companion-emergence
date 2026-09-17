@@ -71,6 +71,18 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 # No call-site changes are required for that tier (or any tier EXCEPT
 # TIER_INTERACTIVE_CHAT — see that constant's own TIER_MODEL comment below).
 
+# Mini-model swaps (embedder, reranker, relevance-judge): model ids can be
+# swapped by changing the constant here, but ONLY as a same-interface drop-in.
+# A replacement with a different task-shape or I/O contract (for example, an
+# NLI-style relevance judge instead of the cross-encoder judge, which needs a
+# query-to-hypothesis reformulation) requires integration code changes, not just
+# this config swap. Exception: the embedder's vector DIMENSION is handled
+# dynamically (the one-touch embedding-dimension work), so a different-dimension
+# embedder IS a clean swap. The caveat applies to task-SHAPE, not dimension.
+# For the F2a relevance judge specifically: the retrieval floor auto-re-derives
+# on the next daily calibration after a same-shape judge swap, so no manual
+# recalibration is needed.
+
 # MODEL_EMBEDDING is NOT a Claude model — it's a local ONNX embedding model id
 # (fastembed/HuggingFace naming), the standing convention (per the local
 # semantic-retrieval spec) for embeddings AND any future minimodel (#228):
