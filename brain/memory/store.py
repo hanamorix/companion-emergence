@@ -604,15 +604,41 @@ class MemoryStore:
         logged and swallowed, never raised out of this method, so a caller
         counting embed successes/failures (the backfill's `errors` field)
         doesn't misclassify an already-committed row as failed.
+
+        Computes, then delegates the persist step to `write_embedding` (F1
+        #259 F3) — see that method for the row-UPDATE + matrix-`put` details.
+        `write_embedding` exists as its own method so a caller that has
+        ALREADY computed a vector elsewhere (consolidation's Pass-2 judge,
+        F3 below) can persist it directly without a second, redundant
+        provider call.
         """
         from brain.memory import embeddings as embeddings_mod
-        from brain.memory.embedding_matrix import build_embedding_matrix
 
         provider = embeddings_mod.build_embedding_provider()
         vec = provider.embed(content).astype("float32")
+        self.write_embedding(memory_id, vec, provider.model_id())
+
+    def write_embedding(self, memory_id: str, vector: np.ndarray, model_id: str) -> None:
+        """Persist a PRECOMPUTED embedding vector directly onto a row + the
+        warm matrix, without calling the embedding provider (F1 #259 F3:
+        consolidation's Pass-2 now embeds a candidate ONCE, before the Haiku
+        judge runs — so the vector is available for the cosine
+        `_related_existing` retrieval — and reuses that SAME vector here at
+        promotion instead of a second, redundant `embed_row` compute; see
+        `brain.engines.consolidation._dispatch`'s promote branch).
+
+        Mirrors `embed_row`'s persist step exactly (row UPDATE + matrix
+        `put`, with the identical matrix-put-failure-is-swallowed contract
+        below) but skips the compute step — `embed_row` itself now computes
+        the vector, then calls this method to do the actual persisting, so
+        the two never drift apart.
+        """
+        from brain.memory.embedding_matrix import build_embedding_matrix
+
+        vec = np.asarray(vector, dtype=np.float32)
         self._conn.execute(
             "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
-            (vec.tobytes(), provider.model_id(), memory_id),
+            (vec.tobytes(), model_id, memory_id),
         )
         self._conn.commit()
         try:
@@ -620,7 +646,7 @@ class MemoryStore:
         except Exception:  # noqa: BLE001 — row is already committed-embedded; a
             # matrix-cache write failure must not surface as an embed failure.
             logger.warning(
-                "MemoryStore.embed_row: warm-matrix put failed for id=%s after "
+                "MemoryStore.write_embedding: warm-matrix put failed for id=%s after "
                 "the row's embedding was already committed — the matrix "
                 "self-heals on rebuild, so this is logged, not raised",
                 memory_id,

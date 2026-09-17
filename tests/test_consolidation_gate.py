@@ -201,6 +201,71 @@ def test_embed_on_write_promoted_memory_has_row_embedding_and_matrix_entry(
     assert matrix.get(promoted.id) is not None, "the warm matrix must reflect the embed immediately"
 
 
+# --------------------------------------------------------------------------- F1 #259 F3 (acceptance #7b)
+def test_f3_cosine_near_dup_dedup_catches_same_batch_paraphrase(persona) -> None:
+    """F1 #259 F3 / spec §4b (acceptance #7b): two PARAPHRASE candidates of
+    the same fact, enqueued in the same batch, share no >3-char SUBSTRING
+    (see the precondition note below — `_related_existing_lexical` probes
+    via `store.search_text`, a plain `LIKE '%token%'` SUBSTRING match, not
+    exact-token FTS, so this is a stricter bar than "no shared word") — the
+    OLD lexical `_related_existing` would have returned empty context for
+    the second candidate, so only the NEW cosine retrieval can surface the
+    first as context for the second's Pass-2 judgment. Consolidation
+    commits incrementally (`_run_locked`'s per-candidate loop calls
+    `store.create` inside the loop), so the first candidate is already a
+    committed, warm-matrix-visible row by the time the second candidate's
+    `_related_existing` runs — same-batch coverage, no special-casing.
+
+    Threshold-free (I3): the cosine retrieval never filters by a similarity
+    cutoff, it just returns whatever ranks in the warm matrix's top-k (here
+    trivially rank 1, since nothing else is embedded) — the REALISTIC
+    classifier below is what actually decides duplicate-ness from that
+    context, exactly like the real Haiku judge would. A promote-all stub
+    would pass this test vacuously; `realistic_classifier` does not: it only
+    rejects a candidate when its specific paraphrase partner is PRESENT in
+    the context list `_related_existing` handed it, so this test fails (2
+    rows, not 1) if the cosine retrieval regresses to lexical-only or to no
+    context at all — proving the mechanism, not just the assertion. (Verified
+    by hand during the F3 build: monkeypatching `_related_existing_cosine`
+    to raise makes this test fail with 2 rows, confirming it genuinely
+    bites — see the F3 build report.)"""
+    tmp, store, hebbian, queue = persona
+
+    content_a = "Bob's grandmother always made braunschweiger sandwiches on rye"
+    content_b = "The old family recipe actually used liverwurst instead of ham"
+    # Precondition (checked by hand, not asserted at runtime, to keep the
+    # test focused on the mechanism): none of content_b's >3-char tokens
+    # ("family", "recipe", "actually", "used", "liverwurst", "instead")
+    # appear anywhere as a SUBSTRING of content_a — `search_text` is a
+    # `LIKE '%token%'` substring probe, so even a partial overlap (e.g.
+    # "sandwich" inside "sandwiches") would defeat this precondition; these
+    # two strings were picked specifically to have none. The OLD lexical
+    # probe could never have caught this near-dup, so the fix is genuinely
+    # load-bearing here, not incidentally covered by substring luck.
+
+    queue.enqueue(_mem(content_a, "dream"), source="x")
+    queue.enqueue(_mem(content_b, "dream"), source="x")
+
+    paraphrase_partner = {content_a: content_b, content_b: content_a}
+
+    def realistic_classifier(cand, context):
+        partner = paraphrase_partner.get(cand.content)
+        if partner is not None and any(m.content == partner for m in context):
+            return Decision("duplicate")
+        return Decision("new")
+
+    run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=realistic_classifier,
+    )
+
+    rows = store.list_active()
+    assert len(rows) == 1, (
+        f"expected exactly one durable row after same-batch near-dup dedup, "
+        f"got {len(rows)}: {[r.content for r in rows]}"
+    )
+
+
 # --------------------------------------------------------------------------- C6
 def test_c6_pass1_exact_dup_only_never_non_identical(persona):
     tmp, store, hebbian, queue = persona

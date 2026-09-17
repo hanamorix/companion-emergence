@@ -16,6 +16,7 @@ import pytest
 
 from brain.bridge.model_tier import MODEL_EMBEDDING_DIM
 from brain.memory.embedding_matrix import EmbeddingMatrix
+from brain.memory.embeddings import cosine_similarity
 from brain.memory.store import MemoryStore
 
 # F1 #259 increment 7: derived from the model_tier.py constant rather than a
@@ -364,6 +365,10 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
 # ---------------------------------------------------------------------------
 # Acceptance criterion 3: warm-matrix stays COHERENT under concurrent
 # rebuild + put/evict — no lost update, no resurrected row, no stale vector.
+# `test_concurrent_reads_survive_writer_puts_and_rebuild` below also
+# includes a consolidation-style cosine-top-k reader actor (F1 #259 F3,
+# spec §4b's `_related_existing_cosine`) alongside the recall-style reader —
+# the NEW matrix reader this build adds must be proven torn-read-free too.
 # ---------------------------------------------------------------------------
 
 
@@ -427,8 +432,10 @@ def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch) 
 
 
 def test_concurrent_reads_survive_writer_puts_and_rebuild(coherence_db) -> None:
-    """Stress/robustness arm: a recall-style reader thread hammers
-    get()/snapshot() while a supervisor-style writer thread does many
+    """Stress/robustness arm: a recall-style reader thread AND a
+    consolidation-style cosine-top-k reader thread (F1 #259 F3, spec §4b's
+    `_related_existing_cosine` — the NEW matrix reader this build adds)
+    both hammer the matrix while a supervisor-style writer thread does many
     per-item puts/evicts interleaved with full rebuilds, all against ids
     that REALLY exist in the DB. Assert: no exception, no torn read (every
     vector handed back is a full, correctly shaped/typed float32 array), and
@@ -459,6 +466,33 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(coherence_db) -> None:
         except BaseException as exc:  # noqa: BLE001 - captured for the main thread to re-raise
             errors.append(exc)
 
+    def consolidation_cosine_reader() -> None:
+        """Mirrors `brain.engines.consolidation._related_existing_cosine`'s
+        access pattern exactly: `snapshot()` the matrix, score every entry
+        against a fixed "candidate" query vector by cosine similarity,
+        sort, slice the top-k (here `limit=8`, the same default the real
+        helper uses) — no threshold, matching the threshold-free design
+        (I3). This is the acceptance-#3 concurrency actor: a consolidation-
+        side cosine read running concurrently with matrix put/evict/rebuild
+        must see no torn read (every scored vector correctly shaped/typed,
+        every cosine score a finite float)."""
+        query_vec = _vec(0.42)
+        try:
+            while not stop.is_set():
+                snap = matrix.snapshot()
+                scored = []
+                for mem_id, vec in snap.items():
+                    assert vec.dtype == np.float32
+                    assert vec.shape == (DIM,)
+                    score = cosine_similarity(query_vec, vec)
+                    assert np.isfinite(score)
+                    scored.append((mem_id, score))
+                scored.sort(key=lambda pair: -pair[1])
+                top_k = scored[:8]
+                assert len(top_k) <= 8
+        except BaseException as exc:  # noqa: BLE001 - captured for the main thread to re-raise
+            errors.append(exc)
+
     def writer() -> None:
         try:
             for round_ in range(50):
@@ -481,18 +515,24 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(coherence_db) -> None:
             errors.append(exc)
 
     reader_threads = [threading.Thread(target=reader) for _ in range(3)]
+    cosine_reader_threads = [threading.Thread(target=consolidation_cosine_reader) for _ in range(2)]
     writer_thread = threading.Thread(target=writer)
 
     for t in reader_threads:
+        t.start()
+    for t in cosine_reader_threads:
         t.start()
     writer_thread.start()
     writer_thread.join(timeout=30)
     stop.set()
     for t in reader_threads:
         t.join(timeout=5)
+    for t in cosine_reader_threads:
+        t.join(timeout=5)
 
     assert not writer_thread.is_alive()
     assert not any(t.is_alive() for t in reader_threads)
+    assert not any(t.is_alive() for t in cosine_reader_threads)
     assert errors == []
 
     for i, mem_id in enumerate(keeper_ids):

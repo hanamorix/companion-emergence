@@ -31,9 +31,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
+
 from brain import prompt_strings
+from brain.memory import embeddings as embeddings_mod
+from brain.memory.embedding_matrix import build_embedding_matrix
+from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
+from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.file_lock import file_lock
 
@@ -228,14 +234,51 @@ def _run_locked(
 
     # --- Pass 2: per-candidate decision against related existing memories.
     for cand in survivors:
-        context = _related_existing(store, cand)
+        # F1 #259 F3: embed the candidate ONCE, here, before the judge runs
+        # (one step earlier than the old "embed at promotion" timing) — the
+        # vector feeds the cosine `_related_existing` retrieval below AND is
+        # reused (never recomputed) at promotion in `_dispatch`. None on a
+        # provider failure (fail-soft): `_related_existing` degrades to its
+        # lexical fallback and `_dispatch` degrades to its own `embed_row`
+        # compute, exactly matching pre-F3 behavior for that one candidate.
+        embedded = _embed_candidate(cand.content)
+        context = _related_existing(store, cand, embedded)
         try:
             decision = classifier(cand, context)
         except Exception:  # noqa: BLE001 — a classifier fault must not lose the batch
             logger.exception("consolidation gate: classifier raised; promoting candidate")
             decision = Decision("new")
-        _dispatch(store, pending, hebbian, persona_dir, cand, decision, result)
+        _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
     return result
+
+
+def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
+    """Embed a Pass-2 candidate's content via the process-cached production
+    provider (F1 #259 F3), returning `(vector, model_id)`.
+
+    Looked up via the MODULE (not a bare imported name) so a test's
+    monkeypatch on `embeddings_mod.build_embedding_provider` is honored —
+    mirrors `MemoryStore.embed_row`'s / `dedupe.is_duplicate`'s identical
+    dynamic lookup.
+
+    Fail-soft: returns None on any provider/compute failure rather than
+    raising, so one bad embed cannot lose the candidate or abort the drain
+    tick. `_related_existing` treats None as "no cosine context available"
+    (lexical fallback) and `_dispatch`'s promote branch treats it as "no
+    precomputed vector" (falls back to its own `embed_row` compute, leaving
+    the row NULL on a repeat failure for the idle backfill to pick up).
+    """
+    try:
+        provider = embeddings_mod.build_embedding_provider()
+        vec = provider.embed(content).astype("float32")
+        return vec, provider.model_id()
+    except Exception:  # noqa: BLE001 — degrade to lexical context + post-promote embed_row
+        logger.warning(
+            "consolidation gate: pre-judge candidate embed failed; falling back to "
+            "lexical _related_existing context and a post-promote embed_row compute",
+            exc_info=True,
+        )
+        return None
 
 
 def _has_exact_existing(store: MemoryStore, content: str, norm: str) -> bool:
@@ -254,9 +297,71 @@ def _has_exact_existing(store: MemoryStore, content: str, norm: str) -> bool:
     return any(_normalize(h.content) == norm for h in hits)
 
 
-def _related_existing(store: MemoryStore, cand: Memory, *, limit: int = 8) -> list[Memory]:
+def _related_existing(
+    store: MemoryStore,
+    cand: Memory,
+    embedded: tuple[np.ndarray, str] | None,
+    *,
+    limit: int = 8,
+) -> list[Memory]:
+    """Gather existing COMMITTED memories to surface to the Pass-2 Haiku
+    judge as near-dup context (F1 #259 F3, spec §4b).
+
+    COSINE top-k retrieval from the warm matrix when the candidate has a
+    vector (`embedded` is not None, see `_embed_candidate`) AND the matrix
+    actually holds at least one comparison vector — the same short-locked
+    matrix reader `run_semantic_recall`/`build_semantic_candidate_pool` use,
+    so this inherits their per-item short-lock discipline (no torn read;
+    covered by the acceptance-#3 concurrency test). NO similarity
+    threshold anywhere here (I3) — only the `limit` breadth, same knob the
+    prior lexical probe had; the Haiku judge makes the keep/merge/reject
+    call from whatever neighbors come back.
+
+    Falls back to the PRIOR lexical token-overlap probe
+    (`_related_existing_lexical`) when: the candidate could not be embedded
+    (`embedded is None`), the warm matrix is cold / holds no active
+    embedded rows yet (empty candidate pool — same "graceful warm-up"
+    degrade `build_semantic_candidate_pool`'s other callers already have),
+    or the cosine retrieval itself raises. Read-only, non-bumping — Pass-2
+    context, not recall.
+    """
+    if embedded is not None:
+        cand_vec, _model_id = embedded
+        try:
+            hits = _related_existing_cosine(store, cand_vec, limit=limit)
+            if hits:
+                return hits
+        except Exception:  # noqa: BLE001 — degrade to lexical, never lose Pass-2 context
+            logger.warning(
+                "consolidation gate: cosine _related_existing failed; "
+                "falling back to lexical token-overlap",
+                exc_info=True,
+            )
+    return _related_existing_lexical(store, cand, limit=limit)
+
+
+def _related_existing_cosine(
+    store: MemoryStore, cand_vec: np.ndarray, *, limit: int
+) -> list[Memory]:
+    """Top-`limit` most cosine-similar active, embedded, committed memories
+    to `cand_vec` — the same matrix-read + score-sort-slice shape
+    `run_semantic_recall` uses (reusing `build_semantic_candidate_pool` for
+    the matrix half, not reinventing it). Empty list when the matrix has no
+    comparison vectors yet (cold-start / pre-backfill)."""
+    matrix = build_embedding_matrix(store.db_path)
+    pool = build_semantic_candidate_pool(store, matrix)
+    if not pool:
+        return []
+    scored = [(mem, cosine_similarity(cand_vec, vec)) for mem, vec in pool.values()]
+    scored.sort(key=lambda pair: -pair[1])
+    return [mem for mem, _score in scored[:limit]]
+
+
+def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 8) -> list[Memory]:
     """Gather existing memories sharing salient tokens with the candidate.
 
+    The PRE-F3 cosine-free probe, kept as `_related_existing`'s fallback
+    for a cold matrix / a failed candidate embed (F1 #259 F3, spec §4b).
     Read-only, non-bumping — Pass-2 context, not recall.
     """
     tokens = [w for w in re.findall(r"\w+", cand.content or "") if len(w) > 3][:6]
@@ -371,6 +476,7 @@ def _dispatch(
     cand: Memory,
     decision: Decision,
     result: ConsolidationResult,
+    embedded: tuple[np.ndarray, str] | None = None,
 ) -> None:
     verdict = decision.verdict if decision.verdict in VERDICTS else "new"
 
@@ -406,16 +512,26 @@ def _dispatch(
     if verdict == "correction" and decision.target_id:
         cand.metadata = {**cand.metadata, "correction_of": decision.target_id}
     store.create(cand)
-    # F1 #259 step 4: embed-on-write at the pending-queue -> committed-memory
+    # F1 #259 F3: embed-on-write at the pending-queue -> committed-memory
     # promotion — the steady-state embedding path (the idle backfill only
-    # mops up rows this misses). Local try/except: a failed embed must never
-    # abort the drain tick or lose the just-promoted candidate — leave the
-    # row's embedding NULL and let the later idle backfill pick it up.
+    # mops up rows this misses). The vector itself was already computed
+    # PRE-judge (`_embed_candidate`, in `_run_locked`'s Pass-2 loop) so it
+    # can feed the cosine `_related_existing` retrieval; REUSE it here via
+    # `store.write_embedding` rather than recomputing (no double-embed).
+    # When `embedded` is None (the pre-judge embed itself failed), fall back
+    # to the original `store.embed_row` compute-and-persist path. Either
+    # way: local try/except — a failed embed must never abort the drain
+    # tick or lose the just-promoted candidate — leave the row's embedding
+    # NULL and let the later idle backfill pick it up.
     try:
-        store.embed_row(cand.id, cand.content)
+        if embedded is not None:
+            cand_vec, model_id = embedded
+            store.write_embedding(cand.id, cand_vec, model_id)
+        else:
+            store.embed_row(cand.id, cand.content)
     except Exception:  # noqa: BLE001 — degrade to backfill, never abort the drain
         logger.warning(
-            "consolidation._dispatch: embed_row failed for promoted id=%s — "
+            "consolidation._dispatch: embed persist failed for promoted id=%s — "
             "leaving embedding NULL for the idle backfill",
             cand.id,
             exc_info=True,
