@@ -463,9 +463,19 @@ def get_rerank_width(
 # still MiniLM-scaled as of this commit (see MODEL_RERANKER's model_tier.py
 # comment) — a known, already-documented, EXPECTED state, not something
 # this increment fixes — so this check is naturally low-power against it
-# until §7 re-derives the floor for jina's own scale; reading the floor
-# live (not hardcoding it) means this same gate sharpens automatically the
-# day that lands, with no code change needed here.
+# until §7 re-derives the floor for jina's own scale. The floor IS read
+# live inside `_run_precision_selfcheck` (never hardcoded), but the
+# decision itself is cached in `_precision_decision_cache` keyed ONLY on
+# `(fp32_model_id, fp16_model_id)`, not on the floor value, so once a
+# decision is cached it does NOT re-evaluate when `RERANK_FLOOR` changes
+# later in the same process. The increment that makes the daily
+# calibration tick update `RERANK_FLOOR` (F2a section 5/7) must call
+# `reranker._reset_precision_decision_cache()` right after updating the
+# floor, so the next `build_reranker_provider()` call re-runs this
+# self-check under the sharpened floor (bounded to once a day, off the
+# hot path). Do not key the cache on the floor float itself: EMA drift
+# would then force a costly re-run, a second real ONNX load of both
+# exports, on most days, defeating the one-time-cost design.
 _FP16_GATE_PAIRS: list[tuple[str, str]] = [
     # genuine (clearly relevant)
     (
@@ -572,11 +582,17 @@ def _run_precision_selfcheck(fp32_model_id: str, fp16_model_id: str, cache_dir: 
         log.exception("reranker fp16/fp32 gate: failed to register the fp16 export -> shipping fp32")
         return fp32_model_id
 
+    fp32_provider: CrossEncoderProvider | None = None
     try:
         fp32_provider = CrossEncoderProvider(model_id=fp32_model_id, cache_dir=cache_dir)
         fp16_provider = CrossEncoderProvider(model_id=fp16_model_id, cache_dir=cache_dir)
     except Exception:  # noqa: BLE001 — fail-soft: fp16 (or even fp32) construction failure must not break recall
         log.exception("reranker fp16/fp32 gate: failed to construct a provider -> shipping fp32")
+        if fp32_provider is not None:
+            # fp32 built fine and only the fp16 construction failed below it;
+            # stash the already-built fp32 provider so build_reranker_provider()
+            # reuses it instead of paying for a redundant ONNX load.
+            _cache_provider(fp32_model_id, fp32_provider)
         return fp32_model_id
 
     try:
