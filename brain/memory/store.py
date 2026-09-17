@@ -24,7 +24,26 @@ from typing import Any
 
 import numpy as np
 
+from brain import tunables
+
 logger = logging.getLogger(__name__)
+
+# F2a (#250 inc5): calibration_log retention window (spec Section 5 / acceptance
+# 5b) — PROVISIONAL default. The spec's full derivation is max(sample-drawable-
+# days, drift-responsiveness): sample-drawable-days depends on the daily
+# calibration SAMPLE SIZE, which is only pinned in F2a's floor-derivation
+# increment (inc7, spec Section 7's "Calibration-pass sample size" open
+# reconfirmation) — not yet built as of this increment. 14 days is a
+# placeholder chosen to comfortably outlast the volume a robust cutoff fit
+# needs (the spec's own citation: robust at "hundreds of pairs", well under a
+# week of ordinary real-recall traffic) while staying short enough for drift-
+# responsiveness (stale month-old recalls, logged against an earlier corpus
+# state, should age out rather than linger in the sample). Inc7 replaces this
+# default with the derived value once the sample size exists; the tunable
+# itself (an operator override via tunables.json) is unaffected by that swap.
+CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
+    "calibration.retention_window_days", 14.0
+)
 
 
 def _coerce_utc(ts: str) -> datetime:
@@ -262,8 +281,12 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- fine-tuning (Out-of-scope) — logged from day one per spec so F2c has data
 -- to start from once it exists.
 --
--- Retention/pruning is UNSPECIFIED by the F2a spec (open gap, flagged back
--- to Planning, not invented here) — this table currently grows unbounded.
+-- Retention/pruning (F2a #250 inc5, spec Section 5 / acceptance 5b): the
+-- daily calibration tick (`_run_calibration_tick` in brain/bridge/
+-- supervisor.py) calls `MemoryStore.prune_calibration_log` every firing, so
+-- this table stays bounded to a rolling `day_bucket` window instead of
+-- growing unbounded — see CALIBRATION_LOG_RETENTION_WINDOW_DAYS above for
+-- the window's current (provisional) value and how it is finalized in inc7.
 CREATE TABLE IF NOT EXISTS calibration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -845,6 +868,43 @@ class MemoryStore:
             ),
         )
         self._conn.commit()
+
+    def prune_calibration_log(
+        self, *, window_days: float | None = None, now: datetime | None = None
+    ) -> int:
+        """Delete `calibration_log` rows whose `day_bucket` falls outside the
+        rolling retention window (F2a #250 inc5, spec Section 5 / acceptance
+        5b), keeping the table bounded instead of growing forever.
+
+        `window_days` defaults to the live `calibration.retention_window_days`
+        tunable (see `CALIBRATION_LOG_RETENTION_WINDOW_DAYS` above) when not
+        passed explicitly — read at call time via `tunables.get_tunable` so an
+        operator override applies with no restart, mirroring
+        `brain/memory/reranker.py`'s `LATENCY_BUDGET_SECONDS` pattern. The
+        window itself is PROVISIONAL (see the tunable's own comment) — its
+        full derivation is finalized in F2a inc7 once the calibration sample
+        size exists.
+
+        `day_bucket` is a `YYYY-MM-DD` string (see the CREATE TABLE default
+        above), so a lexicographic string comparison against the cutoff date
+        is a correct date comparison with no parsing needed.
+
+        Called from the daily calibration tick (`_run_calibration_tick` in
+        `brain/bridge/supervisor.py`), off the hot path (I6) — never from a
+        per-turn recall path. Returns the number of rows deleted (0 if none
+        were due).
+        """
+        if window_days is None:
+            window_days = tunables.get_tunable(
+                "calibration.retention_window_days", CALIBRATION_LOG_RETENTION_WINDOW_DAYS
+            )
+        ref = now if now is not None else datetime.now(UTC)
+        cutoff_bucket = (ref - timedelta(days=window_days)).strftime("%Y-%m-%d")
+        cur = self._conn.execute(
+            "DELETE FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -2357,3 +2357,67 @@ def test_log_calibration_sample_writes_multiple_rows_independently(store: Memory
     )
     rows = store._conn.execute("SELECT query FROM calibration_log ORDER BY id").fetchall()
     assert [r["query"] for r in rows] == ["first turn", "second turn"]
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc5): prune_calibration_log — retention pruning (spec Section 5 /
+# acceptance 5b). Window derivation itself is provisional (see
+# CALIBRATION_LOG_RETENTION_WINDOW_DAYS's own comment) — finalized in inc7.
+# ---------------------------------------------------------------------------
+
+
+def _seed_calibration_row(store: MemoryStore, day_bucket: str, query: str) -> None:
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (day_bucket, query, json.dumps([]), json.dumps([]), "test-model"),
+    )
+    store._conn.commit()
+
+
+def test_prune_calibration_log_deletes_rows_older_than_window_days(store: MemoryStore) -> None:
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    old_bucket = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+    recent_bucket = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    _seed_calibration_row(store, old_bucket, "old")
+    _seed_calibration_row(store, recent_bucket, "recent")
+
+    deleted = store.prune_calibration_log(window_days=5.0, now=now)
+
+    assert deleted == 1
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"recent"}
+
+
+def test_prune_calibration_log_returns_zero_when_nothing_is_due(store: MemoryStore) -> None:
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    _seed_calibration_row(store, now.strftime("%Y-%m-%d"), "today")
+
+    deleted = store.prune_calibration_log(window_days=14.0, now=now)
+
+    assert deleted == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM calibration_log").fetchone()[0] == 1
+
+
+def test_prune_calibration_log_defaults_to_the_live_tunable_window(store: MemoryStore) -> None:
+    """No window_days passed -> reads the live `calibration.retention_window_days`
+    tunable (default CALIBRATION_LOG_RETENTION_WINDOW_DAYS), mirroring
+    reranker.py's LATENCY_BUDGET_SECONDS override pattern."""
+    from brain.memory.store import CALIBRATION_LOG_RETENTION_WINDOW_DAYS
+
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    just_outside = now - timedelta(days=CALIBRATION_LOG_RETENTION_WINDOW_DAYS + 1)
+    just_inside = now - timedelta(days=1)
+    _seed_calibration_row(store, just_outside.strftime("%Y-%m-%d"), "outside")
+    _seed_calibration_row(store, just_inside.strftime("%Y-%m-%d"), "inside")
+
+    deleted = store.prune_calibration_log(now=now)
+
+    assert deleted == 1
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"inside"}

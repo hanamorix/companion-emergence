@@ -156,6 +156,7 @@ def run_folded(
     notes_enabled: bool = True,
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
+    calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
@@ -197,6 +198,17 @@ def run_folded(
     chips a small per-row batch every base tick — clustering instead
     recomputes over the WHOLE cached vector set each firing, so it doesn't
     need or want that tight a cadence).
+
+    ``calibration_interval_s=None`` disables the autonomous daily calibration
+    cadence (F2a #250, spec Section 5) — a 4th sibling to
+    ``compaction_interval_s``, mirroring its idle-gate + restart-safety shape
+    (own persisted ``calibration_cadence.json``, startup catch-up + periodic
+    daily fire). Default 86400s (daily), matching compaction — same
+    rationale: rides existing, already-idle-gated infra. This increment
+    (inc5) scopes the tick to retention pruning of ``calibration_log`` only
+    (acceptance 5b); the judge-labeling pass (Section 6) and floor derivation
+    (Section 7) are later increments — see ``_run_calibration_tick``'s
+    docstring for the full scope note.
     """
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
@@ -258,6 +270,15 @@ def run_folded(
         if compaction_interval_s is not None
         else None
     )
+    # Daily calibration cadence (F2a #250 inc5, spec Section 5) — own
+    # persisted `calibration_cadence.json`, independent of compaction's file
+    # even though the default interval matches (mirrors compaction's own
+    # independent-file rationale vs voice reflection above).
+    calibration_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "calibration_cadence.json")
+        if calibration_interval_s is not None
+        else None
+    )
     # Memory-vector clustering (Stage 5, #157) — own persisted wall-clock
     # cadence, decoupled from every other cadence (see clustering_interval_s
     # docstring above).
@@ -306,6 +327,20 @@ def run_folded(
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup catch-up compaction failed: %s", exc)
+
+    # One-shot startup: catch-up calibration tick (F2a #250 inc5, spec Section
+    # 5). Mirrors compaction's startup-catch-up-or-idle posture immediately
+    # above (owner ruling 2026-08-13, carried into this sibling cadence): a
+    # retention prune that was due while the app was off runs promptly now,
+    # rather than waiting up to a full day for the periodic cadence below.
+    # Startup is idle by nature (no in-flight requests yet), so it fires
+    # cleanly. Fault-isolated (recipe item 3). Skipped when the calibration
+    # cadence is disabled (tests/dev), mirroring the periodic gate.
+    try:
+        if calibration_interval_s is not None:
+            _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup catch-up calibration tick failed: %s", exc)
 
     # One-shot startup: re-tag emotion-less memories so existing personas
     # benefit from the A2 forward-only emotion seeding.  Independent of the
@@ -897,6 +932,30 @@ def run_folded(
                 )
                 persisted_cadence.save_cadence(
                     persona_dir, "compaction_cadence.json", compaction_cadence_state
+                )
+
+        # Daily calibration cadence (F2a #250 inc5, spec Section 5) — 4th
+        # sibling cadence to compaction/clustering/vocab-repair. PERSISTED via
+        # its own `calibration_cadence.json` (mirrors compaction: independent
+        # file even though the default interval matches, so its advance is
+        # always unconditional and independent). INC5 scope: retention
+        # pruning of `calibration_log` only (acceptance 5b) — see
+        # `_run_calibration_tick`'s docstring for the full scope note; the
+        # judge-labeling pass (Section 6) and floor derivation (Section 7)
+        # land in later increments.
+        if calibration_cadence_state is not None and persisted_cadence.is_due(
+            calibration_cadence_state, now=datetime.now(UTC)
+        ):
+            try:
+                _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
+            except Exception:
+                logger.exception("supervisor calibration tick raised")
+            finally:
+                calibration_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=calibration_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "calibration_cadence.json", calibration_cadence_state
                 )
 
         # Wait for the next tick or for stop_event, whichever comes first.
@@ -1996,6 +2055,65 @@ def _run_compaction_tick(
                 )
             except Exception:
                 logger.exception("weekly rollover: session=%s raised", session_id)
+
+
+def _run_calibration_tick(
+    persona_dir: Path,
+    *,
+    is_session_busy: Callable[[str], bool] | None = None,
+) -> None:
+    """F2a daily calibration tick (#250, spec Section 5) — 4th sibling cadence
+    to compaction/clustering/vocab-repair, mirroring ``_run_compaction_tick``'s
+    idle-gate + restart-safety shape: own persisted ``calibration_cadence.json``,
+    startup catch-up + periodic daily fire in ``run_folded``.
+
+    **INC5 SCOPE (this increment):** retention pruning only — deletes
+    ``calibration_log`` rows outside the rolling ``day_bucket`` window via
+    ``MemoryStore.prune_calibration_log`` (spec Section 5's "MUST before ship"
+    pruning responsibility, acceptance 5b). The local-judge first pass
+    (``bge-reranker-v2-m3`` + Haiku tie-break, spec Section 6) and the floor
+    derivation + EMA smoothing + ``RERANK_FLOOR`` write (spec Section 7) are
+    LATER increments (inc6/inc7) — this tick fires and is wired daily, but
+    does not yet derive a floor. (Consequently it also does not yet call
+    ``reranker._reset_precision_decision_cache()`` — see
+    ``brain/memory/reranker.py``'s precision-cache comment — since nothing
+    here writes ``RERANK_FLOOR`` yet; inc7 adds that call right after its
+    floor write.)
+
+    **Idle-gate:** unlike compaction (which skips only the BUSY session's own
+    cascade/rollover, letting idle sessions' work proceed), this tick's work
+    is corpus-global, not scoped to any one session — it reads/writes across
+    the whole ``calibration_log`` table rather than per-session data. So the
+    gate here is a single all-or-nothing check: if ANY active session
+    currently has an in-flight request, the WHOLE tick defers to the next
+    firing, rather than partially running while a live turn may still be
+    calling ``store.log_calibration_sample`` (#250 inc4) against the same
+    table. At startup ``is_session_busy`` is None / no session has an
+    in-flight request yet, so the startup catch-up fires cleanly (mirrors
+    compaction).
+
+    Fault-isolated by the caller (``run_folded``'s ``try/except
+    logger.exception`` around both the startup catch-up and periodic-fire
+    call sites, mirroring ``_run_clustering_tick``) — this function itself
+    does not swallow errors, so a raised exception here is visible in that
+    wrapping try/except rather than silently vanishing.
+    """
+    if is_session_busy is not None:
+        from brain.ingest.buffer import list_active_sessions
+
+        if any(is_session_busy(sid) for sid in list_active_sessions(persona_dir)):
+            logger.info("calibration tick: deferred, a session is busy")
+            return
+
+    with ExitStack() as stack:
+        # integrity_check=False mirrors the sweep/maker/notes/vocab-repair/
+        # clustering ticks in this file — a full PRAGMA integrity_check on
+        # every construction is unwarranted for a background cadence tick.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        pruned = store.prune_calibration_log()
+        logger.info("calibration tick: pruned=%d calibration_log rows outside retention window", pruned)
 
 
 def _run_finalize_tick(

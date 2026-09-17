@@ -69,6 +69,7 @@ def _isolating_kwargs(**overrides):
         "voice_reflection_interval_s": None,
         "self_model_interval_s": None,
         "compaction_interval_s": None,
+        "calibration_interval_s": None,
         "interest_sweep_interval_s": None,
         "kindled_link_enabled": False,
     }
@@ -358,6 +359,7 @@ def test_store_closed_before_uncaught_exception_propagates(tmp_path):
                 voice_reflection_interval_s=None,
                 self_model_interval_s=None,
                 compaction_interval_s=None,
+                calibration_interval_s=None,
                 interest_sweep_interval_s=None,
                 kindled_link_enabled=False,
             )
@@ -547,6 +549,7 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
             voice_reflection_interval_s=None,
             self_model_interval_s=None,
             compaction_interval_s=None,
+            calibration_interval_s=None,
             interest_sweep_interval_s=None,
             kindled_link_enabled=False,
         )
@@ -636,6 +639,7 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
             voice_reflection_interval_s=None,
             self_model_interval_s=None,
             compaction_interval_s=None,
+            calibration_interval_s=None,
             interest_sweep_interval_s=None,
             kindled_link_enabled=False,
         )
