@@ -1,17 +1,21 @@
 """Warm in-process vector matrix over `memories.embedding` (F1, #259 step 2+).
 
-A process-level `{memory_id -> np.ndarray(float32, 384-dim)}` map, sourced
+A process-level `{memory_id -> np.ndarray(float32, N-dim)}` map, sourced
 from the `embedding` column F1 added to the `memories` table (see
-`brain/memory/store.py`'s `_SCHEMA`). This is the read-side cache
-`semantic_recall.py`, `search_memories.py`, and the narrative-memory
-adapter in `brain/bridge/supervisor.py` query directly instead of the old
-content-hash `embeddings.db` join (F1 increment 2). `build_embedding_matrix`
-below is the process-wide singleton accessor every consumer should go
-through — constructing `EmbeddingMatrix` directly is still valid (existing
-tests do this for exact control) but bypasses the shared-instance guarantee
-production callers need. Backfill, dedupe, and clustering are NOT wired to
-this module yet — they still read/write the old `embeddings.db` — that
-migration is later increments' job.
+`brain/memory/store.py`'s `_SCHEMA`). `N` is whatever
+`model_tier.MODEL_EMBEDDING_DIM` currently says (384 for bge-small today;
+a future multilingual swap, e.g. bge-m3 at 1024-dim, changes that one
+constant and this module follows automatically — see `_expected_dim()`
+below). This is the read-side cache `semantic_recall.py`,
+`search_memories.py`, and the narrative-memory adapter in
+`brain/bridge/supervisor.py` query directly instead of the old content-hash
+`embeddings.db` join (F1 increment 2). `build_embedding_matrix` below is the
+process-wide singleton accessor every consumer should go through —
+constructing `EmbeddingMatrix` directly is still valid (existing tests do
+this for exact control) but bypasses the shared-instance guarantee
+production callers need. Backfill (increment 3), dedupe (increment 5), and
+clustering (increment 4) all read/write through this module now — none of
+them touch `embeddings.db` anymore.
 
 Build cost: the matrix is built LAZILY, on first access, never at import or
 construction time — building at startup would pay a cost on every process
@@ -76,11 +80,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Retrieval embeddings are 384-dim float32 (see the backfill/provider). A
-# blob is 384 * 4 = 1536 bytes; anything else is a corrupt/short row that
-# must be skipped rather than allowed to crash the whole build.
-_EXPECTED_DIM = 384
-_EXPECTED_BYTES = _EXPECTED_DIM * 4
+# Retrieval embeddings are float32, dimension `model_tier.MODEL_EMBEDDING_DIM`
+# (see the backfill/provider) — NOT a hardcoded literal (F1 #259 increment 7:
+# a future multilingual embedding model swap, e.g. bge-m3 at 1024-dim vs
+# bge-small's 384, must not require a code change here). A blob whose byte
+# length isn't `dim * 4` (float32) is a corrupt/short row that must be
+# skipped rather than allowed to crash the whole build.
+def _expected_dim() -> int:
+    """The dimension embedding vectors are expected to have, derived from
+    `model_tier.MODEL_EMBEDDING_DIM` — the single source of truth for the
+    active embedding model's output size. Looked up via the `model_tier`
+    MODULE (not a bare imported name), mirroring `build_embedding_matrix`'s
+    own lookup convention, so a test that monkeypatches
+    `brain.bridge.model_tier.MODEL_EMBEDDING_DIM` is honored here too.
+    Called per-build (not cached at import time) so it always reflects the
+    currently configured model, including across a model swap mid-process.
+    """
+    from brain.bridge import model_tier
+
+    return model_tier.MODEL_EMBEDDING_DIM
 
 # Sentinel recorded in the pending overlay to mean "this id was evicted while
 # a build was in flight" — distinct from an absent key (no mutation) and from
@@ -198,6 +216,9 @@ class EmbeddingMatrix:
         never allowed to throw and kill the whole build (which would
         propagate into recall via the request-thread lazy build).
         """
+        expected_dim = _expected_dim()
+        expected_bytes = expected_dim * 4
+
         conn = sqlite3.connect(str(self._db_path))
         try:
             # Mirror MemoryStore's 5s busy_timeout (WAL is already on the
@@ -216,12 +237,12 @@ class EmbeddingMatrix:
         result: dict[str, np.ndarray] = {}
         for row in rows:
             mem_id, blob = row[0], row[1]
-            if blob is None or len(blob) != _EXPECTED_BYTES:
+            if blob is None or len(blob) != expected_bytes:
                 logger.warning(
                     "embedding_matrix: skipping row %s with bad embedding blob"
                     " (expected %d bytes, got %s)",
                     mem_id,
-                    _EXPECTED_BYTES,
+                    expected_bytes,
                     "None" if blob is None else len(blob),
                 )
                 continue
@@ -234,12 +255,12 @@ class EmbeddingMatrix:
                     exc,
                 )
                 continue
-            if vec.shape != (_EXPECTED_DIM,):
+            if vec.shape != (expected_dim,):
                 logger.warning(
                     "embedding_matrix: skipping row %s with wrong embedding dim"
                     " (expected %d, got %d)",
                     mem_id,
-                    _EXPECTED_DIM,
+                    expected_dim,
                     vec.shape[0],
                 )
                 continue

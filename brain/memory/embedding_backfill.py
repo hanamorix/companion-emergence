@@ -67,14 +67,22 @@ persisted cursor (this persona's ``cadence/embedding_backfill_cursor.json``)
 is a scan-cost optimization for a LARGE backlog — it lets a tick skip
 straight past a prefix already known not to be backlog, rather than
 re-querying the same window from the top every time — but it is deliberately
-NOT trusted once a tick's query returns fewer rows than `scan_cap` (i.e. the
-whole currently-null backlog fit in one scan): see the comment at the bottom
-of `run_embedding_backfill_tick` for why a forward cursor is only safe while
-the backlog is larger than one scan window. A missing/corrupt/stale cursor
-file just means the next tick rescans more than strictly necessary, never
-that a row is skipped. The cursor resets automatically on a model swap (its
-persisted `model_id` no longer matches the current provider's), so a new
-model reopens the whole backlog rather than silently under-covering it.
+NOT trusted once a tick actually EXHAUSTS its fetched candidate window (i.e.
+processes every fetched row without stopping early on its own `batch_size`
+cap) AND that window came back smaller than `scan_cap` (the whole
+currently-null backlog fit in one scan): see the comment at the bottom of
+`run_embedding_backfill_tick` for why a forward cursor is only safe while
+the backlog is larger than one scan window. (F1 #259 increment 7: this used
+to key off the fetched window size alone — `len(candidates) < scan_cap` —
+which reset to `None` on EVERY tick whenever `batch_size < backlog <
+scan_cap`, even though the tick made genuine progress; a tick that stops
+early on its batch cap now persists a forward cursor instead, so a
+long-lived persona's no-sleep drain doesn't re-scan its full history every
+single tick.) A missing/corrupt/stale cursor file just means the next tick
+rescans more than strictly necessary, never that a row is skipped. The
+cursor resets automatically on a model swap (its persisted `model_id` no
+longer matches the current provider's), so a new model reopens the whole
+backlog rather than silently under-covering it.
 
 The cursor is a COMPOSITE ``(created_at, id)`` keyset position, not a bare
 timestamp — see ``MemoryStore.list_active_since``/``list_unembedded_since``.
@@ -437,6 +445,7 @@ def run_embedding_backfill_tick(
     skipped_short = 0
     errors = 0
     resolved_up_to = cursor
+    hit_batch_limit = False
 
     for memory in candidates:
         scanned += 1
@@ -456,7 +465,10 @@ def run_embedding_backfill_tick(
         if embedded >= effective_batch_size:
             # Batch budget spent — leave this (and anything after it) for
             # next tick. Ordinary pacing, not a failure: the cursor must NOT
-            # advance past a row that was never even attempted.
+            # advance past a row that was never even attempted. Recorded so
+            # the cursor-persistence decision below (F1 #259 increment 7)
+            # knows this tick did NOT exhaust its fetched candidate window.
+            hit_batch_limit = True
             break
 
         try:
@@ -475,18 +487,37 @@ def run_embedding_backfill_tick(
         embedded += 1
         resolved_up_to = row_cursor
 
-    # If the DB-side query returned fewer rows than scan_cap, this tick has
-    # seen the WHOLE currently-null backlog — persist NO forward cursor
-    # (reset to None) rather than `resolved_up_to`. Unlike the old
-    # content-hash cache, `embedding IS NULL` is not append-only per id: a
-    # row can go null a SECOND time (a later content edit whose synchronous
-    # re-embed fails — see MemoryStore._reembed_or_clear) at a `created_at`
-    # position the cursor may already have passed. A persisted forward
-    # cursor is only a safe scan-cost optimization while the backlog is
-    # LARGER than one scan window (the case it exists to make cheap); once
-    # it fits in one window, resetting is nearly free and makes the NEXT
-    # tick a full, self-healing rescan instead of trusting a stale position.
-    cursor_to_persist = None if len(candidates) < scan_cap else resolved_up_to
+    # Reset the cursor to None ONLY when this tick genuinely EXHAUSTED its
+    # fetched candidate window — processed every row without stopping early
+    # on its own `batch_size` cap (`not hit_batch_limit`) — AND that window
+    # was smaller than `scan_cap` (the whole remaining backlog fit in one
+    # scan). Unlike the old content-hash cache, `embedding IS NULL` is not
+    # append-only per id: a row can go null a SECOND time (a later content
+    # edit whose synchronous re-embed fails — see
+    # MemoryStore._reembed_or_clear) at a `created_at` position the cursor
+    # may already have passed. A persisted forward cursor is only a safe
+    # scan-cost optimization while there is more of the CURRENTLY FETCHED
+    # window left to examine (the `hit_batch_limit` case) or the backlog is
+    # LARGER than one scan window; once the window is both fully processed
+    # and smaller than `scan_cap`, resetting is nearly free and makes the
+    # NEXT tick a full, self-healing rescan instead of trusting a stale
+    # position.
+    #
+    # F1 #259 increment 7 perf fix: this used to key off `len(candidates) <
+    # scan_cap` ALONE, which reset to None on every tick whenever
+    # `batch_size < remaining_backlog < scan_cap` — even though the tick had
+    # just made real progress — forcing the next tick to re-scan the whole
+    # backlog from the top instead of continuing from where it left off.
+    # Under the no-sleep drain (`run_embedding_backfill_to_completion`) on a
+    # long-lived persona this meant every single tick re-scanned full
+    # history. Now a tick that stops early on its batch cap persists a
+    # forward cursor (`hit_batch_limit` is True, so `window_exhausted` is
+    # False regardless of `len(candidates)`), and a genuinely-drained tick
+    # (no batch cap hit, window smaller than scan_cap) still resets — the
+    # "catch rows that went NULL behind the cursor" self-healing property is
+    # unchanged for that case.
+    window_exhausted = not hit_batch_limit and len(candidates) < scan_cap
+    cursor_to_persist = None if window_exhausted else resolved_up_to
     _save_cursor(persona_dir, model_id, cursor_to_persist)
 
     return BackfillTickResult(
@@ -549,26 +580,34 @@ def run_embedding_backfill_to_completion(
     own cursor-freeze fix already lets ONE tick skip past a failing row and
     keep going — but a naive `while backlog not empty: tick()` loop can
     still spin forever on a SMALL backlog that is entirely (or down to its
-    last row) permanently-failing. Why: `run_embedding_backfill_tick`
-    intentionally resets its persisted cursor to `None` whenever a tick sees
-    FEWER than `scan_cap` candidates (i.e. the whole remaining backlog fit
-    in one scan — see that function's closing comment) — a still-NULL
-    permanently-failing row stays in that same small backlog forever, so the
-    VERY NEXT tick would rescan from the top, hit the identical row(s),
-    fail identically, and reset the cursor to `None` again: infinite,
-    byte-for-byte-identical repetition, burning real provider calls for no
-    progress. Detect this directly rather than counting on a wall-clock
-    timeout: if a tick embeds ZERO rows AND saw fewer than `scan_cap`
-    candidates (`result.scanned < scan_cap` — the exact condition under
-    which the tick just reset its cursor to `None`), stop — the next tick is
-    guaranteed to reproduce the same result, so there is nothing to gain by
-    calling it. (A tick that scans a FULL `scan_cap` window of entirely
-    failing rows is NOT a stall: its cursor advances PAST that window
-    regardless of success/failure — see the tick's own skip-and-log cursor
-    logic — so the NEXT tick genuinely examines different, not-yet-seen
-    rows; looping continues in that case.) A tick that saw zero candidates
-    at all (`scanned == 0`) means there is nothing left reachable from the
-    current cursor position — also stop.
+    last row) permanently-failing. Why: whenever a tick embeds ZERO rows, it
+    can never have stopped early on its own `batch_size` cap (that cap only
+    triggers after `embedded >= 1`), so it necessarily processed every
+    fetched candidate — meaning `run_embedding_backfill_tick` resets its
+    persisted cursor to `None` whenever a tick both embeds zero rows AND
+    sees FEWER than `scan_cap` candidates (i.e. the whole remaining backlog
+    fit in one scan and every row in it failed or was skipped — see that
+    function's closing comment) — a still-NULL permanently-failing row stays
+    in that same small backlog forever, so the VERY NEXT tick would rescan
+    from the top, hit the identical row(s), fail identically, and reset the
+    cursor to `None` again: infinite, byte-for-byte-identical repetition,
+    burning real provider calls for no progress. Detect this directly rather
+    than counting on a wall-clock timeout: if a tick embeds ZERO rows AND
+    saw fewer than `scan_cap` candidates (`result.scanned < scan_cap` — the
+    exact condition under which the tick just reset its cursor to `None`),
+    stop — the next tick is guaranteed to reproduce the same result, so
+    there is nothing to gain by calling it. (A tick that scans a FULL
+    `scan_cap` window of entirely failing rows is NOT a stall: its cursor
+    advances PAST that window regardless of success/failure — see the
+    tick's own skip-and-log cursor logic — so the NEXT tick genuinely
+    examines different, not-yet-seen rows; looping continues in that case.
+    Likewise a tick that DOES embed rows before hitting its `batch_size` cap
+    also advances its cursor rather than resetting — F1 #259 increment 7 —
+    but that case can never satisfy this stall check's `embedded == 0`
+    condition in the first place, so the termination guard's correctness is
+    unaffected.) A tick that saw zero candidates at all (`scanned == 0`)
+    means there is nothing left reachable from the current cursor position
+    — also stop.
 
     Both stop conditions are reached in a BOUNDED number of ticks: the
     keyset cursor only ever moves forward (or resets to re-scan a

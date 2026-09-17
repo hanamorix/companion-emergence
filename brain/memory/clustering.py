@@ -409,6 +409,13 @@ def run_clustering_pass(
     The k-means algorithm itself (`choose_k`/`kmeans` above) is unchanged —
     only the vector source and the write destination moved.
 
+    Dormant asymmetry (harmless today): writes are tagged with the warm
+    matrix's own `model_id` (singleton-cached at first build — see
+    `EmbeddingMatrix`), not a fresh `model_tier.model_for_tier(TIER_EMBEDDING)`
+    lookup like other call sites use. Fine as long as nothing hot-reloads the
+    embedding model mid-process (true today); it becomes a landmine only if
+    that ever changes, since the matrix wouldn't notice the swap on its own.
+
     Off the message hot path by construction — callers only ever invoke this
     from a periodic background tick (see `_run_clustering_tick` in
     `brain/bridge/supervisor.py`), never from a chat-turn code path.

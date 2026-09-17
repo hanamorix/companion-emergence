@@ -14,10 +14,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from brain.bridge.model_tier import MODEL_EMBEDDING_DIM
 from brain.memory.embedding_matrix import EmbeddingMatrix
 from brain.memory.store import MemoryStore
 
-DIM = 384
+# F1 #259 increment 7: derived from the model_tier.py constant rather than a
+# literal — a future multilingual embedding model swap (different dim) must
+# not require touching this fixture's dimension by hand.
+DIM = MODEL_EMBEDDING_DIM
 
 
 def _vec(seed: float) -> np.ndarray:
@@ -476,8 +480,9 @@ def test_corrupt_embedding_blob_is_skipped_not_fatal(seeded_db) -> None:
 
 def test_wrong_dim_embedding_blob_is_skipped(seeded_db) -> None:
     """A blob whose byte length is a clean float32 multiple but the wrong
-    dimension (not 384) is skipped, not served as a malformed vector."""
-    wrong = np.full(128, 0.5, dtype=np.float32).tobytes()  # 128-dim, not 384
+    dimension (not DIM) is skipped, not served as a malformed vector."""
+    wrong_dim = 128 if DIM != 128 else 64
+    wrong = np.full(wrong_dim, 0.5, dtype=np.float32).tobytes()  # not DIM
     _insert_row(seeded_db, "mem-wrong-dim", wrong, "fake-model-v1")
     matrix = EmbeddingMatrix(seeded_db, model_id="fake-model-v1")
     snap = matrix.snapshot()

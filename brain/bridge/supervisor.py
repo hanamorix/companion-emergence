@@ -2318,7 +2318,11 @@ def _run_clustering_tick(persona_dir: Path) -> None:
     from brain.memory.clustering import run_clustering_pass
 
     with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
+        # integrity_check=False mirrors the sweep/maker/notes/vocab-repair
+        # ticks in this file (F1 #259 increment 7) — a full PRAGMA
+        # integrity_check on every construction is unwarranted for a
+        # background cadence tick; deep checks are health.py's job.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
         result = run_clustering_pass(store)

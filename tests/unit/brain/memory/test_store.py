@@ -1190,18 +1190,23 @@ def test_hard_delete_raises_on_unknown_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _use_384_fake_provider(monkeypatch: pytest.MonkeyPatch):
-    """Override the process-cached embedding provider to a 384-dim
-    `FakeEmbeddingProvider` and align `model_tier`'s embedding tier to its
-    model id.
+def _use_matrix_dim_fake_provider(monkeypatch: pytest.MonkeyPatch):
+    """Override the process-cached embedding provider to a
+    `FakeEmbeddingProvider` sized to `model_tier.MODEL_EMBEDDING_DIM` and
+    align `model_tier`'s embedding tier to its model id.
 
     Two separate reasons this alignment is needed, both load-bearing for
     every test below:
       (1) DIMENSION — the suite-wide autouse fixture fakes the provider to
-          `FakeEmbeddingProvider(dim=256)`, but `EmbeddingMatrix` hardcodes
-          an expected blob width of 384 (matching production's real
-          `MODEL_EMBEDDING_DIM`) and silently SKIPS any other-width row — a
-          256-dim embed would never appear in the matrix no matter what.
+          `FakeEmbeddingProvider(dim=256)`, but `EmbeddingMatrix` expects a
+          blob width derived from `model_tier.MODEL_EMBEDDING_DIM` (F1 #259
+          increment 7 — no longer a hardcoded literal, but still must MATCH
+          whatever that constant currently is) and silently SKIPS any
+          other-width row — a 256-dim embed would never appear in the
+          matrix no matter what. Sizing this fixture off the same constant
+          (rather than a literal) means it keeps matching automatically if
+          `MODEL_EMBEDDING_DIM` is ever repointed (e.g. a multilingual model
+          swap).
       (2) MODEL ID — `embed_row` embeds via the process-cached provider, but
           the matrix's lazy-build filter is sourced from
           `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — a
@@ -1212,7 +1217,7 @@ def _use_384_fake_provider(monkeypatch: pytest.MonkeyPatch):
     from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
-    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=model_tier.MODEL_EMBEDDING_DIM)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
     monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
     return provider
@@ -1227,7 +1232,7 @@ def test_fade_reembeds_row_and_matrix_with_new_content(tmp_path, monkeypatch: py
 
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1255,7 +1260,7 @@ def test_update_content_reembeds_row_and_matrix(tmp_path, monkeypatch: pytest.Mo
 
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1275,7 +1280,7 @@ def test_update_content_reembeds_row_and_matrix(tmp_path, monkeypatch: pytest.Mo
 def test_update_without_content_does_not_reembed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-content field update must NOT trigger a re-embed — only a
     `content` change invalidates the vector."""
-    _use_384_fake_provider(monkeypatch)
+    _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="stable content", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1298,7 +1303,7 @@ def test_unfade_reembeds_row_and_matrix_with_restored_content(
 ) -> None:
     """Fails pre-fix: `unfade()` never re-embedded, so the row kept the
     fade-summary's vector after content was restored to the full body."""
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(
         content="the full original body", memory_type="episodic", domain="chat", emotions={}
@@ -1323,7 +1328,7 @@ def test_hard_delete_evicts_matrix_entry(tmp_path, monkeypatch: pytest.MonkeyPat
     warm cache."""
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    _use_384_fake_provider(monkeypatch)
+    _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="to be deleted", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1348,7 +1353,7 @@ def test_embed_row_succeeds_even_if_warm_matrix_put_fails(
     `embed_row`, and must never look like the embed itself failed."""
     from brain.memory import embedding_matrix as embedding_matrix_mod
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(
         content="content that gets embedded", memory_type="episodic", domain="chat", emotions={}
@@ -1379,7 +1384,7 @@ def test_reembed_or_clear_clears_row_and_evicts_matrix_on_embed_failure(
     is always safer than a vector silently describing stale content."""
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="original", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1461,7 +1466,7 @@ def test_update_content_nulls_embedding_in_same_commit_before_reembed(
 
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="old content", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1502,7 +1507,7 @@ def test_fade_nulls_embedding_in_same_commit_before_reembed(
 
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(content="original long body", memory_type="episodic", domain="chat", emotions={})
     store.create(m)
@@ -1541,7 +1546,7 @@ def test_unfade_nulls_embedding_in_same_commit_before_reembed(
 
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    provider = _use_384_fake_provider(monkeypatch)
+    provider = _use_matrix_dim_fake_provider(monkeypatch)
     store = MemoryStore(tmp_path / "memories.db")
     m = Memory.create_new(
         content="the full original body", memory_type="episodic", domain="chat", emotions={}

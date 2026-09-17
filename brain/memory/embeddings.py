@@ -256,13 +256,14 @@ class EmbeddingCache:
         """Return every ``(content_hash, vector)`` pair cached under THIS
         cache's model_id.
 
-        Used by the memory-clustering batch pass
-        (``brain/memory/clustering.py``, Stage 5 of the local semantic-
-        retrieval build) to build its candidate pool without reaching into
-        ``_conn`` directly (the pattern ``brain/ingest/dedupe.py`` uses,
-        flagged there as a wart). Scoped to `model_id` like every other read
-        here — a vector from a prior/different provider never enters a
-        clustering pass run under a different model.
+        No longer called by the memory-clustering pass (F1 #259 increment 4
+        moved ``brain/memory/clustering.py`` onto the warm `EmbeddingMatrix`
+        over the `memories` row columns instead of this content-hash cache —
+        see that module's docstring). Retained, unused by production code,
+        until the increment-8 teardown removes `EmbeddingCache`/
+        `embeddings.db` entirely; not a call site to wire anything new onto.
+        Scoped to `model_id` like every other read here — a vector from a
+        prior/different provider never enters the result.
         """
         query = "SELECT content_hash, vector, dim FROM embedding_cache WHERE model_id = ?"
         params: list[object] = [self._model_id]

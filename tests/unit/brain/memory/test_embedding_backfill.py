@@ -224,6 +224,92 @@ def test_backlog_shrinks_across_repeated_ticks(tmp_path: Path) -> None:
     assert embedded_count == 10
 
 
+def test_cursor_advances_not_resets_when_batch_cap_stops_a_tick_short_of_its_window(
+    tmp_path: Path,
+) -> None:
+    """F1 #259 increment 7 perf fix: when `batch_size < remaining_backlog <
+    scan_cap`, a tick that hits its OWN batch-size cap (stops before
+    processing every row the SQL query fetched) must persist a forward
+    cursor, not reset to None — resetting here (keying only off
+    `len(candidates) < scan_cap`, the pre-fix behavior) forced every
+    subsequent tick under a no-sleep drain to re-scan the full backlog from
+    the top despite real progress being made. Once the remaining backlog
+    genuinely fits inside a tick's batch (no cap hit, window smaller than
+    scan_cap), the cursor still resets to None — the "catch rows that went
+    NULL behind the cursor" self-healing property is preserved for that
+    case."""
+    from brain.memory import embeddings as embeddings_mod
+
+    made = _seed(tmp_path, 10)
+    model_id = embeddings_mod.build_embedding_provider().model_id()
+
+    # Tick 1: batch_size(3) < backlog(10) < scan_cap(100) — hits the batch
+    # cap partway through the fetched window (scans 1 row past the 3rd
+    # embed to discover the cap, per the tick's own accounting).
+    store = _open_store(tmp_path)
+    try:
+        result1 = run_embedding_backfill_tick(tmp_path, store, batch_size=3, scan_cap=100)
+    finally:
+        store.close()
+    assert result1.embedded == 3
+    assert result1.scanned == 4
+
+    # The cursor must have ADVANCED (pinned at the 3rd/last-embedded row),
+    # not reset to None, even though len(candidates)=10 < scan_cap=100.
+    persisted = _load_cursor(tmp_path, model_id)
+    assert persisted is not None
+    assert persisted[1] == made[2].id
+
+    # Tick 2 continues from the persisted cursor instead of re-scanning from
+    # the top — it must not re-see the 3 already-embedded rows.
+    store2 = _open_store(tmp_path)
+    try:
+        result2 = run_embedding_backfill_tick(tmp_path, store2, batch_size=3, scan_cap=100)
+    finally:
+        store2.close()
+    assert result2.embedded == 3
+    assert result2.scanned == 4  # rows 3,4,5 embedded; row 6 discovers the cap
+
+    store3 = _open_store(tmp_path)
+    try:
+        for m in made[:6]:
+            assert _is_embedded(store3, m.id) is True
+        for m in made[6:]:
+            assert _is_embedded(store3, m.id) is False
+    finally:
+        store3.close()
+    # Still mid-backlog — cursor stays pinned forward, not reset.
+    assert _load_cursor(tmp_path, model_id) is not None
+
+    # Tick 3: 4 rows remain, batch_size=3 — hits the cap again.
+    store4 = _open_store(tmp_path)
+    try:
+        result3 = run_embedding_backfill_tick(tmp_path, store4, batch_size=3, scan_cap=100)
+    finally:
+        store4.close()
+    assert result3.embedded == 3
+    assert _load_cursor(tmp_path, model_id) is not None
+
+    # Tick 4: exactly 1 row remains — the batch cap is NOT hit (1 < 3), so
+    # the tick genuinely exhausts its fetched window. The cursor now resets
+    # to None, preserving the self-healing property.
+    store5 = _open_store(tmp_path)
+    try:
+        result4 = run_embedding_backfill_tick(tmp_path, store5, batch_size=3, scan_cap=100)
+    finally:
+        store5.close()
+    assert result4.embedded == 1
+    assert result4.scanned == 1
+    assert _load_cursor(tmp_path, model_id) is None
+
+    store6 = _open_store(tmp_path)
+    try:
+        for m in made:
+            assert _is_embedded(store6, m.id) is True
+    finally:
+        store6.close()
+
+
 def test_scan_cap_bounds_rows_examined(tmp_path: Path) -> None:
     """scan_cap bounds how many rows are even looked at, independent of batch_size."""
     _seed(tmp_path, 50)
