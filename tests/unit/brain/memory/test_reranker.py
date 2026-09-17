@@ -61,6 +61,12 @@ def test_fake_reranker_model_id_is_stable_and_distinct() -> None:
 
 
 def test_build_reranker_provider_is_process_cached_by_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scoped to the OUTER provider-caching machinery only — the fp16-vs-
+    fp32 precision DECISION (F2a inc2, #250 §2) is a separate concern with
+    its own dedicated tests below (`_choose_reranker_model_id` /
+    `_run_precision_selfcheck`), so that self-check is short-circuited here
+    via a passthrough stub (mirrors how `_fake_reranker_provider_by_default`
+    intercepts the whole factory for the rest of the suite)."""
     _reset_reranker_provider_cache()
     calls = {"n": 0}
 
@@ -70,6 +76,9 @@ def test_build_reranker_provider_is_process_cached_by_model_id(monkeypatch: pyte
             calls["n"] += 1
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _CountingFake)
+    monkeypatch.setattr(
+        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir: fp32_id
+    )
     monkeypatch.setattr(
         "brain.bridge.model_tier.model_for_tier", lambda tier: "fake-model-id"
     )
@@ -85,6 +94,10 @@ def test_build_reranker_provider_is_process_cached_by_model_id(monkeypatch: pyte
 
 
 def test_reset_reranker_provider_cache_forces_reconstruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scoped to the OUTER provider-caching machinery only — see the
+    docstring on `test_build_reranker_provider_is_process_cached_by_model_id`
+    above for why the precision self-check is stubbed to a passthrough
+    here."""
     _reset_reranker_provider_cache()
     calls = {"n": 0}
 
@@ -94,6 +107,9 @@ def test_reset_reranker_provider_cache_forces_reconstruction(monkeypatch: pytest
             calls["n"] += 1
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _CountingFake)
+    monkeypatch.setattr(
+        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir: fp32_id
+    )
     monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "fake-model-id")
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
 
@@ -446,3 +462,306 @@ def test_width_measurement_failure_with_sample_docs_is_fail_soft(
     width = get_rerank_width(4, _BoomProvider(), ["a real candidate-pool document"])
     assert width == 4, "measurement failure -> unthrottled (pool_size-capped) width, never an exception"
     _reset_latency_cache()
+
+
+# ---------------------------------------------------------------------------
+# fp16-vs-fp32 accuracy self-check (F2a inc2, #250 §2) — all OFFLINE via a
+# scripted stub provider + a fake monotonic clock (same techniques the
+# latency-auto-calibration tests above already use), no real model/network.
+# ---------------------------------------------------------------------------
+
+
+class _PrecisionTimingProvider(RerankerProvider):
+    """Deterministic stub standing in for `CrossEncoderProvider`: scores are
+    keyed by (query, doc) and shared across whichever model_id is asked for
+    (a test overrides per-model_id via the `scores` dict it's constructed
+    with), and each `rerank()` call advances a SHARED fake clock by a
+    per-instance fixed amount — the same "advance the clock inside
+    rerank()" trick `_PlaceholderVsRealisticProvider` above uses, so
+    `_measure_warm_per_doc_latency`'s `time.monotonic()` before/after
+    bracketing reads back an exact, known per-doc latency with no real
+    sleeping."""
+
+    def __init__(
+        self,
+        model_id: str,
+        scores: dict[tuple[str, str], float],
+        clock: dict[str, float],
+        seconds_per_call: float,
+    ) -> None:
+        self._model_id = model_id
+        self._scores = scores
+        self._clock = clock
+        self._seconds_per_call = seconds_per_call
+
+    def rerank(self, query: str, documents: list[str]):
+        out = []
+        for doc in documents:
+            self._clock["t"] += self._seconds_per_call
+            out.append(self._scores.get((query, doc), -1_000.0))
+        return out
+
+    def model_id(self) -> str:
+        return self._model_id
+
+
+def _install_precision_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fp32_id: str,
+    fp16_id: str,
+    fp32_scores: dict[tuple[str, str], float],
+    fp16_scores: dict[tuple[str, str], float],
+    fp32_seconds_per_call: float,
+    fp16_seconds_per_call: float,
+) -> dict[str, float]:
+    """Wires a fake clock + a `CrossEncoderProvider` stub that returns a
+    `_PrecisionTimingProvider` scripted per model_id, and no-ops the real
+    fastembed registration call (metadata-only in production, but this
+    keeps these tests hermetic and independent of fastembed's own
+    registry state). Returns the shared clock dict."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(reranker_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", lambda *a, **k: None)
+
+    def _fake_ctor(model_id: str, cache_dir):
+        if model_id == fp16_id:
+            return _PrecisionTimingProvider(model_id, fp16_scores, clock, fp16_seconds_per_call)
+        return _PrecisionTimingProvider(model_id, fp32_scores, clock, fp32_seconds_per_call)
+
+    monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _fake_ctor)
+    return clock
+
+
+def test_precision_selfcheck_ships_fp16_on_agreement_and_a_measured_speed_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub scenario 1: fp16 and fp32 agree on every bundled surface/abstain
+    decision, AND fp16 measures faster on this (simulated) host -> the gate
+    ships fp16."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-agree-fast", "fake-fp16-agree-fast"
+    # Every bundled pair scores well above RERANK_FLOOR for BOTH precisions
+    # -> every "surfaced" decision agrees.
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+    _install_precision_stubs(
+        monkeypatch,
+        fp32_id=fp32_id,
+        fp16_id=fp16_id,
+        fp32_scores=agree_scores,
+        fp16_scores=agree_scores,
+        fp32_seconds_per_call=0.02,
+        fp16_seconds_per_call=0.01,  # fp16 measurably faster
+    )
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert chosen == fp16_id, "agreement + a real speed win must ship fp16"
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_ships_fp32_on_any_decision_disagreement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub scenario 2: fp16 flips the surface/abstain decision on exactly
+    ONE bundled pair (fp32 keeps it, fp16 would drop it) -> the gate ships
+    fp32, even though fp16 would otherwise be faster. Proves the mechanical
+    bar is ZERO-tolerance, not a percentage — a single flip fails it."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-disagree", "fake-fp16-disagree"
+    fp32_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)  # fp32 keeps everything
+    fp16_scores = dict(fp32_scores)
+    flipped_pair = _FP16_GATE_PAIRS[0]
+    fp16_scores[flipped_pair] = -1_000.0  # fp16 alone drops this one
+
+    _install_precision_stubs(
+        monkeypatch,
+        fp32_id=fp32_id,
+        fp16_id=fp16_id,
+        fp32_scores=fp32_scores,
+        fp16_scores=fp16_scores,
+        fp32_seconds_per_call=0.02,
+        fp16_seconds_per_call=0.01,  # fp16 would be faster, but must not matter here
+    )
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert chosen == fp32_id, "any single flipped keep/drop decision must fail the gate -> fp32"
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_ships_fp32_when_agreement_holds_but_fp16_is_not_faster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub scenario 3: fp16 agrees with fp32 on every bundled decision, but
+    measures NO FASTER on this (simulated, no-AVX2-potato-like) host -> the
+    gate ships fp32 anyway (agreement alone is not sufficient — §2 FORK 2's
+    rationale (iii): a potato CPU may not accelerate fp16, and shipping it
+    without a real latency win is a pure downside)."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-not-faster", "fake-fp16-not-faster"
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+    _install_precision_stubs(
+        monkeypatch,
+        fp32_id=fp32_id,
+        fp16_id=fp16_id,
+        fp32_scores=agree_scores,
+        fp16_scores=agree_scores,
+        fp32_seconds_per_call=0.01,
+        fp16_seconds_per_call=0.02,  # fp16 SLOWER on this simulated host
+    )
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert chosen == fp32_id, "agreement without a measured fp16 speed win must still ship fp32"
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_decision_is_cached_not_recomputed_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The self-check is a cached FIRST-USE cost, not a per-recall one: a
+    second call for the SAME (fp32_model_id, fp16_model_id) pair must be a
+    pure cache hit — no additional provider construction."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-cached", "fake-fp16-cached"
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(reranker_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", lambda *a, **k: None)
+
+    construct_calls = {"n": 0}
+
+    def _fake_ctor(model_id: str, cache_dir):
+        construct_calls["n"] += 1
+        seconds = 0.01 if model_id == fp16_id else 0.02
+        return _PrecisionTimingProvider(model_id, agree_scores, clock, seconds)
+
+    monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _fake_ctor)
+
+    first = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    calls_after_first = construct_calls["n"]
+    assert calls_after_first > 0, "the first (uncached) call must actually run the self-check"
+
+    second = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert second == first, "a cache hit must return the same decision"
+    assert construct_calls["n"] == calls_after_first, (
+        "a second call for the same (fp32, fp16) pair must be a pure cache hit — "
+        "the expensive check runs once, not per call"
+    )
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_registration_failure_is_fail_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If registering the fp16 export itself fails (e.g. a bad model
+    description, an incompatible fastembed version), the self-check must
+    still resolve to fp32 rather than raising into a recall."""
+    from brain.memory.reranker import _choose_reranker_model_id, _reset_precision_decision_cache
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-regfail", "fake-fp16-regfail"
+
+    def _boom_register(*args, **kwargs):
+        raise RuntimeError("simulated fastembed registration failure")
+
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", _boom_register)
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert chosen == fp32_id, "a registration failure must fail-soft to fp32, never raise"
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_load_failure_is_fail_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If constructing a provider for either candidate fails (e.g. the fp16
+    onnx file doesn't actually exist on the HF repo, or a load error), the
+    self-check must still resolve to fp32 rather than raising."""
+    from brain.memory.reranker import _choose_reranker_model_id, _reset_precision_decision_cache
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-loadfail", "fake-fp16-loadfail"
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", lambda *a, **k: None)
+
+    def _boom_ctor(model_id: str, cache_dir):
+        raise RuntimeError("simulated onnx load failure")
+
+    monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _boom_ctor)
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    assert chosen == fp32_id, "a provider construction/load failure must fail-soft to fp32, never raise"
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_cache_key_invalidates_on_model_swap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cached decision is keyed by the (fp32_model_id, fp16_model_id)
+    PAIR, so a model swap on either side (a mini-model registration change)
+    must not serve a stale decision computed for the OLD pair."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
+
+    _reset_precision_decision_cache()
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(reranker_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", lambda *a, **k: None)
+
+    construct_calls = {"n": 0}
+
+    def _fake_ctor(model_id: str, cache_dir):
+        construct_calls["n"] += 1
+        return _PrecisionTimingProvider(model_id, agree_scores, clock, 0.01)
+
+    monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _fake_ctor)
+
+    _choose_reranker_model_id("fp32-v1", "fp16-v1", "/tmp/fake-cache-dir")
+    calls_after_first_pair = construct_calls["n"]
+
+    # A different fp32/fp16 pair (simulating a model swap) must re-run the
+    # self-check, not reuse the old pair's cached decision.
+    _choose_reranker_model_id("fp32-v2", "fp16-v2", "/tmp/fake-cache-dir")
+    assert construct_calls["n"] > calls_after_first_pair, (
+        "a different (fp32, fp16) model-id pair must invalidate the cache and re-run the self-check"
+    )
+    _reset_precision_decision_cache()
+
+
+def test_ac3_no_int8_quantization_code_path() -> None:
+    """AC#3: int8 quantization was explicitly dropped (Roy's catch: a 278M
+    model has less redundancy to absorb int8's accuracy hit than fp16 —
+    fp16 is the one quantization lever). Mechanical grep-level check: the
+    reranker module (and the model_tier registrations it reads) must
+    contain no "int8" code path at all."""
+    import inspect
+
+    from brain.bridge import model_tier as model_tier_mod
+
+    assert "int8" not in inspect.getsource(reranker_mod).lower(), (
+        "no int8 quantization code path may exist in brain/memory/reranker.py"
+    )
+    assert "int8" not in inspect.getsource(model_tier_mod).lower(), (
+        "no int8 quantization code path may exist in brain/bridge/model_tier.py"
+    )

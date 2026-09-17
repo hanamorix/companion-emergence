@@ -138,6 +138,27 @@ MODEL_EMBEDDING_DIM = 1024
 # free/open-source, non-commercial project.
 MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encoder, ~1.11GB fp32, via fastembed
 
+# fp16 export of the SAME model (F2a inc2, #250 §2) — the HF repo above also
+# ships onnx/model_fp16.onnx (~557MB, confirmed present on the repo), but it
+# is NOT pre-registered in fastembed's built-in TextCrossEncoder registry
+# (only the fp32 onnx/model.onnx export above is). brain/memory/reranker.py
+# registers this id via TextCrossEncoder.add_custom_model() pointing at that
+# file, then uses it ONLY as the fp16 candidate in a cached first-use
+# fp16-vs-fp32 accuracy self-check (mirrors reranker.py's existing warm
+# per-doc latency auto-calibration: measured once, cached, not
+# per-recall) — never read directly via model_for_tier/TIER_MODEL, so it
+# stays a plain companion constant here rather than its own tier (same
+# non-tier treatment MODEL_EMBEDDING_DIM gets above). The self-check
+# decides, per box, whether production actually serves this fp16 export or
+# falls back to MODEL_RERANKER's fp32 export — either the fp16 export fails
+# to preserve fp32's surface/abstain decisions on the bundled representative
+# pairs, or it does but isn't measurably faster on this host (a no-AVX2
+# potato CPU may not accelerate fp16), and fp32 stays the safe default in
+# both cases. 8-bit quantization was explicitly ruled out (a 278M model has
+# less redundancy to absorb an 8-bit accuracy hit than a larger model
+# would); fp16 is the one quantization lever here.
+MODEL_RERANKER_FP16 = "jinaai/jina-reranker-v2-base-multilingual-fp16"
+
 # attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
 # (not the bare "haiku" alias) — this predates #154 and substituting the alias
 # could silently repoint it to a different snapshot over time. Moved here from

@@ -50,14 +50,20 @@ Run by hand with network enabled, e.g.:
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
-from brain.memory.reranker import build_reranker_provider
+from brain.memory.reranker import (
+    CrossEncoderProvider,
+    _register_fp16_reranker_model,
+    build_reranker_provider,
+)
 
 pytestmark = [pytest.mark.requires_network, pytest.mark.integration]
 
 _MODEL_ID = "jinaai/jina-reranker-v2-base-multilingual"
+_FP16_MODEL_ID = "jinaai/jina-reranker-v2-base-multilingual-fp16"  # F2a inc2, #250 §2 — model_tier.MODEL_RERANKER_FP16
 
 # ---------------------------------------------------------------------------
 # (query, document) pairs — reused from #88 / test_search_memories_mode.py
@@ -100,11 +106,23 @@ def real_provider():
     is itself the acceptance-criterion-#1 proof: if jina needed the
     external-data materialize workaround F1's e5-large embedder needs, this
     fixture would raise (an onnxruntime "external data path escapes"
-    error) instead of returning a working provider."""
+    error) instead of returning a working provider.
+
+    F2a inc2 (#250 §2): ``build_reranker_provider()`` now runs the cached
+    first-use fp16-vs-fp32 accuracy self-check before returning a provider,
+    so which of the two exports actually comes back is a REAL, box-
+    dependent verdict (not pinned to fp32 anymore) — the assertion below
+    accepts either id rather than hard-pinning fp32, since inc2 legitimately
+    makes that choice non-deterministic across hosts. The self-check's OWN
+    correctness (agreement/disagreement/speed-win logic) is covered
+    offline, by stub, in test_reranker.py; this file stays a real-model
+    load+score shape/sanity guard, not a calibration suite, per its module
+    docstring above."""
     provider = build_reranker_provider()
-    assert provider.model_id() == _MODEL_ID, (
-        "expected the #250 F2a inc1 jina reranker model id — model_tier.py's "
-        "TIER_RERANKER mapping changed out from under this test"
+    assert provider.model_id() in (_MODEL_ID, _FP16_MODEL_ID), (
+        "expected either the #250 F2a inc1 jina fp32 id or its inc2 fp16 export id "
+        "(whichever the fp16-vs-fp32 self-check picked on this host) — model_tier.py's "
+        "TIER_RERANKER/MODEL_RERANKER_FP16 mapping changed out from under this test"
     )
     return provider
 
@@ -181,3 +199,47 @@ def test_real_reranker_orders_genuine_above_decoy_across_sample(real_provider) -
         f"expected every genuine pair to outscore every decoy pair — "
         f"weakest genuine={min_genuine} vs strongest decoy={max_decoy}"
     )
+
+
+def test_real_fp16_reranker_loads_and_scores() -> None:
+    """F2a inc2 (#250 §2) acceptance criterion #2's REAL-load proof (the
+    "AC#2 proof" the fp16-vs-fp32 self-check itself depends on): the fp16
+    onnx export (``onnx/model_fp16.onnx`` on the SAME jina HF repo, ~557MB)
+    registers via ``TextCrossEncoder.add_custom_model()`` and loads/scores
+    cleanly through the SAME ``CrossEncoderProvider`` construction
+    production code uses (``_run_precision_selfcheck`` /
+    ``build_reranker_provider`` both build it exactly this way).
+
+    Deliberately constructs the fp16 provider DIRECTLY (not via
+    ``build_reranker_provider()``) so this test is independent of the
+    self-check's own DECISION (a separate, offline-tested concern in
+    test_reranker.py) — this is purely "does the fp16 export load and
+    score cleanly," the same shape as ``test_real_reranker_loads_and_
+    scores`` above but for the fp16 candidate specifically."""
+    from brain.paths import get_cache_dir
+
+    _register_fp16_reranker_model(_FP16_MODEL_ID, _MODEL_ID)
+    provider = CrossEncoderProvider(model_id=_FP16_MODEL_ID, cache_dir=get_cache_dir())
+
+    query = "how do I calm down when everything feels like too much"
+    docs = [
+        "the stock market closed higher today on tech earnings",  # decoy
+        "deep breathing helps when you are feeling anxious",  # genuine
+    ]
+
+    start = time.monotonic()
+    scores = provider.rerank(query, docs)
+    elapsed = time.monotonic() - start
+
+    print(f"\njina fp16 real reranker load+score time: {elapsed:.2f}s")
+    print(f"jina fp16 real reranker scores: {list(zip(docs, scores, strict=True))}")
+
+    assert provider.model_id() == _FP16_MODEL_ID
+    assert isinstance(scores, list), "rerank() must return a list, not a lazy iterable/generator"
+    assert len(scores) == len(docs), "one score per input document"
+    for score in scores:
+        assert isinstance(score, float), f"expected a plain float, got {type(score)!r} ({score!r})"
+        assert math.isfinite(score), f"reranker score must be finite, got {score!r}"
+
+    decoy_score, genuine_score = scores
+    assert genuine_score > decoy_score, "higher score = more relevant (genuine beats decoy), fp16 too"
