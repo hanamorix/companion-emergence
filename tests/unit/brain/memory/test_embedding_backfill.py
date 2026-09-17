@@ -27,6 +27,7 @@ from brain.memory.embedding_backfill import (
     DEFAULT_SCAN_CAP,
     MIN_CHARS_TO_EMBED,
     _load_cursor,
+    delete_legacy_embeddings_db,
     run_embedding_backfill_tick,
     run_embedding_backfill_to_completion,
 )
@@ -1165,3 +1166,161 @@ def test_drain_empty_backlog_returns_immediately(
     assert result.scanned == 0
     assert result.ticks == 1
     assert result.stopped_reason == "no_more_candidates"
+
+
+# ---------------------------------------------------------------------------
+# delete_legacy_embeddings_db — run-once, fail-safe deletion of the old
+# embeddings.db file (F1 #259 increment 9, spec §5 / S9, invariant I9).
+# ---------------------------------------------------------------------------
+
+
+def _write_dummy_embeddings_db(persona_dir: Path, *, with_sidecars: bool = True) -> Path:
+    """A stand-in for the legacy embeddings.db file — content is irrelevant
+    to the function under test, which never opens it, only checks existence
+    and deletes it."""
+    db_path = persona_dir / "embeddings.db"
+    db_path.write_bytes(b"legacy sqlite content, never actually read")
+    if with_sidecars:
+        (persona_dir / "embeddings.db-wal").write_bytes(b"wal")
+        (persona_dir / "embeddings.db-shm").write_bytes(b"shm")
+    return db_path
+
+
+def test_delete_legacy_embeddings_db_deletes_when_fully_embedded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a) embeddings.db exists + every active >=MIN_CHARS row already
+    carries a current-model embedding -> the file AND its -wal/-shm
+    sidecars are deleted."""
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    made = _seed(tmp_path, 2)
+    store = _open_store(tmp_path)
+    try:
+        for m in made:
+            store.embed_row(m.id, m.content)
+
+        db_path = _write_dummy_embeddings_db(tmp_path)
+        assert store.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 0
+
+        result = delete_legacy_embeddings_db(tmp_path, store)
+    finally:
+        store.close()
+
+    assert result is True
+    assert not db_path.exists()
+    assert not (tmp_path / "embeddings.db-wal").exists()
+    assert not (tmp_path / "embeddings.db-shm").exists()
+
+
+def test_delete_legacy_embeddings_db_defers_when_backlog_nonempty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) embeddings.db exists but some active row is still un-embedded
+    under the current model -> NOT deleted, deferred for the next run."""
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    made = _seed(tmp_path, 2)
+    store = _open_store(tmp_path)
+    try:
+        # Only embed the first row — the second stays backlog.
+        store.embed_row(made[0].id, made[0].content)
+
+        db_path = _write_dummy_embeddings_db(tmp_path)
+        assert store.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 1
+
+        result = delete_legacy_embeddings_db(tmp_path, store)
+    finally:
+        store.close()
+
+    assert result is False
+    assert db_path.exists()
+    assert (tmp_path / "embeddings.db-wal").exists()
+    assert (tmp_path / "embeddings.db-shm").exists()
+
+
+def test_delete_legacy_embeddings_db_noop_when_file_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(c) no embeddings.db at all -> no-op, no error, no provider needed
+    (the file-existence check short-circuits before any embedding-provider
+    lookup, so a broken/unavailable provider must not matter here)."""
+    from brain.memory import embeddings as embeddings_mod
+
+    def _boom() -> None:
+        raise AssertionError("build_embedding_provider should not be called when the file is absent")
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+
+    store = _open_store(tmp_path)
+    try:
+        assert not (tmp_path / "embeddings.db").exists()
+        result = delete_legacy_embeddings_db(tmp_path, store)
+    finally:
+        store.close()
+
+    assert result is False
+    assert not (tmp_path / "embeddings.db").exists()
+
+
+def test_delete_legacy_embeddings_db_idempotent_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(d) a second call after the file is already gone is a clean no-op —
+    does not raise, does not re-log a deletion."""
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    made = _seed(tmp_path, 1)
+    store = _open_store(tmp_path)
+    try:
+        store.embed_row(made[0].id, made[0].content)
+        _write_dummy_embeddings_db(tmp_path)
+
+        first = delete_legacy_embeddings_db(tmp_path, store)
+        second = delete_legacy_embeddings_db(tmp_path, store)
+    finally:
+        store.close()
+
+    assert first is True
+    assert second is False
+    assert not (tmp_path / "embeddings.db").exists()
+
+
+def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(e) a delete failure (e.g. a permission error) is caught + logged,
+    never raised — a stuck stale file must never crash a startup caller."""
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    made = _seed(tmp_path, 1)
+    store = _open_store(tmp_path)
+    try:
+        store.embed_row(made[0].id, made[0].content)
+        db_path = _write_dummy_embeddings_db(tmp_path, with_sidecars=False)
+
+        def _raise_permission_error(self: Path, *args: object, **kwargs: object) -> None:  # noqa: ANN401
+            raise PermissionError(f"simulated permission error deleting {self}")
+
+        monkeypatch.setattr(Path, "unlink", _raise_permission_error)
+
+        with caplog.at_level("WARNING"):
+            result = delete_legacy_embeddings_db(tmp_path, store)  # must not raise
+    finally:
+        store.close()
+
+    assert result is False
+    assert db_path.exists()  # left in place, not partially removed
+    assert "failed to delete legacy embeddings.db" in caplog.text

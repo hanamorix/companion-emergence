@@ -225,12 +225,12 @@ def test_maker_and_notes_reuse_the_sweeps_live_store_object(tmp_path):
 
 
 def test_startup_repair_sites_unchanged(tmp_path):
-    """C4 (regression guard): the two one-shot startup MemoryStore opens (vocab-repair,
-    soul-candidate-repair) still pass integrity_check=False, unaffected by this change.
-    Anchored on the `while not stop_event.is_set():` structural marker, not a line
-    number, so this survives surrounding edits — and runs entirely against the
-    working tree (no external git ref needed, unlike an origin/main diff, which
-    cannot run in this repo's shallow-checkout CI).
+    """C4 (regression guard): the three one-shot startup MemoryStore opens (vocab-repair,
+    soul-candidate-repair, legacy-embeddings.db deletion) still pass integrity_check=False,
+    unaffected by this change. Anchored on the `while not stop_event.is_set():` structural
+    marker, not a line number, so this survives surrounding edits — and runs entirely
+    against the working tree (no external git ref needed, unlike an origin/main diff,
+    which cannot run in this repo's shallow-checkout CI).
     """
     source = Path(supervisor.__file__).read_text(encoding="utf-8")
     anchor = "while not stop_event.is_set():"
@@ -238,10 +238,14 @@ def test_startup_repair_sites_unchanged(tmp_path):
     prefix = source.split(anchor, 1)[0]
     # #173: the vocab-repair open moved into _run_vocab_repair_tick (shared by the
     # startup pass and the 6h cadence); the soul-candidate open is still inline.
-    assert prefix.count("integrity_check=False") == 1
+    # F1 #259 increment 9 added a third inline open, gated on embeddings.db's own
+    # existence (its "should_run" equivalent) before ever constructing a store.
+    assert prefix.count("integrity_check=False") == 2
     assert "_run_vocab_repair_tick(persona_dir)" in prefix
     assert "_soul_candidate_repair_should_run(persona_dir)" in prefix
     assert 'MemoryStore(str(db_path), integrity_check=False)' in prefix
+    assert '(persona_dir / "embeddings.db").exists()' in prefix
+    assert "_delete_legacy_embeddings_db(persona_dir, _store)" in prefix
     tick_src = source.split("def _run_vocab_repair_tick", 1)[1].split("\ndef ", 1)[0]
     assert "_vocab_repair_should_run(persona_dir)" in tick_src
     assert "integrity_check=False" in tick_src

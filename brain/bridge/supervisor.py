@@ -100,6 +100,9 @@ from brain.ingest.pipeline import (
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embedding_backfill import (
+    delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
+)
+from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
 )
 from brain.memory.embedding_matrix import build_embedding_matrix
@@ -360,6 +363,33 @@ def run_folded(
             _self_model_repair_run(persona_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("self-model repair failed during startup: %s", exc)
+
+    # One-shot startup: run-once, fail-safe deletion of the legacy
+    # embeddings.db file once every active row carries a current-model
+    # embedding (F1 #259 increment 9, spec §5 / S9, invariant I9). No code
+    # reads or writes embeddings.db anymore (increment 8's teardown) — on an
+    # already-deployed persona it can only exist as a stale orphan left over
+    # from before this column migration ran. Gated on the file's own
+    # existence BEFORE opening a store — same "should_run" shape as every
+    # other one-shot above, and it means a persona that has already
+    # completed this migration (the overwhelming steady-state case once
+    # this ships) never pays for a MemoryStore open here at all. Opens its
+    # own short-lived MemoryStore handle (mirrors soul-candidate-repair
+    # above) rather than reusing the main loop's per-tick store, since this
+    # runs once before that loop starts. Fault-isolated (recipe item 3): the
+    # function itself already catches delete errors per-file, and this
+    # try/except is the outer safety net (e.g. a provider-load failure) so
+    # a stuck stale file can never crash the bridge — worst case, it is
+    # just re-checked (and left in place, or deleted) on the next startup.
+    try:
+        if (persona_dir / "embeddings.db").exists():
+            _store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+            try:
+                _delete_legacy_embeddings_db(persona_dir, _store)
+            finally:
+                _store.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("legacy embeddings.db deletion check failed during startup: %s", exc)
 
     while not stop_event.is_set():
         # store is opened here (per-tick, this thread only — H-A hardening) and reused by

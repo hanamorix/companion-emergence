@@ -698,3 +698,98 @@ def run_embedding_backfill_to_completion(
         ticks=ticks,
         stopped_reason=stopped_reason,
     )
+
+
+LEGACY_EMBEDDINGS_DB_FILENAME = "embeddings.db"
+
+
+def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noqa: ANN001 — Path, see module convention above
+    """Run-once, fail-safe deletion of the legacy `embeddings.db` file (and
+    its `-wal`/`-shm` SQLite sidecars) once every active row carries a
+    current-model embedding (F1 #259 increment 9, spec §5 / S9, invariant
+    I9).
+
+    `embeddings.db` was the old content-hash-keyed embedding cache
+    (`EmbeddingCache`/`MemoryClusterStore`); no code reads or writes it
+    anymore as of increment 8's teardown (grep-clean) — on an
+    already-deployed persona it can only exist as a stale orphan left over
+    from before this column migration ran. This function is the fail-safe
+    REMOVAL half of that migration: verify the replacement (the row
+    `embedding` column) is fully populated under the CURRENT model before
+    deleting the old file, per I9's verify-before-delete requirement.
+
+    GATE: `store.count_unembedded(current_model_id=<current model's
+    model_id>, min_chars=MIN_CHARS_TO_EMBED) == 0` — the exact same backlog
+    predicate the idle backfill (`run_embedding_backfill_tick`) and the
+    one-go CLI drain (`run_embedding_backfill_to_completion`) already use
+    (see `MemoryStore.count_unembedded`), so "safe to delete" means exactly
+    "the backfill considers itself caught up". The current model id comes
+    from `build_embedding_provider()` (looked up through the module, same
+    dynamic-lookup convention as `MemoryStore.embed_row` and the CLI
+    backfill command), which is pinned to `model_tier.TIER_EMBEDDING` — so a
+    `MODEL_EMBEDDING` swap correctly reopens the gate (old-model rows count
+    as backlog) rather than deleting the file out from under an in-progress
+    re-embed.
+
+    If the backlog is NOT empty (some active row is still un-embedded, or
+    embedded under a stale model id — e.g. mid-drain, or mid a
+    `MODEL_EMBEDDING` swap), the file is left alone and this call is a
+    no-op: it is safe, and expected, to call again on the next startup,
+    which just re-checks the same gate. Idempotent: once `embeddings.db` no
+    longer exists, every subsequent call is an immediate no-op.
+
+    Delete failures (e.g. a permission error) are caught and logged at
+    WARNING per file, never raised — a stuck stale file must never crash
+    the caller (this is called from supervisor startup, off the message hot
+    path, per §5's fail-safe framing: a migration that can't complete
+    degrades to "the old file just stays around a bit longer", never a
+    crash).
+
+    Returns True iff `embeddings.db` itself was deleted THIS call
+    (sidecar-deletion failures don't affect the return value — the main
+    file's removal is what "migration complete" means; a sidecar failure is
+    still logged).
+    """
+    from brain.memory import embeddings as embeddings_mod
+
+    db_path = persona_dir / LEGACY_EMBEDDINGS_DB_FILENAME
+    if not db_path.exists():
+        return False
+
+    provider = embeddings_mod.build_embedding_provider()
+    backlog = store.count_unembedded(
+        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+    )
+    if backlog > 0:
+        logger.info(
+            "legacy embeddings.db deletion deferred for %s: %d row(s) still "
+            "un-embedded under the current model (%s)",
+            persona_dir.name,
+            backlog,
+            provider.model_id(),
+        )
+        return False
+
+    deleted_main = False
+    try:
+        db_path.unlink()
+        deleted_main = True
+    except OSError as exc:
+        logger.warning("failed to delete legacy embeddings.db at %s: %s", db_path, exc)
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("failed to delete legacy embeddings.db sidecar %s: %s", sidecar, exc)
+
+    if deleted_main:
+        logger.info(
+            "deleted legacy embeddings.db for %s (all active rows embedded "
+            "under current model %s)",
+            persona_dir.name,
+            provider.model_id(),
+        )
+
+    return deleted_main

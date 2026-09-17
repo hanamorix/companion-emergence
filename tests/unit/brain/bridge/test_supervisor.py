@@ -491,6 +491,93 @@ def test_supervisor_clustering_tick_writes_row_and_centroids_not_embeddings_db(
     assert not (persona_dir / "embeddings.db").exists()
 
 
+def test_supervisor_startup_deletes_legacy_embeddings_db_when_fully_embedded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-path proof for the F1 #259 increment 9 startup hook: run_folded's
+    one-shot, run-once fail-safe deletion of the legacy embeddings.db file
+    (spec §5 / S9, invariant I9) actually runs during startup — even with
+    stop_event already set, so the main tick loop body never executes at
+    all, proving the hook lives before that loop, not inside it — and
+    actually deletes the stale file once every active row already carries a
+    current-model embedding."""
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import Memory, MemoryStore
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)
+    store.embed_row(memory.id, memory.content)
+    store.close()
+
+    db_path = persona_dir / "embeddings.db"
+    db_path.write_bytes(b"legacy sqlite content, never actually read")
+
+    bus = EventBus()
+    stop = threading.Event()
+    stop.set()  # already set — the main tick loop body must never run
+
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=bus,
+        tick_interval_s=0.1,
+        heartbeat_interval_s=None,
+    )
+
+    assert not db_path.exists()
+
+
+def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same startup hook, other half: a still-un-embedded active row means
+    the backlog gate is non-empty, so the legacy file must be left in place
+    for the next startup rather than deleted early."""
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import Memory, MemoryStore
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor, left unembedded",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)  # deliberately NOT embedded
+    store.close()
+
+    db_path = persona_dir / "embeddings.db"
+    db_path.write_bytes(b"legacy sqlite content, never actually read")
+
+    bus = EventBus()
+    stop = threading.Event()
+    stop.set()
+
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=bus,
+        tick_interval_s=0.1,
+        heartbeat_interval_s=None,
+    )
+
+    assert db_path.exists()
+
+
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     """The hourly finalize cadence at 24h silence runs, deletes the buffer
     + cursor, evicts from _SESSIONS, and publishes session_finalized."""
