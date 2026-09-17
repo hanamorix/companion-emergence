@@ -3,9 +3,11 @@
 A process-level `{memory_id -> np.ndarray(float32, N-dim)}` map, sourced
 from the `embedding` column F1 added to the `memories` table (see
 `brain/memory/store.py`'s `_SCHEMA`). `N` is whatever the REAL embedding
-model currently produces (384 for bge-small today; a future multilingual
-swap, e.g. bge-m3 at 1024-dim, needs NO change here — #259 inc7 red-team F1
-made this module genuinely dim-agnostic): each row is decoded to its OWN
+model currently produces (1024 for the current model,
+`intfloat/multilingual-e5-large`; the dimension is derived at runtime from
+the active provider, so a future model swap needs NO change here, per the
+#259 inc7 red-team F1 finding that made this module genuinely dim-agnostic):
+each row is decoded to its OWN
 stored byte-length (see `_load_from_db` below), never validated against
 `model_tier.MODEL_EMBEDDING_DIM` (that constant is a documented sanity value
 checked elsewhere — see `FastEmbedProvider.embed()` in `embeddings.py` — not
@@ -93,8 +95,8 @@ logger = logging.getLogger(__name__)
 # never a gate here — see the module docstring above and
 # `FastEmbedProvider.embed()` in `embeddings.py`). `_load_from_db` below
 # decodes each row to ITS OWN stored byte-length, model-agnostic by
-# construction: a future multilingual embedding model swap, e.g. bge-m3 at
-# 1024-dim vs bge-small's 384, needs no code change here. A blob whose byte
+# construction: the current model is `intfloat/multilingual-e5-large` at
+# 1024-dim, and any future model swap needs no code change here. A blob whose byte
 # length isn't a multiple of 4 (float32) is corrupt/truncated and is skipped
 # rather than allowed to crash the whole build; a blob that decodes cleanly
 # but to a dimension no other currently-held row shares is NOT rejected at

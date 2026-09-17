@@ -125,6 +125,10 @@ def _materialize_symlinked_files(directory: Path) -> Path:
     Writes are hardlink-or-copy into a temp path then `os.replace` (atomic on
     POSIX) into place, so a second process/instance racing to materialize the
     same directory concurrently can't observe a half-written file.
+
+    Scope: this only materializes symlinked FILES, not symlinked directories.
+    HF's cache always symlinks individual files, never whole directories, so
+    that is not a live gap for this workaround's use.
     """
     entries = [p for p in directory.rglob("*") if p.is_file()]
     if not any(p.is_symlink() for p in entries):
@@ -136,8 +140,10 @@ def _materialize_symlinked_files(directory: Path) -> Path:
         dest = materialized / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         real_src = entry.resolve()  # follow symlink(s) to the real blob
-        if dest.exists() and not dest.is_symlink() and dest.stat().st_size == real_src.stat().st_size:
-            continue  # already materialized, from this or a prior process run
+        if dest.exists() and not dest.is_symlink() and os.path.samefile(dest, real_src):
+            continue  # already a hardlink to real_src, from this or a prior process run
+        if dest.exists() and not dest.is_symlink():
+            dest.unlink()  # stale real file (different inode): re-materialize, don't trust size
         tmp_dest = dest.with_name(dest.name + f".tmp{os.getpid()}")
         try:
             if tmp_dest.exists():
