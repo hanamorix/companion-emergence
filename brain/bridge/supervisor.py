@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
+    from brain.memory.relevance_judge import RelevanceJudgeProvider
 
 from brain import prompt_strings
 from brain.attunement.backfill import (
@@ -2061,24 +2062,42 @@ def _run_calibration_tick(
     persona_dir: Path,
     *,
     is_session_busy: Callable[[str], bool] | None = None,
+    provider: LLMProvider | None = None,
+    judge: RelevanceJudgeProvider | None = None,
 ) -> None:
     """F2a daily calibration tick (#250, spec Section 5) — 4th sibling cadence
     to compaction/clustering/vocab-repair, mirroring ``_run_compaction_tick``'s
     idle-gate + restart-safety shape: own persisted ``calibration_cadence.json``,
     startup catch-up + periodic daily fire in ``run_folded``.
 
-    **INC5 SCOPE (this increment):** retention pruning only — deletes
-    ``calibration_log`` rows outside the rolling ``day_bucket`` window via
-    ``MemoryStore.prune_calibration_log`` (spec Section 5's "MUST before ship"
-    pruning responsibility, acceptance 5b). The local-judge first pass
-    (``bge-reranker-v2-m3`` + Haiku tie-break, spec Section 6) and the floor
-    derivation + EMA smoothing + ``RERANK_FLOOR`` write (spec Section 7) are
-    LATER increments (inc6/inc7) — this tick fires and is wired daily, but
-    does not yet derive a floor. (Consequently it also does not yet call
-    ``reranker._reset_precision_decision_cache()`` — see
-    ``brain/memory/reranker.py``'s precision-cache comment — since nothing
-    here writes ``RERANK_FLOOR`` yet; inc7 adds that call right after its
-    floor write.)
+    **INC5 SCOPE:** retention pruning — deletes ``calibration_log`` rows
+    outside the rolling ``day_bucket`` window via ``MemoryStore.
+    prune_calibration_log`` (spec Section 5's "MUST before ship" pruning
+    responsibility, acceptance 5b).
+
+    **INC6 SCOPE (this increment):** the local-judge first pass +  Haiku
+    tie-break (``bge-reranker-v2-m3``, spec Section 6) — labels a SAMPLE of
+    the rows pruning just left behind, via ``relevance_judge.
+    label_calibration_sample``. The floor derivation + EMA smoothing +
+    ``RERANK_FLOOR`` write (spec Section 7) is a LATER increment (inc7) —
+    this tick labels rows but does not yet derive/write a floor.
+    (Consequently it also does not yet call ``reranker.
+    _reset_precision_decision_cache()`` — see ``brain/memory/reranker.py``'s
+    precision-cache comment — since nothing here writes ``RERANK_FLOOR``
+    yet; inc7 adds that call right after its floor write.)
+
+    ``provider``: the Haiku tie-break's generation provider. ``None`` (the
+    ``run_folded`` call sites' default) builds one via ``build_tier_provider
+    (persona_dir, TIER_BACKGROUND_CLASSIFIER)`` inside this function —
+    mirrors ``consolidation.run_consolidation``'s per-call construction
+    (never the ambient chat provider) so Haiku classification always runs
+    on the cheap tier regardless of what model the persona's own chat uses.
+
+    ``judge``: test-injection point for ``relevance_judge.
+    RelevanceJudgeProvider`` — production leaves this ``None`` so
+    ``label_calibration_sample`` lazily builds the real torch-backed judge
+    only when this tick actually has unlabeled rows to label (never at
+    import time, never on the hot path).
 
     **Idle-gate:** unlike compaction (which skips only the BUSY session's own
     cascade/rollover, letting idle sessions' work proceed), this tick's work
@@ -2095,8 +2114,12 @@ def _run_calibration_tick(
     Fault-isolated by the caller (``run_folded``'s ``try/except
     logger.exception`` around both the startup catch-up and periodic-fire
     call sites, mirroring ``_run_clustering_tick``) — this function itself
-    does not swallow errors, so a raised exception here is visible in that
-    wrapping try/except rather than silently vanishing.
+    does not swallow the PRUNE step's errors, so those are still visible in
+    that wrapping try/except. The JUDGE-LABELING step is different: spec
+    Section 6 requires a judge/torch/Haiku failure to never crash the tick
+    or the bridge, so that step is wrapped in its OWN try/except HERE (not
+    left to the caller) — a labeling failure must not undo or block the
+    prune step that already completed successfully above it.
     """
     if is_session_busy is not None:
         from brain.ingest.buffer import list_active_sessions
@@ -2114,6 +2137,19 @@ def _run_calibration_tick(
 
         pruned = store.prune_calibration_log()
         logger.info("calibration tick: pruned=%d calibration_log rows outside retention window", pruned)
+
+        try:
+            from brain.memory.relevance_judge import label_calibration_sample
+
+            tiebreak_provider = (
+                provider
+                if provider is not None
+                else build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
+            )
+            labeled = label_calibration_sample(store, provider=tiebreak_provider, judge=judge)
+            logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
+        except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
+            logger.exception("calibration tick: judge-labeling pass raised; continuing")
 
 
 def _run_finalize_tick(

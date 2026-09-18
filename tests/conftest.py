@@ -240,6 +240,57 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
     reranker._reset_precision_decision_cache()
 
 
+@pytest.fixture(autouse=True)
+def _fake_relevance_judge_provider_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force brain.memory.relevance_judge.build_judge_provider() to the
+    deterministic, offline FakeRelevanceJudgeProvider for the whole suite by
+    default (F2a #250 inc6, mirrors `_fake_reranker_provider_by_default`
+    above).
+
+    build_judge_provider() is the PRODUCTION default (TorchCrossEncoderJudge
+    — a real local torch/sentence-transformers cross-encoder, downloaded
+    once over the network into a shared cache dir). Any test that exercises
+    the daily calibration tick's judge-labeling pass — even indirectly via
+    `_run_calibration_tick` — would otherwise attempt a real model download
+    and a real torch import. A test that genuinely needs the real judge
+    opts out with `@pytest.mark.requires_network`.
+
+    Every candidate the FakeRelevanceJudgeProvider default scores lands far
+    below any plausible ambiguous band (its unscripted-pair default score,
+    see that class's docstring) — mirroring FakeRerankerProvider's "never
+    accidentally clears the floor" posture, this default never accidentally
+    routes an unscripted pair to a stubbed Haiku call either. Tests that
+    need a specific label/ambiguous-band outcome construct their own
+    `FakeRelevanceJudgeProvider(scores={...})` and pass it directly to
+    `label_calibration_sample`/`_run_calibration_tick` (the `judge=`
+    parameter), mirroring how tests construct their own
+    `FakeRerankerProvider(scores={...})` for the reranker.
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import relevance_judge
+
+    monkeypatch.setattr(
+        relevance_judge, "build_judge_provider", lambda: relevance_judge.FakeRelevanceJudgeProvider()
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_judge_provider_cache() -> Iterator[None]:
+    """Reset relevance_judge.build_judge_provider()'s process-level provider
+    cache before and after each test — mirrors `_reset_reranker_provider_cache`
+    above for the same reason (a test that calls the REAL
+    `build_judge_provider()` directly must not read or leak a provider a
+    prior/later test's call happened to cache)."""
+    from brain.memory import relevance_judge
+
+    relevance_judge._reset_judge_provider_cache()
+    yield
+    relevance_judge._reset_judge_provider_cache()
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     """Walk upward from this file to find the repo root (pyproject.toml).

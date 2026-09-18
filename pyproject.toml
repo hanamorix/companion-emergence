@@ -20,6 +20,20 @@ dependencies = [
     "tzdata>=2024.1",
     "fastembed>=0.4",
     "pypdf>=6",
+    # F2a #250 inc6 (2026-09-18 owner ruling, "torch it is then"): the
+    # OFFLINE daily calibration judge (bge-reranker-v2-m3, brain/memory/
+    # relevance_judge.py) loads directly via torch/sentence-transformers,
+    # NOT fastembed/onnxruntime — the one place in this codebase torch is
+    # used. It is imported lazily (only when the daily calibration tick
+    # actually runs a judge pass), never on the per-turn hot path or at any
+    # module's import time — the e5-large embedder and jina reranker stay
+    # ONNX/onnxruntime, torch-free (see model_tier.py's TIER_RELEVANCE_JUDGE
+    # comment and relevance_judge.py's module docstring). Pinned to the
+    # CPU-only wheel via the [tool.uv.index]/[tool.uv.sources] block below —
+    # the judge runs offline on the no-AVX2 potato baseline, so pulling in
+    # CUDA wheels would bloat the install footprint for no benefit.
+    "torch>=2.2",
+    "sentence-transformers>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -93,3 +107,17 @@ ignore = ["E501"]
 dev = [
     "tdd-guard-pytest>=0.1.2",
 ]
+
+# F2a #250 inc6: pin torch to the CPU-only wheel variant (PyTorch's own
+# index, not PyPI's default GPU/CUDA-bundled wheel) — the offline
+# calibration judge runs on CPU only (potato baseline, per build-for-
+# potato-computers-baseline), so CUDA wheels would only bloat the install
+# footprint. `explicit = true` means this index is used ONLY for packages
+# that name it via [tool.uv.sources] below, never as a general fallback.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]

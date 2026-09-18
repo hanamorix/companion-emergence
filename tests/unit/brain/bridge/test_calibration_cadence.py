@@ -25,17 +25,27 @@ def test_run_calibration_tick_importable_and_callable():
 
     sig = inspect.signature(_run_calibration_tick)
     params = list(sig.parameters)
-    # This increment (inc5) is a retention-pruning-only scaffold — no
-    # provider is needed yet (the judge/floor-derivation work that will need
-    # one lands in inc6/inc7). The idle-gate ``is_session_busy`` keyword
-    # mirrors compaction's, defaulted so the startup catch-up can call it
-    # with no argument.
-    assert params == ["persona_dir", "is_session_busy"], (
-        f"expected (persona_dir, *, is_session_busy), got {params}"
+    # inc6 (#250 §6) adds the judge-labeling pass: `provider` (the Haiku
+    # tie-break's generation provider — None means "build one via
+    # build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER) inside
+    # this function", mirroring consolidation.run_consolidation's per-call
+    # construction) and `judge` (test-injection point for a
+    # RelevanceJudgeProvider — None means "build the real torch judge
+    # lazily"). Both keyword-only, both defaulted, so every existing
+    # zero-arg call site (run_folded's startup catch-up + periodic fire)
+    # keeps working unmodified.
+    assert params == ["persona_dir", "is_session_busy", "provider", "judge"], (
+        f"expected (persona_dir, *, is_session_busy, provider, judge), got {params}"
     )
     busy = sig.parameters["is_session_busy"]
     assert busy.kind is inspect.Parameter.KEYWORD_ONLY
     assert busy.default is None
+    provider_param = sig.parameters["provider"]
+    assert provider_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert provider_param.default is None
+    judge_param = sig.parameters["judge"]
+    assert judge_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert judge_param.default is None
 
 
 def test_calibration_cadence_due_now_when_missing():
@@ -107,6 +117,7 @@ def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
     rows outside the rolling window so the table stays bounded, while rows
     INSIDE the window (needed for the current floor sample) are retained."""
     from brain.bridge.supervisor import _run_calibration_tick
+    from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
     from brain.memory.store import CALIBRATION_LOG_RETENTION_WINDOW_DAYS, MemoryStore
 
     with tempfile.TemporaryDirectory() as d:
@@ -137,7 +148,13 @@ def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
         store._conn.commit()
         store.close()
 
-        _run_calibration_tick(pd)
+        # This test is pruning-only (acceptance 5b); inc6's judge-labeling
+        # pass is exercised separately in test_relevance_judge.py, so a
+        # FakeRelevanceJudgeProvider + no Haiku provider keeps this test
+        # offline/hermetic and focused on the prune assertion below (every
+        # sampled row's candidate id "a" isn't a real memory, so every row
+        # labels "unknown" regardless of the injected judge).
+        _run_calibration_tick(pd, judge=FakeRelevanceJudgeProvider())
 
         store2 = MemoryStore(pd / "memories.db", integrity_check=False)
         rows = store2._conn.execute("SELECT day_bucket FROM calibration_log").fetchall()

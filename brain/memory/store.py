@@ -906,6 +906,68 @@ class MemoryStore:
         self._conn.commit()
         return cur.rowcount
 
+    def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
+        """Return up to `limit` `calibration_log` rows with no
+        `local_judge_label` yet (F2a #250 inc6, spec Section 6/7) — the daily
+        judge pass's SAMPLE, not every logged row (the spec's explicit
+        "sampling IS the design"). `limit` bounds the local judge's daily
+        compute on the no-AVX2 potato baseline — see
+        `relevance_judge.CALIBRATION_SAMPLE_ROWS` for that value's
+        derivation.
+
+        Randomized via SQL `RANDOM()` rather than oldest/newest-N, so an
+        unlabeled backlog doesn't systematically bias the sample toward one
+        time-of-day's query mix. `candidate_ids` / `reranker_scores` are
+        decoded from their stored JSON here so callers work with plain
+        Python lists, not raw JSON strings — mirrors how `get()` decodes
+        `metadata_json` before returning a `Memory`.
+
+        Read-only: does not bump `recall_count` (reads `calibration_log`,
+        not `memories`) and does not label anything itself — labeling +
+        writeback is the caller's job (`relevance_judge.
+        label_calibration_sample` + `write_calibration_labels` below).
+        """
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_ids, reranker_scores, reranker_model_id "
+            "FROM calibration_log WHERE local_judge_label IS NULL "
+            "ORDER BY RANDOM() LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "query": row["query"],
+                "candidate_ids": json.loads(row["candidate_ids"]),
+                "reranker_scores": json.loads(row["reranker_scores"]),
+                "reranker_model_id": row["reranker_model_id"],
+            }
+            for row in rows
+        ]
+
+    def write_calibration_labels(
+        self, row_id: int, local_judge_label: list[str], haiku_label: list[str | None]
+    ) -> None:
+        """Write back the local judge's + Haiku tie-break's per-candidate
+        labels for one `calibration_log` row (F2a #250 inc6, spec Section 6).
+
+        Both lists are POSITIONALLY aligned with that row's `candidate_ids`
+        (same convention `candidate_ids`/`reranker_scores` already use),
+        stored as JSON in their respective TEXT columns. `haiku_label`
+        entries are `None` except at the ambiguous-band positions the local
+        judge routed to Haiku (non-ambiguous positions never call Haiku, per
+        acceptance #7) — a `None` means "no override; the local judge's own
+        provisional label at that position stands."
+
+        Once `local_judge_label` is non-NULL the row no longer matches
+        `sample_unlabeled_calibration_rows`'s `WHERE` clause, so a row is
+        never re-sampled or re-labeled on a later tick.
+        """
+        self._conn.execute(
+            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ? WHERE id = ?",
+            (json.dumps(local_judge_label), json.dumps(haiku_label), row_id),
+        )
+        self._conn.commit()
+
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps
         last_accessed_at + recall_count on hit so salience scoring sees

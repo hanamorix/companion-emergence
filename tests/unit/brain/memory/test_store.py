@@ -2445,3 +2445,87 @@ def test_prune_calibration_log_defaults_to_the_live_tunable_window(store: Memory
         r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
     }
     assert remaining == {"inside"}
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc6): sample_unlabeled_calibration_rows + write_calibration_labels
+# — the daily judge pass's read/write surface on calibration_log (spec
+# Section 6/7). The judge-labeling LOGIC itself (label_for_score, the
+# ambiguous band, the Haiku tie-break) is covered in test_relevance_judge.py;
+# this section covers only the store's own read/write contract.
+# ---------------------------------------------------------------------------
+
+
+def test_sample_unlabeled_calibration_rows_returns_only_unlabeled(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="unlabeled turn", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    store.log_calibration_sample(
+        query="labeled turn", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="m"
+    )
+    labeled_row = store._conn.execute(
+        "SELECT id FROM calibration_log WHERE query = 'labeled turn'"
+    ).fetchone()
+    store.write_calibration_labels(labeled_row["id"], ["relevant"], [None])
+
+    rows = store.sample_unlabeled_calibration_rows(limit=10)
+
+    assert [r["query"] for r in rows] == ["unlabeled turn"], (
+        "a row with a non-NULL local_judge_label must not be re-sampled"
+    )
+
+
+def test_sample_unlabeled_calibration_rows_decodes_json_columns(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[1.5, -2.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    assert row["candidate_ids"] == ["a", "b"], "candidate_ids must come back as a plain list, not a JSON string"
+    assert row["reranker_scores"] == [1.5, -2.0]
+    assert row["query"] == "q"
+    assert row["reranker_model_id"] == "m"
+    assert isinstance(row["id"], int)
+
+
+def test_sample_unlabeled_calibration_rows_respects_limit(store: MemoryStore) -> None:
+    for i in range(5):
+        store.log_calibration_sample(
+            query=f"turn {i}", candidate_ids=[], reranker_scores=[], reranker_model_id="m"
+        )
+    rows = store.sample_unlabeled_calibration_rows(limit=2)
+    assert len(rows) == 2
+
+
+def test_sample_unlabeled_calibration_rows_empty_when_nothing_logged(store: MemoryStore) -> None:
+    assert store.sample_unlabeled_calibration_rows(limit=10) == []
+
+
+def test_write_calibration_labels_round_trips_positional_lists(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+
+    store.write_calibration_labels(
+        row["id"],
+        ["relevant", "irrelevant", "relevant"],
+        [None, "irrelevant", None],
+    )
+
+    written = store._conn.execute(
+        "SELECT local_judge_label, haiku_label FROM calibration_log WHERE id = ?", (row["id"],)
+    ).fetchone()
+    assert json.loads(written["local_judge_label"]) == ["relevant", "irrelevant", "relevant"]
+    assert json.loads(written["haiku_label"]) == [None, "irrelevant", None]
+
+
+def test_write_calibration_labels_removes_row_from_the_unlabeled_sample(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+
+    store.write_calibration_labels(row["id"], ["relevant"], [None])
+
+    assert store.sample_unlabeled_calibration_rows(limit=10) == []
