@@ -560,3 +560,56 @@ def test_bootstrap_floor_never_touches_torch_or_the_relevance_judge(
     assert ("torch" in sys.modules) == torch_loaded_before, (
         "the bootstrap computation must never newly import torch"
     )
+
+
+def test_bootstrap_floor_fails_soft_caches_nothing_and_retries_on_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-soft contract (docstring: "FAIL-SOFT ... any failure ... is
+    caught, logged, and returns None"), the part left untested: if computing
+    the bootstrap raises (provider build or fit failure), `get_bootstrap_
+    floor` must (a) catch the exception and never let it propagate, (b)
+    return None, (c) cache NOTHING for that model_id (a poisoned/empty cache
+    entry must not linger), and (d) a SUBSEQUENT call must RE-ATTEMPT the
+    computation rather than short-circuit on a cached failure — this is the
+    hot-path safety contract: a fresh-install day-0 recall must degrade to
+    lexical, never crash, and must not get PERMANENTLY stuck degraded if a
+    transient failure (e.g. a momentary provider-build hiccup) clears up.
+
+    Patches `reranker._bootstrap_reranker_provider` itself (the same seam
+    `_install_bootstrap_provider` above patches) to raise, with a call
+    counter proving BOTH that the failing path is actually exercised and
+    that a second call genuinely retries rather than serving a cached
+    result."""
+    from brain.memory import floor_calibration
+
+    model_id = "bootstrap-fail-soft-retry-test-model"
+    floor_calibration._reset_bootstrap_floor_cache()
+
+    call_count = {"n": 0}
+
+    def _raising_bootstrap_provider(model_id: str):
+        call_count["n"] += 1
+        raise RuntimeError("simulated bootstrap provider build failure")
+
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        _raising_bootstrap_provider,
+    )
+
+    result = floor_calibration.get_bootstrap_floor(model_id)
+    assert result is None, "a raising bootstrap computation must fail soft to None, never propagate"
+    assert call_count["n"] == 1
+    assert model_id not in floor_calibration._bootstrap_floor_cache, (
+        "a failed computation must cache NOTHING for this model_id"
+    )
+
+    result2 = floor_calibration.get_bootstrap_floor(model_id)
+    assert result2 is None, "a second call after a failure must still fail soft to None"
+    assert call_count["n"] == 2, (
+        "a subsequent call must RE-ATTEMPT (recompute) the bootstrap, not serve a poisoned cache "
+        "entry from the prior failure"
+    )
+    assert model_id not in floor_calibration._bootstrap_floor_cache, (
+        "the cache must still hold no entry for this model_id after a second failed attempt"
+    )
