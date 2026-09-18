@@ -289,6 +289,52 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
         return provider
 
 
+def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
+    """Raw provider construction for `model_id`, used ONLY by
+    `floor_calibration.get_bootstrap_floor` (F2a inc8, #250 §7 UPDATED —
+    Roy's 2026-09-18 bootstrap-floor ruling) to score the bundled cold-start
+    pairs for a floor the caller already knows it needs, for a model_id it
+    already knows it needs it for.
+
+    Deliberately bypasses `build_reranker_provider` — that function's
+    fp16-vs-fp32 precision self-check reads `store.get_reranker_floor(
+    fp32_model_id)`, which is exactly `get_bootstrap_floor`'s OWN caller
+    whenever no persisted floor row exists yet. Routing through
+    `build_reranker_provider` here would recurse:
+    `MemoryStore.get_reranker_floor` -> `floor_calibration.
+    get_bootstrap_floor` -> (this function, if it called
+    `build_reranker_provider`) -> `_choose_reranker_model_id` ->
+    `_run_precision_selfcheck` -> `store.get_reranker_floor(fp32_model_id)`
+    -> back to the start, with the cache not yet populated to break the
+    loop. This function never chooses a precision and never touches
+    `store` — it only constructs (or reuses) a plain `CrossEncoderProvider`
+    for the exact `model_id` it was asked about.
+
+    Reuses the shared `_provider_cache` (the SAME cache
+    `build_reranker_provider` reads/writes, double-checked locking to
+    match) so a caller that resolves to this same `model_id` elsewhere in
+    the process reuses the already-loaded ONNX session instead of paying
+    for a second one. In practice this is very often a cache HIT: every
+    production call site that ends up asking `get_reranker_floor` a
+    question (`run_semantic_recall`, `_semantic_top_k`, the precision
+    self-check itself) has ALREADY resolved/cached a provider for the exact
+    model_id in question via `build_reranker_provider` by the time it does
+    so.
+    """
+    cached = _provider_cache.get(model_id)
+    if cached is not None:
+        return cached
+    with _provider_cache_lock:
+        cached = _provider_cache.get(model_id)
+        if cached is not None:
+            return cached
+        from brain.paths import get_cache_dir
+
+        provider = CrossEncoderProvider(model_id=model_id, cache_dir=get_cache_dir())
+        _provider_cache[model_id] = provider
+        return provider
+
+
 def _cache_provider(model_id: str, provider: RerankerProvider) -> None:
     """Stash an already-constructed provider into the process-wide cache
     under `model_id`, WITHOUT clobbering one a concurrent caller already
@@ -645,15 +691,20 @@ def _run_precision_selfcheck(
     fp32 is the spec's designated REFERENCE precision (§2: "fp32 is the
     reference, no external labels needed"), so its floor is the one stable
     scale to judge fp16's agreement against, independent of which precision
-    this very check ends up shipping. `store is None` OR no calibrated
-    floor row exists yet for `fp32_model_id` (the daily tick has never
-    derived one) means there is no reliable bar to test agreement against
-    yet — rather than inventing one, this short-circuits straight to the
-    existing "insufficient information -> ship the safe default" branch
-    (same posture as every other fail-soft branch below: a registration
-    failure, a load failure, ANY exception), skipping the fp16
-    registration/construction entirely (no ONNX load wasted on a
-    comparison that would be meaningless anyway).
+    this very check ends up shipping. `store is None` means there is no way
+    to read ANY floor at all -> short-circuits straight to the existing
+    "insufficient information -> ship the safe default" branch (same
+    posture as every other fail-soft branch below: a registration failure,
+    a load failure, ANY exception), skipping the fp16 registration/
+    construction entirely (no ONNX load wasted on a comparison that would
+    be meaningless anyway). `calibrated_floor is None` with a real `store`
+    given is now the RARE case (F2a inc8, #250 §7 UPDATED): `store.
+    get_reranker_floor(fp32_model_id)` serves a derived bootstrap floor even
+    when the daily tick has never fired for `fp32_model_id`, so the day-0
+    self-check now runs its REAL comparison against that bootstrap instead
+    of short-circuiting here — this branch fires only if the bootstrap
+    computation itself failed (a reranker load/fit error), the bootstrap's
+    own fail-soft path.
 
     ANY single flipped keep/drop decision fails the gate (mechanical bar,
     not an arbitrary loss percentage — per §2's "principled,

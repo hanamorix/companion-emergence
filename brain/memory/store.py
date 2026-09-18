@@ -319,7 +319,12 @@ CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day
 -- from the daily calibration tick); READ live by `select_standouts`
 -- (`brain/memory/semantic_recall.py`) and the reranker precision self-check
 -- (`brain/memory/reranker.py`) as of inc8's cutover — the bare
--- `RERANK_FLOOR` constant this table replaces no longer exists.
+-- `RERANK_FLOOR` constant this table replaces no longer exists. A model_id
+-- with NO row here yet is a fresh-install/early-days state: `MemoryStore.
+-- get_reranker_floor` serves a derived, transient BOOTSTRAP floor instead of
+-- None in that case (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — never
+-- written to this table; the first accepted daily-tick write always
+-- supersedes it.
 CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     reranker_model_id TEXT PRIMARY KEY,
     floor REAL NOT NULL,
@@ -1043,10 +1048,36 @@ class MemoryStore:
         return pairs
 
     def get_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
-        """Return the persisted `reranker_floor_calibration` row for
-        `reranker_model_id` (F2a #250 inc7, spec Section 7), or `None` if no
-        floor has ever been derived for this model_id yet (fresh install /
-        a brand-new reranker model that has never been calibrated).
+        """Return the operative reranker floor for `reranker_model_id`
+        (F2a #250 inc7/inc8, spec Section 7).
+
+        Checks the PERSISTED `reranker_floor_calibration` row first (written
+        by the daily calibration tick, `floor_calibration.derive_and_
+        persist_floor`) — if one exists, it is returned and this method does
+        no further work.
+
+        If no row exists yet (fresh install / early days / a brand-new
+        reranker model_id that has never been calibrated), F2a inc8 (#250 §7
+        UPDATED, Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
+        process-wide-cached BOOTSTRAP floor instead of `None` —
+        `floor_calibration.get_bootstrap_floor`, computed once (jina-only,
+        torch-free) from the bundled `_FP16_GATE_PAIRS` and cached, never
+        persisted to this table. This decouples semantic recall's EXISTENCE
+        from the daily tick ever having fired: the old "no row -> None ->
+        every caller falls back to lexical" contract permanently coupled
+        recall to the tick (disable calibration, or recall running before
+        the tick's first idle moment, silently and permanently demoted to
+        lexical-only even with embeddings present).
+
+        A persisted row, once the tick writes one, is read FIRST on every
+        subsequent call and supersedes the bootstrap for good — the
+        bootstrap cache is never consulted again for that model_id, so a
+        stale bootstrap value can never shadow a real corpus-derived floor.
+
+        Only returns `None` now on the bootstrap's OWN fail-soft path (the
+        bootstrap computation itself raised — a reranker load/fit failure)
+        — the pre-ruling contract, preserved as the last resort so a broken
+        bootstrap still degrades this turn to lexical rather than crashing.
 
         Read-only: does not write or bump anything.
         """
@@ -1055,16 +1086,18 @@ class MemoryStore:
             "FROM reranker_floor_calibration WHERE reranker_model_id = ?",
             (reranker_model_id,),
         ).fetchone()
-        if row is None:
-            return None
-        return {
-            "reranker_model_id": row["reranker_model_id"],
-            "floor": float(row["floor"]),
-            "raw_fit_floor": float(row["raw_fit_floor"]),
-            "sample_pairs": int(row["sample_pairs"]),
-            "is_cold_start": bool(row["is_cold_start"]),
-            "updated_at": row["updated_at"],
-        }
+        if row is not None:
+            return {
+                "reranker_model_id": row["reranker_model_id"],
+                "floor": float(row["floor"]),
+                "raw_fit_floor": float(row["raw_fit_floor"]),
+                "sample_pairs": int(row["sample_pairs"]),
+                "is_cold_start": bool(row["is_cold_start"]),
+                "updated_at": row["updated_at"],
+            }
+        from brain.memory.floor_calibration import get_bootstrap_floor
+
+        return get_bootstrap_floor(reranker_model_id)
 
     def write_reranker_floor(
         self,

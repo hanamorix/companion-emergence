@@ -85,18 +85,28 @@ log = logging.getLogger(__name__)
 # flip or any future reranker swap never applies a floor fit against one
 # score scale to scores from another.
 #
-# No hardcoded fallback value lives here: when no calibrated floor row
-# exists yet for the runtime model_id (before the daily tick has ever run
-# once for it), `run_semantic_recall` treats this exactly like any other
-# "semantic path not ready yet" precondition (empty/sparse candidate pool,
-# embed failure, ...) — it returns `None` and the caller falls through to
-# the existing lexical/blend fallback (the module's own "graceful warm-up"
-# contract, unchanged by this cutover). This is a narrow window in
-# practice: `persisted_cadence`'s missing-cadence-file default is
-# "due now", so a fresh install's calibration tick fires on its first idle
-# moment and immediately persists a cold-start bootstrap floor (spec
-# Section 7) — see `floor_calibration.derive_and_persist_floor`'s
-# cold-start branch, which needs no accumulated real corpus data at all.
+# No hardcoded fallback value lives here — but as of F2a inc8's bootstrap
+# ruling (#250 §7 UPDATED, Roy 2026-09-18) this is no longer a placeholder
+# comment: `MemoryStore.get_reranker_floor` itself ALWAYS returns a servable
+# floor when no persisted row exists yet, serving a derived, process-wide
+# cached BOOTSTRAP floor instead of `None` (see
+# `floor_calibration.get_bootstrap_floor`). This decouples semantic recall's
+# EXISTENCE from the daily calibration tick ever having fired for the
+# runtime model_id — the earlier design ("no row -> None -> fall back to
+# lexical, exactly like an empty/sparse candidate pool") permanently
+# coupled recall to the tick (disabled calibration, or a recall running
+# before the tick's first idle moment, silently and PERMANENTLY demoted to
+# lexical-only even with embeddings present) — see the spec's §7 UPDATED
+# note for the full rationale. `run_semantic_recall` still returns `None`
+# on a floor-read failure (the bootstrap computation's OWN fail-soft path —
+# a reranker load/fit error), treated exactly like any other "semantic path
+# not ready yet" precondition (empty/sparse candidate pool, embed failure,
+# ...); it is just no longer the ROUTINE fresh-install/no-tick-yet case.
+# Once the daily tick DOES persist a real corpus-derived floor for this
+# model_id, that persisted row supersedes the bootstrap on every subsequent
+# call — see `floor_calibration.derive_and_persist_floor`'s cold-start
+# branch (a separate, PERSISTED cold-start fit the tick itself computes and
+# writes, distinct from this module's transient, never-persisted bootstrap).
 #
 # `select_standouts` below takes the floor as an explicit parameter rather
 # than reading a module global — the call site (this module's
@@ -265,16 +275,17 @@ def run_semantic_recall(
     — replaces the pre-#231 cosine standout/clump classifier).
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
-    candidate clears the calibrated floor. Returns `None` for every
-    INCONCLUSIVE case:
+    candidate clears the operative floor (persisted, or — F2a inc8, #250 §7
+    UPDATED — the derived bootstrap when no persisted row exists yet; see
+    the module-docstring note above `select_standouts`). Returns `None` for
+    every INCONCLUSIVE case:
       - nothing clears the floor,
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
-      - no calibrated floor row exists YET for the runtime reranker
-        model_id (the daily calibration tick has never fired for it) — the
-        SAME "graceful warm-up" treatment as an empty candidate pool, not a
-        crash and not a guessed floor value (see the module-docstring note
-        above `select_standouts`),
+      - the bootstrap computation itself failed (no persisted row AND the
+        bootstrap fit raised — a reranker load/fit error) — this is now the
+        ONLY way "no floor" demotes to lexical; a merely-absent persisted
+        row no longer does, on its own, since the bootstrap always fills it,
       - ANY failure ANYWHERE in this function — constructing the local
         embedding/reranker provider, embedding the query, building the
         candidate pool, cosine scoring, reranking, reading the calibrated
@@ -357,19 +368,22 @@ def run_semantic_recall(
         reranked = list(zip(rerank_ids, rerank_scores, strict=True))
         reranked.sort(key=lambda pair: -pair[1])
 
-        # F2a inc8 (#250 §7/§8 cutover): the floor is read LIVE per call,
-        # keyed by the RUNTIME reranker model_id (whichever of fp32/fp16 the
+        # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed
+        # by the RUNTIME reranker model_id (whichever of fp32/fp16 the
         # precision self-check actually shipped — matches how inc4's
         # calibration-log write and inc7's tick both key by
-        # `reranker_provider.model_id()`). No row yet (daily tick has never
-        # fired for this model_id) -> treat exactly like an empty/sparse
-        # candidate pool: INCONCLUSIVE, fall back to lexical. Never invents
-        # a placeholder numeric floor.
+        # `reranker_provider.model_id()`). No persisted row yet (daily tick
+        # has never fired for this model_id) no longer means INCONCLUSIVE —
+        # `get_reranker_floor` serves a derived bootstrap instead (see this
+        # module's own top-of-file comment). `floor_row is None` now fires
+        # ONLY on the bootstrap's own fail-soft path (a reranker load/fit
+        # failure); this check stays as the fail-soft demotion, never
+        # invents a placeholder numeric floor itself.
         floor_row = store.get_reranker_floor(reranker_provider.model_id())
         if floor_row is None:
             log.info(
-                "run_semantic_recall: no calibrated floor yet for %s — "
-                "falling back to lexical (graceful warm-up)",
+                "run_semantic_recall: no floor available (bootstrap computation failed) for %s — "
+                "falling back to lexical",
                 reranker_provider.model_id(),
             )
             return None

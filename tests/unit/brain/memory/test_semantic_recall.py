@@ -514,17 +514,18 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_abstain(
     assert result is None, "a score just below the SEEDED floor must abstain, not surface"
 
 
-def test_run_semantic_recall_falls_back_to_lexical_when_no_floor_row_exists(
+def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No `reranker_floor_calibration` row yet for the runtime model_id (the
-    daily calibration tick has never fired for it — a fresh install / a
-    brand-new reranker model) -> `run_semantic_recall` must return `None`
-    (the SAME graceful-warm-up contract as an empty/sparse candidate pool),
-    never crash, and never invent a placeholder floor value. Deliberately
-    does NOT call `_seed_floor` — this is the "no row at all" case, distinct
-    from cold-start (which DOES have a row, just one flagged
-    `is_cold_start=True`)."""
+    """F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18 bootstrap-floor ruling) —
+    REPLACES the pre-ruling `test_run_semantic_recall_falls_back_to_lexical_
+    when_no_floor_row_exists`, whose premise ("no row -> lexical") this
+    ruling explicitly overturns: "no floor -> lexical" permanently coupled
+    semantic recall's EXISTENCE to the daily calibration tick ever having
+    fired. No `reranker_floor_calibration` row yet for the runtime model_id
+    now means `run_semantic_recall` gets a DERIVED bootstrap floor instead —
+    a CONCLUSIVE semantic result, not a demotion to lexical. Deliberately
+    does NOT call `_seed_floor` — this is the "no row at all" case."""
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
@@ -536,13 +537,55 @@ def test_run_semantic_recall_falls_back_to_lexical_when_no_floor_row_exists(
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
 
+    floor = store.get_reranker_floor("fake-reranker")
+    assert floor is not None, "test precondition: no persisted row, but a bootstrap must be served"
+    assert floor["updated_at"] is None, "test precondition: this must be the transient bootstrap"
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is not None, (
+        "no persisted floor row must no longer demote to lexical — the bootstrap floor makes "
+        "this turn's well-above-any-plausible-floor score CONCLUSIVE"
+    )
+    assert mem.id in result.scores
+
+    count = store._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) AS n FROM reranker_floor_calibration"
+    ).fetchone()["n"]
+    assert count == 0, "reading/using the bootstrap floor must never persist a row"
+
+
+def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The bootstrap floor's OWN fail-soft path (spec Section 7: the
+    bootstrap computation itself must never crash a turn): if deriving the
+    bootstrap raises (a reranker load/fit failure), `get_reranker_floor`
+    degrades to the pre-ruling `None` contract, and `run_semantic_recall`
+    falls back to lexical exactly as it did before this ruling."""
+    content = "a memory that would clear any floor this suite ever seeds"
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+    )
+
+    def _boom(model_id: str):
+        raise RuntimeError("simulated bootstrap reranker provider failure")
+
+    monkeypatch.setattr("brain.memory.reranker._bootstrap_reranker_provider", _boom)
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
     assert store.get_reranker_floor("fake-reranker") is None, (
-        "test precondition: no floor row must exist yet for this model_id"
+        "test precondition: a failed bootstrap computation must degrade to None"
     )
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "no calibrated floor row yet must fall back to lexical, not crash or guess"
+    assert result is None, "a failed bootstrap computation must fall back to lexical, not crash"
 
 
 def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(

@@ -172,17 +172,19 @@ def _semantic_top_k(
         documents = [pool[mid][0].content for mid in rerank_ids]
         rerank_scores = list(reranker_provider.rerank(query, documents))
 
-        # F2a inc8 (#250 §7/§8 cutover): read the calibrated floor live,
-        # keyed by the RUNTIME reranker model_id — mirrors
-        # `run_semantic_recall`'s identical lookup. No row yet (daily tick
-        # has never fired for this model_id) -> same "graceful warm-up"
-        # treatment as an empty cosine/pool result: fall back to lexical,
-        # never a guessed floor value.
+        # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
+        # by the RUNTIME reranker model_id — mirrors `run_semantic_recall`'s
+        # identical lookup. No persisted row yet (daily tick has never
+        # fired for this model_id) no longer means "nothing to read" —
+        # `get_reranker_floor` serves a derived bootstrap instead. `None`
+        # now fires ONLY on the bootstrap's own fail-soft path (a reranker
+        # load/fit failure), which still falls back to lexical here, never
+        # a guessed floor value.
         floor_row = store.get_reranker_floor(reranker_provider.model_id())
         if floor_row is None:
             logger.info(
-                "search_memories(semantic): no calibrated floor yet for %s — "
-                "falling back to lexical (graceful warm-up)",
+                "search_memories(semantic): no floor available (bootstrap computation failed) "
+                "for %s — falling back to lexical",
                 reranker_provider.model_id(),
             )
             return None

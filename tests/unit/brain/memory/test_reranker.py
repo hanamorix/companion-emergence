@@ -997,31 +997,82 @@ def test_precision_selfcheck_ships_fp32_when_no_store_given(monkeypatch: pytest.
     _reset_precision_decision_cache()
 
 
-def test_precision_selfcheck_ships_fp32_when_store_has_no_floor_row_yet(
+def test_precision_selfcheck_runs_for_real_against_the_bootstrap_when_store_has_no_floor_row_yet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """F2a inc8: a REAL store is given, but `reranker_floor_calibration` has
-    no row yet for `fp32_id` (the daily tick has never derived one) -> same
-    safe-default short-circuit as the no-store case above, and for the same
-    reason — there is nothing reliable to compare fp16/fp32 agreement
-    against yet."""
-    from brain.memory.reranker import _choose_reranker_model_id, _reset_precision_decision_cache
+    """F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18 bootstrap-floor ruling) —
+    REPLACES the pre-ruling `test_precision_selfcheck_ships_fp32_when_store_
+    has_no_floor_row_yet`, whose premise this ruling explicitly overturns.
+
+    A REAL store with NO persisted `reranker_floor_calibration` row for
+    `fp32_id` no longer means "nothing to compare against": `store.
+    get_reranker_floor(fp32_id)` now serves a derived BOOTSTRAP floor (spec
+    Section 7's §2/2b interaction note — "the day-0 check is NO LONGER the
+    vacuous inherited-(-9.25) case"), so the self-check must actually RUN
+    its real fp16-vs-fp32 comparison against that bootstrap — fp16
+    registration is attempted, both providers are constructed and scored —
+    rather than short-circuiting straight to fp32 the instant no row
+    exists."""
+    from brain.memory.reranker import (
+        _FP16_GATE_PAIRS,
+        _choose_reranker_model_id,
+        _reset_precision_decision_cache,
+    )
 
     _reset_precision_decision_cache()
-    fp32_id, fp16_id = "fake-fp32-no-floor-row", "fake-fp16-no-floor-row"
-    empty_store = MemoryStore(db_path=":memory:")
-    assert empty_store.get_reranker_floor(fp32_id) is None, "test precondition: no row seeded"
-    register_calls = {"n": 0}
+    fp32_id, fp16_id = "fake-fp32-bootstrap-check", "fake-fp16-bootstrap-check"
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+    clock = _install_precision_stubs(
+        monkeypatch,
+        fp32_id=fp32_id,
+        fp16_id=fp16_id,
+        fp32_scores=agree_scores,
+        fp16_scores=agree_scores,
+        fp32_seconds_per_call=0.02,
+        fp16_seconds_per_call=0.01,  # fp16 measurably faster
+    )
+    # The suite's autouse fixture (tests/conftest.py) already replaces
+    # `_bootstrap_reranker_provider` WHOLESALE with an unscripted
+    # FakeRerankerProvider — bypassing `_install_precision_stubs`'s
+    # `CrossEncoderProvider` patch entirely, since that function never gets
+    # called. Override it again here (same `monkeypatch` fixture, last
+    # write wins) with a scripted stub sharing `agree_scores`/`clock`, so
+    # the bootstrap's own fit ALSO runs against controlled, known scores
+    # (seconds_per_call=0.0: the bootstrap's 6 scoring calls must not
+    # perturb the self-check's own LATER warm-latency measurement window).
     monkeypatch.setattr(
         reranker_mod,
-        "_register_fp16_reranker_model",
-        lambda *a, **k: register_calls.__setitem__("n", register_calls["n"] + 1),
+        "_bootstrap_reranker_provider",
+        lambda model_id: _PrecisionTimingProvider(model_id, agree_scores, clock, 0.0),
     )
+    # `_install_precision_stubs` already no-op'd registration to keep this
+    # test hermetic (no real fastembed registry call) — wrap that SAME
+    # no-op so this test can additionally COUNT calls (last `setattr` wins,
+    # same `monkeypatch` fixture instance).
+    register_calls = {"n": 0}
+    installed_noop = reranker_mod._register_fp16_reranker_model
+
+    def _counting_register(*a, **k):
+        register_calls["n"] += 1
+        return installed_noop(*a, **k)
+
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", _counting_register)
+
+    empty_store = MemoryStore(db_path=":memory:")
+    bootstrap = empty_store.get_reranker_floor(fp32_id)
+    assert bootstrap is not None, "no persisted row must now serve a derived bootstrap, not None"
+    assert bootstrap["is_cold_start"] is True
 
     chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir", store=empty_store)
 
-    assert chosen == fp32_id, "no calibrated floor row yet must ship the safe default, fp32"
-    assert register_calls["n"] == 0, "no floor row must short-circuit before fp16 registration"
+    assert register_calls["n"] >= 1, (
+        "the self-check must actually ATTEMPT fp16 registration against the bootstrap floor, "
+        "not short-circuit before it just because no row was ever persisted"
+    )
+    assert chosen == fp16_id, (
+        "with the bootstrap floor as the comparison bar, full agreement + a measured fp16 speed "
+        "win must still ship fp16 — the day-0 check now reaches a REAL, non-vacuous verdict"
+    )
     _reset_precision_decision_cache()
 
 

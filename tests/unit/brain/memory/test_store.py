@@ -2624,8 +2624,56 @@ def test_fresh_store_has_reranker_floor_calibration_table() -> None:
     store.close()
 
 
-def test_get_reranker_floor_returns_none_when_never_derived(store: MemoryStore) -> None:
-    assert store.get_reranker_floor("never-calibrated-model") is None
+def test_get_reranker_floor_returns_a_bootstrap_when_never_derived(store: MemoryStore) -> None:
+    """F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): no persisted row is no
+    longer a `None` result — `get_reranker_floor` now serves a derived,
+    transient BOOTSTRAP floor instead (this REPLACES the pre-ruling
+    `test_get_reranker_floor_returns_none_when_never_derived` behavior).
+    Nothing is written to the table by merely reading it."""
+    result = store.get_reranker_floor("never-calibrated-model")
+    assert result is not None
+    assert result["reranker_model_id"] == "never-calibrated-model"
+    assert result["is_cold_start"] is True
+    assert result["updated_at"] is None, "a bootstrap floor is transient — never persisted"
+    count = store._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) AS n FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("never-calibrated-model",),
+    ).fetchone()["n"]
+    assert count == 0, "reading a bootstrap floor must never write a row"
+
+
+def test_get_reranker_floor_persisted_row_supersedes_a_warm_bootstrap_cache(
+    monkeypatch: pytest.MonkeyPatch, store: MemoryStore
+) -> None:
+    """A persisted row must always win over the bootstrap — even when the
+    bootstrap was already computed and cached for this exact model_id by an
+    earlier call. No stale in-memory bootstrap may ever shadow a real
+    corpus-derived floor once the daily tick writes one."""
+    from brain.memory import floor_calibration
+    from brain.memory.reranker import _FP16_GATE_PAIRS, FakeRerankerProvider
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    model_id = "supersession-test-model"
+    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        lambda model_id: FakeRerankerProvider(scores=scores_by_doc),
+    )
+
+    bootstrap = store.get_reranker_floor(model_id)
+    assert bootstrap is not None
+    assert bootstrap["is_cold_start"] is True
+
+    store.write_reranker_floor(
+        model_id, floor=123.456, raw_fit_floor=123.456, sample_pairs=999, is_cold_start=False
+    )
+
+    persisted = store.get_reranker_floor(model_id)
+    assert persisted["floor"] == pytest.approx(123.456), (
+        "a persisted row must supersede an already-cached bootstrap, not be shadowed by it"
+    )
+    assert persisted["is_cold_start"] is False
+    assert persisted["sample_pairs"] == 999
 
 
 def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:

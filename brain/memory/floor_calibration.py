@@ -44,14 +44,33 @@ small bootstrap floor rather than having no floor or crashing") reuses
 representative (query, doc) set §2's fp16-vs-fp32 self-check already ships —
 scored through the LIVE production reranker provider, so the bootstrap floor
 sits on the same scale real per-turn scores will use.
+
+HOT-PATH no-persisted-floor bootstrap (F2a inc8, #250 §7 UPDATED, Roy
+2026-09-18): `get_bootstrap_floor` below is the OTHER cold-start path this
+module owns — distinct from `derive_and_persist_floor`'s own cold-start
+branch (which runs ONLY inside the once-daily tick and PERSISTS its result).
+`get_bootstrap_floor` is called SYNCHRONOUSLY from
+`MemoryStore.get_reranker_floor` whenever no `reranker_floor_calibration`
+row exists yet for a model_id — i.e. it can fire on the per-turn hot path,
+on the very FIRST no-row recall/precision-check of the process. It is
+computed ONCE per model_id and cached process-wide (never persisted to
+`memories.db` — a transient, in-memory-only fallback that a real persisted
+row always supersedes, see that function's docstring), and it deliberately
+builds its own reranker provider via `reranker._bootstrap_reranker_provider`
+rather than `reranker.build_reranker_provider` — going through the latter
+would recurse back into `MemoryStore.get_reranker_floor` via the fp16/fp32
+precision self-check (see `_bootstrap_reranker_provider`'s docstring for the
+full loop this avoids). Never touches the §6 torch-backed relevance judge —
+jina (ONNX, via `reranker.CrossEncoderProvider`) is the only model involved.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -350,6 +369,122 @@ def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, 
         (score,) = reranker_provider.rerank(query, [doc])
         pairs.append((float(score), label))
     return pairs
+
+
+# ---------------------------------------------------------------------------
+# Hot-path bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) —
+# the DEFAULT `get_reranker_floor` serves when NO persisted row exists yet,
+# so semantic recall's existence is decoupled from the daily tick ever
+# having fired. Process-wide cache, keyed by model_id, computed ONCE.
+# ---------------------------------------------------------------------------
+
+# model_id -> the bootstrap floor dict last derived for it (same shape as
+# `MemoryStore.get_reranker_floor`'s persisted-row dict). Process-wide,
+# mirrors `reranker.py`'s `_provider_cache`/`_latency_cache`/
+# `_precision_decision_cache` pattern: computed once per model_id, reused by
+# every later caller in the process, reset only by tests
+# (`_reset_bootstrap_floor_cache`, wired into `tests/conftest.py`'s autouse
+# fixture alongside the reranker module's own resets).
+_bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
+_bootstrap_floor_cache_lock = threading.Lock()
+
+
+def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
+    """Derived DEFAULT floor for `reranker_model_id`, served by
+    `MemoryStore.get_reranker_floor` whenever no persisted
+    `reranker_floor_calibration` row exists yet (spec Section 7, UPDATED
+    2026-09-18 — Roy's bootstrap-floor ruling, F2a inc8): "no floor ->
+    lexical" permanently coupled semantic recall's EXISTENCE to the daily
+    calibration tick ever having fired for a given reranker model_id (an
+    operator disabling calibration, or recall running before the tick's
+    first idle moment, would silently and PERMANENTLY demote to lexical-only
+    even with embeddings present) — this decouples the two by always having
+    a servable floor.
+
+    DERIVATION (I3-clean, not a magic number): scores `reranker.py`'s own
+    bundled `_FP16_GATE_PAIRS[:6]` (the same relevant/decoy set §2's
+    fp16-vs-fp32 gate uses — reused rather than shipping a second bundled
+    set, exactly like `_cold_start_pairs` above) through a RAW provider for
+    `reranker_model_id` specifically (`reranker._bootstrap_reranker_
+    provider` — NOT `reranker.build_reranker_provider`, see that function's
+    docstring for why: going through the precision self-check would recurse
+    back into THIS function), then fits via the SAME `fit_threshold_fbeta`
+    (Youden's-J / F-beta, recall-leaning) every other floor in this module
+    uses — no separate/duplicated fitting logic. Scored through whichever
+    model_id the caller asked about, so the result sits on that exact
+    model's score scale (fp32 or fp16, whichever is the runtime reranker).
+
+    COMPUTE CONSTRAINT (load-bearing, spec Section 7): computed ONCE per
+    model_id (this cache) and NEVER involves the §6 torch-backed relevance
+    judge — only jina (ONNX, via `CrossEncoderProvider`) scores the bundled
+    pairs, so no torch import and no extra latency beyond this one-time cost
+    ever touch the hot path. In practice this is very often a cache HIT on
+    the underlying reranker PROVIDER too (not just this floor cache): the
+    production call sites (`run_semantic_recall`, `_semantic_top_k`, the
+    precision self-check) all resolve/construct their own reranker provider
+    for this exact model_id via `reranker.build_reranker_provider` BEFORE
+    ever calling `get_reranker_floor`, which already populated
+    `reranker._provider_cache[model_id]` — `_bootstrap_reranker_provider`
+    reads that same cache, so the ONNX session is typically already warm.
+
+    NEVER PERSISTED: this is a transient, in-memory-only fallback — the
+    caller (`MemoryStore.get_reranker_floor`) always checks the PERSISTED
+    `reranker_floor_calibration` row first and only reaches this function on
+    a miss, so a real corpus-derived floor (once the daily tick writes one)
+    permanently supersedes this cache for that model_id with no way for a
+    stale bootstrap value to shadow it.
+
+    FAIL-SOFT (spec: the bootstrap computation itself must never crash a
+    turn): any failure constructing the provider or fitting the threshold
+    (a reranker load error, an empty/degenerate pairs list, ...) is caught,
+    logged, and returns `None` — `get_reranker_floor` then degrades to the
+    PRE-ruling contract (`None` -> caller falls back to lexical), the
+    bootstrap's own last-resort failure path.
+    """
+    cached = _bootstrap_floor_cache.get(reranker_model_id)
+    if cached is not None:
+        return dict(cached)
+    with _bootstrap_floor_cache_lock:
+        cached = _bootstrap_floor_cache.get(reranker_model_id)
+        if cached is not None:
+            return dict(cached)
+        try:
+            from brain.memory.reranker import _bootstrap_reranker_provider
+
+            provider = _bootstrap_reranker_provider(reranker_model_id)
+            pairs = _cold_start_pairs(provider)
+            beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
+            floor = fit_threshold_fbeta(pairs, beta=beta)
+        except Exception:  # noqa: BLE001 — fail-soft: must never break a recall/self-check
+            logger.exception(
+                "floor_calibration: bootstrap floor computation failed for %s -> "
+                "get_reranker_floor degrades to the pre-ruling None/lexical-fallback contract",
+                reranker_model_id,
+            )
+            return None
+        result: dict[str, Any] = {
+            "reranker_model_id": reranker_model_id,
+            "floor": floor,
+            "raw_fit_floor": floor,
+            "sample_pairs": len(pairs),
+            "is_cold_start": True,
+            "updated_at": None,
+        }
+        _bootstrap_floor_cache[reranker_model_id] = result
+        return dict(result)
+
+
+def _reset_bootstrap_floor_cache() -> None:
+    """Test-only: clear the cached bootstrap floor(s).
+
+    Wired into `tests/conftest.py`'s autouse `_reset_reranker_provider_cache`
+    fixture alongside `reranker._reset_reranker_provider_cache` et al. — same
+    rationale: a test that calls the real `get_bootstrap_floor` (directly or
+    via `MemoryStore.get_reranker_floor`) must not read or leak a value a
+    prior/later test's call happened to cache for the same model_id.
+    """
+    with _bootstrap_floor_cache_lock:
+        _bootstrap_floor_cache.clear()
 
 
 # ---------------------------------------------------------------------------
