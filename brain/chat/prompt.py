@@ -1100,9 +1100,10 @@ def _build_recall_block(
         # #231 RERANKER RE-ARCHITECTURE: the old Stage-4 plug-in seam
         # (per-persona cosine floor/gap, loaded here via
         # load_semantic_calibration) is REMOVED — run_semantic_recall now
-        # floor-gates a cross-encoder RERANKER score against the FIXED
-        # RERANK_FLOOR module constant (brain/memory/semantic_recall.py),
-        # no per-persona calibration file to load.
+        # floor-gates a cross-encoder RERANKER score against a floor read
+        # live per call (brain/memory/semantic_recall.py; F2a inc8, #250
+        # §7/§8 cut it over from a fixed module constant to a per-persona
+        # DB-calibrated value), no per-persona calibration FILE to load.
         semantic_result = run_semantic_recall(store, persona_dir, user_input)
     except Exception:  # noqa: BLE001
         # Defense-in-depth: run_semantic_recall already wraps its own body in

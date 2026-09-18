@@ -30,6 +30,28 @@ from brain.memory.reranker import (
     build_reranker_provider,
     get_rerank_width,
 )
+from brain.memory.store import MemoryStore
+
+# F2a inc8 cutover: `_run_precision_selfcheck` reads the calibrated floor
+# live from a `MemoryStore` (`store.get_reranker_floor`) rather than the
+# deleted `semantic_recall.RERANK_FLOOR` module constant. This helper seeds
+# that row directly for tests that need the self-check to actually run its
+# real comparison logic (as opposed to short-circuiting on "no store /
+# no floor yet" — see `_run_precision_selfcheck`'s docstring).
+_TEST_FLOOR_SAMPLE_PAIRS = 10
+
+
+def _seeded_floor_store(model_id: str, floor: float) -> MemoryStore:
+    store = MemoryStore(db_path=":memory:")
+    store.write_reranker_floor(
+        model_id,
+        floor=floor,
+        raw_fit_floor=floor,
+        sample_pairs=_TEST_FLOOR_SAMPLE_PAIRS,
+        is_cold_start=False,
+    )
+    return store
+
 
 # ---------------------------------------------------------------------------
 # FakeRerankerProvider — scriptable, offline
@@ -43,12 +65,15 @@ def test_fake_reranker_returns_scripted_scores_positionally_aligned() -> None:
 
 
 def test_fake_reranker_unscripted_document_gets_the_default_far_below_floor() -> None:
-    from brain.memory.semantic_recall import RERANK_FLOOR
-
+    """F2a inc8: no more module-level `RERANK_FLOOR` to compare against — the
+    default is `_DEFAULT_UNSCORED` (a large negative sentinel), so a plain
+    sanity bound well below any plausible calibrated floor value (jina's raw
+    logits, per the ledger, range roughly -1 digit to small positive) proves
+    the same "never accidentally clears a real floor" property."""
     provider = FakeRerankerProvider(scores={"scripted": 5.0})
     scores = list(provider.rerank("query", ["scripted", "never scripted"]))
     assert scores[0] == 5.0
-    assert scores[1] < RERANK_FLOOR, "the unscripted default must sit below any plausible floor"
+    assert scores[1] < -100.0, "the unscripted default must sit below any plausible floor"
 
 
 def test_fake_reranker_custom_default_is_honored() -> None:
@@ -83,7 +108,7 @@ def test_build_reranker_provider_is_process_cached_by_model_id(monkeypatch: pyte
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _CountingFake)
     monkeypatch.setattr(
-        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir: fp32_id
+        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir, store=None: fp32_id
     )
     monkeypatch.setattr(
         "brain.bridge.model_tier.model_for_tier", lambda tier: "fake-model-id"
@@ -114,7 +139,7 @@ def test_reset_reranker_provider_cache_forces_reconstruction(monkeypatch: pytest
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _CountingFake)
     monkeypatch.setattr(
-        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir: fp32_id
+        reranker_mod, "_choose_reranker_model_id", lambda fp32_id, fp16_id, cache_dir, store=None: fp32_id
     )
     monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "fake-model-id")
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
@@ -715,8 +740,8 @@ def test_precision_selfcheck_ships_fp16_on_agreement_and_a_measured_speed_win(
 
     _reset_precision_decision_cache()
     fp32_id, fp16_id = "fake-fp32-agree-fast", "fake-fp16-agree-fast"
-    # Every bundled pair scores well above RERANK_FLOOR for BOTH precisions
-    # -> every "surfaced" decision agrees.
+    # Every bundled pair scores well above the calibrated floor (seeded for
+    # fp32_id below) for BOTH precisions -> every "surfaced" decision agrees.
     agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
     _install_precision_stubs(
         monkeypatch,
@@ -728,7 +753,9 @@ def test_precision_selfcheck_ships_fp16_on_agreement_and_a_measured_speed_win(
         fp16_seconds_per_call=0.01,  # fp16 measurably faster
     )
 
-    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    chosen = _choose_reranker_model_id(
+        fp32_id, fp16_id, "/tmp/fake-cache-dir", store=_seeded_floor_store(fp32_id, 2.0)
+    )
     assert chosen == fp16_id, "agreement + a real speed win must ship fp16"
     _reset_precision_decision_cache()
 
@@ -763,7 +790,9 @@ def test_precision_selfcheck_ships_fp32_on_any_decision_disagreement(
         fp16_seconds_per_call=0.01,  # fp16 would be faster, but must not matter here
     )
 
-    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    chosen = _choose_reranker_model_id(
+        fp32_id, fp16_id, "/tmp/fake-cache-dir", store=_seeded_floor_store(fp32_id, 2.0)
+    )
     assert chosen == fp32_id, "any single flipped keep/drop decision must fail the gate -> fp32"
     _reset_precision_decision_cache()
 
@@ -795,7 +824,9 @@ def test_precision_selfcheck_ships_fp32_when_agreement_holds_but_fp16_is_not_fas
         fp16_seconds_per_call=0.02,  # fp16 SLOWER on this simulated host
     )
 
-    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    chosen = _choose_reranker_model_id(
+        fp32_id, fp16_id, "/tmp/fake-cache-dir", store=_seeded_floor_store(fp32_id, 2.0)
+    )
     assert chosen == fp32_id, "agreement without a measured fp16 speed win must still ship fp32"
     _reset_precision_decision_cache()
 
@@ -828,12 +859,16 @@ def test_precision_selfcheck_decision_is_cached_not_recomputed_per_call(
         return _PrecisionTimingProvider(model_id, agree_scores, clock, seconds)
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _fake_ctor)
+    floor_store = _seeded_floor_store(fp32_id, 2.0)
 
-    first = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    first = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir", store=floor_store)
     calls_after_first = construct_calls["n"]
     assert calls_after_first > 0, "the first (uncached) call must actually run the self-check"
 
-    second = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    # The cache-hit path must not even NEED the store (a cache hit never
+    # touches it) — passing store=None here proves the second call is a
+    # pure cache hit, not a second (differently-argued) real self-check run.
+    second = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir", store=None)
     assert second == first, "a cache hit must return the same decision"
     assert construct_calls["n"] == calls_after_first, (
         "a second call for the same (fp32, fp16) pair must be a pure cache hit — "
@@ -856,7 +891,15 @@ def test_precision_selfcheck_registration_failure_is_fail_soft(monkeypatch: pyte
 
     monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", _boom_register)
 
-    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    # A calibrated floor MUST be seeded here: without one, the self-check
+    # short-circuits to fp32 BEFORE ever calling `_register_fp16_reranker_
+    # model` at all (see `_run_precision_selfcheck`'s "no store/floor"
+    # branch) — this test would then pass for the WRONG reason (the missing
+    # floor, not the registration failure). Seeding the floor forces the
+    # function to actually reach (and exercise) the registration step.
+    chosen = _choose_reranker_model_id(
+        fp32_id, fp16_id, "/tmp/fake-cache-dir", store=_seeded_floor_store(fp32_id, 2.0)
+    )
     assert chosen == fp32_id, "a registration failure must fail-soft to fp32, never raise"
     _reset_precision_decision_cache()
 
@@ -876,7 +919,13 @@ def test_precision_selfcheck_load_failure_is_fail_soft(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _boom_ctor)
 
-    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir")
+    # Same reasoning as the registration-failure test above: without a
+    # seeded floor this would short-circuit to fp32 before ever reaching
+    # CrossEncoderProvider construction, making the assertion pass for the
+    # wrong reason.
+    chosen = _choose_reranker_model_id(
+        fp32_id, fp16_id, "/tmp/fake-cache-dir", store=_seeded_floor_store(fp32_id, 2.0)
+    )
     assert chosen == fp32_id, "a provider construction/load failure must fail-soft to fp32, never raise"
     _reset_precision_decision_cache()
 
@@ -905,28 +954,96 @@ def test_precision_selfcheck_cache_key_invalidates_on_model_swap(monkeypatch: py
 
     monkeypatch.setattr(reranker_mod, "CrossEncoderProvider", _fake_ctor)
 
-    _choose_reranker_model_id("fp32-v1", "fp16-v1", "/tmp/fake-cache-dir")
+    _choose_reranker_model_id(
+        "fp32-v1", "fp16-v1", "/tmp/fake-cache-dir", store=_seeded_floor_store("fp32-v1", 2.0)
+    )
     calls_after_first_pair = construct_calls["n"]
 
     # A different fp32/fp16 pair (simulating a model swap) must re-run the
     # self-check, not reuse the old pair's cached decision.
-    _choose_reranker_model_id("fp32-v2", "fp16-v2", "/tmp/fake-cache-dir")
+    _choose_reranker_model_id(
+        "fp32-v2", "fp16-v2", "/tmp/fake-cache-dir", store=_seeded_floor_store("fp32-v2", 2.0)
+    )
     assert construct_calls["n"] > calls_after_first_pair, (
         "a different (fp32, fp16) model-id pair must invalidate the cache and re-run the self-check"
     )
     _reset_precision_decision_cache()
 
 
+def test_precision_selfcheck_ships_fp32_when_no_store_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2a inc8 (#250 §7/§8): `store=None` (the keyword-only default) means
+    there is no way to read a calibrated floor at all -> the self-check
+    ships fp32 WITHOUT even attempting fp16 registration/construction
+    (never touches `_register_fp16_reranker_model` or `CrossEncoderProvider`
+    for the fp16 candidate) — proves the short-circuit is a genuine early
+    return, not merely "the comparison loop happens to agree on nothing"."""
+    from brain.memory.reranker import _choose_reranker_model_id, _reset_precision_decision_cache
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-no-store", "fake-fp16-no-store"
+    register_calls = {"n": 0}
+    monkeypatch.setattr(
+        reranker_mod,
+        "_register_fp16_reranker_model",
+        lambda *a, **k: register_calls.__setitem__("n", register_calls["n"] + 1),
+    )
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir", store=None)
+
+    assert chosen == fp32_id, "no store to read a floor from must ship the safe default, fp32"
+    assert register_calls["n"] == 0, (
+        "no store must short-circuit BEFORE fp16 registration — never a wasted ONNX load attempt"
+    )
+    _reset_precision_decision_cache()
+
+
+def test_precision_selfcheck_ships_fp32_when_store_has_no_floor_row_yet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F2a inc8: a REAL store is given, but `reranker_floor_calibration` has
+    no row yet for `fp32_id` (the daily tick has never derived one) -> same
+    safe-default short-circuit as the no-store case above, and for the same
+    reason — there is nothing reliable to compare fp16/fp32 agreement
+    against yet."""
+    from brain.memory.reranker import _choose_reranker_model_id, _reset_precision_decision_cache
+
+    _reset_precision_decision_cache()
+    fp32_id, fp16_id = "fake-fp32-no-floor-row", "fake-fp16-no-floor-row"
+    empty_store = MemoryStore(db_path=":memory:")
+    assert empty_store.get_reranker_floor(fp32_id) is None, "test precondition: no row seeded"
+    register_calls = {"n": 0}
+    monkeypatch.setattr(
+        reranker_mod,
+        "_register_fp16_reranker_model",
+        lambda *a, **k: register_calls.__setitem__("n", register_calls["n"] + 1),
+    )
+
+    chosen = _choose_reranker_model_id(fp32_id, fp16_id, "/tmp/fake-cache-dir", store=empty_store)
+
+    assert chosen == fp32_id, "no calibrated floor row yet must ship the safe default, fp32"
+    assert register_calls["n"] == 0, "no floor row must short-circuit before fp16 registration"
+    _reset_precision_decision_cache()
+
+
 def test_reset_precision_decision_for_floor_change_forces_a_genuine_rebuild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Acceptance 2b (F2a inc7, spec Section 7): after the daily calibration
-    tick derives+writes a new floor, `reranker.reset_precision_decision_for_
-    floor_change()` must force the NEXT `build_reranker_provider()` call to
-    (a) actually RE-RUN the fp16/fp32 self-check (not serve a cached
-    decision) and (b) construct a GENUINELY FRESH provider for whichever
-    model_id the re-run decides — proving the reset propagates to the
-    process-wide PROVIDER cache too, not just the decision flag.
+    """Acceptance 2b (F2a inc7/inc8, spec Section 7/8): the FULL end-to-end
+    path a real daily calibration tick exercises — a floor WRITE
+    (`store.write_reranker_floor`, the same call `floor_calibration.
+    derive_and_persist_floor` makes) followed by `reranker.reset_precision_
+    decision_for_floor_change()` (the same call `_run_calibration_tick`
+    makes on an accepted write) — must force the NEXT `build_reranker_
+    provider(store=...)` call to (a) actually RE-RUN the fp16/fp32
+    self-check under the NEWLY WRITTEN floor (read live via `store.
+    get_reranker_floor`, not a cached decision) and (b) construct a
+    GENUINELY FRESH provider for whichever model_id the re-run decides —
+    proving the reset propagates to the process-wide PROVIDER cache too,
+    not just the decision flag. This is the inc7 2b loop CLOSING: inc7 only
+    proved the reset mechanism fired on an in-process floor mutation; this
+    (inc8) version proves it against the REAL write path now that
+    `_run_precision_selfcheck` actually reads the calibrated floor instead
+    of the deleted `semantic_recall.RERANK_FLOOR` constant.
 
     Three phases, going through the real `build_reranker_provider()` +
     model_tier resolution path (not `_choose_reranker_model_id` directly,
@@ -947,7 +1064,6 @@ def test_reset_precision_decision_for_floor_change_forces_a_genuine_rebuild(
          that clearing `_provider_cache` too was necessary.
     """
     from brain.memory import reranker as reranker_mod2
-    from brain.memory import semantic_recall as semantic_recall_mod
     from brain.memory.reranker import _FP16_GATE_PAIRS, reset_precision_decision_for_floor_change
 
     # NOTE: uses the MODULE-LEVEL `build_reranker_provider` name imported at
@@ -962,6 +1078,7 @@ def test_reset_precision_decision_for_floor_change_forces_a_genuine_rebuild(
     reset_precision_decision_for_floor_change()
     fp32_id, fp16_id = "fake-fp32-flip-rebuild", "fake-fp16-flip-rebuild"
     construct_calls: list[str] = []
+    store = MemoryStore(db_path=":memory:")
 
     monkeypatch.setattr(reranker_mod2, "_register_fp16_reranker_model", lambda *a, **k: None)
     monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: fp32_id)
@@ -980,38 +1097,49 @@ def test_reset_precision_decision_for_floor_change_forces_a_genuine_rebuild(
 
         monkeypatch.setattr(reranker_mod2, "CrossEncoderProvider", _fake_ctor)
 
+    def _write_floor(floor: float) -> None:
+        """The REAL production write path (`MemoryStore.write_reranker_
+        floor`) — the same call `floor_calibration.derive_and_persist_floor`
+        makes from inside the daily tick, keyed by `fp32_id` (the runtime
+        model_id `_run_precision_selfcheck` reads its comparison bar from —
+        see that function's docstring on why fp32 specifically)."""
+        store.write_reranker_floor(
+            fp32_id, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
+        )
+
     agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
     flipped_pair = _FP16_GATE_PAIRS[0]
 
     # Phase 1: stale/unreachable floor -> trivial agreement -> ships fp16.
-    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", -1_000_000.0)
+    _write_floor(-1_000_000.0)
     _install_ctor(agree_scores, agree_scores)
-    provider_phase1 = build_reranker_provider()
+    provider_phase1 = build_reranker_provider(store=store)
     assert provider_phase1.model_id() == fp16_id
     calls_after_phase1 = len(construct_calls)
     assert calls_after_phase1 > 0
 
-    # Phase 2: sharpen the floor -> fp16 alone drops the flipped pair ->
-    # disagreement -> ships fp32.
+    # Phase 2: sharpen the floor (a real WRITE, same call the tick makes) ->
+    # fp16 alone drops the flipped pair -> disagreement -> ships fp32.
     fp32_scores_p2 = dict(agree_scores)
     fp16_scores_p2 = dict(agree_scores)
     fp16_scores_p2[flipped_pair] = -1_000.0
-    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", 2.0)
+    _write_floor(2.0)
     _install_ctor(fp32_scores_p2, fp16_scores_p2)
     reset_precision_decision_for_floor_change()
-    provider_phase2 = build_reranker_provider()
+    provider_phase2 = build_reranker_provider(store=store)
     assert provider_phase2.model_id() == fp32_id, (
         "a disagreement under the sharpened, reachable floor must flip the ship decision to fp32"
     )
     calls_after_phase2 = len(construct_calls)
     assert calls_after_phase2 > calls_after_phase1, "the reset must force a genuine self-check re-run"
 
-    # Phase 3: floor reverts to stale -> agreement again -> ships fp16
-    # again. fp16's key was already populated in phase 1.
-    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", -1_000_000.0)
+    # Phase 3: floor reverts to stale (another real WRITE) -> agreement
+    # again -> ships fp16 again. fp16's key was already populated in
+    # phase 1.
+    _write_floor(-1_000_000.0)
     _install_ctor(agree_scores, agree_scores)
     reset_precision_decision_for_floor_change()
-    provider_phase3 = build_reranker_provider()
+    provider_phase3 = build_reranker_provider(store=store)
 
     assert provider_phase3.model_id() == fp16_id
     assert len(construct_calls) > calls_after_phase2, "phase 3 must also force a genuine self-check re-run"

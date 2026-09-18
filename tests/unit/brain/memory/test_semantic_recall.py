@@ -29,7 +29,6 @@ from brain.memory.reranker import FakeRerankerProvider
 from brain.memory.semantic_recall import (
     FULL_INJECT_STANDOUT_MAX,
     MAX_STANDOUT_COUNT,
-    RERANK_FLOOR,
     build_semantic_candidate_pool,
     run_semantic_recall,
     select_standouts,
@@ -37,6 +36,32 @@ from brain.memory.semantic_recall import (
 from brain.memory.store import Memory, MemoryStore
 
 _TEST_MODEL_ID = "fake-test-model"
+
+# F2a inc8 cutover: `select_standouts` takes the floor as an explicit
+# parameter now (no more module-level `RERANK_FLOOR`) — this is an
+# arbitrary reference value for the pure floor-gating unit tests below, with
+# no production significance (mirrors the deleted constant's numeric value
+# only for continuity with this file's existing test data, not because it
+# means anything here).
+_TEST_FLOOR = -9.25
+# `FakeRerankerProvider().model_id()` is always this literal string
+# (`brain/memory/reranker.py`) — the model_id `run_semantic_recall`/
+# `_semantic_top_k` key their `store.get_reranker_floor` lookup on whenever
+# a test lets the suite's default fake reranker provider run.
+_FAKE_RERANKER_MODEL_ID = "fake-reranker"
+
+
+def _seed_floor(
+    store: MemoryStore, floor: float = _TEST_FLOOR, *, model_id: str = _FAKE_RERANKER_MODEL_ID
+) -> None:
+    """Write a calibrated floor row directly (F2a inc8: `run_semantic_recall`
+    now reads `store.get_reranker_floor(reranker_provider.model_id())` live
+    instead of a module constant) — the integration-style `run_semantic_
+    recall` tests below need a row present before they can get a CONCLUSIVE
+    result."""
+    store.write_reranker_floor(
+        model_id, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
+    )
 
 
 def _seed_row_vector(store: MemoryStore, memory_id: str, vec: np.ndarray, *, model_id: str = _TEST_MODEL_ID) -> None:
@@ -87,24 +112,24 @@ def _mem(store: MemoryStore, content: str, *, state: str = "active") -> Memory:
 
 
 def test_nothing_clears_the_floor_returns_none() -> None:
-    scored = [("a", RERANK_FLOOR - 5.0), ("b", RERANK_FLOOR - 1.0)]
-    assert select_standouts(scored) is None
+    scored = [("a", _TEST_FLOOR - 5.0), ("b", _TEST_FLOOR - 1.0)]
+    assert select_standouts(scored, _TEST_FLOOR) is None
 
 
 def test_a_below_floor_candidate_never_enters_the_standout_set() -> None:
-    scored = [("a", RERANK_FLOOR + 1.0), ("b", RERANK_FLOOR - 0.01)]
-    tiers = select_standouts(scored)
+    scored = [("a", _TEST_FLOOR + 1.0), ("b", _TEST_FLOOR - 0.01)]
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == ["a"]
     assert tiers.snippet_ids == []
 
 
 def test_a_score_exactly_at_the_floor_clears_it() -> None:
-    """The floor comparison is >=, not > — a candidate scoring exactly
-    RERANK_FLOOR counts as a standout, matching the pre-#231 classifier's
-    own `< calibration.floor` (strict) exclusion rule."""
-    scored = [("a", RERANK_FLOOR)]
-    tiers = select_standouts(scored)
+    """The floor comparison is >=, not > — a candidate scoring exactly at
+    the floor counts as a standout, matching the pre-#231 classifier's own
+    `< calibration.floor` (strict) exclusion rule."""
+    scored = [("a", _TEST_FLOOR)]
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == ["a"]
 
@@ -115,8 +140,9 @@ def test_a_score_exactly_at_the_floor_clears_it() -> None:
 
 
 def _above_floor_scores(n: int, *, top: float = 5.0, step: float = 0.5) -> list[float]:
-    """n scores, each clearing RERANK_FLOOR (the floor no longer cares about
-    the GAP between them — every above-floor candidate is a standout)."""
+    """n scores, each clearing `_TEST_FLOOR` (the floor no longer cares
+    about the GAP between them — every above-floor candidate is a
+    standout)."""
     return [top - i * step for i in range(n)]
 
 
@@ -124,7 +150,7 @@ def _above_floor_scores(n: int, *, top: float = 5.0, step: float = 0.5) -> list[
 def test_le_5_standouts_all_full(n: int) -> None:
     scores = _above_floor_scores(n)
     scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    tiers = select_standouts(scored)
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == [f"m{i}" for i in range(n)]
     assert tiers.snippet_ids == []
@@ -134,7 +160,7 @@ def test_le_5_standouts_all_full(n: int) -> None:
 def test_6_to_9_standouts_top5_full_rest_snippet(n: int) -> None:
     scores = _above_floor_scores(n)
     scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    tiers = select_standouts(scored)
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX)]
     assert tiers.snippet_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX, n)]
@@ -148,7 +174,7 @@ def test_10_or_more_above_floor_caps_at_max_standout_count_not_lexical() -> None
     lexical fallback."""
     scores = _above_floor_scores(12)
     scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    tiers = select_standouts(scored)
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX)]
     assert tiers.snippet_ids == [f"m{i}" for i in range(FULL_INJECT_STANDOUT_MAX, MAX_STANDOUT_COUNT)]
@@ -160,7 +186,7 @@ def test_surfacing_tier_ids_are_in_reranker_selection_order() -> None:
     re-ordering is the CALLER's job (prompt.py), not this function's."""
     scores = _above_floor_scores(6)
     scored = [(f"m{i}", s) for i, s in enumerate(scores)]
-    tiers = select_standouts(scored)
+    tiers = select_standouts(scored, _TEST_FLOOR)
     assert tiers is not None
     assert tiers.full_ids == sorted(tiers.full_ids, key=lambda mid: -dict(scored)[mid])
     assert tiers.snippet_ids == sorted(tiers.snippet_ids, key=lambda mid: -dict(scored)[mid])
@@ -333,7 +359,7 @@ def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
     # attribute on the reranker module itself (mirrors how conftest.py's
     # own `_fake_reranker_provider_by_default` fixture patches it).
     monkeypatch.setattr(
-        "brain.memory.reranker.build_reranker_provider", lambda: _BoomReranker()
+        "brain.memory.reranker.build_reranker_provider", lambda **kwargs: _BoomReranker()
     )
     _align_embedding_tier(monkeypatch)
 
@@ -367,11 +393,12 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
 
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda: FakeRerankerProvider(scores={content: RERANK_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
+    _seed_floor(store)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
 
@@ -388,7 +415,7 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
     candidate_ids = json.loads(row["candidate_ids"])
     scores = json.loads(row["reranker_scores"])
     assert mem.id in candidate_ids
-    assert scores[candidate_ids.index(mem.id)] == pytest.approx(RERANK_FLOOR + 1.0)
+    assert scores[candidate_ids.index(mem.id)] == pytest.approx(_TEST_FLOOR + 1.0)
     assert row["reranker_model_id"] == "fake-reranker"  # FakeRerankerProvider.model_id()
     assert row["day_bucket"]  # populated, non-empty
     assert row["local_judge_label"] is None
@@ -405,7 +432,7 @@ def test_calibration_log_write_failure_does_not_break_recall(
     content = "a memory that clears the floor"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda: FakeRerankerProvider(scores={content: RERANK_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -415,6 +442,7 @@ def test_calibration_log_write_failure_does_not_break_recall(
     monkeypatch.setattr(MemoryStore, "log_calibration_sample", _boom)
 
     store = MemoryStore(tmp_path / "memories.db")
+    _seed_floor(store)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
 
@@ -422,5 +450,125 @@ def test_calibration_log_write_failure_does_not_break_recall(
 
     assert result is not None, "a calibration-log write failure must not fall back to lexical"
     assert mem.id in [m.id for m in result.full]
+
+
+# ---------------------------------------------------------------------------
+# F2a inc8 (#250 §7/§8 cutover) — the calibrated-floor read itself: the
+# keep/abstain sides of a real floor comparison, the "no row yet" fallback,
+# and fail-soft when the read raises. Each test must genuinely BITE: the
+# keep/abstain pair proves the floor value is actually READ and actually
+# GATES (not merely present), and the no-row/raise tests prove neither case
+# crashes a turn or silently invents a floor.
+# ---------------------------------------------------------------------------
+
+
+def test_run_semantic_recall_uses_the_calibrated_floor_to_keep_a_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A candidate scoring ABOVE the persisted calibrated floor is surfaced
+    — proves the floor value written via `store.write_reranker_floor` is
+    the one actually consulted (not some other value/the deleted constant)."""
+    content = "a memory scored just above the calibrated floor"
+    seeded_floor = 2.5  # an arbitrary value, deliberately far from _TEST_FLOOR,
+    # so this test could not pass by accident against a stale/wrong floor.
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor + 0.01}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _seed_floor(store, seeded_floor)
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is not None, "a score just above the SEEDED floor must surface, not abstain"
+    assert mem.id in [m.id for m in result.full]
+
+
+def test_run_semantic_recall_uses_the_calibrated_floor_to_abstain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A candidate scoring BELOW the persisted calibrated floor is dropped
+    -> INCONCLUSIVE -> falls back to lexical. Same seeded floor as the
+    keep-side test above, only the score moves — proves the comparison is a
+    genuine two-sided gate, not e.g. an accidental always-True/always-False
+    stub."""
+    content = "a memory scored just below the calibrated floor"
+    seeded_floor = 2.5
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor - 0.01}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _seed_floor(store, seeded_floor)
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is None, "a score just below the SEEDED floor must abstain, not surface"
+
+
+def test_run_semantic_recall_falls_back_to_lexical_when_no_floor_row_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No `reranker_floor_calibration` row yet for the runtime model_id (the
+    daily calibration tick has never fired for it — a fresh install / a
+    brand-new reranker model) -> `run_semantic_recall` must return `None`
+    (the SAME graceful-warm-up contract as an empty/sparse candidate pool),
+    never crash, and never invent a placeholder floor value. Deliberately
+    does NOT call `_seed_floor` — this is the "no row at all" case, distinct
+    from cold-start (which DOES have a row, just one flagged
+    `is_cold_start=True`)."""
+    content = "a memory that would clear any floor this suite ever seeds"
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    assert store.get_reranker_floor("fake-reranker") is None, (
+        "test precondition: no floor row must exist yet for this model_id"
+    )
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is None, "no calibrated floor row yet must fall back to lexical, not crash or guess"
+
+
+def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `store.get_reranker_floor` failure (e.g. a transient sqlite error)
+    must demote this turn to lexical, exactly like every other fail-soft
+    trigger in this function — never propagate out of `run_semantic_recall`."""
+    content = "a memory that DOES have a cached vector"
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    def _boom(self: MemoryStore, reranker_model_id: str) -> None:
+        raise RuntimeError("simulated get_reranker_floor failure")
+
+    monkeypatch.setattr(MemoryStore, "get_reranker_floor", _boom)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, "any query")
+
+    assert result is None, "a floor-read failure must demote this turn to lexical, not raise"
 
 

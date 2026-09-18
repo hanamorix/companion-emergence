@@ -11,16 +11,19 @@ REMOVED — the cold red-team proved deriving a floor/gap from the corpus's
 own inter-memory cosine spread doesn't generalize (breaks silently on
 tight/diffuse/bimodal corpora, because the query-match cosine scale is
 MODEL-FIXED, not corpus-shaped). Replaced by a cross-encoder RERANKER
-(`brain/memory/reranker.py`) + a FIXED, empirically-set floor
-(`RERANK_FLOOR`, this module) on the reranker's score — query-conditioned,
-so a fixed cutoff is trustworthy in a way a cosine floor never was.
+(`brain/memory/reranker.py`) + a floor on the reranker's score —
+query-conditioned, so a cutoff on it is trustworthy in a way a cosine floor
+never was. Originally a FIXED, empirically-set module constant
+(`RERANK_FLOOR`); cut over by F2a inc8 (#250 §7/§8) to a per-persona,
+per-runtime-model floor read live from `MemoryStore.get_reranker_floor`,
+derived+persisted daily against the actual corpus (`floor_calibration.py`).
 
 Recall runs semantic cosine as a CHEAP COARSE CUT (narrow the pool before
 the comparatively expensive reranker), then reranks the (auto-scaled-width)
 survivors, then floor-gates the RERANKER score to decide relevance. When
-that produces a CONCLUSIVE result (at least one candidate clears
-`RERANK_FLOOR`) that result is surfaced and the existing lexical path never
-runs for that turn. When NOTHING clears the floor — or the candidate pool is
+that produces a CONCLUSIVE result (at least one candidate clears the
+calibrated floor) that result is surfaced and the existing lexical path
+never runs for that turn. When NOTHING clears the floor — or the candidate pool is
 empty/sparse (cold-start / idle backfill hasn't caught up yet — the
 "graceful warm-up" contract), or any embedding/reranker-infra failure — this
 module returns ``None`` and the caller (``brain.chat.prompt.
@@ -70,43 +73,35 @@ from brain.memory.store import Memory, MemoryStore
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fixed reranker floor (#231 RERANKER RE-ARCHITECTURE) — the abstention
-# decision. A plain module constant, NOT a tunables.py entry: this is
-# PHYSIOLOGY (decides what the persona notices as relevant, same class as
-# the salience/forgetting cutoffs tunables.py explicitly fences OUT) and it
-# mirrors the SEMANTIC_FLOOR_BOOTSTRAP module constant it replaces. NEVER
-# per-corpus-derived — that was the trap this re-architecture exists to
-# kill. Only the auto-scale latency budget (`reranker.LATENCY_BUDGET_
-# SECONDS`) is an ops tunable.
+# Reranker abstention floor (#231 RERANKER RE-ARCHITECTURE, cut over to a
+# DB-adaptive value by F2a inc8, #250 §7/§8): the bare `RERANK_FLOOR = -9.25`
+# module constant this section used to hold is GONE. The floor is now read
+# LIVE, per call, from `MemoryStore.get_reranker_floor(reranker_model_id)`
+# (`brain/memory/store.py`'s `reranker_floor_calibration` table, written by
+# the daily calibration tick — `brain.memory.floor_calibration.
+# derive_and_persist_floor`, F2a inc7). Keyed by the RUNTIME reranker
+# model_id (`reranker_provider.model_id()` — whichever of the fp32/fp16
+# candidates the precision self-check actually shipped), so a precision
+# flip or any future reranker swap never applies a floor fit against one
+# score scale to scores from another.
 #
-# SET EMPIRICALLY (2026-09-10) against the REAL `Xenova/ms-marco-MiniLM-L-
-#6-v2` cross-encoder (fastembed 0.8.0), scoring the committed #88 pair
-# (`tests/unit/brain/chat/test_semantic_primary_recall.py`) plus tight /
-# diffuse / bimodal corpus-shape probes (throwaway script, not committed —
-# see the #231 build report for the full score table). Cross-encoder scores
-# are RAW, UNCALIBRATED logits (this model's range across the sample was
-# roughly -11.5 .. +3.7) — NOT a [0, 1] probability; do not compare this
-# value against a cosine score.
+# No hardcoded fallback value lives here: when no calibrated floor row
+# exists yet for the runtime model_id (before the daily tick has ever run
+# once for it), `run_semantic_recall` treats this exactly like any other
+# "semantic path not ready yet" precondition (empty/sparse candidate pool,
+# embed failure, ...) — it returns `None` and the caller falls through to
+# the existing lexical/blend fallback (the module's own "graceful warm-up"
+# contract, unchanged by this cutover). This is a narrow window in
+# practice: `persisted_cadence`'s missing-cadence-file default is
+# "due now", so a fresh install's calibration tick fires on its first idle
+# moment and immediately persists a cold-start bootstrap floor (spec
+# Section 7) — see `floor_calibration.derive_and_persist_floor`'s
+# cold-start branch, which needs no accumulated real corpus data at all.
 #
-#   decoy/unrelated max (hard negatives, excluding one intentionally
-#     ambiguous near-duplicate-topic probe) = -9.7442
-#   genuine-match min (weakest real paraphrase across every shape)  = -7.8570
-#
-# Floor picked ~25% of the way from the decoy max toward the genuine min
-# (biased toward the DECOY side per the build brief: "a false negative on a
-# real match is worse; lexical fallback catches exact-name misses") —
-# giving every genuine match in the sample a comfortable margin above the
-# floor while sitting clearly above the worst decoy/unrelated score.
-RERANK_FLOOR = -9.25
-
-# DYSLEXIA / heavy-misspelling watch-item (Testing 2026-09-11): a genuine
-# match's cross-encoder score drops as the query gets more misspelled,
-# moving it toward this floor. A live dyslexified-speech run saw a real
-# match land at -8.32 (still above -9.25, but reduced margin); every case
-# tested cleared, yet EXTREME misspelling could occasionally push a genuine
-# match under the floor, where recall abstains and falls back to lexical
-# (which can miss a pure paraphrase). Revisit / tune the floor for this if
-# it shows up in real use; the target user has dyslexia.
+# `select_standouts` below takes the floor as an explicit parameter rather
+# than reading a module global — the call site (this module's
+# `run_semantic_recall`) is the one place with a `MemoryStore` and a
+# resolved runtime model_id in scope to look it up.
 
 # The largest standout cluster the surfacing rule ever recognises. NOT a
 # tunable, part of the fixed shape of the three-tier surfacing rule.
@@ -137,15 +132,22 @@ class SemanticSurfacing:
     snippet_ids: list[str]
 
 
-def select_standouts(reranked_desc: list[tuple[str, float]]) -> SemanticSurfacing | None:
+def select_standouts(reranked_desc: list[tuple[str, float]], floor: float) -> SemanticSurfacing | None:
     """Floor-gate a sorted-descending (memory_id, reranker_score) list into
     surfacing tiers.
 
     Replaces `classify_semantic_shape`'s cosine-era standout/clump judgment:
-    with a query-conditioned, empirically-fixed floor on the RERANKER score,
-    every candidate is judged on its OWN merit — there is no more "bunched
-    clump" to detect via a relative-gap scan. Every candidate whose score
-    clears `RERANK_FLOOR` is a standout.
+    with a query-conditioned floor on the RERANKER score, every candidate is
+    judged on its OWN merit — there is no more "bunched clump" to detect via
+    a relative-gap scan. Every candidate whose score clears `floor` is a
+    standout.
+
+    `floor` (F2a inc8, #250 §7/§8 cutover) is the CALLER's resolved,
+    per-persona, per-runtime-model calibrated floor
+    (`MemoryStore.get_reranker_floor`) — this function stays a pure,
+    directly-testable comparison, same shape as before the cutover, only the
+    floor's SOURCE changed (out of scope per the spec: "F2a changes what the
+    floor IS ... not where/how it's consulted").
 
     Returns ``None`` when NOTHING clears the floor — INCONCLUSIVE, the
     caller falls back to lexical (matching `run_semantic_recall`'s existing
@@ -162,7 +164,7 @@ def select_standouts(reranked_desc: list[tuple[str, float]]) -> SemanticSurfacin
     caller's job — this function trusts the ordering, mirroring the old
     `classify_semantic_shape`/`surfacing_tiers` contract).
     """
-    standouts = [(mid, score) for mid, score in reranked_desc if score >= RERANK_FLOOR]
+    standouts = [(mid, score) for mid, score in reranked_desc if score >= floor]
     if not standouts:
         return None
     capped_ids = [mid for mid, _ in standouts[:MAX_STANDOUT_COUNT]]
@@ -257,27 +259,34 @@ def run_semantic_recall(
     `relevance.CANDIDATE_POOL`), reranks an auto-scaled-width slice of that
     coarse cut with a cross-encoder (`reranker.build_reranker_provider` +
     `reranker.get_rerank_width`), and floor-gates the reranker score
-    (`select_standouts`, `RERANK_FLOOR`) to decide relevance (#231 RERANKER
-    RE-ARCHITECTURE — replaces the pre-#231 cosine standout/clump
-    classifier).
+    (`select_standouts`, against the CALIBRATED floor read live via
+    `store.get_reranker_floor(reranker_provider.model_id())` — F2a inc8,
+    #250 §7/§8 cutover) to decide relevance (#231 RERANKER RE-ARCHITECTURE
+    — replaces the pre-#231 cosine standout/clump classifier).
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
-    candidate clears `RERANK_FLOOR`. Returns `None` for every INCONCLUSIVE
-    case:
+    candidate clears the calibrated floor. Returns `None` for every
+    INCONCLUSIVE case:
       - nothing clears the floor,
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
+      - no calibrated floor row exists YET for the runtime reranker
+        model_id (the daily calibration tick has never fired for it) — the
+        SAME "graceful warm-up" treatment as an empty candidate pool, not a
+        crash and not a guessed floor value (see the module-docstring note
+        above `select_standouts`),
       - ANY failure ANYWHERE in this function — constructing the local
         embedding/reranker provider, embedding the query, building the
-        candidate pool, cosine scoring, reranking, or floor-gating
-        (fail-soft: a broken/missing local model, or a transient store
-        error such as a locked sqlite db during the background backfill,
-        must never break recall — it only demotes this turn to
-        lexical-primary, matching the spec's warm-up contract, and — per
-        the #231 build brief — a reranker failure demotes to the LEXICAL
-        backstop, never to raw cosine ranking, the unreliable signal the
-        reranker replaces). The whole body is wrapped in a broad `except
-        Exception` for exactly this reason.
+        candidate pool, cosine scoring, reranking, reading the calibrated
+        floor, or floor-gating (fail-soft: a broken/missing local model, a
+        transient store error such as a locked sqlite db during the
+        background backfill, or a floor-read error, must never break
+        recall — it only demotes this turn to lexical-primary, matching the
+        spec's warm-up contract, and — per the #231 build brief — a
+        reranker failure demotes to the LEXICAL backstop, never to raw
+        cosine ranking, the unreliable signal the reranker replaces). The
+        whole body is wrapped in a broad `except Exception` for exactly
+        this reason.
 
     Never renders anything and never bumps `recall_count` itself — the
     caller (`brain.chat.prompt._build_recall_block`) owns rendering and the
@@ -309,7 +318,7 @@ def run_semantic_recall(
         cosine_scored.sort(key=lambda pair: -pair[1])
         coarse = cosine_scored[:CANDIDATE_POOL]
 
-        reranker_provider = reranker_mod.build_reranker_provider()
+        reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # #231-fix: calibrate on REAL candidate-pool documents (a small
         # sample off the front of the already cosine-sorted `coarse`
         # list) rather than a synthetic placeholder — see
@@ -348,7 +357,40 @@ def run_semantic_recall(
         reranked = list(zip(rerank_ids, rerank_scores, strict=True))
         reranked.sort(key=lambda pair: -pair[1])
 
-        tiers = select_standouts(reranked)
+        # F2a inc8 (#250 §7/§8 cutover): the floor is read LIVE per call,
+        # keyed by the RUNTIME reranker model_id (whichever of fp32/fp16 the
+        # precision self-check actually shipped — matches how inc4's
+        # calibration-log write and inc7's tick both key by
+        # `reranker_provider.model_id()`). No row yet (daily tick has never
+        # fired for this model_id) -> treat exactly like an empty/sparse
+        # candidate pool: INCONCLUSIVE, fall back to lexical. Never invents
+        # a placeholder numeric floor.
+        floor_row = store.get_reranker_floor(reranker_provider.model_id())
+        if floor_row is None:
+            log.info(
+                "run_semantic_recall: no calibrated floor yet for %s — "
+                "falling back to lexical (graceful warm-up)",
+                reranker_provider.model_id(),
+            )
+            return None
+
+        # Observability (F2a inc8 scope item 5 — carries the red-team's MED
+        # note): cheap, off the critical timing (one debug log line) —
+        # lets live testing see which floor value actually gated this turn
+        # and whether it's still the cold-start bootstrap or a real
+        # corpus-derived fit, without adding per-turn work beyond the log
+        # call itself.
+        log.debug(
+            "run_semantic_recall: floor=%.4f model=%s cold_start=%s "
+            "sample_pairs=%d updated_at=%s",
+            floor_row["floor"],
+            reranker_provider.model_id(),
+            floor_row["is_cold_start"],
+            floor_row["sample_pairs"],
+            floor_row["updated_at"],
+        )
+
+        tiers = select_standouts(reranked, floor_row["floor"])
         if tiers is None:
             return None
 

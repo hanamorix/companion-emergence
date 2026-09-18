@@ -135,12 +135,13 @@ MODEL_EMBEDDING_DIM = 1024
 # external weights). fp16 export (~2x faster) is a LATER increment, gated
 # on a build-time fp16-vs-fp32 accuracy check — this fp32 default is
 # increment 1 only. Score type: raw, unbounded logit (same shape as the
-# outgoing ms-marco score, but a DIFFERENT SCALE) — semantic_recall.py's
-# RERANK_FLOOR is still calibrated against the OLD MiniLM scale as of this
-# commit; a scale mismatch against jina's scores is EXPECTED here and gets
-# resolved by the floor's daily self-calibration (F2a §7), not by this
-# swap. License: CC-BY-NC-4.0 (non-commercial), accepted for this
-# free/open-source, non-commercial project.
+# outgoing ms-marco score, but a DIFFERENT SCALE) — AS OF THIS commit (inc1)
+# the abstention floor was still the old hardcoded MiniLM-scaled constant, a
+# known/expected scale mismatch; F2a's later increments replace it with a
+# floor derived daily against jina's own scale (§7) and cut every consumer
+# over to read it live (§8, inc8) — see `brain/memory/semantic_recall.py`.
+# License: CC-BY-NC-4.0 (non-commercial), accepted for this free/open-source,
+# non-commercial project.
 MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encoder, ~1.11GB fp32, via fastembed
 
 # fp16 export of the SAME model (F2a inc2, #250 §2) — the HF repo above also

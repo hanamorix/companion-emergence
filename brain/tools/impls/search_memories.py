@@ -12,7 +12,7 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import RERANK_FLOOR, build_semantic_candidate_pool
+from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -102,10 +102,14 @@ def _semantic_top_k(
     the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
     get_rerank_width``, same auto-scaling ``run_semantic_recall`` uses).
 
-    The reranker here improves ORDERING; ``RERANK_FLOOR`` decides
-    semantic-vs-lexical: if NOTHING clears the floor, this returns ``None``
-    (the tool's EXISTING empty-semantic→lexical fallback — never returns
-    nothing, never hands back semantic junk that never cleared the floor).
+    The reranker here improves ORDERING; the CALIBRATED reranker floor
+    (F2a inc8, #250 §7/§8 cutover — read live via
+    ``store.get_reranker_floor(reranker_provider.model_id())``, replacing
+    the deleted ``RERANK_FLOOR`` module constant) decides semantic-vs-
+    lexical: if NOTHING clears the floor — or no calibrated floor row exists
+    yet for the runtime model_id — this returns ``None`` (the tool's
+    EXISTING empty-semantic→lexical fallback — never returns nothing, never
+    hands back semantic junk that never cleared the floor).
     Otherwise returns the top ``limit`` floor-clearing memories in
     reranker-descending order.
 
@@ -153,7 +157,7 @@ def _semantic_top_k(
         cosine_scored.sort(key=lambda pair: -pair[1])
         coarse = cosine_scored[:CANDIDATE_POOL]
 
-        reranker_provider = reranker_mod.build_reranker_provider()
+        reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # #231-fix: calibrate on REAL candidate-pool documents (a small
         # sample off the front of the already cosine-sorted `coarse`
         # list) rather than a synthetic placeholder — see
@@ -167,10 +171,35 @@ def _semantic_top_k(
         rerank_ids = [mid for mid, _ in to_rerank]
         documents = [pool[mid][0].content for mid in rerank_ids]
         rerank_scores = list(reranker_provider.rerank(query, documents))
+
+        # F2a inc8 (#250 §7/§8 cutover): read the calibrated floor live,
+        # keyed by the RUNTIME reranker model_id — mirrors
+        # `run_semantic_recall`'s identical lookup. No row yet (daily tick
+        # has never fired for this model_id) -> same "graceful warm-up"
+        # treatment as an empty cosine/pool result: fall back to lexical,
+        # never a guessed floor value.
+        floor_row = store.get_reranker_floor(reranker_provider.model_id())
+        if floor_row is None:
+            logger.info(
+                "search_memories(semantic): no calibrated floor yet for %s — "
+                "falling back to lexical (graceful warm-up)",
+                reranker_provider.model_id(),
+            )
+            return None
+        logger.debug(
+            "search_memories(semantic): floor=%.4f model=%s cold_start=%s "
+            "sample_pairs=%d updated_at=%s",
+            floor_row["floor"],
+            reranker_provider.model_id(),
+            floor_row["is_cold_start"],
+            floor_row["sample_pairs"],
+            floor_row["updated_at"],
+        )
+
         reranked = [
             (mid, score)
             for mid, score in zip(rerank_ids, rerank_scores, strict=True)
-            if score >= RERANK_FLOOR
+            if score >= floor_row["floor"]
         ]
         if not reranked:
             return None
@@ -223,8 +252,8 @@ def search_memories(
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
         CANDIDATE_POOL)``; semantic reranks up to ``CANDIDATE_POOL``
-        floor-clearing candidates in ``_semantic_top_k`` (#231's
-        ``RERANK_FLOOR`` gate still applies — "age" only widens the fetch,
+        floor-clearing candidates in ``_semantic_top_k`` (#231's calibrated
+        reranker-floor gate still applies — "age" only widens the fetch,
         it never skips the floor) — THEN sorts that wider matched set by
         ``created_at`` DESC, THEN slices to
         the caller's real ``limit``. A naive re-sort of an already-``limit``-

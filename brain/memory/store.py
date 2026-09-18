@@ -314,11 +314,12 @@ CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day
 -- start); `raw_fit_floor` is that cycle's pre-EMA fit, kept for
 -- diagnostics/tests. `is_cold_start` distinguishes a bootstrap-pairs fit
 -- (not yet enough real labeled data — spec's outcome-based cold-start exit)
--- from a real corpus-derived fit. Inc7 only WRITES this table (via
--- `brain.memory.floor_calibration.derive_and_persist_floor`, called from
--- the daily calibration tick) — wiring `select_standouts` to READ it and
--- retire the `RERANK_FLOOR` constant is inc8's cutover, out of this
--- increment's scope.
+-- from a real corpus-derived fit. WRITTEN by
+-- `brain.memory.floor_calibration.derive_and_persist_floor` (inc7, called
+-- from the daily calibration tick); READ live by `select_standouts`
+-- (`brain/memory/semantic_recall.py`) and the reranker precision self-check
+-- (`brain/memory/reranker.py`) as of inc8's cutover — the bare
+-- `RERANK_FLOOR` constant this table replaces no longer exists.
 CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     reranker_model_id TEXT PRIMARY KEY,
     floor REAL NOT NULL,

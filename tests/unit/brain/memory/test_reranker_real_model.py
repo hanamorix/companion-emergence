@@ -18,15 +18,15 @@ ships sharded external weights. jina ships a single self-contained
 proof no such workaround is needed. A shape+sanity+load guard, not a
 calibration suite — keep the sample small.
 
-NOTE on ``RERANK_FLOOR``: this file deliberately does NOT assert genuine/
-decoy pairs land on either side of ``brain.memory.semantic_recall.
-RERANK_FLOOR``. That floor is still calibrated against the OLD MiniLM
-score scale as of this commit (F2a inc1 swaps the model only); jina's raw
-logits are a DIFFERENT SCALE (see model_tier.py's MODEL_RERANKER comment),
-so a floor-separation assertion here would be testing a known, expected
-scale mismatch, not a regression. The floor gets re-derived against
-jina's own scale by F2a's later daily self-calibration tick (§7) — not by
-this test.
+NOTE on the reranker abstention floor: this file deliberately does NOT
+assert genuine/decoy pairs land on either side of any specific floor value.
+The floor is now a live, per-persona, DB-calibrated value
+(`store.get_reranker_floor`, F2a inc8, #250 §7/§8) derived daily against
+whatever real corpus the daily calibration tick runs against — this file
+has no persona corpus at all, so asserting an absolute cutoff here would be
+testing this file's own arbitrary seeded floor, not the model. The
+genuine-beats-decoy ordering assertions below are the model-agnostic
+invariant this file actually proves.
 
 Marked BOTH ``@pytest.mark.requires_network`` (opts this test OUT of
 ``tests/conftest.py``'s autouse fake-embedding/fake-reranker-provider
@@ -59,6 +59,7 @@ from brain.memory.reranker import (
     _register_fp16_reranker_model,
     build_reranker_provider,
 )
+from brain.memory.store import MemoryStore
 
 pytestmark = [pytest.mark.requires_network, pytest.mark.integration]
 
@@ -117,8 +118,22 @@ def real_provider():
     correctness (agreement/disagreement/speed-win logic) is covered
     offline, by stub, in test_reranker.py; this file stays a real-model
     load+score shape/sanity guard, not a calibration suite, per its module
-    docstring above."""
-    provider = build_reranker_provider()
+    docstring above.
+
+    F2a inc8 (#250 §7/§8): the self-check needs a calibrated floor to
+    compare fp16/fp32 agreement against (`store.get_reranker_floor`) — with
+    no store at all it short-circuits straight to fp32 (see
+    `reranker._run_precision_selfcheck`'s docstring), which would make this
+    fixture's "real, box-dependent verdict" claim false. Seeds a small
+    in-memory store with a calibrated floor for the fp32 id so the real
+    self-check genuinely runs (this is still a load/score sanity guard, not
+    a calibration suite — the floor value itself is arbitrary, chosen only
+    to be a plausible jina-scale logit)."""
+    store = MemoryStore(db_path=":memory:")
+    store.write_reranker_floor(
+        _MODEL_ID, floor=0.0, raw_fit_floor=0.0, sample_pairs=10, is_cold_start=True
+    )
+    provider = build_reranker_provider(store=store)
     assert provider.model_id() in (_MODEL_ID, _FP16_MODEL_ID), (
         "expected either the #250 F2a inc1 jina fp32 id or its inc2 fp16 export id "
         "(whichever the fp16-vs-fp32 self-check picked on this host) — model_tier.py's "
@@ -155,7 +170,7 @@ def test_real_reranker_loads_and_scores(real_provider) -> None:
     for score in scores:
         assert isinstance(score, float), (
             f"expected a plain float, got {type(score)!r} ({score!r}) — production code "
-            "(RERANK_FLOOR comparisons, sort keys) assumes plain float scores"
+            "(calibrated-floor comparisons, sort keys) assumes plain float scores"
         )
         assert math.isfinite(score), f"reranker score must be finite, got {score!r}"
 
@@ -172,10 +187,10 @@ def test_real_reranker_orders_genuine_above_decoy_across_sample(real_provider) -
     """A model-agnostic sanity check (small sample, 3 + 3): the real jina
     model scores every genuine pair higher than every decoy pair's score —
     proving the swapped model still produces a query-conditioned relevance
-    signal usable for reranking, WITHOUT asserting any absolute
-    RERANK_FLOOR cutoff (that floor is still MiniLM-scaled as of this
-    commit — see module docstring). This is NOT a calibration suite; the
-    actual floor for jina's scale is F2a's later work (§7)."""
+    signal usable for reranking, WITHOUT asserting any absolute floor
+    cutoff (see module docstring). This is NOT a calibration suite; the
+    actual per-persona floor is derived daily against a real corpus
+    (F2a §7), not by this network-only load/sanity file."""
     genuine_scores = []
     for query, doc in _GENUINE_PAIRS:
         (score,) = real_provider.rerank(query, [doc])

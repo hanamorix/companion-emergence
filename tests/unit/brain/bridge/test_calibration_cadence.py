@@ -260,7 +260,7 @@ def test_calibration_tick_resets_precision_cache_on_an_accepted_floor_write(
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
 
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda: FakeRerankerProvider())
+        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
         scripted = FloorDerivationOutcome(
             accepted=True, floor=1.0, raw_fit_floor=1.0, sample_pairs=200,
             is_cold_start=False, held_for_stability=False,
@@ -302,7 +302,7 @@ def test_calibration_tick_does_not_reset_precision_cache_on_a_held_cycle(monkeyp
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
 
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda: FakeRerankerProvider())
+        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
         held = FloorDerivationOutcome(
             accepted=False, floor=1.0, raw_fit_floor=2.0, sample_pairs=200,
             is_cold_start=False, held_for_stability=True,
@@ -334,7 +334,7 @@ def test_calibration_tick_floor_derivation_failure_does_not_crash_the_tick(monke
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
 
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda: FakeRerankerProvider())
+        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
 
         def _raising_derive(store, model_id, **kw):
             raise RuntimeError("simulated floor-derivation failure")

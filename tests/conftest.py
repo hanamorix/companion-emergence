@@ -194,7 +194,7 @@ def _fake_reranker_provider_by_default(
     `@pytest.mark.requires_network`.
 
     FakeRerankerProvider defaults every UNSCRIPTED document to a score far
-    below any plausible RERANK_FLOOR (see that class's docstring) — so a
+    below any plausible calibrated floor (see that class's docstring) — so a
     test that never scripts reranker scores gets the same "semantic
     inconclusive -> lexical fallback" behavior it would have gotten from an
     empty/orthogonal cosine result pre-#231, rather than an arbitrary
@@ -217,7 +217,7 @@ def _fake_reranker_provider_by_default(
     # patching this ONE module attribute is sufficient to intercept every
     # call site.
     monkeypatch.setattr(
-        reranker, "build_reranker_provider", lambda: reranker.FakeRerankerProvider()
+        reranker, "build_reranker_provider", lambda *, store=None: reranker.FakeRerankerProvider()
     )
 
 

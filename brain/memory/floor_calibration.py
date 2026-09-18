@@ -479,7 +479,7 @@ def derive_and_persist_floor(
     if reranker_provider is None:
         from brain.memory.reranker import build_reranker_provider
 
-        reranker_provider = build_reranker_provider()
+        reranker_provider = build_reranker_provider(store=store)
     cold_pairs = _cold_start_pairs(reranker_provider)
     raw_floor = fit_threshold_fbeta(cold_pairs, beta=beta)
     store.write_reranker_floor(

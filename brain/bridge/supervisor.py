@@ -2086,10 +2086,12 @@ def _run_calibration_tick(
     model_id (``reranker.build_reranker_provider().model_id()``), reading
     whatever labeled ``calibration_log`` pairs the judge pass above (across
     every prior tick, not just this one) has accumulated for that model_id.
-    This does NOT wire the derived floor into ``select_standouts`` or touch
-    the ``semantic_recall.RERANK_FLOOR`` constant — that cutover is inc8's,
-    out of this increment's scope; inc7 only derives and WRITES the floor
-    to ``memories.db`` (I1).
+    F2a inc8 (#250 §7/§8, this cutover) wires the derived floor into
+    ``select_standouts`` (``brain/memory/semantic_recall.py``) and the
+    reranker precision self-check (``brain/memory/reranker.py``) — both now
+    read ``store.get_reranker_floor`` live rather than the deleted
+    ``semantic_recall.RERANK_FLOOR`` constant. This tick's own job stays
+    unchanged: derive and WRITE the floor to ``memories.db`` (I1).
 
     Immediately after an ACCEPTED floor write (a cold-start fit, or a real
     fit that cleared the stability gate — see ``floor_calibration.
@@ -2176,7 +2178,7 @@ def _run_calibration_tick(
                 reset_precision_decision_for_floor_change,
             )
 
-            current_reranker_model_id = build_reranker_provider().model_id()
+            current_reranker_model_id = build_reranker_provider(store=store).model_id()
             outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
             logger.info(
                 "calibration tick: floor derivation for %s -> accepted=%s floor=%.4f "
