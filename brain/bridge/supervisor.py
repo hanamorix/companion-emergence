@@ -2075,16 +2075,34 @@ def _run_calibration_tick(
     prune_calibration_log`` (spec Section 5's "MUST before ship" pruning
     responsibility, acceptance 5b).
 
-    **INC6 SCOPE (this increment):** the local-judge first pass +  Haiku
-    tie-break (``bge-reranker-v2-m3``, spec Section 6) — labels a SAMPLE of
-    the rows pruning just left behind, via ``relevance_judge.
-    label_calibration_sample``. The floor derivation + EMA smoothing +
-    ``RERANK_FLOOR`` write (spec Section 7) is a LATER increment (inc7) —
-    this tick labels rows but does not yet derive/write a floor.
-    (Consequently it also does not yet call ``reranker.
-    _reset_precision_decision_cache()`` — see ``brain/memory/reranker.py``'s
-    precision-cache comment — since nothing here writes ``RERANK_FLOOR``
-    yet; inc7 adds that call right after its floor write.)
+    **INC6 SCOPE:** the local-judge first pass + Haiku tie-break
+    (``bge-reranker-v2-m3``, spec Section 6) — labels a SAMPLE of the rows
+    pruning just left behind, via ``relevance_judge.label_calibration_
+    sample``.
+
+    **INC7 SCOPE (this increment):** floor derivation + EMA smoothing +
+    persistence (spec Section 7), via ``floor_calibration.derive_and_
+    persist_floor`` — runs against the CURRENT production reranker's
+    model_id (``reranker.build_reranker_provider().model_id()``), reading
+    whatever labeled ``calibration_log`` pairs the judge pass above (across
+    every prior tick, not just this one) has accumulated for that model_id.
+    This does NOT wire the derived floor into ``select_standouts`` or touch
+    the ``semantic_recall.RERANK_FLOOR`` constant — that cutover is inc8's,
+    out of this increment's scope; inc7 only derives and WRITES the floor
+    to ``memories.db`` (I1).
+
+    Immediately after an ACCEPTED floor write (a cold-start fit, or a real
+    fit that cleared the stability gate — see ``floor_calibration.
+    FloorDerivationOutcome.accepted``), this calls ``reranker.reset_
+    precision_decision_for_floor_change()`` so the fp16-vs-fp32 precision
+    self-check (#250 §2) re-runs under the freshly written floor on its
+    next use (spec Section 7's cross-increment MUST). A HELD cycle (the
+    stability gate tripped — nothing was written) does NOT call this:
+    nothing changed, so there is nothing to re-evaluate the precision
+    decision against. Wrapped in its OWN try/except (mirrors the
+    judge-labeling step immediately above it) — a floor-derivation failure
+    must not crash the tick or undo the prune/labeling steps that already
+    completed.
 
     ``provider``: the Haiku tie-break's generation provider. ``None`` (the
     ``run_folded`` call sites' default) builds one via ``build_tier_provider
@@ -2150,6 +2168,35 @@ def _run_calibration_tick(
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
             logger.exception("calibration tick: judge-labeling pass raised; continuing")
+
+        try:
+            from brain.memory import floor_calibration
+            from brain.memory.reranker import (
+                build_reranker_provider,
+                reset_precision_decision_for_floor_change,
+            )
+
+            current_reranker_model_id = build_reranker_provider().model_id()
+            outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
+            logger.info(
+                "calibration tick: floor derivation for %s -> accepted=%s floor=%.4f "
+                "cold_start=%s held_for_stability=%s sample_pairs=%d",
+                current_reranker_model_id,
+                outcome.accepted,
+                outcome.floor,
+                outcome.is_cold_start,
+                outcome.held_for_stability,
+                outcome.sample_pairs,
+            )
+            if outcome.accepted:
+                # Spec Section 7's cross-increment MUST: a WRITTEN floor
+                # invalidates the cached fp16-vs-fp32 precision decision so
+                # the next build_reranker_provider() call re-runs that
+                # self-check under the new floor. A held (unaccepted) cycle
+                # wrote nothing, so nothing to re-evaluate against.
+                reset_precision_decision_for_floor_change()
+        except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
+            logger.exception("calibration tick: floor-derivation pass raised; continuing")
 
 
 def _run_finalize_tick(

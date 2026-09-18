@@ -739,3 +739,42 @@ def _reset_precision_decision_cache() -> None:
     """Test-only: clear the cached fp16-vs-fp32 decision."""
     with _precision_decision_cache_lock:
         _precision_decision_cache.clear()
+
+
+def reset_precision_decision_for_floor_change() -> None:
+    """PRODUCTION entry point (F2a inc7, #250 §7): call once, immediately
+    after the daily calibration tick (re-)derives and WRITES a new floor
+    (`floor_calibration.derive_and_persist_floor` returning an ACCEPTED
+    outcome) — from `brain.bridge.supervisor._run_calibration_tick`.
+
+    Clears BOTH the cached fp16-vs-fp32 precision decision
+    (`_precision_decision_cache`) AND the process-wide reranker provider
+    cache (`_provider_cache`). Clearing the decision cache alone is not
+    enough to GUARANTEE a genuine rebuild: `_run_precision_selfcheck`
+    caches its winning provider via `_cache_provider`'s `setdefault`, which
+    silently keeps whatever provider ALREADY sits under that model_id's key
+    — so if today's re-run's winning model_id was ALSO the winner at some
+    EARLIER point in this process's life (e.g. day-0's vacuous agreement
+    picked fp16, a later floor picks fp32, and a LATER-STILL floor picks
+    fp16 again), `build_reranker_provider()` would silently hand back the
+    STALE day-0 provider instance instead of the one the just-rerun
+    self-check actually built — same model_id, so functionally identical
+    for a real ONNX model, but not what "re-run the self-check" is supposed
+    to guarantee, and not something to rely on staying harmless. Clearing
+    `_provider_cache` too forces a genuine fresh construction for whichever
+    model_id wins this re-run, no matter its history.
+
+    Reuses the existing test-only reset hooks (`_reset_precision_decision_
+    cache` / `_reset_reranker_provider_cache`) rather than duplicating their
+    logic — those stay test-only in their own right (conftest.py's autouse
+    fixture calls them directly around every test); this function is the
+    one PRODUCTION call site, bounded to fire at most once per daily
+    calibration tick (I6), never on the per-turn hot path. Do NOT call this
+    from anywhere that keys off the floor FLOAT value itself (e.g. on every
+    EMA-smoothed update) — only on an ACCEPTED floor WRITE — or EMA drift
+    would force a costly re-run (a second real ONNX load of both exports)
+    on most days, defeating §2's one-time-cost design (spec Section 7's own
+    implementation constraint).
+    """
+    _reset_precision_decision_cache()
+    _reset_reranker_provider_cache()

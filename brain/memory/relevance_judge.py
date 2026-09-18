@@ -46,10 +46,27 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain import prompt_strings, tunables
 from brain.bridge.provider import LLMProvider
-from brain.memory.store import MemoryStore
+
+# F2a inc7 (#250 §7): TYPE_CHECKING-gated, not a runtime top-level import.
+# `MemoryStore` is used here ONLY as a type hint (`from __future__ import
+# annotations` above already defers every annotation to a string, so the
+# name is never evaluated at runtime); the runtime edge back to store.py
+# this used to be (`from brain.memory.store import MemoryStore` at module
+# top) created a genuine store.py <-> relevance_judge.py IMPORT CYCLE risk
+# once store.py's own retention-window derivation (inc7,
+# `floor_calibration.py`) needed to read `CALIBRATION_SAMPLE_ROWS` from
+# THIS module — whichever module happened to be imported first would hit
+# a half-initialized sibling depending on import order. Since this module
+# never actually calls anything ON the `MemoryStore` class itself (only
+# duck-typed attribute/method access on the `store` parameter), dropping
+# the runtime import removes the cycle entirely rather than relying on a
+# fragile "import order happens to work out" hope.
+if TYPE_CHECKING:
+    from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 

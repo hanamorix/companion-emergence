@@ -2529,3 +2529,142 @@ def test_write_calibration_labels_removes_row_from_the_unlabeled_sample(store: M
     store.write_calibration_labels(row["id"], ["relevant"], [None])
 
     assert store.sample_unlabeled_calibration_rows(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc7): labeled_calibration_pairs — the floor-derivation fit's
+# input (spec Section 7).
+# ---------------------------------------------------------------------------
+
+
+def test_labeled_calibration_pairs_uses_local_label_when_no_haiku_override(
+    store: MemoryStore,
+) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[1.0, 2.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    store.write_calibration_labels(row["id"], ["relevant", "irrelevant"], [None, None])
+
+    pairs = store.labeled_calibration_pairs("m")
+    assert sorted(pairs) == sorted([(1.0, "relevant"), (2.0, "irrelevant")])
+
+
+def test_labeled_calibration_pairs_haiku_label_overrides_local_label(store: MemoryStore) -> None:
+    """Spec Section 6/7 precedence: the Haiku tie-break OVERRIDES the local
+    judge's own provisional label at the position it resolved."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    # Local judge said "relevant" (ambiguous-band, hence a Haiku call);
+    # Haiku overrode it to "irrelevant".
+    store.write_calibration_labels(row["id"], ["relevant"], ["irrelevant"])
+
+    assert store.labeled_calibration_pairs("m") == [(1.0, "irrelevant")]
+
+
+def test_labeled_calibration_pairs_skips_unknown_and_error_sentinels(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    store.write_calibration_labels(row["id"], ["relevant", "unknown", "error"], [None, None, None])
+
+    assert store.labeled_calibration_pairs("m") == [(1.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_filters_by_reranker_model_id(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="model-x"
+    )
+    store.log_calibration_sample(
+        query="q", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="model-y"
+    )
+    for row in store.sample_unlabeled_calibration_rows(limit=10):
+        store.write_calibration_labels(row["id"], ["relevant"], [None])
+
+    assert store.labeled_calibration_pairs("model-x") == [(1.0, "relevant")]
+    assert store.labeled_calibration_pairs("model-y") == [(2.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_excludes_unlabeled_rows(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    assert store.labeled_calibration_pairs("m") == []
+
+
+def test_labeled_calibration_pairs_empty_when_nothing_logged(store: MemoryStore) -> None:
+    assert store.labeled_calibration_pairs("never-logged-model") == []
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc7): reranker_floor_calibration table + get/write_reranker_floor
+# (spec Section 7 — the calibrated abstention floor's persistence, I1).
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_reranker_floor_calibration_table() -> None:
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "reranker_floor_calibration" in tables
+    cols = {
+        row[1] for row in store._conn.execute("PRAGMA table_info(reranker_floor_calibration)").fetchall()
+    }
+    assert cols == {
+        "reranker_model_id", "floor", "raw_fit_floor", "sample_pairs", "is_cold_start", "updated_at",
+    }
+    store.close()
+
+
+def test_get_reranker_floor_returns_none_when_never_derived(store: MemoryStore) -> None:
+    assert store.get_reranker_floor("never-calibrated-model") is None
+
+
+def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    row = store.get_reranker_floor("model-a")
+    assert row == {
+        "reranker_model_id": "model-a",
+        "floor": 1.5,
+        "raw_fit_floor": 1.25,
+        "sample_pairs": 250,
+        "is_cold_start": False,
+        "updated_at": row["updated_at"],  # not asserting an exact timestamp
+    }
+
+
+def test_write_reranker_floor_upserts_by_model_id(store: MemoryStore) -> None:
+    """A model_id's row is REPLACED wholesale, not accumulated (one current
+    floor per model_id, not a history table)."""
+    store.write_reranker_floor(
+        "model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=200, is_cold_start=True
+    )
+    store.write_reranker_floor(
+        "model-a", floor=2.0, raw_fit_floor=2.0, sample_pairs=300, is_cold_start=False
+    )
+    row = store.get_reranker_floor("model-a")
+    assert row["floor"] == 2.0
+    assert row["sample_pairs"] == 300
+    assert row["is_cold_start"] is False
+    count = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("model-a",),
+    ).fetchone()["n"]
+    assert count == 1
+
+
+def test_write_reranker_floor_is_scoped_per_model_id(store: MemoryStore) -> None:
+    store.write_reranker_floor("model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=1, is_cold_start=True)
+    store.write_reranker_floor("model-b", floor=2.0, raw_fit_floor=2.0, sample_pairs=1, is_cold_start=True)
+    assert store.get_reranker_floor("model-a")["floor"] == 1.0
+    assert store.get_reranker_floor("model-b")["floor"] == 2.0

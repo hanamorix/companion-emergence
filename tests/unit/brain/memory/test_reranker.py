@@ -917,6 +917,113 @@ def test_precision_selfcheck_cache_key_invalidates_on_model_swap(monkeypatch: py
     _reset_precision_decision_cache()
 
 
+def test_reset_precision_decision_for_floor_change_forces_a_genuine_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance 2b (F2a inc7, spec Section 7): after the daily calibration
+    tick derives+writes a new floor, `reranker.reset_precision_decision_for_
+    floor_change()` must force the NEXT `build_reranker_provider()` call to
+    (a) actually RE-RUN the fp16/fp32 self-check (not serve a cached
+    decision) and (b) construct a GENUINELY FRESH provider for whichever
+    model_id the re-run decides — proving the reset propagates to the
+    process-wide PROVIDER cache too, not just the decision flag.
+
+    Three phases, going through the real `build_reranker_provider()` +
+    model_tier resolution path (not `_choose_reranker_model_id` directly,
+    so the provider-cache half of the mechanism is actually exercised):
+      1. floor=stale/unreachable -> every bundled pair trivially agrees,
+         fp16 measures faster -> ships fp16 (provider instance A).
+      2. floor sharpens -> one bundled pair's fp16 score drops below it
+         while fp32's does not -> disagreement -> ships fp32 (a provider
+         instance never cached before, so this phase alone would pass even
+         WITHOUT clearing the provider cache — it's phase 3 below that
+         actually distinguishes the two implementations).
+      3. floor reverts to stale again -> agreement again -> ships fp16
+         AGAIN. The fp16 model_id key was ALREADY populated back in phase 1
+         — if only the decision cache were cleared (not the provider
+         cache), `_cache_provider`'s `setdefault` would silently hand back
+         phase 1's STALE provider object here. Asserting the phase-3
+         provider is a FRESH instance (`is not` phase 1's) is the proof
+         that clearing `_provider_cache` too was necessary.
+    """
+    from brain.memory import reranker as reranker_mod2
+    from brain.memory import semantic_recall as semantic_recall_mod
+    from brain.memory.reranker import _FP16_GATE_PAIRS, reset_precision_decision_for_floor_change
+
+    # NOTE: uses the MODULE-LEVEL `build_reranker_provider` name imported at
+    # the top of this file (the pristine, real function object) rather than
+    # re-importing it here — a fresh `from brain.memory.reranker import
+    # build_reranker_provider` INSIDE the test would resolve through
+    # `reranker_mod`'s CURRENT attribute, which the autouse `_fake_reranker_
+    # provider_by_default` fixture (tests/conftest.py) has already replaced
+    # with a fake lambda by the time this test body runs — this test needs
+    # the REAL function's logic (with CrossEncoderProvider/model_tier
+    # stubbed below), not that fixture's stand-in.
+    reset_precision_decision_for_floor_change()
+    fp32_id, fp16_id = "fake-fp32-flip-rebuild", "fake-fp16-flip-rebuild"
+    construct_calls: list[str] = []
+
+    monkeypatch.setattr(reranker_mod2, "_register_fp16_reranker_model", lambda *a, **k: None)
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: fp32_id)
+    monkeypatch.setattr("brain.bridge.model_tier.MODEL_RERANKER_FP16", fp16_id)
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(reranker_mod2.time, "monotonic", lambda: clock["t"])
+
+    def _install_ctor(fp32_scores, fp16_scores) -> None:
+        def _fake_ctor(model_id: str, cache_dir):
+            construct_calls.append(model_id)
+            scores = fp16_scores if model_id == fp16_id else fp32_scores
+            seconds = 0.01 if model_id == fp16_id else 0.02  # fp16 always faster on this box
+            return _PrecisionTimingProvider(model_id, scores, clock, seconds)
+
+        monkeypatch.setattr(reranker_mod2, "CrossEncoderProvider", _fake_ctor)
+
+    agree_scores = dict.fromkeys(_FP16_GATE_PAIRS, 5.0)
+    flipped_pair = _FP16_GATE_PAIRS[0]
+
+    # Phase 1: stale/unreachable floor -> trivial agreement -> ships fp16.
+    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", -1_000_000.0)
+    _install_ctor(agree_scores, agree_scores)
+    provider_phase1 = build_reranker_provider()
+    assert provider_phase1.model_id() == fp16_id
+    calls_after_phase1 = len(construct_calls)
+    assert calls_after_phase1 > 0
+
+    # Phase 2: sharpen the floor -> fp16 alone drops the flipped pair ->
+    # disagreement -> ships fp32.
+    fp32_scores_p2 = dict(agree_scores)
+    fp16_scores_p2 = dict(agree_scores)
+    fp16_scores_p2[flipped_pair] = -1_000.0
+    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", 2.0)
+    _install_ctor(fp32_scores_p2, fp16_scores_p2)
+    reset_precision_decision_for_floor_change()
+    provider_phase2 = build_reranker_provider()
+    assert provider_phase2.model_id() == fp32_id, (
+        "a disagreement under the sharpened, reachable floor must flip the ship decision to fp32"
+    )
+    calls_after_phase2 = len(construct_calls)
+    assert calls_after_phase2 > calls_after_phase1, "the reset must force a genuine self-check re-run"
+
+    # Phase 3: floor reverts to stale -> agreement again -> ships fp16
+    # again. fp16's key was already populated in phase 1.
+    monkeypatch.setattr(semantic_recall_mod, "RERANK_FLOOR", -1_000_000.0)
+    _install_ctor(agree_scores, agree_scores)
+    reset_precision_decision_for_floor_change()
+    provider_phase3 = build_reranker_provider()
+
+    assert provider_phase3.model_id() == fp16_id
+    assert len(construct_calls) > calls_after_phase2, "phase 3 must also force a genuine self-check re-run"
+    assert provider_phase3 is not provider_phase1, (
+        "phase 3's shipped fp16 provider must be a FRESH instance, not the stale object "
+        "left over in _provider_cache from phase 1 — proves reset_precision_decision_for_"
+        "floor_change() clears the provider cache too, not just the decision cache"
+    )
+
+    reset_precision_decision_for_floor_change()
+
+
 def test_ac3_no_int8_quantization_code_path() -> None:
     """AC#3: int8 quantization was explicitly dropped (Roy's catch: a 278M
     model has less redundancy to absorb int8's accuracy hit than fp16 —
