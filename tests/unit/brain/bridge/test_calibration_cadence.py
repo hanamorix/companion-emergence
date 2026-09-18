@@ -168,3 +168,64 @@ def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
         # Bounded: no rows older than the window remain at all.
         cutoff = (now - timedelta(days=window)).strftime("%Y-%m-%d")
         assert all(b >= cutoff for b in remaining_buckets)
+
+
+def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committed(
+    monkeypatch,
+):
+    """The tick-level fault-isolation wrapper (spec Section 5/6: 'must not
+    crash the tick or the bridge') around `_run_calibration_tick`'s
+    judge-labeling pass has no dedicated test — `label_calibration_sample`'s
+    OWN internal fault isolation is covered in test_relevance_judge.py, but
+    the try/except `_run_calibration_tick` wraps around *calling* it is not.
+
+    Monkeypatches `relevance_judge.label_calibration_sample` (the name
+    `_run_calibration_tick` imports fresh, inside its own try block, on
+    every call) to raise, and asserts:
+      (a) `_run_calibration_tick` completes without the exception
+          propagating (the tick/bridge does not crash), and
+      (b) the prune step that ran BEFORE the failing judge pass stays
+          committed — an old bucket is gone and a recent bucket survives —
+          proving the failure did not undo the already-committed prune.
+    """
+    from brain.bridge.supervisor import _run_calibration_tick
+    from brain.memory import relevance_judge as rj_mod
+    from brain.memory.store import CALIBRATION_LOG_RETENTION_WINDOW_DAYS, MemoryStore
+
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        store = MemoryStore(pd / "memories.db", integrity_check=False)
+        now = datetime.now(UTC)
+        window = CALIBRATION_LOG_RETENTION_WINDOW_DAYS
+
+        old_bucket = (now - timedelta(days=window + 5)).strftime("%Y-%m-%d")
+        recent_bucket = now.strftime("%Y-%m-%d")
+        for bucket in (old_bucket, recent_bucket):
+            store._conn.execute(
+                "INSERT INTO calibration_log "
+                "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (bucket, f"query for {bucket}", json.dumps(["a"]), json.dumps([1.0]), "test-model"),
+            )
+        store._conn.commit()
+        store.close()
+
+        def _raising_label_calibration_sample(*args, **kwargs):
+            raise RuntimeError("judge blew up")
+
+        monkeypatch.setattr(rj_mod, "label_calibration_sample", _raising_label_calibration_sample)
+
+        # (a) must not raise — a propagating exception here would fail this
+        # test just as surely as an explicit assertion would.
+        _run_calibration_tick(pd)
+
+        # (b) the prune that ran before the judge pass failed must stand.
+        store2 = MemoryStore(pd / "memories.db", integrity_check=False)
+        rows = store2._conn.execute("SELECT day_bucket FROM calibration_log").fetchall()
+        store2.close()
+        remaining_buckets = {row["day_bucket"] for row in rows}
+
+        assert old_bucket not in remaining_buckets, (
+            "prune must already have run/committed before the judge-labeling failure"
+        )
+        assert recent_bucket in remaining_buckets

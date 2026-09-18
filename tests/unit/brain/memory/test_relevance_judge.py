@@ -202,6 +202,73 @@ def test_importing_this_module_never_pulls_torch_into_sys_modules() -> None:
 
 
 # ---------------------------------------------------------------------------
+# TorchCrossEncoderJudge.score() — the double-sigmoid regression guard
+# (`activation_fn=lambda x: x`, see the class's own docstring). This is the
+# ONLY offline/default-gate coverage of that line: the sole prior test that
+# would catch a revert to `activation_fn=None` lived in
+# test_relevance_judge_real_model.py, which is requires_network + integration
+# and deselected from the default gate/CI.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSentenceTransformersCrossEncoder:
+    """Stand-in for `sentence_transformers.CrossEncoder`, monkeypatched onto
+    the REAL `sentence_transformers` module so `TorchCrossEncoderJudge`'s
+    lazy `from sentence_transformers import CrossEncoder` (inside its own
+    `__init__`) picks it up — mirrors real `.predict()`'s documented
+    activation_fn contract just enough to prove the production code forces
+    an identity pass-through: if `activation_fn` is None, applies
+    sentence-transformers' OWN documented default for a num_labels=1 model
+    (Sigmoid) — exactly the double-sigmoid trap
+    `TorchCrossEncoderJudge.score()`'s comment describes; otherwise applies
+    whatever callable it was given."""
+
+    RAW_LOGIT = 2.7
+
+    def __init__(self, model_id: str, cache_folder: str | None = None) -> None:
+        self.model_id = model_id
+        self.cache_folder = cache_folder
+        self.predict_calls: list[object] = []
+
+    def predict(self, pairs, activation_fn=None):
+        self.predict_calls.append(activation_fn)
+        fn = activation_fn if activation_fn is not None else (lambda x: 1.0 / (1.0 + math.exp(-x)))
+        return [fn(self.RAW_LOGIT)]
+
+
+def test_torch_cross_encoder_judge_score_forces_identity_activation_fn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Constructs a REAL `TorchCrossEncoderJudge` (bypassing
+    `build_judge_provider`, which the autouse `_fake_relevance_judge_
+    provider_by_default` fixture fakes) with `sentence_transformers.
+    CrossEncoder` itself monkeypatched to `_FakeSentenceTransformersCrossEncoder`.
+    Asserts BOTH that the `activation_fn` the fake's `.predict()` received is
+    an identity callable, AND that `score()`'s return value is the untouched
+    raw logit rather than a sigmoid-squashed probability — either assertion
+    alone would miss a regression that broke only one half of the contract."""
+    import sentence_transformers
+
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _FakeSentenceTransformersCrossEncoder)
+
+    judge = rj_mod.TorchCrossEncoderJudge(model_id="fake-judge-model", cache_dir="/tmp/fake-cache-dir")
+    score = judge.score("q", "d")
+
+    assert score == pytest.approx(_FakeSentenceTransformersCrossEncoder.RAW_LOGIT), (
+        f"score() must return the RAW logit ({_FakeSentenceTransformersCrossEncoder.RAW_LOGIT}), "
+        f"not a pre-sigmoided probability — got {score!r}"
+    )
+    fake_model = judge._model  # noqa: SLF001 — test-only reach into the fake we just installed
+    assert len(fake_model.predict_calls) == 1
+    received_activation_fn = fake_model.predict_calls[0]
+    assert received_activation_fn is not None, (
+        "activation_fn must never be None — None triggers sentence-transformers' own default "
+        "Sigmoid for a num_labels=1 model, double-sigmoiding against label_for_score's own sigmoid"
+    )
+    assert received_activation_fn(2.7) == 2.7, "activation_fn must be an identity pass-through"
+
+
+# ---------------------------------------------------------------------------
 # _make_haiku_tiebreak — mirrors consolidation._make_haiku_classifier's
 # fail-soft-on-any-failure shape.
 # ---------------------------------------------------------------------------
