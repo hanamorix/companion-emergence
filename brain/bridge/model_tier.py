@@ -81,7 +81,12 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 # embedder IS a clean swap. The caveat applies to task-SHAPE, not dimension.
 # For the F2a relevance judge specifically: the retrieval floor auto-re-derives
 # on the next daily calibration after a same-shape judge swap, so no manual
-# recalibration is needed.
+# recalibration is needed. UNLIKE the ONNX-loaded embedder/reranker above,
+# the judge (MODEL_RELEVANCE_JUDGE below) loads via torch/sentence-
+# transformers (#250 F2a inc6, Roy 2026-09-18 "torch it is then") — so it
+# swaps to ANY cross-encoder id, PyTorch-only or ONNX alike, whereas the
+# ONNX-loaded embedder/reranker can only swap to models that ship a usable
+# ONNX export.
 
 # MODEL_EMBEDDING is NOT a Claude model — it's a local ONNX embedding model id
 # (fastembed/HuggingFace naming), the standing convention (per the local
@@ -120,7 +125,75 @@ MODEL_EMBEDDING_DIM = 1024
 # (query, memory) TOGETHER and scores true relevance, replacing the old
 # cosine-floor/gap auto-calibration that didn't generalize across corpus
 # shapes. See brain/memory/reranker.py.
-MODEL_RERANKER = "Xenova/ms-marco-MiniLM-L-6-v2"  # ONNX cross-encoder, ~80MB, via fastembed
+# #250 F2a inc1 model-swap (2026-09-17, Roy): swapped from the English-only
+# Xenova/ms-marco-MiniLM-L-6-v2 to this multilingual model per the F4
+# forward-compat item (see semantic-retrieval-LEDGER.md, agent a2feb8f5) —
+# fastembed-native (TextCrossEncoder registry), a SINGLE self-contained
+# fp32 .onnx file (additional_files: []), ~1.11GB, so it needs NO
+# materialize-files workaround (unlike F1's multilingual-e5-large, which
+# hits the onnxruntime external-data-path bug because it ships sharded
+# external weights). fp16 export (~2x faster) is a LATER increment, gated
+# on a build-time fp16-vs-fp32 accuracy check — this fp32 default is
+# increment 1 only. Score type: raw, unbounded logit (same shape as the
+# outgoing ms-marco score, but a DIFFERENT SCALE) — AS OF THIS commit (inc1)
+# the abstention floor was still the old hardcoded MiniLM-scaled constant, a
+# known/expected scale mismatch; F2a's later increments replace it with a
+# floor derived daily against jina's own scale (§7) and cut every consumer
+# over to read it live (§8, inc8) — see `brain/memory/semantic_recall.py`.
+# License: CC-BY-NC-4.0 (non-commercial), accepted for this free/open-source,
+# non-commercial project.
+MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encoder, ~1.11GB fp32, via fastembed
+
+# fp16 export of the SAME model (F2a inc2, #250 §2) — the HF repo above also
+# ships onnx/model_fp16.onnx (~557MB, confirmed present on the repo), but it
+# is NOT pre-registered in fastembed's built-in TextCrossEncoder registry
+# (only the fp32 onnx/model.onnx export above is). brain/memory/reranker.py
+# registers this id via TextCrossEncoder.add_custom_model() pointing at that
+# file, then uses it ONLY as the fp16 candidate in a cached first-use
+# fp16-vs-fp32 accuracy self-check (mirrors reranker.py's existing warm
+# per-doc latency auto-calibration: measured once, cached, not
+# per-recall) — never read directly via model_for_tier/TIER_MODEL, so it
+# stays a plain companion constant here rather than its own tier (same
+# non-tier treatment MODEL_EMBEDDING_DIM gets above). The self-check
+# decides, per box, whether production actually serves this fp16 export or
+# falls back to MODEL_RERANKER's fp32 export — either the fp16 export fails
+# to preserve fp32's surface/abstain decisions on the bundled representative
+# pairs, or it does but isn't measurably faster on this host (a no-AVX2
+# potato CPU may not accelerate fp16), and fp32 stays the safe default in
+# both cases. 8-bit quantization was explicitly ruled out (a 278M model has
+# less redundancy to absorb an 8-bit accuracy hit than a larger model
+# would); fp16 is the one quantization lever here.
+MODEL_RERANKER_FP16 = "jinaai/jina-reranker-v2-base-multilingual-fp16"
+
+# MODEL_RELEVANCE_JUDGE is also not a Claude model — it's the offline local
+# relevance judge for F2a's daily calibration tick (#250 §6, inc6). Runs
+# ENTIRELY inside the once-daily idle-gated calibration tick
+# (brain/bridge/supervisor.py's _run_calibration_tick), never on the
+# per-turn recall path, so its own latency is irrelevant to recall — the
+# reason it can be a bigger/slower model than the per-turn reranker.
+# LOAD MECHANISM (Roy 2026-09-18, "torch it is then"): DIRECTLY via torch/
+# sentence-transformers (brain/memory/relevance_judge.py), NOT fastembed/
+# onnxruntime — deliberately different from MODEL_EMBEDDING/MODEL_RERANKER
+# above. torch is a project dependency SCOPED to this offline judge only
+# (see pyproject.toml's dependency comment); it is imported lazily, only
+# when the daily tick actually runs a judge pass, so importing this module
+# or any per-turn recall module never pulls torch in. Rationale for going
+# through torch instead of ONNX here specifically: the judge is offline so
+# torch's extra weight costs no per-turn latency, and direct-torch lets a
+# user swap the judge to ANY cross-encoder id (PyTorch-only or ONNX-only
+# alike) via this one constant — an ONNX-only runtime would restrict swaps
+# to models that happen to ship a usable ONNX export.
+# Independence rationale (settled on the ledger, not re-litigated here):
+# bge-reranker-v2-m3 and jina (MODEL_RERANKER above) share an XLM-RoBERTa
+# BASE model but are fine-tuned on different data — a soft correlated-blind-
+# spot concern, not the hard self-judging circularity that sharing weights
+# would create; Haiku's independent tie-break (relevance_judge.py) covers
+# the ambiguous cases where that soft concern would matter most.
+# License: apache-2.0 (permissively licensed; this model was already
+# weighed and REJECTED as the per-turn reranker on latency grounds — too
+# heavy per-doc for the no-AVX2 potato baseline's rerank-width auto-scaling
+# — but that latency is irrelevant here, offline and once-daily).
+MODEL_RELEVANCE_JUDGE = "BAAI/bge-reranker-v2-m3"
 
 # attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
 # (not the bare "haiku" alias) — this predates #154 and substituting the alias
@@ -151,6 +224,13 @@ TIER_EMBEDDING = "embedding"
 # build_reranker_provider() in brain/memory/reranker.py, which reads
 # model_for_tier(TIER_RERANKER) rather than hardcoding the id.
 TIER_RERANKER = "reranker"
+# Same non-Claude-tier treatment as TIER_EMBEDDING/TIER_RERANKER above —
+# registered here so the model id lives in ONE place; construct the actual
+# judge provider via build_judge_provider() in brain/memory/relevance_judge.py
+# (#250 F2a inc6), which reads model_for_tier(TIER_RELEVANCE_JUDGE) rather
+# than hardcoding the id. See MODEL_RELEVANCE_JUDGE's own comment above for
+# why this tier loads via torch instead of the ONNX path the other two use.
+TIER_RELEVANCE_JUDGE = "relevance-judge"
 
 TIER_MODEL: dict[str, str] = {
     # NOMINAL/DEFAULT ONLY — decorative for this one tier (future "biggest"
@@ -170,6 +250,7 @@ TIER_MODEL: dict[str, str] = {
     TIER_DEV_CLI: MODEL_MEDIUM,
     TIER_EMBEDDING: MODEL_EMBEDDING,
     TIER_RERANKER: MODEL_RERANKER,
+    TIER_RELEVANCE_JUDGE: MODEL_RELEVANCE_JUDGE,
 }
 
 

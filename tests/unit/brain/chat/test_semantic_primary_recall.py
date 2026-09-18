@@ -7,9 +7,11 @@ functions (those are covered directly in
 Uses a small scripted `EmbeddingProvider` (deterministic, hand-chosen cosine
 relationships) so the semantic candidate POOL is populated and coarse-cut
 predictably, and a scripted `FakeRerankerProvider` (deterministic,
-per-content-text scores) to control which candidates clear `RERANK_FLOOR`
-and in what order — since #231 the reranker score, not cosine, decides
-surfacing. Fake's hash-seeded default embedding vectors are ~orthogonal for
+per-content-text scores) to control which candidates clear the calibrated
+reranker floor (F2a inc8: read live via `store.get_reranker_floor`, seeded
+directly in this suite via `_seed_floor`) and in what order — since #231 the
+reranker score, not cosine, decides surfacing. Fake's hash-seeded default
+embedding vectors are ~orthogonal for
 any two distinct strings (fine for mechanical plumbing) and
 FakeRerankerProvider's default score for an unscripted document sits far
 below any floor (see that class's docstring) — neither can exercise a
@@ -41,10 +43,15 @@ from brain.chat.prompt import _build_recall_block
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.relevance import SNIPPET_COUNT
 from brain.memory.reranker import FakeRerankerProvider
-from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 
 _SCRIPTED_MODEL_ID = "scripted-test"
+# F2a inc8 cutover: no more module-level `RERANK_FLOOR` — the floor is read
+# live from `store.get_reranker_floor(reranker_provider.model_id())`. This
+# suite seeds it directly via `_seed_floor` below; the numeric value here has
+# no production significance (an arbitrary reference point for test data).
+_TEST_FLOOR = -9.25
+_FAKE_RERANKER_MODEL_ID = "fake-reranker"
 # Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
 # EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
 # (each row decodes to its own stored byte-length) — a 2-dim test vector
@@ -158,7 +165,18 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     so it never accidentally clears it."""
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scores),
+    )
+
+
+def _seed_floor(
+    store: MemoryStore, floor: float = _TEST_FLOOR, *, model_id: str = _FAKE_RERANKER_MODEL_ID
+) -> None:
+    """F2a inc8: write a calibrated floor row directly so the real
+    `run_semantic_recall` (driven here through `_build_recall_block`) has
+    something to read via `store.get_reranker_floor`."""
+    store.write_reranker_floor(
+        model_id, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
     )
 
 
@@ -205,9 +223,10 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
 
     _seed_vectors(store, vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _seed_floor(store)
     _patch_reranker(
         monkeypatch,
-        {target: RERANK_FLOOR + 5.0, decoy: RERANK_FLOOR - 2.0},  # decoy scored but below floor
+        {target: _TEST_FLOOR + 5.0, decoy: _TEST_FLOOR - 2.0},  # decoy scored but below floor
     )
 
     before_target, before_decoy = _rc(store, m_target.id), _rc(store, m_decoy.id)
@@ -321,11 +340,12 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     contents_by_id[noise_mem.id] = noise_content
     _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _seed_floor(store)
     _patch_reranker(
         monkeypatch,
         {
-            **{content: RERANK_FLOOR + 6.0 - i for i, content in enumerate(contents)},  # 6 standouts, strictly descending
-            noise_content: RERANK_FLOOR - 1.0,  # scored but below floor
+            **{content: _TEST_FLOOR + 6.0 - i for i, content in enumerate(contents)},  # 6 standouts, strictly descending
+            noise_content: _TEST_FLOOR - 1.0,  # scored but below floor
         },
     )
 
@@ -373,9 +393,10 @@ def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
 
     _seed_vectors(store, vectors, contents_by_id={m.id: c for m, c in zip(mems, contents, strict=True)})
     _patch_provider(monkeypatch, vectors, dim=dim)
+    _seed_floor(store)
     _patch_reranker(
         monkeypatch,
-        {content: RERANK_FLOOR + 12.0 - i for i, content in enumerate(contents)},  # all 12 clear the floor
+        {content: _TEST_FLOOR + 12.0 - i for i, content in enumerate(contents)},  # all 12 clear the floor
     )
 
     block = _build_recall_block(store, query, persona_dir=tmp_path)
@@ -427,8 +448,10 @@ def test_nothing_clears_floor_engages_lexical_fallback_ordered_by_blend(
     _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
     # No reranker scores scripted at all — every candidate falls to
-    # FakeRerankerProvider's below-floor default, so NOTHING clears
-    # RERANK_FLOOR and run_semantic_recall returns None.
+    # FakeRerankerProvider's below-floor default, so NOTHING clears the
+    # floor and run_semantic_recall returns None. No floor row is even
+    # seeded here — either way (no row, or a row nothing clears) the
+    # outcome is the same INCONCLUSIVE None.
 
     block = _build_recall_block(store, query, persona_dir=tmp_path)
 

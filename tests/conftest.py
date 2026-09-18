@@ -194,7 +194,7 @@ def _fake_reranker_provider_by_default(
     `@pytest.mark.requires_network`.
 
     FakeRerankerProvider defaults every UNSCRIPTED document to a score far
-    below any plausible RERANK_FLOOR (see that class's docstring) — so a
+    below any plausible calibrated floor (see that class's docstring) — so a
     test that never scripts reranker scores gets the same "semantic
     inconclusive -> lexical fallback" behavior it would have gotten from an
     empty/orthogonal cosine result pre-#231, rather than an arbitrary
@@ -203,6 +203,34 @@ def _fake_reranker_provider_by_default(
     `FakeRerankerProvider(scores={...})` and monkeypatch this function
     directly, mirroring how `_ScriptedProvider` overrides the embedding
     fixture above for the same reason.
+
+    Also patches `reranker._bootstrap_reranker_provider` (F2a inc8, #250 §7
+    UPDATED — the bootstrap-floor ruling) the same way: that function is the
+    OTHER production entry point that constructs a real `CrossEncoderProvider`
+    (deliberately independent of `build_reranker_provider` itself — see its
+    own docstring on why), used by `floor_calibration.get_bootstrap_floor`
+    whenever `store.get_reranker_floor` is asked about a model_id with no
+    persisted row yet. Without this, ANY test whose store has no persisted
+    floor row (the common case for a fresh in-memory/tmp_path store) would
+    attempt a REAL fastembed model load the first time `get_reranker_floor`
+    is called — even tests that never intentionally touch the reranker at
+    all.
+
+    UNLIKE `build_reranker_provider`'s fake, this one is scripted (not left
+    fully unscripted): the bootstrap fits a THRESHOLD from whatever scores
+    its provider returns for the bundled `_FP16_GATE_PAIRS[:6]` pairs, so an
+    UNSCRIPTED default-everywhere provider would fit a floor of roughly
+    `_DEFAULT_UNSCORED - 1.0` (every pair ties at the same sentinel score,
+    and `fit_threshold_fbeta` picks the threshold just below it) — only
+    ONE unit below `FakeRerankerProvider`'s own `_DEFAULT_UNSCORED`, not
+    "far below" it. That would silently break the "unscripted reranker
+    score never clears an unscripted floor -> INCONCLUSIVE" invariant every
+    other test in this suite relies on for its OWN default (an unscripted
+    -1000.0 candidate score would clear a -1001.0 bootstrap floor). Scripted
+    here to a realistic, well-SEPARATED pair of scores instead (relevant
+    pairs high, irrelevant pairs low) so the default bootstrap floor lands
+    near 0.0 — comfortably above `_DEFAULT_UNSCORED`, restoring that
+    invariant for every test that never scripts its OWN bootstrap provider.
     """
     if "requires_network" in request.keywords:
         return
@@ -217,24 +245,90 @@ def _fake_reranker_provider_by_default(
     # patching this ONE module attribute is sufficient to intercept every
     # call site.
     monkeypatch.setattr(
-        reranker, "build_reranker_provider", lambda: reranker.FakeRerankerProvider()
+        reranker, "build_reranker_provider", lambda *, store=None: reranker.FakeRerankerProvider()
+    )
+    default_bootstrap_scores = {
+        doc: (5.0 if i < 3 else -5.0) for i, (_query, doc) in enumerate(reranker._FP16_GATE_PAIRS[:6])
+    }
+    monkeypatch.setattr(
+        reranker,
+        "_bootstrap_reranker_provider",
+        lambda model_id: reranker.FakeRerankerProvider(scores=default_bootstrap_scores),
     )
 
 
 @pytest.fixture(autouse=True)
 def _reset_reranker_provider_cache() -> Iterator[None]:
     """Reset reranker.build_reranker_provider()'s process-level provider
-    cache before and after each test — mirrors
+    cache, its warm-latency cache, its fp16-vs-fp32 precision-decision
+    cache (F2a inc2, #250 §2), and floor_calibration's bootstrap-floor cache
+    (F2a inc8, #250 §7 UPDATED) before and after each test — mirrors
     `_reset_embedding_provider_cache` above for the same reason (a test that
-    calls the REAL `build_reranker_provider()` directly must not read or
-    leak a provider a prior/later test's call happened to cache)."""
-    from brain.memory import reranker
+    calls the REAL `build_reranker_provider()` / `get_reranker_floor()`
+    directly must not read or leak a provider/decision/bootstrap a
+    prior/later test's call happened to cache)."""
+    from brain.memory import floor_calibration, reranker
 
     reranker._reset_reranker_provider_cache()
     reranker._reset_latency_cache()
+    reranker._reset_precision_decision_cache()
+    floor_calibration._reset_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
     reranker._reset_latency_cache()
+    reranker._reset_precision_decision_cache()
+    floor_calibration._reset_bootstrap_floor_cache()
+
+
+@pytest.fixture(autouse=True)
+def _fake_relevance_judge_provider_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force brain.memory.relevance_judge.build_judge_provider() to the
+    deterministic, offline FakeRelevanceJudgeProvider for the whole suite by
+    default (F2a #250 inc6, mirrors `_fake_reranker_provider_by_default`
+    above).
+
+    build_judge_provider() is the PRODUCTION default (TorchCrossEncoderJudge
+    — a real local torch/sentence-transformers cross-encoder, downloaded
+    once over the network into a shared cache dir). Any test that exercises
+    the daily calibration tick's judge-labeling pass — even indirectly via
+    `_run_calibration_tick` — would otherwise attempt a real model download
+    and a real torch import. A test that genuinely needs the real judge
+    opts out with `@pytest.mark.requires_network`.
+
+    Every candidate the FakeRelevanceJudgeProvider default scores lands far
+    below any plausible ambiguous band (its unscripted-pair default score,
+    see that class's docstring) — mirroring FakeRerankerProvider's "never
+    accidentally clears the floor" posture, this default never accidentally
+    routes an unscripted pair to a stubbed Haiku call either. Tests that
+    need a specific label/ambiguous-band outcome construct their own
+    `FakeRelevanceJudgeProvider(scores={...})` and pass it directly to
+    `label_calibration_sample`/`_run_calibration_tick` (the `judge=`
+    parameter), mirroring how tests construct their own
+    `FakeRerankerProvider(scores={...})` for the reranker.
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import relevance_judge
+
+    monkeypatch.setattr(
+        relevance_judge, "build_judge_provider", lambda: relevance_judge.FakeRelevanceJudgeProvider()
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_judge_provider_cache() -> Iterator[None]:
+    """Reset relevance_judge.build_judge_provider()'s process-level provider
+    cache before and after each test — mirrors `_reset_reranker_provider_cache`
+    above for the same reason (a test that calls the REAL
+    `build_judge_provider()` directly must not read or leak a provider a
+    prior/later test's call happened to cache)."""
+    from brain.memory import relevance_judge
+
+    relevance_judge._reset_judge_provider_cache()
+    yield
+    relevance_judge._reset_judge_provider_cache()
 
 
 @pytest.fixture(scope="session")

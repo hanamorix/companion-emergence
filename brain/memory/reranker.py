@@ -8,9 +8,11 @@ derived a floor/gap from the corpus's own pairwise cosine spread, which the
 cold red-team proved doesn't generalize (breaks silently on tight/diffuse/
 bimodal corpora, because the query-match cosine scale is MODEL-FIXED, not
 corpus-shaped). A cross-encoder reads (query, memory) TOGETHER and scores
-true relevance — that score is query-conditioned, so a FIXED, empirically-set
-floor on it (``brain.memory.semantic_recall.RERANK_FLOOR``) is trustworthy in
-a way a cosine floor never was.
+true relevance — that score is query-conditioned, so a floor on it is
+trustworthy in a way a cosine floor never was. Originally a FIXED,
+empirically-set module constant (``RERANK_FLOOR``); cut over by F2a inc8
+(#250 §7/§8) to a DB-adaptive floor read live per call from
+``MemoryStore.get_reranker_floor`` — see ``brain/memory/semantic_recall.py``.
 
 Mirrors ``brain/memory/embeddings.py``'s ``FastEmbedProvider`` +
 ``build_embedding_provider`` PROCESS-CACHE pattern:
@@ -30,31 +32,102 @@ number of candidates reranked self-derives from a MEASURED warm per-doc
 rerank latency on the actual host vs a fixed latency budget — no per-corpus,
 no per-persona, no operator tuning; only the budget itself
 (``LATENCY_BUDGET_SECONDS``) is an ops tunable.
+
+F2a inc2 (#250 §2) additionally owns the fp16-vs-fp32 accuracy SELF-CHECK: a
+cached, first-use, on-box check (mirroring the warm-latency auto-calibration
+pattern above — measured once, cached, not per-recall) that registers the
+jina reranker's fp16 onnx export via ``TextCrossEncoder.add_custom_model()``,
+tests it against the fp32 export on a small bundled representative set of
+(query, doc) pairs for surface/abstain DECISION agreement against the
+CALIBRATED floor (F2a inc8), and — only if that agreement holds AND fp16
+measures faster on this host — ships fp16; otherwise fp32 (the safe
+default). See ``_choose_reranker_model_id`` / ``_run_precision_selfcheck``
+near the bottom of this module.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain import tunables
 from brain.memory.relevance import CANDIDATE_POOL
 
+if TYPE_CHECKING:
+    from brain.memory.store import MemoryStore
+
 log = logging.getLogger(__name__)
 
-# Latency budget for one rerank call (spec point 3: "~1-2s", MEASURED
-# no-AVX2 numbers put ~50 docs at ~1.1s). The ONLY operator-tunable knob in
-# this module — ops-clean (a latency/throughput knob), unlike RERANK_FLOOR
-# (physiology, fenced into semantic_recall.py per tunables.py's own
-# "physiology fenced out" rule). Registered here (the owning module), read
-# at call time via tunables.get_tunable so a live override applies with no
-# restart.
-LATENCY_BUDGET_SECONDS: float = tunables.register("reranker.latency_budget_seconds", 1.5)
+
+def _detect_avx2() -> bool:
+    """Best-effort startup AVX2 capability check (F2a inc3, #250 §3).
+
+    Runs at process startup (this module's import time), not install time —
+    a VM's AVX2 exposure depends on the host it boots on and can change
+    between boots ([[dev-vm-avx2-depends-on-host]]), so baking the answer in
+    at build/install time would go stale.
+
+    Only Linux is actually probed, via /proc/cpuinfo's `flags` line — the
+    one place a reliable answer is available with no new dependency (no
+    py-cpuinfo, no numpy CPU-dispatch introspection — that answers "does
+    numpy's own build support AVX2", not "does this CPU"). macOS, Windows,
+    and any read/parse failure on Linux all fall back to "no AVX2": #250 §3
+    pins the 2s/4s split but not a cross-platform detection METHOD, so this
+    is resolved conservatively rather than guessed — an undetectable host is
+    treated exactly like a confirmed no-AVX2 host, getting the larger, safer
+    budget instead of silently assuming a fast one (keeps the potato
+    baseline honest). Fail-soft throughout: this must never raise into
+    startup.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("flags"):
+                    return "avx2" in line.split(":", 1)[1].split()
+        return False
+    except Exception:  # noqa: BLE001 — fail-soft: a capability probe must never break startup
+        log.exception("reranker: AVX2 detection failed — defaulting to the conservative no-AVX2 latency budget")
+        return False
+
+
+def _default_latency_budget_seconds(avx2_present: bool) -> float:
+    """AVX2-aware rerank latency-budget default (#250 §3): 2s when the
+    startup check found AVX2, 4s when it did not (or could not tell — see
+    `_detect_avx2`) — build for the no-AVX2 potato baseline, AVX2 as a
+    bonus, per the spec's design posture. Split out as its own pure
+    function (rather than inlined where `LATENCY_BUDGET_SECONDS` is
+    computed) so tests can exercise both branches directly, without needing
+    to reload this module under a monkeypatched detector."""
+    return 2.0 if avx2_present else 4.0
+
+
+_AVX2_PRESENT = _detect_avx2()
+
+# Latency budget for one rerank call (#250 §3): AVX2-aware default — 2s if
+# this process's startup check found AVX2, 4s if not (see
+# `_default_latency_budget_seconds`). The ONLY operator-tunable knob in this
+# module — ops-clean (a latency/throughput knob), unlike the reranker
+# abstention floor (physiology, fenced into semantic_recall.py/the DB-backed
+# calibration table per tunables.py's own "physiology fenced out" rule, NOT
+# a tunables.py entry). Registered here (the owning module) as the
+# DEFAULT only; a manual override in tunables.json wins over this
+# auto-detected value via tunables.get_tunable's existing override-
+# precedence mechanism (see `get_rerank_width` below) — this AVX2-awareness
+# only changes what the default resolves to, never the override behavior
+# itself. Read at call time via tunables.get_tunable so a live override
+# applies with no restart.
+LATENCY_BUDGET_SECONDS: float = tunables.register(
+    "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT)
+)
 
 
 class RerankerProvider(ABC):
@@ -126,7 +199,7 @@ class FakeRerankerProvider(RerankerProvider):
     that need to exercise the floor/tier logic must control the exact score
     per document, not merely get a consistent-but-arbitrary one. A document
     with no entry in `scores` falls back to `default` — deliberately a value
-    far below any plausible `RERANK_FLOOR`, so a test that seeds unrelated
+    far below any plausible calibrated floor, so a test that seeds unrelated
     filler content (the same "neutral, never-a-match" role
     `_ScriptedProvider.embed()`'s all-zero fallback plays for embeddings)
     never accidentally clears the floor and turns an intended-inconclusive
@@ -154,12 +227,30 @@ _provider_cache: dict[str, RerankerProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
-def build_reranker_provider() -> RerankerProvider:
+def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProvider:
     """The production reranker provider: CrossEncoderProvider pinned to
-    `model_tier.TIER_RERANKER`'s model id, caching the model file in the
-    shared `get_cache_dir()` (one download across every persona on the box —
-    the model isn't persona-specific data, same reasoning as the embedding
+    whichever model id the fp16-vs-fp32 self-check (F2a inc2, #250 §2)
+    decides to serve — `model_tier.TIER_RERANKER`'s fp32 model id, or its
+    fp16 export (`model_tier.MODEL_RERANKER_FP16`) if that self-check's
+    cached decision picked it — caching the model file in the shared
+    `get_cache_dir()` (one download across every persona on the box — the
+    model isn't persona-specific data, same reasoning as the embedding
     model).
+
+    `store` (F2a inc8, #250 §7/§8 cutover): the caller's `MemoryStore`,
+    threaded through to the precision self-check ONLY (never used for
+    anything else here) so it can read the CALIBRATED reranker floor
+    (`store.get_reranker_floor`) as the comparison bar for the fp16-vs-fp32
+    surface/abstain agreement check, replacing the deleted
+    `semantic_recall.RERANK_FLOOR` constant it used to import. Optional and
+    keyword-only: on a cache HIT (the overwhelmingly common case —
+    `_choose_reranker_model_id` short-circuits before ever touching `store`)
+    it is never even looked at; every production call site
+    (`semantic_recall.run_semantic_recall`, `search_memories._semantic_
+    top_k`, `supervisor._run_calibration_tick`) has a store in scope and
+    passes it. `None` (test/legacy call sites that don't) degrades the
+    precision self-check to its existing safe default — see
+    `_run_precision_selfcheck`'s docstring.
 
     PROCESS-WIDE CACHING, same rationale as `embeddings.build_embedding_
     provider`: constructing a CrossEncoderProvider builds a real ONNX
@@ -167,16 +258,23 @@ def build_reranker_provider() -> RerankerProvider:
     (double-checked locking: unlocked fast-path read for the common
     already-cached case; the lock is only taken — then re-checked — the
     first time a given model_id needs constructing) for the same reasons
-    documented on that function.
+    documented on that function. `_choose_reranker_model_id` below may
+    already have populated this cache for the winning model_id (it warms
+    both candidates to run the self-check, so it stashes whichever provider
+    it already built for the DECIDED model_id here to avoid a second ONNX
+    session load on this very first call) — the block below is then a
+    fast-path cache hit, not a redundant construction.
 
     TEST ISOLATION: `tests/conftest.py`'s autouse fixture clears this
     process-global dict before and after every test, mirroring the embedding
     provider's own isolation fixture.
     """
-    from brain.bridge.model_tier import TIER_RERANKER, model_for_tier
+    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
     from brain.paths import get_cache_dir
 
-    model_id = model_for_tier(TIER_RERANKER)
+    fp32_model_id = model_for_tier(TIER_RERANKER)
+    cache_dir = get_cache_dir()
+    model_id = _choose_reranker_model_id(fp32_model_id, MODEL_RERANKER_FP16, cache_dir, store=store)
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -186,9 +284,66 @@ def build_reranker_provider() -> RerankerProvider:
         provider = _provider_cache.get(model_id)  # re-check: lost the race?
         if provider is not None:
             return provider
+        provider = CrossEncoderProvider(model_id=model_id, cache_dir=cache_dir)
+        _provider_cache[model_id] = provider
+        return provider
+
+
+def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
+    """Raw provider construction for `model_id`, used ONLY by
+    `floor_calibration.get_bootstrap_floor` (F2a inc8, #250 §7 UPDATED —
+    Roy's 2026-09-18 bootstrap-floor ruling) to score the bundled cold-start
+    pairs for a floor the caller already knows it needs, for a model_id it
+    already knows it needs it for.
+
+    Deliberately bypasses `build_reranker_provider` — that function's
+    fp16-vs-fp32 precision self-check reads `store.get_reranker_floor(
+    fp32_model_id)`, which is exactly `get_bootstrap_floor`'s OWN caller
+    whenever no persisted floor row exists yet. Routing through
+    `build_reranker_provider` here would recurse:
+    `MemoryStore.get_reranker_floor` -> `floor_calibration.
+    get_bootstrap_floor` -> (this function, if it called
+    `build_reranker_provider`) -> `_choose_reranker_model_id` ->
+    `_run_precision_selfcheck` -> `store.get_reranker_floor(fp32_model_id)`
+    -> back to the start, with the cache not yet populated to break the
+    loop. This function never chooses a precision and never touches
+    `store` — it only constructs (or reuses) a plain `CrossEncoderProvider`
+    for the exact `model_id` it was asked about.
+
+    Reuses the shared `_provider_cache` (the SAME cache
+    `build_reranker_provider` reads/writes, double-checked locking to
+    match) so a caller that resolves to this same `model_id` elsewhere in
+    the process reuses the already-loaded ONNX session instead of paying
+    for a second one. In practice this is very often a cache HIT: every
+    production call site that ends up asking `get_reranker_floor` a
+    question (`run_semantic_recall`, `_semantic_top_k`, the precision
+    self-check itself) has ALREADY resolved/cached a provider for the exact
+    model_id in question via `build_reranker_provider` by the time it does
+    so.
+    """
+    cached = _provider_cache.get(model_id)
+    if cached is not None:
+        return cached
+    with _provider_cache_lock:
+        cached = _provider_cache.get(model_id)
+        if cached is not None:
+            return cached
+        from brain.paths import get_cache_dir
+
         provider = CrossEncoderProvider(model_id=model_id, cache_dir=get_cache_dir())
         _provider_cache[model_id] = provider
         return provider
+
+
+def _cache_provider(model_id: str, provider: RerankerProvider) -> None:
+    """Stash an already-constructed provider into the process-wide cache
+    under `model_id`, WITHOUT clobbering one a concurrent caller already
+    cached (`setdefault`) — used by `_run_precision_selfcheck` so a provider
+    it already warmed (and paid the real ONNX-session-load cost for) while
+    running the self-check is reused by `build_reranker_provider`'s own
+    cache lookup rather than being constructed a second time."""
+    with _provider_cache_lock:
+        _provider_cache.setdefault(model_id, provider)
 
 
 def _reset_reranker_provider_cache() -> None:
@@ -398,3 +553,329 @@ def get_rerank_width(
     else:
         width = math.floor(budget / per_doc)
     return max(1, min(pool_size, CANDIDATE_POOL, width))
+
+
+# ---------------------------------------------------------------------------
+# fp16-vs-fp32 accuracy self-check (F2a inc2, #250 §2): a cached, first-use,
+# on-box check that decides whether production serves the jina reranker's
+# fp16 export or stays on fp32 — mirrors the warm-latency auto-calibration
+# above (measured once, cached, not per-recall), not a GH-Actions
+# release-pipeline step (see the ledger's FORK 2 resolution: fp16-vs-fp32
+# agreement is a property of the BUNDLED model, computable anywhere, so
+# first-use is as valid as a release-time gate, and first-use additionally
+# covers `uv run` source installs the release pipeline never touches, and
+# lets the check confirm fp16 is genuinely faster on THIS box before
+# preferring it — a no-AVX2 potato CPU may not accelerate fp16).
+# ---------------------------------------------------------------------------
+
+# Small BUNDLED representative (query, doc) pairs for the self-check below
+# (bundled because a fresh install has no corpus yet to draw pairs from —
+# fp16-vs-fp32 agreement is a property of the MODEL, not of any one corpus,
+# per §2). The first 3 + next 3 pairs are the genuine/decoy set
+# tests/unit/brain/memory/test_reranker_real_model.py already carries
+# (itself reused from #88/test_search_memories_mode.py) — the closest
+# existing checked-in "representative pair set" the spec's open
+# reconfirmation says to reuse if one exists. The last 4 are additional
+# borderline/weakly-related pairs (topically adjacent but not a direct
+# match) added for the diversity that same reconfirmation calls for
+# ("diverse relevant/irrelevant/borderline cases, not an arbitrary
+# handful"). This set is NOT used to derive a relevance floor itself (that
+# is `floor_calibration.py`'s job, F2a §7) — only to compare fp16 against
+# fp32 on the SAME comparison bar: `fp32_model_id`'s CALIBRATED floor
+# (`store.get_reranker_floor`, read live inside `_run_precision_selfcheck`,
+# never copied/pinned here — F2a inc8, #250 §7/§8 cutover, replacing the
+# old MiniLM-scaled `semantic_recall.RERANK_FLOOR` constant this comment
+# used to reference). The decision itself is cached in
+# `_precision_decision_cache` keyed ONLY on `(fp32_model_id, fp16_model_id)`,
+# not on the floor value, so once a decision is cached it does NOT
+# re-evaluate when the calibrated floor changes later in the same process.
+# The daily calibration tick, after it writes a new floor, calls
+# `reranker.reset_precision_decision_for_floor_change()` (F2a inc7) so the
+# next `build_reranker_provider()` call re-runs this self-check under the
+# sharpened floor (bounded to once a day, off the hot path). Do not key the
+# cache on the floor float itself: EMA drift would then force a costly
+# re-run, a second real ONNX load of both exports, on most days, defeating
+# the one-time-cost design.
+_FP16_GATE_PAIRS: list[tuple[str, str]] = [
+    # genuine (clearly relevant)
+    (
+        "how do I calm down when everything feels like too much",
+        "deep breathing helps when you are feeling anxious",
+    ),
+    ("quiet evening", "a quiet evening with nothing much happening"),
+    (
+        "what does Bob like to drink in the morning",
+        "Bob always starts his day with a strong cup of black coffee",
+    ),
+    # decoy (clearly irrelevant)
+    (
+        "too much of a flood of party invitations this week",
+        "how do I calm down when everything feels like too much",
+    ),
+    ("what's the capital of France", "my cat knocked a glass off the kitchen counter this morning"),
+    (
+        "how do I calm down when everything feels like too much",
+        "the stock market closed higher today on tech earnings",
+    ),
+    # borderline (topically adjacent, weakly related — neither a clean
+    # match nor a clean miss)
+    (
+        "what does Bob like to drink in the morning",
+        "Bob mentioned he used to drink tea before switching to coffee last year",
+    ),
+    ("quiet evening", "a busy weekend trip with friends and lots of noise"),
+    (
+        "how do I calm down when everything feels like too much",
+        "sometimes taking a walk outside clears my head a little",
+    ),
+    ("quiet evening", "the kitchen sink has been leaking for a week"),
+]
+
+# model_id -> chosen model_id ("fp32" or "fp16" candidate id, whichever the
+# self-check decided). Keyed by the (fp32_model_id, fp16_model_id) PAIR, not
+# a single id, so a model swap on EITHER side (a mini-model registration
+# change per model_tier.py's own caveat comment) invalidates the cached
+# decision automatically rather than serving a stale one. Process-wide,
+# mirrors `_latency_cache` above — but unlike that cache this one is NOT
+# periodically recomputed: the spec frames this as a one-time first-use
+# cost for the life of the process, not a recurring measurement.
+_precision_decision_cache: dict[tuple[str, str], str] = {}
+_precision_decision_cache_lock = threading.Lock()
+
+
+def _register_fp16_reranker_model(fp16_model_id: str, hf_repo: str) -> None:
+    """Idempotently register the jina fp16 onnx export with fastembed's
+    `TextCrossEncoder`, via `add_custom_model()` — the confirmed mechanism
+    (checked against the installed fastembed 0.8.0): fp16 is NOT in
+    fastembed's built-in registry (only the fp32 export is), but the SAME
+    HF repo (`hf_repo` — in practice `model_tier.MODEL_RERANKER`, the fp32
+    id, since it names the identical repo) also ships
+    `onnx/model_fp16.onnx` (~557MB, confirmed present on the repo).
+
+    Registration is metadata-only (no network, no download — the download
+    happens lazily on the registered model's first real `rerank()` call,
+    same as the fp32 model). Guarded against `add_custom_model`'s own
+    "already registered" `ValueError` so a second self-check in the same
+    process (or a test re-running this) is a no-op, not a crash.
+    """
+    from fastembed.common.model_description import ModelSource
+    from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+
+    already_registered = {m["model"] for m in TextCrossEncoder.list_supported_models()}
+    if fp16_model_id in already_registered:
+        return
+    TextCrossEncoder.add_custom_model(
+        model=fp16_model_id,
+        sources=ModelSource(hf=hf_repo),
+        model_file="onnx/model_fp16.onnx",
+        description="fp16 export of jina-reranker-v2-base-multilingual, for the F2a fp16/fp32 accuracy self-check (#250)",
+        license="cc-by-nc-4.0",
+        size_in_gb=0.56,
+    )
+
+
+def _run_precision_selfcheck(
+    fp32_model_id: str, fp16_model_id: str, cache_dir: str | Path, *, store: MemoryStore | None = None
+) -> str:
+    """The actual (uncached — see `_choose_reranker_model_id`) fp16-vs-fp32
+    self-check: registers the fp16 export, loads both it and fp32, tests
+    surface/abstain DECISION agreement on `_FP16_GATE_PAIRS` against the
+    live CALIBRATED floor for `fp32_model_id` (F2a inc8, #250 §7/§8 cutover
+    — replaces the deleted `semantic_recall.RERANK_FLOOR` constant this
+    used to import), and — only on full agreement AND a measured fp16 speed
+    win on this host — returns `fp16_model_id`. Returns `fp32_model_id` in
+    every other case, INCLUDING any failure along the way (fail-soft: fp32
+    is always the safe default; this must never raise into a recall).
+
+    The comparison bar is `fp32_model_id`'s calibrated floor specifically —
+    fp32 is the spec's designated REFERENCE precision (§2: "fp32 is the
+    reference, no external labels needed"), so its floor is the one stable
+    scale to judge fp16's agreement against, independent of which precision
+    this very check ends up shipping. `store is None` means there is no way
+    to read ANY floor at all -> short-circuits straight to the existing
+    "insufficient information -> ship the safe default" branch (same
+    posture as every other fail-soft branch below: a registration failure,
+    a load failure, ANY exception), skipping the fp16 registration/
+    construction entirely (no ONNX load wasted on a comparison that would
+    be meaningless anyway). `calibrated_floor is None` with a real `store`
+    given is now the RARE case (F2a inc8, #250 §7 UPDATED): `store.
+    get_reranker_floor(fp32_model_id)` serves a derived bootstrap floor even
+    when the daily tick has never fired for `fp32_model_id`, so the day-0
+    self-check now runs its REAL comparison against that bootstrap instead
+    of short-circuiting here — this branch fires only if the bootstrap
+    computation itself failed (a reranker load/fit error), the bootstrap's
+    own fail-soft path.
+
+    ANY single flipped keep/drop decision fails the gate (mechanical bar,
+    not an arbitrary loss percentage — per §2's "principled,
+    behavior-preserving" bar and its open reconfirmation that the number
+    must not be picked ad hoc).
+
+    Whichever provider(s) this function actually constructs get stashed
+    into the process-wide provider cache (`_cache_provider`) under their
+    own model_id, so the ONE that wins is already warm (its ONNX session
+    already loaded via the `.rerank()` calls below) by the time
+    `build_reranker_provider` goes to construct it — the real, non-trivial
+    load cost is paid exactly once, not twice, for the winning model.
+    """
+    if store is None:
+        log.info(
+            "reranker fp16/fp32 gate: no store to read a calibrated floor from -> shipping fp32"
+        )
+        return fp32_model_id
+    calibrated_floor = store.get_reranker_floor(fp32_model_id)
+    if calibrated_floor is None:
+        log.info(
+            "reranker fp16/fp32 gate: no calibrated floor yet for %s (daily tick has not "
+            "derived one) -> shipping fp32 pending the first calibration",
+            fp32_model_id,
+        )
+        return fp32_model_id
+
+    try:
+        _register_fp16_reranker_model(fp16_model_id, fp32_model_id)
+    except Exception:  # noqa: BLE001 — fail-soft: registration failure must not break recall
+        log.exception("reranker fp16/fp32 gate: failed to register the fp16 export -> shipping fp32")
+        return fp32_model_id
+
+    fp32_provider: CrossEncoderProvider | None = None
+    try:
+        fp32_provider = CrossEncoderProvider(model_id=fp32_model_id, cache_dir=cache_dir)
+        fp16_provider = CrossEncoderProvider(model_id=fp16_model_id, cache_dir=cache_dir)
+    except Exception:  # noqa: BLE001 — fail-soft: fp16 (or even fp32) construction failure must not break recall
+        log.exception("reranker fp16/fp32 gate: failed to construct a provider -> shipping fp32")
+        if fp32_provider is not None:
+            # fp32 built fine and only the fp16 construction failed below it;
+            # stash the already-built fp32 provider so build_reranker_provider()
+            # reuses it instead of paying for a redundant ONNX load.
+            _cache_provider(fp32_model_id, fp32_provider)
+        return fp32_model_id
+
+    try:
+        floor = calibrated_floor["floor"]
+        for query, doc in _FP16_GATE_PAIRS:
+            (fp32_score,) = fp32_provider.rerank(query, [doc])
+            (fp16_score,) = fp16_provider.rerank(query, [doc])
+            if (fp32_score >= floor) != (fp16_score >= floor):
+                log.info(
+                    "reranker fp16/fp32 gate: surface/abstain decision disagreement "
+                    "(fp32=%.4f fp16=%.4f floor=%.4f) on pair %r -> shipping fp32",
+                    fp32_score,
+                    fp16_score,
+                    floor,
+                    (query, doc),
+                )
+                _cache_provider(fp32_model_id, fp32_provider)
+                return fp32_model_id
+
+        # Agreement holds on every bundled pair. Before preferring fp16,
+        # confirm it is genuinely FASTER on THIS box (rationale iii, §2's
+        # FORK 2 resolution) — a no-AVX2 potato CPU may not accelerate fp16,
+        # and shipping it anyway would be a pure downside (same accuracy
+        # bar, no latency win). Reuses the SAME warm per-doc measurement the
+        # auto-scaling width calculation uses above, sampled against the
+        # bundled pairs' own documents (already-loaded content, no extra
+        # network).
+        sample_docs = [doc for _, doc in _FP16_GATE_PAIRS]
+        fp32_per_doc = _measure_warm_per_doc_latency(fp32_provider, sample_docs)
+        fp16_per_doc = _measure_warm_per_doc_latency(fp16_provider, sample_docs)
+
+        if fp16_per_doc < fp32_per_doc:
+            log.info(
+                "reranker fp16/fp32 gate: fp16 agrees with fp32 on every bundled decision and "
+                "measured faster on this host (%.4fs vs %.4fs/doc) -> shipping fp16",
+                fp16_per_doc,
+                fp32_per_doc,
+            )
+            _cache_provider(fp16_model_id, fp16_provider)
+            return fp16_model_id
+
+        log.info(
+            "reranker fp16/fp32 gate: decisions agree but fp16 was not faster on this host "
+            "(%.4fs vs %.4fs/doc) -> shipping fp32",
+            fp16_per_doc,
+            fp32_per_doc,
+        )
+        _cache_provider(fp32_model_id, fp32_provider)
+        return fp32_model_id
+    except Exception:  # noqa: BLE001 — fail-soft: any self-check failure must not break recall
+        log.exception("reranker fp16/fp32 gate: self-check failed -> shipping fp32")
+        return fp32_model_id
+
+
+def _choose_reranker_model_id(
+    fp32_model_id: str, fp16_model_id: str, cache_dir: str | Path, *, store: MemoryStore | None = None
+) -> str:
+    """Cached entry point for the fp16-vs-fp32 self-check: a cache HIT
+    returns instantly (`store` is never touched — the whole point of the
+    cache is to avoid a store round-trip on every recall); a cache MISS
+    runs `_run_precision_selfcheck` (real, potentially slow — first-use
+    ONNX loads of BOTH exports plus scoring — which is why it runs OUTSIDE
+    the lock, mirroring `_warm_per_doc_latency`'s identical reasoning: a
+    concurrent caller must not block behind this one-time cost) and caches
+    the result keyed by the `(fp32_model_id, fp16_model_id)` pair so either
+    model changing invalidates it. A rare race where two callers both miss
+    and both run the self-check pays the one-time cost twice in the worst
+    case, never more — `setdefault` on write means whichever finishes first
+    is the decision every later caller (and the other racer) actually gets.
+
+    `store`: F2a inc8 — passed through to `_run_precision_selfcheck` so it
+    can read the calibrated floor; see `build_reranker_provider`'s
+    docstring for the full rationale.
+    """
+    cache_key = (fp32_model_id, fp16_model_id)
+    with _precision_decision_cache_lock:
+        cached = _precision_decision_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    decision = _run_precision_selfcheck(fp32_model_id, fp16_model_id, cache_dir, store=store)
+
+    with _precision_decision_cache_lock:
+        _precision_decision_cache.setdefault(cache_key, decision)
+        return _precision_decision_cache[cache_key]
+
+
+def _reset_precision_decision_cache() -> None:
+    """Test-only: clear the cached fp16-vs-fp32 decision."""
+    with _precision_decision_cache_lock:
+        _precision_decision_cache.clear()
+
+
+def reset_precision_decision_for_floor_change() -> None:
+    """PRODUCTION entry point (F2a inc7, #250 §7): call once, immediately
+    after the daily calibration tick (re-)derives and WRITES a new floor
+    (`floor_calibration.derive_and_persist_floor` returning an ACCEPTED
+    outcome) — from `brain.bridge.supervisor._run_calibration_tick`.
+
+    Clears BOTH the cached fp16-vs-fp32 precision decision
+    (`_precision_decision_cache`) AND the process-wide reranker provider
+    cache (`_provider_cache`). Clearing the decision cache alone is not
+    enough to GUARANTEE a genuine rebuild: `_run_precision_selfcheck`
+    caches its winning provider via `_cache_provider`'s `setdefault`, which
+    silently keeps whatever provider ALREADY sits under that model_id's key
+    — so if today's re-run's winning model_id was ALSO the winner at some
+    EARLIER point in this process's life (e.g. day-0's vacuous agreement
+    picked fp16, a later floor picks fp32, and a LATER-STILL floor picks
+    fp16 again), `build_reranker_provider()` would silently hand back the
+    STALE day-0 provider instance instead of the one the just-rerun
+    self-check actually built — same model_id, so functionally identical
+    for a real ONNX model, but not what "re-run the self-check" is supposed
+    to guarantee, and not something to rely on staying harmless. Clearing
+    `_provider_cache` too forces a genuine fresh construction for whichever
+    model_id wins this re-run, no matter its history.
+
+    Reuses the existing test-only reset hooks (`_reset_precision_decision_
+    cache` / `_reset_reranker_provider_cache`) rather than duplicating their
+    logic — those stay test-only in their own right (conftest.py's autouse
+    fixture calls them directly around every test); this function is the
+    one PRODUCTION call site, bounded to fire at most once per daily
+    calibration tick (I6), never on the per-turn hot path. Do NOT call this
+    from anywhere that keys off the floor FLOAT value itself (e.g. on every
+    EMA-smoothed update) — only on an ACCEPTED floor WRITE — or EMA drift
+    would force a costly re-run (a second real ONNX load of both exports)
+    on most days, defeating §2's one-time-cost design (spec Section 7's own
+    implementation constraint).
+    """
+    _reset_precision_decision_cache()
+    _reset_reranker_provider_cache()

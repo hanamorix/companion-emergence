@@ -5,8 +5,9 @@ that composes with the existing `mode` (semantic/lexical) toggle.
 purely additive, no change when unused. `order="age"` WIDENS the internal
 fetch to `CANDIDATE_POOL` for BOTH modes (lexical: `rank_memories(...,
 limit=CANDIDATE_POOL)`; semantic: reranks up to `CANDIDATE_POOL`
-floor-clearing candidates in `_semantic_top_k` — #231's `RERANK_FLOOR` gate
-still applies, "age" only widens the FETCH, it never skips the floor),
+floor-clearing candidates in `_semantic_top_k` — #231's calibrated
+reranker-floor gate still applies, "age" only widens the FETCH, it never
+skips the floor),
 then sorts that wider matched set by `created_at` DESC, then slices to the
 caller's real `limit` — proving a naive re-sort of an already-`limit`-capped
 set would have missed the whole point: an "age" ordering must be able to
@@ -29,11 +30,16 @@ import pytest
 from brain.bridge import model_tier
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
 
 _SCRIPTED_MODEL_ID = "scripted-test"
+# F2a inc8 cutover: no more module-level `RERANK_FLOOR` — `_semantic_top_k`
+# reads the floor live from `store.get_reranker_floor`. This suite seeds it
+# directly via `_seed_floor`; the numeric value has no production
+# significance (an arbitrary reference point for test data).
+_TEST_FLOOR = -9.25
+_FAKE_RERANKER_MODEL_ID = "fake-reranker"
 # Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
 # EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
 # (each row decodes to its own stored byte-length) — a 2-dim test vector
@@ -144,14 +150,25 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     cosine) for BOTH `order` values — `order="age"` widens the internal
     fetch, it does not skip the floor gate. conftest.py's autouse fixture
     already forces `build_reranker_provider` to a scoreless
-    `FakeRerankerProvider` (every unscripted document defaults far below
-    `RERANK_FLOOR`), so a test that wants a CONCLUSIVE semantic result must
-    script the specific memory contents it expects to clear the floor."""
+    `FakeRerankerProvider` (every unscripted document defaults far below the
+    calibrated floor), so a test that wants a CONCLUSIVE semantic result
+    must script the specific memory contents it expects to clear the
+    floor."""
     from brain.memory.reranker import FakeRerankerProvider
 
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scores),
+    )
+
+
+def _seed_floor(
+    store: MemoryStore, floor: float = _TEST_FLOOR, *, model_id: str = _FAKE_RERANKER_MODEL_ID
+) -> None:
+    """F2a inc8: write a calibrated floor row directly so `_semantic_top_k`
+    has something to read via `store.get_reranker_floor`."""
+    store.write_reranker_floor(
+        model_id, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
     )
 
 
@@ -238,7 +255,7 @@ def test_order_age_lexical_still_matches_by_mode_first(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # order="age" widens the fetch + age-sorts — SEMANTIC mode (top-K reranked,
-# RERANK_FLOOR still gates which candidates count as matches).
+# the calibrated reranker floor still gates which candidates count as matches).
 # ---------------------------------------------------------------------------
 
 
@@ -266,13 +283,14 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
         contents_by_id={strong_old.id: strong_old_text, weak_recent.id: weak_recent_text},
     )
     _patch_provider(monkeypatch, vectors, dim=dim)
-    # Both clear RERANK_FLOOR (order="age" widens the fetch, it does not
-    # skip the floor gate — see _patch_reranker's docstring) — scored to
-    # preserve the cosine-era relative strength (0.95 vs 0.4) this test's
-    # docstring describes.
+    _seed_floor(ctx["store"])
+    # Both clear the calibrated floor (order="age" widens the fetch, it
+    # does not skip the floor gate — see _patch_reranker's docstring) —
+    # scored to preserve the cosine-era relative strength (0.95 vs 0.4)
+    # this test's docstring describes.
     _patch_reranker(
         monkeypatch,
-        scores={strong_old_text: RERANK_FLOOR + 5.0, weak_recent_text: RERANK_FLOOR + 1.0},
+        scores={strong_old_text: _TEST_FLOOR + 5.0, weak_recent_text: _TEST_FLOOR + 1.0},
     )
 
     # Default relevance, limit=1: the higher-cosine memory wins.
@@ -280,8 +298,8 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
     assert relevance_res["mode"] == "semantic"
     assert [m["id"] for m in relevance_res["memories"]] == [strong_old.id]
 
-    # order="age", limit=1: both scripted scores clear RERANK_FLOOR, so both
-    # are still top-CANDIDATE_POOL reranked matches, and widening surfaces
+    # order="age", limit=1: both scripted scores clear the calibrated floor,
+    # so both are still top-CANDIDATE_POOL reranked matches, and widening surfaces
     # the weaker one too — sorted by created_at DESC, the recent-but-weaker
     # match now wins the limit=1 slice.
     age_res = dispatch("search_memories", {"query": query, "mode": "semantic", "limit": 1, "order": "age"}, **ctx)

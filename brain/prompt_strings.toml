@@ -440,6 +440,13 @@ reappraiser_prompt = '''You judge how important a kindled's memory is, on a 0-10
 # _make_haiku_classifier's local prompt. Plain (no interpolation).
 classifier_prompt = '''You consolidate a companion's auto-generated memory candidates. Given a CANDIDATE and EXISTING related memories, reply with ONE JSON object: {"verdict": one of ["duplicate","merge","distinct","correction","continuation","new"], "target_id": <existing id or null>, "merged_content": <string or null>}. duplicate=already fully captured; merge=near-duplicate adding info (give target_id + a minimal surgical merged_content); correction/continuation=keep as its own memory linked to target_id; distinct/new=keep fresh. Reply with JSON only.'''
 
+[memory.relevance_judge]
+# _make_haiku_tiebreak's local prompt (F2a #250 inc6, spec Section 6). Not
+# persona-facing (internal calibration tooling, never shown to a companion
+# or a user) but externalized here anyway, matching every other Haiku
+# call-site's convention. Plain (no interpolation).
+haiku_tiebreak_prompt = '''You judge whether a CANDIDATE memory is relevant to a QUERY, for calibrating a memory-retrieval system. Reply with ONE JSON object: {"label": one of ["relevant","irrelevant"]}. relevant=the candidate would usefully answer or relate to the query; irrelevant=it would not. Reply with JSON only.'''
+
 [engines.heartbeat]
 # _try_fire_dream's local persona_system_prompt segments, in order,
 # reassembled around 1 var: self.persona_name -- seg[0] + persona_name + seg[1].
