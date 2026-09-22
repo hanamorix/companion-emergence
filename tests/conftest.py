@@ -204,6 +204,28 @@ def _fake_reranker_provider_by_default(
     directly, mirroring how `_ScriptedProvider` overrides the embedding
     fixture above for the same reason.
 
+    F2b (#276 §2/§4): every rerank() call now also scores the fixed
+    `reranker.ANCHOR_POOL` documents alongside the real candidates (once
+    `width` is wide enough to reserve `k >= K_MIN` anchors — see
+    `normalize_against_anchors`), and the floor gate compares the
+    NORMALIZED score (`raw - median(anchor_scores)`), not the raw one. If
+    the DEFAULT fake left `ANCHOR_POOL` unscripted too, it would collide
+    with the SAME `_DEFAULT_UNSCORED` sentinel every other unscripted
+    document already falls back to — collapsing `median(anchor_scores)` to
+    exactly that sentinel, and so `normalized = _DEFAULT_UNSCORED -
+    _DEFAULT_UNSCORED == 0.0` for EVERY unscripted real candidate, silently
+    breaking the "unscripted -> far below floor" invariant the paragraph
+    above promises (0.0 sits comfortably ABOVE a near-zero floor, not "far
+    below" it). Explicitly scripting the anchors to a fixed neutral value
+    (0.0) — while leaving every OTHER unscripted document at
+    `_DEFAULT_UNSCORED` via `default=` — restores the invariant exactly:
+    an unscripted real candidate normalizes to `_DEFAULT_UNSCORED - 0.0 ==
+    _DEFAULT_UNSCORED`, unchanged from pre-F2b, comfortably below any
+    plausible floor again. A test that scripts its OWN reranker scores
+    (the common case, via its own `FakeRerankerProvider(scores={...})`)
+    is unaffected — this only shapes the SUITE-WIDE DEFAULT a test gets
+    when it never overrides `build_reranker_provider` at all.
+
     Also patches `reranker._bootstrap_reranker_provider` (F2a inc8, #250 §7
     UPDATED — the bootstrap-floor ruling) the same way: that function is the
     OTHER production entry point that constructs a real `CrossEncoderProvider`
@@ -244,8 +266,17 @@ def _fake_reranker_provider_by_default(
     # identical dynamic lookup on `embeddings.build_embedding_provider` — so
     # patching this ONE module attribute is sufficient to intercept every
     # call site.
+    # F2b (#276 §2/§4): script ANCHOR_POOL to a fixed neutral value (0.0) so
+    # the default fake's anchor median never collapses onto the SAME
+    # `_DEFAULT_UNSCORED` sentinel an unscripted real candidate also falls
+    # back to — see this fixture's own docstring for why that collision
+    # would otherwise zero out the normalization offset for every test that
+    # never scripts its own reranker.
+    default_anchor_scores = dict.fromkeys(reranker.ANCHOR_POOL, 0.0)
     monkeypatch.setattr(
-        reranker, "build_reranker_provider", lambda *, store=None: reranker.FakeRerankerProvider()
+        reranker,
+        "build_reranker_provider",
+        lambda *, store=None: reranker.FakeRerankerProvider(scores=default_anchor_scores),
     )
     default_bootstrap_scores = {
         doc: (5.0 if i < 3 else -5.0) for i, (_query, doc) in enumerate(reranker._FP16_GATE_PAIRS[:6])

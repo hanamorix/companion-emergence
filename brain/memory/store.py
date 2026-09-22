@@ -49,6 +49,16 @@ CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
     "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT
 )
 
+# F2b (#276 §5): the score scale every `calibration_log` row `log_
+# calibration_sample` writes FROM HERE ON is stamped with — a single named
+# constant (never a bare string literal at either the write site or the
+# fit-sample filter site) so the two stay in lockstep by construction. Once
+# F2b ships, `reranker_scores` is always the per-query anchor-normalized
+# value (`brain.memory.reranker.normalize_against_anchors`), never the raw
+# cross-encoder score — see the `calibration_log` schema comment above for
+# why the two scales must never be mixed into one floor fit.
+CALIBRATION_SCORE_SCALE = "normalized"
+
 
 def _coerce_utc(ts: str) -> datetime:
     """Parse ISO-8601 timestamp; coerce tz-naive values to UTC.
@@ -291,6 +301,21 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- this table stays bounded to a rolling `day_bucket` window instead of
 -- growing unbounded — see CALIBRATION_LOG_RETENTION_WINDOW_DAYS above for
 -- the window's FINALIZED (inc7) value and derivation.
+-- `score_scale` (F2b, #276 §5): marks whether `reranker_scores` on this row
+-- is on the PRE-F2b raw reranker-score scale or the POST-F2b per-query
+-- anchor-normalized scale (`brain.memory.reranker.normalize_against_
+-- anchors`) — the two are not comparable (a constant per-query offset
+-- separates them) and must never be mixed into one floor fit. DEFAULT
+-- 'raw' so every row written before this column existed (and every legacy
+-- row picked up by the migration below) reads as raw without a backfill;
+-- `log_calibration_sample` (F2b) always stamps the CURRENT scale
+-- (`CALIBRATION_SCORE_SCALE` = 'normalized') explicitly on every row it
+-- writes from here on, never relying on the column default. Read by
+-- `labeled_calibration_pairs`'s fit-sample filter (F2b §5) so a post-deploy
+-- floor fit draws only from normalized-scale rows. This same marker is a
+-- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
+-- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
+-- deploy-detection signal, though wiring that trigger is out of scope here.
 CREATE TABLE IF NOT EXISTS calibration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -300,7 +325,8 @@ CREATE TABLE IF NOT EXISTS calibration_log (
     reranker_scores TEXT NOT NULL,
     reranker_model_id TEXT NOT NULL,
     local_judge_label TEXT,
-    haiku_label TEXT
+    haiku_label TEXT,
+    score_scale TEXT NOT NULL DEFAULT 'raw'
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
 
@@ -328,13 +354,29 @@ CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day
 -- None in that case (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — never
 -- written to this table; the first accepted daily-tick write always
 -- supersedes it.
+-- `score_scale` (F2b, #276 §6): mirrors `calibration_log.score_scale`
+-- (same rationale, same DEFAULT 'raw' — see that column's comment above)
+-- but marks the SCALE OF THE PERSISTED FLOOR ITSELF rather than a logged
+-- score row. A pre-F2b row (written before this column existed) reads as
+-- 'raw' via the column default without a backfill; every write FROM HERE
+-- ON (`MemoryStore.write_reranker_floor`, called only by
+-- `floor_calibration.derive_and_persist_floor`) stamps the CURRENT scale
+-- (`CALIBRATION_SCORE_SCALE` = 'normalized', post-§5b true for BOTH the
+-- real-fit and cold-start branches) explicitly, never relying on the
+-- default. Read by `MemoryStore.reranker_floor_is_stale` — the deploy-time
+-- one-time-recalibration trigger (spec §6, #276 inc3,
+-- `brain.bridge.supervisor._run_deploy_recalibration_check`): an ABSENT
+-- row or a row still reading 'raw' means the persisted floor predates
+-- F2b's normalized-scale gate and needs one out-of-cycle recalibration
+-- pass, rather than waiting for the next scheduled daily tick.
 CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     reranker_model_id TEXT PRIMARY KEY,
     floor REAL NOT NULL,
     raw_fit_floor REAL NOT NULL,
     sample_pairs INTEGER NOT NULL,
     is_cold_start INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    score_scale TEXT NOT NULL DEFAULT 'raw'
 );
 
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
@@ -522,6 +564,38 @@ class MemoryStore:
             self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
         if "cluster_model_id" not in existing:
             self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_model_id TEXT")
+        # F2b (#276 §5): score_scale migration for a `calibration_log` table
+        # that pre-dates this column (I9 — legacy DBs keep working; never
+        # drop/rewrite). Same idempotent existing-columns-check pattern as
+        # the `memories` migrations above, scoped to `calibration_log`.
+        # DEFAULT 'raw' matches the CREATE TABLE default: every row that
+        # existed before this migration ran was logged on the pre-F2b raw
+        # scale, so backfilling them as 'raw' (rather than leaving them
+        # NULL) is the honest label, not a guess.
+        existing_calibration_log = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(calibration_log)").fetchall()
+        }
+        if "score_scale" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN score_scale TEXT NOT NULL DEFAULT 'raw'"
+            )
+        # F2b (#276 §6): same migration shape, scoped to
+        # `reranker_floor_calibration` — a legacy DB's persisted floor row
+        # predates the scale marker and must read as 'raw' (never a guess)
+        # so `reranker_floor_is_stale` correctly flags it for the deploy-time
+        # one-time recalibration (§6) rather than silently trusting a
+        # raw-scale floor under the normalized gate.
+        existing_floor_calibration = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(reranker_floor_calibration)"
+            ).fetchall()
+        }
+        if "score_scale" not in existing_floor_calibration:
+            self._conn.execute(
+                "ALTER TABLE reranker_floor_calibration ADD COLUMN score_scale "
+                "TEXT NOT NULL DEFAULT 'raw'"
+            )
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
@@ -885,6 +959,15 @@ class MemoryStore:
         `reranker_model_id` is stamped per row so a later floor-derivation
         pass can filter to one reranker's score scale.
 
+        F2b (#276 §5): `reranker_scores` must be the caller's already-
+        NORMALIZED per-query anchor-corrected value (`brain.memory.
+        reranker.normalize_against_anchors`'s output), not the raw
+        cross-encoder score — this method stamps every row it writes with
+        `score_scale = CALIBRATION_SCORE_SCALE` ('normalized') accordingly.
+        This method does no normalization itself; it trusts the caller the
+        same way it already trusts `candidate_ids`/`reranker_scores` to be
+        the already-computed per-turn output.
+
         ONE bounded INSERT — no embedding, no model call, off the hot path
         in every sense except this single cheap write (I6). Fail-soft is
         the CALLER's job (`semantic_recall.run_semantic_recall` wraps this
@@ -895,13 +978,14 @@ class MemoryStore:
         """
         self._conn.execute(
             "INSERT INTO calibration_log "
-            "(query, candidate_ids, reranker_scores, reranker_model_id) "
-            "VALUES (?, ?, ?, ?)",
+            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 query,
                 json.dumps(list(candidate_ids)),
                 json.dumps([float(s) for s in reranker_scores]),
                 reranker_model_id,
+                CALIBRATION_SCORE_SCALE,
             ),
         )
         self._conn.commit()
@@ -1043,14 +1127,25 @@ class MemoryStore:
         is a usable relevant/irrelevant ground-truth label for a threshold
         fit.
 
+        F2b (#276 §5): additionally filters to `score_scale =
+        CALIBRATION_SCORE_SCALE` ('normalized') — this is the floor-fit's
+        ONLY sampler (see `floor_calibration.py`), so this is the one place
+        the raw/normalized scale split actually matters. A pre-F2b row
+        logged on the raw scale is excluded outright, never mixed into a
+        fit trained against normalized-scale scores (mixing scales would
+        silently corrupt the derived floor — the two are not comparable, a
+        constant per-query offset separates them). The MAX-`day_bucket`
+        lookup below is scoped by this same score_scale filter, so a
+        raw-scale row can never be picked as "the most recent day" either.
+
         Read-only: does not bump `recall_count` and does not label or
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
         """
         max_day_row = self._conn.execute(
             "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
-            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL",
-            (reranker_model_id,),
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE),
         ).fetchone()
         most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
         if most_recent_day is None:
@@ -1058,8 +1153,8 @@ class MemoryStore:
         rows = self._conn.execute(
             "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
-            "AND day_bucket = ?",
-            (reranker_model_id, most_recent_day),
+            "AND score_scale = ? AND day_bucket = ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1091,7 +1186,7 @@ class MemoryStore:
         """
         row = self._conn.execute(
             "SELECT reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
-            "updated_at "
+            "updated_at, score_scale "
             "FROM reranker_floor_calibration WHERE reranker_model_id = ?",
             (reranker_model_id,),
         ).fetchone()
@@ -1104,6 +1199,7 @@ class MemoryStore:
             "sample_pairs": int(row["sample_pairs"]),
             "is_cold_start": bool(row["is_cold_start"]),
             "updated_at": row["updated_at"],
+            "score_scale": row["score_scale"],
         }
 
     def get_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
@@ -1150,6 +1246,43 @@ class MemoryStore:
 
         return get_bootstrap_floor(reranker_model_id)
 
+    def reranker_floor_is_stale(self, reranker_model_id: str) -> bool:
+        """True iff `reranker_model_id`'s PERSISTED `reranker_floor_
+        calibration` row is either ABSENT or still on the pre-F2b RAW score
+        scale (F2b #276 §6, inc3's deploy-time one-time-recalibration
+        trigger).
+
+        Reads the persisted row DIRECTLY (not through `get_reranker_floor`,
+        which serves a transient, never-persisted bootstrap floor on a miss
+        — that in-memory fallback is irrelevant here: this check exists
+        purely to decide whether the ON-DISK row needs one out-of-cycle
+        `floor_calibration.derive_and_persist_floor` pass, so an ABSENT row
+        must read as stale exactly like a present-but-'raw' one, not be
+        masked by the bootstrap's existence).
+
+        Called ONLY by the bridge-startup deploy-recalibration check
+        (`brain.bridge.supervisor._run_deploy_recalibration_check`) — never
+        by the per-recall floor gate itself, which always goes through
+        `get_reranker_floor` (persisted-or-bootstrap) unconditionally and
+        does not care about staleness on a per-turn basis.
+
+        A model_id that has never had ANY row written (fresh install, or a
+        newly-registered reranker model_id) reads as stale too — the
+        out-of-cycle pass then runs F2a's own cold-start path (now
+        normalized-scale per §5b), landing a scale-correct floor
+        immediately instead of waiting on the bootstrap's transient,
+        never-persisted default.
+
+        Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+            (reranker_model_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        return row["score_scale"] != CALIBRATION_SCORE_SCALE
+
     def write_reranker_floor(
         self,
         reranker_model_id: str,
@@ -1158,6 +1291,7 @@ class MemoryStore:
         raw_fit_floor: float,
         sample_pairs: int,
         is_cold_start: bool,
+        score_scale: str = CALIBRATION_SCORE_SCALE,
     ) -> None:
         """Upsert this cycle's derived floor for `reranker_model_id` (F2a
         #250 inc7, spec Section 7) — the ONLY write path into
@@ -1178,21 +1312,33 @@ class MemoryStore:
         branch) — a held/rejected cycle (`FloorDerivationOutcome.accepted
         is False`, Change 1's data-starvation backstop) must NOT call this,
         leaving the previously persisted row (or its absence) untouched.
+
+        `score_scale` (F2b #276 §6): defaults to the CURRENT scale
+        (`CALIBRATION_SCORE_SCALE` = 'normalized') — post-§5b, the only
+        remaining caller (`floor_calibration.derive_and_persist_floor`'s
+        real-fit branch; Change 1 removed its cold-start branch, which used
+        to be this method's other caller) always scores/fits on the
+        anchor-normalized scale, so it never needs to override this. The
+        parameter exists (rather than a bare hardcoded value in the SQL) so
+        a test can exercise a legacy 'raw' row without reaching around this
+        method's public contract.
         """
         self._conn.execute(
             "INSERT INTO reranker_floor_calibration "
-            "(reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "(reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at, score_scale) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?) "
             "ON CONFLICT(reranker_model_id) DO UPDATE SET "
             "floor = excluded.floor, raw_fit_floor = excluded.raw_fit_floor, "
             "sample_pairs = excluded.sample_pairs, is_cold_start = excluded.is_cold_start, "
-            "updated_at = excluded.updated_at",
+            "updated_at = excluded.updated_at, score_scale = excluded.score_scale",
             (
                 reranker_model_id,
                 float(floor),
                 float(raw_fit_floor),
                 int(sample_pairs),
                 int(is_cold_start),
+                str(score_scale),
             ),
         )
         self._conn.commit()

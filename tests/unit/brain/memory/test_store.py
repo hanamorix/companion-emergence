@@ -2303,6 +2303,7 @@ def test_fresh_store_has_calibration_log_table() -> None:
         "reranker_model_id",
         "local_judge_label",
         "haiku_label",
+        "score_scale",  # F2b (#276 §5): raw-vs-normalized score scale marker
     }
     store.close()
 
@@ -2315,6 +2316,59 @@ def test_calibration_log_table_creation_is_idempotent(tmp_path) -> None:
     store1.close()
     store2 = MemoryStore(db_path)  # must not raise
     store2.close()
+
+
+def test_existing_store_migrates_in_score_scale_column(tmp_path) -> None:
+    """F2b (#276 §5): simulate a pre-F2b persona — manually create the OLD
+    `calibration_log` schema (no `score_scale` column) with a pre-existing
+    row already in it, then open `MemoryStore`: the column must be added
+    without error, default to 'raw' for the pre-existing row (I9 — legacy
+    rows survive and read as the honest pre-F2b scale, never dropped/
+    rewritten), and new writes through `log_calibration_sample` must land
+    on the current ('normalized') scale from that point on."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE calibration_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        day_bucket TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
+        query TEXT NOT NULL,
+        candidate_ids TEXT NOT NULL,
+        reranker_scores TEXT NOT NULL,
+        reranker_model_id TEXT NOT NULL,
+        local_judge_label TEXT,
+        haiku_label TEXT
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO calibration_log (query, candidate_ids, reranker_scores, reranker_model_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("a pre-F2b logged query", json.dumps(["old-id"]), json.dumps([1.23]), "old-model"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)  # must not raise
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert "score_scale" in cols
+
+    legacy_row = store._conn.execute(
+        "SELECT query, score_scale FROM calibration_log WHERE query = ?",
+        ("a pre-F2b logged query",),
+    ).fetchone()
+    assert legacy_row is not None, "the pre-existing row must survive the migration"
+    assert legacy_row["score_scale"] == "raw", "a migrated-in legacy row must default to the raw scale"
+
+    store.log_calibration_sample(
+        query="a post-F2b query", candidate_ids=["new-id"], reranker_scores=[4.56],
+        reranker_model_id="new-model",
+    )
+    new_row = store._conn.execute(
+        "SELECT score_scale FROM calibration_log WHERE query = ?", ("a post-F2b query",)
+    ).fetchone()
+    assert new_row["score_scale"] == "normalized", "a fresh write must always stamp the current scale"
 
 
 def test_log_calibration_sample_writes_row(store: MemoryStore) -> None:
@@ -2357,6 +2411,18 @@ def test_log_calibration_sample_writes_multiple_rows_independently(store: Memory
     )
     rows = store._conn.execute("SELECT query FROM calibration_log ORDER BY id").fetchall()
     assert [r["query"] for r in rows] == ["first turn", "second turn"]
+
+
+def test_log_calibration_sample_stamps_current_score_scale(store: MemoryStore) -> None:
+    """F2b (#276 §5): every row `log_calibration_sample` writes is stamped
+    `score_scale = 'normalized'` (`CALIBRATION_SCORE_SCALE`) — the scores it
+    logs are always the caller's already-normalized per-query value from
+    here on, never the pre-F2b raw one."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    row = store._conn.execute("SELECT score_scale FROM calibration_log").fetchone()
+    assert row["score_scale"] == "normalized"
 
 
 # ---------------------------------------------------------------------------
@@ -2598,6 +2664,43 @@ def test_labeled_calibration_pairs_excludes_unlabeled_rows(store: MemoryStore) -
 
 def test_labeled_calibration_pairs_empty_when_nothing_logged(store: MemoryStore) -> None:
     assert store.labeled_calibration_pairs("never-logged-model") == []
+
+
+def test_labeled_calibration_pairs_excludes_stale_raw_scale_rows(store: MemoryStore) -> None:
+    """AC9 (F2b, #276 §5): a pre-F2b ('raw') row and a post-F2b
+    ('normalized') row for the SAME model_id, both labeled — the fit
+    sampler must return ONLY the normalized-scale row. Mixing a raw-scale
+    score into a fit trained against normalized-scale scores would silently
+    corrupt the derived floor (the two scales are not comparable), so this
+    must genuinely exclude the raw row, not merely happen not to include it
+    by coincidence of value."""
+    # Pre-F2b row: inserted directly on the raw scale (score_scale='raw'),
+    # mirroring how a migrated-in legacy row lands (see
+    # test_existing_store_migrates_in_score_scale_column above) — NOT via
+    # log_calibration_sample, which always stamps 'normalized' now.
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("a pre-F2b query", json.dumps(["raw-id"]), json.dumps([99.0]), "m", "raw"),
+    )
+    store._conn.commit()
+    # Post-F2b row: the normal, current-scale write path.
+    store.log_calibration_sample(
+        query="a post-F2b query", candidate_ids=["norm-id"], reranker_scores=[1.0],
+        reranker_model_id="m",
+    )
+    for row in store.sample_unlabeled_calibration_rows(limit=10):
+        store.write_calibration_labels(row["id"], ["relevant"], [None])
+    # The raw row's own local_judge_label write above (if it landed via
+    # sample_unlabeled_calibration_rows) is irrelevant to this assertion —
+    # what matters is that ONLY the normalized-scale pair ever reaches the
+    # fit sampler's output, regardless of label state on the raw row.
+    pairs = store.labeled_calibration_pairs("m")
+    assert pairs == [(1.0, "relevant")], (
+        "the raw-scale row's score (99.0) must never appear in the fit sample — "
+        f"got {pairs!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
