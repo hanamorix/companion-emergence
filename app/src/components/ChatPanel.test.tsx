@@ -53,7 +53,7 @@ vi.mock("../expressions", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession, closeSession, snapshotSession } from "../bridge";
+import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession, closeSession, snapshotSession, uploadImage } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -1035,5 +1035,227 @@ describe("ChatPanel — shared-file send path (P0 image-tool-route)", () => {
     const accept = fileInput.getAttribute("accept") ?? "";
     // At least one non-image type must be accepted (backed by the widened /upload).
     expect(accept).toMatch(/text\/plain|application\/pdf|\.txt|\.md/);
+  });
+});
+
+// ── File-send trio (#268 non-image, #269 tool cue, #270 multi-file) ─────────
+describe("ChatPanel — file-send trio (#268 / #269 / #270)", () => {
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const mockedUpload = uploadImage as unknown as ReturnType<typeof vi.fn>;
+  let createSpy: ReturnType<typeof vi.spyOn>;
+  let revokeSpy: ReturnType<typeof vi.spyOn>;
+  let urlCounter = 0;
+
+  // Sha per upload so multi-file sends are distinguishable and ordered.
+  const uploadByKind = async (_persona: string, file: File) => {
+    const sha = `sha-${file.name}`;
+    return file.type.startsWith("image/")
+      ? { kind: "image", sha, media_type: file.type, size_bytes: file.size }
+      : { kind: "file", sha, filename: file.name, size_bytes: file.size };
+  };
+
+  beforeEach(() => {
+    urlCounter = 0;
+    createSpy = vi
+      .spyOn(URL, "createObjectURL")
+      .mockImplementation(() => `blob:test-${++urlCounter}`);
+    revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedUpload.mockReset();
+    mockedUpload.mockImplementation(uploadByKind);
+  });
+
+  afterEach(() => {
+    cleanup();
+    createSpy.mockRestore();
+    revokeSpy.mockRestore();
+  });
+
+  function fileInputOf(container: HTMLElement): HTMLInputElement {
+    return container.querySelector('input[type="file"]') as HTMLInputElement;
+  }
+
+  async function stage(container: HTMLElement, files: File[]) {
+    await act(async () => {
+      fireEvent.change(fileInputOf(container), { target: { files } });
+    });
+  }
+
+  function sentOpts(callIndex = 0) {
+    const args = mockedStreamChat.mock.calls[callIndex] as [
+      string,
+      string,
+      string,
+      unknown,
+      { sharedFiles?: Array<{ kind: string; sha: string; filename?: string }> } | undefined,
+    ];
+    return { text: args[2], opts: args[4] };
+  }
+
+  it("AC1 — a text/plain file stages, shows its name, and ships as a kind=file ref", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    await stage(container, [new File(["hello"], "notes.txt", { type: "text/plain" })]);
+    expect(mockedUpload).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("notes.txt")).toBeInTheDocument();
+    // Non-image rows get the document glyph, not an <img>.
+    expect(screen.getByRole("img", { name: /file notes\.txt/i })).toBeInTheDocument();
+    expect(container.querySelector("img[alt='notes.txt']")).toBeNull();
+
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await waitFor(() => expect(sendBtn).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalled());
+    const { text, opts } = sentOpts();
+    expect(opts?.sharedFiles).toEqual([
+      { kind: "file", sha: "sha-notes.txt", media_type: undefined, filename: "notes.txt" },
+    ]);
+    expect(text).toBe("Please look at this file.");
+  });
+
+  it("AC2 — an unsupported type is refused and not uploaded; an extension-only .md is accepted", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    await stage(container, [new File(["zip"], "a.zip", { type: "application/zip" })]);
+    expect(mockedUpload).not.toHaveBeenCalled();
+    expect(screen.getByText(/Unsupported file type: application\/zip\./)).toBeInTheDocument();
+
+    await stage(container, [new File(["# md"], "README.md", { type: "" })]);
+    expect(mockedUpload).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("README.md")).toBeInTheDocument();
+  });
+
+  it("AC3 — multi-select stages every file, the paperclip stays enabled, the ninth is refused, send ships eight in order", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    const mk = (i: number) => new File([`f${i}`], `f${i}.txt`, { type: "text/plain" });
+    await stage(container, [mk(1), mk(2), mk(3)]);
+    expect(screen.getAllByRole("button", { name: /remove file/i })).toHaveLength(3);
+    const clip = screen.getByRole("button", { name: /send file/i });
+    expect(clip).toBeEnabled();
+
+    await stage(container, [mk(4)]);
+    expect(screen.getAllByRole("button", { name: /remove file/i })).toHaveLength(4);
+
+    await stage(container, [mk(5), mk(6), mk(7), mk(8), mk(9)]);
+    expect(screen.getAllByRole("button", { name: /remove file/i })).toHaveLength(8);
+    expect(screen.getByText("Up to 8 files per message.")).toBeInTheDocument();
+    expect(clip).toBeDisabled();
+
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await waitFor(() => expect(sendBtn).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalled());
+    const { text, opts } = sentOpts();
+    expect(opts?.sharedFiles?.map((f) => f.sha)).toEqual(
+      [1, 2, 3, 4, 5, 6, 7, 8].map((i) => `sha-f${i}.txt`),
+    );
+    expect(text).toBe("Here are a few files, have a look.");
+    // Staging cleared after send (the paperclip stays disabled only because
+    // the mocked stream never finishes; that is the streaming gate, not the cap).
+    expect(screen.queryAllByRole("button", { name: /remove file/i })).toHaveLength(0);
+  });
+
+  it("AC4 — removing the second of three rows keeps the other two and revokes only that URL", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    await stage(container, [
+      new File(["1"], "one.txt", { type: "text/plain" }),
+      new File(["2"], "two.txt", { type: "text/plain" }),
+      new File(["3"], "three.txt", { type: "text/plain" }),
+    ]);
+    const removes = screen.getAllByRole("button", { name: /remove file/i });
+    expect(removes).toHaveLength(3);
+    await act(async () => {
+      fireEvent.click(removes[1]);
+    });
+    expect(screen.queryByText("two.txt")).toBeNull();
+    expect(screen.getByText("one.txt")).toBeInTheDocument();
+    expect(screen.getByText("three.txt")).toBeInTheDocument();
+    expect(revokeSpy).toHaveBeenCalledTimes(1);
+    expect(revokeSpy).toHaveBeenCalledWith("blob:test-2");
+  });
+
+  it("AC4b — a drop stages every passing file in order and shows the first failure only", async () => {
+    const { container } = render(<ChatPanel persona="nell" />);
+    const big = new File([new Uint8Array(21 * 1024 * 1024)], "big.txt", { type: "text/plain" });
+    const panel = container.querySelector(".chat-panel") as HTMLElement;
+    await act(async () => {
+      fireEvent.drop(panel, {
+        dataTransfer: {
+          files: [
+            new File(["ok"], "ok.txt", { type: "text/plain" }),
+            new File(["zip"], "a.zip", { type: "application/zip" }),
+            big,
+          ],
+          items: [],
+          types: ["Files"],
+        },
+      });
+    });
+    expect(screen.getAllByRole("button", { name: /remove file/i })).toHaveLength(1);
+    expect(screen.getByText("ok.txt")).toBeInTheDocument();
+    expect(screen.getByText("Unsupported file type: application/zip.")).toBeInTheDocument();
+    expect(screen.queryByText(/File too large/)).toBeNull();
+  });
+
+  it("AC5 — send is disabled while any row uploads; a failed row is never shipped", async () => {
+    let resolveSlow: (v: unknown) => void = () => undefined;
+    mockedUpload.mockImplementation(async (_p: string, file: File) => {
+      if (file.name === "slow.txt") {
+        await new Promise((r) => (resolveSlow = r));
+        return { kind: "file", sha: "sha-slow", filename: "slow.txt", size_bytes: 1 };
+      }
+      if (file.name === "bad.txt") throw new Error("upload exploded");
+      return uploadByKind(_p, file);
+    });
+    const { container } = render(<ChatPanel persona="nell" />);
+    await stage(container, [
+      new File(["a"], "fast.txt", { type: "text/plain" }),
+      new File(["b"], "slow.txt", { type: "text/plain" }),
+      new File(["c"], "bad.txt", { type: "text/plain" }),
+    ]);
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    await waitFor(() => expect(screen.getByText(/failed: upload exploded/)).toBeInTheDocument());
+    expect(sendBtn).toBeDisabled();
+    await act(async () => {
+      resolveSlow(undefined);
+    });
+    await waitFor(() => expect(sendBtn).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalled());
+    const { opts } = sentOpts();
+    expect(opts?.sharedFiles?.map((f) => f.sha)).toEqual(["sha-fast.txt", "sha-slow"]);
+  });
+
+  it("AC6 — default text: one image, one file, several files", async () => {
+    const run = async (files: File[]) => {
+      const { container, unmount } = render(<ChatPanel persona="nell" />);
+      await stage(container, files);
+      const sendBtn = screen.getByRole("button", { name: /^send$/i });
+      await waitFor(() => expect(sendBtn).toBeEnabled());
+      await act(async () => {
+        fireEvent.click(sendBtn);
+      });
+      await waitFor(() => expect(mockedStreamChat).toHaveBeenCalled());
+      const { text } = sentOpts(mockedStreamChat.mock.calls.length - 1);
+      unmount();
+      return text;
+    };
+    expect(await run([new File(["p"], "shot.png", { type: "image/png" })])).toBe(
+      "Please look at this image.",
+    );
+    expect(await run([new File(["t"], "notes.txt", { type: "text/plain" })])).toBe(
+      "Please look at this file.",
+    );
+    expect(
+      await run([
+        new File(["p"], "shot.png", { type: "image/png" }),
+        new File(["t"], "notes.txt", { type: "text/plain" }),
+      ]),
+    ).toBe("Here are a few files, have a look.");
   });
 });

@@ -623,7 +623,8 @@ SCHEMAS: dict[str, dict] = {
             "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see; a PDF returns "
             "its text, page-marked. When the user "
             "shares a file with you this turn, its path appears in their message as "
-            "'[the user shared a file: <path>]' — you can read that path to see or read what they "
+            '\'[the user shared a file "<filename>": <path>. Open it with your read_file tool to '
+            "see what it says.]' — you can read that path to see or read what they "
             "handed you. Otherwise, use this ONLY when the user explicitly asks you to read, open, or "
             "look at a specific file or path — never proactively. If something you read matters, you "
             "can choose to remember or reflect on it. "

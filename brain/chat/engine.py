@@ -152,7 +152,8 @@ def respond(
         Optional list of file references the user attached this turn, each a
         dict ``{kind: "image"|"file", sha: <64hex>, media_type?, filename?}``.
         Each is resolved to its on-disk path and surfaced to the model as a
-        ``[the user shared a file: <path>]`` line appended to the OUTGOING user
+        ``[the user shared a file "<name>": <path>. Open it with your read_file tool
+        to see what it says.]`` line appended to the OUTGOING user
         message (NOT fed into salience/volatile), and read_file is force-
         recruited so she can read/see it. Replaces the deleted image transport.
     reply_to_audit_id:
@@ -414,10 +415,12 @@ def _resolve_shared_file_lines(
             short = sha[:8] if isinstance(sha, str) and len(sha) >= 8 else sha
             logger.warning("skipping shared file sha=%s: %s", short, exc)
             continue
+        # #269: name the tool in the line itself; the model tends to forget it has read_file.
+        cue = "Open it with your read_file tool to see what it says."
         if filename:
-            lines.append(f'[the user shared a file "{filename}": {path}]')
+            lines.append(f'[the user shared a file "{filename}": {path}. {cue}]')
         else:
-            lines.append(f"[the user shared a file: {path}]")
+            lines.append(f"[the user shared a file: {path}. {cue}]")
     return lines
 
 
