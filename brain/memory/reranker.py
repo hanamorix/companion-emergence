@@ -55,11 +55,13 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -263,8 +265,9 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
     constructed per resolved model_id now, never both. `store` is kept as a
     keyword-only parameter purely for call-site compatibility with every
     existing production caller (`semantic_recall.run_semantic_recall`,
-    `search_memories._semantic_top_k`, `supervisor._run_calibration_tick`,
-    `floor_calibration.py`) — it is no longer read by this function at all.
+    `search_memories._semantic_top_k`, `supervisor._run_calibration_tick`/
+    `_run_deploy_recalibration_check`, `floor_calibration.py`) — it is no
+    longer read by this function at all.
 
     PROCESS-WIDE CACHING, same rationale as `embeddings.build_embedding_
     provider`: constructing a CrossEncoderProvider builds a real ONNX
@@ -594,8 +597,15 @@ def _measure_warm_per_doc_memory(
     call, cycling through `sample_docs` exactly like `_measure_warm_per_doc_
     latency`'s `_doc_for` helper — rather than one N-document batch call.
     This mirrors that function's per-doc isolation shape (reusing it, not
-    inventing a second one, per this change's own requirement), the same way
-    the existing latency measurement's single-document calls already do.
+    inventing a second one, per this change's own requirement) AND matters
+    structurally: a caller-facing invariant elsewhere in this codebase
+    (`test_f2b_anchor_wiring.py`'s "exactly one combined rerank() call"
+    checks) identifies the real+anchor call specifically by it being the
+    only MULTI-document `rerank()` call in a turn — a single N-document
+    batch call here would collide with that and be mistaken for a second
+    combined call. Keeping every calibration call length-1 avoids that
+    collision entirely, the same way the existing latency measurement's
+    single-document calls already do.
 
     `_WARMUP_RERANKS` warmup calls are run first and discarded before the
     measured sequence, matching `_measure_warm_per_doc_latency`'s
@@ -956,6 +966,299 @@ def get_rerank_width(
         bounds.append(math.floor(headroom / per_doc_memory))
 
     return max(1, min(bounds))
+
+
+# ---------------------------------------------------------------------------
+# Per-query anchor normalization (F2b, #276 — follow-on to #250/F2a).
+# ---------------------------------------------------------------------------
+#
+# A cross-encoder's raw score carries a PER-QUERY constant offset (listwise-
+# softmax translation invariance): one query's candidate scores can sit
+# systematically higher or lower than another's for reasons unrelated to
+# relevance, which makes ANY absolute floor (including F2a's daily-derived
+# one, #250 §7/§8) less trustworthy than it looks. This section fixes that
+# PER REQUEST, at rerank time: inject a small FIXED set of off-topic "anchor"
+# documents into the SAME rerank() call as the real candidates, and recenter
+# each real candidate's score against that call's own anchor-score median —
+# `normalized_score = raw_score - median(anchor_scores)`. Median (not mean)
+# so a single anomalous anchor score cannot swing the whole correction, the
+# same robust-statistics posture F2a's own design favors generally.
+#
+# `k = min(P, floor(width / 2))` — the anchor count `k` is HARDWARE-DERIVED
+# from `get_rerank_width`'s own output, never a hand-picked constant [OWNER
+# 2026-09-22 "that, is a magic number constant. No. Have it scale based on
+# the hardware capability like everything else"]. Anchors are RESERVED OUT
+# OF `width`, never appended on top of it, so the one combined rerank() call
+# scores exactly `real_width + k = width` documents — the same budget-
+# derived count `get_rerank_width` already enforces, never more (I6: zero
+# net latency added over today's one bounded per-turn rerank step).
+#
+# This section builds ONLY the isolated mechanism (helper + anchor pool).
+# Wiring it into `semantic_recall.py` / `search_memories.py`'s floor-gate
+# call sites, re-pointing F2a's calibration-log write at the normalized
+# score, and the deploy-time one-time recalibration are LATER increments
+# (spec §2/§5/§6) — see `~/.claude/plans/f2b-anchor-normalization-spec.md`.
+
+# The meaningful-median floor: below 2 anchor scores, "median" degenerates
+# (a single value, or an arbitrary pick between two with no robust middle)
+# and offers no protection against one anomalous anchor swinging the whole
+# correction — the same robust-statistics reasoning the median choice above
+# rests on. SIZES the anchor mechanism (I3-clean — same precedent class as
+# `CALIBRATION_SAMPLE_SIZE` above); it is NOT a relevance threshold — no
+# memory/candidate score is ever compared against `K_MIN`.
+K_MIN = 2
+
+# The split ratio (spec §3's natural "anchors keep AT MOST HALF the rerank
+# slots" rule): `k = min(P, width // ANCHOR_SPLIT_DIVISOR)`. A build-time
+# tunable ratio, not a relevance threshold — SIZES the mechanism, same
+# I3-clean class as `K_MIN`/`P`. Named (rather than an inline `2` in the
+# formula) so the split ratio is a single, greppable, documented knob if it
+# is ever retuned, per the Open-reconfirmations note that this ratio "may be
+# tuned".
+ANCHOR_SPLIT_DIVISOR = 2
+
+# Curated, FIXED, genuinely off-topic anchor documents (ledger-settled: Roy
+# adopted "old Option B", whose mechanism is a fixed off-topic anchor set —
+# a non-self-calibrating pool is ledger-settled, not a smuggled I3 constant,
+# per the spec's §4 I3 discussion). Eight short documents spanning eight
+# DIVERSE, non-overlapping mundane domains (consumer-goods warranty
+# legalese, shipping/logistics contract text, a hardware spec sheet, a
+# facilities-maintenance procedure, software release notes, a
+# building-management notice, weather-instrument telemetry, a library loan
+# policy) so no single real query plausibly lands close to more than one or
+# two of them. The reranker is multilingual (jina, F2a §1) and judges
+# semantic RELATEDNESS rather than language match, so off-topicness is
+# expected to transfer cross-lingually.
+#
+# ORDER IS MEANINGFUL, not incidental: `normalize_against_anchors` takes
+# `ANCHOR_POOL[:k]` — a PREFIX — so on a small/potato width (small `k`) only
+# the FRONT of this list participates, and a large `k` (fast host) is the
+# only case where the tail ever enters the median. The pool is therefore
+# ordered SAFEST-FIRST: the six clearly-inert bureaucratic/technical anchors
+# (warranty, shipping, printer, irrigation, spreadsheet release notes, HOA
+# parking) come first, so the least-robust k=2/k=3 calls (narrowest width,
+# median of the fewest anchors — most exposed to a single anomalous score)
+# draw only from them. The two entries below with faint topical overlap with
+# this project's own real query patterns are placed LAST, deliberately,
+# so they only enter the mix at large k (k=7/8, wide/fast-host calls) where
+# a median over many anchors absorbs one elevated score:
+#   - the weather-instrument entry: the project pervasively uses an
+#     "emotional weather" framing elsewhere (a `weather_shift` anchor
+#     detector, the emotion self-model's weather metaphors) that a
+#     weather-themed real query could resonate with, even though this entry
+#     itself is pure instrument telemetry, not conversational small talk;
+#   - the library loan-policy entry: the persona has an author/book life, so
+#     "book / loan period / renewals" carries faint topical overlap with
+#     real book/manuscript queries.
+# Do NOT read this ordering as arbitrary or reorder it without re-applying
+# this same safest-first placement.
+ANCHOR_POOL: list[str] = [
+    "This appliance's warranty covers manufacturing defects for twelve "
+    "months from the original purchase date and does not cover damage "
+    "caused by misuse or unauthorized repair.",
+    "Standard shipping terms require the buyer to inspect goods within "
+    "five business days of delivery and report any discrepancy in writing "
+    "to the carrier's claims department.",
+    "The printer supports A4, Letter, and Legal paper sizes with a "
+    "recommended margin of at least six millimeters on all sides to avoid "
+    "print clipping.",
+    "Quarterly maintenance of the irrigation valve assembly should include "
+    "flushing the filter screen and checking the solenoid wiring for "
+    "corrosion.",
+    "The spreadsheet application's release notes for this version list "
+    "improved handling of frozen panes and a fix for a rare crash when "
+    "pasting merged cells.",
+    "Residents are reminded that guest parking permits must be displayed "
+    "on the dashboard and are valid only between six in the evening and "
+    "eight in the morning on weekdays.",
+    "Yesterday's weather station reading recorded a barometric pressure of "
+    "1013 hectopascals with wind speeds averaging twelve kilometers per "
+    "hour from the northwest.",
+    "A public library's standard loan period for print books is three "
+    "weeks, with up to two renewals allowed unless another patron has "
+    "placed a hold.",
+]
+
+# The curated pool size CAPS `k` (`k = min(P, floor(width / 2))`) so a fast
+# host (large `width`) never reranks an excessive anchor block — a robust
+# median saturates well before 8 anchors, and 8 gives headroom across the
+# realistic width range (potato ~7 through CANDIDATE_POOL-bound hosts). SIZES
+# the mechanism, same I3-clean class as `K_MIN` above; DERIVED from
+# `ANCHOR_POOL`'s own length, never re-typed as a separate literal.
+P = len(ANCHOR_POOL)
+
+
+def _median_normalize(real_scores: list[float], anchor_scores: list[float]) -> list[float]:
+    """Shared median-normalization CORE (F2b §5b, #276 inc3): `real_score -
+    median(anchor_scores)` for each real score, sharing statistics.median's
+    robust-to-a-single-outlier-anchor property (see the module section
+    header above).
+
+    Used by BOTH normalization callers in this module: the per-recall gate
+    (`normalize_against_anchors`, below — scores a hardware-derived `k`-
+    subset of `ANCHOR_POOL`, latency-budget-limited) and the off-hot-path
+    bundled-pair normalization (`normalize_bundled_pairs_against_anchors`,
+    below — scores the FULL curated pool `P`, off the hot path, no latency
+    budget). One shared arithmetic core; each caller only differs in HOW
+    MANY anchors it scores and WHY (spec §5b: "the FULL pool P, NOT the
+    per-recall k" for the floor-derivation sources — the gate stays
+    `k`-limited for latency, §3)."""
+    offset = statistics.median(anchor_scores)
+    return [s - offset for s in real_scores]
+
+
+def normalize_bundled_pairs_against_anchors(
+    provider: RerankerProvider,
+    pairs: list[tuple[str, str]],
+) -> list[float]:
+    """Per-bundled-pair anchor-median normalization (F2b §5b, #276 inc3) —
+    used by `floor_calibration.py`'s cold-start (`_cold_start_pairs`, feeding
+    both `derive_and_persist_floor`'s cold-start branch and
+    `get_bootstrap_floor`), so EVERY floor-derivation source F2a computes
+    lands on the SAME normalized scale the per-recall gate compares against
+    (`normalize_against_anchors`).
+
+    Unlike `normalize_against_anchors` (the per-RECALL gate path, latency-
+    budget-limited to a hardware-derived `k`-subset of `ANCHOR_POOL`), this
+    scores each bundled `(query, doc)` pair against the FULL curated anchor
+    pool (`ANCHOR_POOL`, all `P` of them) — off the hot path (build-time /
+    first-load-cached for the bootstrap, or the daily idle tick for
+    cold-start) there is no latency budget to reserve slots out of, so the
+    full pool gives the most stable median for these single-scalar-floor
+    derivations (spec §5b: "the FULL pool P, NOT the per-recall k" — the two
+    are deliberately different anchor-COUNT policies sharing the same
+    `_median_normalize` arithmetic core above).
+
+    One combined `rerank(query, [doc] + ANCHOR_POOL)` call PER PAIR (a
+    different query each time, so pairs cannot be batched into one call) —
+    `len(ANCHOR_POOL) + 1` documents scored per pair. Cheap and bounded: this
+    only ever runs at build-time/first-load (bootstrap) or in the daily idle
+    tick (cold-start) — never per recall (I6).
+
+    Returns one normalized score per pair, positionally aligned with
+    `pairs`. Anchor documents/scores are used ONLY to compute each pair's
+    median offset and are never returned.
+    """
+    normalized: list[float] = []
+    for query, doc in pairs:
+        raw_scores = list(provider.rerank(query, [doc, *ANCHOR_POOL]))
+        real_score, anchor_scores = raw_scores[0], raw_scores[1:]
+        normalized.append(_median_normalize([real_score], anchor_scores)[0])
+    return normalized
+
+
+@dataclass(frozen=True)
+class AnchorNormalizationResult:
+    """Result of `normalize_against_anchors` — everything a (later-increment)
+    caller needs to map scores back onto real candidate ids.
+
+    `scores` — one float per ACTUALLY-SCORED real candidate, positionally
+    aligned with the FRONT of the caller's `real_documents` (i.e.
+    `real_documents[:real_width]` — see `real_width`). Median-normalized
+    (`raw - median(anchor_scores)`) when `did_normalize` is True; raw,
+    unmodified reranker scores when False (the no-op case — F2a-only
+    behaviour for that call).
+
+    `real_width` — how many of the caller's `real_documents` were actually
+    sent to the reranker (`== len(scores)`). Equals `width` when
+    `did_normalize` is False (no anchors reserved that call) and
+    `width - k` when True.
+
+    `did_normalize` — False on a near-degenerate `width` (`k < K_MIN`, i.e.
+    `width < 4` at today's `K_MIN`/split values): no anchors were appended,
+    `scores` are RAW. True whenever the median correction actually ran.
+    """
+
+    scores: list[float]
+    real_width: int
+    did_normalize: bool
+
+
+def normalize_against_anchors(
+    provider: RerankerProvider,
+    query: str,
+    real_documents: list[str],
+    width: int,
+) -> AnchorNormalizationResult:
+    """Per-query anchor-median normalization (F2b, #276) — see the module
+    section header above for the mechanism and the owner ruling that shaped
+    `k`'s derivation.
+
+    `real_documents` is the caller's coarse-ranked REAL candidate content,
+    already ordered best-first (the same list a caller would otherwise slice
+    to `width` and rerank directly) — this function does its OWN slicing
+    (`real_documents[:real_width]`), so callers should NOT pre-slice to
+    `width` themselves. `width` is exactly what `get_rerank_width(...)`
+    returned for this call.
+
+    Computes `k = min(P, width // ANCHOR_SPLIT_DIVISOR)` (anchors keep at
+    most half the rerank slots, capped at the curated pool size) and, when
+    `k >= K_MIN`, reserves
+    `k` anchors OUT OF `width` (never on top of it — `real_width = width -
+    k`), makes ONE combined `rerank(query, real_documents[:real_width] +
+    ANCHOR_POOL[:k])` call, splits the returned scores positionally back
+    into real vs. anchor, and returns `raw_real_scores - median(anchor_
+    scores)`. Computed FRESH on every call — unlike `_latency_cache` /
+    `_provider_cache` above (which memoize call-STABLE properties: warm
+    per-doc timing, a loaded model), the anchor offset is a per-QUERY
+    property, so caching it across calls would defeat the point of the
+    correction.
+
+    No-ops (raw scores, no anchors appended) when `k < K_MIN` — `width` too
+    small for a meaningful anchor median while still leaving a real
+    candidate slot; see `AnchorNormalizationResult.did_normalize`.
+
+    Total documents ever sent to `provider.rerank()` is exactly `width` in
+    both branches (`real_width + k` when normalizing, `real_width` alone —
+    `== width` — on no-op): never more than the budget-derived count
+    `get_rerank_width` already enforces (I6).
+
+    Anchor documents/scores are used ONLY to compute the median offset and
+    are NEVER returned — callers must not treat them as candidates.
+
+    Fail-soft guard: in the anchor-reserving branch (`k >= K_MIN`), the
+    invariant `len(real_documents) >= real_width` always holds for
+    correctly-wired callers (`real_documents` is the coarse-ranked pool
+    backing `width = min(pool_size, ...) <= pool_size <= len(real_documents)`,
+    and `real_width <= width`), but is not itself enforced here. A future
+    caller that violates it would otherwise misalign the positional
+    real/anchor split — `real_documents[:real_width]` silently returns fewer
+    than `real_width` documents, so the positional
+    `raw_scores[:real_width]` / `raw_scores[real_width:]` split spills
+    anchor-scored positions into `real_scores` and can leave `anchor_scores`
+    EMPTY, calling `statistics.median([])`, which raises `StatisticsError`
+    and crashes recall. This is hot-path-adjacent, so a violation degrades
+    gracefully instead of raising: it logs a warning (so the real bug stays
+    visible) and no-ops to RAW scores over whatever `real_documents` are
+    actually available (`did_normalize=False`), same shape as the `k <
+    K_MIN` no-op above.
+    """
+    k = min(P, width // ANCHOR_SPLIT_DIVISOR)
+    if k < K_MIN:
+        real_width = width
+        scores = list(provider.rerank(query, real_documents[:real_width]))
+        return AnchorNormalizationResult(scores=scores, real_width=real_width, did_normalize=False)
+
+    real_width = width - k
+    if len(real_documents) < real_width:
+        log.warning(
+            "normalize_against_anchors: invariant len(real_documents) >= "
+            "real_width violated (len(real_documents)=%d, real_width=%d, "
+            "width=%d) — degrading to raw scores over the available "
+            "real_documents, no anchors appended",
+            len(real_documents),
+            real_width,
+            width,
+        )
+        scores = list(provider.rerank(query, real_documents))
+        return AnchorNormalizationResult(scores=scores, real_width=len(real_documents), did_normalize=False)
+
+    combined = real_documents[:real_width] + ANCHOR_POOL[:k]
+    raw_scores = list(provider.rerank(query, combined))
+    real_scores = raw_scores[:real_width]
+    anchor_scores = raw_scores[real_width:]
+    normalized = _median_normalize(real_scores, anchor_scores)
+    return AnchorNormalizationResult(scores=normalized, real_width=real_width, did_normalize=True)
 
 
 # ---------------------------------------------------------------------------

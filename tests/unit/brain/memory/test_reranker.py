@@ -13,6 +13,7 @@ integration" — requires_network alone is not part of that expression).
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from unittest.mock import mock_open
 
@@ -21,7 +22,12 @@ import pytest
 import brain.memory.reranker as reranker_mod
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.reranker import (
+    ANCHOR_POOL,
+    ANCHOR_SPLIT_DIVISOR,
+    K_MIN,
+    AnchorNormalizationResult,
     FakeRerankerProvider,
+    P,
     RerankerProvider,
     _default_latency_budget_seconds,
     _detect_avx2,
@@ -30,6 +36,8 @@ from brain.memory.reranker import (
     _reset_reranker_provider_cache,
     build_reranker_provider,
     get_rerank_width,
+    normalize_against_anchors,
+    normalize_bundled_pairs_against_anchors,
 )
 
 # ---------------------------------------------------------------------------
@@ -962,7 +970,8 @@ def test_get_rerank_width_skips_memory_term_when_per_doc_memory_measurement_fail
 
 
 def test_ac5_get_rerank_width_introduces_no_new_numeric_literal() -> None:
-    """AC5 (mechanical, AST-based): `get_rerank_width`'s own body
+    """AC5 (mechanical, mirrors `test_ac11_normalize_against_anchors_has_no_
+    bare_numeric_literal`'s AST style below): `get_rerank_width`'s own body
     must contain no numeric literal beyond the two PRE-EXISTING, structural
     ones (`0` for the empty-pool guard, `1` for the `max(1, ...)` floor) and
     the `0.0` "no signal" sentinel comparison (already present pre-Change-3
@@ -1389,3 +1398,283 @@ def test_ac3_no_int8_quantization_code_path() -> None:
     assert "int8" not in inspect.getsource(model_tier_mod).lower(), (
         "no int8 quantization code path may exist in brain/bridge/model_tier.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# normalize_against_anchors — F2b (#276) per-query anchor-median
+# normalization. Isolated-mechanism build ONLY (no call-site wiring — that's
+# a later increment, see spec §2/§5/§6). All offline, FakeRerankerProvider +
+# a scripted `width`, never the live model.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingProvider(RerankerProvider):
+    """Wraps a FakeRerankerProvider and records the exact `documents` list
+    passed to each `rerank()` call — used to prove the ONE-combined-call
+    shape (AC1) and that no anchor content leaks outside that one call."""
+
+    def __init__(self, scores: dict[str, float], default: float = 0.0) -> None:
+        self._fake = FakeRerankerProvider(scores=scores, default=default)
+        self.calls: list[list[str]] = []
+
+    def rerank(self, query: str, documents: list[str]) -> list[float]:
+        self.calls.append(list(documents))
+        return self._fake.rerank(query, documents)
+
+    def model_id(self) -> str:
+        return "recording-fake"
+
+
+def _real_docs(n: int) -> list[str]:
+    """`n` distinct, deterministic placeholder real-candidate documents,
+    best-first order (matches the coarse-ranked-pool contract
+    `normalize_against_anchors` expects)."""
+    return [f"real-candidate-{i}" for i in range(n)]
+
+
+def test_k_min_and_p_are_named_module_constants() -> None:
+    """Sanity/I7 check: P is DERIVED from ANCHOR_POOL's own length (never a
+    re-typed literal), K_MIN is the named meaningful-median floor, and the
+    "anchors keep at most half" split ratio is its own named divisor."""
+    assert K_MIN == 2
+    assert P == len(ANCHOR_POOL) == 8
+    assert ANCHOR_SPLIT_DIVISOR == 2
+    assert reranker_mod.P == P, "module-level P must be the single source of truth"
+
+
+def test_normalize_against_anchors_returns_an_anchor_normalization_result() -> None:
+    real = _real_docs(4)
+    provider = _RecordingProvider({}, default=0.0)
+    result = normalize_against_anchors(provider, "q", real, width=4)
+    assert isinstance(result, AnchorNormalizationResult)
+
+
+# --- AC3: exact arithmetic + fresh-per-call (no caching) -------------------
+
+
+def test_ac3_normalized_score_equals_raw_minus_median_of_anchor_scores() -> None:
+    real = _real_docs(2)
+    anchors = ANCHOR_POOL[:2]  # k=2 == K_MIN at width=4
+    scores = {
+        real[0]: 5.0,
+        real[1]: 3.0,
+        anchors[0]: 10.0,
+        anchors[1]: 12.0,  # median(10.0, 12.0) == 11.0
+    }
+    provider = _RecordingProvider(scores)
+
+    result = normalize_against_anchors(provider, "some query", real, width=4)
+
+    assert result.did_normalize is True
+    assert result.real_width == 2
+    assert result.scores == [5.0 - 11.0, 3.0 - 11.0], "normalized_score must equal raw_score - median(anchor_scores)"
+
+
+def test_ac3_same_query_different_anchor_scores_yields_different_normalized_value() -> None:
+    """Proves the offset is computed FRESH on every call — never cached or
+    reused across calls, even for the identical query string."""
+    real = _real_docs(2)
+    anchors = ANCHOR_POOL[:2]
+
+    provider_a = _RecordingProvider({real[0]: 5.0, real[1]: 3.0, anchors[0]: 10.0, anchors[1]: 12.0})
+    result_a = normalize_against_anchors(provider_a, "identical query text", real, width=4)
+
+    provider_b = _RecordingProvider({real[0]: 5.0, real[1]: 3.0, anchors[0]: 1.0, anchors[1]: 3.0})
+    result_b = normalize_against_anchors(provider_b, "identical query text", real, width=4)
+
+    assert result_a.scores != result_b.scores, (
+        "the SAME query rerun with DIFFERENT scripted anchor scores must produce a "
+        "DIFFERENT normalized value — the offset must not be cached/reused across calls"
+    )
+    assert result_b.scores == [5.0 - 2.0, 3.0 - 2.0]  # median(1.0, 3.0) == 2.0
+
+
+# --- AC1 (isolated): one combined call, correct length/content -------------
+
+
+def test_ac1_one_combined_rerank_call_has_length_width_and_contains_anchor_content() -> None:
+    real = _real_docs(10)  # a generous coarse-ranked pool
+    width = 7  # potato-baseline case: k = min(8, 3) = 3, real_width = 4
+    provider = _RecordingProvider({}, default=0.0)
+
+    result = normalize_against_anchors(provider, "q", real, width=width)
+
+    assert len(provider.calls) == 1, "must be exactly ONE combined rerank() call, not two"
+    (sent_docs,) = provider.calls
+    assert len(sent_docs) == width == 7
+    assert result.real_width == 4
+    assert sent_docs[:4] == real[:4], "real candidates must occupy the FRONT of the combined list"
+    assert sent_docs[4:] == ANCHOR_POOL[:3], "the k=3 anchors must be the ANCHOR_POOL prefix, appended after reals"
+    assert set(ANCHOR_POOL[:3]).issubset(set(sent_docs))
+    assert not set(ANCHOR_POOL[3:]) & set(sent_docs), "only the k-sized anchor prefix may appear, never the rest"
+
+
+# --- AC7: near-degenerate width no-ops to raw, no anchors appended ---------
+
+
+@pytest.mark.parametrize("width", [1, 2, 3])
+def test_ac7_near_degenerate_width_noops_to_raw_scores(width: int) -> None:
+    real = _real_docs(5)
+    provider = _RecordingProvider({doc: float(i) for i, doc in enumerate(real)})
+
+    result = normalize_against_anchors(provider, "q", real, width=width)
+
+    assert result.did_normalize is False
+    assert result.real_width == width
+    (sent_docs,) = provider.calls
+    assert sent_docs == real[:width], "no-op call must be real-candidates-only"
+    assert not set(ANCHOR_POOL) & set(sent_docs), "no anchor content may appear in a no-op call"
+    assert result.scores == [float(i) for i in range(width)], "no-op scores must be RAW, unmodified"
+
+
+# --- Fail-soft guard: len(real_documents) < width must degrade, not crash --
+
+
+def test_guard_short_real_documents_degrades_to_raw_and_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A caller that violates the `len(real_documents) >= width` invariant
+    (always true for correctly-wired callers, but not itself enforced) must
+    degrade gracefully instead of crashing `statistics.median([])` with a
+    `StatisticsError`: raw scores over the available `real_documents`,
+    `did_normalize=False`, no anchors appended — and the violation must be
+    logged as a warning so the real bug stays visible in logs."""
+    real = _real_docs(2)  # fewer real documents than the requested width
+    provider = _RecordingProvider({real[0]: 5.0, real[1]: 3.0})
+
+    with caplog.at_level(logging.WARNING, logger=reranker_mod.__name__):
+        result = normalize_against_anchors(provider, "q", real, width=10)
+
+    assert result.did_normalize is False
+    assert result.real_width == 2
+    assert result.scores == [5.0, 3.0], "must be RAW scores over the available real_documents, unmodified"
+    (sent_docs,) = provider.calls
+    assert sent_docs == real, "no anchors may be appended when the invariant is violated"
+    assert not set(ANCHOR_POOL) & set(sent_docs), "no anchor content may leak into a guard-triggered call"
+    assert any("invariant" in record.message.lower() for record in caplog.records), (
+        "a len(real_documents) < width violation must log a warning naming the invariant"
+    )
+
+
+# --- AC6: hardware-derived k across the width range -------------------------
+
+
+@pytest.mark.parametrize(
+    "width",
+    [1, 3, 4, 7, 20, 50],  # degenerate, degenerate, k_min boundary, potato-mid, pool-cap, pool-cap-wide
+)
+def test_ac6_k_equals_min_pool_cap_and_floor_half_width(width: int) -> None:
+    """`formula_k = min(P, width // ANCHOR_SPLIT_DIVISOR)` is the DOCUMENTED
+    §3 formula (spec's own arithmetic, independent of
+    `normalize_against_anchors`'s internals); this test checks production
+    behavior AGAINST that formula, split into the two cases the formula
+    itself branches on: below `K_MIN` (no-op — zero anchors actually
+    reserved, regardless of what the pre-gate formula value was) and
+    at/above it (normalize — the formula value IS the reserved count)."""
+    real = _real_docs(width)
+    provider = _RecordingProvider({}, default=0.0)
+
+    result = normalize_against_anchors(provider, "q", real, width=width)
+
+    formula_k = min(P, width // ANCHOR_SPLIT_DIVISOR)
+    (sent_docs,) = provider.calls
+    assert len(sent_docs) == width, "total documents scored must equal exactly `width` in every case"
+    effective_k = len(sent_docs) - result.real_width
+
+    if formula_k < K_MIN:
+        assert result.did_normalize is False
+        assert result.real_width == width
+        assert effective_k == 0, "a no-op call must reserve zero anchors, whatever the pre-gate formula value was"
+    else:
+        assert result.did_normalize is True
+        assert result.real_width == width - formula_k
+        assert effective_k == formula_k
+
+    assert result.real_width >= 1
+    assert result.real_width >= effective_k, "real candidates must keep at least half the rerank slots"
+
+
+def test_ac6_k_grows_monotonically_with_width() -> None:
+    """`k` must be a monotonic non-decreasing function of `width` — a larger
+    scripted `width` must yield `k` at least as large, realizing 'scales
+    with hardware' rather than any fixed/pinned count."""
+    widths = [1, 2, 3, 4, 5, 6, 7, 10, 13, 16, 20, 30, 50]
+    ks: list[int] = []
+    for width in widths:
+        real = _real_docs(width)
+        provider = _RecordingProvider({}, default=0.0)
+        result = normalize_against_anchors(provider, "q", real, width=width)
+        (sent_docs,) = provider.calls
+        ks.append(len(sent_docs) - result.real_width)
+
+    assert ks == sorted(ks), f"k must be non-decreasing as width grows: widths={widths} ks={ks}"
+    assert ks[0] == 0, "smallest scripted width must no-op (k below K_MIN)"
+    assert ks[-1] == P, "a wide-enough width must saturate k at the curated pool size P"
+
+
+# --- AC11: no new bare numeric relevance threshold --------------------------
+
+
+def test_ac11_normalize_against_anchors_has_no_bare_numeric_literal() -> None:
+    """AC11 (mechanical, grep/lint-level, mirrors test_ac3_no_int8_
+    quantization_code_path's AST-over-inspect.getsource style above): the
+    mechanism function itself must contain NO numeric literal at all — `k`
+    is derived purely from the named `P` / `K_MIN` / `ANCHOR_SPLIT_DIVISOR`
+    module constants, never a re-typed/pinned number sneaking in as e.g. a
+    bare `2` for either the K_MIN comparison or the split divisor. Uses the
+    function's own AST (not a source-text regex) so this survives
+    reformatting."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(reranker_mod.normalize_against_anchors)
+    tree = ast.parse(source)
+    numeric_literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ]
+    assert numeric_literals == [], (
+        "normalize_against_anchors must contain no bare numeric literal anywhere in its "
+        f"body — k must be derived from P/K_MIN alone; found literal(s): {numeric_literals}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# normalize_bundled_pairs_against_anchors — F2b §5b (#276 inc3): the
+# off-hot-path bundled-pair normalization used by floor_calibration.py's
+# cold-start/bootstrap sources. Scores
+# the FULL curated anchor pool (never a `k`-subset) once per pair, since a
+# different query means the pairs cannot be batched into one rerank() call.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_bundled_pairs_against_anchors_scores_full_pool_one_call_per_pair() -> None:
+    pairs = [("query-a", "doc-a"), ("query-b", "doc-b")]
+    scores = {"doc-a": 5.0, "doc-b": -2.0, **dict.fromkeys(ANCHOR_POOL, 1.0)}
+    provider = _RecordingProvider(scores)
+
+    result = normalize_bundled_pairs_against_anchors(provider, pairs)
+
+    assert len(provider.calls) == 2, "one combined rerank() call PER pair — different query each time"
+    for sent_docs, (_query, doc) in zip(provider.calls, pairs, strict=True):
+        assert sent_docs[0] == doc, "the real doc occupies the FRONT of each combined call"
+        assert sent_docs[1:] == ANCHOR_POOL, (
+            "must score the FULL anchor pool (never a k-subset) — off the hot path, no latency budget"
+        )
+    assert result == [5.0 - 1.0, -2.0 - 1.0], "normalized_score = raw_score - median(anchor_scores)"
+
+
+def test_normalize_bundled_pairs_against_anchors_never_leaks_anchor_scores_into_the_result() -> None:
+    """Only ONE normalized score per pair is ever returned — the anchor
+    scores feed the median offset and nothing else."""
+    pairs = [("q", "the-real-doc")]
+    scores = {"the-real-doc": 10.0, **dict.fromkeys(ANCHOR_POOL, -1.0)}
+    provider = _RecordingProvider(scores)
+
+    result = normalize_bundled_pairs_against_anchors(provider, pairs)
+
+    assert len(result) == 1
+    assert result[0] == pytest.approx(10.0 - (-1.0))
