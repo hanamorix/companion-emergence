@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
-from brain.memory.store import _SCHEMA, Memory, MemoryStore
+from brain.memory.store import _SCHEMA, CALIBRATION_SCORE_SCALE, Memory, MemoryStore
 
 
 def test_memory_create_new_generates_uuid() -> None:
@@ -2816,6 +2816,7 @@ def test_fresh_store_has_reranker_floor_calibration_table() -> None:
     }
     assert cols == {
         "reranker_model_id", "floor", "raw_fit_floor", "sample_pairs", "is_cold_start", "updated_at",
+        "score_scale",  # F2b (#276 §6): raw-vs-normalized scale marker on the PERSISTED floor row
     }
     store.close()
 
@@ -2938,6 +2939,10 @@ def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:
         "sample_pairs": 250,
         "is_cold_start": False,
         "updated_at": row["updated_at"],  # not asserting an exact timestamp
+        # F2b (#276 §6): write_reranker_floor's default stamps the CURRENT
+        # scale — every production caller (derive_and_persist_floor, both
+        # branches, post-§5b) writes normalized-scale floors.
+        "score_scale": "normalized",
     }
 
 
@@ -2966,3 +2971,120 @@ def test_write_reranker_floor_is_scoped_per_model_id(store: MemoryStore) -> None
     store.write_reranker_floor("model-b", floor=2.0, raw_fit_floor=2.0, sample_pairs=1, is_cold_start=True)
     assert store.get_reranker_floor("model-a")["floor"] == 1.0
     assert store.get_reranker_floor("model-b")["floor"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# F2b (#276 §6, inc3): `reranker_floor_calibration.score_scale` + the
+# `reranker_floor_is_stale` staleness check the deploy-time one-time
+# recalibration trigger reads (`supervisor._run_deploy_recalibration_check`).
+# ---------------------------------------------------------------------------
+
+
+def test_write_reranker_floor_defaults_to_normalized_scale(store: MemoryStore) -> None:
+    """Every production write path (`derive_and_persist_floor`'s real-fit
+    and cold-start branches, both normalized post-§5b) relies on
+    `write_reranker_floor`'s default rather than passing `score_scale`
+    explicitly — confirm that default is the CURRENT scale constant, not a
+    bare string literal that could drift from `CALIBRATION_SCORE_SCALE`."""
+    store.write_reranker_floor(
+        "model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=1, is_cold_start=True
+    )
+    row = store._conn.execute(
+        "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("model-a",),
+    ).fetchone()
+    assert row["score_scale"] == CALIBRATION_SCORE_SCALE == "normalized"
+
+
+def test_write_reranker_floor_can_stamp_a_legacy_raw_scale(store: MemoryStore) -> None:
+    """`score_scale` is an overridable keyword (not hardcoded in the SQL) so
+    a test can seed a legacy pre-F2b row without reaching around the public
+    write path — exercised by the staleness tests below."""
+    store.write_reranker_floor(
+        "legacy-model", floor=-1.0, raw_fit_floor=-1.0, sample_pairs=6,
+        is_cold_start=True, score_scale="raw",
+    )
+    row = store._conn.execute(
+        "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("legacy-model",),
+    ).fetchone()
+    assert row["score_scale"] == "raw"
+
+
+def test_reranker_floor_is_stale_true_when_no_row_exists(store: MemoryStore) -> None:
+    """A model_id with NO persisted row (fresh install, or a never-
+    calibrated model) reads as stale — the deploy-recalibration check must
+    not be fooled by `get_reranker_floor`'s transient bootstrap fallback
+    into thinking a real floor already exists on disk."""
+    assert store.reranker_floor_is_stale("never-seen-model") is True
+
+
+def test_reranker_floor_is_stale_true_for_a_legacy_raw_row(store: MemoryStore) -> None:
+    """A persisted row still on the pre-F2b raw scale (a legacy write, or a
+    migrated-in row defaulted to 'raw') must be flagged stale."""
+    store.write_reranker_floor(
+        "legacy-model", floor=-1.0, raw_fit_floor=-1.0, sample_pairs=6,
+        is_cold_start=True, score_scale="raw",
+    )
+    assert store.reranker_floor_is_stale("legacy-model") is True
+
+
+def test_reranker_floor_is_stale_false_after_a_normalized_write(store: MemoryStore) -> None:
+    """Once a row is stamped with the current scale (the default every
+    production write uses), the same model_id must read as NOT stale —
+    this is the mechanism that makes the deploy-recalibration check
+    idempotent (fires once, never again for that model_id)."""
+    store.write_reranker_floor(
+        "fresh-model", floor=0.5, raw_fit_floor=0.5, sample_pairs=6, is_cold_start=True
+    )
+    assert store.reranker_floor_is_stale("fresh-model") is False
+
+
+def test_existing_reranker_floor_calibration_migrates_in_score_scale_column(tmp_path) -> None:
+    """F2b (#276 §6): simulate a pre-F2b persona whose `reranker_floor_
+    calibration` table predates the `score_scale` column, with a real
+    persisted floor row already in it (written by F2a before F2b ever
+    shipped). Opening `MemoryStore` must add the column without error,
+    default the pre-existing row to 'raw' (I9 — legacy rows survive,
+    labeled honestly, never dropped/rewritten), and
+    `reranker_floor_is_stale` must correctly flag that migrated-in row as
+    stale (it is exactly the pre-F2b raw floor §6 exists to catch)."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE reranker_floor_calibration (
+        reranker_model_id TEXT PRIMARY KEY,
+        floor REAL NOT NULL,
+        raw_fit_floor REAL NOT NULL,
+        sample_pairs INTEGER NOT NULL,
+        is_cold_start INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO reranker_floor_calibration "
+        "(reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("pre-f2b-model", -1.0, -1.0, 250, 0),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)  # must not raise
+    cols = {
+        row[1] for row in store._conn.execute("PRAGMA table_info(reranker_floor_calibration)").fetchall()
+    }
+    assert "score_scale" in cols
+
+    legacy_row = store._conn.execute(
+        "SELECT reranker_model_id, score_scale FROM reranker_floor_calibration "
+        "WHERE reranker_model_id = ?",
+        ("pre-f2b-model",),
+    ).fetchone()
+    assert legacy_row is not None, "the pre-existing row must survive the migration"
+    assert legacy_row["score_scale"] == "raw", "a migrated-in legacy row must default to the raw scale"
+    assert store.reranker_floor_is_stale("pre-f2b-model") is True, (
+        "a migrated-in raw-scale row must be detected as stale"
+    )
+    store.close()

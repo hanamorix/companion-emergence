@@ -343,6 +343,25 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup catch-up calibration tick failed: %s", exc)
 
+    # One-shot startup: F2b deploy-time one-time floor recalibration (spec
+    # §6, #276 inc3) — DISTINCT from the daily-cadence catch-up immediately
+    # above. That catch-up only fires the derivation when the persisted
+    # `calibration_cadence.json` says a daily firing is DUE; this check
+    # fires on the raw->normalized SCALE TRANSITION itself, regardless of
+    # cadence timing, so an existing deployment never rides a stale
+    # raw-scale floor under F2b's normalized gate for a full cadence
+    # window. Gated on the same `calibration_interval_s is not None` flag
+    # as the calibration subsystem generally (tests/dev disable knob) —
+    # when calibration itself is off, there is no floor-gated recall path
+    # for this check to protect. Idempotent by construction (see
+    # `_run_deploy_recalibration_check`'s docstring) and fault-isolated
+    # here, mirroring every other one-shot startup step in this function.
+    try:
+        if calibration_interval_s is not None:
+            _run_deploy_recalibration_check(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup deploy recalibration check failed: %s", exc)
+
     # One-shot startup: re-tag emotion-less memories so existing personas
     # benefit from the A2 forward-only emotion seeding.  Independent of the
     # attunement backfill (separate if, not elif) — both can fire on the same
@@ -2190,6 +2209,99 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+
+def _run_deploy_recalibration_check(persona_dir: Path) -> None:
+    """F2b deploy-time ONE-TIME floor recalibration (spec §6, #276 inc3).
+
+    F2b (§5) re-points F2a's daily calibration fit to compare NORMALIZED
+    (anchor-corrected) scores; §5b additionally normalizes F2a's cold-start
+    and bootstrap floor sources. But a floor row PERSISTED before F2b
+    started producing normalized scores is still on the RAW scale — left
+    alone, that stale row stays in effect until the next scheduled daily
+    calibration tick happens to re-derive it, which can be a full day (or
+    longer, on a corpus still in cold-start) after the deploy that flipped
+    the score scale. This is a DIFFERENT trigger than that daily cadence
+    (`_run_calibration_tick`, gated on `calibration_cadence.json`'s
+    wall-clock `is_due`): this check fires on the SCALE TRANSITION itself,
+    at startup, regardless of when the last daily tick ran or is next due.
+
+    Mechanism: `MemoryStore.reranker_floor_is_stale` reads the PERSISTED
+    `reranker_floor_calibration` row directly — stale means ABSENT or still
+    stamped `score_scale != 'normalized'`. When stale, this runs F2a's
+    already-built `floor_calibration.derive_and_persist_floor` ONCE,
+    out-of-cycle (the SAME function the daily tick calls — no new
+    calibration algorithm). §5b guarantees both branches
+    `derive_and_persist_floor` can take (a real fit off `calibration_log`
+    rows, or the cold-start fit off the bundled pairs) land on the
+    normalized scale, so this always corrects a stale/absent row to
+    scale-correct in one pass — never a raw-scale write.
+
+    Idempotent BY CONSTRUCTION, not by a separate one-shot flag: an
+    accepted `derive_and_persist_floor` call always stamps the fresh row
+    `score_scale = CALIBRATION_SCORE_SCALE` (`MemoryStore.
+    write_reranker_floor`'s default), so the very next call to this
+    function — another startup, or interleaved with a normal daily tick —
+    reads `reranker_floor_is_stale() == False` and returns immediately
+    without re-deriving. This survives a real process restart (the marker
+    lives in `memories.db`, not in-process state), unlike a boot-time flag.
+
+    Placed at the bridge-startup seam in `run_folded`, immediately after
+    the existing F2a startup catch-up calibration tick — but unlike that
+    catch-up (which reuses `_run_calibration_tick`'s prune + judge-label +
+    cadence-scoped floor derivation), this is deliberately its OWN,
+    narrower function: no pruning, no judge-labeling, no cadence-due check
+    — only the one scale-transition floor derivation, so a deploy recovers
+    a scale-correct floor even when the daily cadence itself is disabled
+    for a long window or has not yet come due.
+
+    Fault-isolated by the CALLER (`run_folded`'s `try/except
+    logger.warning`, mirroring every other one-shot startup step in this
+    function) — a failure constructing the store, the reranker provider, or
+    running the derivation must never crash bridge startup; the stale row
+    (or absence of one) is simply picked up again on the next startup.
+    """
+    with ExitStack() as stack:
+        # integrity_check=False mirrors every other background-tick store
+        # open in this file (compaction/calibration/clustering ticks) — a
+        # full PRAGMA integrity_check on a one-shot startup check is
+        # unwarranted.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        from brain.memory.reranker import (
+            build_reranker_provider,
+            reset_precision_decision_for_floor_change,
+        )
+
+        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+
+        if not store.reranker_floor_is_stale(current_reranker_model_id):
+            logger.info(
+                "deploy recalibration check: %s already normalized-scale, skipping",
+                current_reranker_model_id,
+            )
+            return
+
+        from brain.memory import floor_calibration
+
+        outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
+        logger.info(
+            "deploy recalibration check: out-of-cycle floor derivation for %s -> "
+            "accepted=%s floor=%.4f cold_start=%s held_for_stability=%s sample_pairs=%d",
+            current_reranker_model_id,
+            outcome.accepted,
+            outcome.floor,
+            outcome.is_cold_start,
+            outcome.held_for_stability,
+            outcome.sample_pairs,
+        )
+        if outcome.accepted:
+            # Same cross-increment MUST as `_run_calibration_tick`'s own
+            # floor-derivation step (spec Section 7): an accepted write
+            # invalidates the cached fp16-vs-fp32 precision decision so it
+            # re-runs under the freshly (now normalized-scale) floor.
+            reset_precision_decision_for_floor_change()
 
 
 def _run_finalize_tick(
