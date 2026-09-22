@@ -1,0 +1,38 @@
+{
+  "_comment": "Hook wiring for the plan-ledger skill. Merge these three entries into the `hooks` object of .claude/settings.json (project) or ~/.claude/settings.json (user). The scripts are tracked under scripts/plan_ledger/; both fail open on any internal error.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/plan_ledger/session_start.py\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/plan_ledger/read_gate.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/plan_ledger/read_gate.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -18,6 +18,23 @@ this table is a quick map.
 
 ## Inventory
 
+### `install_plan_ledger.sh` — tier 1
+
+Installs the `plan-ledger` skill (ThinkerOfThoughts/claude-code-skills,
+pinned commit in the script) into the project-scoped, gitignored
+`.claude/skills/plan-ledger/`. `--check` runs the skill's own self-check
+(installed copy == upstream copy). Config: `plan-ledger.companion.md` at
+the repo root; hook scripts under `scripts/plan_ledger/` with the
+settings wiring in `scripts/plan_ledger/settings.snippet.json`.
+
+```bash
+bash scripts/install_plan_ledger.sh
+bash scripts/install_plan_ledger.sh --check
+```
+
+Cost: one shallow fetch. No persona, no LLM, nothing written outside
+`.claude/skills/`.
+
 ### `smoke_test_wheel.sh` — tier 1
 
 Builds the wheel + sdist, installs the wheel into a fresh `uv venv`

@@ -144,6 +144,14 @@ hunts/
 
 # guarded-change working/scratch — per-change stage docs (spec/criteria/plan/red-team)
 changes/
+
+# plan-ledger working state — ledgers + cold-pass reports quote the owner; local only
+# (config plan-ledger.companion.md and docs/plan-ledger/DESIGN-INVARIANTS.md are tracked)
+docs/plan-ledger/ledgers/*
+!docs/plan-ledger/ledgers/.gitkeep
+!docs/plan-ledger/ledgers/reports/
+docs/plan-ledger/ledgers/reports/*
+!docs/plan-ledger/ledgers/reports/.gitkeep
 app/src-tauri/python-runtime/
 
 # ── Leak-guard local tier + private local docs ──
