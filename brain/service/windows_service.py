@@ -213,17 +213,43 @@ def _task_action_for_nell_path(persona: str, nell_path: Path) -> WindowsTaskActi
     return WindowsTaskAction(command=str(nell_path), arguments=args)
 
 
+def task_user_id() -> str | None:
+    """The account a per-user task is registered for, as ``DOMAIN\\user`` (#260).
+
+    Task Scheduler reads a ``<LogonTrigger>`` without ``<UserId>`` as "at ANY
+    user's logon" — an all-users registration that needs elevation, so
+    ``schtasks /Create`` from a normal shell fails with "Access is denied".
+    Naming the current account on both the trigger and the principal keeps
+    the registration per-user (the launchd ``gui/<uid>/`` and systemd
+    ``--user`` analog) and lets it register unelevated.
+
+    Resolved from ``USERDOMAIN`` + ``USERNAME``; a bare ``USERNAME`` is
+    accepted (Task Scheduler resolves it against the local machine). ``None``
+    when ``USERNAME`` is unset — non-Windows hosts running the unit tests —
+    so the XML is rendered without the node.
+    """
+    username = (os.environ.get("USERNAME") or "").strip()
+    if not username:
+        return None
+    domain = (os.environ.get("USERDOMAIN") or "").strip()
+    return f"{domain}\\{username}" if domain else username
+
+
 def build_task_xml(
     *,
     persona: str,
     nell_path: str | Path,
     env_path: str = DEFAULT_WINDOWS_PATH,
     nellbrain_home: str | Path | None = None,
+    user_id: str | None = None,
 ) -> str:
     """Render a Task Scheduler XML for the persona's supervisor task.
 
     The XML follows Windows Task Scheduler 1.3 schema:
-      * ``<LogonTrigger>`` — start at login (matches RunAtLoad / WantedBy=default.target).
+      * ``<LogonTrigger>`` — start at login (matches RunAtLoad / WantedBy=default.target),
+        scoped to the current account via ``<UserId>`` on both the trigger and the
+        principal (#260); ``user_id`` overrides the environment-derived account,
+        and the node is omitted when neither resolves.
       * ``<RegistrationInfo><Author>`` — for diagnostic tracing.
       * ``<Settings><RestartOnFailure>`` — restart on crash with a
         2-minute interval, up to 3 times (matches launchd KeepAlive
@@ -258,6 +284,9 @@ def build_task_xml(
     # captured stdout/stderr files exist as a fallback if the
     # supervisor fails before logging is initialized.
 
+    resolved_user = user_id if user_id is not None else task_user_id()
+    user_node = f"      <UserId>{_xml_escape(resolved_user)}</UserId>\n" if resolved_user else ""
+
     env_block = ""
     if nellbrain_home is not None:
         nellbrain_home_str = _xml_escape(str(Path(nellbrain_home).expanduser()))
@@ -278,10 +307,12 @@ def build_task_xml(
         "  <Triggers>\n"
         "    <LogonTrigger>\n"
         "      <Enabled>true</Enabled>\n"
+        f"{user_node}"
         "    </LogonTrigger>\n"
         "  </Triggers>\n"
         "  <Principals>\n"
         '    <Principal id="Author">\n'
+        f"{user_node}"
         "      <LogonType>InteractiveToken</LogonType>\n"
         "      <RunLevel>LeastPrivilege</RunLevel>\n"
         "    </Principal>\n"
@@ -402,12 +433,25 @@ def uninstall_service(*, persona: str, keep_xml: bool = False) -> Path:
 
 
 def service_status(*, persona: str) -> ServiceStatus:
-    """Combine cached-XML presence with ``schtasks /Query`` output."""
+    """Report the task as Task Scheduler sees it (``schtasks /Query``).
+
+    ``installed`` is true only when the query finds the task registered. The
+    cached XML under ``<root>\\service\\`` is NOT proof of installation: a
+    failed ``schtasks /Create`` leaves it behind, and trusting it reported a
+    denied install as ``installed: yes`` (#260). When the XML exists but the
+    task is missing, ``detail`` says so on top of the schtasks output.
+    """
     paths = paths_for_persona(persona)
-    installed = paths.xml_path.exists()
     query = run_schtasks(["/Query", "/TN", paths.task_name, "/V", "/FO", "LIST"])
-    detail = query.stdout.strip() if query.returncode == 0 else query.stderr.strip()
-    loaded = query.returncode == 0 and "Status:" in (query.stdout or "")
+    installed = query.returncode == 0
+    detail = query.stdout.strip() if installed else query.stderr.strip()
+    if not installed and paths.xml_path.exists():
+        detail = (
+            f"task {paths.task_name} is not registered with Task Scheduler although "
+            f"{paths.xml_path} exists (a failed install leaves the XML behind; "
+            "re-run `nell service install`)" + (f"; schtasks: {detail}" if detail else "")
+        )
+    loaded = installed and "Status:" in (query.stdout or "")
     return ServiceStatus(
         task_name=paths.task_name,
         xml_path=paths.xml_path,

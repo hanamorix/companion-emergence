@@ -324,3 +324,140 @@ def test_build_task_xml_rejects_bundled_nell_bat_without_pythonw(tmp_path: Path)
 
     with pytest.raises(windows_service.WindowsServiceConfigError, match="pythonw.exe"):
         windows_service.build_task_xml(persona="nell", nell_path=nell_bat)
+
+
+# ---------------------------------------------------------------------------
+# Per-user registration: <UserId> on the trigger AND the principal (#260)
+# ---------------------------------------------------------------------------
+
+
+def _xml_section(body: str, tag: str) -> str:
+    return body[body.index(f"<{tag}") : body.index(f"</{tag}>")]
+
+
+def test_task_user_id_joins_domain_and_username(monkeypatch) -> None:
+    monkeypatch.setenv("USERDOMAIN", "DESKTOP-X1")
+    monkeypatch.setenv("USERNAME", "hana")
+    assert windows_service.task_user_id() == "DESKTOP-X1\\hana"
+
+
+def test_task_user_id_bare_username_when_domain_unset(monkeypatch) -> None:
+    monkeypatch.delenv("USERDOMAIN", raising=False)
+    monkeypatch.setenv("USERNAME", "hana")
+    assert windows_service.task_user_id() == "hana"
+
+
+def test_task_user_id_none_when_username_unset(monkeypatch) -> None:
+    monkeypatch.delenv("USERDOMAIN", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    assert windows_service.task_user_id() is None
+
+
+def test_build_task_xml_scopes_logon_trigger_and_principal_to_user(monkeypatch) -> None:
+    """Without <UserId> on the LogonTrigger, Task Scheduler treats the task as
+    'any user's logon' (all-users) and refuses an unelevated schtasks /Create."""
+    monkeypatch.setenv("USERDOMAIN", "DESKTOP-X1")
+    monkeypatch.setenv("USERNAME", "hana")
+    body = windows_service.build_task_xml(persona="nell", nell_path="C:\\fake\\nell.exe")
+
+    assert "<UserId>DESKTOP-X1\\hana</UserId>" in _xml_section(body, "LogonTrigger")
+    assert "<UserId>DESKTOP-X1\\hana</UserId>" in _xml_section(body, "Principal")
+    assert body.count("<UserId>") == 2
+    # Schema order inside the principal: UserId precedes LogonType.
+    principal = _xml_section(body, "Principal")
+    assert principal.index("<UserId>") < principal.index("<LogonType>")
+
+
+def test_build_task_xml_explicit_user_id_overrides_environment(monkeypatch) -> None:
+    monkeypatch.setenv("USERDOMAIN", "DESKTOP-X1")
+    monkeypatch.setenv("USERNAME", "hana")
+    body = windows_service.build_task_xml(
+        persona="nell", nell_path="C:\\fake\\nell.exe", user_id="S-1-5-21-1-2-3-1001"
+    )
+    assert body.count("<UserId>S-1-5-21-1-2-3-1001</UserId>") == 2
+    assert "hana" not in body
+
+
+def test_build_task_xml_omits_user_id_when_unresolvable(monkeypatch) -> None:
+    """Non-Windows unit hosts have no USERNAME; the XML must stay well-formed
+    and byte-identical to the pre-#260 shape rather than emit an empty node."""
+    monkeypatch.delenv("USERDOMAIN", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    body = windows_service.build_task_xml(persona="nell", nell_path="C:\\fake\\nell.exe")
+    assert "<UserId>" not in body
+    assert "<LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>" in body
+
+
+def test_build_task_xml_escapes_user_id(monkeypatch) -> None:
+    monkeypatch.setenv("USERDOMAIN", "A&B")
+    monkeypatch.setenv("USERNAME", "h<a>na")
+    body = windows_service.build_task_xml(persona="nell", nell_path="C:\\fake\\nell.exe")
+    assert "<UserId>A&amp;B\\h&lt;a&gt;na</UserId>" in body
+
+
+# ---------------------------------------------------------------------------
+# service_status trusts schtasks /Query, not the cached XML (#260 secondary)
+# ---------------------------------------------------------------------------
+
+
+def _fake_schtasks(monkeypatch, *, returncode: int, stdout: str = "", stderr: str = "") -> list:
+    calls: list[list[str]] = []
+
+    def fake(args: list[str]):
+        calls.append(args)
+        import subprocess
+
+        return subprocess.CompletedProcess(
+            args=["schtasks", *args], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    monkeypatch.setattr(windows_service, "run_schtasks", fake)
+    return calls
+
+
+def test_service_status_not_installed_when_query_fails_despite_cached_xml(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed `schtasks /Create` leaves the XML behind; status used to report
+    `installed: yes` from that file alone while the task did not exist."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    paths = windows_service.paths_for_persona("nell")
+    paths.xml_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.xml_path.write_text("<Task/>", encoding="utf-8")
+    _fake_schtasks(
+        monkeypatch, returncode=1, stderr="ERROR: The system cannot find the file specified."
+    )
+
+    status = windows_service.service_status(persona="nell")
+
+    assert status.installed is False
+    assert status.loaded is False
+    assert "not registered" in status.detail
+    assert str(paths.xml_path) in status.detail
+    assert "cannot find the file" in status.detail
+
+
+def test_service_status_installed_and_loaded_from_query(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    _fake_schtasks(
+        monkeypatch,
+        returncode=0,
+        stdout="TaskName: \\CompanionEmergence-nell\nStatus: Ready\n",
+    )
+
+    status = windows_service.service_status(persona="nell")
+
+    assert status.installed is True
+    assert status.loaded is True
+    assert "Status: Ready" in status.detail
+
+
+def test_service_status_not_installed_without_xml_or_task(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    _fake_schtasks(monkeypatch, returncode=127, stderr="schtasks not available")
+
+    status = windows_service.service_status(persona="nell")
+
+    assert status.installed is False
+    assert status.loaded is False
+    assert status.detail == "schtasks not available"
