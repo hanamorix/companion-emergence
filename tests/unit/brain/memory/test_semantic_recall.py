@@ -432,21 +432,34 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     — editing the stored memory's content AFTER the recall turn that logged
     it must NOT change what the calibration row already persisted. This is
     the exact drift `store.log_calibration_sample`'s docstring calls out:
-    a label-time re-fetch would silently pick up post-recall edits."""
+    a label-time re-fetch would silently pick up post-recall edits.
+
+    Seeds TWO candidates (not one): with a single candidate, a positional
+    mix-up of `candidate_docs` relative to `candidate_ids` (e.g. an
+    accidental reorder of one of the two lists before the log write) is
+    invisible — reversing a 1-element list is a no-op. Two distinct
+    candidates make the alignment check below actually bite: each logged
+    doc must land at the same index as the id of the memory it came from,
+    not merely be *a* content string that appears somewhere in the row."""
     original_content = "a memory that clears the floor, before any edit"
     edited_content = "a memory that clears the floor, AFTER being edited"
+    other_content = "a second, distinct candidate that is never edited"
     query = "any query"
 
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={original_content: _TEST_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(
+            scores={original_content: _TEST_FLOOR + 1.0, other_content: _TEST_FLOOR + 0.5}
+        ),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     _seed_floor(store)
     mem = _mem(store, original_content)
+    other = _mem(store, other_content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, other.id, np.zeros(384, dtype=np.float32))
 
     result = run_semantic_recall(store, tmp_path, query)
     assert result is not None
@@ -462,6 +475,18 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     candidate_ids = json.loads(row["candidate_ids"])
     candidate_docs = json.loads(row["candidate_docs"])
     assert len(candidate_docs) == len(candidate_ids), "candidate_docs must be 1:1 with candidate_ids"
+    assert len(candidate_ids) == 2, "test precondition: both seeded candidates must have been scored"
+
+    # Positional alignment: the doc at each index must be the RECALL-TIME
+    # content of the memory whose id sits at that same index — not some
+    # other candidate's content shifted into its slot by a reorder.
+    expected_content_by_id = {mem.id: original_content, other.id: other_content}
+    for cand_id, cand_doc in zip(candidate_ids, candidate_docs, strict=True):
+        assert cand_doc == expected_content_by_id[cand_id], (
+            "candidate_docs must be positionally aligned with candidate_ids — the doc logged at "
+            f"this position must be memory {cand_id!r}'s own recall-time content"
+        )
+
     idx = candidate_ids.index(mem.id)
     assert candidate_docs[idx] == original_content, (
         "the persisted snapshot must be the RECALL-TIME text, unaffected by a later content edit"
