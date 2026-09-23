@@ -493,11 +493,13 @@ def test_label_calibration_sample_one_row_failure_does_not_sink_other_rows(
     original_write = store.write_calibration_labels
     calls = {"n": 0}
 
-    def _flaky_write(row_id, local_labels, haiku_labels):
+    def _flaky_write(row_id, local_labels, haiku_labels, local_judge_raw_score=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("disk full")
-        return original_write(row_id, local_labels, haiku_labels)
+        return original_write(
+            row_id, local_labels, haiku_labels, local_judge_raw_score=local_judge_raw_score
+        )
 
     monkeypatch.setattr(store, "write_calibration_labels", _flaky_write)
 
@@ -513,3 +515,118 @@ def test_label_calibration_sample_respects_sample_rows_limit(store: MemoryStore)
         )
     labeled = label_calibration_sample(store, judge=FakeRelevanceJudgeProvider(), sample_rows=2)
     assert labeled == 2
+
+
+# ---------------------------------------------------------------------------
+# F2c inc1 (data foundation only, spec §3 Addition A): the judge's RAW
+# score/logit is accumulated alongside the derived label and persisted via
+# `write_calibration_labels`.
+# ---------------------------------------------------------------------------
+
+
+def test_label_calibration_sample_persists_raw_scores_not_derived_labels(
+    store: MemoryStore,
+) -> None:
+    """BITE: `local_judge_raw_score` holds the RAW logit the judge actually
+    returned (e.g. 12.5, far outside [0,1]) — not the sigmoid-derived
+    relevant/irrelevant label, and positionally aligned with
+    `candidate_ids`/`local_judge_label`."""
+    mem_a = _mem("clearly relevant content")
+    mem_b = _mem("clearly irrelevant content")
+    store.create(mem_a)
+    store.create(mem_b)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem_a.id, mem_b.id], reranker_scores=[1.0, 2.0],
+        reranker_model_id="m",
+    )
+    judge = FakeRelevanceJudgeProvider(
+        scores={("q", mem_a.content): 12.5, ("q", mem_b.content): -8.25}
+    )
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    labels = json.loads(row["local_judge_label"])
+    raw_scores = json.loads(row["local_judge_raw_score"])
+    assert labels == ["relevant", "irrelevant"]
+    assert raw_scores == [12.5, -8.25], "the RAW logits, not the derived labels"
+    assert raw_scores != labels
+
+
+def test_label_calibration_sample_raw_score_is_null_for_unknown_candidate(
+    store: MemoryStore,
+) -> None:
+    """A candidate the judge never scored (deleted since logging -> the
+    "unknown" label sentinel) gets `None` at that position in
+    `local_judge_raw_score`, never a fabricated 0.0 that could be mistaken
+    for a real score."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["does-not-exist"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider()
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    assert json.loads(row["local_judge_label"]) == ["unknown"]
+    assert json.loads(row["local_judge_raw_score"]) == [None]
+
+
+def test_label_calibration_sample_raw_score_is_null_for_error_candidate(
+    store: MemoryStore,
+) -> None:
+    """A candidate whose judge.score() call raises (the "error" label
+    sentinel) also gets `None` at that position, not a fabricated score."""
+    mem_bad = _mem("bad content")
+    store.create(mem_bad)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem_bad.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    class _FlakyJudge(FakeRelevanceJudgeProvider):
+        def score(self, query: str, document: str) -> float:
+            raise RuntimeError("boom")
+
+    labeled = label_calibration_sample(store, judge=_FlakyJudge())
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    assert json.loads(row["local_judge_label"]) == ["error"]
+    assert json.loads(row["local_judge_raw_score"]) == [None]
+
+
+# ---------------------------------------------------------------------------
+# F2c inc1 (spec §6): the durable in-code Haiku-oracle note must actually be
+# present at the F2a judge/label site — grep/lint check (acceptance #9).
+# ---------------------------------------------------------------------------
+
+
+def test_haiku_oracle_note_is_present_in_relevance_judge_source() -> None:
+    """A plain code-comment presence check — not a behavior test — proving
+    the required durable note (spec §6: Haiku is the effective relevance
+    ORACLE the judge converges toward) actually exists at this module,
+    immediately above `label_calibration_sample` (the F2a judge/label
+    site), so a later relevance-quality problem has a documented place to
+    look. Scoped to just that note block (not the whole module, which uses
+    em-dashes freely elsewhere in ordinary docstrings) since the "no
+    em-dash" requirement applies to this specific durable note, not to
+    every comment in the file."""
+    import inspect
+
+    source = inspect.getsource(rj_mod)
+    marker = "# F2c (durable note, spec"
+    assert marker in source, "the durable Haiku-oracle note must precede label_calibration_sample"
+    note_start = source.index(marker)
+    note_end = source.index("def label_calibration_sample", note_start)
+    note = source[note_start:note_end]
+    assert "oracle" in note.lower()
+    assert "haiku" in note.lower()
+    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"

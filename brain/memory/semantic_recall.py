@@ -385,11 +385,25 @@ def run_semantic_recall(
             # fail-soft `except` below so a logging failure can NEVER demote
             # a good semantic result to the lexical fallback — it only
             # loses that one turn's calibration row.
+            #
+            # F2c inc1 (data foundation only, spec §3 Addition B):
+            # `candidate_docs` is `real_documents` sliced to the SAME
+            # `normalization.real_width` prefix as `scored_ids` above —
+            # `real_documents` is built from `rerank_ids` in the same order
+            # (`real_documents = [pool[mid][0].content for mid in
+            # rerank_ids]`, above), so `real_documents[:real_width]` is
+            # positionally 1:1 with `scored_ids`/`candidate_ids` exactly the
+            # way `rerank_scores` already is. This is the RECALL-TIME text
+            # snapshot — the whole point of logging it here rather than
+            # re-fetching by id later is that a memory can drift/be
+            # forgotten between this turn and whenever F2c's weekly tick
+            # consumes the row.
             store.log_calibration_sample(
                 query=user_input,
                 candidate_ids=scored_ids,
                 reranker_scores=rerank_scores,
                 reranker_model_id=reranker_provider.model_id(),
+                candidate_docs=real_documents[: normalization.real_width],
             )
         except Exception:  # noqa: BLE001 — fail-soft: logging must never break recall
             log.warning(

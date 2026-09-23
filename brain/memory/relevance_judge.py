@@ -342,6 +342,18 @@ def _make_haiku_tiebreak(provider: LLMProvider) -> Callable[[str, str], str | No
 
 # ---------------------------------------------------------------------------
 # Orchestration — the ONE entry point the daily calibration tick calls.
+#
+# F2c (durable note, spec §6): Haiku is the effective relevance ORACLE this
+# judge is being converged toward. The tie-break below already treats a
+# Haiku verdict as ground truth over the local judge's own provisional
+# label at ambiguous positions, and F2c's later weekly self-tune (knob-refit
+# / LoRA / full fine-tune, not built in this increment) trains the local
+# judge's score-to-label mapping toward the accumulated Haiku decisions
+# logged here. If a relevance-quality problem shows up downstream later,
+# this is the place to look first: what the judge converges toward is
+# Haiku's own labeling behavior, not some independently-verified ground
+# truth, so a systematic Haiku bias would propagate into the judge rather
+# than being caught by it.
 # ---------------------------------------------------------------------------
 
 
@@ -400,6 +412,17 @@ def label_calibration_sample(
             candidate_ids: list[str] = row["candidate_ids"]
             local_labels: list[str] = []
             haiku_labels: list[str | None] = []
+            # F2c inc1 (data foundation only, spec §3 Addition A): the raw
+            # judge score/logit, accumulated alongside the derived labels in
+            # this same loop and positionally aligned with `candidate_ids`
+            # (same convention as `local_labels`/`haiku_labels`) — a `None`
+            # entry marks a position this pass never scored (the
+            # "unknown"/"error" sentinels below), distinct from a real 0.0
+            # score. Persisted via `write_calibration_labels` so F2c's later
+            # knob-refit (not built here) has the raw score to fit a
+            # threshold/Platt mapping over, instead of only the label the
+            # score was already collapsed into.
+            raw_scores: list[float | None] = []
             for cid in candidate_ids:
                 try:
                     mem = store.get(cid, bump=False)
@@ -409,10 +432,12 @@ def label_calibration_sample(
                         # never silently coerced into relevant/irrelevant.
                         local_labels.append("unknown")
                         haiku_labels.append(None)
+                        raw_scores.append(None)
                         continue
                     raw_score = judge.score(query, mem.content)
                     provisional, is_ambiguous = label_for_score(raw_score)
                     local_labels.append(provisional)
+                    raw_scores.append(float(raw_score))
                     if is_ambiguous and haiku_tiebreak is not None:
                         haiku_labels.append(haiku_tiebreak(query, mem.content))
                     else:
@@ -424,7 +449,10 @@ def label_calibration_sample(
                     )
                     local_labels.append("error")
                     haiku_labels.append(None)
-            store.write_calibration_labels(row["id"], local_labels, haiku_labels)
+                    raw_scores.append(None)
+            store.write_calibration_labels(
+                row["id"], local_labels, haiku_labels, local_judge_raw_score=raw_scores
+            )
             labeled += 1
         except Exception:  # noqa: BLE001 — one row must not sink the whole pass
             logger.exception(

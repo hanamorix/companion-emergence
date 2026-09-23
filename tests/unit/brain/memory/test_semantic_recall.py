@@ -422,6 +422,59 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
     assert row["haiku_label"] is None
 
 
+def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F2c inc1 (data foundation only, spec §3 Addition B — BITE test): the
+    logged `candidate_docs` column must hold the RECALL-TIME doc text
+    (`real_documents`, positionally aligned with `candidate_ids` the same
+    way `reranker_scores` already is), NOT a later re-fetch from `memories`
+    — editing the stored memory's content AFTER the recall turn that logged
+    it must NOT change what the calibration row already persisted. This is
+    the exact drift `store.log_calibration_sample`'s docstring calls out:
+    a label-time re-fetch would silently pick up post-recall edits."""
+    original_content = "a memory that clears the floor, before any edit"
+    edited_content = "a memory that clears the floor, AFTER being edited"
+    query = "any query"
+
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider",
+        lambda **kwargs: FakeRerankerProvider(scores={original_content: _TEST_FLOOR + 1.0}),
+    )
+    _align_embedding_tier(monkeypatch)
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _seed_floor(store)
+    mem = _mem(store, original_content)
+    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+
+    result = run_semantic_recall(store, tmp_path, query)
+    assert result is not None
+
+    # Edit the memory's content AFTER the recall turn already logged it —
+    # simulates the days-later drift between recall time and F2c's
+    # eventual weekly consume.
+    store.update(mem.id, content=edited_content)
+
+    row = store._conn.execute(  # noqa: SLF001
+        "SELECT candidate_ids, candidate_docs FROM calibration_log"
+    ).fetchone()
+    candidate_ids = json.loads(row["candidate_ids"])
+    candidate_docs = json.loads(row["candidate_docs"])
+    assert len(candidate_docs) == len(candidate_ids), "candidate_docs must be 1:1 with candidate_ids"
+    idx = candidate_ids.index(mem.id)
+    assert candidate_docs[idx] == original_content, (
+        "the persisted snapshot must be the RECALL-TIME text, unaffected by a later content edit"
+    )
+    assert candidate_docs[idx] != edited_content
+
+    # And the live row itself really did change, proving this is a genuine
+    # snapshot-vs-live-drift check, not a no-op comparison.
+    live = store.get(mem.id, bump=False)
+    assert live is not None
+    assert live.content == edited_content
+
+
 def test_calibration_log_write_failure_does_not_break_recall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

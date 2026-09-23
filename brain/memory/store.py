@@ -316,6 +316,26 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
 -- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
 -- deploy-detection signal, though wiring that trigger is out of scope here.
+-- `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
+-- Addition A): the bge judge's RAW per-candidate score/logit, JSON-encoded
+-- and positionally aligned with `candidate_ids` (same convention as
+-- `reranker_scores`/`local_judge_label`). Today `relevance_judge.
+-- label_calibration_sample` computes this score (`judge.score(query,
+-- mem.content)`) and discards it after deriving the label — F2c's
+-- knob-refit (later increment) needs the raw score itself to fit a
+-- threshold/Platt mapping, not just the derived label. Nullable: NULL on
+-- every legacy row and on any position this judge pass never scored
+-- (`"unknown"`/`"error"` sentinels — see `write_calibration_labels`).
+-- `candidate_docs` (F2c inc1, data foundation only — spec §3 Addition B):
+-- a JSON list of candidate DOC-TEXT strings, positionally aligned with
+-- `candidate_ids`, snapshotted at RECALL time (`log_calibration_sample`'s
+-- caller, `semantic_recall.run_semantic_recall`, already holds this text
+-- as `real_documents` that turn) rather than re-fetched from `memories` at
+-- label time — a memory can be edited/pruned/forgotten in the days between
+-- being logged and being labeled, so a label-time re-fetch would drift
+-- from what the judge/reranker actually scored. F2c's later LoRA/full-FT
+-- tiers need `(query, doc, label)` triples built from this exact snapshot.
+-- Nullable: NULL on every legacy row (I9 — legacy import stays working).
 CREATE TABLE IF NOT EXISTS calibration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -326,7 +346,9 @@ CREATE TABLE IF NOT EXISTS calibration_log (
     reranker_model_id TEXT NOT NULL,
     local_judge_label TEXT,
     haiku_label TEXT,
-    score_scale TEXT NOT NULL DEFAULT 'raw'
+    score_scale TEXT NOT NULL DEFAULT 'raw',
+    local_judge_raw_score TEXT,
+    candidate_docs TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
 
@@ -579,6 +601,21 @@ class MemoryStore:
             self._conn.execute(
                 "ALTER TABLE calibration_log ADD COLUMN score_scale TEXT NOT NULL DEFAULT 'raw'"
             )
+        # F2c inc1 (data foundation only, spec §3): same idempotent
+        # existing-columns-check pattern, scoped to `calibration_log`'s two
+        # new additive columns. Both are nullable with NO default (unlike
+        # `score_scale`'s 'raw' default) — there is no honest backfill
+        # value for a pre-F2c row's raw judge score or doc-text snapshot
+        # (unlike `score_scale`, where "every prior row was on the raw
+        # scale" is a true fact); NULL correctly means "not captured for
+        # this legacy row" (I9 — legacy rows keep reading, just without
+        # this data).
+        if "local_judge_raw_score" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN local_judge_raw_score TEXT"
+            )
+        if "candidate_docs" not in existing_calibration_log:
+            self._conn.execute("ALTER TABLE calibration_log ADD COLUMN candidate_docs TEXT")
         # F2b (#276 §6): same migration shape, scoped to
         # `reranker_floor_calibration` — a legacy DB's persisted floor row
         # predates the scale marker and must read as 'raw' (never a guess)
@@ -947,6 +984,7 @@ class MemoryStore:
         candidate_ids: list[str],
         reranker_scores: list[float],
         reranker_model_id: str,
+        candidate_docs: list[str] | None = None,
     ) -> None:
         """Log one recall turn's (query, candidate ids, reranker scores) row
         to `calibration_log` (F2a #250 inc4).
@@ -958,6 +996,19 @@ class MemoryStore:
         output (same order, 1:1) — this method does no scoring of its own.
         `reranker_model_id` is stamped per row so a later floor-derivation
         pass can filter to one reranker's score scale.
+
+        `candidate_docs` (F2c inc1, data foundation only — spec §3 Addition
+        B): the RECALL-TIME candidate doc-text snapshot, positionally
+        aligned with `candidate_ids` 1:1 — the caller's already-in-hand
+        content strings for this turn's candidates (e.g. `semantic_recall.
+        run_semantic_recall`'s `real_documents`, sliced the same way
+        `candidate_ids` itself is), never a re-fetch from `memories` at some
+        later time (a memory can be edited/pruned/forgotten between being
+        logged and being labeled/trained on, so a later re-fetch would
+        silently drift from what was actually scored this turn). Optional
+        and defaults to `None` (stored as SQL NULL) so callers that don't
+        have doc text in hand keep working unchanged — this method does no
+        fetching of its own.
 
         F2b (#276 §5): `reranker_scores` must be the caller's already-
         NORMALIZED per-query anchor-corrected value (`brain.memory.
@@ -978,14 +1029,16 @@ class MemoryStore:
         """
         self._conn.execute(
             "INSERT INTO calibration_log "
-            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale, "
+            "candidate_docs) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 query,
                 json.dumps(list(candidate_ids)),
                 json.dumps([float(s) for s in reranker_scores]),
                 reranker_model_id,
                 CALIBRATION_SCORE_SCALE,
+                json.dumps(list(candidate_docs)) if candidate_docs is not None else None,
             ),
         )
         self._conn.commit()
@@ -1066,7 +1119,11 @@ class MemoryStore:
         ]
 
     def write_calibration_labels(
-        self, row_id: int, local_judge_label: list[str], haiku_label: list[str | None]
+        self,
+        row_id: int,
+        local_judge_label: list[str],
+        haiku_label: list[str | None],
+        local_judge_raw_score: list[float | None] | None = None,
     ) -> None:
         """Write back the local judge's + Haiku tie-break's per-candidate
         labels for one `calibration_log` row (F2a #250 inc6, spec Section 6).
@@ -1079,13 +1136,31 @@ class MemoryStore:
         acceptance #7) — a `None` means "no override; the local judge's own
         provisional label at that position stands."
 
+        `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
+        Addition A): the bge judge's RAW per-candidate score/logit, also
+        POSITIONALLY aligned with `candidate_ids`, stored as JSON in
+        `local_judge_raw_score`. A `None` entry means this position was
+        never scored (the `"unknown"`/`"error"` label sentinels — a deleted
+        candidate or a judge failure on that candidate, see
+        `relevance_judge.label_calibration_sample`), distinct from a real
+        score of 0.0. Optional and defaults to `None` (the whole column
+        stays NULL for this row) so a caller that doesn't have raw scores
+        in hand — e.g. any test exercising only the label-writing path —
+        keeps working unchanged.
+
         Once `local_judge_label` is non-NULL the row no longer matches
         `sample_unlabeled_calibration_rows`'s `WHERE` clause, so a row is
         never re-sampled or re-labeled on a later tick.
         """
         self._conn.execute(
-            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ? WHERE id = ?",
-            (json.dumps(local_judge_label), json.dumps(haiku_label), row_id),
+            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ?, "
+            "local_judge_raw_score = ? WHERE id = ?",
+            (
+                json.dumps(local_judge_label),
+                json.dumps(haiku_label),
+                json.dumps(local_judge_raw_score) if local_judge_raw_score is not None else None,
+                row_id,
+            ),
         )
         self._conn.commit()
 
