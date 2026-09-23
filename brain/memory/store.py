@@ -401,6 +401,30 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     score_scale TEXT NOT NULL DEFAULT 'raw'
 );
 
+-- F2c (inc2, spec §2): per-persona weekly judge self-tune MARKER — mirrors
+-- `reranker_floor_calibration`'s posture immediately above (a small
+-- per-persona artifact table in memories.db, never a side file, I1) but
+-- tracks a CONSUMED-THROUGH CURSOR into `calibration_log` rather than a
+-- fitted value: `consumed_through_id` is the highest `calibration_log.id`
+-- this persona's judge self-tune has trained on so far (id is
+-- AUTOINCREMENT, so a plain `> consumed_through_id` comparison is stable
+-- across calibration_log's own rolling-retention pruning — see
+-- `MemoryStore.count_new_haiku_decisions`). `last_trained_at` is the
+-- wall-clock timestamp of the most recent ACCEPTED weekly firing (NULL
+-- before the first one). Keyed by `judge_model_id` (mirrors
+-- `reranker_floor_calibration`'s `reranker_model_id` keying) so a future
+-- local-judge model swap never mixes one model's consumed-cursor progress
+-- with another's. `CREATE TABLE IF NOT EXISTS` (legacy-safe, I9): a fresh
+-- table needs no ALTER/migration path, and an absent row (fresh
+-- install/pre-F2c persona) reads as "never trained" via
+-- `MemoryStore.get_judge_selftune_state` returning `None`, not an error.
+CREATE TABLE IF NOT EXISTS judge_selftune_state (
+    judge_model_id TEXT PRIMARY KEY,
+    last_trained_at TEXT,
+    consumed_through_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
 -- content with content_rowid='rowid' indexes only `content` (no duplication).
@@ -1417,6 +1441,102 @@ class MemoryStore:
             ),
         )
         self._conn.commit()
+
+    def get_judge_selftune_state(self, judge_model_id: str) -> dict[str, Any] | None:
+        """Return the PERSISTED `judge_selftune_state` marker row for
+        `judge_model_id`, or `None` if this persona's judge has never been
+        self-tuned yet (F2c inc2, spec §2). Persisted-only reader — mirrors
+        `get_persisted_reranker_floor`'s posture exactly: no derived/
+        bootstrap fallback here, the weekly tick's own gate logic (`_run_
+        judge_selftune_tick` in `brain.memory.judge_selftune`) decides what
+        "no marker yet" means (a `since_id` of 0 — count every Haiku-
+        labeled row ever logged).
+
+        Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT judge_model_id, last_trained_at, consumed_through_id, updated_at "
+            "FROM judge_selftune_state WHERE judge_model_id = ?",
+            (judge_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "judge_model_id": row["judge_model_id"],
+            "last_trained_at": row["last_trained_at"],
+            "consumed_through_id": int(row["consumed_through_id"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def write_judge_selftune_state(
+        self,
+        judge_model_id: str,
+        *,
+        last_trained_at: datetime,
+        consumed_through_id: int,
+    ) -> None:
+        """Upsert this persona's judge self-tune marker for `judge_model_id`
+        (F2c inc2, spec §2) — the ONLY write path into
+        `judge_selftune_state` (I1: a table in memories.db, never a side
+        file). `INSERT ... ON CONFLICT DO UPDATE` keyed on `judge_model_id`
+        (its PRIMARY KEY), mirroring `write_reranker_floor`'s upsert shape:
+        the row is replaced wholesale on each accepted weekly firing, never
+        accumulated (this table tracks the CURRENT consumed-cursor per
+        judge model, not a history of past firings).
+
+        Called only when the weekly tick's >handful gate FIRES (spec §2/§3)
+        — a tick that does not fire (not enough new Haiku-labeled decisions
+        yet) must NOT call this, leaving the previously persisted cursor
+        (or its absence) untouched, so nothing already-counted is silently
+        dropped from the next gate check.
+        """
+        self._conn.execute(
+            "INSERT INTO judge_selftune_state "
+            "(judge_model_id, last_trained_at, consumed_through_id, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(judge_model_id) DO UPDATE SET "
+            "last_trained_at = excluded.last_trained_at, "
+            "consumed_through_id = excluded.consumed_through_id, "
+            "updated_at = excluded.updated_at",
+            (judge_model_id, last_trained_at.isoformat(), int(consumed_through_id)),
+        )
+        self._conn.commit()
+
+    def count_new_haiku_decisions(self, since_id: int) -> tuple[int, int | None]:
+        """Count `calibration_log` rows with a non-null `haiku_label` and
+        `id > since_id` (F2c inc2's >handful gate, spec §2/§3) — the weekly
+        judge self-tune tick's ONLY signal for whether new judge-labeled
+        decisions have accumulated since its marker's `consumed_through_id`
+        cursor.
+
+        `haiku_label` is written (as a JSON list, possibly all-`None`
+        entries) by `write_calibration_labels` for EVERY judge-labeled row,
+        whether or not any individual candidate position actually triggered
+        a Haiku tie-break call that turn — so this counts newly JUDGE-
+        LABELED rows at row granularity (the gate's specified granularity,
+        per the F2c inc2 build instructions), not per-candidate Haiku
+        invocations.
+
+        Returns `(count, max_id)`. `max_id` is the highest `id` among the
+        counted rows, or `None` when `count == 0` — the caller must not
+        advance the consumed cursor on a zero/`None` result (nothing new to
+        mark as consumed). `id` is AUTOINCREMENT (monotonic), so this
+        composes safely with `calibration_log`'s own rolling-retention
+        pruning (`prune_calibration_log`): pruning only ever removes OLD
+        `day_bucket` rows, which can only shrink this count, never corrupt
+        it — the `> since_id` comparison stays correct whether or not rows
+        below the cursor still physically exist.
+
+        Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM calibration_log "
+            "WHERE id > ? AND haiku_label IS NOT NULL",
+            (int(since_id),),
+        ).fetchone()
+        count = int(row["n"]) if row is not None else 0
+        max_id = int(row["max_id"]) if row is not None and row["max_id"] is not None else None
+        return count, max_id
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

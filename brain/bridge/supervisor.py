@@ -108,6 +108,11 @@ from brain.memory.embedding_backfill import (
 )
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.judge_selftune import (
+    JUDGE_TUNE_CADENCE_FILE,
+    JUDGE_TUNE_INTERVAL_HOURS,
+    _run_judge_selftune_tick,
+)
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
@@ -159,6 +164,7 @@ def run_folded(
     compaction_interval_s: float | None = 86400.0,
     calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
+    judge_selftune_interval_s: float | None = JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
@@ -210,6 +216,20 @@ def run_folded(
     (acceptance 5b); the judge-labeling pass (Section 6) and floor derivation
     (Section 7) are later increments — see ``_run_calibration_tick``'s
     docstring for the full scope note.
+
+    ``judge_selftune_interval_s=None`` disables the autonomous weekly judge
+    self-tune cadence (F2c inc2, spec Section 2) — wired structurally
+    identically to ``interest_sweep_interval_s`` immediately above (own
+    persisted ``judge_selftune_cadence.json``, own fault-isolated tick, NO
+    startup catch-up), not to ``calibration_interval_s``'s daily
+    catch-up-or-idle shape. Default matches
+    ``brain.memory.judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
+    This increment (inc2) is a SCAFFOLD ONLY: the cadence, the >handful
+    gate, runtime RAM tier-detection and the cgroup-aware OOM-safety
+    downgrade are built and wired; the actual tuning (knob-refit / LoRA /
+    full fine-tune) is a later increment — see
+    ``judge_selftune._run_judge_selftune_tick``'s docstring for the scope
+    note.
     """
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
@@ -243,6 +263,15 @@ def run_folded(
     interest_sweep_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
         if interest_sweep_interval_s is not None
+        else None
+    )
+    # Judge self-tune — weekly persisted wall-clock cadence (F2c inc2, spec
+    # Section 2). Same None-gated posture as interest sweep immediately
+    # above (own disable knob, not a user-facing setting) and its own
+    # persisted cadence file, decoupled from every other cadence.
+    judge_selftune_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, JUDGE_TUNE_CADENCE_FILE)
+        if judge_selftune_interval_s is not None
         else None
     )
     _last_intensity_drivers: IntensityDrivers | None = None
@@ -707,6 +736,47 @@ def run_folded(
                 )
                 persisted_cadence.save_cadence(
                     persona_dir, interest_sweep.SWEEP_CADENCE_FILE, interest_sweep_cadence_state
+                )
+
+            # Judge self-tune — weekly, persisted wall-clock (F2c inc2, spec
+            # Section 2). Structurally identical to the interest-sweep block
+            # immediately above: `_run_judge_selftune_tick` is a leaf engine
+            # call (not a supervisor `_run_X_tick` wrapper despite its name)
+            # that owns neither cadence nor throttle by design — this block
+            # owns both, same as interest sweep. Own per-tick MemoryStore
+            # (ExitStack), own cli_throttle.background_slot. NO startup
+            # catch-up (mirrors interest sweep, NOT the daily calibration
+            # tick's catch-up-at-boot shape) — a due-while-off firing just
+            # waits for the next idle moment, since a week's slack on an
+            # already-weekly cadence is immaterial. The returned dict
+            # (fired/tune_grade/new_decisions/error) is caller-facing only
+            # (mirrors interest sweep's ignored return value), so it is
+            # ignored here.
+            if judge_selftune_cadence_state is not None and persisted_cadence.is_due(
+                judge_selftune_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    with (
+                        ExitStack() as _judge_selftune_stack,
+                        cli_throttle.background_slot() as _judge_selftune_slot,
+                    ):
+                        if _judge_selftune_slot:
+                            _judge_selftune_store = MemoryStore(persona_dir / "memories.db")
+                            _judge_selftune_stack.callback(_judge_selftune_store.close)
+                            _run_judge_selftune_tick(
+                                store=_judge_selftune_store,
+                                now=datetime.now(UTC),
+                            )
+                except Exception:
+                    logger.exception("supervisor judge-selftune tick raised")
+                # End-of-block advance+save: body above is fully wrapped, so this
+                # is unconditionally reached (cadence invariant, defer #21 pattern).
+                judge_selftune_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC),
+                    interval_s=judge_selftune_interval_s,
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, JUDGE_TUNE_CADENCE_FILE, judge_selftune_cadence_state
                 )
 
             # Finalize cadence — 24h silence (default) or explicit. Each pass
