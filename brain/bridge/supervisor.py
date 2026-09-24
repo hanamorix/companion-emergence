@@ -343,6 +343,25 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup catch-up calibration tick failed: %s", exc)
 
+    # One-shot startup: F2b deploy-time one-time floor recalibration (spec
+    # §6, #276 inc3) — DISTINCT from the daily-cadence catch-up immediately
+    # above. That catch-up only fires the derivation when the persisted
+    # `calibration_cadence.json` says a daily firing is DUE; this check
+    # fires on the raw->normalized SCALE TRANSITION itself, regardless of
+    # cadence timing, so an existing deployment never rides a stale
+    # raw-scale floor under F2b's normalized gate for a full cadence
+    # window. Gated on the same `calibration_interval_s is not None` flag
+    # as the calibration subsystem generally (tests/dev disable knob) —
+    # when calibration itself is off, there is no floor-gated recall path
+    # for this check to protect. Idempotent by construction (see
+    # `_run_deploy_recalibration_check`'s docstring) and fault-isolated
+    # here, mirroring every other one-shot startup step in this function.
+    try:
+        if calibration_interval_s is not None:
+            _run_deploy_recalibration_check(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup deploy recalibration check failed: %s", exc)
+
     # One-shot startup: re-tag emotion-less memories so existing personas
     # benefit from the A2 forward-only emotion seeding.  Independent of the
     # attunement backfill (separate if, not elif) — both can fire on the same
@@ -2190,6 +2209,162 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+
+# Pre-flip revision Change 1's §6 retry gate (see `_run_deploy_
+# recalibration_check` below): a persisted-cadence file (mirrors every
+# other `*_cadence.json` in this module), gating ONLY the no-persisted-row
+# ramp case — a genuine raw-scale-row migration always fires immediately,
+# ungated. 86400.0s (one day) mirrors the grain every other cadence in this
+# file already uses, and reuses Change 1's own day-boundary rather than
+# inventing a second one (spec's F2b §6 interaction note: "gate §6's retry
+# on the same day-boundary the backstop uses").
+_DEPLOY_RECAL_RETRY_CADENCE_FILE = "deploy_recalibration_retry_cadence.json"
+_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS = 86400.0
+
+
+def _run_deploy_recalibration_check(persona_dir: Path) -> None:
+    """F2b deploy-time ONE-TIME floor recalibration (spec §6, #276 inc3).
+
+    F2b (§5) re-points F2a's daily calibration fit to compare NORMALIZED
+    (anchor-corrected) scores; §5b additionally normalizes F2a's cold-start
+    and bootstrap floor sources. But a floor row PERSISTED before F2b
+    started producing normalized scores is still on the RAW scale — left
+    alone, that stale row stays in effect until the next scheduled daily
+    calibration tick happens to re-derive it, which can be a full day (or
+    longer, on a corpus still in cold-start) after the deploy that flipped
+    the score scale. This is a DIFFERENT trigger than that daily cadence
+    (`_run_calibration_tick`, gated on `calibration_cadence.json`'s
+    wall-clock `is_due`): this check fires on the SCALE TRANSITION itself,
+    at startup, regardless of when the last daily tick ran or is next due.
+
+    Mechanism: `MemoryStore.reranker_floor_is_stale` reads the PERSISTED
+    `reranker_floor_calibration` row directly — stale means ABSENT or still
+    stamped `score_scale != 'normalized'`. When stale, this runs F2a's
+    already-built `floor_calibration.derive_and_persist_floor` ONCE,
+    out-of-cycle (the SAME function the daily tick calls — no new
+    calibration algorithm).
+
+    PRE-FLIP REVISION CHANGE 1's §6 INTERACTION (build-time gate, spec's
+    "F2b §6 interaction" note): Change 1 removes `derive_and_persist_
+    floor`'s old cold-start branch, which used to unconditionally persist
+    SOME row (bundled-pair fit) on every call — that write was what made
+    `reranker_floor_is_stale` false again after the FIRST out-of-cycle
+    pass, regardless of how little real data existed yet. Change 1's
+    replacement backstop can instead write NOTHING (the no-prior-row edge
+    case — a fresh deploy still short of `FLOOR_FIT_MIN_LABELED_PAIRS` on
+    its most recent day), which leaves the row ABSENT — and an absent row
+    reads as stale FOREVER until real data clears the threshold. Without a
+    gate, THIS function would re-attempt `derive_and_persist_floor` (itself
+    now a cheap no-op in that state) on every single bridge restart during
+    the ramp, which is wasteful and noisy.
+
+    The fix distinguishes the two genuinely different reasons a row can
+    read stale, per the two properties this gate must satisfy simultaneously:
+      - a row EXISTS but is still raw-scale (`get_persisted_reranker_floor`
+        returns a row with `score_scale != 'normalized'`) — this IS the §6
+        migration case and fires UNCONDITIONALLY on this restart, exactly
+        as originally spec'd; it is never gated.
+      - NO row exists at all (`get_persisted_reranker_floor` returns
+        `None`) — this is either a true pre-Change-1 fresh install (no
+        change in behavior: the very first attempt still fires
+        immediately, so a genuinely fresh corpus that already has enough
+        data gets its floor right away) OR Change 1's own ramp state
+        (not enough data yet — this attempt will just no-op again). Only
+        THIS no-row case is rate-limited, via `persisted_cadence` (the SAME
+        module every other cadence in this file already uses): at most one
+        attempt per `_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS` (one day,
+        mirroring the backstop's own day-boundary rather than inventing a
+        second time-windowing scheme), tracked in its own small JSON side
+        file — NOT in `memories.db` (no schema/table addition; this is
+        cadence bookkeeping, not calibration data, exactly what `persisted_
+        cadence.py` exists for). Once real data clears the threshold on
+        some day, `derive_and_persist_floor` writes a real row and
+        `reranker_floor_is_stale` goes False on the very next check
+        regardless of this gate's state — self-healing, per the spec.
+
+    Idempotent BY CONSTRUCTION once a row exists, not by a separate one-shot
+    flag: an accepted `derive_and_persist_floor` call always stamps the
+    fresh row `score_scale = CALIBRATION_SCORE_SCALE` (`MemoryStore.
+    write_reranker_floor`'s default), so the very next call to this
+    function — another startup, or interleaved with a normal daily tick —
+    reads `reranker_floor_is_stale() == False` and returns immediately
+    without re-deriving. This survives a real process restart (the marker
+    lives in `memories.db`, not in-process state), unlike a boot-time flag
+    — and the no-row gate above survives a real restart the same way (a
+    JSON file under `persona_dir`, not in-process state).
+
+    Placed at the bridge-startup seam in `run_folded`, immediately after
+    the existing F2a startup catch-up calibration tick — but unlike that
+    catch-up (which reuses `_run_calibration_tick`'s prune + judge-label +
+    cadence-scoped floor derivation), this is deliberately its OWN,
+    narrower function: no pruning, no judge-labeling, no cadence-due check
+    on the migration path — only the one scale-transition floor derivation,
+    so a deploy recovers a scale-correct floor even when the daily cadence
+    itself is disabled for a long window or has not yet come due.
+
+    Fault-isolated by the CALLER (`run_folded`'s `try/except
+    logger.warning`, mirroring every other one-shot startup step in this
+    function) — a failure constructing the store, the reranker provider, or
+    running the derivation must never crash bridge startup; the stale row
+    (or absence of one) is simply picked up again on the next startup.
+    """
+    with ExitStack() as stack:
+        # integrity_check=False mirrors every other background-tick store
+        # open in this file (compaction/calibration/clustering ticks) — a
+        # full PRAGMA integrity_check on a one-shot startup check is
+        # unwarranted.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        from brain.memory.reranker import build_reranker_provider
+
+        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+
+        if not store.reranker_floor_is_stale(current_reranker_model_id):
+            logger.info(
+                "deploy recalibration check: %s already normalized-scale, skipping",
+                current_reranker_model_id,
+            )
+            return
+
+        # Change 1's §6 gate (see docstring above): only the no-row case is
+        # rate-limited — an existing raw-scale row always migrates now.
+        if store.get_persisted_reranker_floor(current_reranker_model_id) is None:
+            now = datetime.now(UTC)
+            retry_cadence = persisted_cadence.load_cadence(
+                persona_dir, _DEPLOY_RECAL_RETRY_CADENCE_FILE
+            )
+            if not persisted_cadence.is_due(retry_cadence, now=now):
+                logger.info(
+                    "deploy recalibration check: %s has no persisted floor yet (Change 1's "
+                    "data-starvation ramp, or a genuinely fresh install) and was already "
+                    "retried within the last %.0fs — skipping this restart to avoid "
+                    "re-spinning; the daily calibration tick stays the authoritative path "
+                    "once enough data accumulates",
+                    current_reranker_model_id,
+                    _DEPLOY_RECAL_RETRY_INTERVAL_SECONDS,
+                )
+                return
+            persisted_cadence.save_cadence(
+                persona_dir,
+                _DEPLOY_RECAL_RETRY_CADENCE_FILE,
+                persisted_cadence.advance(now=now, interval_s=_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS),
+            )
+
+        from brain.memory import floor_calibration
+
+        outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
+        logger.info(
+            "deploy recalibration check: out-of-cycle floor derivation for %s -> "
+            "accepted=%s floor=%s cold_start=%s held_for_data_starvation=%s sample_pairs=%d",
+            current_reranker_model_id,
+            outcome.accepted,
+            outcome.floor,
+            outcome.is_cold_start,
+            outcome.held_for_data_starvation,
+            outcome.sample_pairs,
+        )
 
 
 def _run_finalize_tick(

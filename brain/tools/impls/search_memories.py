@@ -102,6 +102,12 @@ def _semantic_top_k(
     the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
     get_rerank_width``, same auto-scaling ``run_semantic_recall`` uses).
 
+    F2b (#276 §2/§4): the score compared against the floor is the
+    per-query anchor-median NORMALIZED score (``reranker.normalize_
+    against_anchors``), not the raw cross-encoder score — same mechanism
+    and ordering (normalize THEN gate) as ``run_semantic_recall``'s
+    identical composition. This site has no calibration-log write.
+
     The reranker here improves ORDERING; the CALIBRATED reranker floor
     (F2a inc8, #250 §7/§8 cutover — read live via
     ``store.get_reranker_floor(reranker_provider.model_id())``, replacing
@@ -169,8 +175,21 @@ def _semantic_top_k(
         width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
         to_rerank = coarse[:width]
         rerank_ids = [mid for mid, _ in to_rerank]
-        documents = [pool[mid][0].content for mid in rerank_ids]
-        rerank_scores = list(reranker_provider.rerank(query, documents))
+        real_documents = [pool[mid][0].content for mid in rerank_ids]
+        # F2b (#276 §2/§4): normalize against the anchor median BEFORE the
+        # floor gate below — mirrors `run_semantic_recall`'s identical
+        # wiring (inc1's `normalize_against_anchors` is reused unchanged,
+        # not reimplemented here). `scored_ids` is the PREFIX of
+        # `rerank_ids` actually scored this call (`result.real_width` <=
+        # `width`); `result.scores` is positionally aligned with it 1:1.
+        # This site has no calibration-log write to re-point (confirmed —
+        # only `run_semantic_recall` logs). Anchors never leave the helper,
+        # so they can never enter `scored_ids`/the gate/the returned list.
+        normalization = reranker_mod.normalize_against_anchors(
+            reranker_provider, query, real_documents, width
+        )
+        scored_ids = rerank_ids[: normalization.real_width]
+        rerank_scores = normalization.scores
 
         # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
         # by the RUNTIME reranker model_id — mirrors `run_semantic_recall`'s
@@ -200,7 +219,7 @@ def _semantic_top_k(
 
         reranked = [
             (mid, score)
-            for mid, score in zip(rerank_ids, rerank_scores, strict=True)
+            for mid, score in zip(scored_ids, rerank_scores, strict=True)
             if score >= floor_row["floor"]
         ]
         if not reranked:

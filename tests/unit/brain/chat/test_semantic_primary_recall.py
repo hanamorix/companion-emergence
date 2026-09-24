@@ -162,10 +162,28 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     """Script the RERANKER score per memory-content text (#231: reranker
     score, not cosine, decides surfacing). Any content NOT listed here falls
     back to FakeRerankerProvider's default — far below any plausible floor,
-    so it never accidentally clears it."""
+    so it never accidentally clears it.
+
+    F2b (#276 §2/§4): the floor gate now compares the per-query anchor-
+    median NORMALIZED score (`raw - median(anchor_scores)`), not the raw
+    one — see `brain.memory.reranker.normalize_against_anchors`. Anchor
+    content is pinned to a fixed neutral score (0.0) here, UNLESS a caller's
+    own `scores` already covers it, so `median(anchor_scores) == 0.0` and
+    `normalized == raw - 0.0 == raw` for every test in this suite: this
+    restores this helper's own stated invariant exactly (an unscripted
+    candidate's raw default stays far below any floor post-normalization
+    too) and keeps every ALREADY-SCRIPTED score in this file meaning
+    exactly what it always meant, byte-for-byte. Mirrors
+    `tests/conftest.py`'s `_fake_reranker_provider_by_default` fixture's
+    identical fix for the SAME collision (its docstring has the full
+    explanation) — this helper builds its OWN provider instance per test,
+    bypassing that suite-wide default, so it needs the same fix locally."""
+    from brain.memory.reranker import ANCHOR_POOL
+
+    scores_with_neutral_anchors = {**dict.fromkeys(ANCHOR_POOL, 0.0), **scores}
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scores_with_neutral_anchors),
     )
 
 
@@ -321,6 +339,18 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     dim = _EMBED_DIM
     contents = [f"standout memory number {i}" for i in range(6)]
     noise_content = "noise memory scored but never surfaced"
+    # F2b (#276 §3): anchors are RESERVED OUT of the auto-scaled rerank
+    # width (`real_width = width - k`, `k` growing with width) — so with
+    # only the 7 candidates above, `width == 7` would narrow `real_width`
+    # to 4, silently dropping `noise_content` (rank 6) and two standouts
+    # from ever reaching the reranker at all. These low-cosine filler
+    # candidates pad `width` up (to 15: real_width == 8) so all 7 of the
+    # candidates this test actually cares about stay within real_width —
+    # they rank BELOW noise_content and are intentionally left unscripted
+    # (falling to FakeRerankerProvider's far-below-floor default, same as
+    # noise_content historically relied on pre-F2b), so they play no part
+    # in this test's own assertions either way.
+    filler_contents = [f"unrelated filler memory {i}" for i in range(8)]
 
     # Cosine vectors just need to be nonzero and distinct enough to populate
     # + coarse-cut the pool — the reranker score (below) is what actually
@@ -329,15 +359,19 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     for i, content in enumerate(contents):
         vectors[content] = _unit_vec_with_cosine(0.9 - 0.02 * i)
     vectors[noise_content] = _unit_vec_with_cosine(0.5)
+    for i, content in enumerate(filler_contents):
+        vectors[content] = _unit_vec_with_cosine(0.3 - 0.01 * i)
 
     store = _store(tmp_path)
     mems = [_mem(store, c) for c in contents]
     noise_mem = _mem(store, noise_content)
+    filler_mems = [_mem(store, c) for c in filler_contents]
     before = {m.id: _rc(store, m.id) for m in mems}
     before_noise = _rc(store, noise_mem.id)
 
     contents_by_id = {m.id: c for m, c in zip(mems, contents, strict=True)}
     contents_by_id[noise_mem.id] = noise_content
+    contents_by_id.update({m.id: c for m, c in zip(filler_mems, filler_contents, strict=True)})
     _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(store)
@@ -367,6 +401,11 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     # selected — must not be bumped at all.
     assert _rc(store, noise_mem.id) == before_noise
 
+    # The low-cosine filler padding never surfaces either — it exists only
+    # to keep F2b's anchor reservation from narrowing real_width below the
+    # 7 candidates this test actually cares about (see its seeding comment).
+    assert not {m.id for m in filler_mems} & set(ids)
+
 
 # ---------------------------------------------------------------------------
 # #231 correction: 10+ candidates ALL clearing the floor is capped at
@@ -383,15 +422,28 @@ def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
     query = "capped query"
     dim = _EMBED_DIM
     contents = [f"clearly relevant memory number {i}" for i in range(12)]
+    # F2b (#276 §3): with only the 12 candidates above, `width == 12` would
+    # narrow `real_width` to 6 (anchors reserved out of width), so fewer
+    # than 9 of them would ever reach the reranker at all — this padding
+    # (low-cosine, unscripted, never scored/surfaced either way) widens
+    # `width` to 18 (`real_width == 10`), enough for MORE than
+    # MAX_STANDOUT_COUNT to actually clear the floor, so the assertion
+    # below genuinely exercises the CAP, not just real_width narrowing.
+    filler_contents = [f"unrelated filler memory {i}" for i in range(6)]
 
     vectors = {query: _query_unit_vec()}
     for i, content in enumerate(contents):
         vectors[content] = _unit_vec_with_cosine(0.9 - 0.01 * i)
+    for i, content in enumerate(filler_contents):
+        vectors[content] = _unit_vec_with_cosine(0.3 - 0.01 * i)
 
     store = _store(tmp_path)
     mems = [_mem(store, c) for c in contents]
+    filler_mems = [_mem(store, c) for c in filler_contents]
 
-    _seed_vectors(store, vectors, contents_by_id={m.id: c for m, c in zip(mems, contents, strict=True)})
+    contents_by_id = {m.id: c for m, c in zip(mems, contents, strict=True)}
+    contents_by_id.update({m.id: c for m, c in zip(filler_mems, filler_contents, strict=True)})
+    _seed_vectors(store, vectors, contents_by_id=contents_by_id)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(store)
     _patch_reranker(
@@ -407,6 +459,7 @@ def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
     # arbitrary/lexical selection.
     expected_top9_ids = {m.id for m in mems[:9]}
     assert set(ids) == expected_top9_ids
+    assert not {m.id for m in filler_mems} & set(ids), "the low-cosine padding never surfaces"
 
 
 # ---------------------------------------------------------------------------

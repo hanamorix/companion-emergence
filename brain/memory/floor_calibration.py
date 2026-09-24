@@ -87,6 +87,15 @@ through the EXACT `model_id` `get_reranker_floor`'s caller is asking about
 recursion through). Never touches the §6 torch-backed relevance judge —
 jina (ONNX, via `reranker.CrossEncoderProvider`) is the only model
 involved.
+
+F2b §5b (#276 inc3, UNCHANGED by Change 1): both this hot-path bootstrap
+AND (formerly) the now-removed `derive_and_persist_floor` cold-start
+branch fit on the per-query ANCHOR-NORMALIZED score
+(`raw - median(anchor_scores)`, `reranker.normalize_bundled_pairs_against_
+anchors` — the FULL curated anchor pool, off the hot path), not the raw
+reranker score, so the fit lands on the same scale the per-recall floor
+gate (`reranker.normalize_against_anchors`) compares against. See
+`_cold_start_pairs` below for the shared normalization mechanism.
 """
 
 from __future__ import annotations
@@ -293,20 +302,31 @@ def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, 
     recall uses, so the bootstrap floor sits on the correct scale even
     before any real corpus data exists.
 
+    F2b §5b (#276 inc3): each pair's score is now the per-query
+    ANCHOR-NORMALIZED score (`raw - median(anchor_scores)`,
+    `reranker.normalize_bundled_pairs_against_anchors` — the SAME shared
+    `_median_normalize` core `normalize_against_anchors` (the per-recall
+    gate) uses, scored against the FULL curated anchor pool rather than the
+    gate's latency-limited `k`-subset — see that function's docstring and
+    the spec's §5b "FULL pool P, NOT the per-recall k" requirement), not the
+    raw reranker score. This is what makes this cold-start path land on the
+    same normalized scale the per-recall floor gate compares against
+    (`normalize_against_anchors` in `semantic_recall.py` /
+    `search_memories.py`) — before the original §5b fix, this source fit a
+    raw-scale floor while the gate compared a normalized score against it,
+    an under-abstention scale mismatch.
+
     Pre-flip revision Change 1: the ONLY caller of this helper is now
     `get_bootstrap_floor` below — `derive_and_persist_floor`'s own
     cold-start branch (the daily-tick path this helper used to ALSO back)
     is removed; see the module docstring.
     """
-    from brain.memory.reranker import _FP16_GATE_PAIRS
+    from brain.memory.reranker import _FP16_GATE_PAIRS, normalize_bundled_pairs_against_anchors
 
     labeled_slice = _FP16_GATE_PAIRS[:6]
     labels = ["relevant"] * 3 + ["irrelevant"] * 3
-    pairs: list[tuple[float, str]] = []
-    for (query, doc), label in zip(labeled_slice, labels, strict=True):
-        (score,) = reranker_provider.rerank(query, [doc])
-        pairs.append((float(score), label))
-    return pairs
+    normalized_scores = normalize_bundled_pairs_against_anchors(reranker_provider, labeled_slice)
+    return list(zip((float(s) for s in normalized_scores), labels, strict=True))
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +375,11 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     (Youden's-J / F-beta, recall-leaning) every other floor in this module
     uses — no separate/duplicated fitting logic. Scored through whichever
     model_id the caller asked about, so the result sits on that exact
-    model's score scale (fp32 or fp16, whichever is the runtime reranker).
+    model's score scale (fp32 or fp16, whichever is the runtime reranker) —
+    F2b §5b (#276 inc3): via `_cold_start_pairs`, this is now the
+    NORMALIZED scale (`raw - median(anchor_scores)`, scored against the
+    FULL curated anchor pool), matching what the per-recall gate compares
+    against.
 
     COMPUTE CONSTRAINT (load-bearing, spec Section 7): computed ONCE per
     model_id (this cache) and NEVER involves the §6 torch-backed relevance

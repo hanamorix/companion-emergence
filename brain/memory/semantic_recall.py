@@ -246,6 +246,13 @@ class SemanticRecallResult:
     number (tests, logging). NOTE: unlike the pre-#231 cosine-era version,
     `scores` only covers candidates that were actually reranked (the
     auto-scaled-width slice of the cosine coarse-cut), not the whole pool.
+
+    F2b (#276 §2): as of the per-query anchor-median normalization, this is
+    the NORMALIZED score (`raw - median(anchor_scores)`, or raw unmodified
+    on a near-degenerate-width no-op — see `reranker.normalize_against_
+    anchors`) — the SAME value the floor gate actually compared against,
+    never the pre-normalization raw reranker score. Anchor documents are
+    never candidates, so they never appear here.
     """
 
     full: list[Memory]
@@ -341,22 +348,46 @@ def run_semantic_recall(
         width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
         to_rerank = coarse[:width]
         rerank_ids = [mid for mid, _ in to_rerank]
-        documents = [pool[mid][0].content for mid in rerank_ids]
-        rerank_scores = list(reranker_provider.rerank(user_input, documents))
+        real_documents = [pool[mid][0].content for mid in rerank_ids]
+        # F2b (#276 §2/§4): one combined rerank() call (real candidates +
+        # hardware-derived anchor count), normalized against the anchor
+        # median BEFORE anything downstream (the log write, the floor gate)
+        # ever sees a score — `normalize_against_anchors` is inc1's already-
+        # built, already-tested helper; this call site only wires it in, it
+        # does not reimplement any of its arithmetic. `scored_ids` is the
+        # PREFIX of `rerank_ids` that was actually scored this call
+        # (`result.real_width` <= `width` — fewer than `width` only when
+        # anchors were reserved out of it, spec §3); `result.scores` is
+        # positionally aligned with `scored_ids` 1:1. Anchors themselves
+        # never appear in `result.scores`/`scored_ids` — this is computed
+        # entirely inside the helper and never leaves it, so there is
+        # nothing here that could leak an anchor id/content into the
+        # log write, the gate, or the surfaced result below.
+        normalization = reranker_mod.normalize_against_anchors(
+            reranker_provider, user_input, real_documents, width
+        )
+        scored_ids = rerank_ids[: normalization.real_width]
+        rerank_scores = normalization.scores
         try:
-            # F2a (#250 inc4): real-query calibration logging (spec Section
-            # 4). `user_input` is logged byte-identical to what was just
-            # embedded/reranked above — no synthetic/reconstructed query.
-            # `rerank_ids`/`rerank_scores` are the already-computed per-turn
-            # rerank output, reused as-is (no recompute). One bounded INSERT,
-            # off the hot path in every sense but this single cheap write
-            # (I6). Wrapped separately from the outer fail-soft `except`
-            # below so a logging failure can NEVER demote a good semantic
-            # result to the lexical fallback — it only loses that one turn's
-            # calibration row.
+            # F2a (#250 inc4), re-pointed by F2b (#276 §5): real-query
+            # calibration logging (spec Section 4/5). `user_input` is logged
+            # byte-identical to what was just embedded/reranked above — no
+            # synthetic/reconstructed query. `scored_ids`/`rerank_scores`
+            # are the SAME already-computed, already-NORMALIZED per-turn
+            # values that feed the floor gate just below (computed once,
+            # above, reused as-is here) — never the raw pre-normalization
+            # score, and never more ids than were actually scored this call
+            # (`scored_ids`, not the full `rerank_ids`, when anchors
+            # narrowed `real_width` below `width`). `log_calibration_sample`
+            # stamps the current score_scale on this row itself. One
+            # bounded INSERT, off the hot path in every sense but this
+            # single cheap write (I6). Wrapped separately from the outer
+            # fail-soft `except` below so a logging failure can NEVER demote
+            # a good semantic result to the lexical fallback — it only
+            # loses that one turn's calibration row.
             store.log_calibration_sample(
                 query=user_input,
-                candidate_ids=rerank_ids,
+                candidate_ids=scored_ids,
                 reranker_scores=rerank_scores,
                 reranker_model_id=reranker_provider.model_id(),
             )
@@ -365,7 +396,7 @@ def run_semantic_recall(
                 "run_semantic_recall: calibration log write failed — continuing",
                 exc_info=True,
             )
-        reranked = list(zip(rerank_ids, rerank_scores, strict=True))
+        reranked = list(zip(scored_ids, rerank_scores, strict=True))
         reranked.sort(key=lambda pair: -pair[1])
 
         # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed

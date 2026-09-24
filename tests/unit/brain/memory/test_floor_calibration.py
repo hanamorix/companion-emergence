@@ -35,21 +35,39 @@ from brain.memory.floor_calibration import (
     derive_retention_window_days,
     fit_threshold_fbeta,
 )
-from brain.memory.reranker import FakeRerankerProvider
-from brain.memory.store import MemoryStore
+from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
+from brain.memory.store import CALIBRATION_SCORE_SCALE, MemoryStore
 
 MODEL_ID = "fake-reranker-for-floor-tests"
 
+# F2b §5b (#276 inc3): the cold-start/bootstrap fit now scores each bundled
+# pair against the FULL anchor pool and fits on `raw - median(anchor_scores)`
+# (normalized scale), not the raw reranker score. Anchor docs must
+# be given a REALISTIC score in these fixtures — leaving them at
+# FakeRerankerProvider's `_DEFAULT_UNSCORED` (-1000.0) sentinel would shift
+# every fitted floor by a constant +1000, a test-fixture artifact that would
+# mask any REAL scale bug rather than exercising genuine normalized-scale
+# arithmetic. -3.5 mirrors the spec's own cited real-jina figure for a
+# genuinely off-topic anchor ("gibberish bottoms ~-3.74", ledger F4) —
+# plausible, not hand-picked to make assertions pass.
+_ANCHOR_FIXTURE_SCORE = -3.5
+
+
 def _bundled_scores(relevant_score: float, irrelevant_score: float) -> dict[str, float]:
     """`reranker._FP16_GATE_PAIRS[:6]`'s 3 relevant / 3 irrelevant docs
-    scored at the given values — the shared fixture every cold-start/bootstrap
-    test in this file builds its `FakeRerankerProvider` from."""
+    scored at the given values, PLUS every `ANCHOR_POOL` document scored at
+    `_ANCHOR_FIXTURE_SCORE` — the shared fixture every cold-start/bootstrap
+    test in this file builds its `FakeRerankerProvider` from, so the
+    anchor-normalization these floor sources now run (§5b) has a realistic,
+    non-degenerate anchor median to normalize against."""
     from brain.memory.reranker import _FP16_GATE_PAIRS
 
-    return {
+    scores = {
         doc: (relevant_score if i < 3 else irrelevant_score)
         for i, (_query, doc) in enumerate(_FP16_GATE_PAIRS[:6])
     }
+    scores.update(dict.fromkeys(ANCHOR_POOL, _ANCHOR_FIXTURE_SCORE))
+    return scores
 
 
 @pytest.fixture
@@ -70,6 +88,13 @@ def _seed_labeled_row(
     log_calibration_sample + write_calibration_labels' two-step API, since
     these tests want the row fully labeled in one shot).
 
+    F2b (#276 §5): explicitly stamped `score_scale = CALIBRATION_SCORE_SCALE`
+    ('normalized') — these tests exercise the floor-derivation FIT logic
+    against today's live scale, not the pre-F2b raw one, so a row seeded
+    here must read the same way a real `log_calibration_sample` write would
+    (or `labeled_calibration_pairs`'s F2b scale filter would silently drop
+    it, starving every fit test in this file of its seeded pairs).
+
     `day_bucket` (pre-flip revision Change 1): `None` (the default) leaves
     the column's own `strftime('%Y-%m-%d','now')` default in place — every
     row in a test that never passes this lands on the SAME (today's) day,
@@ -77,16 +102,14 @@ def _seed_labeled_row(
     care about it. Tests that DO exercise the day filter pass an explicit
     value.
     """
-    import json
-
     if haiku_labels is None:
         haiku_labels = [None] * len(labels)
     if day_bucket is None:
         store._conn.execute(
             "INSERT INTO calibration_log "
             "(query, candidate_ids, reranker_scores, reranker_model_id, local_judge_label, "
-            "haiku_label) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "haiku_label, score_scale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 "some query",
                 json.dumps([f"m{i}" for i in range(len(scores))]),
@@ -94,14 +117,15 @@ def _seed_labeled_row(
                 reranker_model_id,
                 json.dumps(labels),
                 json.dumps(haiku_labels),
+                CALIBRATION_SCORE_SCALE,
             ),
         )
     else:
         store._conn.execute(
             "INSERT INTO calibration_log "
             "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
-            "local_judge_label, haiku_label) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "local_judge_label, haiku_label, score_scale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 day_bucket,
                 "some query",
@@ -110,6 +134,7 @@ def _seed_labeled_row(
                 reranker_model_id,
                 json.dumps(labels),
                 json.dumps(haiku_labels),
+                CALIBRATION_SCORE_SCALE,
             ),
         )
     store._conn.commit()
@@ -658,6 +683,37 @@ def test_lock_repro_reversed_floor_tracks_a_sustained_shift_within_two_days(
 
 
 # ---------------------------------------------------------------------------
+# Cold-start bootstrap fit (_cold_start_pairs) — UNCHANGED mechanism,
+# but its ONLY remaining caller is get_bootstrap_floor (Change 1 removes
+# derive_and_persist_floor's own cold-start branch).
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_pairs_uses_the_shared_anchor_normalization_helper() -> None:
+    """AC13(a)/AC13 (F2b §5b, unaffected by Change 1): `_cold_start_pairs`
+    must produce EXACTLY what the shared `reranker.normalize_bundled_pairs_
+    against_anchors` helper computes for the same provider/pairs."""
+    from brain.memory.floor_calibration import _cold_start_pairs
+    from brain.memory.reranker import _FP16_GATE_PAIRS, normalize_bundled_pairs_against_anchors
+
+    provider = FakeRerankerProvider(scores=_bundled_scores(2.5, -3.0))
+
+    pairs = _cold_start_pairs(provider)
+    scores_only = [s for s, _label in pairs]
+    labels_only = [label for _s, label in pairs]
+
+    assert labels_only == ["relevant"] * 3 + ["irrelevant"] * 3
+    assert scores_only[0] != pytest.approx(2.5), (
+        "the cold-start pairs must NOT be raw reranker scores once §5b lands"
+    )
+
+    expected_scores = normalize_bundled_pairs_against_anchors(provider, _FP16_GATE_PAIRS[:6])
+    assert scores_only == pytest.approx(expected_scores), (
+        "_cold_start_pairs must produce EXACTLY the shared anchor-normalization helper's output"
+    )
+
+
+# ---------------------------------------------------------------------------
 # get_bootstrap_floor — F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): the
 # hot-path DEFAULT `get_reranker_floor` serves instead of None when no
 # persisted row exists yet. UNCHANGED by Change 1. All offline via a
@@ -677,21 +733,19 @@ def _install_bootstrap_provider(
     )
 
 
-def _bundled_scores(relevant_score: float, irrelevant_score: float) -> dict[str, float]:
-    from brain.memory.reranker import _FP16_GATE_PAIRS
-
-    return {
-        doc: (relevant_score if i < 3 else irrelevant_score)
-        for i, (_query, doc) in enumerate(_FP16_GATE_PAIRS[:6])
-    }
-
-
 def test_bootstrap_floor_lands_on_a_reachable_jina_scale_value_not_the_dead_constant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The bootstrap must be a REAL fit result on a reachable jina-scale
     logit (jina's raw scores run roughly -4..+4, per the spec) — never the
-    outgoing dead `-9.25` constant, and never an arbitrary hardcoded pin."""
+    outgoing dead `-9.25` constant, and never an arbitrary hardcoded pin.
+
+    §5b: the fit now runs on NORMALIZED scores (`raw -
+    _ANCHOR_FIXTURE_SCORE`, since `_bundled_scores` scores every anchor at
+    `_ANCHOR_FIXTURE_SCORE`), so the reachable window shifts by
+    `-_ANCHOR_FIXTURE_SCORE` from the raw cluster bounds — computed here
+    rather than re-hardcoded, so this test stays correct if the fixture
+    anchor score is ever retuned."""
     from brain.memory import floor_calibration
 
     floor_calibration._reset_bootstrap_floor_cache()
@@ -701,9 +755,11 @@ def test_bootstrap_floor_lands_on_a_reachable_jina_scale_value_not_the_dead_cons
 
     assert result is not None
     assert result["floor"] != pytest.approx(-9.25), "must not be the dead ported MiniLM constant"
-    assert -3.0 < result["floor"] < 2.5, (
+    normalized_lo = -3.0 - _ANCHOR_FIXTURE_SCORE
+    normalized_hi = 2.5 - _ANCHOR_FIXTURE_SCORE
+    assert normalized_lo < result["floor"] < normalized_hi, (
         "the fitted floor must sit strictly between the relevant/irrelevant clusters it was fit "
-        "from — a reachable value, not an extreme/placeholder"
+        "from (on the NORMALIZED scale, §5b) — a reachable value, not an extreme/placeholder"
     )
     assert result["raw_fit_floor"] == pytest.approx(result["floor"]), (
         "the bootstrap has no EMA history to smooth against — raw fit applied unchanged"
@@ -857,4 +913,104 @@ def test_bootstrap_floor_fails_soft_caches_nothing_and_retries_on_next_call(
     )
     assert model_id not in floor_calibration._bootstrap_floor_cache, (
         "the cache must still hold no entry for this model_id after a second failed attempt"
+    )
+
+
+def test_bootstrap_floor_normalization_never_reenters_get_reranker_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5b LOAD-BEARING PIN (mirrors F2a's own bootstrap recursion guard):
+    the bootstrap's anchor-normalization (scoring ANCHOR_POOL alongside
+    each bundled pair, through the SAME guarded `_bootstrap_reranker_
+    provider`) must NEVER re-enter `MemoryStore.get_reranker_floor` — doing
+    so would recurse straight back into `get_bootstrap_floor` itself.
+
+    Wraps `MemoryStore.get_reranker_floor` to COUNT calls; the ONE call this
+    test makes to trigger the bootstrap must not cause any further
+    (recursive) call — proving recursion depth stays at 1."""
+    from brain.memory import floor_calibration
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    _install_bootstrap_provider(monkeypatch, _bundled_scores(5.0, -5.0))
+
+    call_count = {"n": 0}
+    real_get_floor = MemoryStore.get_reranker_floor
+
+    def _counting_get_floor(self, reranker_model_id):
+        call_count["n"] += 1
+        return real_get_floor(self, reranker_model_id)
+
+    monkeypatch.setattr(MemoryStore, "get_reranker_floor", _counting_get_floor)
+
+    store = MemoryStore(db_path=":memory:")
+    result = store.get_reranker_floor("recursion-guard-test-model")
+
+    assert result is not None
+    assert call_count["n"] == 1, (
+        "the bootstrap's anchor-normalization must not re-enter get_reranker_floor — a count > 1 "
+        "means the normalization routed through a store-touching provider (e.g. "
+        "build_reranker_provider) instead of the guarded _bootstrap_reranker_provider"
+    )
+
+
+def test_ac13c_directional_guard_normalized_floor_correctly_abstains_what_raw_floor_wrongly_admits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC13(c): pins the FAILURE DIRECTION empirically, mirroring the
+    spec's own worked example (§5b: "raw -3 vs. a raw floor -1 correctly
+    abstains, but normalized = -3 - (-3) = 0 >= -1 WRONGLY admits").
+
+    Before §5b, an irrelevant candidate's per-call NORMALIZED score (`raw -
+    median(anchor_scores)`, anchors scoring low) can clear a floor that was
+    fit on RAW bundled-pair scores — comparing a normalized candidate score
+    against a raw-scale floor is the scale mismatch that under-abstains.
+    After §5b, the floor SOURCE is normalized too, so the SAME normalized
+    candidate score is correctly abstained against the now-normalized
+    floor.
+    """
+    from brain.memory import floor_calibration
+    from brain.memory.reranker import _FP16_GATE_PAIRS, ANCHOR_POOL, normalize_against_anchors
+
+    relevant_raw, irrelevant_raw, anchor_raw = 4.0, -6.0, -3.0
+    candidate_doc = "an irrelevant real-world candidate document, off-topic to the query"
+    scores = {
+        doc: (relevant_raw if i < 3 else irrelevant_raw)
+        for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])
+    }
+    scores.update(dict.fromkeys(ANCHOR_POOL, anchor_raw))
+    scores[candidate_doc] = irrelevant_raw + 3.0  # -3.0, mirrors the spec's own worked example
+    provider = FakeRerankerProvider(scores=scores)
+
+    # The OLD (pre-§5b) raw-scale floor: fitting DIRECTLY on the raw bundled
+    # scores, ignoring anchors entirely — exactly what `_cold_start_pairs`
+    # did before §5b.
+    raw_pairs = [(relevant_raw, "relevant")] * 3 + [(irrelevant_raw, "irrelevant")] * 3
+    raw_floor_old = fit_threshold_fbeta(raw_pairs, beta=FLOOR_FIT_BETA)
+
+    # The candidate's per-call NORMALIZED score, via the REAL gate-path
+    # helper (the same one run at recall time, semantic_recall.py §2).
+    real_documents = [candidate_doc, "filler-candidate-1", "filler-candidate-2"]
+    gate_result = normalize_against_anchors(provider, "some real query", real_documents, width=5)
+    assert gate_result.did_normalize is True
+    normalized_candidate_score = gate_result.scores[0]
+
+    assert normalized_candidate_score >= raw_floor_old, (
+        "PRE-FIX premise: the normalized candidate score must clear the OLD raw-scale floor — "
+        "proving the scale mismatch would have WRONGLY ADMITTED this irrelevant candidate"
+    )
+
+    # The FIXED (§5b) floor source: the bootstrap, now normalized-scale.
+    floor_calibration._reset_bootstrap_floor_cache()
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        lambda model_id: provider,
+    )
+    fixed = floor_calibration.get_bootstrap_floor("ac13c-directional-guard-model")
+
+    assert fixed is not None
+    normalized_floor_new = fixed["floor"]
+
+    assert normalized_candidate_score < normalized_floor_new, (
+        "POST-FIX: comparing the SAME normalized candidate score against the NOW-normalized "
+        "bootstrap floor must correctly ABSTAIN it — the exact direction §5b fixes"
     )
