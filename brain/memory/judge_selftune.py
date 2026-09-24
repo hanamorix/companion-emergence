@@ -202,6 +202,43 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
     return TUNE_GRADE_KNOB_REFIT  # last-resort: footprint estimates misconfigured; the floor still fits
 
 
+def _downgrade_for_missing_lora_extra(tune_grade: str) -> str:
+    """Optional-extra guard (F2c inc5a, Opus cold-review round 2, Planning
+    ruling) — the SAME partial-availability posture as
+    `_downgrade_for_oom_safety` above, for a different resource: the
+    LoRA/full-FT tune grades both need `brain.memory.judge_lora`'s training
+    mechanism, which needs `peft`/`datasets` — packages that live behind
+    the OPTIONAL `f2c-training` extra in `pyproject.toml`
+    (`uv sync --extra f2c-training`), not this project's always-installed
+    baseline (unlike torch/sentence-transformers, which the daily
+    calibration judge already needs unconditionally). A box whose RAM tier
+    WOULD select LoRA/full-FT but never installed that extra downgrades to
+    knob-refit — the same always-safe floor the cgroup-aware OOM guard
+    downgrades to, for the same reason: a tier this process cannot actually
+    EXECUTE is not a tier to select, RAM headroom or not.
+
+    `judge_lora.lora_available()` is a cheap try-import check (no heavy/
+    model load — see that function's own docstring), so it is safe to call
+    on every tick; imported here lazily (not at this module's own top
+    level) purely to keep this module's own import list minimal and
+    unchanged for anything that doesn't reach this branch — `judge_lora`'s
+    OWN top-level imports are already torch-free by construction (see its
+    module docstring), so this import carries no I6 risk either way.
+
+    knob-refit is a no-op call (`tune_grade == TUNE_GRADE_KNOB_REFIT`
+    already) — skipped without even checking availability, mirroring
+    `_downgrade_for_oom_safety`'s identical short-circuit for the same
+    grade.
+    """
+    if tune_grade == TUNE_GRADE_KNOB_REFIT:
+        return tune_grade
+    from brain.memory.judge_lora import lora_available
+
+    if lora_available():
+        return tune_grade
+    return TUNE_GRADE_KNOB_REFIT
+
+
 # ---------------------------------------------------------------------------
 # F2c inc3 — the knob-refit fit itself (spec §5: "fit the threshold/Platt
 # slope+intercept on the (judge-raw-score, effective-label) pairs"). Weak-
@@ -430,6 +467,7 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
         tune_grade = _select_tune_grade_by_ram(total_ram)
         effective_headroom = _available_ram_headroom_bytes()
         tune_grade = _downgrade_for_oom_safety(tune_grade, effective_headroom)
+        tune_grade = _downgrade_for_missing_lora_extra(tune_grade)
 
         # Knob-refit ALWAYS runs on the weak tier (spec §5) and is the
         # natural finishing step after any weight-retrain on mid/beefy

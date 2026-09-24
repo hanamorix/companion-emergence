@@ -248,6 +248,92 @@ def test_oom_guard_knob_refit_footprint_is_the_floor_it_never_downgrades_past() 
 
 
 # ---------------------------------------------------------------------------
+# _downgrade_for_missing_lora_extra — F2c inc5a's optional-extra guard
+# (Opus cold-review round 2, Planning ruling): the SAME downgrade-to-floor
+# posture as the OOM guard above, gated on `judge_lora.lora_available()`
+# instead of memory headroom.
+# ---------------------------------------------------------------------------
+
+
+def test_lora_extra_guard_keeps_grade_when_lora_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    import brain.memory.judge_lora as judge_lora
+
+    monkeypatch.setattr(judge_lora, "lora_available", lambda: True)
+    result = judge_selftune._downgrade_for_missing_lora_extra(judge_selftune.TUNE_GRADE_LORA)
+    assert result == judge_selftune.TUNE_GRADE_LORA
+
+
+def test_lora_extra_guard_downgrades_lora_to_knob_refit_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual BITE: `judge_lora.lora_available()` monkeypatched False
+    (the optional `f2c-training` extra isn't installed) on a LoRA-grade
+    pick must downgrade to the always-safe knob-refit floor -- mirrors
+    `test_oom_guard_bites_without_it_the_naive_pick_would_oom`'s "proves
+    the guard actually changes the outcome" posture."""
+    import brain.memory.judge_lora as judge_lora
+
+    monkeypatch.setattr(judge_lora, "lora_available", lambda: False)
+    result = judge_selftune._downgrade_for_missing_lora_extra(judge_selftune.TUNE_GRADE_LORA)
+    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_lora_extra_guard_downgrades_full_ft_to_knob_refit_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import brain.memory.judge_lora as judge_lora
+
+    monkeypatch.setattr(judge_lora, "lora_available", lambda: False)
+    result = judge_selftune._downgrade_for_missing_lora_extra(judge_selftune.TUNE_GRADE_FULL_FT)
+    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_lora_extra_guard_knob_refit_never_calls_lora_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """knob_refit short-circuits BEFORE checking availability at all --
+    mirrors `_downgrade_for_oom_safety`'s identical short-circuit for this
+    grade (the floor never needs to ask "is the optional extra installed"
+    since it never uses it)."""
+    import brain.memory.judge_lora as judge_lora
+
+    def _must_not_be_called() -> bool:
+        raise AssertionError("lora_available() must not be called for knob_refit")
+
+    monkeypatch.setattr(judge_lora, "lora_available", _must_not_be_called)
+    result = judge_selftune._downgrade_for_missing_lora_extra(judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_tick_downgrades_to_knob_refit_when_ram_selects_lora_but_extra_unavailable(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end BITE through the real tick: a scripted RAM config that
+    naively selects LoRA, with generous OOM headroom (the OOM guard alone
+    would KEEP the LoRA pick), but `lora_available()` monkeypatched False
+    -- the tick's actual `tune_grade` result must still land on knob-refit.
+    """
+    import brain.memory.judge_lora as judge_lora
+
+    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    _seed_labeled_rows(store, handful + 1)
+    monkeypatch.setattr(
+        judge_selftune, "_read_total_ram_bytes",
+        lambda: judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES + 1.0,
+    )
+    monkeypatch.setattr(
+        judge_selftune, "_available_ram_headroom_bytes",
+        lambda: judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0,  # generous: OOM guard alone keeps LoRA
+    )
+    monkeypatch.setattr(judge_lora, "lora_available", lambda: False)
+
+    result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
+
+    assert result["fired"] is True
+    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+# ---------------------------------------------------------------------------
 # MemoryStore.count_new_haiku_decisions / mark_selftune_consumed — the
 # >handful gate's data source (spec §2/§3), red-team fixes F-1 (per-row
 # consume-once, no MAX(id) watermark) + F-2 (count non-None POSITIONS, not
