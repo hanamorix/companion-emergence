@@ -345,7 +345,9 @@ def _fake_relevance_judge_provider_by_default(
     from brain.memory import relevance_judge
 
     monkeypatch.setattr(
-        relevance_judge, "build_judge_provider", lambda: relevance_judge.FakeRelevanceJudgeProvider()
+        relevance_judge,
+        "build_judge_provider",
+        lambda adapter_dir=None: relevance_judge.FakeRelevanceJudgeProvider(),
     )
 
 

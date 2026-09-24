@@ -34,6 +34,32 @@ dependencies = [
     # CUDA wheels would bloat the install footprint for no benefit.
     "torch>=2.2",
     "sentence-transformers>=3.0",
+    # F2c inc5b-2 (Roy 2026-09-24, reversing the inc5a optional-extras
+    # plan): the LoRA/full-FT judge weight-retrain training deps (peft +
+    # datasets, brain/memory/judge_lora.py) are now BASE dependencies, not
+    # an optional `f2c-training` extra. Reason: the feature must never
+    # require a user to run pip/python to enable it — a capable box must be
+    # able to train without a manual `uv sync --extra …` step. `torch` is
+    # already a base dep (the daily calibration judge needs it), so the
+    # added footprint is the `datasets` transitive chain (pandas/pyarrow/
+    # aiohttp); accepted as the cost of zero-manual-step enablement.
+    # `judge_selftune.py`'s tier-detect still downgrades to knob-refit on a
+    # low-RAM / cgroup-capped box, so a potato never RUNS the training path
+    # even though it now CARRIES the deps.
+    #
+    # `peft` pinned EXACT (not a range): peft's metadata declares an
+    # unbounded `transformers` dependency, and `transformers` is only pulled
+    # in transitively via sentence-transformers (locked at 5.17.0 in
+    # uv.lock), so uv's resolver has no compatibility signal to check peft
+    # against on its own. 0.21.0 is the version verified by hand against the
+    # #3980 LoRA train/save/reload smoke test with transformers 5.17.0
+    # (tests/unit/brain/memory/test_judge_lora.py); bumping peft, or letting
+    # the locked transformers version move, needs re-verifying that test.
+    "peft==0.21.0",
+    # sentence-transformers 6.1.0's CrossEncoderTrainer hard-requires HF
+    # `datasets` for ANY CrossEncoder training path (LoRA or full-FT).
+    # Lower bound matches sbert's own `[train]`/`[dev]` extra.
+    "datasets>=2.16.0",
 ]
 
 [project.optional-dependencies]
@@ -41,43 +67,6 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.5",
-]
-# F2c inc5a (Planning ruling, cold-review round 2): LoRA weight-retrain
-# training deps for the judge self-tune (brain/memory/judge_lora.py) —
-# OPTIONAL, not part of the always-installed baseline. Unlike torch/
-# sentence-transformers above (required unconditionally since F2a #250
-# inc6, because the daily calibration judge always needs them), `peft`/
-# `datasets` are needed ONLY by the LoRA/full-FT weight-retrain tiers,
-# which are themselves optional per-box (spec §1: weak-tier boxes never
-# select them) — bundling this weight into every install would cost every
-# potato-tier box the `datasets` transitive footprint (pandas/pyarrow/
-# aiohttp) for a training path it will never run. Install with
-# `uv sync --extra f2c-training`. `judge_lora.lora_available()` is the
-# runtime check that lets `judge_selftune.py`'s tier-detect downgrade to
-# the always-safe knob-refit floor when this extra isn't installed, and
-# `judge_lora.py`'s own lazy imports raise a clear, actionable ImportError
-# naming this extra when a caller reaches the training/reload paths
-# without it.
-f2c-training = [
-    # Pinned EXACT, not a range: peft's own metadata declares an unbounded
-    # `transformers` dependency (no upper bound), and `transformers` itself
-    # isn't a direct dependency of this project at all (only pulled in
-    # transitively via sentence-transformers, currently locked at 5.17.0 in
-    # uv.lock) — so uv's resolver has no compatibility signal to check peft
-    # against on its own. 0.21.0 is the version actually verified (by hand,
-    # running the #3980 LoRA train/save/reload smoke test against the
-    # transformers version locked at the time, 5.17.0) to work with this
-    # stack; bumping peft, or letting the locked transformers version move,
-    # needs re-verifying the smoke test
-    # (tests/unit/brain/memory/test_judge_lora.py).
-    "peft==0.21.0",
-    # sentence-transformers 6.1.0's CrossEncoderTrainer (and even its
-    # deprecated .fit() shim) hard-requires the HF `datasets` package at
-    # runtime (raises ImportError otherwise) for ANY CrossEncoder training
-    # path, LoRA or full-FT alike — not optional FOR THIS MECHANISM, even
-    # though the mechanism itself is an optional extra. Lower bound matches
-    # sbert's own `[train]`/`[dev]` extra (`datasets>=2.16.0`).
-    "datasets>=2.16.0",
 ]
 
 [project.scripts]

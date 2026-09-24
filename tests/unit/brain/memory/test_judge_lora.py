@@ -40,7 +40,6 @@ from brain.memory.judge_lora import (
     LoraRollbackHandle,
     build_lora_retrain_fn,
     load_lora_scorer,
-    lora_available,
 )
 
 # ---------------------------------------------------------------------------
@@ -278,6 +277,52 @@ def test_bug_3980_reload_via_peft_native_reproduces_exact_scores(tiny_model_dir:
     )
 
 
+def test_save_adapter_dir_persists_a_reloadable_adapter(tiny_model_dir: Path, tmp_path: Path) -> None:
+    """F2c inc5b-2 (C10): `build_lora_retrain_fn(save_adapter_dir=X)` persists
+    the trained adapter to X (the STAGED dir the tick swaps into the champion
+    pointer on ACCEPT), and `load_lora_scorer` reloads it via the #3980-safe
+    peft path so the reloaded model reproduces the trained model's labels —
+    the WIRED persist->reload path, distinct from the manual save in
+    `test_bug_3980_reload_via_peft_native_reproduces_exact_scores`."""
+    import torch
+
+    from brain.memory.relevance_judge import label_for_score
+
+    torch.manual_seed(0)
+    staged = tmp_path / "staged_adapter"
+    retrain_fn = build_lora_retrain_fn(
+        tiny_model_dir,
+        target_modules=_TARGET_MODULES,
+        modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4,
+        epochs=2,
+        save_adapter_dir=staged,
+    )
+    label_fn = retrain_fn(_TRAIN_TRIPLES)
+
+    # The adapter was persisted to the staged dir (not left in the deleted
+    # training scratch dir).
+    assert staged.is_dir() and any(staged.iterdir()), "adapter not persisted to save_adapter_dir"
+
+    # Reload via load_lora_scorer (peft PeftModel.from_pretrained) and confirm
+    # the reloaded model's labels match the in-memory trained label fn's.
+    scorer = load_lora_scorer(tiny_model_dir, staged)
+    for item in _FIXED_EVAL_ITEMS:
+        reloaded_label, _amb = label_for_score(scorer(item))
+        assert reloaded_label == label_fn(item), item
+
+
+def test_save_adapter_dir_none_leaves_no_save(tiny_model_dir: Path, tmp_path: Path) -> None:
+    """Default `save_adapter_dir=None` is the inc5a in-memory-only behavior —
+    no directory is written."""
+    retrain_fn = build_lora_retrain_fn(
+        tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=1,
+    )
+    retrain_fn(_TRAIN_TRIPLES)
+    assert not (tmp_path / "staged_adapter").exists()
+
+
 # ---------------------------------------------------------------------------
 # build_lora_retrain_fn: produces a working label callable.
 # ---------------------------------------------------------------------------
@@ -435,91 +480,6 @@ def test_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> N
     second = train_and_score()
     assert first == second
 
-
-# ---------------------------------------------------------------------------
-# Optional-extra guard (Opus cold-review round 2, Planning ruling):
-# `lora_available()` + the import-guard ImportError message on the three
-# lazy-import sites.
-# ---------------------------------------------------------------------------
-
-
-def test_lora_available_is_true_in_this_dev_env() -> None:
-    """This worktree was `uv sync --all-extras`'d for testing, so the
-    optional `f2c-training` extra (peft + datasets) IS installed here --
-    `lora_available()` must reflect that."""
-    assert lora_available() is True
-
-
-def test_lora_available_is_a_cheap_check_that_does_not_import_torch() -> None:
-    """`lora_available()` uses `importlib.util.find_spec`, never a bare
-    `import sentence_transformers` -- a fresh subprocess proves calling it
-    never pulls torch/sentence_transformers into `sys.modules`, even though
-    `sentence_transformers` IS one of the three packages it checks for
-    (checking it must not mean IMPORTING it)."""
-    script = textwrap.dedent(
-        """
-        import sys
-
-        from brain.memory.judge_lora import lora_available
-
-        assert lora_available() is True, "expected True in this all-extras dev env"
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-
-
-def test_retrain_fn_import_guard_names_the_f2c_training_extra(
-    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Simulate a missing `peft` (without actually uninstalling it):
-    `sys.modules["peft"] = None` makes `import peft` raise `ImportError`,
-    same as a genuinely-absent package. `retrain_fn`'s call-time import
-    guard must turn that into ONE clear message naming the `f2c-training`
-    extra, not a bare `ModuleNotFoundError` surfacing from inside the
-    function."""
-    monkeypatch.setitem(sys.modules, "peft", None)
-
-    retrain_fn = build_lora_retrain_fn(
-        tiny_model_dir,
-        target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE,
-        lora_rank=4,
-        epochs=1,
-    )
-    with pytest.raises(ImportError, match="f2c-training"):
-        retrain_fn(_TRAIN_TRIPLES)
-
-
-def test_load_lora_scorer_import_guard_names_the_f2c_training_extra(
-    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setitem(sys.modules, "peft", None)
-
-    with pytest.raises(ImportError, match="f2c-training"):
-        load_lora_scorer(tiny_model_dir, tmp_path / "nonexistent-adapter-dir")
-
-
-def test_dataset_from_triples_import_guard_names_the_f2c_training_extra(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from brain.memory.judge_lora import _dataset_from_triples
-
-    monkeypatch.setitem(sys.modules, "datasets", None)
-
-    with pytest.raises(ImportError, match="f2c-training"):
-        _dataset_from_triples(_TRAIN_TRIPLES)
 
 
 # ---------------------------------------------------------------------------

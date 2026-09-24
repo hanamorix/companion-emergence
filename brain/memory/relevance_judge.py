@@ -277,24 +277,65 @@ class FakeRelevanceJudgeProvider(RelevanceJudgeProvider):
         return "fake-relevance-judge"
 
 
+class LoraAdapterJudge(RelevanceJudgeProvider):
+    """A per-persona TUNED judge backed by a saved LoRA adapter (F2c
+    inc5b-2, spec §5 "where the tuned judge loads from"). Wraps
+    `judge_lora.load_lora_scorer`'s `(query, doc) -> raw float` callable
+    (the #3980-safe peft reload) as a `RelevanceJudgeProvider`, so the daily
+    calibration tick serves a persona's tuned adapter exactly where it would
+    otherwise serve the base judge, and `label_for_score` applies the
+    persona's knob on top exactly as for the base judge.
+
+    `model_id()` returns the BASE model id, deliberately: the per-persona
+    knob (`judge_knob_calibration`) is keyed by the base judge model id
+    (inc4a), and the adapter is scoped per-persona by its DIRECTORY, not by
+    model id — so keeping model_id stable keeps `label_calibration_sample`'s
+    `get_judge_knob_calibration(judge.model_id())` lookup correct for both
+    the base and the tuned judge. Torch is imported lazily inside
+    `load_lora_scorer` (I6), never at this module's import time.
+    """
+
+    def __init__(
+        self, base_model_id: str, adapter_dir: str, *, cache_dir: str | None = None
+    ) -> None:
+        from brain.memory.judge_lora import load_lora_scorer
+
+        self._model_id = base_model_id
+        self._scorer = load_lora_scorer(base_model_id, adapter_dir, cache_dir=cache_dir)
+
+    def score(self, query: str, document: str) -> float:
+        return float(self._scorer((query, document)))
+
+    def model_id(self) -> str:
+        return self._model_id
+
+
 # Process-wide provider cache keyed by model_id (mirrors reranker.py's
 # _provider_cache). Kept at module scope so `_reset_judge_provider_cache`
 # (test-only) can reach it and so monkeypatching the *function* fully
-# controls behavior.
+# controls behavior. ONLY the shared BASE judge is cached here — a
+# per-persona adapter judge is built fresh per call and never cached (F2c
+# inc5b-2: a newly-accepted adapter every week would otherwise grow the
+# cache unbounded; the adapter judge is built at most once per daily
+# calibration tick, offline, so the once/day load cost is acceptable).
 _provider_cache: dict[str, RelevanceJudgeProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
-def build_judge_provider() -> RelevanceJudgeProvider:
-    """The production judge provider: `TorchCrossEncoderJudge` pinned to
-    `model_tier.TIER_RELEVANCE_JUDGE`'s model id, caching the model file in
-    the shared `get_cache_dir()` (one download across every persona on the
-    box, same reasoning as the embedder/reranker).
+def build_judge_provider(adapter_dir: str | None = None) -> RelevanceJudgeProvider:
+    """The production judge provider. With NO `adapter_dir`: the shared base
+    `TorchCrossEncoderJudge` pinned to `model_tier.TIER_RELEVANCE_JUDGE`'s
+    model id, caching the model file in the shared `get_cache_dir()` (one
+    download across every persona on the box) and PROCESS-WIDE cached by
+    model_id (double-checked locking) — unchanged from f2a-inc6.
 
-    PROCESS-WIDE CACHING, same rationale as `reranker.build_reranker_
-    provider`: constructing a `TorchCrossEncoderJudge` loads a real torch
-    model — expensive to redo every tick. Keyed by model_id (double-checked
-    locking: unlocked fast-path read for the common already-cached case).
+    With `adapter_dir` (F2c inc5b-2): a per-persona `LoraAdapterJudge`
+    serving that persona's tuned LoRA adapter (the #3980-safe peft reload),
+    built FRESH and NOT cached (see the `_provider_cache` note above). The
+    caller (`supervisor._run_calibration_tick`) resolves the persona's
+    champion-adapter pointer and passes the resolved dir here; an absent /
+    unresolvable pointer means the caller passes no `adapter_dir` and gets
+    the base judge (I9, absent → base, byte-identical to pre-inc5b2).
 
     TEST ISOLATION: tests must monkeypatch this function directly (mirrors
     `reranker.build_reranker_provider`'s test-fixture convention) rather
@@ -305,6 +346,9 @@ def build_judge_provider() -> RelevanceJudgeProvider:
     from brain.paths import get_cache_dir
 
     model_id = model_for_tier(TIER_RELEVANCE_JUDGE)
+
+    if adapter_dir is not None:
+        return LoraAdapterJudge(model_id, adapter_dir, cache_dir=str(get_cache_dir()))
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -394,6 +438,7 @@ def label_calibration_sample(
     provider: LLMProvider | None = None,
     judge: RelevanceJudgeProvider | None = None,
     sample_rows: int | None = None,
+    adapter_dir: str | None = None,
 ) -> int:
     """Label a SAMPLE of unlabeled `calibration_log` rows: the local judge
     (`judge`, or the real `build_judge_provider()` if not injected) scores
@@ -443,7 +488,12 @@ def label_calibration_sample(
 
     if judge is None:
         try:
-            judge = build_judge_provider()
+            # F2c inc5b-2: `adapter_dir` (this persona's resolved champion LoRA
+            # adapter, from `_run_calibration_tick`) serves the TUNED judge;
+            # None → the base judge (I9, byte-identical to pre-inc5b2). Built
+            # LAZILY here — only when there are actually rows to label — so a
+            # tick with nothing to do never loads a torch model.
+            judge = build_judge_provider(adapter_dir=adapter_dir)
         except Exception:  # noqa: BLE001 — torch missing, download failed, etc.
             logger.exception(
                 "calibration judge: failed to construct the local judge provider — skipping this pass"

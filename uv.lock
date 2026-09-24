@@ -427,12 +427,14 @@ version = "0.0.42"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
+    { name = "datasets" },
     { name = "ddgs" },
     { name = "fastapi" },
     { name = "fastembed" },
     { name = "httpx" },
     { name = "mcp" },
     { name = "numpy" },
+    { name = "peft" },
     { name = "platformdirs" },
     { name = "pypdf" },
     { name = "sentence-transformers" },
@@ -448,10 +450,6 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
-f2c-training = [
-    { name = "datasets" },
-    { name = "peft" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -461,14 +459,14 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=43" },
-    { name = "datasets", marker = "extra == 'f2c-training'", specifier = ">=2.16.0" },
+    { name = "datasets", specifier = ">=2.16.0" },
     { name = "ddgs", specifier = ">=6.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastembed", specifier = ">=0.4" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "peft", marker = "extra == 'f2c-training'", specifier = "==0.21.0" },
+    { name = "peft", specifier = "==0.21.0" },
     { name = "platformdirs", specifier = ">=4.2" },
     { name = "pypdf", specifier = ">=6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
@@ -479,7 +477,7 @@ requires-dist = [
     { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
-provides-extras = ["dev", "f2c-training"]
+provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "tdd-guard-pytest", specifier = ">=0.1.2" }]

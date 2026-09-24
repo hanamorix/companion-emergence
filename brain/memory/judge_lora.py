@@ -16,25 +16,27 @@ copies (`shutil.copytree`/`rmtree`) — genuinely torch-free, not merely
 scoped: they never load a model at all, by construction, which is also why
 a rollback is cheap enough to call on every champion/challenger cycle.
 
-OPTIONAL DEPENDENCY (Opus cold-review round 2, Planning ruling): `peft` and
-`datasets` are NOT part of this project's always-installed baseline — they
-live behind the optional `f2c-training` extra in `pyproject.toml`
-(`uv sync --extra f2c-training`), since only the LoRA/full-FT weight-retrain
-tiers need them (a weak-tier box never does). `lora_available()` below is a
-cheap try-import check (no heavy/model load) for callers — in particular
-`judge_selftune.py`'s tier-detect, which downgrades to the always-safe
-knob-refit floor when this extra isn't installed, mirroring its existing
-cgroup-aware OOM-safety downgrade. Every lazy-import site in this module
-that needs `peft`/`datasets`/`sentence_transformers` catches `ImportError`
-and re-raises with a clear pointer at the extra, rather than surfacing a
-bare `ModuleNotFoundError` from deep inside a training/reload call.
+BASE DEPENDENCIES (F2c inc5b-2, Roy 2026-09-24 — reverses the inc5a
+optional-extras plan): `peft` and `datasets` are now part of this project's
+always-installed baseline (`[project.dependencies]` in `pyproject.toml`),
+no longer an optional training extra. The feature must never require a user
+to run pip/python to enable it, so a capable box can train with no manual
+install step. They are still imported LAZILY here (torch-scoping, I6), but a
+missing one is now a broken-install error, not a "you forgot the extra"
+condition — so the lazy-import sites raise plainly and `judge_selftune.py`'s
+tier-detect no longer carries a missing-extra downgrade (RAM + cgroup-OOM
+only). A low-RAM / cgroup-capped potato still downgrades to the knob-refit
+floor and never RUNS the training path, even though it now CARRIES the deps.
 
-Scope (inc5a only — mirrors `judge_eval.py`'s own scoping note): this
-module builds the LoRA train/save/reload MECHANISM and proves it against a
-FROM-SCRATCH TINY model in its tests, never the real bge-reranker-v2-m3.
-It is NOT wired into `judge_selftune._run_judge_selftune_tick`'s tier
-dispatch (that wiring is inc5b, alongside the Haiku-only extraction
-`judge_eval.py`'s docstring already flags as owed). `target_modules` and
+Scope: this module builds the LoRA train/save/reload MECHANISM +, as of F2c
+inc5b-2, the per-persona champion-adapter store (the `champion_dir` /
+`staged_adapter_path` / `swap_champion_pointer` / `resolve_champion_adapter`
+/ `cleanup_stale_adapters` helpers at the bottom). It proves everything
+against a FROM-SCRATCH TINY model in its tests, never the real
+bge-reranker-v2-m3. `judge_selftune._run_judge_selftune_tick` (inc5b-2)
+drives it: on an AC6 ACCEPT it saves the challenger via `build_lora_retrain_fn`'s
+`save_adapter_dir` and atomically swaps the champion pointer.
+`target_modules` and
 `modules_to_save` are REQUIRED, caller-supplied arguments here, not
 hardcoded defaults: bge-reranker-v2-m3's actual attention/head module
 names are inc5b's job to confirm against the real checkpoint, and guessing
@@ -100,6 +102,7 @@ own `modules_to_save=["score"]` naming exactly):
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import uuid
 from collections.abc import Callable, Sequence
@@ -111,60 +114,6 @@ from brain.memory.judge_eval import RollbackHandle
 from brain.memory.relevance_judge import label_for_score
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Optional-dependency guard (Opus cold-review round 2, Planning ruling):
-# `peft`/`datasets` live behind pyproject.toml's `f2c-training` extra, not
-# this project's always-installed baseline (see module docstring). Every
-# lazy-import site below that needs them funnels through
-# `_require_training_deps`'s `ImportError` wrapping so a missing extra
-# fails with ONE clear, actionable message instead of a bare
-# `ModuleNotFoundError: No module named 'peft'` surfacing from deep inside
-# a training/reload call.
-# ---------------------------------------------------------------------------
-
-_F2C_TRAINING_EXTRA_HINT = (
-    "requires the optional 'f2c-training' extra (peft + datasets), which "
-    "is not installed -- install it with `uv sync --extra f2c-training` "
-    "(or `uv pip install '.[f2c-training]'` outside a uv-managed venv)."
-)
-
-
-def lora_available() -> bool:
-    """Cheap availability check: True iff `peft`, `datasets`, and
-    `sentence_transformers` are all INSTALLABLE-AND-FINDABLE. NO heavy/
-    model load, and — deliberately — no actual import either:
-    `importlib.util.find_spec` locates each package on the import path
-    without executing its `__init__.py`, so this check never triggers
-    `sentence_transformers`' own (transitive) `import torch` as a side
-    effect. A plain `try: import sentence_transformers` here would DO that
-    unconditionally, on every box whose RAM tier resolves to LoRA/full-FT —
-    defeating the very invariant this module's docstring and
-    `judge_selftune.py`'s own torch-free tick test guard for (torch stays
-    scoped to actually RUNNING the training/reload mechanism, never to
-    merely checking whether it's available). Safe to call on every weekly
-    tick regardless of which RAM tier is in play.
-
-    Used by `judge_selftune.py`'s tier-detect to decide whether a RAM tier
-    that WOULD select LoRA/full-FT is actually usable on this install —
-    downgrading to the always-safe knob-refit floor when the optional
-    `f2c-training` extra was never installed, the same posture as the
-    existing cgroup-aware OOM-safety downgrade (a tier this process cannot
-    actually execute is not a tier to select, RAM or extras).
-    """
-    import importlib.util
-
-    try:
-        return all(
-            importlib.util.find_spec(name) is not None
-            for name in ("peft", "datasets", "sentence_transformers")
-        )
-    except (ImportError, ValueError):
-        # find_spec can raise (rather than return None) for a malformed or
-        # partially-broken install; fail toward "not available" -- the
-        # same safe-floor posture as everywhere else in this guard.
-        return False
-
 
 # ---------------------------------------------------------------------------
 # Tunables (I3/I7) — shares the `judge_selftune.*` namespace with
@@ -242,10 +191,7 @@ def _label_to_float(label: str) -> float:
 
 
 def _dataset_from_triples(triples: Sequence[LabeledTriple]) -> Any:
-    try:
-        from datasets import Dataset
-    except ImportError as exc:
-        raise ImportError(f"judge_lora training {_F2C_TRAINING_EXTRA_HINT}") from exc
+    from datasets import Dataset  # base dep (F2c inc5b-2); lazy for torch-scoping only
 
     return Dataset.from_dict(
         {
@@ -277,9 +223,19 @@ def build_lora_retrain_fn(
     epochs: int | None = None,
     max_length: int | None = None,
     activation_fn: Callable[[Any], Any] | None = None,
+    save_adapter_dir: str | Path | None = None,
 ) -> Callable[[Sequence[LabeledTriple]], Callable[[tuple[str, str]], str]]:
     """Build a `retrain_fn` matching `judge_eval.run_champion_challenger`'s
     `Callable[[Sequence[Any]], Callable[[Any], str]]` contract.
+
+    `save_adapter_dir` (F2c inc5b-2): when set, `retrain_fn` ALSO saves the
+    trained adapter to this STAGED directory (via `CrossEncoder.
+    save_pretrained`) before returning the label-fn — so the tick can, ONLY
+    on an AC6 ACCEPT, atomically swap it into the persona's champion pointer
+    and `load_lora_scorer` it (both to re-score the knob on the tuned model
+    and to serve it). The label-fn still binds the trained IN-MEMORY model
+    for the forward-only eval regardless. `None` (default) = no save, the
+    inc5a in-memory-only behavior.
 
     `base_model_path`: a local path or hub id `sentence_transformers.
     CrossEncoder` can load (inc5a's TESTS always pass a from-scratch tiny
@@ -309,22 +265,17 @@ def build_lora_retrain_fn(
     """
 
     def retrain_fn(train_items: Sequence[LabeledTriple]) -> Callable[[tuple[str, str]], str]:
-        # Lazy imports (module docstring: never at this module's top
-        # level), import-guarded (Opus cold-review round 2): peft/
-        # sentence_transformers live behind the optional `f2c-training`
-        # extra (peft does; sentence-transformers is always installed, but
-        # is guarded alongside it here for ONE unified, clear error path
-        # regardless of which piece is actually missing).
-        try:
-            from peft import LoraConfig
-            from sentence_transformers import CrossEncoder
-            from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
-            from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
-            from sentence_transformers.cross_encoder.training_args import (
-                CrossEncoderTrainingArguments,
-            )
-        except ImportError as exc:
-            raise ImportError(f"build_lora_retrain_fn's retrain_fn {_F2C_TRAINING_EXTRA_HINT}") from exc
+        # Lazy imports (module docstring: never at this module's top level,
+        # to keep torch scoped to actually RUNNING training — I6). peft +
+        # datasets + sentence-transformers are all BASE deps (F2c inc5b-2),
+        # so a missing one is a broken install, surfaced plainly.
+        from peft import LoraConfig
+        from sentence_transformers import CrossEncoder
+        from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
+        from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+        from sentence_transformers.cross_encoder.training_args import (
+            CrossEncoderTrainingArguments,
+        )
 
         resolved_rank = (
             lora_rank
@@ -379,6 +330,13 @@ def build_lora_retrain_fn(
             )
             trainer = CrossEncoderTrainer(model=model, args=args, train_dataset=dataset, loss=loss_fn)
             trainer.train()
+
+        # F2c inc5b-2: persist the trained adapter to the caller's STAGED
+        # dir (outside the deleted scratch dir) so the tick can atomically
+        # swap it into the champion pointer + reload it (#3980-safe, via
+        # `load_lora_scorer`) on an AC6 ACCEPT. Only when requested.
+        if save_adapter_dir is not None:
+            model.save_pretrained(str(save_adapter_dir))
 
         def label_fn(item: tuple[str, str]) -> str:
             query, document = item[0], item[1]
@@ -435,11 +393,8 @@ def load_lora_scorer(
     this, the serve tokenizer applied no truncation while training did (via
     the CrossEncoder's own max_length) — a silent skew on long inputs.
     """
-    try:
-        from peft import PeftModel
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    except ImportError as exc:
-        raise ImportError(f"load_lora_scorer {_F2C_TRAINING_EXTRA_HINT}") from exc
+    from peft import PeftModel  # base dep (F2c inc5b-2); lazy for torch-scoping only
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     resolved_max_length = (
         max_length
@@ -524,3 +479,108 @@ class LoraRollbackHandle(RollbackHandle):
             shutil.rmtree(self._adapter_dir)
         if snapshot is not None:
             shutil.copytree(snapshot, self._adapter_dir)
+
+
+# ---------------------------------------------------------------------------
+# Per-persona champion-adapter store (F2c inc5b-2, spec §4/§5 "where the
+# tuned judge loads from" + crash-safety). TORCH-FREE, filesystem-only —
+# these never load a model. The persona's tuned judge lives under
+# `champion_dir(persona_dir)` as versioned `adapter-<uuid>` subdirs plus a
+# `current` POINTER FILE naming the active subdir. Persist = write a fresh
+# staged subdir, then atomically repoint `current` (write-temp + os.replace
+# on the same filesystem). A mid-tick crash resolves `current` to the
+# last-known-good adapter; an incomplete staged subdir is orphaned scratch,
+# never served. This supersedes inc5a's `LoraRollbackHandle` (a
+# copytree/rmtree mutate-in-place model) for the wiring: the atomic pointer
+# swap is strictly more crash-safe and needs no copy to roll back.
+# ---------------------------------------------------------------------------
+
+_CHAMPION_POINTER = "current"
+_ADAPTER_PREFIX = "adapter-"
+
+
+def champion_dir(persona_dir: str | Path) -> Path:
+    """The per-persona champion-adapter root: `persona_dir/models/relevance_judge/`
+    (spec §5, handoff PINNED CONTRACTS). Does not create it."""
+    return Path(persona_dir) / "models" / "relevance_judge"
+
+
+def staged_adapter_path(champion_root: str | Path) -> Path:
+    """A fresh, unique `adapter-<uuid>` subdir under `champion_root` for a
+    staged write (NOT yet the champion). Same filesystem as the `current`
+    pointer (both under `champion_root`), so the later `os.replace` swap is
+    atomic (C22). Creates `champion_root` (parents) but not the subdir
+    itself — `CrossEncoder.save_pretrained` creates it."""
+    root = Path(champion_root)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{_ADAPTER_PREFIX}{uuid.uuid4().hex}"
+
+
+def swap_champion_pointer(champion_root: str | Path, staged_subdir: str | Path) -> None:
+    """Atomically repoint `current` at `staged_subdir` (its basename). Writes
+    a temp pointer file under `champion_root` (same filesystem) and
+    `os.replace`s it onto `current` — a single atomic rename, so a concurrent
+    reader of `current` sees either the old or the new complete pointer,
+    never a torn one (C12)."""
+    root = Path(champion_root)
+    root.mkdir(parents=True, exist_ok=True)
+    name = Path(staged_subdir).name
+    tmp = root / f".{_CHAMPION_POINTER}.tmp-{uuid.uuid4().hex}"
+    tmp.write_text(name, encoding="utf-8")
+    os.replace(tmp, root / _CHAMPION_POINTER)
+
+
+def clear_champion_pointer(champion_root: str | Path) -> None:
+    """Remove the `current` pointer (best-effort, never raises) so the persona
+    resolves to the BASE judge again — used by the tick's post-swap-fault
+    rollback when there was no prior champion to roll back to (a first-ever
+    tune that faulted after its swap)."""
+    pointer = Path(champion_root) / _CHAMPION_POINTER
+    try:
+        pointer.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("clear_champion_pointer: failed to remove %s", pointer, exc_info=True)
+
+
+def resolve_champion_adapter(champion_root: str | Path) -> Path | None:
+    """Read `current` and return the adapter subdir it names, or `None`
+    (absent pointer, dangling target, or any read error). Fail-soft — a
+    resolve failure must degrade to the base judge (I9), never crash the
+    serve/tick path."""
+    root = Path(champion_root)
+    pointer = root / _CHAMPION_POINTER
+    try:
+        if not pointer.is_file():
+            return None
+        name = pointer.read_text(encoding="utf-8").strip()
+        if not name:
+            return None
+        target = root / name
+        return target if target.is_dir() else None
+    except OSError:
+        logger.warning("resolve_champion_adapter: failed to read %s", pointer, exc_info=True)
+        return None
+
+
+def cleanup_stale_adapters(champion_root: str | Path, keep_names: Sequence[str]) -> None:
+    """Best-effort removal of `adapter-*` subdirs whose basename is NOT in
+    `keep_names` (never raises). The tick passes {new, old} on an accept
+    swap (keep N=2, so an in-flight reader that resolved the prior pointer
+    still finds its subdir — C18), or {current} on a revert/fault to reap a
+    discarded staged subdir (C21). A `None`/empty name in `keep_names` is
+    ignored (first-ever tune has no prior)."""
+    root = Path(champion_root)
+    keep = {n for n in keep_names if n}
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(_ADAPTER_PREFIX):
+            continue
+        if entry.name in keep:
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            logger.warning("cleanup_stale_adapters: failed to remove %s", entry, exc_info=True)

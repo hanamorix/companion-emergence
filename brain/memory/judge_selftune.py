@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
@@ -202,43 +203,6 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
     return TUNE_GRADE_KNOB_REFIT  # last-resort: footprint estimates misconfigured; the floor still fits
 
 
-def _downgrade_for_missing_lora_extra(tune_grade: str) -> str:
-    """Optional-extra guard (F2c inc5a, Opus cold-review round 2, Planning
-    ruling) — the SAME partial-availability posture as
-    `_downgrade_for_oom_safety` above, for a different resource: the
-    LoRA/full-FT tune grades both need `brain.memory.judge_lora`'s training
-    mechanism, which needs `peft`/`datasets` — packages that live behind
-    the OPTIONAL `f2c-training` extra in `pyproject.toml`
-    (`uv sync --extra f2c-training`), not this project's always-installed
-    baseline (unlike torch/sentence-transformers, which the daily
-    calibration judge already needs unconditionally). A box whose RAM tier
-    WOULD select LoRA/full-FT but never installed that extra downgrades to
-    knob-refit — the same always-safe floor the cgroup-aware OOM guard
-    downgrades to, for the same reason: a tier this process cannot actually
-    EXECUTE is not a tier to select, RAM headroom or not.
-
-    `judge_lora.lora_available()` is a cheap try-import check (no heavy/
-    model load — see that function's own docstring), so it is safe to call
-    on every tick; imported here lazily (not at this module's own top
-    level) purely to keep this module's own import list minimal and
-    unchanged for anything that doesn't reach this branch — `judge_lora`'s
-    OWN top-level imports are already torch-free by construction (see its
-    module docstring), so this import carries no I6 risk either way.
-
-    knob-refit is a no-op call (`tune_grade == TUNE_GRADE_KNOB_REFIT`
-    already) — skipped without even checking availability, mirroring
-    `_downgrade_for_oom_safety`'s identical short-circuit for the same
-    grade.
-    """
-    if tune_grade == TUNE_GRADE_KNOB_REFIT:
-        return tune_grade
-    from brain.memory.judge_lora import lora_available
-
-    if lora_available():
-        return tune_grade
-    return TUNE_GRADE_KNOB_REFIT
-
-
 # ---------------------------------------------------------------------------
 # F2c inc3 — the knob-refit fit itself (spec §5: "fit the threshold/Platt
 # slope+intercept on the (judge-raw-score, effective-label) pairs"). Weak-
@@ -388,72 +352,231 @@ def fit_platt_knob(pairs: list[tuple[float, str]]) -> tuple[float, float]:
     return float(slope), float(intercept)
 
 
+def _weak_knob_refit_and_consume(store, now: datetime, row_ids: list[int]) -> None:
+    """The weak-tier / degenerate-floor knob-refit (spec §5, inc3 path,
+    UNCHANGED): fit the Platt knob on the FULL LOGGED `(raw_score,
+    effective_label)` set (`judge_knob_refit_pairs`, doc-AGNOSTIC — trains on
+    every row incl. legacy doc-absent ones), persist it, then consume the
+    FULL firing `row_ids` (every row was trained on by this doc-agnostic fit,
+    so all are retired — Planning consume-semantics 2B). Any fault (e.g.
+    `fit_platt_knob`'s `ValueError` on zero usable pairs) propagates to the
+    caller's try/except, leaving `row_ids` UNCONSUMED (fail-safe)."""
+    pairs = store.judge_knob_refit_pairs(row_ids)
+    slope, intercept = fit_platt_knob(pairs)
+    store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
+    store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
+    store.mark_selftune_consumed(row_ids, consumed_at=now)
+
+
+def _run_weight_retrain(
+    store, now: datetime, persona_dir: Path, row_ids: list[int]
+) -> tuple[bool | None, bool]:
+    """The LoRA/full-FT weight-retrain lifecycle (spec §4/§5, AC5/6/7/11) for
+    a mid/beefy ACCEPT-or-REVERT tick. Returns `(accepted, adapter_persisted)`
+    — `accepted` is `None` when the DEGENERATE FLOOR fell through to a plain
+    knob-refit (too few Haiku triples to evaluate). Raises on any fault (the
+    caller leaves `row_ids` unconsumed).
+
+    DURABLE HAIKU-ORACLE NOTE (spec §6): the champion/challenger below scores
+    both judges against the accumulated HAIKU tie-break labels as the oracle,
+    and the accepted challenger's knob is re-fit on Haiku-derived effective
+    labels — Haiku is the effective relevance ORACLE this weight-retrain
+    converges the local judge toward, NOT an independently verified ground
+    truth. A systematic Haiku bias would propagate into which judge this
+    accepts and how its knob is centered; if a relevance-quality problem shows
+    up downstream, this dispatch is one of the two places to look (alongside
+    the knob-refit's training data).
+
+    Full ORDER + crash-safety per spec §4 and the plan REVISION 2:
+      - ACCEPT: re-score the knob on the TUNED (staged) model → capture the
+        prior champion pointer (o1) → atomically swap the pointer → persist
+        the knob → cleanup (keep N=2) → persist state → CONSUME the doc-HAVING
+        subset only (2B) LAST. A post-swap fault rolls the pointer back (o2).
+      - REVERT: the champion pointer is never swapped (nothing to restore);
+        reap the discarded staged adapter (o3); knob from LOGGED scores (inc3
+        path); CONSUME the FULL `row_ids` (all trained by the doc-agnostic
+        logged fit) LAST.
+    """
+    from brain.memory import judge_eval, judge_lora, relevance_judge
+
+    resolved_min_n = tunables.get_tunable(
+        "judge_selftune.eval_min_test_n", judge_eval.JUDGE_EVAL_MIN_TEST_N_DEFAULT
+    )
+
+    triples = store.judge_lora_training_triples(row_ids)
+    # DEGENERATE FLOOR (spec §4, finding 7 — reuse the pinned `eval_min_test_n`
+    # tunable, no second threshold): too few Haiku (query, doc, label) triples
+    # to split + evaluate → keep the champion, run the always-on weak knob-refit
+    # on the logged pairs, consume the full set. No champion/challenger.
+    if len(triples) < resolved_min_n:
+        _weak_knob_refit_and_consume(store, now, row_ids)
+        return (None, False)
+
+    champion_root = judge_lora.champion_dir(persona_dir)
+    old_target_dir = judge_lora.resolve_champion_adapter(champion_root)
+    old_target_name = old_target_dir.name if old_target_dir is not None else None
+
+    # Champion = the CURRENT serving judge as an (item)->label fn: the live
+    # tuned adapter if this persona already has one, else the base judge —
+    # so champion and challenger are compared like-for-like.
+    if old_target_dir is not None:
+        champ_scorer = judge_lora.load_lora_scorer(MODEL_RELEVANCE_JUDGE, old_target_dir)
+
+        def champion(item):
+            label, _amb = relevance_judge.label_for_score(float(champ_scorer(item)))
+            return label
+    else:
+        base_judge = relevance_judge.build_judge_provider()
+
+        def champion(item):
+            label, _amb = relevance_judge.label_for_score(
+                float(base_judge.score(item[0], item[1]))
+            )
+            return label
+
+    train, test = judge_eval.split_train_test(triples)
+    train_items = [(q, d, label) for (q, d, label) in train]
+    test_items = [((q, d), label) for (q, d, label) in test]
+
+    staged = judge_lora.staged_adapter_path(champion_root)
+    retrain_fn = judge_lora.build_lora_retrain_fn(
+        MODEL_RELEVANCE_JUDGE,
+        target_modules=judge_lora.BGE_RERANKER_LORA_TARGET_MODULES,
+        modules_to_save=judge_lora.BGE_RERANKER_LORA_MODULES_TO_SAVE,
+        save_adapter_dir=staged,
+    )
+
+    swapped = False
+    try:
+        cc = judge_eval.run_champion_challenger(
+            champion=champion,
+            retrain_fn=retrain_fn,
+            train_items=train_items,
+            test_items=test_items,
+            # No-op rollback: the champion is never mutated during eval
+            # (retrain writes to the fresh staged subdir), so there is nothing
+            # for run_champion_challenger to restore. Crash-safety is owned
+            # here via the atomic pointer swap + pointer-snapshot (plan R2.4).
+            rollback=judge_eval.RollbackHandle(),
+        )
+        if cc.accepted:
+            # RE-SCORE the knob on the TUNED model (§5 pin): forward-pass the
+            # doc-HAVING re-score set through the persisted/reloaded challenger
+            # adapter (peft #3980-safe path) → fresh raw scores → fit the Platt
+            # knob on those. Computed from the STAGED adapter BEFORE the swap —
+            # its scores match what will serve after the swap (same reload
+            # path). Raises if empty → outer handler, rows unconsumed.
+            scorer = judge_lora.load_lora_scorer(MODEL_RELEVANCE_JUDGE, staged)
+            rescore = store.judge_knob_refit_rescore_items(row_ids)
+            pairs = [(float(scorer((q, d))), label) for (q, d, label) in rescore]
+            slope, intercept = fit_platt_knob(pairs)
+
+            judge_lora.swap_champion_pointer(champion_root, staged)
+            swapped = True
+            store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
+            # keep N=2 (new + immediately-prior) so an in-flight reader that
+            # resolved the prior pointer still finds its subdir (C18).
+            judge_lora.cleanup_stale_adapters(champion_root, keep_names=[staged.name, old_target_name])
+            store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
+            # ACCEPT consume = doc-HAVING subset only (2B): a legacy
+            # doc-absent row was NOT trained here (excluded from both the LoRA
+            # train set and the re-score knob), so it stays re-eligible.
+            doc_having = store.rows_with_doc_snapshot(row_ids)
+            store.mark_selftune_consumed(doc_having, consumed_at=now)
+            return (True, True)
+
+        # REVERT: champion pointer untouched; reap the discarded staged
+        # adapter (o3). Knob from LOGGED scores (resulting model == champion
+        # == logged-score model → no re-score, inc3 path). Consume the FULL
+        # row_ids (the doc-agnostic logged fit trained on every row — 2B).
+        judge_lora.cleanup_stale_adapters(champion_root, keep_names=[old_target_name])
+        _weak_knob_refit_and_consume(store, now, row_ids)
+        return (False, False)
+    except Exception:
+        # o2/o3/o4: crash-safe rollback. Wrapped in its own guard so a
+        # secondary fault here never MASKS the original fault (stage-6
+        # finding 4) — the original propagates to the tick's handler, which
+        # leaves rows unconsumed (fail-safe, re-eligible).
+        try:
+            # A POST-swap fault → roll the champion pointer back to the prior
+            # last-known-good adapter (or clear it if this was the first-ever
+            # tune), so the persona never resolves to a knob/adapter mismatch
+            # beyond the self-healing window.
+            if swapped:
+                if old_target_name is not None:
+                    judge_lora.swap_champion_pointer(champion_root, champion_root / old_target_name)
+                else:
+                    judge_lora.clear_champion_pointer(champion_root)
+            # Reap the discarded staged adapter but keep N=2 ({prior, staged})
+            # on the swapped path (stage-6 finding 1): an in-flight reader that
+            # resolved `staged` during the brief post-swap window is protected
+            # for one cycle, the same guarantee C12/C18 give the success path;
+            # the orphaned staged subdir is reaped by the next tick's cleanup.
+            keep = [old_target_name, staged.name] if swapped else [old_target_name]
+            judge_lora.cleanup_stale_adapters(champion_root, keep_names=keep)
+        except Exception:  # noqa: BLE001 — rollback is best-effort; never mask the original
+            logger.warning("judge self-tune: crash-safe rollback itself faulted", exc_info=True)
+        raise  # rows stay UNCONSUMED (caller's handler) — fail-safe, re-eligible
+
+
 # ---------------------------------------------------------------------------
 # F2c (durable note, spec §6): Haiku is the effective relevance ORACLE this
-# module's future training code converges the local judge toward. The
-# TODO(F2c inc3+) placeholder below is where that training will run: it
-# will fit the judge's score-to-label mapping (knob-refit / LoRA / full
-# fine-tune) against the accumulated Haiku tie-break decisions logged in
-# calibration_log, the same decisions relevance_judge.label_calibration_
-# sample already treats as ground truth over the local judge's own
-# provisional label at ambiguous positions (see that module's own durable
-# note at its orchestration entry point, spec §6). If a relevance-quality
-# problem shows up downstream later, this is one of the two places to
-# look first: what the judge converges toward is Haiku's own labeling
-# behavior, not an independently verified ground truth, so a systematic
-# Haiku bias would propagate into the judge rather than being caught by
-# it.
+# module's training code converges the local judge toward. The tick below
+# (and the `_run_weight_retrain` helper above) fit the judge's score-to-label
+# mapping (knob-refit / LoRA / full fine-tune) against the accumulated Haiku
+# tie-break decisions logged in calibration_log, the same decisions
+# relevance_judge.label_calibration_sample already treats as ground truth over
+# the local judge's own provisional label at ambiguous positions (see that
+# module's own durable note at its orchestration entry point, spec §6). If a
+# relevance-quality problem shows up downstream later, this is one of the two
+# places to look first: what the judge converges toward is Haiku's own
+# labeling behavior, not an independently verified ground truth, so a
+# systematic Haiku bias would propagate into the judge rather than being
+# caught by it.
 # ---------------------------------------------------------------------------
 
 
-def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
-    """One weekly judge self-tune tick (F2c inc2 cadence/gate scaffold +
-    inc3 knob-refit). Caller owns cadence + throttle — mirrors
-    `interest_sweep.run_sweep_tick`'s contract exactly (a leaf engine call,
-    not a supervisor `_run_X_tick` wrapper by naming convention alone; this
-    function's own docstring states the same "caller owns cadence +
-    throttle" contract the BUILD instructions name it by). Never raises.
+def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None = None) -> dict:
+    """One weekly judge self-tune tick (F2c inc2 cadence/gate + inc3 knob-refit
+    + inc5b-2 LoRA/full-FT weight-retrain lifecycle). Caller owns cadence +
+    throttle — mirrors `interest_sweep.run_sweep_tick`'s contract exactly.
+    Never raises.
 
-    Counts UNCONSUMED non-None `haiku_label` positions across
-    `calibration_log` (the >handful gate, spec §2/§3, pinned counting unit
-    — `MemoryStore.count_new_haiku_decisions`) and, ONLY when the gate
-    fires: runtime-detects the RAM tune-grade, applies the cgroup-aware
-    OOM-safety downgrade, then runs the knob-refit (spec §5 — ALWAYS runs
-    on every tier, weak/mid/beefy alike; `tune_grade` selects only whether
-    a LoRA/full-FT weight-retrain ALSO runs, not built here — TODO(F2c
-    inc5/6) below) — assembling `(judge_raw_score, effective_label)` pairs
-    from `row_ids`'s rows (`MemoryStore.judge_knob_refit_pairs`), fitting
-    `fit_platt_knob`, and persisting the result
-    (`MemoryStore.write_judge_knob_calibration`) — and ONLY once that
-    fit has completed successfully marks every row this tick scanned as
-    consumed (`MemoryStore.mark_selftune_consumed`). Spec §2's "consume =
-    trained-on, never fired-on" pinned contract: if the assembly or fit
-    raises (e.g. `fit_platt_knob`'s `ValueError` on zero usable pairs — a
-    real possibility for legacy rows logged before F2c inc1 added the raw-
-    score column), this function's own try/except below catches it,
-    `result["fired"]` stays `False`, and `row_ids` are left UNCONSUMED —
-    next week's gate recounts them rather than silently losing that Haiku
-    signal.
+    Counts UNCONSUMED non-None `haiku_label` positions across `calibration_log`
+    (the >handful gate, spec §2/§3, `count_new_haiku_decisions`) and, ONLY when
+    the gate fires: runtime-detects the RAM tune-grade + applies the
+    cgroup-aware OOM-safety downgrade (RAM + cgroup only — the inc5a
+    missing-extra downgrade is gone now peft/datasets are base deps), then:
 
-    F2c INC4a (built, elsewhere): loading a persona's fitted knob params
-    INTO the live judge pass — `relevance_judge.label_calibration_sample`
-    now reads what this tick persists (via `store.get_judge_knob_
-    calibration`) and applies it to every `label_for_score` call in its
-    pass, so a completed refit here takes effect on this persona's very
-    next daily calibration tick.
-    ⚠ F2c INC5/6, NOT built here: the LoRA (mid) / full fine-tune (beefy)
-    weight-retrain tiers, the 2/3-train/1/3-test champion/challenger split
-    + rollback (spec §4) — `tune_grade` below is computed and returned so
-    a caller can see which grade WOULD run once those increments land, but
-    only the knob-refit executes regardless of `tune_grade`'s value.
+    - **WEAK tier** (`knob_refit`): the inc3 path unchanged —
+      `_weak_knob_refit_and_consume` fits the Platt knob on the FULL logged
+      set and consumes the full `row_ids`.
+    - **LoRA / full-FT tiers** (mid/beefy): `_run_weight_retrain` runs the
+      2/3-1/3 split + champion/challenger (McNemar, AC6). On ACCEPT it persists
+      the challenger adapter (staged write + atomic champion-pointer swap),
+      re-scores the knob on the tuned model (§5 pin), and consumes only the
+      doc-HAVING rows (2B). On REVERT it keeps the champion and consumes the
+      full `row_ids` via the logged knob. A DEGENERATE-FLOOR (too few Haiku
+      triples) falls through to the weak knob-refit.
 
-    Returns a caller-facing result dict (ignored by the current
-    `supervisor.run_folded` wiring below, mirrors `run_sweep_tick`'s own
-    ignored-return-value contract):
-    ``{"fired": bool, "tune_grade": str | None, "new_decisions": int,
-    "error": str | None}``.
+    Spec §2's "consume = trained-on, never fired-on": consume is the LAST
+    durable step on every path, so any fault before it (caught here) leaves
+    `row_ids` UNCONSUMED and re-eligible next week. `persona_dir` locates the
+    per-persona champion-adapter store (`get_persona_dir(name)/models/
+    relevance_judge/`, spec §5).
+
+    Returns ``{"fired": bool, "tune_grade": str | None, "new_decisions": int,
+    "accepted": bool | None, "adapter_persisted": bool, "error": str | None}``
+    (caller-facing; the `supervisor.run_folded` wiring ignores it).
     """
-    result: dict = {"fired": False, "tune_grade": None, "new_decisions": 0, "error": None}
+    result: dict = {
+        "fired": False,
+        "tune_grade": None,
+        "new_decisions": 0,
+        "accepted": None,
+        "adapter_persisted": False,
+        "error": None,
+    }
     try:
         gate_handful = tunables.get_tunable(
             "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
@@ -467,27 +590,28 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
         tune_grade = _select_tune_grade_by_ram(total_ram)
         effective_headroom = _available_ram_headroom_bytes()
         tune_grade = _downgrade_for_oom_safety(tune_grade, effective_headroom)
-        tune_grade = _downgrade_for_missing_lora_extra(tune_grade)
-
-        # Knob-refit ALWAYS runs on the weak tier (spec §5) and is the
-        # natural finishing step after any weight-retrain on mid/beefy
-        # tiers too — inc5/6 will re-run it after their own weight update,
-        # not built here. Any exception here (assembly or fit) propagates
-        # to this function's own except block below, which is exactly
-        # spec AC3's "fault before training completes" case: `row_ids`
-        # stays unconsumed.
-        pairs = store.judge_knob_refit_pairs(row_ids)
-        slope, intercept = fit_platt_knob(pairs)
-        store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
-
-        # Consume = trained-on, never fired-on (spec §2 pinned contract):
-        # reaching this line means the knob-refit above ran to completion,
-        # so `row_ids` — the exact set `judge_knob_refit_pairs` was built
-        # from — is now safe to retire.
-        store.mark_selftune_consumed(row_ids, consumed_at=now)
-        store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
-        result["fired"] = True
         result["tune_grade"] = tune_grade
+
+        if tune_grade == TUNE_GRADE_KNOB_REFIT or persona_dir is None:
+            # Weak tier: knob-refit only (spec §5), inc3 behavior unchanged.
+            # `persona_dir is None` (no per-persona adapter store available)
+            # is a safe floor: without a place to persist a champion adapter,
+            # a mid/beefy box cannot run the weight-retrain, so it degrades to
+            # the always-safe knob-refit (the supervisor always passes
+            # persona_dir; None only arises in unit tests exercising the weak
+            # path or the gate/tier logic).
+            if tune_grade != TUNE_GRADE_KNOB_REFIT and persona_dir is None:
+                logger.info(
+                    "judge self-tune: tune_grade=%s but no persona_dir — floor to knob-refit",
+                    tune_grade,
+                )
+            _weak_knob_refit_and_consume(store, now, row_ids)
+        else:
+            # Mid/beefy: LoRA/full-FT weight-retrain + champion/challenger.
+            accepted, adapter_persisted = _run_weight_retrain(store, now, persona_dir, row_ids)
+            result["accepted"] = accepted
+            result["adapter_persisted"] = adapter_persisted
+        result["fired"] = True
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick
         logger.warning("judge self-tune tick failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"

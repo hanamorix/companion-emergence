@@ -1826,6 +1826,87 @@ class MemoryStore:
                 continue
         return triples
 
+    def judge_knob_refit_rescore_items(self, row_ids: list[int]) -> list[tuple[str, str, str]]:
+        """`(query, doc, effective_label)` items for F2c inc5b-2's ACCEPT-path
+        knob RE-SCORE (spec §5 "On the updated model = RE-SCORE"). Same BROAD
+        effective-label population `judge_knob_refit_pairs` fits the knob on
+        (Haiku-over-local precedence; skip `unknown`/`error`), but carries the
+        `(query, doc)` needed to forward-pass each position through the UPDATED
+        (tuned) model to get a FRESH raw score — which `judge_knob_refit_pairs`
+        (raw-score-only, no text) cannot supply.
+
+        DOC-REQUIRED (Planning OPTION A, 2026-09-24): a position is emitted
+        only when `candidate_docs[i]` is present and non-empty — a position
+        with no doc snapshot CANNOT be forward-passed, so it cannot be
+        re-scored. This is why the ACCEPT-path knob fits the doc-HAVING rows
+        while the WEAK/REVERT-path knob (`judge_knob_refit_pairs`, logged
+        scores) fits the FULL logged set: on the accept path there is no valid
+        way to include a doc-absent position (mixing its stale logged score
+        into a tuned-model fit would misplace the cutoff). `doc` is
+        `candidate_docs[i]` — the recall-time snapshot, never a re-fetch.
+
+        `effective_label` = `haiku_label[i]` where present, else
+        `local_judge_label[i]` — the SAME precedence as `judge_knob_refit_pairs`
+        / `labeled_calibration_pairs`, so the accept knob and the weak/revert
+        knob calibrate over the same effective-label semantics (only the score
+        SOURCE differs: fresh tuned vs logged). Ordered by row id then position
+        (stable), fail-soft on malformed JSON (mirrors `judge_lora_training_
+        triples`). Read-only. Empty `row_ids` / no usable positions → `[]`.
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_docs, local_judge_label, haiku_label "
+            f"FROM calibration_log WHERE id IN ({placeholders}) ORDER BY id",
+            row_ids,
+        ).fetchall()
+        items: list[tuple[str, str, str]] = []
+        for row in rows:
+            if row["candidate_docs"] is None or row["local_judge_label"] is None:
+                continue
+            try:
+                docs = json.loads(row["candidate_docs"])
+                local_labels = json.loads(row["local_judge_label"])
+                haiku_labels = (
+                    json.loads(row["haiku_label"])
+                    if row["haiku_label"] is not None
+                    else [None] * len(local_labels)
+                )
+                query = row["query"]
+                for doc, local_label, haiku_label in zip(
+                    docs, local_labels, haiku_labels, strict=False
+                ):
+                    effective = haiku_label if haiku_label is not None else local_label
+                    if effective not in ("relevant", "irrelevant"):
+                        continue
+                    if not doc:
+                        continue
+                    items.append((query, doc, effective))
+            except (TypeError, ValueError):
+                continue
+        return items
+
+    def rows_with_doc_snapshot(self, row_ids: list[int]) -> list[int]:
+        """The subset of `row_ids` whose `candidate_docs` column is NON-NULL —
+        the DOC-HAVING rows (F2c inc5b-2, Planning consume-semantics 2B). On an
+        ACCEPT tick the accept-path knob + LoRA train set both train ONLY on
+        doc-having rows, so consume retires ONLY these (a legacy
+        score-present/doc-absent row, `candidate_docs IS NULL`, is left
+        UNCONSUMED — it is still trainable by the doc-agnostic logged-knob fit
+        on a future weak/revert week; §2 forbids retiring a still-trainable row
+        untrained). Weak/revert ticks consume the full `row_ids` instead (their
+        logged-knob fit trains on every row). Read-only. Empty → `[]`."""
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            f"SELECT id FROM calibration_log WHERE id IN ({placeholders}) "
+            "AND candidate_docs IS NOT NULL",
+            row_ids,
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
     def get_judge_knob_calibration(self, judge_model_id: str) -> dict[str, Any] | None:
         """Return the PERSISTED `judge_knob_calibration` row for
         `judge_model_id`, or `None` if this persona's judge has never had a
