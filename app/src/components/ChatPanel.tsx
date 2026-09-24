@@ -44,8 +44,8 @@ interface Message {
   reachedOut?: boolean;
 }
 
-interface StagedImage {
-  /** Object URL for the local preview thumbnail. */
+interface StagedFile {
+  /** Object URL for the local preview thumbnail; also the row key (unique per staging). */
   previewUrl: string;
   /** Human-readable file name. */
   fileName: string;
@@ -66,7 +66,27 @@ interface StagedImage {
 // old image-only set so existing image sends are unaffected.
 const ACCEPTED_FILE_TYPES =
   "image/png,image/jpeg,image/webp,image/gif,text/plain,application/pdf,.md,.txt";
+const ACCEPTED_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "text/plain",
+  "application/pdf",
+]);
+const ACCEPTED_EXTENSIONS = [".md", ".txt"];
 const MAX_BYTES = 20 * 1024 * 1024;
+// Mirrors the bridge's ChatReq.shared_files max_length=8 (#270). A transport
+// cap, not a behaviour threshold.
+const MAX_STAGED_FILES = 8;
+
+/** Type check shared by the picker, drag-drop and paste (#268): the same
+ *  eight types as ACCEPTED_FILE_TYPES, so all three entry paths agree. */
+function isAcceptedType(type: string, name: string): boolean {
+  if (ACCEPTED_MIME_TYPES.has(type)) return true;
+  const lower = name.toLowerCase();
+  return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
 
 // Curated emoji palette — small enough to inline, broad enough for chat.
 const EMOJI_GROUPS: { label: string; chars: string[] }[] = [
@@ -166,7 +186,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     setError(trimmed.length > 0 ? trimmed : EMPTY_ERROR_FALLBACK);
   };
   const [memorySaveWarning, setMemorySaveWarning] = useState<string | null>(null);
-  const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
+  const [stagedFiles, setStagedFiles] = useState<StagedFile[]>([]);
+  // Mirror of stagedFiles for the staging path, which must read the current
+  // count synchronously (cap check) without a stale closure.
+  const stagedRef = useRef<StagedFile[]>([]);
+  const updateStaged = (fn: (prev: StagedFile[]) => StagedFile[]) => {
+    stagedRef.current = fn(stagedRef.current);
+    setStagedFiles(stagedRef.current);
+  };
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
@@ -383,78 +410,103 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Cmd-V'd screenshots.
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
-      if (!e.clipboardData || stagedImage) return;
+      if (!e.clipboardData) return;
+      const files: File[] = [];
       for (const item of e.clipboardData.items) {
-        if (item.kind === "file" && item.type.startsWith("image/")) {
-          const file = item.getAsFile();
-          if (file) {
-            e.preventDefault();
-            void handleFile(file);
-            return;
-          }
-        }
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+      // Same accept list as the picker and drag-drop (#268). Only take over
+      // the paste when at least one file passes, so plain text still pastes.
+      if (files.some((f) => isAcceptedType(f.type, f.name))) {
+        e.preventDefault();
+        stageFiles(files);
       }
     }
     const ta = textareaRef.current;
     ta?.addEventListener("paste", onPaste);
     return () => ta?.removeEventListener("paste", onPaste);
-    // handleFile is closed-over and stable enough; stagedImage gates
-    // the re-stage so we re-bind when it clears.
+    // stageFiles reads staging state through stagedRef, so binding once is safe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stagedImage]);
+  }, []);
 
-  async function handleFile(file: File) {
-    if (!file.type.startsWith("image/")) {
-      setErrorSafe(`Unsupported file type: ${file.type}.`);
-      return;
+  /** Why a file cannot be staged, or null when it can. Check order (#268):
+   *  type, then size, then the cap; the first failing check's message wins. */
+  function stagingFailure(file: File): string | null {
+    if (!isAcceptedType(file.type, file.name)) {
+      return `Unsupported file type: ${file.type || file.name}.`;
     }
     if (file.size > MAX_BYTES) {
-      setErrorSafe(`Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB).`);
-      return;
+      return `File too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 20 MB).`;
     }
-    setErrorSafe(null);
-    const previewUrl = URL.createObjectURL(file);
-    // F-007 (v0.0.7 audit, polish): track the preview URL the moment it's
-    // created — not when the message is sent. If the user stages an image
-    // and then unmounts (persona switch, app quit, route change) without
-    // sending, the URL is held only in React state. The unmount sweep at
-    // lines 159-160 iterates trackedUrlsRef, so adding here ensures it's
-    // freed. Set semantics make subsequent track-on-send (line ~279)
-    // idempotent, and clearStagedImage's explicit revoke is unaffected
-    // since the URL stays in the set until unmount.
-    trackedUrlsRef.current.add(previewUrl);
-    setStagedImage({
-      previewUrl,
-      fileName: file.name,
-      sha: "",
-      kind: file.type.startsWith("image/") ? "image" : "file",
-      status: "uploading",
-    });
+    if (stagedRef.current.length >= MAX_STAGED_FILES) {
+      return `Up to ${MAX_STAGED_FILES} files per message.`;
+    }
+    return null;
+  }
+
+  // Single staging entry for the picker, drag-drop and paste (#268, #270).
+  // Every file that passes is staged in order; the first failure in the
+  // batch is the one shown, later failures in the same batch are not.
+  function stageFiles(files: File[]) {
+    let firstFailure: string | null = null;
+    for (const file of files) {
+      const failure = stagingFailure(file);
+      if (failure) {
+        if (firstFailure === null) firstFailure = failure;
+        continue;
+      }
+      const previewUrl = URL.createObjectURL(file);
+      // F-007 (v0.0.7 audit, polish): track the preview URL the moment it's
+      // created — not when the message is sent. The unmount sweep iterates
+      // trackedUrlsRef, so a staged-but-unsent row is still freed.
+      trackedUrlsRef.current.add(previewUrl);
+      updateStaged((prev) => [
+        ...prev,
+        {
+          previewUrl,
+          fileName: file.name,
+          sha: "",
+          kind: file.type.startsWith("image/") ? "image" : "file",
+          status: "uploading",
+        },
+      ]);
+      void uploadStaged(previewUrl, file);
+    }
+    setErrorSafe(firstFailure);
+  }
+
+  async function uploadStaged(previewUrl: string, file: File) {
     try {
       const result = await uploadImage(persona, file);
-      setStagedImage((prev) =>
-        prev && prev.previewUrl === previewUrl
-          ? {
-              ...prev,
-              sha: result.sha,
-              kind: result.kind,
-              mediaType: result.media_type,
-              status: "ready",
-            }
-          : prev,
+      updateStaged((prev) =>
+        prev.map((f) =>
+          f.previewUrl === previewUrl
+            ? {
+                ...f,
+                sha: result.sha,
+                kind: result.kind,
+                mediaType: result.media_type,
+                status: "ready",
+              }
+            : f,
+        ),
       );
     } catch (e) {
-      setStagedImage((prev) =>
-        prev && prev.previewUrl === previewUrl
-          ? { ...prev, status: "error", error: errString(e) }
-          : prev,
+      updateStaged((prev) =>
+        prev.map((f) =>
+          f.previewUrl === previewUrl
+            ? { ...f, status: "error", error: errString(e) }
+            : f,
+        ),
       );
     }
   }
 
-  function clearStagedImage() {
-    if (stagedImage?.previewUrl) URL.revokeObjectURL(stagedImage.previewUrl);
-    setStagedImage(null);
+  function removeStaged(previewUrl: string) {
+    URL.revokeObjectURL(previewUrl);
+    updateStaged((prev) => prev.filter((f) => f.previewUrl !== previewUrl));
   }
 
   function insertEmoji(emoji: string) {
@@ -663,29 +715,33 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Main composer submit — validates input, clears UI state, calls streamTurn.
   async function send() {
     const text = input.trim();
-    const ready =
-      stagedImage?.status === "ready" && stagedImage.sha ? stagedImage : null;
-    if ((!text && !ready) || streaming) return;
-    if (stagedImage && stagedImage.status === "uploading") return;
-    const isImage = ready?.kind === "image";
-    const outboundText =
-      text || (isImage ? "Please look at this image." : "Please look at this file.");
-    const imageThumb = ready && isImage ? ready.previewUrl : undefined;
-    // Send the staged upload as a shared_files reference on the normal turn
-    // (the bridge resolves it to a path the model reads) — NOT the old
-    // image_shas transport payload.
-    const sharedFiles: SharedFileRef[] | undefined = ready
-      ? [
-          {
-            kind: ready.kind,
-            sha: ready.sha,
-            media_type: ready.mediaType,
-            filename: ready.fileName,
-          },
-        ]
-      : undefined;
+    const ready = stagedFiles.filter((f) => f.status === "ready" && !!f.sha);
+    if ((!text && ready.length === 0) || streaming) return;
+    if (stagedFiles.some((f) => f.status === "uploading")) return;
+    // Default text when nothing is typed (#268, #270): one image, one file,
+    // or several of any kind. Persona-facing; wording is the owner's call.
+    let outboundText = text;
+    if (!outboundText) {
+      if (ready.length >= 2) outboundText = "Here are a few files, have a look.";
+      else if (ready[0]?.kind === "image") outboundText = "Please look at this image.";
+      else outboundText = "Please look at this file.";
+    }
+    // The bubble keeps a single thumbnail: the first ready image, if any.
+    const imageThumb = ready.find((f) => f.kind === "image")?.previewUrl;
+    // Send every ready upload as shared_files references on the normal turn
+    // (the bridge resolves each to a path the model reads) — NOT the old
+    // image_shas transport payload. Failed rows are never sent.
+    const sharedFiles: SharedFileRef[] | undefined =
+      ready.length > 0
+        ? ready.map((f) => ({
+            kind: f.kind,
+            sha: f.sha,
+            media_type: f.mediaType,
+            filename: f.fileName,
+          }))
+        : undefined;
 
-    setStagedImage(null);
+    updateStaged(() => []);
     setEmojiOpen(false);
     setInput("");
     if (textareaRef.current) {
@@ -736,9 +792,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   const [dragOver, setDragOver] = useState(false);
 
   function onDragOver(e: React.DragEvent<HTMLDivElement>) {
-    if (stagedImage || streaming) return;
+    if (streaming) return;
+    // Items carry no filename during dragover, so an empty type (a .md or
+    // .txt on some platforms) cannot be judged yet; let the drop decide.
     if (Array.from(e.dataTransfer.items).some(
-      (i) => i.kind === "file" && i.type.startsWith("image/"),
+      (i) => i.kind === "file" && (i.type === "" || isAcceptedType(i.type, "")),
     )) {
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
@@ -753,16 +811,13 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   function onDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
     setDragOver(false);
-    if (stagedImage || streaming) return;
-    const file = Array.from(e.dataTransfer.files).find((f) =>
-      f.type.startsWith("image/"),
-    );
-    if (file) void handleFile(file);
+    if (streaming) return;
+    stageFiles(Array.from(e.dataTransfer.files));
   }
 
-  const hasReadyImage = stagedImage?.status === "ready" && !!stagedImage.sha;
-  const sendDisabled =
-    !streaming && ((!input.trim() && !hasReadyImage) || stagedImage?.status === "uploading");
+  const hasReadyFile = stagedFiles.some((f) => f.status === "ready" && !!f.sha);
+  const anyUploading = stagedFiles.some((f) => f.status === "uploading");
+  const sendDisabled = !streaming && ((!input.trim() && !hasReadyFile) || anyUploading);
 
   return (
     <div
@@ -878,9 +933,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           }}
         />
       ))}
-      {stagedImage && (
+      {stagedFiles.length > 0 && (
         <div style={{ padding: "0 16px" }}>
-          <StagedImageRow staged={stagedImage} onRemove={clearStagedImage} />
+          {stagedFiles.map((f) => (
+            <StagedFileRow
+              key={f.previewUrl}
+              staged={f}
+              onRemove={() => removeStaged(f.previewUrl)}
+            />
+          ))}
         </div>
       )}
       <div
@@ -898,9 +959,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           ref={fileInputRef}
           type="file"
           accept={ACCEPTED_FILE_TYPES}
+          multiple
           onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) handleFile(f);
+            stageFiles(Array.from(e.target.files ?? []));
             e.target.value = ""; // allow re-selecting same file later
           }}
           style={{ display: "none" }}
@@ -909,7 +970,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           aria-label="send file"
           title="send file"
           onClick={() => fileInputRef.current?.click()}
-          disabled={streaming || !!stagedImage}
+          disabled={streaming || stagedFiles.length >= MAX_STAGED_FILES}
         >
           <PaperclipIcon />
         </IconButton>
@@ -1228,11 +1289,34 @@ function EmojiPicker({
   );
 }
 
-function StagedImageRow({
+function FileGlyph({ name }: { name: string }) {
+  // Generic document glyph for a staged non-image row (#268).
+  return (
+    <svg
+      role="img"
+      aria-label={`file ${name}`}
+      width="36"
+      height="36"
+      viewBox="0 0 36 36"
+      style={{ flexShrink: 0, borderRadius: 4, background: "rgba(255,255,255,0.06)" }}
+    >
+      <path
+        d="M11 6h9l6 6v18a1 1 0 0 1-1 1H11a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z"
+        fill="none"
+        stroke="var(--mauve)"
+        strokeWidth="1.5"
+      />
+      <path d="M20 6v6h6" fill="none" stroke="var(--mauve)" strokeWidth="1.5" />
+      <path d="M14 18h8M14 22h8M14 26h5" stroke="var(--linen)" strokeWidth="1.2" opacity="0.7" />
+    </svg>
+  );
+}
+
+function StagedFileRow({
   staged,
   onRemove,
 }: {
-  staged: StagedImage;
+  staged: StagedFile;
   onRemove: () => void;
 }) {
   return (
@@ -1249,11 +1333,15 @@ function StagedImageRow({
         animation: "msg-in 0.22s ease",
       }}
     >
-      <img
-        src={staged.previewUrl}
-        alt={staged.fileName}
-        style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 4 }}
-      />
+      {staged.kind === "image" ? (
+        <img
+          src={staged.previewUrl}
+          alt={staged.fileName}
+          style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 4 }}
+        />
+      ) : (
+        <FileGlyph name={staged.fileName} />
+      )}
       <div style={{ flex: 1, fontSize: 11, color: "var(--linen)", overflow: "hidden" }}>
         <div
           style={{
@@ -1273,7 +1361,7 @@ function StagedImageRow({
       </div>
       <button
         onClick={onRemove}
-        aria-label="remove image"
+        aria-label="remove file"
         title="remove"
         style={{
           background: "transparent",

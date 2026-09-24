@@ -506,6 +506,14 @@ def test_respond_file_send_surfaces_path_in_user_text(
     assert sha in last_user
     assert "notes.txt" in last_user
     assert "look at this" in last_user
+    # #269: the line carries the tool cue, byte-exact (owner-approved wording).
+    from brain import file_store
+
+    path = file_store.file_path(persona_dir, sha)
+    assert (
+        f'[the user shared a file "notes.txt": {path}. '
+        "Open it with your read_file tool to see what it says.]"
+    ) in last_user
     # Shown-able-to-fail: with no shared file, the path line is absent.
     respond(
         persona_dir,
@@ -517,6 +525,33 @@ def test_respond_file_send_surfaces_path_in_user_text(
     )
     plain = [m for m in recording_provider.last_messages if m.role == "user"][-1].content_text()
     assert "the user shared a file" not in plain
+
+
+def test_respond_file_send_without_filename_still_carries_tool_cue(
+    persona_dir: Path,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    recording_provider: _RecordingProvider,
+) -> None:
+    """#269: a ref with no display filename gets the shorter line, same cue."""
+    from brain import file_store
+
+    sha = "d" * 64
+    respond(
+        persona_dir,
+        "",
+        store=store,
+        hebbian=hebbian,
+        provider=recording_provider,
+        shared_files=[{"kind": "file", "sha": sha}],
+        voice_md_override="# Nell",
+    )
+    last_user = [m for m in recording_provider.last_messages if m.role == "user"][-1].content_text()
+    path = file_store.file_path(persona_dir, sha)
+    assert (
+        f"[the user shared a file: {path}. Open it with your read_file tool to see what it says.]"
+    ) in last_user
+    assert '"' not in last_user.split("[the user shared a file")[1].split(":")[0]
 
 
 def test_respond_file_send_turn_then_text_turn_carries_volatile(

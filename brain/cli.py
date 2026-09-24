@@ -1760,6 +1760,14 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_kind() -> str:
+    """'source' when brain/ sits inside a checkout (pyproject.toml beside it), else 'bundled'."""
+    import brain
+
+    pkg = Path(brain.__file__).resolve().parent
+    return "source" if (pkg.parent / "pyproject.toml").exists() else "bundled"
+
+
 def _paths_for_persona(persona: str) -> dict[str, Path]:
     """Build the key → path map for the given persona."""
     from brain.paths import get_cache_dir, get_log_dir
@@ -1775,6 +1783,12 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         # The only ops-override surface, and it lives under the platformdirs
         # home — undiscoverable unless `paths` says where it is (#63).
         "tunables": home / "tunables.json",
+        # Code location (#179) — an updater must find the install, not just the data.
+        # install_kind is a bare word wrapped in Path so the str()/exists() plumbing
+        # below stays uniform; its "exists" is meaningless and always False.
+        "install_root": Path(sys.prefix),
+        "brain_package": Path(__import__("brain").__file__).resolve().parent,
+        "install_kind": Path(_install_kind()),
         # Per-persona
         "persona_dir": pd,
         "bridge_json": pd / "bridge.json",
@@ -1801,7 +1815,7 @@ def _print_paths(persona: str, *, json_mode: bool) -> None:
         return
     width = max(len(k) for k in paths)
     for key, p in paths.items():
-        marker = "  (missing)" if not p.exists() else ""
+        marker = "  (missing)" if key != "install_kind" and not p.exists() else ""
         print(f"{key:<{width}}  {p}{marker}")
 
 
