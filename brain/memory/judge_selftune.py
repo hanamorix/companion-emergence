@@ -50,13 +50,15 @@ _TUNE_GRADE_ORDER = (TUNE_GRADE_KNOB_REFIT, TUNE_GRADE_LORA, TUNE_GRADE_FULL_FT)
 # a bare hardcoded constant) --------------------------------------------
 
 # ">a handful" gate (spec §2): the weekly tick fires only when MORE new
-# Haiku-labeled `calibration_log` rows than this have accumulated since the
-# marker's consumed cursor (`MemoryStore.count_new_haiku_decisions`).
-# Provisional default — "a handful" ~5, so "more than a handful" starts
-# just past it. Unlike the RAM-tier/footprint tunables below, this one
-# isn't hardware-dependent, so it is a build-time judgment call rather than
-# a dry-run-derived figure (spec's Open Reconfirmations list it alongside
-# the RAM thresholds as a build-time derivation, not an owner fork).
+# non-None `haiku_label` POSITIONS (one Haiku decision each — spec §2's
+# pinned counting unit, red-team fix F-2) than this have accumulated across
+# UNCONSUMED `calibration_log` rows (`MemoryStore.count_new_haiku_
+# decisions`). Provisional default — "a handful" ~5, so "more than a
+# handful" starts just past it. Unlike the RAM-tier/footprint tunables
+# below, this one isn't hardware-dependent, so it is a build-time judgment
+# call rather than a dry-run-derived figure (spec's Open Reconfirmations
+# list it alongside the RAM thresholds as a build-time derivation, not an
+# owner fork).
 JUDGE_TUNE_GATE_HANDFUL_DECISIONS: int = tunables.register(
     "judge_selftune.gate_handful_decisions", 20
 )
@@ -224,13 +226,16 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
     "caller owns cadence + throttle" contract the BUILD instructions name
     it by). Never raises.
 
-    Scaffold-only (inc2): checks the per-persona marker's consumed cursor
-    against `calibration_log`'s new Haiku-labeled rows (the >handful gate,
-    spec §2/§3) and — ONLY when the gate fires — runtime-detects the RAM
-    tune-grade, applies the cgroup-aware OOM-safety downgrade, and advances
-    the marker's consumed cursor to the newest row it "consumed." The
-    actual tuning (knob-refit / LoRA / full-FT, the eval split, champion/
-    challenger + rollback) is NOT invoked here.
+    Scaffold-only (inc2): counts UNCONSUMED non-None `haiku_label`
+    positions across `calibration_log` (the >handful gate, spec §2/§3,
+    pinned counting unit — `MemoryStore.count_new_haiku_decisions`) and —
+    ONLY when the gate fires — runtime-detects the RAM tune-grade, applies
+    the cgroup-aware OOM-safety downgrade, and marks every row this tick
+    scanned as consumed (`MemoryStore.mark_selftune_consumed`). The actual
+    tuning (knob-refit / LoRA / full-FT, the eval split, champion/
+    challenger + rollback) is NOT invoked here — see the TODO(F2c inc3+)
+    marker below for what inc3 must change about consumption once training
+    actually exists.
 
     Returns a caller-facing result dict (ignored by the current
     `supervisor.run_folded` wiring below, mirrors `run_sweep_tick`'s own
@@ -240,37 +245,37 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
     """
     result: dict = {"fired": False, "tune_grade": None, "new_decisions": 0, "error": None}
     try:
-        marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
-        since_id = marker["consumed_through_id"] if marker is not None else 0
-
         gate_handful = tunables.get_tunable(
             "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
         )
-        count, max_id = store.count_new_haiku_decisions(since_id)
+        count, row_ids = store.count_new_haiku_decisions()
         result["new_decisions"] = count
-        if count <= gate_handful or max_id is None:
-            return result  # not yet MORE than a handful — no fire, marker untouched
+        if count <= gate_handful:
+            return result  # not yet MORE than a handful — no fire, nothing consumed
 
         total_ram = _read_total_ram_bytes()
         tune_grade = _select_tune_grade_by_ram(total_ram)
         effective_headroom = _available_ram_headroom_bytes()
         tune_grade = _downgrade_for_oom_safety(tune_grade, effective_headroom)
 
-        # TODO(F2c inc3+): run the selected tier's tuning here — assemble
-        # (query, doc, label) triples from this consume window's
-        # calibration_log rows (spec §3-5, the effective Haiku-over-local
-        # label, skipping "unknown"/"error" rows), fit the knob-refit
-        # threshold/Platt mapping (always) plus the `tune_grade` weight-
-        # retrain (LoRA/full-FT) when the grade calls for one, then run the
-        # 2/3-train/1/3-test champion/challenger eval + rollback (spec §4)
-        # before this becomes next week's deployed judge. `tune_grade`
-        # computed just above is what that future work selects between.
+        # TODO(F2c inc3+): run the selected tier's tuning HERE, BEFORE the
+        # consume below — assemble (query, doc, label) triples from
+        # `row_ids`'s calibration_log rows (spec §3-5, the effective
+        # Haiku-over-local label, skipping "unknown"/"error" rows), fit the
+        # knob-refit threshold/Platt mapping (always) plus the `tune_grade`
+        # weight-retrain (LoRA/full-FT) when the grade calls for one, then
+        # run the 2/3-train/1/3-test champion/challenger eval + rollback
+        # (spec §4) before this becomes next week's deployed judge.
+        # `tune_grade` computed just above is what that future work selects
+        # between. ⚠ inc2 has no training yet, so this scaffold consumes
+        # `row_ids` unconditionally below on every fire — inc3 MUST NOT
+        # keep that: once training exists, only mark_selftune_consumed the
+        # rows actually used in that week's train+test split (a row
+        # skipped/failed mid-training must NOT be marked consumed, or its
+        # Haiku decision is silently lost rather than retried next week).
 
-        store.write_judge_selftune_state(
-            MODEL_RELEVANCE_JUDGE,
-            last_trained_at=now,
-            consumed_through_id=max_id,
-        )
+        store.mark_selftune_consumed(row_ids, consumed_at=now)
+        store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
         result["fired"] = True
         result["tune_grade"] = tune_grade
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick

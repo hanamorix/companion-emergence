@@ -336,6 +336,26 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- from what the judge/reranker actually scored. F2c's later LoRA/full-FT
 -- tiers need `(query, doc, label)` triples built from this exact snapshot.
 -- Nullable: NULL on every legacy row (I9 — legacy import stays working).
+-- `selftune_consumed_at` (F2c inc2, red-team fix F-1, spec §2 consume-once
+-- contract): per-ROW consumed marker for F2c's weekly judge self-tune gate,
+-- replacing the `judge_selftune_state.consumed_through_id` MAX(id)
+-- watermark that F-1 found could strand an out-of-order low-id label (see
+-- that table's comment above for the mechanism). NULL means "not yet
+-- consumed by a firing weekly tick"; `MemoryStore.mark_selftune_consumed`
+-- is the only writer, stamping the tick's wall-clock time on every row it
+-- scanned this firing. Per-ROW (not per-position) granularity suffices:
+-- `write_calibration_labels` is the ONLY writer of `local_judge_label`/
+-- `haiku_label`, and it writes a row's COMPLETE `haiku_label` list in one
+-- atomic UPDATE — `sample_unlabeled_calibration_rows`'s `WHERE
+-- local_judge_label IS NULL` clause then permanently excludes that row from
+-- ever being sampled/labeled again (see that method's own docstring), so a
+-- labeled row's `haiku_label` list never gains or loses non-None positions
+-- after the fact. `MemoryStore.count_new_haiku_decisions` reads unconsumed
+-- rows (`selftune_consumed_at IS NULL`) and sums non-None `haiku_label`
+-- positions across them — the gate's pinned counting unit (spec §2/AC3).
+-- Nullable, no migration-time backfill: every pre-existing row reads as
+-- unconsumed, which is the honest/safe default (never silently "already
+-- counted").
 CREATE TABLE IF NOT EXISTS calibration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -348,7 +368,8 @@ CREATE TABLE IF NOT EXISTS calibration_log (
     haiku_label TEXT,
     score_scale TEXT NOT NULL DEFAULT 'raw',
     local_judge_raw_score TEXT,
-    candidate_docs TEXT
+    candidate_docs TEXT,
+    selftune_consumed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
 
@@ -401,27 +422,32 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     score_scale TEXT NOT NULL DEFAULT 'raw'
 );
 
--- F2c (inc2, spec §2): per-persona weekly judge self-tune MARKER — mirrors
--- `reranker_floor_calibration`'s posture immediately above (a small
--- per-persona artifact table in memories.db, never a side file, I1) but
--- tracks a CONSUMED-THROUGH CURSOR into `calibration_log` rather than a
--- fitted value: `consumed_through_id` is the highest `calibration_log.id`
--- this persona's judge self-tune has trained on so far (id is
--- AUTOINCREMENT, so a plain `> consumed_through_id` comparison is stable
--- across calibration_log's own rolling-retention pruning — see
--- `MemoryStore.count_new_haiku_decisions`). `last_trained_at` is the
--- wall-clock timestamp of the most recent ACCEPTED weekly firing (NULL
--- before the first one). Keyed by `judge_model_id` (mirrors
--- `reranker_floor_calibration`'s `reranker_model_id` keying) so a future
--- local-judge model swap never mixes one model's consumed-cursor progress
--- with another's. `CREATE TABLE IF NOT EXISTS` (legacy-safe, I9): a fresh
--- table needs no ALTER/migration path, and an absent row (fresh
--- install/pre-F2c persona) reads as "never trained" via
+-- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
+-- MARKER — mirrors `reranker_floor_calibration`'s posture immediately above
+-- (a small per-persona artifact table in memories.db, never a side file,
+-- I1). `last_trained_at` is the wall-clock timestamp of the most recent
+-- ACCEPTED weekly firing (NULL before the first one). Keyed by
+-- `judge_model_id` (mirrors `reranker_floor_calibration`'s
+-- `reranker_model_id` keying) so a future local-judge model swap never
+-- mixes one model's progress with another's. `CREATE TABLE IF NOT EXISTS`
+-- (legacy-safe, I9): a fresh table needs no ALTER/migration path, and an
+-- absent row (fresh install/pre-F2c persona) reads as "never trained" via
 -- `MemoryStore.get_judge_selftune_state` returning `None`, not an error.
+--
+-- inc2 ORIGINALLY also carried a `consumed_through_id` MAX(id) watermark
+-- column here. Red-team F-1 found that watermark VIOLATES the pinned
+-- consume-once contract (spec §2): `sample_unlabeled_calibration_rows`
+-- samples unlabeled rows via `ORDER BY RANDOM() LIMIT`, so a LOW-id row can
+-- be judge-labeled (and get its `haiku_label` written) in a LATER week than
+-- a higher-id row — a monotonic `MAX(id)` cursor would then permanently
+-- strand that low-id row's Haiku decision below the watermark, uncounted
+-- forever. The fix moves the consumed marker to PER-ROW granularity, on
+-- `calibration_log.selftune_consumed_at` itself (see that column's comment
+-- below) — this table no longer needs a cursor column, only the cadence
+-- timestamp.
 CREATE TABLE IF NOT EXISTS judge_selftune_state (
     judge_model_id TEXT PRIMARY KEY,
     last_trained_at TEXT,
-    consumed_through_id INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -640,6 +666,14 @@ class MemoryStore:
             )
         if "candidate_docs" not in existing_calibration_log:
             self._conn.execute("ALTER TABLE calibration_log ADD COLUMN candidate_docs TEXT")
+        # F2c inc2 red-team fix F-1: per-row consumed marker for the weekly
+        # judge self-tune gate (see the column's own comment on the CREATE
+        # TABLE above). Same idempotent pattern; NULL/unconsumed for every
+        # pre-existing row is the honest default.
+        if "selftune_consumed_at" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN selftune_consumed_at TEXT"
+            )
         # F2b (#276 §6): same migration shape, scoped to
         # `reranker_floor_calibration` — a legacy DB's persisted floor row
         # predates the scale marker and must read as 'raw' (never a guess)
@@ -1447,15 +1481,19 @@ class MemoryStore:
         `judge_model_id`, or `None` if this persona's judge has never been
         self-tuned yet (F2c inc2, spec §2). Persisted-only reader — mirrors
         `get_persisted_reranker_floor`'s posture exactly: no derived/
-        bootstrap fallback here, the weekly tick's own gate logic (`_run_
-        judge_selftune_tick` in `brain.memory.judge_selftune`) decides what
-        "no marker yet" means (a `since_id` of 0 — count every Haiku-
-        labeled row ever logged).
+        bootstrap fallback here.
+
+        Red-team fix F-1: this row no longer carries a `consumed_through_id`
+        cursor — the consumed marker lives per-row on
+        `calibration_log.selftune_consumed_at` now (see that column's
+        comment). This table is purely the cadence-adjacent "last trained"
+        record; `MemoryStore.count_new_haiku_decisions` needs no state from
+        here to compute the gate's count.
 
         Read-only: does not write or bump anything.
         """
         row = self._conn.execute(
-            "SELECT judge_model_id, last_trained_at, consumed_through_id, updated_at "
+            "SELECT judge_model_id, last_trained_at, updated_at "
             "FROM judge_selftune_state WHERE judge_model_id = ?",
             (judge_model_id,),
         ).fetchone()
@@ -1464,7 +1502,6 @@ class MemoryStore:
         return {
             "judge_model_id": row["judge_model_id"],
             "last_trained_at": row["last_trained_at"],
-            "consumed_through_id": int(row["consumed_through_id"]),
             "updated_at": row["updated_at"],
         }
 
@@ -1473,7 +1510,6 @@ class MemoryStore:
         judge_model_id: str,
         *,
         last_trained_at: datetime,
-        consumed_through_id: int,
     ) -> None:
         """Upsert this persona's judge self-tune marker for `judge_model_id`
         (F2c inc2, spec §2) — the ONLY write path into
@@ -1481,62 +1517,110 @@ class MemoryStore:
         file). `INSERT ... ON CONFLICT DO UPDATE` keyed on `judge_model_id`
         (its PRIMARY KEY), mirroring `write_reranker_floor`'s upsert shape:
         the row is replaced wholesale on each accepted weekly firing, never
-        accumulated (this table tracks the CURRENT consumed-cursor per
-        judge model, not a history of past firings).
+        accumulated (a current-state row, not a history of past firings).
+
+        Red-team fix F-1: no longer takes a `consumed_through_id` — the
+        per-row consumed marker (`calibration_log.selftune_consumed_at`,
+        written by `mark_selftune_consumed`) is the consume-once mechanism
+        now; this call is purely "stamp the last-trained timestamp."
 
         Called only when the weekly tick's >handful gate FIRES (spec §2/§3)
         — a tick that does not fire (not enough new Haiku-labeled decisions
-        yet) must NOT call this, leaving the previously persisted cursor
-        (or its absence) untouched, so nothing already-counted is silently
-        dropped from the next gate check.
+        yet) must NOT call this.
         """
         self._conn.execute(
             "INSERT INTO judge_selftune_state "
-            "(judge_model_id, last_trained_at, consumed_through_id, updated_at) "
-            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "(judge_model_id, last_trained_at, updated_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) "
             "ON CONFLICT(judge_model_id) DO UPDATE SET "
             "last_trained_at = excluded.last_trained_at, "
-            "consumed_through_id = excluded.consumed_through_id, "
             "updated_at = excluded.updated_at",
-            (judge_model_id, last_trained_at.isoformat(), int(consumed_through_id)),
+            (judge_model_id, last_trained_at.isoformat()),
         )
         self._conn.commit()
 
-    def count_new_haiku_decisions(self, since_id: int) -> tuple[int, int | None]:
-        """Count `calibration_log` rows with a non-null `haiku_label` and
-        `id > since_id` (F2c inc2's >handful gate, spec §2/§3) — the weekly
-        judge self-tune tick's ONLY signal for whether new judge-labeled
-        decisions have accumulated since its marker's `consumed_through_id`
-        cursor.
+    def count_new_haiku_decisions(self) -> tuple[int, list[int]]:
+        """Count UNCONSUMED non-None `haiku_label` POSITIONS across
+        `calibration_log` (F2c inc2's >handful gate, spec §2/§3, pinned
+        counting unit) — the weekly judge self-tune tick's ONLY signal for
+        whether new Haiku tie-break decisions have accumulated.
 
-        `haiku_label` is written (as a JSON list, possibly all-`None`
-        entries) by `write_calibration_labels` for EVERY judge-labeled row,
-        whether or not any individual candidate position actually triggered
-        a Haiku tie-break call that turn — so this counts newly JUDGE-
-        LABELED rows at row granularity (the gate's specified granularity,
-        per the F2c inc2 build instructions), not per-candidate Haiku
-        invocations.
+        Red-team fixes F-1 + F-2, both folded into this one method:
 
-        Returns `(count, max_id)`. `max_id` is the highest `id` among the
-        counted rows, or `None` when `count == 0` — the caller must not
-        advance the consumed cursor on a zero/`None` result (nothing new to
-        mark as consumed). `id` is AUTOINCREMENT (monotonic), so this
-        composes safely with `calibration_log`'s own rolling-retention
-        pruning (`prune_calibration_log`): pruning only ever removes OLD
-        `day_bucket` rows, which can only shrink this count, never corrupt
-        it — the `> since_id` comparison stays correct whether or not rows
-        below the cursor still physically exist.
+        F-2 (counting unit): `haiku_label` is written (as a JSON list,
+        possibly all-`None` entries) by `write_calibration_labels` for
+        EVERY judge-labeled row, whether or not any individual candidate
+        position actually triggered a Haiku tie-break call that turn. A
+        `haiku_label IS NOT NULL` ROW count (inc2's original query) counts
+        newly JUDGE-LABELED rows, not oracle Haiku decisions — a week of
+        many judge-labeled rows whose lists are all-`None` would wrongly
+        fire the gate on zero new signal. This method instead parses each
+        candidate row's `haiku_label` JSON list and sums the non-`None`
+        POSITIONS across all of them — one Haiku decision = one non-`None`
+        position (spec §2's pinned unit, the SAME unit §4's 2/3-1/3 split
+        rations against).
+
+        F-1 (consume-once): the SQL scans `WHERE haiku_label IS NOT NULL
+        AND selftune_consumed_at IS NULL` — unconsumed rows, per-row,
+        rather than an `id > since_id` MAX(id) watermark. A watermark
+        strands a low-id row whose `haiku_label` is written OUT OF ORDER in
+        a later week (`sample_unlabeled_calibration_rows` samples via
+        `ORDER BY RANDOM() LIMIT`, so this is reachable); a per-row
+        unconsumed marker cannot strand it — the row simply stays in this
+        scan until some firing tick consumes it, however out of order its
+        label arrived.
+
+        Returns `(count, row_ids)`. `row_ids` is EVERY unconsumed
+        judge-labeled row this scan considered (including any whose
+        `haiku_label` list is all-`None` and so contributes 0 to `count`) —
+        the caller passes this full list to `mark_selftune_consumed` on a
+        firing tick, so an all-`None` row is marked consumed too (it has
+        already contributed everything it ever will: nothing) rather than
+        being re-scanned forever. `count == 0` implies `row_ids` may still
+        be non-empty (the all-`None`-rows case, AC3's bite); the caller
+        must not consume anything when the gate does not fire regardless of
+        `row_ids`'s contents (a non-firing tick leaves everything
+        untouched, spec §2).
 
         Read-only: does not write or bump anything.
         """
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM calibration_log "
-            "WHERE id > ? AND haiku_label IS NOT NULL",
-            (int(since_id),),
-        ).fetchone()
-        count = int(row["n"]) if row is not None else 0
-        max_id = int(row["max_id"]) if row is not None and row["max_id"] is not None else None
-        return count, max_id
+        rows = self._conn.execute(
+            "SELECT id, haiku_label FROM calibration_log "
+            "WHERE haiku_label IS NOT NULL AND selftune_consumed_at IS NULL"
+        ).fetchall()
+        count = 0
+        row_ids: list[int] = []
+        for row in rows:
+            haiku_labels = json.loads(row["haiku_label"])
+            count += sum(1 for label in haiku_labels if label is not None)
+            row_ids.append(int(row["id"]))
+        return count, row_ids
+
+    def mark_selftune_consumed(self, row_ids: list[int], *, consumed_at: datetime) -> None:
+        """Stamp `calibration_log.selftune_consumed_at` for every id in
+        `row_ids` (F2c inc2, red-team fix F-1) — the consume-once
+        mechanism's ONLY writer. Called only on a firing weekly tick, with
+        the exact `row_ids` `count_new_haiku_decisions` returned for that
+        same tick (every unconsumed judge-labeled row it scanned), so a row
+        is marked consumed precisely once it has been accounted for in a
+        gate count — never before, never twice (once stamped, the row no
+        longer matches `count_new_haiku_decisions`'s `selftune_consumed_at
+        IS NULL` filter, so it can never contribute to a later gate count
+        again).
+
+        No-op on an empty list (nothing to stamp). Read the module-level
+        note above `_run_judge_selftune_tick` in `brain.memory.
+        judge_selftune` for why inc2 consumes without training yet, and
+        what inc3 must change about when this is called.
+        """
+        if not row_ids:
+            return
+        now_iso = consumed_at.isoformat()
+        self._conn.executemany(
+            "UPDATE calibration_log SET selftune_consumed_at = ? WHERE id = ?",
+            [(now_iso, row_id) for row_id in row_ids],
+        )
+        self._conn.commit()
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

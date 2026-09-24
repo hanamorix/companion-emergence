@@ -4,7 +4,10 @@ SCAFFOLD (spec `f2c-judge-selftune-spec.md` §1 [hardware-tiered mechanism],
 
 Covers what inc2 actually builds: the >handful gate, runtime RAM
 tier-detection, the cgroup-aware OOM-safety downgrade, the per-persona
-consumed-cursor marker (round-trip via `MemoryStore`), and
+last-trained marker + the per-row consumed marker (round-trip via
+`MemoryStore` — red-team fixes F-1/F-2 replaced the original MAX(id)
+watermark + judge-labeled-row count with a per-row `selftune_consumed_at`
+marker and a non-None-`haiku_label`-position count), and
 `_run_judge_selftune_tick`'s fault isolation. Cadence WIRING into
 `supervisor.run_folded` (is_due/advance/save, startup-catch-up-free shape,
 `=None` disables) is covered separately in
@@ -19,7 +22,10 @@ own TODO(F2c inc3+) marker).
 from __future__ import annotations
 
 import inspect
+import subprocess
+import sys
 import tempfile
+import textwrap
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import mock_open
@@ -226,51 +232,175 @@ def test_oom_guard_knob_refit_footprint_is_the_floor_it_never_downgrades_past() 
 
 
 # ---------------------------------------------------------------------------
-# MemoryStore.count_new_haiku_decisions — the >handful gate's data source
-# (spec §2/§3).
+# MemoryStore.count_new_haiku_decisions / mark_selftune_consumed — the
+# >handful gate's data source (spec §2/§3), red-team fixes F-1 (per-row
+# consume-once, no MAX(id) watermark) + F-2 (count non-None POSITIONS, not
+# judge-labeled ROWS).
 # ---------------------------------------------------------------------------
 
 
-def test_count_new_haiku_decisions_counts_labeled_rows_after_cursor(store: MemoryStore) -> None:
-    _seed_labeled_rows(store, 3)
-    count, max_id = store.count_new_haiku_decisions(0)
+def _seed_row_with_haiku_labels(
+    store: MemoryStore, haiku_labels: list[str | None], *, n_candidates: int | None = None
+) -> int:
+    """Insert ONE judge-labeled `calibration_log` row with an EXPLICIT
+    `haiku_label` list (unlike `_seed_labeled_rows`, which always writes a
+    single-candidate, single-non-None-position row) — lets a test control
+    exactly how many non-None POSITIONS one row contributes. Returns the
+    row id."""
+    n = n_candidates if n_candidates is not None else len(haiku_labels)
+    candidate_ids = [f"m{i}" for i in range(n)]
+    store.log_calibration_sample(
+        query="q", candidate_ids=candidate_ids, reranker_scores=[1.0] * n, reranker_model_id="m"
+    )
+    row_id = store._conn.execute(
+        "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    store.write_calibration_labels(row_id, ["relevant"] * n, haiku_labels)
+    return row_id
+
+
+def test_count_new_haiku_decisions_counts_labeled_rows(store: MemoryStore) -> None:
+    _seed_labeled_rows(store, 3)  # 1 non-None position each (see helper docstring)
+    count, row_ids = store.count_new_haiku_decisions()
     assert count == 3
-    assert max_id == 3
+    assert sorted(row_ids) == [1, 2, 3]
 
 
 def test_count_new_haiku_decisions_excludes_unlabeled_rows(store: MemoryStore) -> None:
     store.log_calibration_sample(
         query="q", candidate_ids=[], reranker_scores=[], reranker_model_id="m"
     )
-    count, max_id = store.count_new_haiku_decisions(0)
+    count, row_ids = store.count_new_haiku_decisions()
     assert count == 0
-    assert max_id is None
+    assert row_ids == []
 
 
-def test_count_new_haiku_decisions_respects_since_id_cursor(store: MemoryStore) -> None:
-    ids = _seed_labeled_rows(store, 5)
-    count, max_id = store.count_new_haiku_decisions(ids[2])
+def test_count_new_haiku_decisions_counts_positions_not_rows(store: MemoryStore) -> None:
+    """AC3 / F-2 bite: a SINGLE row with `haiku_label` `[None, "relevant",
+    None]` must count as 1 decision (one non-None POSITION) — not as 1 row
+    (the old row-count semantics) and not as 3 (the list's length). Before
+    the F-2 fix this method counted `haiku_label IS NOT NULL` ROWS, which
+    would have read this as 1 anyway by coincidence of row-count == 1; the
+    real break is exposed by the all-None-row test below, which the OLD
+    row-counting query could not distinguish from this one."""
+    _seed_row_with_haiku_labels(store, [None, "relevant", None])
+    count, row_ids = store.count_new_haiku_decisions()
+    assert count == 1
+    assert len(row_ids) == 1
+
+
+def test_count_new_haiku_decisions_all_none_rows_do_not_count(store: MemoryStore) -> None:
+    """AC3 bite (F-2, the actual break the fix targets): MANY judge-labeled
+    rows whose `haiku_label` lists are ALL-`None` (the local judge never
+    routed any candidate to Haiku that turn — `write_calibration_labels`
+    still writes a non-NULL JSON list of `None`s per its own contract) must
+    contribute ZERO to the count. The OLD `haiku_label IS NOT NULL` ROW
+    count would have wrongly read this as `handful + 1` and fired the gate
+    on zero new Haiku signal — exactly the bug AC3 requires closed."""
+    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    for _ in range(handful + 1):
+        _seed_row_with_haiku_labels(store, [None, None, None])
+    count, row_ids = store.count_new_haiku_decisions()
+    assert count == 0, "all-None-position rows must not count as Haiku decisions"
+    assert len(row_ids) == handful + 1, "the rows are still returned so a firing tick can consume them"
+
+
+def test_count_new_haiku_decisions_excludes_consumed_rows(store: MemoryStore) -> None:
+    ids = _seed_labeled_rows(store, 3)
+    store.mark_selftune_consumed([ids[0]], consumed_at=datetime.now(UTC))
+    count, row_ids = store.count_new_haiku_decisions()
     assert count == 2
-    assert max_id == ids[-1]
+    assert sorted(row_ids) == sorted(ids[1:])
+
+
+def test_count_new_haiku_decisions_out_of_order_low_id_row_still_counts(store: MemoryStore) -> None:
+    """F-1 bite: the exact scenario a MAX(id) watermark strands. Row 1 is
+    logged but stays UNLABELED (simulating `sample_unlabeled_calibration_
+    rows`'s randomized sampling skipping it this week); row 2 gets labeled
+    and consumed this week. A week later, row 1 FINALLY gets labeled (its
+    `haiku_label` written out of order, after a higher-id row already
+    advanced past it) — it must still be counted. A `MAX(id)`
+    watermark set to row 2's id would have permanently excluded row 1
+    (`id > since_id` with `since_id == 2` never matches `id == 1`); the
+    per-row `selftune_consumed_at` marker has no such ordering dependency."""
+    store.log_calibration_sample(
+        query="q1", candidate_ids=["m"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    row1_id = store._conn.execute(
+        "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    # row 1 stays unlabeled here — sampled-out this week.
+    row2_id = _seed_row_with_haiku_labels(store, ["relevant"])
+    store.mark_selftune_consumed([row2_id], consumed_at=datetime.now(UTC))
+
+    # Week later: row 1 finally gets labeled, out of order relative to row 2.
+    store.write_calibration_labels(row1_id, ["relevant"], ["relevant"])
+
+    count, row_ids = store.count_new_haiku_decisions()
+    assert count == 1, "the out-of-order low-id row's Haiku decision must still be counted"
+    assert row_ids == [row1_id]
 
 
 def test_count_new_haiku_decisions_survives_retention_pruning(store: MemoryStore) -> None:
-    """Cursor semantics compose with calibration_log's own rolling
-    retention: id is AUTOINCREMENT/monotonic, so deleting an OLD row below
-    the cursor can only shrink the count, never corrupt the `> since_id`
-    comparison — pre-checked per the BUILD instructions' flag-back
-    criterion, not a design fork (see the method's own docstring)."""
+    """`calibration_log`'s own rolling retention can delete OLD rows
+    outright — the count is a live scan of whatever rows physically remain
+    (no cursor to corrupt), so deleting one just shrinks the result."""
     ids = _seed_labeled_rows(store, 3)
     store._conn.execute("DELETE FROM calibration_log WHERE id = ?", (ids[0],))
     store._conn.commit()
-    count, max_id = store.count_new_haiku_decisions(0)
+    count, row_ids = store.count_new_haiku_decisions()
     assert count == 2
-    assert max_id == ids[-1]
+    assert sorted(row_ids) == sorted(ids[1:])
+
+
+def test_mark_selftune_consumed_is_the_only_writer_of_the_marker(store: MemoryStore) -> None:
+    ids = _seed_labeled_rows(store, 2)
+    now = datetime(2026, 9, 24, tzinfo=UTC)
+    store.mark_selftune_consumed(ids, consumed_at=now)
+    rows = store._conn.execute(
+        "SELECT id, selftune_consumed_at FROM calibration_log ORDER BY id"
+    ).fetchall()
+    assert [r["selftune_consumed_at"] for r in rows] == [now.isoformat(), now.isoformat()]
+
+
+def test_mark_selftune_consumed_empty_list_is_a_noop(store: MemoryStore) -> None:
+    ids = _seed_labeled_rows(store, 2)
+    store.mark_selftune_consumed([], consumed_at=datetime.now(UTC))
+    count, row_ids = store.count_new_haiku_decisions()
+    assert count == 2
+    assert sorted(row_ids) == sorted(ids)
+
+
+def test_consume_once_a_row_consumed_in_week_one_is_not_recounted_in_week_two(
+    store: MemoryStore,
+) -> None:
+    """AC3 / spec §2 consume-once contract: once a row is marked consumed,
+    it must never contribute to a later gate count again, however many
+    times `count_new_haiku_decisions` is subsequently called."""
+    ids = _seed_labeled_rows(store, 5)
+    week1_count, week1_ids = store.count_new_haiku_decisions()
+    assert week1_count == 5
+    store.mark_selftune_consumed(week1_ids, consumed_at=datetime.now(UTC))
+
+    # Week 2: no new rows logged at all — everything from week 1 is consumed.
+    week2_count, week2_ids = store.count_new_haiku_decisions()
+    assert week2_count == 0
+    assert week2_ids == []
+
+    # Week 3: one genuinely new row arrives — only IT counts, not the 5 already consumed.
+    new_id = _seed_row_with_haiku_labels(store, ["relevant"])
+    week3_count, week3_ids = store.count_new_haiku_decisions()
+    assert week3_count == 1
+    assert week3_ids == [new_id]
+    assert new_id not in ids, "sanity: the new row is distinct from the consumed ones"
 
 
 # ---------------------------------------------------------------------------
 # MemoryStore.get_judge_selftune_state / write_judge_selftune_state — marker
-# upsert/read round-trip (I1: table in memories.db).
+# upsert/read round-trip (I1: table in memories.db). Red-team fix F-1: this
+# marker no longer carries a `consumed_through_id` cursor (see
+# `calibration_log.selftune_consumed_at` above) — it is purely the
+# cadence-adjacent "last trained" record now.
 # ---------------------------------------------------------------------------
 
 
@@ -280,21 +410,19 @@ def test_judge_selftune_state_absent_reads_as_none(store: MemoryStore) -> None:
 
 def test_judge_selftune_state_round_trip(store: MemoryStore) -> None:
     now = datetime(2026, 9, 23, 12, tzinfo=UTC)
-    store.write_judge_selftune_state("model-a", last_trained_at=now, consumed_through_id=42)
+    store.write_judge_selftune_state("model-a", last_trained_at=now)
     state = store.get_judge_selftune_state("model-a")
     assert state is not None
     assert state["judge_model_id"] == "model-a"
-    assert state["consumed_through_id"] == 42
     assert state["last_trained_at"] == now.isoformat()
 
 
 def test_judge_selftune_state_upsert_replaces_not_accumulates(store: MemoryStore) -> None:
     now1 = datetime(2026, 9, 1, tzinfo=UTC)
     now2 = datetime(2026, 9, 8, tzinfo=UTC)
-    store.write_judge_selftune_state("model-a", last_trained_at=now1, consumed_through_id=10)
-    store.write_judge_selftune_state("model-a", last_trained_at=now2, consumed_through_id=25)
+    store.write_judge_selftune_state("model-a", last_trained_at=now1)
+    store.write_judge_selftune_state("model-a", last_trained_at=now2)
     state = store.get_judge_selftune_state("model-a")
-    assert state["consumed_through_id"] == 25
     assert state["last_trained_at"] == now2.isoformat()
     n_rows = store._conn.execute("SELECT COUNT(*) AS n FROM judge_selftune_state").fetchone()["n"]
     assert n_rows == 1, "upsert must replace, never accumulate a history row"
@@ -305,7 +433,7 @@ def test_judge_selftune_state_scoped_per_judge_model_id(store: MemoryStore) -> N
     visible under the first's key (mirrors reranker_floor_calibration's own
     model_id keying)."""
     now = datetime(2026, 9, 23, tzinfo=UTC)
-    store.write_judge_selftune_state("model-a", last_trained_at=now, consumed_through_id=5)
+    store.write_judge_selftune_state("model-a", last_trained_at=now)
     assert store.get_judge_selftune_state("model-b") is None
 
 
@@ -336,8 +464,9 @@ def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore)
 
 
 def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC3 (gate): MORE than a handful -> fires, and the marker's consumed
-    cursor advances to the newest counted row."""
+    """AC3 (gate): MORE than a handful -> fires, the marker records the
+    firing timestamp, and every scanned row is marked consumed (red-team
+    fix F-1: per-row consumed marker, not a MAX(id) cursor)."""
     handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1)
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)  # weak box
@@ -352,16 +481,24 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     assert result["new_decisions"] == handful + 1
     marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
     assert marker is not None
-    assert marker["consumed_through_id"] == ids[-1]
     assert marker["last_trained_at"] == now.isoformat()
+    # every row this tick scanned must now be consumed — a second count sees nothing.
+    post_count, post_row_ids = store.count_new_haiku_decisions()
+    assert post_count == 0
+    assert post_row_ids == []
+    consumed_rows = store._conn.execute(
+        "SELECT id FROM calibration_log WHERE selftune_consumed_at IS NOT NULL"
+    ).fetchall()
+    assert sorted(r["id"] for r in consumed_rows) == sorted(ids)
 
 
 def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The gate is re-evaluated against the marker's own consumed cursor
-    each tick, not against the corpus total — a second consecutive fire
-    without enough genuinely NEW rows must not fire again."""
+    """The gate is re-evaluated against UNCONSUMED rows each tick, not
+    against the corpus total — a second consecutive fire without enough
+    genuinely NEW (unconsumed) rows must not fire again, and the first
+    fire's rows must not be double-counted (consume-once, F-1)."""
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)
     monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: None)
     handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
@@ -373,7 +510,9 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     _seed_labeled_rows(store, handful)  # exactly `handful` NEW rows -> not more than a handful
     r2 = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
     assert r2["fired"] is False
-    assert r2["new_decisions"] == handful
+    assert r2["new_decisions"] == handful, (
+        "must count only the genuinely NEW unconsumed rows, not re-count week 1's"
+    )
 
 
 def test_tick_selects_tier_and_applies_oom_downgrade(
@@ -411,14 +550,66 @@ def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: py
 
 
 def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
-    """I6 / AC8 (off hot path): the scaffold itself must never pull in
-    torch/sentence_transformers — that stays scoped to the future TODO(F2c
-    inc3+) tuning code, never to the cadence/gate/tier-detect machinery
-    this increment ships."""
-    source = inspect.getsource(judge_selftune)
-    assert "import torch" not in source
-    assert "import sentence_transformers" not in source
-    assert "from sentence_transformers" not in source
+    """I6 / AC8 (off hot path): the scaffold, including a FIRING tick, must
+    never pull torch/sentence_transformers into `sys.modules` — that stays
+    scoped to the future TODO(F2c inc3+) tuning code, never to the
+    cadence/gate/tier-detect machinery this increment ships.
+
+    Red-team fix F-3: the prior version of this test grepped
+    `judge_selftune`'s own source TEXT for the literal strings "import
+    torch" / "import sentence_transformers". That only proves this one
+    module has no such import statement in it — it would NOT catch a
+    TRANSITIVE pull via some other module `judge_selftune` imports (e.g. a
+    future change to `brain.memory.reranker` or `brain.memory.store`
+    growing a module-scope torch import). This runs a FRESH subprocess —
+    never inheriting whatever this test PROCESS's own earlier tests may
+    already have imported into `sys.modules`, which would make an
+    in-process `sys.modules` check meaningless (the same caveat
+    `test_relevance_judge.py`'s sibling import-scope test documents) — that
+    imports `judge_selftune`, seeds enough `calibration_log` rows to FIRE
+    the >handful gate, actually runs `_run_judge_selftune_tick` end to end,
+    and only THEN asserts neither package landed in `sys.modules`.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        from datetime import UTC, datetime
+
+        from brain.memory import judge_selftune
+        from brain.memory.store import MemoryStore
+
+        store = MemoryStore(db_path=":memory:")
+        handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+        for i in range(handful + 1):
+            store.log_calibration_sample(
+                query=f"q{i}",
+                candidate_ids=["m"],
+                reranker_scores=[1.0],
+                reranker_model_id="m",
+            )
+            row_id = store._conn.execute(
+                "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()["id"]
+            store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+
+        result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
+        assert result["fired"] is True, result
+
+        assert "torch" not in sys.modules, sorted(sys.modules)
+        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
+        print("SUBPROCESS_OK")
+        """
+    )
+    repo_root = Path(__file__).resolve().parents[4]
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
 
 
 # ---------------------------------------------------------------------------

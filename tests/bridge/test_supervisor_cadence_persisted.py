@@ -507,10 +507,24 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     store = MemoryStore(persona_dir / "memories.db")
     try:
         marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
+        # Red-team fix F-1: the consumed marker moved to per-row
+        # `calibration_log.selftune_consumed_at` (see that column's
+        # comment in store.py) — the persisted `judge_selftune_state` row
+        # no longer carries a `consumed_through_id` cursor, only the
+        # last-trained timestamp. Verify consumption at its new home: every
+        # seeded row must now be marked consumed, and a fresh gate count
+        # must see nothing left to count.
+        consumed_rows = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM calibration_log WHERE selftune_consumed_at IS NOT NULL"
+        ).fetchone()["n"]
+        post_count, post_row_ids = store.count_new_haiku_decisions()
     finally:
         store.close()
     assert marker is not None, "the >handful gate must have fired and written the marker"
-    assert marker["consumed_through_id"] == handful + 1
+    assert marker["last_trained_at"] is not None
+    assert consumed_rows == handful + 1
+    assert post_count == 0
+    assert post_row_ids == []
 
 
 def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advances(

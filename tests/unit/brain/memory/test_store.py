@@ -2306,6 +2306,7 @@ def test_fresh_store_has_calibration_log_table() -> None:
         "score_scale",  # F2b (#276 §5): raw-vs-normalized score scale marker
         "local_judge_raw_score",  # F2c inc1 (spec §3 Addition A): raw judge score/logit
         "candidate_docs",  # F2c inc1 (spec §3 Addition B): recall-time doc-text snapshot
+        "selftune_consumed_at",  # F2c inc2 red-team fix F-1: per-row weekly-selftune consumed marker
     }
     store.close()
 
